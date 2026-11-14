@@ -1024,6 +1024,19 @@ async fn handle_socket(
                                     return;
                                 }
                             };
+                            // The wait for the permit is unbounded, so the agent
+                            // can be disabled while this prompt is parked. Judge
+                            // it again now, with nothing awaited in between.
+                            if !live_agent_takes_turns(&state, &agent_alias) {
+                                let _ = sender
+                                    .send(Message::Text(
+                                        agent_not_dispatchable_frame(&agent_alias)
+                                            .to_string()
+                                            .into(),
+                                    ))
+                                    .await;
+                                return;
+                            }
                             let client_gone = process_chat_message(
                                 &state,
                                 &mut agent,
@@ -1253,6 +1266,20 @@ async fn handle_socket(
                         continue;
                     }
                 };
+
+                // The wait for the permit is unbounded, so the agent can be
+                // disabled while this prompt is parked. Judge it again now,
+                // with nothing awaited in between.
+                if !live_agent_takes_turns(&state, &agent_alias) {
+                    let _ = sender
+                        .send(Message::Text(
+                            agent_not_dispatchable_frame(&agent_alias)
+                                .to_string()
+                                .into(),
+                        ))
+                        .await;
+                    continue;
+                }
 
                 let client_gone = process_chat_message(
                     &state,
@@ -4044,6 +4071,52 @@ data: {\"type\":\"message_stop\"}\n\n",
         let _ = fixture
             .start_parked_turn(&mut client, "runs once the agent is enabled again")
             .await;
+        fixture.shutdown();
+    }
+
+    #[tokio::test]
+    async fn a_prompt_queued_behind_a_running_turn_is_refused_after_the_agent_is_disabled() {
+        let mut fixture = ParkedTurnFixture::spawn().await;
+        // The same session id means the same session permit, so the second
+        // socket's prompt can only queue behind the first socket's turn.
+        let (mut running, _) = fixture.connect("ws-queued-disable").await;
+        let (mut queued, _) = fixture.connect("ws-queued-disable").await;
+
+        let _running_request = fixture
+            .start_parked_turn(&mut running, "the running turn")
+            .await;
+
+        send_chat(&mut queued, "this prompt must not start").await;
+        // Let the queued prompt reach the permit wait before disabling. Nothing
+        // is sent back while it waits, so the poll below sees no frame.
+        for _ in 0..10 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            if let Ok(frame) =
+                tokio::time::timeout(Duration::from_millis(1), next_text_frame(&mut queued)).await
+            {
+                panic!("the queued prompt was answered before the permit: {frame}");
+            }
+        }
+
+        let mut disabled = fixture.state.config.snapshot();
+        disabled
+            .agents
+            .get_mut("web")
+            .expect("the fixture agent")
+            .enabled = false;
+        fixture.state.config_authority.publish_for_test(disabled);
+        // Enough time for the disabled config to reach the queued socket's
+        // post-permit check once the running turn releases the permit.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        fixture.release_next();
+        let err = next_text_frame(&mut queued).await;
+        assert_eq!(err["type"], "error", "{err}");
+        assert_eq!(err["code"], "AGENT_NOT_DISPATCHABLE", "{err}");
+        assert!(
+            fixture.request_seen.try_recv().is_err(),
+            "a prompt admitted before the disable must not reach the provider"
+        );
         fixture.shutdown();
     }
 

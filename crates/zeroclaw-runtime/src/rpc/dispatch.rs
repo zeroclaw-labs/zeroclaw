@@ -1403,7 +1403,8 @@ impl RpcDispatcher {
         let Some(grants) = self.stamped_grants() else {
             return Err(rpc_err(AUTH_REQUIRED, "First call must be 'initialize'"));
         };
-        self.selector_session_agent_with_grants(method, grants, alias)
+        let config = self.ctx.config.read();
+        self.selector_session_agent_with_grants(method, grants, &config, alias)
     }
 
     /// The grants stamped on this connection by the last pass through the
@@ -1420,6 +1421,7 @@ impl RpcDispatcher {
         &self,
         method: Method,
         grants: &zeroclaw_api::grants::ResolvedGrants,
+        config: &Config,
         alias: &str,
     ) -> Result<(), JsonRpcError> {
         if !grants.may_use_agent(alias) {
@@ -1436,15 +1438,14 @@ impl RpcDispatcher {
             );
             return Err(denied);
         }
-        self.require_agent_takes_turns(alias)
+        self.require_agent_takes_turns(config, alias)
     }
 
     /// Live-config check that a named agent can take a turn: enabled, with a
     /// model provider and a risk profile. A runtime profile is optional.
     /// Unknown aliases are left to existing not-found paths so a grant for a
     /// name that is not configured stays a grant question, not a dispatch one.
-    fn require_agent_takes_turns(&self, alias: &str) -> Result<(), JsonRpcError> {
-        let config = self.ctx.config.read();
+    fn require_agent_takes_turns(&self, config: &Config, alias: &str) -> Result<(), JsonRpcError> {
         if config
             .agent(alias)
             .is_some_and(|agent| !agent.is_dispatchable())
@@ -1820,7 +1821,7 @@ impl RpcDispatcher {
         // longer reach another's session by ID, so the outright refusal is
         // lifted and the selector is composed into that principal's own,
         // owner-isolated session.
-        self.selector_session_agent_with_grants(method, grants, alias)?;
+        self.selector_session_agent_with_grants(method, grants, config, alias)?;
         self.confine_session_workspace_with_grants(method, grants, config, alias, workspace)
     }
 
@@ -4598,9 +4599,11 @@ impl RpcDispatcher {
                     .map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?;
                 let grants = self.recheck_authority_after_admission(Method::SessionNew)?;
                 if let Some(grants) = grants.as_ref() {
+                    let config = self.ctx.config.read();
                     self.selector_session_agent_with_grants(
                         Method::SessionNew,
                         grants,
+                        &config,
                         &req.agent_alias,
                     )?;
                 }
@@ -4692,7 +4695,13 @@ impl RpcDispatcher {
             // recorded), and every create-or-resume branch is owner-predicated,
             // so neither branch can hand a constrained principal a session that
             // another principal could reach by ID.
-            self.selector_session_agent_with_grants(Method::SessionNew, grants, &req.agent_alias)?;
+            let config = self.ctx.config.read();
+            self.selector_session_agent_with_grants(
+                Method::SessionNew,
+                grants,
+                &config,
+                &req.agent_alias,
+            )?;
         }
         // Ownership from here on is judged by these grants as well: the stamp
         // predates the wait, and a caller that lost the administrator bypass
@@ -4974,7 +4983,12 @@ impl RpcDispatcher {
         // freshly resolved set.
         let grants = self.recheck_authority_after_admission(Method::SessionNew)?;
         if let Some(grants) = grants.as_ref() {
-            self.selector_session_agent_with_grants(Method::SessionNew, grants, &req.agent_alias)?;
+            self.selector_session_agent_with_grants(
+                Method::SessionNew,
+                grants,
+                &config,
+                &req.agent_alias,
+            )?;
         }
         // The same edit can remove the administrator bypass, so ownership is
         // judged by these grants again: a restore keeps the durable owner and a
@@ -12814,7 +12828,8 @@ impl RpcDispatcher {
         };
         for alias in &agents {
             if executes {
-                self.selector_session_agent_with_grants(method, grants, alias)?;
+                let config = self.ctx.config.read();
+                self.selector_session_agent_with_grants(method, grants, &config, alias)?;
             } else {
                 self.selector_agent(method, alias)?;
             }
@@ -12864,8 +12879,9 @@ impl RpcDispatcher {
         };
         self.refuse_constrained_principal_for_sop(method, &grants)?;
         if let Some(agents) = agents {
+            let config = self.ctx.config.read();
             for alias in agents {
-                self.selector_session_agent_with_grants(method, &grants, &alias)?;
+                self.selector_session_agent_with_grants(method, &grants, &config, &alias)?;
             }
         }
         Ok(())
