@@ -43307,7 +43307,7 @@ mod tests {
         assert_eq!(record["outcome"], "pending");
         assert_eq!(
             record["path"],
-            json!(["providers", "models", "openai", "test-provider", "model"])
+            json!(["providers", "models", "openai.test-provider", "model"])
         );
         assert_eq!(
             record["revision"],
@@ -43394,7 +43394,7 @@ mod tests {
             .unwrap()
             .iter()
             .filter(|record| {
-                record["path"] == json!(["providers", "models", "openai", "test-provider", "model"])
+                record["path"] == json!(["providers", "models", "openai.test-provider", "model"])
             })
             .collect();
         assert!(!same_path_records.is_empty());
