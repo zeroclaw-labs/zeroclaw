@@ -1382,6 +1382,61 @@ export interface MapKeyResponse {
   created: boolean;
 }
 
+export type HttpCredentialKind = "user_password" | "api_key" | "ssh_key" | "totp";
+export type HttpCredentialSource = "local" | "open_bao" | "one_password" | "azure" | "aws" | "google";
+export type SshDestination = { host: string; port: number; username: string };
+export type HttpCredentialRow = { name: string; origin: string; kind: HttpCredentialKind; source: HttpCredentialSource; destinations?: SshDestination[] | null; http_allowed?: boolean | null; header?: "bearer" | "x_api_key" | null };
+type HttpCredentialAuth =
+  | { kind: "totp"; seed: string }
+  | { kind: "user_password"; username: string; password: string }
+  | { kind: "ssh_key"; private_key: string; destinations: SshDestination[] }
+  | { kind: "api_key"; value: string; header: "bearer" | "x_api_key" };
+
+const httpCredentialsPath = "/api/config/http-credentials";
+
+export function listHttpCredentials() {
+  return apiFetch<{ encryption_enabled: boolean; credentials: HttpCredentialRow[] }>(
+    httpCredentialsPath,
+  );
+}
+
+export function changeHttpCredential(mutation:
+  | { name: string; operation: "create" | "replace"; credential: { origin: string; source: HttpCredentialSource; auth: HttpCredentialAuth } }
+  | { name: string; operation: "replace"; permissions: { http_allowed: boolean } | { destinations: SshDestination[] } }
+  | { name: string; operation: "delete" }
+) {
+  return apiFetch<void>(httpCredentialsPath, { method: "POST", body: JSON.stringify(mutation) });
+}
+
+export interface PluginTlsCredential {
+  instance: string;
+  property: string;
+  configured: boolean;
+  profiles: Record<string, string[]>;
+}
+
+const pluginTlsCredentialsPath = "/api/config/plugin-tls-credentials";
+
+export function listPluginTlsCredentials() {
+  return apiFetch<{ encryption_enabled: boolean; credentials: PluginTlsCredential[] }>(
+    pluginTlsCredentialsPath,
+  );
+}
+
+export function changePluginTlsCredential(
+  credential: Pick<PluginTlsCredential, "instance" | "property">,
+  mutation: { operation: "create" | "replace"; value: string } | { operation: "delete" },
+) {
+  return apiFetch<{ configured: boolean }>(pluginTlsCredentialsPath, {
+    method: "POST",
+    body: JSON.stringify({
+      instance: credential.instance,
+      property: credential.property,
+      ...mutation,
+    }),
+  });
+}
+
 // ── Shared workspace browse ────────────────────────────────────────
 // Hard-scoped to `<install>/shared/`. The gateway adapter at
 // `crates/zeroclaw-gateway/src/api_browse.rs` defers all containment
