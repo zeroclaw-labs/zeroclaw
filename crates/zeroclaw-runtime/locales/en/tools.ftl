@@ -274,3 +274,42 @@ tool-a2a-cancel = Cancel an in-flight A2A task on a peer. Returns the updated Ta
 tool-a2a-cancel-desc-peer = Configured peer name hosting the task.
 tool-a2a-cancel-desc-task-id = The task id to cancel.
 tool-a2a-cancel-desc-agent = Optional agent alias or tenant that created the task (from a2a_send). Helps route the cancel to the correct interface when discovery is re-run (the cached route is used first).
+
+tool-send-via-error-no-active-reply = No active channel reply to redirect. To start or resume a conversation, call send_via with both `target` and a non-empty `body`.
+
+tool-send-via-description-background =
+    Send a message immediately to a configured channel peer. Both `target` and a non-empty `body` are required: this task has no active channel reply to redirect. Sending starts or resumes the recipient's conversation; no inbound message is required. The target must be a channel alias or a peer group the active agent belongs to. `modality` defaults to the peer group's output modality.
+
+tool-send-via-description-routing =
+    Control where and how this turn's reply is delivered, or send an extra message to another channel.
+
+    WHEN TO USE: call this tool at the start of your response whenever the user requests a specific reply format or destination — e.g. "reply by text", "send as voice", "text only", "send to my email", "redirect to Discord". Do not wait for the user to name the tool; infer intent from natural language just as you would use a weather tool when asked for the weather.
+
+    Without `body` (routing instruction — affects this turn's main reply):
+    - `send_via(modality: "text")` — reply by text even on a voice-only peer
+    - `send_via(modality: "voice")` — reply by voice even on a text-only peer
+    - `send_via(target: "discord.main")` — redirect reply to another channel
+    - `send_via(target: "discord.main", modality: "voice")` — redirect + force modality
+    At least one of `target` or `modality` is required when `body` is absent.
+    Modality applies to this turn's final reply. Progress already streamed earlier in the turn (e.g. Telegram multi_message narration) keeps its streamed modality and is not retracted.
+
+    With `body` (immediate fanout — main reply still goes to originating channel):
+    - `send_via(target: "email.default", body: "...")` — send separate content elsewhere
+    `target` is required when `body` is present.
+
+    `target` must be a channel alias (e.g. `telegram.default`) or a peer group name the active agent belongs to. `modality` defaults to the peer group's output_modality.
+
+tool-send-via-param-target =
+    Channel alias (e.g. telegram.default) or peer group name. Required when body is present. Optional otherwise (omit = same channel).
+
+tool-send-via-param-modality =
+    Delivery modality. Omit to inherit from the peer group's output_modality.
+
+tool-send-via-param-body =
+    Message content for an immediate fanout send. Omit to set a routing instruction for the current reply instead.
+
+tool-send-via-param-background-target =
+    Required destination: a configured channel alias or authorized peer group.
+
+tool-send-via-param-background-body =
+    Required non-empty message content to send immediately.
