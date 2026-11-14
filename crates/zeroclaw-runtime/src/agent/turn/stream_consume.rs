@@ -82,6 +82,7 @@ pub(crate) async fn consume_provider_streaming_response(
     model_provider: &dyn ModelProvider,
     messages: &[ChatMessage],
     request_tools: Option<&[crate::tools::ToolSpec]>,
+    known_tool_names: &std::collections::HashSet<String>,
     model: &str,
     temperature: Option<f64>,
     cancellation_token: Option<&CancellationToken>,
@@ -110,6 +111,7 @@ pub(crate) async fn consume_provider_streaming_response(
         draft_reasoning,
         zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
         guard_tools,
+        known_tool_names,
     )
     .await
 }
@@ -130,6 +132,7 @@ pub(crate) async fn consume_provider_streaming_response_with_policy(
     draft_reasoning: StreamReasoningMode,
     policy: zeroclaw_api::model_provider::ToolRoundPolicy,
     guard_tools: Option<&[crate::tools::ToolSpec]>,
+    known_tool_names: &std::collections::HashSet<String>,
 ) -> Result<StreamedChatOutcome> {
     let request_tools = request.tools;
     let mut provider_stream = ProviderDispatch::from_ref(model_provider)
@@ -144,7 +147,12 @@ pub(crate) async fn consume_provider_streaming_response_with_policy(
     let mut delta_sender = on_delta;
     let mut think_stripper = StreamThinkTagStripper::default();
     let mut marker_stripper = StreamTerminalMarkerStripper::new();
-    let mut text_guard = StreamTextGuard::new(guard_tools);
+    // The guard recognises every active tool, not only the ones the request
+    // exposes natively: `guard_tools` carries the iteration's specs when
+    // native tools are in use, and `known_tool_names` the names the loop can
+    // execute even in text-tool mode, so streaming refuses the same leaks
+    // the final response check does.
+    let mut text_guard = StreamTextGuard::new(guard_tools, known_tool_names);
     // Correlates PreExecutedToolCall events with their later results so both
     // TurnEvents share a stable id (FIFO per tool name).
     let mut pre_executed_ids: std::collections::HashMap<
@@ -863,6 +871,7 @@ mod tests {
             &provider,
             &[ChatMessage::user("go")],
             None,
+            &std::collections::HashSet::new(),
             "mock-model",
             Some(0.0),
             None,
@@ -896,6 +905,7 @@ mod tests {
             &EmptyStreamProvider,
             &[ChatMessage::user("go")],
             None,
+            &std::collections::HashSet::new(),
             "mock-model",
             Some(0.0),
             None,
@@ -926,6 +936,7 @@ mod tests {
             &provider,
             &[ChatMessage::user("go")],
             None,
+            &std::collections::HashSet::new(),
             "mock-model",
             Some(0.0),
             Some(&cancellation),
@@ -968,6 +979,7 @@ mod tests {
             &provider,
             &[ChatMessage::user("go")],
             None,
+            &std::collections::HashSet::new(),
             "mock-model",
             Some(0.0),
             Some(&cancellation),
@@ -1003,6 +1015,7 @@ mod tests {
             &ThinkingSplitProvider,
             &[ChatMessage::user("go")],
             None,
+            &std::collections::HashSet::new(),
             "mock-model",
             Some(0.0),
             None,
@@ -1050,6 +1063,7 @@ mod tests {
             &ThinkingSplitProvider,
             &[ChatMessage::user("go")],
             None,
+            &std::collections::HashSet::new(),
             "mock-model",
             Some(0.0),
             None,
@@ -1073,6 +1087,7 @@ mod tests {
             &ThinkingSplitProvider,
             &[ChatMessage::user("go")],
             None,
+            &std::collections::HashSet::new(),
             "mock-model",
             Some(0.0),
             None,
@@ -1100,6 +1115,7 @@ mod tests {
             &ReasoningProvider,
             &[ChatMessage::user("go")],
             None,
+            &std::collections::HashSet::new(),
             "mock-model",
             Some(0.0),
             None,
@@ -1129,6 +1145,7 @@ mod tests {
             &ReasoningProvider,
             &[ChatMessage::user("go")],
             None,
+            &std::collections::HashSet::new(),
             "mock-model",
             Some(0.0),
             None,
@@ -1163,6 +1180,7 @@ mod tests {
             &ReasoningProvider,
             &[ChatMessage::user("go")],
             None,
+            &std::collections::HashSet::new(),
             "mock-model",
             Some(0.0),
             None,
@@ -1295,6 +1313,7 @@ mod tests {
             &provider,
             &[ChatMessage::user("go")],
             Some(&exposed),
+            &std::collections::HashSet::new(),
             "mock-model",
             Some(0.0),
             None,
@@ -1334,6 +1353,7 @@ mod tests {
             &provider,
             &[ChatMessage::user("go")],
             None,
+            &std::collections::HashSet::new(),
             "mock-model",
             Some(0.0),
             None,
@@ -1361,6 +1381,7 @@ mod tests {
             &provider,
             &[ChatMessage::user("go")],
             None,
+            &std::collections::HashSet::new(),
             "mock-model",
             Some(0.0),
             None,
@@ -1471,6 +1492,7 @@ mod tests {
             &provider,
             &[ChatMessage::user("go")],
             None,
+            &std::collections::HashSet::new(),
             "mock-model",
             Some(0.0),
             None,
@@ -1519,6 +1541,7 @@ mod tests {
             &provider,
             &[ChatMessage::user("go")],
             None,
+            &std::collections::HashSet::new(),
             "mock-model",
             Some(0.0),
             None,
@@ -1545,6 +1568,7 @@ mod tests {
             &provider,
             &[ChatMessage::user("go")],
             None,
+            &std::collections::HashSet::new(),
             "mock-model",
             Some(0.0),
             None,
@@ -1571,6 +1595,7 @@ mod tests {
             &provider,
             &[ChatMessage::user("go")],
             None,
+            &std::collections::HashSet::new(),
             "mock-model",
             Some(0.0),
             None,
@@ -1684,6 +1709,7 @@ mod tests {
                 &provider,
                 &[ChatMessage::user("go")],
                 None,
+                &std::collections::HashSet::new(),
                 "mock-model",
                 Some(0.0),
                 None,
@@ -1807,6 +1833,7 @@ mod tests {
             &provider,
             &[ChatMessage::user("go")],
             None,
+            &std::collections::HashSet::new(),
             "claude-sonnet-4-6",
             Some(0.0),
             None,
