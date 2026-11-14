@@ -102,6 +102,8 @@ pub struct AnthropicModelProvider {
     /// One TTL per request by design. Defaults to the 5-minute API
     /// default.
     cache_ttl: CacheTtl,
+    /// Sent as `output_config.effort` on every request; `None` omits it.
+    effort: Option<String>,
     /// Memoized cleaned tool schemas: each registered schema is cleaned once
     /// per provider instance (not once per request) and the byte-stable
     /// result keeps the `cache_control` tools block identical across
@@ -166,6 +168,14 @@ struct NativeChatRequest {
     /// only; `None` (the default) keeps the request byte-identical to today.
     #[serde(skip_serializing_if = "Option::is_none")]
     fallbacks: Option<Vec<NativeFallbackEntry>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_config: Option<OutputConfig>,
+}
+
+/// The native `output_config` object: how deeply the model thinks.
+#[derive(Debug, Serialize)]
+struct OutputConfig {
+    effort: String,
 }
 
 /// One entry in the native `fallbacks` array: a model Anthropic may serve
@@ -672,6 +682,7 @@ pub struct AnthropicBuilder {
     timeout_secs: Option<u64>,
     server_fallback_models: Vec<String>,
     cache_ttl: Option<CacheTtl>,
+    effort: Option<String>,
 }
 
 impl AnthropicBuilder {
@@ -727,6 +738,14 @@ impl AnthropicBuilder {
         self
     }
 
+    /// Effort level sent as `output_config.effort` on every request (`low`,
+    /// `medium`, `high`, `xhigh`, `max`). Defaults to unset, which leaves
+    /// requests byte-identical to today.
+    pub fn effort(mut self, effort: Option<&str>) -> Self {
+        self.effort = effort.map(ToString::to_string);
+        self
+    }
+
     pub fn build(self) -> AnthropicModelProvider {
         AnthropicModelProvider {
             alias: self.alias,
@@ -741,6 +760,7 @@ impl AnthropicBuilder {
                 .unwrap_or(zeroclaw_api::model_provider::BASELINE_TIMEOUT_SECS),
             server_fallback_models: self.server_fallback_models,
             cache_ttl: self.cache_ttl.unwrap_or_default(),
+            effort: self.effort,
             schema_cache: zeroclaw_api::schema::SchemaCleanCache::new(),
         }
     }
@@ -759,7 +779,12 @@ impl AnthropicModelProvider {
             timeout_secs: None,
             server_fallback_models: Vec::new(),
             cache_ttl: None,
+            effort: None,
         }
+    }
+
+    fn output_config(&self) -> Option<OutputConfig> {
+        self.effort.clone().map(|effort| OutputConfig { effort })
     }
 
     fn is_setup_token(token: &str) -> bool {
@@ -2952,6 +2977,7 @@ impl ModelProvider for AnthropicModelProvider {
             stream: None,
             thinking: None,
             fallbacks,
+            output_config: self.output_config(),
         };
 
         let mut request = self
@@ -3106,6 +3132,7 @@ impl ModelProvider for AnthropicModelProvider {
             stream: None,
             thinking: thinking_config,
             fallbacks,
+            output_config: self.output_config(),
         };
 
         let req = self
@@ -3344,6 +3371,7 @@ impl ModelProvider for AnthropicModelProvider {
                 // Streaming path (incl. this thinking `stream: None` request):
                 // never opts into server-side fallback.
                 fallbacks: None,
+                output_config: self.output_config(),
             };
             // Serialize eagerly so the request body is owned and `'static`
             // across the async boundary.
@@ -3475,6 +3503,7 @@ impl ModelProvider for AnthropicModelProvider {
             thinking: thinking_config,
             // Streaming never opts into server-side fallback.
             fallbacks: None,
+            output_config: self.output_config(),
         };
 
         let body = match Self::build_streaming_request(&native_request) {
@@ -4823,6 +4852,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             stream: None,
             thinking: None,
             fallbacks: None,
+            output_config: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("max_tokens"));
@@ -4845,6 +4875,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             stream: None,
             thinking: None,
             fallbacks: None,
+            output_config: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(
@@ -5738,6 +5769,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             stream: None,
             thinking: None,
             fallbacks: None,
+            output_config: None,
         };
 
         let json = serde_json::to_string(&req).unwrap();
@@ -5767,6 +5799,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             stream: None,
             thinking: None,
             fallbacks: None,
+            output_config: None,
         };
 
         let json = serde_json::to_string(&req).unwrap();
@@ -9503,6 +9536,31 @@ data: {\"type\":\"message_stop\"}\n\n";
     }
 
     #[tokio::test]
+    async fn effort_config_adds_output_config_and_nothing_else() {
+        let (addr, captured, server) = spawn_capturing_server().await;
+        let builder = || {
+            AnthropicModelProvider::builder("test")
+                .credential(Some("sk-ant-api-key"))
+                .base_url(&format!("http://{addr}"))
+        };
+        for (effort, expected) in [
+            (Some("medium"), serde_json::json!({"effort": "medium"})),
+            (None, serde_json::Value::Null),
+        ] {
+            let result = builder()
+                .effort(effort)
+                .build()
+                .chat_with_system(None, "hello", "claude-opus-5-5", None)
+                .await;
+            assert!(result.is_ok(), "chat failed: {:?}", result.err());
+            let (_, body) = captured.lock().unwrap().take().expect("no request");
+            assert_eq!(body["output_config"], expected, "{body}");
+            assert!(body.get("thinking").is_none(), "no thinking: {body}");
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn oauth_credential_merges_beta_values_into_one_header() {
         let (addr, captured, server) = spawn_capturing_server().await;
         let provider = AnthropicModelProvider::builder("test")
@@ -10691,6 +10749,7 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"refusal\"},\"usag
                 display: Some(ThinkingDisplay::Updates),
             }),
             fallbacks: None,
+            output_config: None,
         };
 
         let body = serde_json::to_value(&request).expect("serialize");
@@ -11016,6 +11075,7 @@ data: {\"type\":\"message_stop\"}\n\n";
                 display: Some(ThinkingDisplay::Updates),
             }),
             fallbacks: None,
+            output_config: None,
         };
 
         let body = serde_json::to_value(&request).expect("serialize");
