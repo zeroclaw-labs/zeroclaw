@@ -8585,7 +8585,6 @@ options = {{ temperature = 0.8, max_tokens = 77, provider_extra = {{ selected_on
                 fixture.browser = zeroclaw_config::schema::BrowserConfig::default();
                 fixture.http_request = zeroclaw_config::schema::HttpRequestConfig::default();
                 fixture.web_fetch = zeroclaw_config::schema::WebFetchConfig::default();
-                fixture.agents = HashMap::new();
                 std::sync::Arc::new(fixture)
             };
             (|| -> anyhow::Result<_> {

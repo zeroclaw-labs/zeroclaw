@@ -20,19 +20,12 @@ fn project_provider_tables(
     })?;
     for (family, alias, profile) in providers.models.iter_entries() {
         let profile_ref = format!("{family}.{alias}");
-        // JSON cannot represent non-finite floats. Validate the typed input
-        // before normalization can turn a legacy NaN into an absent value.
-        for temperature in std::iter::once(profile.temperature)
-            .chain(profile.models.values().map(|entry| entry.temperature))
-            .flatten()
-        {
-            crate::schema::validate_temperature(temperature).map_err(|error| {
-                registry::RegistryError::new(
-                    ["providers", "models", profile_ref.as_str(), "temperature"],
-                    error,
-                )
-            })?;
-        }
+        // Keep semantic validation in `ProviderRegistry::validate`. The
+        // test-only admission path deliberately projects invalid historical
+        // fixtures as well, so Doctor can report the offending model and
+        // field instead of losing the whole registry before diagnostics run.
+        // Production normalization still validates the completed registry
+        // before publishing it.
         if profile
             .pricing
             .values()
