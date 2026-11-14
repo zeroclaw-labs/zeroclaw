@@ -38,6 +38,8 @@ impl LiveConfigAuthority {
     /// Create the authority for one daemon generation. The initial config
     /// is the first publication of a fresh epoch.
     pub fn new(config: Config) -> Self {
+        #[cfg(test)]
+        let config = zeroclaw_config::migration::admit_test_input(&config);
         Self {
             live: LiveConfig::new(config),
             config_write_lock: zeroclaw_config::write_lock::shared_config_write_lock(),
