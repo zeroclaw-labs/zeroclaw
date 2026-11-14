@@ -166,11 +166,16 @@ async fn whatsapp_web_shape_queue_overflow_drops_newest() {
     let h_b =
         zeroclaw_spawn::spawn!(async move { paced_b.send(&SendMessage::new("b", jid)).await });
     tokio::time::sleep(Duration::from_millis(50)).await;
-    // Overflow — queue is full (depth=2). Drop newest, returns Ok.
-    paced
-        .send(&SendMessage::new("overflow", jid))
-        .await
-        .unwrap();
+    // Overflow — queue is full (depth=2). The newest send is dropped, and the
+    // caller is told: reporting success here would be indistinguishable from
+    // delivery.
+    let overflow = paced.send(&SendMessage::new("overflow", jid)).await;
+    let err = overflow.expect_err("a dropped send must be reported to the caller as an error");
+    let rendered = format!("{err}");
+    assert!(
+        rendered.contains("queue full") && rendered.contains("dropped"),
+        "the error must say the message was dropped, got: {rendered}",
+    );
     let (a, b) = tokio::join!(h_a, h_b);
     a.unwrap().unwrap();
     b.unwrap().unwrap();
