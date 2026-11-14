@@ -59,6 +59,28 @@ impl Drop for ChildGroupGuard {
     }
 }
 
+// The host broker executes outside OS sandboxes. Never pass that capability
+// through a sandbox, including values supplied by passthrough/TUI overlays.
+fn configure_task_ssh_environment(
+    cmd: &mut tokio::process::Command,
+    sandbox: &dyn Sandbox,
+    task: Option<zeroclaw_tools::task_ssh::SshTask>,
+) {
+    for name in [
+        "ZEROCLAW_SSH_TASK",
+        "ZEROCLAW_SSH_STATE_DIR",
+        "ZEROCLAW_SSH_TASK_HELPER",
+    ] {
+        cmd.env_remove(name);
+    }
+    if sandbox.name() == "none"
+        && let Some(task) = task
+    {
+        cmd.env("ZEROCLAW_SSH_TASK", task.id);
+        cmd.env("ZEROCLAW_SSH_STATE_DIR", task.state_dir);
+    }
+}
+
 /// Shell command execution tool with sandboxing
 pub struct ShellTool {
     security: Arc<SecurityPolicy>,
@@ -260,6 +282,18 @@ impl Tool for ShellTool {
             });
         }
 
+        // A shared host broker must not be reachable from an OS sandbox,
+        // even by discovering its socket in a shared directory such as /tmp.
+        if self.sandbox.name() != "none" && zeroclaw_tools::task_ssh::current().is_some() {
+            return Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(crate::i18n::get_required_cli_string(
+                    "tool-shell-ssh-broker-sandbox-unsupported",
+                )),
+            });
+        }
+
         // Execute with timeout to prevent hanging commands.
         // Clear the environment to prevent leaking API keys and other secrets
         // (CWE-200), then re-add only safe, functional variables.
@@ -323,6 +357,12 @@ impl Tool for ShellTool {
                 cmd.env(k, v);
             }
         }
+
+        configure_task_ssh_environment(
+            &mut cmd,
+            self.sandbox.as_ref(),
+            zeroclaw_tools::task_ssh::current(),
+        );
 
         // Android: platform tools (sh, getprop, am, dumpsys, content, pm, ...)
         // live in /system/bin and /system/xbin. The cleared+rebuilt PATH above
@@ -2240,6 +2280,75 @@ mod tests {
             r2.error.as_deref().unwrap_or("").contains("Rate limit")
                 || r2.error.as_deref().unwrap_or("").contains("budget")
         );
+    }
+
+    struct BrokerIsolationSandbox;
+    #[async_trait::async_trait]
+    impl Sandbox for BrokerIsolationSandbox {
+        fn wrap_command(&self, _: &mut std::process::Command) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn is_available(&self) -> bool {
+            true
+        }
+        fn name(&self) -> &str {
+            "isolated-test"
+        }
+        fn description(&self) -> &str {
+            "Synthetic OS isolation"
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn sandboxed_shell_cannot_inherit_host_ssh_broker() {
+        let mut command = tokio::process::Command::new("/usr/bin/env");
+        command.env_clear();
+        for name in [
+            "ZEROCLAW_SSH_TASK",
+            "ZEROCLAW_SSH_STATE_DIR",
+            "ZEROCLAW_SSH_TASK_HELPER",
+        ] {
+            command.env(name, "untrusted-overlay");
+        }
+        configure_task_ssh_environment(
+            &mut command,
+            &BrokerIsolationSandbox,
+            Some(zeroclaw_tools::task_ssh::SshTask {
+                id: "test-task".into(),
+                state_dir: "/tmp/test-broker".into(),
+            }),
+        );
+        let output = command.output().await.unwrap();
+        assert!(output.status.success());
+        assert!(
+            !String::from_utf8(output.stdout)
+                .unwrap()
+                .contains("ZEROCLAW_SSH_")
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn unsandboxed_shell_uses_only_current_broker_identity() {
+        let mut command = tokio::process::Command::new("/usr/bin/env");
+        command.env_clear();
+        command.env("ZEROCLAW_SSH_TASK_HELPER", "untrusted-overlay");
+        command.env("ZEROCLAW_SSH_TASK", "stale-task");
+        configure_task_ssh_environment(
+            &mut command,
+            &crate::security::NoopSandbox,
+            Some(zeroclaw_tools::task_ssh::SshTask {
+                id: "test-task".into(),
+                state_dir: "/tmp/test-broker".into(),
+            }),
+        );
+        let output = command.output().await.unwrap();
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert!(text.contains("ZEROCLAW_SSH_TASK=test-task"));
+        assert!(text.contains("ZEROCLAW_SSH_STATE_DIR=/tmp/test-broker"));
+        assert!(!text.contains("untrusted-overlay"));
+        assert!(!text.contains("stale-task"));
     }
 
     // ── Sandbox integration tests ────────────────────────

@@ -4897,13 +4897,48 @@ impl Agent {
         steering_rx: Option<&mut tokio::sync::mpsc::Receiver<crate::agent::SteeringInput>>,
     ) -> std::result::Result<StreamedTurnSuccess, StreamedTurnError> {
         let mut steering = CloseSteeringOnExit(steering_rx);
-        self.turn_streamed_with_steering_body(
-            user_message,
-            event_tx,
-            cancel_token,
-            steering.0.as_deref_mut(),
+        // One logical turn owns SSH across every SteeringPending re-entry.
+        // Inner tool-loop scopes reuse this owner rather than resetting failures.
+        let mut outcome = None;
+        let session_agent = self
+            .forwarded_environment
+            .as_ref()
+            .and_then(|environment| environment.get("SSH_AUTH_SOCK"))
+            .map(std::ffi::OsString::from);
+        let cleanup = zeroclaw_tools::task_ssh::scope_with_agent(
+            session_agent,
+            Box::pin(async {
+                outcome = Some(
+                    self.turn_streamed_with_steering_body(
+                        user_message,
+                        event_tx,
+                        cancel_token,
+                        steering.0.as_deref_mut(),
+                    )
+                    .await,
+                );
+                Ok(())
+            }),
         )
-        .await
+        .await;
+        match (cleanup, outcome) {
+            (Ok(()), Some(outcome)) => outcome,
+            (Err(error), Some(Ok(done))) => Err(StreamedTurnError {
+                error,
+                committed_response: done.response,
+                new_messages: done.new_messages,
+            }),
+            (Err(error), Some(Err(mut failed))) => {
+                failed.error = failed.error.context(error);
+                Err(failed)
+            }
+            (Err(error), None) => Err(StreamedTurnError {
+                error,
+                committed_response: String::new(),
+                new_messages: Vec::new(),
+            }),
+            (Ok(()), None) => unreachable!("SSH scope completed without running its turn"),
+        }
     }
 
     /// Body of [`Self::turn_streamed_with_steering_state`]. The successful
@@ -18237,7 +18272,9 @@ mod tests {
     #[tokio::test]
     async fn steering_sent_during_a_tool_reaches_the_next_step() {
         // Sends once, during the first tool call only.
+        let ssh_ids = Arc::new(Mutex::new(Vec::<Option<String>>::new()));
         struct SteerDuringTool {
+            ssh_ids: Arc<Mutex<Vec<Option<String>>>>,
             tx: Mutex<Option<tokio::sync::mpsc::Sender<crate::agent::SteeringInput>>>,
         }
         #[async_trait]
@@ -18252,6 +18289,9 @@ mod tests {
                 serde_json::json!({"type": "object"})
             }
             async fn execute(&self, _args: serde_json::Value) -> Result<crate::tools::ToolResult> {
+                self.ssh_ids
+                    .lock()
+                    .push(zeroclaw_tools::task_ssh::current().map(|task| task.id));
                 let tx = self.tx.lock().take();
                 if let Some(tx) = tx {
                     tx.send("steer-now".into())
@@ -18305,6 +18345,7 @@ mod tests {
             .model_provider(model_provider)
             .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
                 vec![Box::new(SteerDuringTool {
+                    ssh_ids: ssh_ids.clone(),
                     tx: Mutex::new(Some(steering_tx)),
                 })],
             ))
@@ -18332,6 +18373,16 @@ mod tests {
         .expect("steered turn must finish")
         .expect("steered turn should succeed");
         assert_eq!(outcome.response, "final");
+        let ids = ssh_ids.lock();
+        assert_eq!(ids.len(), 2, "both steering rounds must execute their tool");
+        assert_eq!(ids[0], ids[1], "steering must retain the owning SSH task");
+        if std::env::var_os("ZEROCLAW_SSH_TASK_HELPER").is_some() {
+            assert!(
+                ids[0].is_some(),
+                "opt-in test must observe a real SSH owner"
+            );
+        }
+        drop(ids);
 
         let seen = seen.lock();
         let second_call = seen.get(1).expect("the turn must make a second model call");
