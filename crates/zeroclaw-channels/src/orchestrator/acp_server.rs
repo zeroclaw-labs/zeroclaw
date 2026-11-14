@@ -4728,6 +4728,7 @@ mod tests {
                             model: Some("test-model".to_string()),
                             ..Default::default()
                         },
+                        management_api_key: None,
                     },
                 );
                 p
@@ -4815,6 +4816,7 @@ mod tests {
                             model: Some("test-model".to_string()),
                             ..Default::default()
                         },
+                        management_api_key: None,
                     },
                 );
                 providers
@@ -5069,6 +5071,7 @@ mod tests {
                             model: Some("test-model".to_string()),
                             ..Default::default()
                         },
+                        management_api_key: None,
                     },
                 );
                 p
@@ -5144,6 +5147,7 @@ mod tests {
                             model: Some("test-model".to_string()),
                             ..Default::default()
                         },
+                        management_api_key: None,
                     },
                 );
                 p
@@ -5198,6 +5202,7 @@ mod tests {
                             model: Some("test-model".to_string()),
                             ..Default::default()
                         },
+                        management_api_key: None,
                     },
                 );
                 p

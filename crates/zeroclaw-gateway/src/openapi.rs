@@ -109,6 +109,7 @@ pub fn build_spec() -> serde_json::Value {
             "TriggerSourceRegistry": schema_value::<zeroclaw_runtime::sop::TriggerSourceRegistry>(),
             "SlashOptionKindsResult": schema_value::<crate::api_skills::SlashOptionKindsResult>(),
             "StatusResponse": response_schema_value::<StatusResponse>(),
+            "OpenRouterCreditsResponse": schema_value::<crate::api::OpenRouterCreditsResponse>(),
             "InstalledPluginPackage": schema_value::<crate::api_plugins::InstalledPluginPackage>(),
             "AvailablePluginPackage": schema_value::<crate::api_plugins::AvailablePluginPackage>(),
             "PluginCatalogEntry": schema_value::<crate::api_plugins::PluginCatalogEntry>(),
@@ -236,6 +237,25 @@ pub fn build_spec() -> serde_json::Value {
                     "200": {
                         "description": "Current gateway status.",
                         "content": { "application/json": { "schema": { "$ref": "#/components/schemas/StatusResponse" } } }
+                    }
+                }
+            }
+        },
+        "/api/openrouter/credits": {
+            "get": {
+                "tags": ["providers"],
+                "summary": "Read OpenRouter account credits",
+                "description": "Returns account-level OpenRouter credit totals only when an enabled agent uses a configured OpenRouter alias and that alias has working inference and management API credentials. Secrets are never returned. Otherwise responds with 204 so dashboard clients can omit the balance card.",
+                "responses": {
+                    "200": {
+                        "description": "Current OpenRouter account credit totals.",
+                        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/OpenRouterCreditsResponse" } } }
+                    },
+                    "204": {
+                        "description": "OpenRouter credit reporting is not configured or the credits API is unavailable."
+                    },
+                    "401": {
+                        "description": "A valid pairing-derived bearer token is required."
                     }
                 }
             }
