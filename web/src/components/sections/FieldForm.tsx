@@ -24,6 +24,7 @@ import {
   useEffect,
   useImperativeHandle,
   useMemo,
+  useRef,
   useState,
 } from "react";
 import type { KeyboardEvent, ReactNode } from "react";
@@ -1033,23 +1034,61 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
       [schema],
     );
 
-    const reload = async () => {
-      setLoading(true);
+    // `reload` awaits the list request, so read the draft store through a ref
+    // to seed from its state when the response arrives, not when the request
+    // started. Only the newest request may seed the form: a Discard all while
+    // a load is pending starts another load, and the older response must not
+    // restore the discarded drafts (#12288).
+    const latestConfigDraft = useRef(configDraft);
+    latestConfigDraft.current = configDraft;
+    const loadGeneration = useRef(0);
+    // Monotonic clock so a list request that started before a successful
+    // enable-toggle can still apply, while the just-saved pill is preserved.
+    const loadClock = useRef(0);
+    const enabledOverride = useRef<{
+      path: string;
+      value: string;
+      savedAt: number;
+    } | null>(null);
+
+    const reload = async (opts?: { background?: boolean }) => {
+      const startedAt = ++loadClock.current;
+      const generation = ++loadGeneration.current;
+      // Initial mount / prefix changes replace the form with a spinner.
+      // Discard all must keep mounted FieldRows in place so focus and
+      // row-local UI survive the refresh.
+      if (!opts?.background) {
+        setLoading(true);
+      }
       setTopError(null);
       try {
         const resp = await listProps(prefix);
-        setEntries(resp.entries);
+        if (generation !== loadGeneration.current) return;
+        const store = latestConfigDraft.current;
+        const override = enabledOverride.current;
+        let nextEntries = resp.entries;
+        if (override && startedAt < override.savedAt) {
+          nextEntries = nextEntries.map((e) =>
+            e.path === override.path
+              ? { ...e, populated: true, value: override.value }
+              : e,
+          );
+        } else if (override && startedAt >= override.savedAt) {
+          enabledOverride.current = null;
+        }
+        setEntries(nextEntries);
         const seed: Record<string, string> = {};
         const commentSeed: Record<string, string> = {};
-        for (const e of resp.entries) {
-          const staged = configDraft.drafts[e.path];
+        for (const e of nextEntries) {
+          const staged = store.drafts[e.path];
           seed[e.path] = staged?.input ?? defaultInputValue(e);
-          const stagedComment = configDraft.comments[e.path];
+          const stagedComment = store.comments[e.path];
           if (stagedComment) commentSeed[e.path] = stagedComment;
         }
         setDraft(seed);
         setComments(commentSeed);
       } catch (e) {
+        if (generation !== loadGeneration.current) return;
         if (e instanceof ApiError) {
           setTopError(`[${e.envelope.code}] ${e.envelope.message}`);
         } else {
@@ -1058,7 +1097,7 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
           );
         }
       } finally {
-        setLoading(false);
+        if (generation === loadGeneration.current) setLoading(false);
       }
     };
 
@@ -1066,6 +1105,33 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
       void reload();
       // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [prefix]);
+
+    // Discard-all clears the shared store but leaves this form's local draft
+    // and comment maps untouched. Without a reset, the inputs stay dirty and a
+    // later section Save would persist the discarded values (#12288). Reset
+    // local state from the last loaded `entries` immediately so a failed
+    // refresh cannot leave discarded edits saveable, then refresh from the
+    // server in the background (entries can predate a Save all; a load may
+    // still be in flight). A background refresh must not set `loading`, or
+    // the form would unmount every FieldRow and flash a spinner.
+    const seenDiscardGeneration = useRef(configDraft.discardGeneration);
+    useEffect(() => {
+      if (configDraft.discardGeneration === seenDiscardGeneration.current) {
+        return;
+      }
+      seenDiscardGeneration.current = configDraft.discardGeneration;
+      const restored: Record<string, string> = {};
+      for (const e of entries) {
+        restored[e.path] = defaultInputValue(e);
+      }
+      setDraft(restored);
+      setComments({});
+      setTopError(null);
+      setFieldErrors({});
+      setSavedAt(null);
+      void reload({ background: true });
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [configDraft.discardGeneration]);
 
     const actionableEntries = useMemo(() => {
       if (!scopeActionsToIncludedPaths || !includePath) return entries;
@@ -1498,6 +1564,17 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
                 enabled={entryValue(enabledEntry) === "true"}
                 onChange={(next) => {
                   const nextStr = next ? "true" : "false";
+                  // Do not bump loadGeneration or start a new list request:
+                  // an in-flight Discard all (or section Save) GET must still
+                  // finish so other fields update and loading can clear. A
+                  // GET that started before this save would otherwise restore
+                  // the old pill; remember the saved value and re-apply it
+                  // when that response arrives.
+                  enabledOverride.current = {
+                    path: enabledEntry.path,
+                    value: nextStr,
+                    savedAt: ++loadClock.current,
+                  };
                   setEntries((prev) =>
                     prev.map((e) =>
                       e.path === enabledEntry.path
