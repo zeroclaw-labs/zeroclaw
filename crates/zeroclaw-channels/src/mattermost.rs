@@ -3573,6 +3573,7 @@ mod tests {
                 assemblyai: None,
                 google: None,
                 local_whisper: Some(zeroclaw_config::schema::LocalWhisperConfig {
+                    model: None,
                     url: whisper_url,
                     bearer_token: Some("test_token".to_string()),
                     max_audio_bytes: 25_000_000,
@@ -3640,6 +3641,7 @@ mod tests {
                 assemblyai: None,
                 google: None,
                 local_whisper: Some(zeroclaw_config::schema::LocalWhisperConfig {
+                    model: None,
                     url: format!("{}/v1/audio/transcriptions", mock_server.uri()),
                     bearer_token: Some("test_token".to_string()),
                     max_audio_bytes: 25_000_000,
@@ -3699,6 +3701,7 @@ mod tests {
                 assemblyai: None,
                 google: None,
                 local_whisper: Some(zeroclaw_config::schema::LocalWhisperConfig {
+                    model: None,
                     url: mock_server.uri(),
                     bearer_token: Some("test_token".to_string()),
                     max_audio_bytes: 25_000_000,
