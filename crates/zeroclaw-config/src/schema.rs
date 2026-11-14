@@ -121,6 +121,7 @@ static RUNTIME_PROXY_CLIENT_CACHE: OnceLock<RwLock<HashMap<String, RuntimeProxyC
 
 struct RuntimeProxyCachedClient {
     generation: u64,
+    runtime_id: tokio::runtime::Id,
     client: reqwest::Client,
 }
 
@@ -12027,21 +12028,28 @@ fn runtime_proxy_cache_key(
 }
 
 fn runtime_proxy_cached_client(cache_key: &str) -> Option<reqwest::Client> {
+    let runtime_id = tokio::runtime::Handle::try_current().ok()?.id();
     let generation = runtime_proxy_current_generation();
     match runtime_proxy_client_cache().read() {
         Ok(guard) => guard
             .get(cache_key)
-            .filter(|entry| entry.generation == generation)
+            .filter(|entry| entry.generation == generation && entry.runtime_id == runtime_id)
             .map(|entry| entry.client.clone()),
         Err(poisoned) => poisoned
             .into_inner()
             .get(cache_key)
-            .filter(|entry| entry.generation == generation)
+            .filter(|entry| entry.generation == generation && entry.runtime_id == runtime_id)
             .map(|entry| entry.client.clone()),
     }
 }
 
 fn set_runtime_proxy_cached_client(cache_key: String, generation: u64, client: reqwest::Client) {
+    // A pooled client's dispatcher belongs to the Tokio runtime that first
+    // uses it. Never hand that client to another runtime after its owner exits.
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    let runtime_id = runtime.id();
     if generation != runtime_proxy_current_generation() {
         return;
     }
@@ -12049,13 +12057,27 @@ fn set_runtime_proxy_cached_client(cache_key: String, generation: u64, client: r
     match runtime_proxy_client_cache().write() {
         Ok(mut guard) => {
             if generation == runtime_proxy_config_generation() {
-                guard.insert(cache_key, RuntimeProxyCachedClient { generation, client });
+                guard.insert(
+                    cache_key,
+                    RuntimeProxyCachedClient {
+                        generation,
+                        runtime_id,
+                        client,
+                    },
+                );
             }
         }
         Err(poisoned) => {
             let mut guard = poisoned.into_inner();
             if generation == runtime_proxy_config_generation() {
-                guard.insert(cache_key, RuntimeProxyCachedClient { generation, client });
+                guard.insert(
+                    cache_key,
+                    RuntimeProxyCachedClient {
+                        generation,
+                        runtime_id,
+                        client,
+                    },
+                );
             }
         }
     }
@@ -16479,6 +16501,12 @@ pub struct ChannelsConfig {
     /// not forwarded as individual channel messages. Default: `false`.
     #[serde(default = "default_false")]
     pub show_tool_calls: bool,
+    /// Periodic plain-text liveness notices during channel turns. Zero disables
+    /// them (default). Nonzero values are clamped to 15..3600 seconds. Notices
+    /// contain no tool arguments, model reasoning or completion claims.
+    #[serde(default)]
+    pub message_progress_interval_secs: u64,
+
     /// Notice mode for ordinary same-family, different-model fallback: `off`
     /// (default), `redacted`, or `detailed`. Applies globally to all orchestrated
     /// channels and is read from live config at outbound delivery. Detailed
@@ -16949,6 +16977,7 @@ impl Default for ChannelsConfig {
             max_concurrent_per_channel: default_channel_max_concurrent_per_channel(),
             ack_reactions: true,
             show_tool_calls: false,
+            message_progress_interval_secs: 0,
             model_fallback_notice: ModelFallbackNotice::default(),
             session_persistence: true,
             session_backend: default_session_backend(),
@@ -35015,6 +35044,7 @@ auto_save = true
                 max_concurrent_per_channel: default_channel_max_concurrent_per_channel(),
                 ack_reactions: true,
                 show_tool_calls: true,
+                message_progress_interval_secs: 0,
                 model_fallback_notice: ModelFallbackNotice::default(),
                 session_persistence: true,
                 session_backend: default_session_backend(),
@@ -37438,6 +37468,7 @@ allowed_users = ["@u:matrix.org"]
             max_concurrent_per_channel: default_channel_max_concurrent_per_channel(),
             ack_reactions: true,
             show_tool_calls: true,
+            message_progress_interval_secs: 0,
             model_fallback_notice: ModelFallbackNotice::default(),
             session_persistence: true,
             session_backend: default_session_backend(),
@@ -38057,6 +38088,7 @@ allowed_numbers = ["+1", "+2"]
             max_concurrent_per_channel: default_channel_max_concurrent_per_channel(),
             ack_reactions: true,
             show_tool_calls: true,
+            message_progress_interval_secs: 0,
             model_fallback_notice: ModelFallbackNotice::default(),
             session_persistence: true,
             session_backend: default_session_backend(),
@@ -40996,6 +41028,118 @@ api_token = "tok"
         assert!(err.contains("sub_resource contains invalid characters"));
     }
 
+    #[test]
+    async fn runtime_proxy_client_cache_survives_owner_runtime_shutdown() {
+        let _guard = env_override_lock().await;
+        struct RestoreProxyBypass(Vec<(&'static str, Option<std::ffi::OsString>)>);
+        impl Drop for RestoreProxyBypass {
+            fn drop(&mut self) {
+                for (key, value) in &self.0 {
+                    // SAFETY: the environment test lock outlives this guard.
+                    unsafe {
+                        match value {
+                            Some(value) => std::env::set_var(key, value),
+                            None => std::env::remove_var(key),
+                        }
+                    }
+                }
+            }
+        }
+        let _bypass = RestoreProxyBypass(
+            ["NO_PROXY", "no_proxy"]
+                .into_iter()
+                .map(|key| (key, std::env::var_os(key)))
+                .collect(),
+        );
+        for key in ["NO_PROXY", "no_proxy"] {
+            set_or_clear_env(key, Some("127.0.0.1"));
+        }
+        let previous = runtime_proxy_config();
+        set_runtime_proxy_config(ProxyConfig::default());
+        let result = tokio::task::spawn_blocking(|| {
+            use std::io::{Read, Write};
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let endpoint = format!("http://{}", listener.local_addr().unwrap());
+            listener.set_nonblocking(true).unwrap();
+            let server = std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+                let mut connections: Vec<(std::net::TcpStream, Vec<u8>)> = Vec::new();
+                let mut served_on = Vec::new();
+                while served_on.len() < 4 && std::time::Instant::now() < deadline {
+                    loop {
+                        match listener.accept() {
+                            Ok((socket, _)) => {
+                                socket.set_nonblocking(true).unwrap();
+                                connections.push((socket, Vec::new()));
+                            }
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                            Err(error) => panic!("fixture accept: {error}"),
+                        }
+                    }
+                    for (index, (socket, buffered)) in connections.iter_mut().enumerate() {
+                        let mut chunk = [0u8; 4096];
+                        match socket.read(&mut chunk) {
+                            Ok(count) => buffered.extend_from_slice(&chunk[..count]),
+                            Err(error) if matches!(error.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::ConnectionReset) => {},
+                            Err(error) => panic!("fixture read: {error}"),
+                        }
+                        while let Some(end) = buffered.windows(4).position(|part| part == b"\r\n\r\n") {
+                            buffered.drain(..end + 4);
+                            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok").unwrap();
+                            served_on.push(index);
+                        }
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                served_on
+            });
+            let service = format!("runtime-owner-{}", uuid::Uuid::new_v4());
+            fn request_on(runtime: &tokio::runtime::Runtime, service: &str, endpoint: &str, count: usize) -> Vec<reqwest::Result<String>> {
+                runtime.block_on(async {
+                    let mut results = Vec::new();
+                    for _ in 0..count {
+                        let client = build_runtime_proxy_client_with_timeouts(service, 2, 2);
+                        results.push(async {client.get(endpoint).send().await?.text().await}.await);
+                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    }
+                    results
+                })
+            }
+            let runtime = || tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            let first_owner = runtime();
+            let mut results = request_on(&first_owner, &service, &endpoint, 2);
+            // Keep the first owner's live pool, but stop driving its reactor.
+            // A runtime-blind hit now dispatches into that paused owner and times out.
+            let second_owner = runtime();
+            results.extend(request_on(&second_owner, &service, &endpoint, 1));
+            drop(first_owner);
+            drop(second_owner);
+            // Also exercise cache lookup after its last owner has shut down.
+            let after_shutdown = runtime();
+            results.extend(request_on(&after_shutdown, &service, &endpoint, 1));
+            drop(after_shutdown);
+            (results, server.join().unwrap())
+        }).await;
+        set_runtime_proxy_config(previous);
+        let (results, served_on) = result.unwrap();
+        for result in results {
+            assert_eq!(result.unwrap(), "ok");
+        }
+        assert_eq!(served_on.len(), 4);
+        assert_eq!(
+            served_on[0], served_on[1],
+            "warm requests must reuse a live pooled connection"
+        );
+        assert_ne!(
+            served_on[1], served_on[2],
+            "a new runtime needs its own connection"
+        );
+        assert_ne!(
+            served_on[2], served_on[3],
+            "a shut-down owner cannot supply the next pool"
+        );
+    }
+
     fn runtime_proxy_cache_contains(cache_key: &str) -> bool {
         runtime_proxy_cached_client(cache_key).is_some()
     }
@@ -41105,6 +41249,7 @@ api_token = "tok"
                     cache_key.clone(),
                     RuntimeProxyCachedClient {
                         generation: stale_generation,
+                        runtime_id: tokio::runtime::Handle::current().id(),
                         client: reqwest::Client::new(),
                     },
                 );
@@ -41115,6 +41260,7 @@ api_token = "tok"
                     cache_key.clone(),
                     RuntimeProxyCachedClient {
                         generation: stale_generation,
+                        runtime_id: tokio::runtime::Handle::current().id(),
                         client: reqwest::Client::new(),
                     },
                 );

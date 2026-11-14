@@ -1390,7 +1390,7 @@ channel-runtime-conversation-busy = This conversation has too many pending messa
 channel-runtime-model-empty = Model ID cannot be empty. Use `/model <model-id>`.
 channel-runtime-model-switched = Model switched to `{ $model }` (model_provider: `{ $provider }`). Context preserved.
 channel-runtime-agent-scope-rejected = Sender `{ $sender }` is not authorized for `/model --agent` on agent `{ $agent }`. Use `/model --user { $model }` for a session-only override, or ask an admin to mark a peer group `admin_for_agent_scope = true` with you as a member.
-channel-runtime-request-timeout = ⚠️ Request timed out while waiting for the model. Please try again.
+channel-runtime-task-deadline = ⚠️ The task reached its processing deadline. Some actions may have completed; verify their state before retrying.
 channel-runtime-no-reply-refused = 🚫 I can't help with that request.
 channel-runtime-no-reply-failed = ⚠️ I couldn't complete that request.
 channel-runtime-current-model-status =
@@ -1758,6 +1758,8 @@ sop-rpc-definition-unavailable = The procedure definition is no longer available
 cli-sop-run-unavailable = SOP run unavailable in this session.
 cli-sop-step-owner-principal-mismatch = SOP step refused: this run belongs to a different principal than the one this turn's capabilities act for.
 cli-sop-step-owner-memory-unavailable = SOP step failed: the memory of this run's owner is unavailable ({ $error }).
+
+channel-runtime-still-working = Still working on your request ({ $seconds } seconds elapsed). No final result yet.
 
 # Result-aware Agent loop recovery
 turn-repeated-success-advisory = The same tool call returned the same successful result repeatedly. Reconsider whether another call will help. Polling may continue when needed.
