@@ -383,6 +383,13 @@ pub fn build_model(
     model_provider_ref: &str,
     model_override: Option<&str>,
 ) -> anyhow::Result<BuiltModel> {
+    #[cfg(feature = "test-helpers")]
+    let admitted_config;
+    #[cfg(feature = "test-helpers")]
+    let config = {
+        admitted_config = zeroclaw_config::migration::admit_test_input(config);
+        &admitted_config
+    };
     let model_provider_ref = model_provider_ref.trim();
     let registry = config.chat_registry_for_input(Some(agent_alias), model_provider_ref)?;
     let reference = zeroclaw_config::provider_registry::ModelRef::from(model_provider_ref);
