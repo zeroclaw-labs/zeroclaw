@@ -158,6 +158,13 @@ The setting has no live reload: change it, then restart the channel.
 (raise it if Slack rate-limits the edits), and `cancel_reaction` sets an emoji
 users can react with to cancel an in-flight reply.
 
+`stream_reasoning` controls what that draft shows while the model is generating:
+`off` (default) leaves the draft unchanged, `status` shows a liveness-only thinking
+line, and `full` shows the model's raw reasoning as a quoted block above the
+in-progress answer. It is only effective with `stream_drafts = true`. Reasoning is
+draft-only chrome: the finalized reply is rewritten from the answer alone and never
+contains it.
+
 ## Troubleshooting
 
 | Symptom | Likely cause | Fix |
