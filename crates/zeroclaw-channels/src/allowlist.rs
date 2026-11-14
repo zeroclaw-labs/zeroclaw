@@ -140,6 +140,28 @@ pub fn is_identity_allowed_by(
     peer_policy_admits(allowed, identities, match_fn)
 }
 
+/// `is_identity_allowed_by`, with positive wildcard grants excluded.
+///
+/// A blanket grant answers "may talk to whoever talks to us", which is not the
+/// same permission as "may act on this third party": a surface that adds
+/// someone to a room, or messages a person who never wrote in, needs an entry
+/// naming them. Only the wildcard *grant* is dropped. The list is evaluated as
+/// one snapshot by the same matcher as admission, so every deny still applies
+/// and takes precedence, `!*` included.
+#[must_use]
+pub fn is_identity_named_by(
+    allowed: &[String],
+    identities: &[&str],
+    match_fn: impl Fn(&str, &str) -> bool,
+) -> bool {
+    let named: Vec<String> = allowed
+        .iter()
+        .filter(|entry| !peer_grant_identity(entry).is_some_and(peer_is_wildcard))
+        .cloned()
+        .collect();
+    is_identity_allowed_by(&named, identities, match_fn)
+}
+
 /// `is_identity_allowed_by` with the shared case-sensitivity selector.
 #[must_use]
 pub fn is_identity_allowed(allowed: &[String], identities: &[&str], mode: Match) -> bool {
@@ -205,6 +227,34 @@ mod tests {
         let list = vec!["*".to_string(), "!@Alice".to_string()];
         assert!(!is_user_allowed(&list, "alice", Match::Sensitive));
         assert!(!is_user_allowed(&list, "@ALICE", Match::Sensitive));
+    }
+
+    #[test]
+    fn a_named_grant_is_required_but_denies_still_win() {
+        let exact = |entry: &str, user: &str| entry == user;
+
+        let wildcard = vec!["*".to_string()];
+        assert!(
+            is_user_allowed(&wildcard, "alice", Match::Sensitive),
+            "the wildcard still admits an ordinary sender"
+        );
+        assert!(
+            !is_identity_named_by(&wildcard, &["alice"], exact),
+            "but it names nobody to act on"
+        );
+        assert!(is_identity_named_by(
+            &["*".to_string(), "alice".to_string()],
+            &["alice"],
+            exact
+        ));
+
+        for denied in [vec!["!alice"], vec!["alice", "!alice"], vec!["alice", "!*"]] {
+            let list: Vec<String> = denied.iter().map(|e| (*e).to_string()).collect();
+            assert!(
+                !is_identity_named_by(&list, &["alice"], exact),
+                "{denied:?} denies alice"
+            );
+        }
     }
 
     #[test]
