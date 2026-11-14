@@ -39,6 +39,11 @@ impl Acp {
         self.inner.commit_reconnect_handoff();
     }
 
+    /// Reclaim only dispatched clipboard temporaries during a normal TUI exit.
+    pub(crate) fn cleanup_active_turn_on_shutdown(&mut self) {
+        self.inner.cleanup_active_turn_on_shutdown();
+    }
+
     pub(crate) fn terminal_statuses(&self) -> Vec<(crate::turn_status::TurnStatus, String)> {
         self.inner.terminal_statuses()
     }

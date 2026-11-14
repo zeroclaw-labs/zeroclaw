@@ -160,6 +160,7 @@ pub async fn handle_agent_skills(
 /// through.
 fn agent_skill_entry(s: EffectiveSkill) -> AgentSkillEntry {
     let (origin, plugin, bundle) = match s.origin {
+        SkillOrigin::BuiltIn => ("built-in", None, None),
         SkillOrigin::Workspace => ("workspace", None, None),
         SkillOrigin::OpenSkills => ("open-skills", None, None),
         SkillOrigin::Plugin(p) => ("plugin", Some(p), None),
@@ -388,6 +389,23 @@ mod tests {
         assert_eq!(entry.shadowed.len(), 1);
         assert_eq!(entry.shadowed[0].name, "foo");
         assert_eq!(entry.shadowed[0].origin, "bundle");
+    }
+
+    #[test]
+    fn agent_skill_entry_maps_builtin_origin() {
+        let entry = agent_skill_entry(EffectiveSkill {
+            name: "zeroclaw-docs".into(),
+            description: "d".into(),
+            origin: SkillOrigin::BuiltIn,
+            directory: None,
+            editable: false,
+            bundle: None,
+            shadowed: vec![],
+        });
+
+        assert_eq!(entry.origin, "built-in");
+        assert!(entry.directory.is_none());
+        assert!(!entry.editable);
     }
 
     // each SkillDropReason arm maps to the right reason_kind tag.

@@ -163,9 +163,11 @@ unlink, or the transaction entry if its package is absent or was already removed
 The message does not claim the original payload is still intact. Cleanup checks
 treat a replaced or removed plugins root or coordination lock as a namespace
 refusal before continuing. The reported hidden transaction belongs to this failed
-install and does not block a later one: `plugin remove` does not sweep it while no
-package of that name exists, so once no install is running you may inspect and
-delete that specific transaction by hand.
+install and does not block a later one. The next `plugin install` of that name
+removes it once no process holds its lease and whatever stopped the cleanup is
+resolved. `plugin remove` does not sweep it while no package of that name exists,
+so to clear it without installing, inspect and delete that specific transaction
+by hand once no install is running.
 
 Earlier builds wrote straight into the final directory, creating it and then
 writing `manifest.toml` first, so an interrupted install could leave an empty
@@ -222,7 +224,13 @@ retained, and the command reports their paths. A PID in a filename does not
 prove abandonment. These retained stages do not prevent a fresh install after
 the incomplete final package is recovered. If no final package exists,
 `plugin remove` does not sweep staging directories, unless it finishes a
-delete that an earlier `plugin remove` had begun.
+delete that an earlier `plugin remove` had begun. An install stopped before it
+published its package leaves only such a stage, and the next `plugin install`
+of that name clears it before staging its own. Active and legacy stages are
+left as they are. An install whose source is inside one of that name's stages,
+such as the staged copy a failed install reports keeping, is refused before
+anything is cleared, whatever path names the source. To install that copy,
+copy the package out of the stage first and install from the copy.
 
 Other occupants are refused, and the command prints why: a symlink or a
 file at the name, a directory that holds files but no `manifest.toml`, one
