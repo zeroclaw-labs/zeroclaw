@@ -24933,17 +24933,6 @@ impl Config {
     /// Called after TOML deserialization and env-override application to catch
     /// obviously invalid values early instead of failing at arbitrary runtime points.
     pub fn validate(&self) -> Result<()> {
-        #[cfg(feature = "test-helpers")]
-        {
-            return crate::migration::admit_test_input(self).validate_inner();
-        }
-        #[cfg(not(feature = "test-helpers"))]
-        {
-            self.validate_inner()
-        }
-    }
-
-    fn validate_inner(&self) -> Result<()> {
         validate_memory_rerank_config(&self.memory)?;
         self.cost.rates.validate()?;
 
