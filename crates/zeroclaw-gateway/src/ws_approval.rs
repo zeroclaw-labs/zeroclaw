@@ -17,14 +17,63 @@ use zeroclaw_api::channel::{
 
 /// Shared map keyed by `request_id`. Consumed by the receive loop to resolve
 /// the oneshot when an `approval_response` frame arrives.
-pub type PendingApprovals = Arc<Mutex<HashMap<String, oneshot::Sender<ChannelApprovalResponse>>>>;
+pub type PendingApprovals = Arc<Mutex<HashMap<String, PendingApproval>>>;
 
-/// Construct an empty pending-approvals registry for a fresh connection.
+/// One live request, never a durable authorization. Reconnection only projects
+/// this request; it cannot replace its sender or extend its original deadline.
+pub struct PendingApproval {
+    sender: oneshot::Sender<ChannelApprovalResponse>,
+    pub(crate) tool_name: String,
+    pub(crate) arguments_summary: String,
+    deadline: tokio::time::Instant,
+}
+
+impl PendingApproval {
+    pub(crate) fn new(
+        sender: oneshot::Sender<ChannelApprovalResponse>,
+        request: &ChannelApprovalRequest,
+        timeout: Duration,
+    ) -> Self {
+        Self {
+            sender,
+            tool_name: request.tool_name.clone(),
+            arguments_summary: request.arguments_summary.clone(),
+            deadline: tokio::time::Instant::now() + timeout,
+        }
+    }
+
+    pub(crate) fn remaining_secs(&self) -> Option<u64> {
+        let remaining = self
+            .deadline
+            .checked_duration_since(tokio::time::Instant::now())?;
+        if remaining.is_zero() || self.sender.is_closed() {
+            return None;
+        }
+        Some(remaining.as_secs() + u64::from(remaining.subsec_nanos() > 0))
+    }
+
+    pub(crate) fn resolve(self, decision: ChannelApprovalResponse) -> bool {
+        self.remaining_secs().is_some() && self.sender.send(decision).is_ok()
+    }
+}
+
+struct PendingRegistration {
+    pending: PendingApprovals,
+    request_id: String,
+}
+
+impl Drop for PendingRegistration {
+    fn drop(&mut self) {
+        self.pending.lock().remove(&self.request_id);
+    }
+}
+
+/// Construct an empty pending-approvals registry for a fresh conversation.
 pub fn new_pending_approvals() -> PendingApprovals {
     Arc::new(Mutex::new(HashMap::new()))
 }
 
-/// `Channel` implementation that emits approval frames over a connection's
+/// `Channel` implementation that emits approval frames over a conversation's
 /// existing `event_tx` and parks on a oneshot until the matching response
 /// arrives or `timeout` elapses.
 pub struct WsApprovalChannel {
@@ -133,7 +182,15 @@ impl Channel for WsApprovalChannel {
     ) -> anyhow::Result<Option<AttributedApprovalResponse>> {
         let request_id = Uuid::new_v4().to_string();
         let (tx, rx) = oneshot::channel();
-        self.pending.lock().insert(request_id.clone(), tx);
+        let entry = PendingApproval::new(tx, request, self.timeout);
+        let deadline = entry.deadline;
+        self.pending.lock().insert(request_id.clone(), entry);
+        // Cancellation/aborting the waiter must also revoke the prompt, even
+        // when the forwarding task is blocked or the timeout is not polled yet.
+        let _registration = PendingRegistration {
+            pending: Arc::clone(&self.pending),
+            request_id: request_id.clone(),
+        };
 
         let event = TurnEvent::ApprovalRequest {
             request_id: request_id.clone(),
@@ -150,11 +207,10 @@ impl Channel for WsApprovalChannel {
             return Ok(None);
         }
 
-        match tokio::time::timeout(self.timeout, rx).await {
+        match tokio::time::timeout_at(deadline, rx).await {
             Ok(Ok(decision)) => Ok(Some(AttributedApprovalResponse::operator(decision))),
             Ok(Err(_)) => {
-                // Sender dropped without responding (connection closed
-                // mid-prompt). Treat as deny rather than None so the agent
+                // Sender revoked without responding (cancellation or reset). Treat as deny rather than None so the agent
                 // does not silently fall back to "no channel handled this" —
                 // but mark it Unreachable, because nobody answered.
                 self.pending.lock().remove(&request_id);
@@ -231,7 +287,7 @@ mod tests {
         assert!(attributed.source.is_runtime_fail_closed());
     }
 
-    /// The connection closes mid-prompt: the pending sender is dropped. Same
+    /// The conversation revokes a prompt: the pending sender is dropped. Same
     /// contract as the timeout — a deny, but not the operator's.
     #[tokio::test]
     async fn dropped_responder_denies_with_runtime_provenance() {
@@ -245,7 +301,7 @@ mod tests {
                 .await
         };
         // Drop the registered oneshot sender out from under the waiter, which is
-        // what a closing WebSocket does.
+        // what a reset or explicit cancellation does.
         let dropper = async {
             for _ in 0..100 {
                 {
@@ -284,5 +340,31 @@ mod tests {
             .await
             .expect("timeout is not an error");
         assert_eq!(response, Some(ChannelApprovalResponse::Deny));
+    }
+    #[tokio::test]
+    async fn expired_prompt_cannot_be_approved_even_before_timeout_is_polled() {
+        let (tx, rx) = oneshot::channel();
+        let mut entry = PendingApproval::new(tx, &approval_request(), Duration::from_secs(30));
+        entry.deadline = tokio::time::Instant::now() - Duration::from_millis(1);
+        assert!(entry.remaining_secs().is_none());
+        assert!(!entry.resolve(ChannelApprovalResponse::Approve));
+        assert!(rx.await.is_err());
+    }
+
+    #[tokio::test]
+    async fn aborted_waiter_revokes_its_pending_prompt() {
+        let (tx, mut events) = mpsc::channel(8);
+        let pending = new_pending_approvals();
+        let channel = WsApprovalChannel::new(tx, pending.clone(), Duration::from_secs(30));
+        let task = zeroclaw_spawn::spawn!(async move {
+            channel
+                .request_approval_attributed("operator", &approval_request())
+                .await
+        });
+        events.recv().await.unwrap();
+        assert_eq!(pending.lock().len(), 1);
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(pending.lock().is_empty());
     }
 }

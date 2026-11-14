@@ -37,7 +37,34 @@ pub struct SqliteSessionBackend {
 }
 
 impl SqliteSessionBackend {
-    fn database_path(workspace_dir: &Path) -> PathBuf {
+    /// Called only by the exclusive gateway owner, before it admits turns.
+    /// Opening a reader/backend must never settle another owner's live work.
+    pub(crate) fn settle_abandoned_gateway_turns(data_dir: &Path) -> std::io::Result<usize> {
+        let path = Self::database_path(data_dir);
+        if !path.try_exists()? {
+            return Ok(0);
+        }
+        let conn = Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)
+            .map_err(std::io::Error::other)?;
+        conn.busy_timeout(OPEN_BUSY_TIMEOUT)
+            .map_err(std::io::Error::other)?;
+        let has_state: bool = conn.query_row(
+            "SELECT COUNT(*) > 0 FROM pragma_table_info('session_metadata') WHERE name = 'state'",
+            [], |row| row.get(0),
+        ).map_err(std::io::Error::other)?;
+        if !has_state {
+            return Ok(0);
+        }
+        // No migration, replay, history rewrite or non-gateway state change.
+        conn.execute(
+            "UPDATE session_metadata SET state = 'error', turn_started_at = NULL
+             WHERE substr(session_key, 1, 3) = 'gw_' AND state = 'running'",
+            [],
+        )
+        .map_err(std::io::Error::other)
+    }
+
+    pub(crate) fn database_path(workspace_dir: &Path) -> PathBuf {
         workspace_dir.join("sessions").join("sessions.db")
     }
 

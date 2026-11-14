@@ -933,7 +933,12 @@ async fn run_gateway_starts_with_unresolved_agent_risk_profile() {
 
 #[tokio::test]
 async fn run_gateway_starts_with_mismatched_provider_api_key() {
-    let mut config = Config::default();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let mut config = Config {
+        data_dir: tmp.path().join("workspace"),
+        config_path: tmp.path().join("config.toml"),
+        ..Config::default()
+    };
     config.providers.models.anthropic.insert(
         "default".to_string(),
         zeroclaw_config::schema::AnthropicModelProviderConfig {
@@ -3549,4 +3554,103 @@ async fn container_bind_startup_allowed_matrix_serves_health() {
             .unwrap()
             .unwrap();
     }
+}
+
+/// Exercise production startup and the HTTP state projection, not a simulated
+/// store opener: restart must settle old work, while a competing port must not.
+#[tokio::test]
+async fn gateway_restart_settles_abandoned_turns_and_refuses_a_second_owner() {
+    use zeroclaw_infra::session_backend::SessionBackend;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = Config {
+        data_dir: tmp.path().join("data"),
+        config_path: tmp.path().join("config.toml"),
+        ..Config::default()
+    };
+    config.gateway.require_pairing = false;
+    config.gateway.session_persistence = true;
+    let backend =
+        zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(&config.data_dir).unwrap();
+    backend
+        .append(
+            "gw_restart",
+            &zeroclaw_api::model_provider::ChatMessage::user("preserved input"),
+        )
+        .unwrap();
+    backend
+        .set_session_state("gw_restart", "running", Some("crashed-turn"))
+        .unwrap();
+    let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = probe.local_addr().unwrap().port();
+    drop(probe);
+    let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+    let (reload_tx, _) = tokio::sync::watch::channel(false);
+    let controls = zeroclaw_runtime::daemon::GatewayReloadControls {
+        shutdown_tx: shutdown_tx.clone(),
+        reload_tx,
+    };
+    let first_config = config.clone();
+    let task = zeroclaw_spawn::spawn!(async move {
+        run_gateway("127.0.0.1", port, first_config, None, Some(controls), None).await
+    });
+    let response = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            if let Ok(mut stream) = tokio::net::TcpStream::connect(("127.0.0.1", port)).await {
+                stream.write_all(b"GET /api/sessions/restart/state HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").await.unwrap();
+                let mut response = String::new();
+                stream.read_to_string(&mut response).await.unwrap();
+                break response;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    }).await.expect("gateway must serve restored session state");
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    let body: serde_json::Value =
+        serde_json::from_str(response.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+    assert_eq!(body["state"], "error");
+    assert_eq!(body["turn_id"], "crashed-turn");
+    assert_eq!(backend.load("gw_restart")[0].content, "preserved input");
+    // A new turn is live now: a second gateway, even on a different port,
+    // must fail before resetting it or admitting more work.
+    backend
+        .set_session_state("gw_restart", "running", Some("live-turn"))
+        .unwrap();
+    let refused = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        run_gateway("127.0.0.1", 0, config, None, None, None),
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert!(
+        refused.to_string().contains("another gateway still owns"),
+        "{refused}"
+    );
+    assert_eq!(
+        backend
+            .get_session_state("gw_restart")
+            .unwrap()
+            .unwrap()
+            .state,
+        "running"
+    );
+    shutdown_tx.send(true).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn gateway_shutdown_observes_a_signal_sent_before_subscription() {
+    let (signal, _receiver) = tokio::sync::watch::channel(false);
+    signal.send(true).unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        gateway_shutdown(signal.subscribe()),
+    )
+    .await
+    .unwrap();
 }

@@ -407,6 +407,7 @@ impl<A> Conversation<A> {
         match self.turn.lock().as_ref() {
             Some(active) => {
                 active.cancel.cancel();
+                self.drain_approvals();
                 self.questions.drain();
                 true
             }
@@ -446,6 +447,7 @@ impl<A> Conversation<A> {
             Some(active) if active.id != target => "stale",
             Some(active) => {
                 active.cancel.cancel();
+                self.drain_approvals();
                 self.questions.drain();
                 "requested"
             }
@@ -464,7 +466,7 @@ impl<A> Conversation<A> {
         decision: ChannelApprovalResponse,
     ) -> bool {
         match self.pending_approvals.lock().remove(request_id) {
-            Some(tx) => tx.send(decision).is_ok(),
+            Some(entry) => entry.resolve(decision),
             None => false,
         }
     }
@@ -476,6 +478,31 @@ impl<A> Conversation<A> {
         drop(drained);
     }
 
+    pub(crate) fn approval_frames(
+        &self,
+        leak_detection: &zeroclaw_config::schema::LeakDetectionConfig,
+    ) -> Vec<Frame> {
+        let pending = self.pending_approvals.lock();
+        let revision = self.reset_revision();
+        pending
+            .iter()
+            .filter_map(|(id, entry)| {
+                let remaining = entry.remaining_secs()?;
+                let frame = crate::ws::approval_request_ws_frame(
+                    id,
+                    &entry.tool_name,
+                    &entry.arguments_summary,
+                    remaining,
+                    leak_detection,
+                );
+                Some(Frame {
+                    text: Arc::from(frame.to_string()),
+                    reset_revision: revision,
+                })
+            })
+            .collect()
+    }
+
     pub(crate) fn subscriber_count(&self) -> usize {
         self.frames.subscribers.load(Ordering::Acquire)
     }
@@ -485,6 +512,9 @@ type Slot<A> = Arc<OnceCell<Arc<Conversation<A>>>>;
 
 /// Live conversations keyed by session key.
 pub struct ConversationHub<A> {
+    // Detached turns retain the hub, so releasing the listener alone cannot
+    // allow a replacement gateway to settle work that is still executing.
+    _session_owner: Option<zeroclaw_infra::gateway_session_owner::GatewaySessionOwner>,
     /// Bounded process-epoch request/turn replay; execution stays in Conversation.
     pub(crate) turn_control: crate::ws::turn_control::Store,
     /// Canonical bounded ephemeral payload bytes for this gateway.
@@ -503,6 +533,7 @@ pub struct ConversationHub<A> {
 impl<A> Default for ConversationHub<A> {
     fn default() -> Self {
         Self {
+            _session_owner: None,
             slots: parking_lot::Mutex::new(HashMap::new()),
             lifecycles: parking_lot::Mutex::default(),
             attachments: crate::api_attachments::Store::default(),
@@ -514,6 +545,22 @@ impl<A> Default for ConversationHub<A> {
 }
 
 impl<A> ConversationHub<A> {
+    pub(crate) fn owned(data_dir: &std::path::Path) -> std::io::Result<Self> {
+        let owner = zeroclaw_infra::gateway_session_owner::GatewaySessionOwner::acquire(data_dir)?;
+        if owner.recovered_turns() > 0 {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(serde_json::json!({"recovered_turns": owner.recovered_turns()})),
+                "Marked abandoned gateway turns as failed; external effects remain unknown and are not replayed"
+            );
+        }
+        Ok(Self {
+            _session_owner: Some(owner),
+            ..Self::default()
+        })
+    }
+
     /// Serialize same-session hydration/admission with deletion, independently
     /// of the long-running execution queue. Never hold this guard while waiting
     /// for socket input/output. Weak entries retain no disconnected sessions.
@@ -742,9 +789,8 @@ impl<A> Drop for Subscription<A> {
             .fetch_sub(1, Ordering::AcqRel)
             - 1;
         if remaining == 0 {
-            // Nobody is left to answer: a pending approval would otherwise
-            // hold the turn until its timeout. The turn itself keeps going.
-            self.conversation.drain_approvals();
+            // Tool approvals retain their original deadline for reconnect.
+            // Questions keep their existing offline behavior.
             self.conversation
                 .questions
                 .drain_if_offline(&self.conversation.frames);
@@ -763,6 +809,20 @@ mod tests {
             .await
             .unwrap();
         (sub, built.is_some())
+    }
+
+    fn pending_approval(
+        sender: tokio::sync::oneshot::Sender<ChannelApprovalResponse>,
+    ) -> crate::ws_approval::PendingApproval {
+        crate::ws_approval::PendingApproval::new(
+            sender,
+            &zeroclaw_api::channel::ChannelApprovalRequest {
+                tool_name: "file_write".into(),
+                arguments_summary: "path=test.txt".into(),
+                raw_arguments: None,
+            },
+            std::time::Duration::from_secs(30),
+        )
     }
 
     #[tokio::test]
@@ -922,7 +982,7 @@ mod tests {
         let (reset, observed_revision) = {
             // Model the relay after it found the request but before it published.
             let mut pending = conversation.pending_approvals.lock();
-            pending.insert("old-approval".into(), tx);
+            pending.insert("old-approval".into(), pending_approval(tx));
             let resetting = Arc::clone(&conversation);
             let reset = std::thread::spawn(move || resetting.reset());
             // Cancellation proves reset has entered its turn-locked section; the
@@ -1052,6 +1112,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancellation_revokes_detached_approval_before_any_new_decision() {
+        let hub = Arc::new(ConversationHub::<()>::default());
+        let (sub, _) = attach(&hub, "gw_cancel").await;
+        let conversation = sub.conversation.clone();
+        let Submitted::Start(claim) = conversation.submit("go".into()) else {
+            panic!()
+        };
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        conversation
+            .pending_approvals
+            .lock()
+            .insert("cancel-me".into(), pending_approval(tx));
+        drop(sub);
+        assert_eq!(conversation.cancel_turn(&claim.turn_id), "requested");
+        assert!(rx.await.is_err());
+        assert!(conversation.approval_frames(&Default::default()).is_empty());
+        assert!(!conversation.resolve_approval("cancel-me", ChannelApprovalResponse::Approve));
+    }
+
+    #[tokio::test]
     async fn an_approval_resolves_once_from_any_subscriber() {
         let hub = Arc::new(ConversationHub::<()>::default());
         let (a, _) = attach(&hub, "gw_s1").await;
@@ -1060,7 +1140,7 @@ mod tests {
         a.conversation
             .pending_approvals
             .lock()
-            .insert("req-1".into(), tx);
+            .insert("req-1".into(), pending_approval(tx));
         assert!(
             b.conversation
                 .resolve_approval("req-1", ChannelApprovalResponse::Approve)
@@ -1077,7 +1157,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn closing_the_last_socket_keeps_the_turn_but_drops_its_approvals() {
+    async fn closing_the_last_socket_keeps_the_turn_and_bounded_approval() {
         let hub = Arc::new(ConversationHub::<()>::default());
         let (a, _) = attach(&hub, "gw_s1").await;
         let conv = Arc::clone(&a.conversation);
@@ -1085,16 +1165,35 @@ mod tests {
             panic!()
         };
         let (tx, rx) = tokio::sync::oneshot::channel();
-        conv.pending_approvals.lock().insert("req-1".into(), tx);
+        conv.pending_approvals
+            .lock()
+            .insert("req-1".into(), pending_approval(tx));
 
         drop(a);
         assert!(!claim.cancel.is_cancelled(), "detach must not cancel");
-        assert!(rx.await.is_err(), "unanswerable approval is dropped");
+        assert_eq!(
+            conv.pending_approvals.lock().len(),
+            1,
+            "detach does not revoke a live prompt"
+        );
         assert_eq!(hub.len(), 1, "a running turn keeps its conversation");
 
         // A socket reconnecting mid-turn finds the same conversation.
         let (again, created) = attach(&hub, "gw_s1").await;
         assert!(!created && Arc::ptr_eq(&again.conversation, &conv));
+        assert_eq!(
+            again
+                .conversation
+                .approval_frames(&Default::default())
+                .len(),
+            1
+        );
+        assert!(
+            again
+                .conversation
+                .resolve_approval("req-1", ChannelApprovalResponse::Approve)
+        );
+        assert!(matches!(rx.await, Ok(ChannelApprovalResponse::Approve)));
         drop(again);
 
         conv.finish_turn(claim.generation);

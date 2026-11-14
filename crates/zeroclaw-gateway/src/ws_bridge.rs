@@ -183,16 +183,14 @@ async fn run_control_socket(
         "bridge control socket attached"
     );
     let mut in_flight = None;
-    let reason = serve(
-        socket,
-        &bridge,
-        &outbox,
-        &replaced,
-        &state,
-        conn_id,
-        &mut in_flight,
-    )
-    .await;
+    let shutdown = state.shutdown_tx.subscribe();
+    let reason = tokio::select! {
+        biased;
+        () = crate::gateway_shutdown(shutdown) => "gateway shutdown",
+        reason = serve(socket, &bridge, &outbox, &replaced, &state, conn_id, &mut in_flight) => reason,
+    };
+    // Always release the connection and mark an unacknowledged attempt unknown,
+    // including shutdown while a send is suspended. Never requeue it as accepted.
     if let Err(error) = sockets.release(
         &bridge,
         conn_id,
@@ -891,5 +889,34 @@ mod tests {
             status("agent=nobody&session_id=main", "zcb_nope").await,
             401
         );
+    }
+    #[tokio::test]
+    async fn gateway_shutdown_releases_bridge_and_marks_inflight_unknown() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = bridge_state(&tmp, true);
+        let outbox = outbox(&state);
+        let candidate = outbox.enqueue("tg", "42", None, "shutdown test").unwrap();
+        let gateway = serve(state.clone()).await;
+        let mut client = BridgeClient::connect(&gateway, TOKEN).await.unwrap();
+        assert!(next(&mut client).await.is_some());
+        state.shutdown_tx.send(true).unwrap();
+        // Shutdown retires the transport, including a send that cannot finish
+        // a WebSocket close handshake. EOF must not become another delivery.
+        let ended = tokio::time::timeout(WAIT, client.next_deliver())
+            .await
+            .unwrap();
+        assert!(!matches!(ended, Ok(Some(_))));
+        tokio::time::timeout(WAIT, async {
+            while !state.bridge_sockets.live.lock().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            outbox.inspect("tg", &candidate).unwrap().unwrap()["delivery_state"],
+            "unknown"
+        );
+        assert!(outbox.pending("tg", 0, BATCH).unwrap().is_empty());
     }
 }

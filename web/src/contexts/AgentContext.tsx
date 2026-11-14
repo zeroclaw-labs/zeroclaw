@@ -867,8 +867,8 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
 
       case 'approval_request': {
         // Supervised-mode tool consent prompt. Backend parks on a oneshot
-        // until we send `approval_response`; if the socket closes or the
-        // timeout elapses, the backend auto-denies on its side.
+        // until we send `approval_response` or the original timeout elapses.
+        // Reconnect reprojects the same request with only its remaining time.
         if (!msg.request_id) break;
         setPendingApproval({
           requestId: msg.request_id,

@@ -4,6 +4,7 @@
 pub mod acp_session_store;
 pub mod bridge_outbox;
 pub mod debounce;
+pub mod gateway_session_owner;
 pub mod net_guard;
 pub mod owned_archive;
 pub mod process;

@@ -267,8 +267,15 @@ pub async fn handle_ws_chat(
     let session_id = params.session_id;
     let session_name = params.name;
     let session_cwd = params.cwd.or(params.workspace_dir);
-    ws.on_upgrade(move |socket| {
-        handle_socket(
+    let shutdown = state.shutdown_tx.subscribe();
+    ws.on_upgrade(move |socket| async move {
+        // Cover the entire lifetime, including a client that never sends its
+        // connect frame. Dropping a socket only detaches; owned turns keep the
+        // hub/lease until they actually finish.
+        tokio::select! {
+            biased;
+            () = crate::gateway_shutdown(shutdown) => {},
+            () = handle_socket(
             socket,
             state,
             agent_alias,
@@ -278,7 +285,8 @@ pub async fn handle_ws_chat(
             surface,
             auth_subject,
             bridge_scope,
-        )
+            ) => {},
+        }
     })
     .into_response()
 }
@@ -601,6 +609,15 @@ async fn handle_socket(
         let _ = sender.send(Message::Text(frame.to_string().into())).await;
     }
 
+    let approval_frames = subscription
+        .conversation
+        .approval_frames(&state.config.read().security.leak_detection);
+    for frame in approval_frames {
+        if frame.is_current(subscription.conversation.reset_revision()) {
+            let _ = sender.send(Message::Text(frame.to_string().into())).await;
+        }
+    }
+
     let question_frames = subscription
         .conversation
         .questions
@@ -771,6 +788,11 @@ async fn handle_socket(
         drop(lifecycle_guard);
         // Acceptance is independent of delivering its ACK. Even a failed/slow
         // writer must release the admitted claim to execution and recovery.
+        // Handoff has no await: shutdown may drop this socket at the very next
+        // await, but must never drop an accepted claim before its task owns it.
+        if let Some(claim) = start {
+            start_ws_turns(&state, &subscription.conversation, &scope, claim);
+        }
         let sent = match reply {
             Some(reply) => {
                 turn_control::send(
@@ -782,9 +804,6 @@ async fn handle_socket(
             }
             None => true,
         };
-        if let Some(claim) = start {
-            start_ws_turns(&state, &subscription.conversation, &scope, claim);
-        }
         if turn_negotiated && !sent {
             break;
         }
@@ -910,9 +929,8 @@ async fn build_ws_session(
     Ok((WsSession { agent, ws_memory }, restore_trim_event))
 }
 
-/// Publish the approval channel's prompts to every subscriber. With no
-/// socket attached nobody can answer, so the prompt resolves as unreachable
-/// at once instead of holding the turn until its timeout.
+/// Publish prompts to current subscribers. Offline requests remain in the
+/// conversation until their original deadline, so reconnect can project them.
 async fn relay_approval_requests(
     mut events: tokio::sync::mpsc::Receiver<zeroclaw_api::agent::TurnEvent>,
     frames: FrameSink,
@@ -926,7 +944,7 @@ async fn relay_approval_requests(
             request_id,
             tool_name,
             arguments_summary,
-            timeout_secs,
+            timeout_secs: _,
         } = event
         else {
             ::zeroclaw_log::record!(
@@ -938,17 +956,16 @@ async fn relay_approval_requests(
             );
             continue;
         };
-        if !frames.has_subscribers() {
-            pending_approvals.lock().remove(&request_id);
-            continue;
-        }
         // Reset/timeout can revoke the request before this relay is scheduled.
         // Hold the map guard through publication so deletion either invalidates
         // its frame revision or removes the request before we publish it.
         let pending = pending_approvals.lock();
-        if !pending.contains_key(&request_id) {
+        let Some(timeout_secs) = pending
+            .get(&request_id)
+            .and_then(|entry| entry.remaining_secs())
+        else {
             continue;
-        }
+        };
         frames.publish(&approval_request_ws_frame(
             &request_id,
             &tool_name,
@@ -1065,7 +1082,7 @@ fn turn_event_ws_frame(
     }
 }
 
-fn approval_request_ws_frame(
+pub(super) fn approval_request_ws_frame(
     request_id: &str,
     tool_name: &str,
     arguments_summary: &str,

@@ -13,6 +13,23 @@ This page keeps the fork-specific facts that used to live in `AGENTS.md`. The sh
 
 ## Upstream relationship
 
+### Desktop backend continuity
+
+Compared with upstream `zeroclaw-labs/zeroclaw#11523`, merged as
+`ee04d0d44142674886c880e9f809838b49804aca`, this fork adapts abandoned-turn
+settlement at the gateway owner. It does not import upstream's broader live
+config authority. The existing conversation hub owns detached turns, while
+`SessionBackend` owns history and request receipts. Only gateway-prefixed
+running rows are settled, after exclusive data-directory ownership; failure
+refuses startup. The empty lock file contains no second task ledger.
+
+Upstream comparison head `87461d1ac5c9005b82216a223010471e63ab6718` has no
+selected equivalent for this fork's shared-conversation approval recovery.
+The owner approved retaining pending tool prompts through client detach within
+the original timeout. This replaces the prior immediate offline revocation;
+expiry, cancellation, deletion, restart and existing response authorization
+remain fail-closed. See [runtime ownership and persistence](../architecture/runtime-state-and-persistence.md#client-detach-and-approvals).
+
 This repository is an independent project (decision 2026-08-16). Upstream `zeroclaw-labs/zeroclaw` is a reference to port from deliberately, not a stream to track: no scheduled rebases and no wholesale merges.
 
 - **Baseline:** history contains upstream work through upstream PR #9356; `master` `40cc158e8` (2026-08-16) is the last wholesale-aligned point.

@@ -73,6 +73,54 @@ A full process restart also rotates process-local state such as health
 snapshots, actor queues, and any ephemeral tool-receipt key.
 Durable stores survive restart according to the table above.
 
+### Gateway ownership and interrupted turns
+
+Every production gateway takes an exclusive operating-system lock on
+`data/sessions/gateway.lock` before opening its runtime. A second gateway using
+the same data directory is refused even on another port. The conversation hub
+retains the lock for detached turns: closing the listener or last client does
+not make still-executing work abandoned. Keep the empty lock file in place;
+deleting it can allow two independent locks.
+
+After acquiring ownership, startup settles `gw_` sessions left `running` in the
+existing SQLite store as `error`, preserving the turn ID, history and request
+receipts. This reports an interrupted turn, not that its tools had no effects.
+No tool or accepted request is automatically replayed. Non-gateway sessions
+and terminal states are untouched. Recovery neither creates a SQLite store nor
+migrates an older schema; a store error refuses startup. JSONL has no durable
+running-state guarantee.
+
+This cooperative lock cannot fence older binaries or external database writers.
+Stop old gateways before upgrading; never run an older binary against the same
+data directory concurrently. Reload can acquire a new hub only after all owners
+of the preceding hub release it. Outstanding work blocks replacement rather than
+being misreported as abandoned.
+
+Shutdown retires chat sockets, including incomplete handshakes, and bridge
+control sockets. They cannot keep admitting work or hold an otherwise idle hub
+through reload. Bridge cleanup leaves unacknowledged delivery attempts unknown;
+it does not put them back into the automatic-send queue.
+
+### Client detach and approvals
+
+Ordinary tool approvals belong to the running conversation, not its sockets.
+Within the same gateway lifetime, closing the last client leaves the prompt
+pending only until its original deadline. Reconnect projects that same request
+ID and its remaining time; it neither extends the deadline nor grants authority.
+The existing operation/identity checks still govern responses, and only the
+first timely decision can resolve the request. Timeout, turn cancellation,
+session deletion or losing the owning process revokes the prompt. Approval
+arguments and pending decisions are not persisted for execution after restart.
+Correlated questions retain their separate offline behavior.
+
+Desktop clients reuse the existing service and authenticated gateway. Closing
+the app only detaches it; reconnect must not invoke `/admin/shutdown`, cancel a
+turn or launch another backend. Reconnect negotiates the turn-control epoch.
+A changed epoch requires reading durable history and session state, never
+resending an accepted effectful request. Service installation, pairing and
+operator migration remain explicit setup steps; health alone proves neither
+identity nor operator authority.
+
 ## Backup and restore
 
 For a normal single-instance install, back up the whole `<install>` directory.
