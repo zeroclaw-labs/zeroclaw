@@ -123,6 +123,9 @@ safely attributed reject the write. A pre-existing unrelated error may be
 retained only when validation can safely continue past it without skipping a
 related check; otherwise the write is rejected. Retained diagnostics use the
 `pre_existing_validation_error` warning code in responses that carry warnings.
+If a non-continuable baseline error hides a later error, fixing the first one
+alone can still be rejected because the later error cannot be classified as
+pre-existing. A batch correcting both may be required.
 Secret and initialization responses keep their documented shapes and do not
 include warnings. A pre-existing error retained during one of those writes is
 saved unchanged and reported only in the gateway log.
@@ -144,9 +147,10 @@ fails, on-disk and in-memory state are unchanged. Comment annotations are
 applied after the save on a non-fatal, best-effort basis.
 
 `move` and `copy` return `400 op_not_supported` because safe reference-graph
-rewriting is not part of this surface. `test` against a `#[secret]` path is
-rejected with `secret_test_forbidden`: a differential outcome would be the
-only signal a client could read, and that would leak the value.
+rewriting is not part of this surface. `test` additionally requires
+`Config:Read`; testing a `#[secret]` path is rejected with
+`secret_test_forbidden` even for a reader,
+because a differential outcome would leak the value.
 
 Path syntax: JSON Pointer (`/agents/researcher/model_provider`) or the
 dotted form (`agents.researcher.model_provider`). Both are accepted; the

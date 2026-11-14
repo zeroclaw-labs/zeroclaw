@@ -309,8 +309,8 @@ fn map_prop_error(err: anyhow::Error, path: &str) -> ConfigApiError {
 use zeroclaw_config::typed_value::coerce_for_set_prop as json_to_setprop_string;
 
 use crate::principal_gate::{
-    ConfigWriteAuthorization, ConfigWriteSet, RequestPrincipal, authorize_config_write,
-    authorize_whole_config_write,
+    ConfigWriteAuthorization, ConfigWriteSet, RequestPrincipal, authorize_config_read,
+    authorize_config_write, authorize_whole_config_write,
 };
 use zeroclaw_api::grants::Verb;
 
@@ -2678,6 +2678,9 @@ pub async fn handle_patch(
 
         match op.op.as_str() {
             "test" => {
+                if let Err(denied) = authorize_config_read(&principal, &_cfg_guard) {
+                    return denied.into_response();
+                }
                 // Secret values can't leave the server, so a differential
                 // test response would be the only signal — ban the op.
                 if is_sensitive {

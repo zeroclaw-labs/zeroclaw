@@ -312,7 +312,7 @@ pub fn build_spec() -> serde_json::Value {
             "patch": {
                 "tags": ["config"],
                 "summary": "Apply a JSON Patch (RFC 6902) document atomically",
-                "description": "Operations execute in order against an in-memory copy; `Config::validate()` runs once at the end; on success the snapshot persists and swaps. On failure, on-disk and in-memory state are unchanged. `move`/`copy` return `op_not_supported`. `test` against a secret path returns `secret_test_forbidden`.\n\n**Drift guard:** if the on-disk file has drifted from in-memory state on any path being patched, returns 409 `config_changed_externally` unless the request carries `X-ZeroClaw-Override-Drift: true`. GET /api/config/drift to inspect first.",
+                "description": "Operations execute in order against an in-memory copy. Edit-aware validation rejects new or related errors and may retain safely isolated pre-existing errors as warnings; on success the snapshot persists and swaps. On failure, on-disk and in-memory state are unchanged. `move`/`copy` return `op_not_supported`. `test` additionally requires `Config:Read`; testing a secret path returns `secret_test_forbidden`.\n\n**Drift guard:** if the on-disk file has drifted from in-memory state on any path being patched, returns 409 `config_changed_externally` unless the request carries `X-ZeroClaw-Override-Drift: true`. GET /api/config/drift to inspect first.",
                 "parameters": [{
                     "name": "X-ZeroClaw-Override-Drift",
                     "in": "header",
@@ -694,6 +694,11 @@ mod tests {
         assert!(paths.get("/api/status").is_some());
         assert!(paths.get("/api/config/list").is_some());
         assert!(paths.get("/api/config").is_some());
+        let patch_description = paths["/api/config"]["patch"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(patch_description.contains("Config:Read"));
+        assert!(patch_description.contains("pre-existing errors"));
         assert!(paths.get("/api/config/init").is_some());
         assert!(paths.get("/api/config/migrate").is_some());
         assert!(paths.get("/api/config/drift").is_some());

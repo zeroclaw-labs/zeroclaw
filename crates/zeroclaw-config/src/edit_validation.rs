@@ -329,6 +329,40 @@ mod tests {
     }
 
     #[test]
+    fn repairing_a_noncontinuable_error_can_require_a_batch() {
+        let mut baseline = Config::default();
+        baseline.users.insert(
+            "u".into(),
+            crate::schema::UserConfig {
+                uid: Some(1000),
+                permission_profiles: vec!["missing".into()],
+                ..Default::default()
+            },
+        );
+        baseline.permission_profiles.insert(
+            "valid".into(),
+            crate::schema::PermissionProfileConfig::default(),
+        );
+        baseline.security.otp.challenge_max_attempts = 0;
+
+        let mut auth_only = baseline.clone();
+        auth_only.users.get_mut("u").unwrap().permission_profiles = vec!["valid".into()];
+        auth_only.mark_dirty("users.u.permission_profiles");
+        let error = validate_without_mutation(&auth_only, &baseline).unwrap_err();
+        assert_eq!(
+            error.path.as_deref(),
+            Some("security.otp.challenge_max_attempts"),
+            "{error:?}"
+        );
+
+        let mut both = auth_only;
+        both.security.otp.challenge_max_attempts =
+            Config::default().security.otp.challenge_max_attempts;
+        both.mark_dirty("security.otp.challenge_max_attempts");
+        assert!(validate_without_mutation(&both, &baseline).is_ok());
+    }
+
+    #[test]
     fn p1_goal_enable_introducing_missing_verifier_is_rejected() {
         let baseline = Config::default();
         let mut candidate = baseline.clone();
