@@ -345,6 +345,7 @@ mod tests {
                 password: None,
                 mention_only: false,
                 approval_timeout_secs: 300,
+                approval_typed_instructions: true,
                 reply_in_thread: true,
                 ack_reactions: Some(true),
                 excluded_tools: vec![],
