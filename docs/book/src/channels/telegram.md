@@ -125,6 +125,24 @@ channel instance. This includes a wildcard peer group.
 > public bot with a suitably restricted agent; it is not a shortcut for private
 > setup.
 
+### What an unauthorized sender is told
+
+A sender outside the resolved peer set receives a notice instead of an agent reply. The built-in text follows the authorization path in use. While a one-time pairing code is still outstanding and no effective grant authorizes a peer, it carries the operator `zeroclaw channel bind-telegram` command. Once that code is redeemed or an effective grant authorizes a peer, the notice names the identity to authorize instead. Deny-only lists and grants shadowed by denies keep recovery pairing available.
+
+Set `unauthorized_message` to replace that text, for example when the bot faces end users who need to contact support:
+
+```toml
+[channels.telegram.home]
+unauthorized_message = """
+This assistant only replies to approved contacts.
+Ask our support team to release access for {identity}.
+"""
+```
+
+`{identity}` expands to the sender's Telegram user ID, or the username when no ID is available; `{bind_command}` expands to the bind command for this alias. Unset or blank keeps the built-in notice. The notice is always sent as a text message: a URL, a file path, or an attachment marker in it reaches the sender as written, never as a document or a voice note.
+
+The notice reads the daemon's published configuration when it is sent. Changes published through its shared config authority reach the next notice. Edits made only to disk, including `config.toml` edits and `zeroclaw config set`, need a daemon reload or process restart; see [Restart and persistence behavior](#restart-and-persistence-behavior).
+
 ## 4. Start the channel and inspect it
 
 Use the full daemon for normal operation, the channel-only process for a
@@ -170,8 +188,9 @@ flowchart TD
     I --> M{"Either identity matches<br/>the resolved peer set?"}
     M -->|"yes"| D["Dispatch ChannelMessage to the owning agent"]
     M -->|"no"| B{"Message is /bind code?"}
-    B -->|"no"| H["Reply with the alias-aware operator bind command"]
-    B -->|"yes, pairing active"| V{"One-time code is valid?"}
+    B -->|"no"| H["Reply with the notice for the authorization path in use"]
+    B -->|"yes, startup pairing available"| V{"One-time code is valid?"}
+    B -->|"yes, but pairing is over"| N["Reply that pairing is not active"]
     V -->|"no"| X["Reject; repeated failures can lock out retries"]
     V -->|"yes"| P["Add numeric user ID to peer_groups.telegram_home"]
     P --> W["Save config.toml and accept subsequent messages"]
@@ -182,16 +201,11 @@ On success, ZeroClaw prefers the stable numeric sender ID, adds it to
 The running channel's peer resolver reads that shared config, so the user can
 send the next message immediately without a restart.
 
-The code is one-time. On later restarts the saved peer makes the resolved set
-non-empty, so pairing stays disabled and no replacement code is issued. If the
-bot says it paired only for the current runtime because persistence failed,
-fix the reported config permission or write error before restarting.
+The code is one-time. On later restarts the saved grant keeps pairing disabled and no replacement code is issued. An effective grant that arrives in the live peer set while the channel runs ends pairing at once: an outstanding code stops being redeemable without waiting for a restart. Binding consumes the code only after the config write succeeds. If persistence fails, nothing is bound and the code remains available; fix the reported config permission or write error and retry.
 
 ## 6. Bind another user from the operator CLI
 
-An unauthorized user can message the bot to receive a suggested operator
-command containing their numeric ID. Run that command on the ZeroClaw host.
-For the `home` alias it has this form:
+The operator runs `bind-telegram` on the ZeroClaw host with the identity to approve. While startup pairing is available, an unauthorized user who messages the bot receives this command with their numeric ID filled in. Once an effective grant authorizes a peer, the built-in notice names that ID instead, and the operator composes the command. For the `home` alias it has this form:
 
 ```sh
 zeroclaw channel bind-telegram 111111111 --alias home

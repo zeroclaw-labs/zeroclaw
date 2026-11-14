@@ -1241,7 +1241,10 @@ mod tests {
     }
 
     fn assert_common_dev_template_contract(cfg: &zeroclaw_config::schema::Config) {
-        assert_eq!(cfg.schema_version, 3);
+        assert_eq!(
+            cfg.schema_version,
+            zeroclaw_config::migration::CURRENT_SCHEMA_VERSION
+        );
 
         let provider = cfg
             .providers
@@ -1620,7 +1623,6 @@ mod tests {
                 8, 30, 600,
             )),
             device_registry: None,
-            pending_pairings: None,
             canvas_store: zeroclaw_runtime::tools::CanvasStore::new(),
             #[cfg(feature = "webauthn")]
             webauthn: None,
