@@ -1074,7 +1074,7 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
 
     // The registry owns model/capability validation. All diagnostics consume
     // the same projection used by construction, including migrated inputs.
-    match config.provider_registry() {
+    match config.provider_registry_for_diagnostics() {
         Err(error) => items.push(DiagItem::error(
             cat,
             format!("invalid provider registry: {error}"),

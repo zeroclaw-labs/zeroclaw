@@ -1133,6 +1133,21 @@ impl Providers {
             self.fallback.clone(),
         )
     }
+
+    /// Resolve the registry shape for diagnostics without applying semantic
+    /// validation. This keeps Doctor able to enumerate invalid model rows;
+    /// callers that construct or publish providers must use
+    /// [`Self::canonical_registry`] instead.
+    pub(crate) fn canonical_registry_unvalidated(
+        &self,
+    ) -> Result<ProviderRegistry, super::provider_registry::RegistryError> {
+        ProviderRegistry::from_raw_parts_unvalidated(
+            self.connections.clone(),
+            self.models.canonical_models.clone(),
+            self.model_presets.clone(),
+            self.fallback.clone(),
+        )
+    }
 }
 
 macro_rules! emit_model_cost_rates_struct {

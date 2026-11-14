@@ -56064,4 +56064,26 @@ impl Config {
             self.providers.canonical_registry()
         }
     }
+
+    /// Resolve the canonical registry shape for diagnostics while retaining
+    /// invalid model values for field-level reporting. This method is not a
+    /// construction boundary; provider creation and publication still use
+    /// [`Self::provider_registry`].
+    pub fn provider_registry_for_diagnostics(
+        &self,
+    ) -> Result<crate::provider_registry::ProviderRegistry, crate::provider_registry::RegistryError>
+    {
+        #[cfg(feature = "test-helpers")]
+        {
+            if let Ok(admitted) = crate::migration::try_admit_test_input(self) {
+                admitted.providers.canonical_registry_unvalidated()
+            } else {
+                self.providers.canonical_registry_unvalidated()
+            }
+        }
+        #[cfg(not(feature = "test-helpers"))]
+        {
+            self.providers.canonical_registry_unvalidated()
+        }
+    }
 }
