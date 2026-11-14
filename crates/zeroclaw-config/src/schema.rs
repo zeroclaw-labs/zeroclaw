@@ -17161,6 +17161,22 @@ pub enum MatrixStreamMode {
     MultiMessage,
 }
 
+/// Matrix conversation-history boundary for one sender in one room.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum MatrixSessionScope {
+    /// One shared history per room and sender; Matrix threads are only reply
+    /// anchors (default).
+    #[default]
+    RoomSender,
+    /// One history per room, sender, and Matrix thread root. Top-level
+    /// messages that do not open a thread keep the room+sender history.
+    RoomSenderThread,
+}
+
 /// Matrix single-message reasoning visibility.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
@@ -18340,6 +18356,14 @@ pub struct MatrixConfig {
     #[tab(Behavior)]
     #[serde(default = "default_true")]
     pub reply_in_thread: bool,
+    /// Conversation-history boundary. `"room_sender"` (default): one history
+    /// per room and sender, shared across Matrix threads. `"room_sender_thread"`:
+    /// each Matrix thread root gets its own history, interruption scope, and
+    /// reset target; with `reply_in_thread = true` every top-level message
+    /// opens its own thread and therefore its own conversation.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub session_scope: MatrixSessionScope,
     /// Override for the top-level `[channels].ack_reactions`. When
     /// `None`, falls back to the channels-wide default. When set
     /// explicitly (`true`/`false`), takes precedence for this Matrix
@@ -37358,6 +37382,7 @@ allowed_contacts = ["+1234567890", "user@icloud.com"]
             password: None,
             approval_timeout_secs: 300,
             reply_in_thread: true,
+            session_scope: MatrixSessionScope::default(),
             ack_reactions: Some(true),
             excluded_tools: vec![],
             reply_min_interval_secs: 0,
@@ -37398,6 +37423,7 @@ allowed_contacts = ["+1234567890", "user@icloud.com"]
             password: None,
             approval_timeout_secs: 300,
             reply_in_thread: true,
+            session_scope: MatrixSessionScope::default(),
             ack_reactions: Some(true),
             excluded_tools: vec![],
             reply_min_interval_secs: 0,
@@ -37480,6 +37506,29 @@ allowed_users = ["@u:matrix.org"]
 "#;
         let parsed: MatrixConfig = toml::from_str(toml).unwrap();
         assert!(parsed.reply_in_thread);
+    }
+
+    #[test]
+    async fn matrix_config_session_scope_defaults_to_room_sender_and_parses_thread() {
+        let base = r#"
+homeserver = "https://matrix.org"
+access_token = "tok"
+"#;
+        let parsed: MatrixConfig = toml::from_str(base).unwrap();
+        assert_eq!(parsed.session_scope, MatrixSessionScope::RoomSender);
+        assert_eq!(
+            MatrixConfig::default().session_scope,
+            MatrixSessionScope::RoomSender
+        );
+
+        let threaded: MatrixConfig =
+            toml::from_str(&format!("{base}session_scope = \"room_sender_thread\"\n")).unwrap();
+        assert_eq!(threaded.session_scope, MatrixSessionScope::RoomSenderThread);
+
+        assert!(
+            toml::from_str::<MatrixConfig>(&format!("{base}session_scope = \"thread\"\n")).is_err(),
+            "unknown session_scope values must be rejected, not silently defaulted"
+        );
     }
 
     #[test]
@@ -37584,6 +37633,7 @@ allowed_users = ["@u:matrix.org"]
                     password: None,
                     approval_timeout_secs: 300,
                     reply_in_thread: true,
+                    session_scope: MatrixSessionScope::default(),
                     ack_reactions: Some(true),
                     excluded_tools: vec![],
                     reply_min_interval_secs: 0,
@@ -47841,6 +47891,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             password: None,
             approval_timeout_secs: 300,
             reply_in_thread: true,
+            session_scope: MatrixSessionScope::default(),
             ack_reactions: Some(true),
             excluded_tools: vec![],
             reply_min_interval_secs: 0,
@@ -47892,6 +47943,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             password: None,
             approval_timeout_secs: 300,
             reply_in_thread: true,
+            session_scope: MatrixSessionScope::default(),
             ack_reactions: Some(true),
             excluded_tools: vec![],
             reply_min_interval_secs: 0,
@@ -47924,6 +47976,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             password: None,
             approval_timeout_secs: 300,
             reply_in_thread: true,
+            session_scope: MatrixSessionScope::default(),
             ack_reactions: Some(true),
             excluded_tools: vec![],
             reply_min_interval_secs: 0,
@@ -47957,6 +48010,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             password: None,
             approval_timeout_secs: 300,
             reply_in_thread: true,
+            session_scope: MatrixSessionScope::default(),
             ack_reactions: Some(true),
             excluded_tools: vec![],
             reply_min_interval_secs: 0,
@@ -48001,6 +48055,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
                 password: None,
                 approval_timeout_secs: 300,
                 reply_in_thread: true,
+                session_scope: MatrixSessionScope::default(),
                 ack_reactions: Some(true),
                 excluded_tools: vec![],
                 reply_min_interval_secs: 0,
@@ -48044,6 +48099,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
                 password: None,
                 approval_timeout_secs: 300,
                 reply_in_thread: true,
+                session_scope: MatrixSessionScope::default(),
                 ack_reactions: Some(true),
                 excluded_tools: vec![],
                 reply_min_interval_secs: 0,
@@ -48092,6 +48148,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
                 password: None,
                 approval_timeout_secs: 300,
                 reply_in_thread: true,
+                session_scope: MatrixSessionScope::default(),
                 ack_reactions: Some(true),
                 excluded_tools: vec![],
                 reply_min_interval_secs: 0,
@@ -48208,6 +48265,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             password: None,
             approval_timeout_secs: 300,
             reply_in_thread: true,
+            session_scope: MatrixSessionScope::default(),
             ack_reactions: Some(true),
             excluded_tools: vec![],
             reply_min_interval_secs: 0,
@@ -48252,6 +48310,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             password: None,
             approval_timeout_secs: 300,
             reply_in_thread: true,
+            session_scope: MatrixSessionScope::default(),
             ack_reactions: Some(true),
             excluded_tools: vec![],
             reply_min_interval_secs: 0,
@@ -48292,6 +48351,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             password: None,
             approval_timeout_secs: 300,
             reply_in_thread: true,
+            session_scope: MatrixSessionScope::default(),
             ack_reactions: Some(true),
             excluded_tools: vec![],
             reply_min_interval_secs: 0,
@@ -48339,6 +48399,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             password: None,
             approval_timeout_secs: 300,
             reply_in_thread: true,
+            session_scope: MatrixSessionScope::default(),
             ack_reactions: Some(true),
             excluded_tools: vec![],
             reply_min_interval_secs: 0,
