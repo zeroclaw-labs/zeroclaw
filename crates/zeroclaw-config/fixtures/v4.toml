@@ -828,6 +828,11 @@ timeout_secs = 30
 [tools]
 optional = ["*"]
 
+[tools.send_via]
+max_attachment_bytes = 10485760
+max_attachments = 10
+max_total_attachment_bytes = 20971520
+
 [transcription]
 
 [trust]
