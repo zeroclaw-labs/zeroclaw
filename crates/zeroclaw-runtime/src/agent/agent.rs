@@ -169,6 +169,13 @@ pub(crate) fn build_model(
     model_provider_ref: &str,
     model_override: Option<&str>,
 ) -> Result<ModelRuntime> {
+    #[cfg(test)]
+    let admitted_config;
+    #[cfg(test)]
+    let config = {
+        admitted_config = zeroclaw_config::migration::admit_test_input(config);
+        &admitted_config
+    };
     let model = zeroclaw_providers::model::build_model(
         config,
         agent_alias,

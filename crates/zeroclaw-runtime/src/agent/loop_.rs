@@ -1562,6 +1562,8 @@ pub fn run<'a>(
     origin: TurnOrigin,
     overrides: AgentRunOverrides,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String>> + Send + 'a>> {
+    #[cfg(test)]
+    let config = zeroclaw_config::migration::admit_test_input(&config);
     let config = Arc::new(config);
     Box::pin(async move {
         run_with_request(
@@ -1605,6 +1607,8 @@ pub fn run_with_capabilities<'a>(
     origin: TurnOrigin,
     overrides: AgentRunOverrides,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String>> + Send + 'a>> {
+    #[cfg(test)]
+    let config = zeroclaw_config::migration::admit_test_input(&config);
     Box::pin(async move {
         run_with_request(
             Arc::new(config),
@@ -1639,6 +1643,8 @@ pub fn run_with_request<'a>(
     request: AgentRunRequest<'a>,
     overrides: AgentRunOverrides,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String>> + Send + 'a>> {
+    #[cfg(test)]
+    let config = Arc::new(zeroclaw_config::migration::admit_test_input(&config));
     Box::pin(run_inner(config, request, overrides))
 }
 
@@ -3554,6 +3560,8 @@ pub async fn process_message(
     origin: TurnOrigin,
     internal_principal: Option<zeroclaw_api::ingress::InternalPrincipal>,
 ) -> Result<String> {
+    #[cfg(test)]
+    let config = zeroclaw_config::migration::admit_test_input(&config);
     process_message_shared(
         Arc::new(config),
         agent_alias,
@@ -3580,6 +3588,8 @@ pub(crate) fn process_message_shared<'a>(
     origin: TurnOrigin,
     internal_principal: Option<zeroclaw_api::ingress::InternalPrincipal>,
 ) -> impl std::future::Future<Output = Result<String>> + 'a {
+    #[cfg(test)]
+    let config = Arc::new(zeroclaw_config::migration::admit_test_input(&config));
     process_message_inner(
         config,
         None,

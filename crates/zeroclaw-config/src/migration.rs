@@ -3092,8 +3092,26 @@ pub fn normalize_test_input(config: &mut Config) {
 /// mutable while exercising canonical consumers. Preserve non-serialized state.
 #[cfg(any(test, feature = "test-helpers"))]
 pub fn admit_test_input(input: &Config) -> Config {
+    // Keep the historical typed maps available to fixture code that performs
+    // a second edit before admitting the next candidate. They are still only
+    // input data: canonical consumers resolve the registry below, and a
+    // subsequent admission re-projects any edits into that registry.
+    let source_models = input.providers.models.clone();
+    let source_tts = input.providers.tts.clone();
+    let source_transcription = input.providers.transcription.clone();
     let mut config = input.clone();
     normalize_test_input(&mut config);
+    if source_models.iter_entries().next().is_some() {
+        let canonical_models = config.providers.models.canonical_models.clone();
+        config.providers.models = source_models;
+        config.providers.models.canonical_models = canonical_models;
+    }
+    if source_tts.iter_entries().next().is_some() {
+        config.providers.tts = source_tts;
+    }
+    if source_transcription.iter_entries().next().is_some() {
+        config.providers.transcription = source_transcription;
+    }
     config
 }
 
