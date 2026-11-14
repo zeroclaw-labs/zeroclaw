@@ -13900,6 +13900,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "zeroclaw-a2a"
+version = "0.9.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "futures-util",
+ "parking_lot",
+ "reqwest 0.12.28",
+ "schemars 1.2.2",
+ "serde",
+ "serde_json",
+ "serial_test",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
+ "uuid",
+ "wiremock",
+ "zeroclaw-infra",
+]
+
+[[package]]
 name = "zeroclaw-api"
 version = "0.9.0"
 dependencies = [
@@ -14180,6 +14202,7 @@ dependencies = [
  "tower-http",
  "uuid",
  "wiremock",
+ "zeroclaw-a2a",
  "zeroclaw-api",
  "zeroclaw-channels",
  "zeroclaw-config",
@@ -14703,6 +14726,7 @@ dependencies = [
  "which",
  "windows-sys 0.61.2",
  "wiremock",
+ "zeroclaw-a2a",
  "zeroclaw-api",
  "zeroclaw-config",
  "zeroclaw-infra",
