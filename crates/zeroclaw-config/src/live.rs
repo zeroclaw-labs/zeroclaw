@@ -204,6 +204,8 @@ impl LiveConfig {
         revision: ConfigRevision,
         config: Config,
     ) -> Result<ConfigRevision, LiveConfigError> {
+        #[cfg(feature = "test-helpers")]
+        let config = crate::migration::admit_test_input(&config);
         let mut pair = self.pair.write();
         // Checked successor comparison: past `u64::MAX` no successor exists,
         // so the storage contract itself rejects a wrapping publication
