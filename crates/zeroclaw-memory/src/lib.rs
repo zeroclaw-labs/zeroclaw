@@ -91,13 +91,17 @@ use zeroclaw_config::schema::{
 #[cfg(feature = "memory-postgres")]
 fn build_postgres_memory(
     storage: &PostgresStorageConfig,
+    embedder: Arc<dyn embeddings::EmbeddingProvider>,
+    vector_weight: f32,
+    keyword_weight: f32,
+    search_mode: zeroclaw_config::schema::SearchMode,
 ) -> anyhow::Result<postgres::PostgresMemory> {
     use postgres::PostgresMemory;
     let db_url = storage
         .db_url
         .as_deref()
         .context("memory backend 'postgres' requires [storage.postgres.<alias>].db_url")?;
-    PostgresMemory::new(
+    PostgresMemory::with_embedder(
         "postgres",
         db_url,
         &storage.schema,
@@ -105,11 +109,21 @@ fn build_postgres_memory(
         storage.connect_timeout_secs,
         Some(storage.vector_enabled),
         Some(storage.vector_dimensions),
+        embedder,
+        vector_weight,
+        keyword_weight,
+        search_mode,
     )
 }
 
 #[cfg(not(feature = "memory-postgres"))]
-fn build_postgres_memory(_storage: &PostgresStorageConfig) -> anyhow::Result<Box<dyn Memory>> {
+fn build_postgres_memory(
+    _storage: &PostgresStorageConfig,
+    _embedder: Arc<dyn embeddings::EmbeddingProvider>,
+    _vector_weight: f32,
+    _keyword_weight: f32,
+    _search_mode: zeroclaw_config::schema::SearchMode,
+) -> anyhow::Result<Box<dyn Memory>> {
     anyhow::bail!(
         "memory backend 'postgres' requested but this build was compiled without \
          `memory-postgres`; rebuild with `--features memory-postgres`"
@@ -757,8 +771,15 @@ fn build_memory_with_storage(
         };
         #[cfg(feature = "memory-postgres")]
         {
+            let embedder = create_embedder(resolved_embedding);
             return wrap_scanned_and_audit(
-                build_postgres_memory(pg_cfg)?,
+                build_postgres_memory(
+                    pg_cfg,
+                    embedder,
+                    config.vector_weight as f32,
+                    config.keyword_weight as f32,
+                    config.search_mode.clone(),
+                )?,
                 &config.policy,
                 workspace_dir,
                 config.audit_enabled,
@@ -766,7 +787,14 @@ fn build_memory_with_storage(
         }
         #[cfg(not(feature = "memory-postgres"))]
         {
-            return build_postgres_memory(pg_cfg);
+            let embedder = create_embedder(resolved_embedding);
+            return build_postgres_memory(
+                pg_cfg,
+                embedder,
+                config.vector_weight as f32,
+                config.keyword_weight as f32,
+                config.search_mode.clone(),
+            );
         }
     }
 
