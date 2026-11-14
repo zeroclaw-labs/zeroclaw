@@ -7385,13 +7385,10 @@ path = "{trigger_path}"
     }
 
     #[tokio::test]
-    async fn gateway_boot_pins_nested_model_over_legacy_model() {
+    async fn gateway_boot_uses_canonical_model_definition() {
         use axum::routing::post;
         use serde_json::{Value, json};
         use zeroclaw_api::model_provider::{ChatMessage, ChatRequest};
-        use zeroclaw_config::schema::{
-            ModelEntryConfig, ModelProviderConfig, OpenAIModelProviderConfig, WireApi,
-        };
 
         type Capture = Arc<Mutex<Option<Value>>>;
 
@@ -7422,89 +7419,33 @@ path = "{trigger_path}"
                 .expect("serve mock model endpoint");
         });
 
-        let mut config = Config::default();
-        config.providers.models.openai.insert(
-            "gateway".to_string(),
-            OpenAIModelProviderConfig {
-                base: ModelProviderConfig {
-                    model: Some("legacy-boot-model".to_string()),
-                    api_key: Some("sk-test".to_string()),
-                    uri: Some(format!("http://{address}/v1")),
-                    wire_api: Some(WireApi::ChatCompletions),
-                    models: HashMap::from([(
-                        "only".to_string(),
-                        ModelEntryConfig {
-                            id: Some("nested-boot-model".to_string()),
-                            temperature: Some(0.25),
-                            ..Default::default()
-                        },
-                    )]),
-                    ..Default::default()
-                },
-            },
-        );
+        let config = Config {
+            providers: toml::from_str(&format!(
+                r#"
+[connections."gateway"]
+kind = "custom"
+uri = "http://{address}/v1"
+auth = {{ mode = "api_key", api_key = "sk-test" }}
+[models."chat.gateway"]
+capability = "chat"
+provider = "gateway"
+model = "nested-boot-model"
+options = {{ temperature = 0.25, max_tokens = 192 }}
+"#
+            ))
+            .expect("canonical gateway model fixture parses"),
+            ..Config::default()
+        };
 
-        let boot =
-            resolve_gateway_boot_selection(&zeroclaw_config::migration::admit_test_input(&config));
-        assert_eq!(boot.provider_ref(), "openai.gateway.only");
+        let admitted = zeroclaw_config::migration::admit_test_input(&config);
+        let boot = resolve_gateway_boot_selection(&admitted);
+        assert_eq!(boot.provider_ref(), "chat.gateway");
         assert_eq!(boot.model(), "nested-boot-model");
         assert_eq!(boot.temperature(), Some(0.25));
-        let provider = create_gateway_boot_provider(
-            Arc::new(zeroclaw_config::migration::admit_test_input(&config)),
-            &boot.provider_ref(),
-        )
-        .await
-        .expect("nested-only boot provider should construct");
-        let messages = [ChatMessage::user("hello")];
-        provider
-            .chat(
-                ChatRequest {
-                    messages: &messages,
-                    tools: None,
-                    thinking: None,
-                },
-                boot.model(),
-                boot.temperature(),
-            )
+        let provider = create_gateway_boot_provider(Arc::new(admitted), &boot.provider_ref())
             .await
-            .expect("nested-only boot provider should reach configured endpoint");
-
-        let body = capture.lock().clone().expect("mock endpoint was called");
-        assert_eq!(
-            body.get("model").and_then(Value::as_str),
-            Some("nested-boot-model")
-        );
-        assert_eq!(body.get("temperature").and_then(Value::as_f64), Some(0.25));
-
-        let profile = config.providers.models.ensure("openai", "gateway").unwrap();
-        profile.models.insert(
-            "default".into(),
-            ModelEntryConfig {
-                id: Some("default-model-must-not-be-used".into()),
-                max_tokens: Some(64),
-                provider_extra: Some(json!({"selection": "default"})),
-                ..Default::default()
-            },
-        );
-        let selected = profile.models.get_mut("only").unwrap();
-        selected.max_tokens = Some(192);
-        selected.provider_extra = Some(json!({"selection": "non-default"}));
-        // The compatible adapter supports arbitrary request body overlays.
-        let compatible_profile = profile.clone();
-        *config.providers.models.ensure("custom", "gateway").unwrap() = compatible_profile;
-        let boot = GatewayBootSelection {
-            model_ref: "custom.gateway.only".into(),
-            model_id: zeroclaw_config::migration::admit_test_input(&config)
-                .resolve_model_id("custom.gateway.only"),
-            temperature: config.resolve_model_temperature("custom.gateway.only"),
-        };
-        assert_eq!(boot.provider_ref(), "custom.gateway.only");
-        let provider = create_gateway_boot_provider(
-            Arc::new(zeroclaw_config::migration::admit_test_input(&config)),
-            &boot.provider_ref(),
-        )
-        .await
-        .expect("a non-default nested selection should construct");
+            .expect("canonical boot provider should construct");
+        let messages = [ChatMessage::user("hello")];
         provider
             .chat(
                 ChatRequest::new(&messages),
@@ -7512,11 +7453,12 @@ path = "{trigger_path}"
                 boot.temperature(),
             )
             .await
-            .expect("the complete selected reference must reach construction");
+            .expect("canonical boot provider should reach configured endpoint");
+
         let body = capture.lock().clone().expect("mock endpoint was called");
         assert_eq!(body["model"], "nested-boot-model");
+        assert_eq!(body["temperature"], 0.25);
         assert_eq!(body["max_tokens"], 192);
-        assert_eq!(body["selection"], "non-default");
         server.abort();
     }
 

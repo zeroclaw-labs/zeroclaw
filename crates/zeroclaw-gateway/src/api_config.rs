@@ -5028,9 +5028,7 @@ model = "effective-before"
         assert_eq!(status, StatusCode::OK, "registry PUT failed: {json}");
         let live = state.config.read();
         assert_eq!(
-            live.resolve_model_selection("chat.migrated")
-                .and_then(|selection| selection.model_id)
-                .as_deref(),
+            live.resolve_model_id("chat.migrated").as_deref(),
             Some("effective-after")
         );
         let written = tokio::fs::read_to_string(tmp.path().join("config.toml"))
@@ -5038,10 +5036,7 @@ model = "effective-before"
             .expect("patched config must be saved");
         let reloaded = zeroclaw_config::migration::migrate_to_current(&written).unwrap();
         assert_eq!(
-            reloaded
-                .resolve_model_selection("chat.migrated")
-                .and_then(|selection| selection.model_id)
-                .as_deref(),
+            reloaded.resolve_model_id("chat.migrated").as_deref(),
             Some("effective-after")
         );
     }
