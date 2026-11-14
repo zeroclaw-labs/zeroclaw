@@ -2114,7 +2114,7 @@ mod inbound {
         config::SyncSettings,
         event_handler::RawEvent,
         ruma::{
-            OwnedEventId, OwnedUserId, UserId,
+            OwnedEventId, OwnedRoomId, OwnedUserId, UserId,
             events::{
                 AnySyncTimelineEvent,
                 reaction::ReactionEventContent,
@@ -2158,6 +2158,16 @@ mod inbound {
         /// could not be decrypted. Tracked so the bot reacts ❓ exactly once
         /// per event across sync catchup deliveries.
         pub undecryptable_seen: Arc<TokioMutex<HashSet<OwnedEventId>>>,
+        /// SDK client for outbound side-effects that must bypass the
+        /// orchestrator (the owner notice DM). `None` in unit tests that
+        /// drive `handle_message` without a logged-in client.
+        pub client: Option<Client>,
+        /// Shared with [`super::MatrixChannel`]: DM room cache for the owner
+        /// notice, keyed by the configured owner user ID.
+        pub owner_notice_room: Arc<TokioMutex<Option<(String, OwnedRoomId)>>>,
+        /// Shared with [`super::MatrixChannel`]: owner-notice throttle map.
+        pub owner_notice_throttle:
+            Arc<std::sync::Mutex<HashMap<(String, String), std::time::Instant>>>,
     }
 
     /// Register the inbound event handlers on `client`. The returned guards
@@ -2476,6 +2486,205 @@ mod inbound {
                     })),
                 "matrix: failed to accept room invite"
             ),
+    /// Minimum interval between owner notices for the same (sender, room)
+    /// pair. Matrix has no transport-level flood gate (unlike Telegram's Bot
+    /// API), so the channel throttles its own notices — without this a
+    /// determined spammer could turn the operator's DM into a firehose.
+    const OWNER_NOTICE_THROTTLE: Duration = Duration::from_secs(300);
+
+    /// Sliding-window throttle admission: returns true (and records `now`)
+    /// when the pair's last notice is older than [`OWNER_NOTICE_THROTTLE`]
+    /// or absent, false otherwise. The map stays bounded in practice because
+    /// every admission rewrites the pair's slot and keys are only created by
+    /// real turn-away events.
+    pub(super) fn owner_notice_throttle_admits(
+        throttle: &mut HashMap<(String, String), std::time::Instant>,
+        sender: &str,
+        room_id: &str,
+        now: std::time::Instant,
+    ) -> bool {
+        let key = (sender.to_string(), room_id.to_string());
+        match throttle.get(&key) {
+            Some(last) if now.duration_since(*last) < OWNER_NOTICE_THROTTLE => false,
+            _ => {
+                throttle.insert(key, now);
+                true
+            }
+        }
+    }
+
+    /// Bounded single-line preview of the turned-away message for the owner
+    /// notice: whitespace-collapsed, `PREVIEW_MAX_CHARS` cap with an
+    /// ellipsis — the same contract as the Telegram owner notice.
+    pub(super) fn owner_notice_preview(body: &str) -> String {
+        const PREVIEW_MAX_CHARS: usize = 160;
+        let collapsed: String = body.split_whitespace().collect::<Vec<_>>().join(" ");
+        let mut preview: String = collapsed.chars().take(PREVIEW_MAX_CHARS).collect();
+        if collapsed.chars().count() > PREVIEW_MAX_CHARS {
+            preview.push('…');
+        }
+        preview
+    }
+
+    /// Compose the operator-facing heads-up for a message the sender
+    /// allowlist turned away. The authorization hint is static copy: Matrix
+    /// admits users through `peer_groups` configuration, so unlike the
+    /// Telegram notice there is no bind command to name.
+    pub(super) fn compose_owner_notice(
+        sender: &str,
+        room_id: &str,
+        preview: &str,
+        alias: &str,
+    ) -> String {
+        zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+            "channel-matrix-unauthorized-owner-notice",
+            &[
+                ("sender", sender),
+                ("room", room_id),
+                ("preview", preview),
+                ("alias", alias),
+            ],
+        )
+    }
+
+    /// Gate and compose an owner notice for a turned-away sender. Returns
+    /// `(notice, owner, client)` when the alias configures `owner_user_id`
+    /// (non-blank), the (sender, room) pair is outside the throttle window,
+    /// and a logged-in client is available; `None` otherwise, in which case
+    /// the drop stays exactly as silent as before this feature.
+    pub(super) fn prepare_owner_notice(
+        ctx: &HandlerCtx,
+        sender: &str,
+        room_id: &str,
+        body: &str,
+    ) -> Option<(String, String, Client)> {
+        let owner = ctx.config.owner_user_id.as_deref()?.trim();
+        if owner.is_empty() {
+            return None;
+        }
+        {
+            let mut throttle = ctx.owner_notice_throttle.lock().ok()?;
+            if !owner_notice_throttle_admits(
+                &mut throttle,
+                sender,
+                room_id,
+                std::time::Instant::now(),
+            ) {
+                return None;
+            }
+        }
+        let notice = compose_owner_notice(sender, room_id, &owner_notice_preview(body), &ctx.alias);
+        let client = ctx.client.clone()?;
+        Some((notice, owner.to_string(), client))
+    }
+
+    /// Deliver the owner heads-up DM off the serial inbound loop. Reuses the
+    /// cached DM room while it still belongs to the configured owner, falls
+    /// back to an existing DM with that user, and creates one (`is_direct`,
+    /// encrypted when the SDK's e2e feature is on) as a last resort. Any
+    /// failure is logged as a failure event — never silently dropped — and
+    /// never re-fires anything at the turned-away sender, who by design
+    /// receives no public stub.
+    async fn deliver_owner_notice(
+        client: Client,
+        room_cache: Arc<TokioMutex<Option<(String, OwnedRoomId)>>>,
+        owner: String,
+        notice: String,
+        alias: String,
+    ) {
+        let result = async {
+            let user_id: OwnedUserId = owner.parse().map_err(|e| {
+                anyhow::Error::msg(format!(
+                    "matrix: owner_user_id {owner:?} is not a valid MXID: {e}"
+                ))
+            })?;
+            let room = {
+                let mut cache = room_cache.lock().await;
+                let cached = cache
+                    .as_ref()
+                    .filter(|(cached_owner, _)| cached_owner == &owner)
+                    .and_then(|(_, room_id)| client.get_room(room_id));
+                match cached {
+                    Some(room) => room,
+                    None => {
+                        let room = match client.get_dm_room(&user_id) {
+                            Some(room) => room,
+                            None => {
+                                let room = client.create_dm(&user_id).await.map_err(|e| {
+                                    anyhow::Error::msg(format!(
+                                        "matrix: failed to create owner DM: {e}"
+                                    ))
+                                })?;
+                                // Classify the fresh room as a DM in the
+                                // bot's account data: the homeserver does
+                                // not manage `m.direct`, so without this
+                                // clients (Element) render the owner notice
+                                // room as an ordinary room instead of under
+                                // People. Best-effort — a failure here only
+                                // degrades presentation, never the notice.
+                                let account = client.account();
+                                let mut direct = account
+                                    .account_data::<
+                                        matrix_sdk::ruma::events::direct::DirectEventContent,
+                                    >()
+                                    .await
+                                    .ok()
+                                    .flatten()
+                                    .and_then(|raw| raw.deserialize().ok())
+                                    .unwrap_or_default();
+                                let key: matrix_sdk::ruma::events::direct::OwnedDirectUserIdentifier =
+                                    user_id.clone().into();
+                                let entry = direct.entry(key).or_default();
+                                let room_id_owned = room.room_id().to_owned();
+                                if !entry.contains(&room_id_owned) {
+                                    entry.push(room_id_owned);
+                                }
+                                if let Err(e) = account.set_account_data(direct).await {
+                                    ::zeroclaw_log::record!(
+                                        WARN,
+                                        ::zeroclaw_log::Event::new(
+                                            module_path!(),
+                                            ::zeroclaw_log::Action::Note
+                                        )
+                                        .with_outcome(
+                                            ::zeroclaw_log::EventOutcome::Unknown
+                                        )
+                                        .with_attrs(::serde_json::json!({
+                                            "error": e.to_string(),
+                                        })),
+                                        "matrix: failed to mark owner DM as direct"
+                                    );
+                                }
+                                room
+                            }
+                        };
+                        *cache = Some((owner.clone(), room.room_id().to_owned()));
+                        room
+                    }
+                }
+            };
+            room.send(
+                matrix_sdk::ruma::events::room::message::RoomMessageEventContent::text_plain(
+                    &notice,
+                ),
+            )
+            .await
+            .map_err(|e| anyhow::Error::msg(format!("matrix: owner notice send failed: {e}")))?;
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        if let Err(err) = result {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "alias": alias,
+                        "owner": owner,
+                        "error": err.to_string(),
+                    })),
+                "matrix: owner notice delivery failed; owner was not notified"
+            );
         }
     }
 
@@ -2514,6 +2723,28 @@ mod inbound {
         }
 
         if !sender_allowed {
+            // Owner heads-up: unlike Telegram's public stub, a Matrix
+            // turn-away is invisible to everyone, so when the alias
+            // configures `owner_user_id` the operator gets a throttled DM
+            // naming the sender, the room, and a bounded preview. Composed
+            // inline (deterministic for tests); the DM round-trips off the
+            // serial inbound loop so a slow homeserver cannot head-of-line
+            // block authorized traffic behind a rejected one.
+            if let Some((notice, owner, client)) =
+                prepare_owner_notice(&ctx, sender, room_id, &body)
+            {
+                let delivery = deliver_owner_notice(
+                    client,
+                    ctx.owner_notice_room.clone(),
+                    owner,
+                    notice,
+                    ctx.alias.clone(),
+                );
+                #[cfg(test)]
+                delivery.await;
+                #[cfg(not(test))]
+                let _delivery_task = ::zeroclaw_spawn::spawn!(delivery);
+            }
             ::zeroclaw_log::record!(
                 DEBUG,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -4521,6 +4752,17 @@ pub struct MatrixChannel {
     bot_display_name: Arc<TokioRwLock<Option<String>>>,
     initial_sync_done: Arc<AtomicBool>,
     undecryptable_seen: Arc<TokioMutex<HashSet<OwnedEventId>>>,
+    /// Cached DM room for the configured owner-notice target: `(owner_user_id,
+    /// room_id)`. Refreshed when the configured owner changes, so switching
+    /// `owner_user_id` re-targets the notice instead of writing into the
+    /// previous owner's DM.
+    owner_notice_room: Arc<TokioMutex<Option<(String, OwnedRoomId)>>>,
+    /// Sliding-window throttle timestamps for owner notices, keyed by
+    /// `(sender, room_id)`: at most one notice per pair per
+    /// [`inbound::OWNER_NOTICE_THROTTLE`]. Matrix has no transport-level
+    /// flood gate like Telegram's, so without this a determined spammer
+    /// would turn the operator's DM into a firehose.
+    owner_notice_throttle: Arc<std::sync::Mutex<HashMap<(String, String), std::time::Instant>>>,
     /// Resolved `ack_reactions` for this Matrix instance — the
     /// per-channel `MatrixConfig.ack_reactions` override falls back to
     /// `[channels].ack_reactions` here at construction time, so the
@@ -4571,6 +4813,8 @@ impl MatrixChannel {
             bot_display_name: Arc::new(TokioRwLock::new(None)),
             initial_sync_done: Arc::new(AtomicBool::new(false)),
             undecryptable_seen: Arc::new(TokioMutex::new(HashSet::new())),
+            owner_notice_room: Arc::new(TokioMutex::new(None)),
+            owner_notice_throttle: Arc::new(std::sync::Mutex::new(HashMap::new())),
             ack_reactions,
         })
     }
@@ -5084,6 +5328,9 @@ impl Channel for MatrixChannel {
             bot_display_name: self.bot_display_name.clone(),
             initial_sync_done: self.initial_sync_done.clone(),
             undecryptable_seen: self.undecryptable_seen.clone(),
+            client: Some(client.clone()),
+            owner_notice_room: self.owner_notice_room.clone(),
+            owner_notice_throttle: self.owner_notice_throttle.clone(),
         };
         inbound::run_sync_loop(client, ctx).await
     }
@@ -7163,6 +7410,9 @@ mod tests {
                 bot_display_name: Arc::new(TokioRwLock::new(None)),
                 initial_sync_done: Arc::new(AtomicBool::new(true)),
                 undecryptable_seen: Arc::new(TokioMutex::new(HashSet::new())),
+                client: None,
+                owner_notice_room: Arc::new(TokioMutex::new(None)),
+                owner_notice_throttle: Arc::new(std::sync::Mutex::new(HashMap::new())),
             }
         }
 
@@ -7925,6 +8175,9 @@ mod tests {
                 bot_display_name: Arc::new(TokioRwLock::new(None)),
                 initial_sync_done: Arc::new(AtomicBool::new(true)),
                 undecryptable_seen: Arc::new(TokioMutex::new(HashSet::new())),
+                client: None,
+                owner_notice_room: Arc::new(TokioMutex::new(None)),
+                owner_notice_throttle: Arc::new(std::sync::Mutex::new(HashMap::new())),
             };
             let (approved_tx, approved_rx) = oneshot::channel();
             let (wrong_tx, _wrong_rx) = oneshot::channel();
@@ -9033,6 +9286,9 @@ mod tests {
                 bot_display_name: Arc::clone(&channel.bot_display_name),
                 initial_sync_done: Arc::clone(&channel.initial_sync_done),
                 undecryptable_seen: Arc::clone(&channel.undecryptable_seen),
+                client: None,
+                owner_notice_room: Arc::clone(&channel.owner_notice_room),
+                owner_notice_throttle: Arc::clone(&channel.owner_notice_throttle),
             };
             inbound::handle_message_for_test(handler_ctx, event, room, RawEvent(raw.into_json()))
                 .await
@@ -10971,6 +11227,7 @@ mod tests {
                 device_id: None,
                 allowed_rooms: vec![],
                 interrupt_on_new_message: false,
+                owner_user_id: None,
                 stream_mode: Default::default(),
                 stream_tool_arguments: vec![],
                 draft_update_interval_ms: 1500,
@@ -12350,6 +12607,122 @@ mod tests {
             assert_eq!(
                 info_size(info),
                 UInt::try_from(image_marker_with_file_mime.data.len()).ok()
+            );
+        }
+    }
+
+    /// Gate, throttle, and composition behavior for the owner notice a
+    /// sender-allowlist drop can trigger. Delivery itself (DM creation,
+    /// send) needs a logged-in client and is exercised by the live test on
+    /// the NB stand; here the pure decision layer is pinned.
+    mod owner_notice_gates {
+        use std::collections::{HashMap, HashSet};
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+        use std::time::{Duration, Instant};
+
+        use matrix_sdk::ruma::user_id;
+        use tokio::sync::{Mutex as TokioMutex, RwLock as TokioRwLock, mpsc};
+        use zeroclaw_config::schema::MatrixConfig;
+
+        use super::super::inbound::{
+            HandlerCtx, compose_owner_notice, owner_notice_preview, owner_notice_throttle_admits,
+            prepare_owner_notice,
+        };
+
+        fn ctx_with_owner(owner: Option<&str>) -> HandlerCtx {
+            let (tx, _rx) = mpsc::channel(1);
+            HandlerCtx {
+                config: Arc::new(MatrixConfig {
+                    owner_user_id: owner.map(str::to_string),
+                    ..MatrixConfig::default()
+                }),
+                alias: "test".to_string(),
+                peer_resolver: Arc::new(|| vec!["*".to_string()]),
+                transcription: None,
+                workspace_dir: None,
+                tx,
+                pending_approvals: Arc::new(TokioMutex::new(HashMap::new())),
+                threads_seen: Arc::new(TokioRwLock::new(HashSet::new())),
+                bot_user_id: user_id!("@bot:localhost").to_owned(),
+                bot_display_name: Arc::new(TokioRwLock::new(None)),
+                initial_sync_done: Arc::new(AtomicBool::new(true)),
+                undecryptable_seen: Arc::new(TokioMutex::new(HashSet::new())),
+                client: None,
+                owner_notice_room: Arc::new(TokioMutex::new(None)),
+                owner_notice_throttle: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            }
+        }
+
+        #[test]
+        fn preview_collapses_whitespace_and_truncates_with_ellipsis() {
+            let collapsed = owner_notice_preview("a\n\n b\t\tc ");
+            assert_eq!(collapsed, "a b c");
+            let long = "word ".repeat(60);
+            let preview = owner_notice_preview(&long);
+            assert!(preview.ends_with('…'));
+            assert!(preview.chars().count() <= 161);
+            assert_eq!(owner_notice_preview("short"), "short");
+        }
+
+        #[test]
+        fn throttle_admits_first_suppresses_within_window_readmits_after() {
+            let mut map = HashMap::new();
+            let t0 = Instant::now();
+            assert!(owner_notice_throttle_admits(&mut map, "@a:s", "!r:s", t0));
+            assert!(!owner_notice_throttle_admits(
+                &mut map,
+                "@a:s",
+                "!r:s",
+                t0 + Duration::from_secs(10)
+            ));
+            // A different (sender, room) pair has its own budget.
+            assert!(owner_notice_throttle_admits(&mut map, "@b:s", "!r:s", t0));
+            // Past the window the pair is admitted again.
+            assert!(owner_notice_throttle_admits(
+                &mut map,
+                "@a:s",
+                "!r:s",
+                t0 + Duration::from_secs(301)
+            ));
+        }
+
+        #[test]
+        fn compose_names_sender_room_preview_and_alias() {
+            let notice = compose_owner_notice(
+                "@alice:example.org",
+                "!room:example.org",
+                "hi there",
+                "mybot",
+            );
+            assert!(notice.contains("@alice:example.org"));
+            assert!(notice.contains("!room:example.org"));
+            assert!(notice.contains("hi there"));
+            assert!(notice.contains("mybot"));
+        }
+
+        #[test]
+        fn prepare_returns_none_without_owner_or_client() {
+            // No owner configured: nothing to send.
+            assert!(
+                prepare_owner_notice(&ctx_with_owner(None), "@mallory:s", "!r:s", "hello")
+                    .is_none()
+            );
+            // Owner configured but no logged-in client (unit-test ctx): the
+            // gate must not pretend a notice was deliverable.
+            assert!(
+                prepare_owner_notice(
+                    &ctx_with_owner(Some("@op:s")),
+                    "@mallory:s",
+                    "!r:s",
+                    "hello"
+                )
+                .is_none()
+            );
+            // Blank owner behaves as unset.
+            assert!(
+                prepare_owner_notice(&ctx_with_owner(Some("   ")), "@mallory:s", "!r:s", "hello")
+                    .is_none()
             );
         }
     }
