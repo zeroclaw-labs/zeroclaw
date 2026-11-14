@@ -1148,6 +1148,32 @@ const MAX_CONCURRENT_BUSY_NOTICES: usize = 1;
 /// must not accumulate detached reply tasks without bound.
 const MAX_CONCURRENT_STOP_REPLIES: usize = 8;
 
+/// Freshness window for addressed message edits. An edit of a message older
+/// than this is a clarification of history, not a live prompt: it is
+/// recorded as passive context instead of triggering an agent turn.
+/// Deliberately not operator-configurable.
+const EDIT_FRESHNESS_SECS: u64 = 600;
+
+/// Bound on distinct pending edits retained for latest-wins coalescing, so a
+/// flood of edits across many messages cannot pin unbounded content behind
+/// the dispatcher.
+const PENDING_EDITS_LIMIT: usize = 128;
+
+/// Marker prepended to a dispatched edit's content so the model sees the
+/// message evolved instead of arriving fresh.
+const EDITED_CONTENT_PREFIX: &str = "[edited] ";
+
+/// Key of one pending edit: the edited message's reply target, sender, and
+/// channel message id.
+type PendingEditKey = (String, String, String);
+
+/// One coalesced edit awaiting its quiet window. `generation` identifies the
+/// latest edit of the message so a superseded timer never dispatches.
+struct PendingEdit {
+    generation: u64,
+    cancel: CancellationToken,
+}
+
 /// Best-effort notices (busy notices, `/stop` acknowledgements) are bounded
 /// in time as well as in count: shutdown drains their tracker, so one send
 /// parked forever inside a stalled transport must not hold process shutdown
@@ -12290,6 +12316,50 @@ fn resolve_effective_debounce_window(
     std::time::Duration::from_millis(per_channel_ms.unwrap_or(global_ms))
 }
 
+fn pending_edit_key(msg: &zeroclaw_api::channel::ChannelMessage) -> PendingEditKey {
+    (msg.reply_target.clone(), msg.sender.clone(), msg.id.clone())
+}
+
+/// Dispatch one coalesced edit once its quiet window elapses, unless a newer
+/// edit of the same message superseded it. The edit re-enters the dispatch
+/// loop through `tx` as an ordinary inbound message carrying the
+/// `[edited]` marker, so it queues behind whatever the conversation is
+/// already doing instead of interrupting it.
+fn spawn_pending_edit_timer(
+    tasks: &Arc<IngressTaskTracker>,
+    pending: &Arc<std::sync::Mutex<HashMap<PendingEditKey, PendingEdit>>>,
+    key: PendingEditKey,
+    msg: zeroclaw_api::channel::ChannelMessage,
+    window: Duration,
+    entry: PendingEdit,
+    tx: tokio::sync::mpsc::UnboundedSender<zeroclaw_api::channel::ChannelMessage>,
+) {
+    let pending = Arc::clone(pending);
+    tasks.spawn(async move {
+        tokio::select! {
+            () = entry.cancel.cancelled() => {}
+            () = tokio::time::sleep(window) => {
+                let superseded = {
+                    let mut map = pending.lock().unwrap_or_else(|e| e.into_inner());
+                    match map.get(&key) {
+                        Some(latest) if latest.generation == entry.generation => {
+                            map.remove(&key);
+                            false
+                        }
+                        _ => true,
+                    }
+                };
+                if !superseded {
+                    let mut msg = msg;
+                    msg.content = format!("{EDITED_CONTENT_PREFIX}{}", msg.content);
+                    msg.edited = false;
+                    let _ = tx.send(msg);
+                }
+            }
+        }
+    });
+}
+
 /// Drop guard reclaiming abandoned model-picker delivery-ack
 /// registrations when the production dispatch pipeline (`start_channels`)
 /// tears down — whether it returns normally or its future is dropped on
@@ -12360,6 +12430,14 @@ async fn run_message_dispatch_loop_until_cancelled(
     // its replies). Recording the owner keeps a cancellation from retiring a
     // bucket another, still-live turn is waiting in.
     let mut debounce_bucket_owners: HashMap<String, u64> = HashMap::new();
+    // Latest-wins coalescing state for addressed message edits: one pending
+    // edit per (reply target, sender, message id), dispatched after a quiet
+    // debounce window through `pending_edit_rx`.
+    let pending_edits: Arc<std::sync::Mutex<HashMap<PendingEditKey, PendingEdit>>> =
+        Arc::new(std::sync::Mutex::new(HashMap::new()));
+    let edit_generation = AtomicU64::new(1);
+    let (pending_edit_tx, mut pending_edit_rx) =
+        tokio::sync::mpsc::unbounded_channel::<zeroclaw_api::channel::ChannelMessage>();
 
     let cancelled = loop {
         let msg = tokio::select! {
@@ -12368,6 +12446,15 @@ async fn run_message_dispatch_loop_until_cancelled(
             msg = rx.recv() => match msg {
                 Some(msg) => msg,
                 None => break false,
+            },
+            // Coalesced edits re-enter here once their quiet window elapses;
+            // they carry the "[edited] " marker and flow through the
+            // standard path below.
+            msg = pending_edit_rx.recv() => match msg {
+                Some(msg) => msg,
+                // The loop holds a sender for its entire life, so this
+                // channel can only close after the loop is gone.
+                None => continue,
             },
         };
         // Acquire picker-delivery ownership at the first definitive queue
@@ -12428,6 +12515,72 @@ async fn run_message_dispatch_loop_until_cancelled(
         let Some(ctx) = router.resolve(&msg) else {
             ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"channel_alias": msg.channel_alias, "sender": msg.sender})), "dropping inbound message: no agent owns this channel");
             continue;
+        };
+
+        // ── Edited inbound messages: freshness gate + latest-wins ─────
+        // An edit (Telegram `edited_message`) replaces the meaning of the
+        // original message. An addressed edit of a stale original is a
+        // clarification of history: recorded as passive context without an
+        // agent turn. A fresh one coalesces latest-wins over the channel's
+        // debounce window and dispatches once through the standard path
+        // with an "[edited] " marker; it never interrupts a turn already
+        // in flight. A passive edit is unaddressed and is handled by the
+        // ordinary passive-context path.
+        let msg = if msg.edited && !msg.passive_context {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            if now.saturating_sub(msg.timestamp) > EDIT_FRESHNESS_SECS {
+                let history_key = runtime_conversation_history_key(ctx.as_ref(), &msg);
+                record_passive_context(ctx.as_ref(), &msg, &history_key);
+                continue;
+            }
+            let window = resolve_effective_debounce_window(
+                ctx.prompt_config.channels.debounce_ms,
+                &msg.channel,
+                msg.channel_alias.as_deref(),
+                &ctx.prompt_config.channels.telegram,
+            );
+            if !window.is_zero() {
+                let key = pending_edit_key(&msg);
+                let mut pending = pending_edits.lock().unwrap_or_else(|e| e.into_inner());
+                if pending.len() < PENDING_EDITS_LIMIT || pending.contains_key(&key) {
+                    let generation = edit_generation.fetch_add(1, Ordering::SeqCst);
+                    let timer_cancel = CancellationToken::new();
+                    if let Some(previous) = pending.insert(
+                        key.clone(),
+                        PendingEdit {
+                            generation,
+                            cancel: timer_cancel.clone(),
+                        },
+                    ) {
+                        previous.cancel.cancel();
+                    }
+                    drop(pending);
+                    spawn_pending_edit_timer(
+                        &debounce_tasks,
+                        &pending_edits,
+                        key,
+                        msg,
+                        window,
+                        PendingEdit {
+                            generation,
+                            cancel: timer_cancel,
+                        },
+                        pending_edit_tx.clone(),
+                    );
+                    continue;
+                }
+                // The pending-edit budget is exhausted: fall through and
+                // dispatch this edit immediately instead of retaining it.
+            }
+            let mut msg = msg;
+            msg.content = format!("{EDITED_CONTENT_PREFIX}{}", msg.content);
+            msg.edited = false;
+            msg
+        } else {
+            msg
         };
 
         // Gate answers were already considered against the global approval
@@ -13241,6 +13394,7 @@ fn build_channel_by_id(
                 .with_tts(&config)
                 .with_workspace_dir(workspace_dir)
                 .with_per_user_session(tg.per_user_session)
+                .with_edited_messages(tg.edited_messages)
                 .with_approval_timeout_secs(tg.approval_timeout_secs),
             ))
         }
@@ -14824,6 +14978,7 @@ fn collect_configured_channels_with_authority(
                     .with_proxy_url(tg.proxy_url.clone())
                     .with_tool_command_specs(tool_specs.to_vec())
                     .with_per_user_session(tg.per_user_session)
+                    .with_edited_messages(tg.edited_messages)
                     .with_approval_timeout_secs(tg.approval_timeout_secs),
                 ),
                 tg,
@@ -28955,6 +29110,255 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(
             user_history.contains("[Current WhatsApp group message from alice]"),
             "active group turn should preserve current sender attribution, got: {user_history}"
+        );
+    }
+
+    fn edited_test_message(
+        id: &str,
+        content: &str,
+        timestamp: u64,
+    ) -> zeroclaw_api::channel::ChannelMessage {
+        zeroclaw_api::channel::ChannelMessage {
+            id: id.into(),
+            sender: "alice".into(),
+            reply_target: "tg-chat-1".into(),
+            content: content.into(),
+            channel: "test-channel".into(),
+            timestamp,
+            edited: true,
+            ..Default::default()
+        }
+    }
+
+    async fn wait_for_provider_calls(
+        provider_impl: &Arc<HistoryCaptureModelProvider>,
+        count: usize,
+    ) {
+        let ready = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if provider_impl
+                    .calls
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .len()
+                    >= count
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .is_ok();
+        assert!(ready, "expected {count} provider call(s) within 3s");
+    }
+
+    #[tokio::test]
+    async fn edited_message_fresh_dispatches_with_edited_marker() {
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let provider_impl = Arc::new(HistoryCaptureModelProvider::default());
+        let provider: Arc<dyn ModelProvider> = provider_impl.clone();
+        let runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            provider,
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(8);
+        let loop_task = zeroclaw_spawn::spawn!(run_message_dispatch_loop(
+            rx,
+            AgentRouter::single(runtime_ctx),
+            2
+        ));
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        tx.send(edited_test_message("telegram_1_71", "edited question", now))
+            .await
+            .unwrap();
+
+        wait_for_provider_calls(&provider_impl, 1).await;
+
+        drop(tx);
+        tokio::time::timeout(Duration::from_secs(2), loop_task)
+            .await
+            .expect("dispatch loop must finish")
+            .unwrap();
+
+        let calls = provider_impl
+            .calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert_eq!(calls.len(), 1);
+        let user_content = calls[0]
+            .iter()
+            .filter(|(role, _)| role == "user")
+            .map(|(_, content)| content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            user_content.contains("[edited] edited question"),
+            "dispatched edit must carry the [edited] marker, got: {user_content}"
+        );
+    }
+
+    #[tokio::test]
+    async fn edited_message_stale_records_history_without_agent_turn() {
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let provider_impl = Arc::new(HistoryCaptureModelProvider::default());
+        let provider: Arc<dyn ModelProvider> = provider_impl.clone();
+        let runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            provider,
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(8);
+        let loop_task = zeroclaw_spawn::spawn!(run_message_dispatch_loop(
+            rx,
+            AgentRouter::single(runtime_ctx),
+            2
+        ));
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let stale_ts = now.saturating_sub(EDIT_FRESHNESS_SECS + 10);
+        tx.send(edited_test_message(
+            "telegram_1_72",
+            "old clarification",
+            stale_ts,
+        ))
+        .await
+        .unwrap();
+
+        // Give the loop a beat to record the stale edit, then prove it
+        // started no turn by driving a fresh follow-up through the same
+        // session: the follow-up's history must contain the edit.
+        tx.send(zeroclaw_api::channel::ChannelMessage {
+            id: "telegram_1_73".into(),
+            sender: "alice".into(),
+            reply_target: "tg-chat-1".into(),
+            content: "what did I clarify?".into(),
+            channel: "test-channel".into(),
+            timestamp: now,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+        wait_for_provider_calls(&provider_impl, 1).await;
+
+        drop(tx);
+        tokio::time::timeout(Duration::from_secs(2), loop_task)
+            .await
+            .expect("dispatch loop must finish")
+            .unwrap();
+
+        let calls = provider_impl
+            .calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            calls.len(),
+            1,
+            "a stale edit must not start an agent turn of its own"
+        );
+        let user_content = calls[0]
+            .iter()
+            .filter(|(role, _)| role == "user")
+            .map(|(_, content)| content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            user_content.contains("old clarification"),
+            "stale edit must be recorded as history context, got: {user_content}"
+        );
+        assert!(
+            !user_content.contains("[edited] old clarification"),
+            "a recorded stale edit is passive context, not a dispatch"
+        );
+    }
+
+    #[tokio::test]
+    async fn edited_message_coalesces_latest_wins() {
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let provider_impl = Arc::new(HistoryCaptureModelProvider::default());
+        let provider: Arc<dyn ModelProvider> = provider_impl.clone();
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.channels.debounce_ms = 50;
+        let runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            provider,
+            config,
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(8);
+        let loop_task = zeroclaw_spawn::spawn!(run_message_dispatch_loop(
+            rx,
+            AgentRouter::single(runtime_ctx),
+            2
+        ));
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        tx.send(edited_test_message("telegram_1_74", "first version", now))
+            .await
+            .unwrap();
+        tx.send(edited_test_message("telegram_1_74", "second version", now))
+            .await
+            .unwrap();
+
+        wait_for_provider_calls(&provider_impl, 1).await;
+        // Give a (hypothetical) second dispatch time to arrive before
+        // asserting the coalesced count.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        drop(tx);
+        tokio::time::timeout(Duration::from_secs(2), loop_task)
+            .await
+            .expect("dispatch loop must finish")
+            .unwrap();
+
+        let calls = provider_impl
+            .calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            calls.len(),
+            1,
+            "two edits of one message must coalesce into one dispatch"
+        );
+        let user_content = calls[0]
+            .iter()
+            .filter(|(role, _)| role == "user")
+            .map(|(_, content)| content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            user_content.contains("[edited] second version"),
+            "latest-wins must dispatch the last edit, got: {user_content}"
+        );
+        assert!(
+            !user_content.contains("first version"),
+            "latest-wins must replace the superseded edit, not concatenate"
         );
     }
 
@@ -48112,6 +48516,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel_alias: None,
                 timestamp: 1,
                 passive_context: false,
+                edited: false,
                 explicitly_addressed: false,
                 conversation_scope: zeroclaw_api::channel::ChannelConversationScope::Sender,
                 thread_ts: None,
@@ -51809,6 +52214,7 @@ This is an example JSON object for profile settings."#;
                 channel_alias: None,
                 timestamp: 1,
                 passive_context: false,
+                edited: false,
                 explicitly_addressed: false,
                 conversation_scope: zeroclaw_api::channel::ChannelConversationScope::Sender,
                 thread_ts: None,
@@ -53533,6 +53939,7 @@ This is an example JSON object for profile settings."#;
                 unauthorized_message: None,
                 per_user_session: true,
                 passive_group_context: false,
+                edited_messages: false,
                 ack_reactions: None,
                 proxy_url: None,
                 approval_timeout_secs: 120,
@@ -53566,6 +53973,7 @@ This is an example JSON object for profile settings."#;
                 unauthorized_message: None,
                 per_user_session: true,
                 passive_group_context: false,
+                edited_messages: false,
                 ack_reactions: None,
                 proxy_url: None,
                 approval_timeout_secs: 120,

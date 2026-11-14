@@ -17259,6 +17259,15 @@ pub struct TelegramConfig {
     #[tab(Behavior)]
     #[serde(default)]
     pub passive_group_context: bool,
+    /// When true, Telegram `edited_message` updates are processed as
+    /// inbound messages: an addressed edit of a fresh message triggers the
+    /// agent (coalesced latest-wins over the debounce window and dispatched
+    /// with an `[edited]` marker), while an edit of a message older than the
+    /// freshness window is recorded as history context only. Default:
+    /// `false` — edits are ignored.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub edited_messages: bool,
     /// Override for the top-level `ack_reactions` setting. When `None`, the
     /// channel falls back to `[channels].ack_reactions`. When set
     /// explicitly, it takes precedence.
@@ -17315,6 +17324,7 @@ impl Default for TelegramConfig {
             reply_min_interval_secs: 0,
             reply_queue_depth_max: 0,
             debounce_ms: None,
+            edited_messages: false,
         }
     }
 }
@@ -34968,6 +34978,7 @@ auto_save = true
                         unauthorized_message: None,
                         per_user_session: true,
                         passive_group_context: false,
+                        edited_messages: false,
                         ack_reactions: None,
                         proxy_url: None,
                         approval_timeout_secs: default_telegram_approval_timeout_secs(),
@@ -37007,6 +37018,7 @@ default_temperature = 0.7
             unauthorized_message: None,
             per_user_session: true,
             passive_group_context: false,
+            edited_messages: false,
             ack_reactions: None,
             proxy_url: None,
             approval_timeout_secs: 120,
@@ -37057,6 +37069,19 @@ stream_mode = "single_message"
         let parsed: TelegramConfig =
             serde_json::from_str(r#"{"bot_token":"t","passive_group_context":true}"#).unwrap();
         assert!(parsed.passive_group_context);
+    }
+
+    #[test]
+    async fn telegram_config_edited_messages_defaults_off() {
+        let parsed: TelegramConfig = serde_json::from_str(r#"{"bot_token":"t"}"#).unwrap();
+        assert!(!parsed.edited_messages);
+    }
+
+    #[test]
+    async fn telegram_config_edited_messages_deserializes_true() {
+        let parsed: TelegramConfig =
+            serde_json::from_str(r#"{"bot_token":"t","edited_messages":true}"#).unwrap();
+        assert!(parsed.edited_messages);
     }
 
     #[test]
@@ -43833,6 +43858,7 @@ high_entropy_tokens = false
                 unauthorized_message: None,
                 per_user_session: true,
                 passive_group_context: false,
+                edited_messages: false,
                 ack_reactions: None,
                 proxy_url: None,
                 approval_timeout_secs: default_telegram_approval_timeout_secs(),
