@@ -27834,10 +27834,19 @@ fn apply_dirty_natural_key_path(
         // because two parallel walks (in-memory vs on-disk) drifted apart;
         // a forked copy here would recreate exactly that hazard, so any
         // future fix to dash handling lands in both code paths at once.
-        let inner_segments: Vec<String> = match mem_entry {
-            Some(table) => resolve_dirty_segments(table, &inner_raw),
-            None => inner_raw.iter().map(|s| (*s).to_string()).collect(),
-        };
+        // A deleted dotted map key is only present in the persisted entry.
+        let disk_entry = find_array_of_tables_entry_mut(
+            root,
+            parent_segs,
+            array_key,
+            section.natural_key_field,
+            alias,
+        );
+        let inner_segments = resolve_dirty_segments_from_sources(
+            mem_entry,
+            disk_entry.map(|table| table as &dyn toml_edit::TableLike),
+            &inner_raw,
+        );
         let inner_segs: Vec<&str> = inner_segments.iter().map(String::as_str).collect();
 
         let mem_inner_val = mem_entry.and_then(|t| lookup_path_in_table(t, &inner_segs));

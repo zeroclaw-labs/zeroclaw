@@ -81,6 +81,17 @@ impl PluginInstanceId {
         &self.binding
     }
 
+    /// Recover a canonical identity from a configuration entry key.
+    pub fn from_config_entry_key(key: &str) -> Option<Self> {
+        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(key.strip_prefix("zpi1_")?)
+            .ok()?;
+        let (package, capability, binding): (String, PluginCapability, String) =
+            serde_json::from_slice(&bytes).ok()?;
+        let id = Self::new(package, capability, binding).ok()?;
+        (id.config_entry_key().ok()?.as_str() == key).then_some(id)
+    }
+
     /// Dotted-config-safe key for host-owned state belonging to this instance.
     ///
     /// The versioned payload is a Base64URL encoding of the canonical JSON

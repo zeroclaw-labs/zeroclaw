@@ -938,6 +938,12 @@ fn config_admin_router(route_auth: principal_gate::ConfigRouteAuth) -> Router<Ap
                 .delete(api_config::handle_prop_delete)
                 .options(api_config::handle_options_prop),
         )
+        .route(
+            "/api/config/plugin-tls-credentials",
+            get(api_config::list_plugin_tls_credentials)
+                .post(api_config::mutate_plugin_tls_credential)
+                .layer(axum::extract::DefaultBodyLimit::max(64 * 1024)),
+        )
         .route("/api/config/list", get(api_config::handle_list))
         .route("/api/config/drift", get(api_config::handle_drift))
         .route(

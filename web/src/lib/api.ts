@@ -1382,6 +1382,35 @@ export interface MapKeyResponse {
   created: boolean;
 }
 
+export interface PluginTlsCredential {
+  instance: string;
+  property: string;
+  configured: boolean;
+  profiles: Record<string, string[]>;
+}
+
+const pluginTlsCredentialsPath = "/api/config/plugin-tls-credentials";
+
+export function listPluginTlsCredentials() {
+  return apiFetch<{ encryption_enabled: boolean; credentials: PluginTlsCredential[] }>(
+    pluginTlsCredentialsPath,
+  );
+}
+
+export function changePluginTlsCredential(
+  credential: Pick<PluginTlsCredential, "instance" | "property">,
+  mutation: { operation: "create" | "replace"; value: string } | { operation: "delete" },
+) {
+  return apiFetch<{ configured: boolean }>(pluginTlsCredentialsPath, {
+    method: "POST",
+    body: JSON.stringify({
+      instance: credential.instance,
+      property: credential.property,
+      ...mutation,
+    }),
+  });
+}
+
 // ── Shared workspace browse ────────────────────────────────────────
 // Hard-scoped to `<install>/shared/`. The gateway adapter at
 // `crates/zeroclaw-gateway/src/api_browse.rs` defers all containment
