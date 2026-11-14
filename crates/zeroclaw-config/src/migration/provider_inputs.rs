@@ -865,6 +865,17 @@ pub(crate) fn normalize(config: &mut Config) -> Result<()> {
 }
 
 pub(crate) fn normalize_definitions(config: &mut Config) -> Result<()> {
+    normalize_definitions_inner(config, true)
+}
+
+/// Test-fixture admission preserves projection even when a fixture is
+/// intentionally invalid and validation is the behavior under test.
+#[cfg(any(test, feature = "test-helpers"))]
+pub(crate) fn normalize_for_test(config: &mut Config) -> Result<()> {
+    normalize_definitions_inner(config, false)
+}
+
+fn normalize_definitions_inner(config: &mut Config, validate: bool) -> Result<()> {
     if !has_legacy_input(config) {
         config.providers.canonical_registry()?;
         return Ok(());
@@ -892,7 +903,9 @@ pub(crate) fn normalize_definitions(config: &mut Config) -> Result<()> {
             agent.transcription_provider = reference.to_string().into();
         }
     }
-    registry.validate()?;
+    if validate {
+        registry.validate()?;
+    }
     config.providers.connections = registry.connections;
     config.providers.models = Default::default();
     config.providers.models.canonical_models =

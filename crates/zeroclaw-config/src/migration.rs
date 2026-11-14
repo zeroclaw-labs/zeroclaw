@@ -3085,7 +3085,7 @@ pub(crate) fn toml_value_to_edit_item(value: &toml::Value) -> toml_edit::Item {
 /// normalization as deserialization. Production consumers never call this.
 #[cfg(any(test, feature = "test-helpers"))]
 pub fn normalize_test_input(config: &mut Config) {
-    provider_inputs::normalize(config).expect("valid historical provider fixture");
+    provider_inputs::normalize_for_test(config).expect("valid historical provider fixture");
 }
 
 /// An explicit input boundary for fixtures that keep their historical source
@@ -3133,7 +3133,7 @@ pub fn try_admit_test_input(input: &Config) -> Result<Config> {
         .canonical_models
         .retain(|_, model| !generated_connections.contains(model.provider()));
 
-    provider_inputs::normalize(&mut config)?;
+    provider_inputs::normalize_for_test(&mut config)?;
     if source_models.iter_entries().next().is_some() {
         let canonical_models = config.providers.models.canonical_models.clone();
         config.providers.models = source_models;
