@@ -81,6 +81,7 @@ const SUPPORTED_PROXY_SERVICE_KEYS: &[&str] = &[
     "channel.lark",
     "channel.matrix",
     "channel.mattermost",
+    "channel.zulip",
     "channel.nextcloud_talk",
     "channel.qq",
     "channel.signal",
@@ -16327,6 +16328,10 @@ pub struct ChannelsConfig {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
     pub mattermost: HashMap<String, MattermostConfig>,
+    /// Zulip bot channel instances (`[channels.zulip.<alias>]`).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[nested]
+    pub zulip: HashMap<String, ZulipConfig>,
     /// Webhook channel instances (`[channels.webhook.<alias>]`).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
@@ -16542,6 +16547,13 @@ impl ChannelsConfig {
                 name: "Mattermost",
                 desc: "connect to your bot",
                 configured: !self.mattermost.is_empty(),
+            },
+            ChannelInfo {
+                kind: "zulip",
+                config_key: "zulip",
+                name: "Zulip",
+                desc: "connect your bot",
+                configured: !self.zulip.is_empty(),
             },
             ChannelInfo {
                 kind: "imessage",
@@ -16780,6 +16792,7 @@ impl ChannelsConfig {
             || self.discord.values().any(|c| c.enabled)
             || self.slack.values().any(|c| c.enabled)
             || self.mattermost.values().any(|c| c.enabled)
+            || self.zulip.values().any(|c| c.enabled)
             || self.webhook.values().any(|c| c.enabled)
             || self.imessage.values().any(|c| c.enabled)
             || self.matrix.values().any(|c| c.enabled)
@@ -16821,12 +16834,13 @@ impl ChannelsConfig {
     /// amqp are fan-in listeners; voice_wake is input-only), so a name-addressed
     /// outbound surface such as `heartbeat.target` can refuse them at validation
     /// instead of accepting a target the delivery layer silently drops.
-    pub fn channel_presence(&self) -> [(&'static str, bool, bool); 36] {
+    pub fn channel_presence(&self) -> [(&'static str, bool, bool); 37] {
         [
             ("telegram", !self.telegram.is_empty(), true),
             ("discord", !self.discord.is_empty(), true),
             ("slack", !self.slack.is_empty(), true),
             ("mattermost", !self.mattermost.is_empty(), true),
+            ("zulip", !self.zulip.is_empty(), true),
             ("webhook", !self.webhook.is_empty(), true),
             ("imessage", !self.imessage.is_empty(), true),
             ("matrix", !self.matrix.is_empty(), true),
@@ -16913,6 +16927,7 @@ impl Default for ChannelsConfig {
             discord: HashMap::new(),
             slack: HashMap::new(),
             mattermost: HashMap::new(),
+            zulip: HashMap::new(),
             webhook: HashMap::new(),
             imessage: HashMap::new(),
             matrix: HashMap::new(),
@@ -17944,6 +17959,102 @@ impl ChannelConfig for MattermostConfig {
     }
 }
 
+/// Zulip bot channel configuration.
+///
+/// `Default` is implemented below rather than derived, for the same reason as
+/// [`MattermostConfig`]: a derived `approval_timeout_secs` of `0` would deny
+/// every approval.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "channels.zulip"]
+pub struct ZulipConfig {
+    /// Whether this channel is active. The runtime only loads channels whose
+    /// `enabled = true`.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub enabled: bool,
+    /// Zulip server URL (e.g. `"https://zulip.example.com"`).
+    #[tab(Connection)]
+    #[serde(default)]
+    pub site: String,
+    /// Bot email (Settings → Bots).
+    #[tab(Connection)]
+    #[serde(default)]
+    pub email: String,
+    /// Bot API key.
+    #[secret]
+    #[tab(Connection)]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    #[serde(default)]
+    pub api_key: String,
+    /// PEM file with an extra root CA to trust for `site`, for servers behind
+    /// a private certificate authority. Added to the built-in web PKI roots.
+    #[tab(Connection)]
+    #[serde(default)]
+    pub tls_ca_cert_path: Option<String>,
+    /// Numeric stream IDs to listen on. Empty = every stream the bot is
+    /// subscribed to.
+    #[tab(Advanced)]
+    #[serde(default)]
+    pub stream_ids: Vec<String>,
+    /// In streams, respond only when mentioned. DMs always bypass this filter.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub mention_only: Option<bool>,
+    /// Whether this alias answers direct messages (default true). Set false when
+    /// several aliases share one bot, each bound to its own streams.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub dm_enabled: Option<bool>,
+    /// Per-channel proxy URL; overrides the global `[proxy]` setting.
+    #[tab(Advanced)]
+    #[serde(default)]
+    pub proxy_url: Option<String>,
+    /// Tools excluded from this channel's tool spec.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub excluded_tools: Vec<String>,
+    /// Per-(channel, recipient) outbound pacing floor in seconds.
+    #[serde(default)]
+    pub reply_min_interval_secs: u64,
+    /// Per-(channel, recipient) outbound pacing queue depth.
+    #[serde(default)]
+    pub reply_queue_depth_max: u16,
+    /// Seconds to wait for operator approval before auto-denying.
+    #[tab(Behavior)]
+    #[serde(default = "default_channel_approval_timeout_secs")]
+    pub approval_timeout_secs: u64,
+}
+
+impl Default for ZulipConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            site: String::new(),
+            email: String::new(),
+            api_key: String::new(),
+            tls_ca_cert_path: None,
+            stream_ids: Vec::new(),
+            mention_only: None,
+            dm_enabled: None,
+            proxy_url: None,
+            excluded_tools: Vec::new(),
+            reply_min_interval_secs: 0,
+            reply_queue_depth_max: 0,
+            approval_timeout_secs: default_channel_approval_timeout_secs(),
+        }
+    }
+}
+
+impl ChannelConfig for ZulipConfig {
+    fn name() -> &'static str {
+        "Zulip"
+    }
+    fn desc() -> &'static str {
+        "connect your bot"
+    }
+}
+
 /// Webhook channel configuration.
 ///
 /// Receives messages via HTTP POST and sends replies to a configurable outbound URL.
@@ -18782,6 +18893,7 @@ impl_reply_pacing!(
     DiscordConfig,
     SlackConfig,
     MattermostConfig,
+    ZulipConfig,
     WebhookConfig,
     IMessageConfig,
     MatrixConfig,
@@ -24518,6 +24630,7 @@ impl Config {
             .chain(rows("discord", &c.discord))
             .chain(rows("slack", &c.slack))
             .chain(rows("mattermost", &c.mattermost))
+            .chain(rows("zulip", &c.zulip))
             .chain(rows("webhook", &c.webhook))
             .chain(rows("imessage", &c.imessage))
             .chain(rows("matrix", &c.matrix))
@@ -34979,6 +35092,7 @@ auto_save = true
                 discord: HashMap::new(),
                 slack: HashMap::new(),
                 mattermost: HashMap::new(),
+                zulip: HashMap::new(),
                 webhook: HashMap::new(),
                 imessage: HashMap::new(),
                 matrix: HashMap::new(),
@@ -37366,6 +37480,7 @@ allowed_users = ["@u:matrix.org"]
             discord: HashMap::new(),
             slack: HashMap::new(),
             mattermost: HashMap::new(),
+            zulip: HashMap::new(),
             webhook: HashMap::new(),
             imessage: HashMap::from([(
                 "default".to_string(),
@@ -37991,6 +38106,7 @@ allowed_numbers = ["+1", "+2"]
             discord: HashMap::new(),
             slack: HashMap::new(),
             mattermost: HashMap::new(),
+            zulip: HashMap::new(),
             webhook: HashMap::new(),
             imessage: HashMap::new(),
             matrix: HashMap::new(),
