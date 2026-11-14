@@ -14,12 +14,13 @@ use serde_json::json;
 use tokio::sync::{Mutex, RwLock};
 use tokio::time::{Duration, Instant, timeout, timeout_at};
 
+use crate::mcp_oauth::{McpOAuthManager, TransportOAuth};
 use crate::mcp_prompt::{McpGetPromptResult, McpPromptsListResult};
 use crate::mcp_protocol::{JsonRpcRequest, MCP_PROTOCOL_VERSION, McpToolDef, McpToolsListResult};
 use crate::mcp_resource::{McpResourceContents, McpResourcesListResult};
 use crate::mcp_transport::{
     McpRecoveryGate, McpRequestLifecycle, McpTransportError, SharedMcpTransportConn,
-    create_shared_transport,
+    create_shared_transport_with_oauth,
 };
 use zeroclaw_config::schema::{McpServerConfig, McpTransport};
 
@@ -45,6 +46,13 @@ async fn handshake(
     server_name: &str,
     epoch: u64,
 ) -> Result<McpServerCapabilities> {
+    // The interactive OAuth sign-in (when configured) is a human-paced
+    // loopback wait, not a network receive: run it before the request
+    // timeouts below exist, so the browser flow keeps its full callback
+    // budget instead of being canceled at `RECV_TIMEOUT_SECS`. No-op for
+    // non-OAuth transports.
+    transport.prepare_auth().await?;
+
     let init_req = JsonRpcRequest::new(
         1,
         "initialize",
@@ -324,14 +332,32 @@ impl Drop for OutcomeUnknownGuard {
 impl McpServer {
     /// Connect to the server, perform the initialize handshake, and fetch the tool list.
     pub async fn connect(config: McpServerConfig) -> Result<Self> {
+        Self::connect_with_oauth(config, None).await
+    }
+
+    /// Connect with an optional OAuth handle (`crate::mcp_oauth`). A server
+    /// configured with `oauth = true` on a remote transport requires the
+    /// handle: connecting without one is an actionable error, never a
+    /// silent unauthenticated attempt.
+    pub async fn connect_with_oauth(
+        config: McpServerConfig,
+        oauth: Option<TransportOAuth>,
+    ) -> Result<Self> {
+        if config.oauth && config.transport != McpTransport::Stdio && oauth.is_none() {
+            bail!(
+                "MCP server `{}` is configured with `oauth = true` but no OAuth manager is available; MCP OAuth fails closed when secrets are unencrypted, so check `secrets.encrypt`",
+                config.name
+            );
+        }
         // Create transport based on config
-        let transport: Arc<dyn SharedMcpTransportConn> =
-            Arc::from(create_shared_transport(&config).with_context(|| {
+        let transport: Arc<dyn SharedMcpTransportConn> = Arc::from(
+            create_shared_transport_with_oauth(&config, oauth).with_context(|| {
                 format!(
                     "failed to create transport for MCP server `{}`",
                     config.name
                 )
-            })?);
+            })?,
+        );
         let epoch_gate = Arc::new(RwLock::new(0));
         let serial_gate =
             (config.transport != McpTransport::Stdio).then(|| Arc::new(Mutex::new(())));
@@ -894,12 +920,30 @@ pub struct McpRegistry {
 impl McpRegistry {
     /// Connect to all configured servers. Non-fatal: failures are logged and skipped.
     pub async fn connect_all(configs: &[McpServerConfig]) -> Result<Self> {
+        Self::connect_all_with_oauth(configs, None, false).await
+    }
+
+    /// `connect_all` with the process-wide OAuth manager. `interactive`
+    /// decides the whole-process sign-in posture: an interactive assembly
+    /// may run the browser flow for a server that has no stored grant yet;
+    /// the background runtime never does (design §5) and simply skips such
+    /// servers with the actionable `authorize from an interactive session`
+    /// error logged by the non-fatal path below.
+    pub async fn connect_all_with_oauth(
+        configs: &[McpServerConfig],
+        oauth_manager: Option<&std::sync::Arc<McpOAuthManager>>,
+        interactive: bool,
+    ) -> Result<Self> {
         let mut servers = Vec::new();
         let mut tool_index = HashMap::new();
         let mut server_index = HashMap::new();
 
         for config in configs {
-            match McpServer::connect(config.clone()).await {
+            let oauth = oauth_manager.and_then(|manager| {
+                (config.oauth && config.transport != McpTransport::Stdio)
+                    .then(|| TransportOAuth::new(Arc::clone(manager), config.clone(), interactive))
+            });
+            match McpServer::connect_with_oauth(config.clone(), oauth).await {
                 Ok(server) => {
                     let server_idx = servers.len();
                     server_index.insert(config.name.clone(), server_idx);
