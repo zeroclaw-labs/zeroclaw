@@ -60,6 +60,10 @@ nix = { version = "0.30", default-features = false, features = ["process", "sign
 process-wrap = { version = "=9.0.0", default-features = false, features = ["job-object", "kill-on-drop", "tokio1"] }
 windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
 
+[[bin]]
+name = "llmtr-chat"
+path = "src/bin/llmtr_chat.rs"
+
 [features]
 default = []
 test-helpers = []

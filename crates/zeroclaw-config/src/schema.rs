@@ -3673,6 +3673,47 @@ pub struct ZerorouterModelProviderConfig {
     pub base: ModelProviderConfig,
 }
 
+// ── LLMTR (OpenAI-compatible chat gateway) ──
+
+/// LLMTR endpoint. The single variant is the public gateway base
+/// `https://llmtr.com/v1`. Chat uses `POST /v1/chat/completions` only.
+/// `GET /v1/models` is public and does not validate an API key.
+/// [`LLMTR_DEFAULT_URL`] is the canonical default consumed by both schema
+/// and provider construction.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum LlmtrEndpoint {
+    #[default]
+    Default,
+}
+
+/// Default API base for the LLMTR chat-completions gateway.
+pub const LLMTR_DEFAULT_URL: &str = "https://llmtr.com/v1";
+
+/// Model id verified on the public LLMTR catalog. Examples and the local
+/// one-chat smoke use this id verbatim. It is not a generated alias and it
+/// is not a token-limit default.
+pub const LLMTR_EXAMPLE_MODEL: &str = "minimax/minimax-m3.1-flash";
+
+impl ModelEndpoint for LlmtrEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => LLMTR_DEFAULT_URL,
+        }
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.llmtr"]
+pub struct LlmtrModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
 // ── Custom (user-supplied URL, no canonical default) ──
 
 /// Custom catch-all for operator-defined endpoints. The endpoint variant has
@@ -3795,6 +3836,7 @@ impl_default_family_endpoint! {
     NearaiModelProviderConfig,
     NovitaModelProviderConfig,
     ZerorouterModelProviderConfig,
+    LlmtrModelProviderConfig,
     NvidiaModelProviderConfig,
     TelnyxModelProviderConfig,
     VercelModelProviderConfig,

@@ -461,6 +461,42 @@ from the environment the same way as any other provider key (see
 > OAuth, or provider-specific credential storage. Set `api_key` (or its env
 > injection) to run inference.
 
+### LLMTR: slot `llmtr`
+
+```toml
+[providers.models.llmtr.home]
+model   = "minimax/minimax-m3.1-flash"
+api_key = "..."
+```
+
+OpenAI-compatible chat gateway at `https://llmtr.com/v1`. Bearer auth.
+Requests go to `POST /v1/chat/completions`. This slot does not select the
+Responses API: `wire_api = "responses"` is ignored.
+
+`GET /v1/models` is public. A successful listing does not validate
+`api_key`. Inference needs a key on the typed alias. Bridge an existing
+`LLMTR_API_KEY` with
+`ZEROCLAW_providers__models__llmtr__home__api_key="$LLMTR_API_KEY"`.
+The provider constructor does not read `LLMTR_API_KEY` itself.
+
+Model ids are sent verbatim, including an `llmtr/` prefix and a vendor path
+such as `minimax/minimax-m3.1-flash`. The public catalog record for that id
+(retrieved 2026-11-06) reports `context_length` 1000000 and
+`top_provider.max_completion_tokens` 524288, and it lists only
+`CHAT_COMPLETIONS` / `/v1/chat/completions`. Those figures are catalog
+fields. This slot does not copy them into the request, and it does not ship
+a price table. When the live record includes `pricing.prompt`,
+`pricing.completion`, or `pricing.input_cache_read`, listing keeps those
+strings. Set `max_tokens` when the completion must be shorter than the
+catalog cap.
+
+That catalog record also marks reasoning as mandatory and enabled by
+default on the server. This slot omits a `reasoning` object and omits
+`reasoning_effort`. It does not send a disable flag. Server-side reasoning
+still applies.
+
+Use the canonical `llmtr` slot only.
+
 ---
 
 ## All slots

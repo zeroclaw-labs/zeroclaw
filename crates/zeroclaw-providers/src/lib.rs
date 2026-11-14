@@ -2409,6 +2409,7 @@ pub fn list_model_providers() -> Vec<ModelProviderInfo> {
             ("kilocli", "KiloCLI", true),
             ("kilo", "Kilo", false),
             ("zerorouter", "ZeroRouter", false),
+            ("llmtr", "LLMTR", false),
             ("lmstudio", "LM Studio", true),
             ("llamacpp", "llama.cpp server", true),
             ("sglang", "SGLang", true),
@@ -2652,6 +2653,47 @@ mod tests {
             create_model_provider("atlascloud", Some("provider-test-credential")).is_ok(),
             "Atlas Cloud should construct through the OpenAI-compatible family factory"
         );
+    }
+
+    #[test]
+    fn resolve_llmtr_credential_ignores_llmtr_api_key_env() {
+        let _env_lock = env_lock();
+        let _guard = EnvGuard::set("LLMTR_API_KEY", Some("llmtr-env-key"));
+        assert!(resolve_model_provider_credential("llmtr", None).is_none());
+        assert_eq!(
+            resolve_model_provider_credential("llmtr", Some("  explicit-key  ")).as_deref(),
+            Some("explicit-key")
+        );
+    }
+
+    #[test]
+    fn llmtr_uses_canonical_provider_id_only() {
+        assert_eq!(canonicalize_v2_model_provider_name("llmtr"), "llmtr");
+        for alias in ["llmtr-cloud", "llmtr_com", "LLMTR"] {
+            assert_eq!(canonicalize_v2_model_provider_name(alias), alias);
+            assert!(
+                create_model_provider(alias, Some("provider-test-credential")).is_err(),
+                "{alias} must not select the llmtr family"
+            );
+        }
+    }
+
+    #[test]
+    fn llmtr_provider_is_listed_and_constructible() {
+        let providers = list_model_providers();
+        let llmtr = providers
+            .iter()
+            .find(|provider| provider.name == "llmtr")
+            .expect("LLMTR provider should be listed");
+        assert_eq!(llmtr.display_name, "LLMTR");
+        assert!(!llmtr.local);
+        let provider = create_model_provider("llmtr", Some("provider-test-credential"))
+            .expect("LLMTR should construct through the OpenAI-compatible family factory");
+        assert_eq!(
+            provider.default_base_url(),
+            Some(zeroclaw_config::schema::LLMTR_DEFAULT_URL)
+        );
+        assert_eq!(provider.default_wire_api(), "chat_completions");
     }
 
     #[test]
