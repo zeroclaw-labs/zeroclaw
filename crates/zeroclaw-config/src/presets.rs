@@ -90,6 +90,7 @@ fn locked_down_risk() -> RiskProfileConfig {
         sandbox_backend: None,
         sandbox_image: None,
         firejail_args: vec![],
+        file_read_allowed_patterns: vec![],
     }
 }
 
@@ -116,6 +117,7 @@ fn balanced_risk() -> RiskProfileConfig {
         sandbox_backend: None,
         sandbox_image: None,
         firejail_args: vec![],
+        file_read_allowed_patterns: vec![],
     }
 }
 
@@ -142,6 +144,7 @@ fn yolo_risk() -> RiskProfileConfig {
         sandbox_backend: None,
         sandbox_image: None,
         firejail_args: vec![],
+        file_read_allowed_patterns: vec![],
     }
 }
 
