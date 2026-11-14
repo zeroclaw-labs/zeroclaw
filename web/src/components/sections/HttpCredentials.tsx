@@ -28,6 +28,7 @@ export default function HttpCredentials({ kind }: { kind: HttpCredentialKind }) 
   const [editing, setEditing] = useState<HttpCredentialRow | "new" | null>(null);
   const [removing, setRemoving] = useState<HttpCredentialRow | null>(null);
   const [header, setHeader] = useState<"bearer" | "x_api_key">("bearer");
+  const [passwordTarget, setPasswordTarget] = useState<"https" | "service">("https");
   const [source, setSource] = useState<HttpCredentialSource>("local");
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState("");
@@ -62,7 +63,8 @@ export default function HttpCredentials({ kind }: { kind: HttpCredentialKind }) 
     const form = event.currentTarget;
     const data = new FormData(form);
     const name = editing === "new" ? String(data.get("name")) : editing.name;
-    const origin = kind === "ssh_key" || kind === "totp" ? "" : String(data.get("origin")).trim();
+    const destination = String(data.get("origin") ?? "").trim();
+    const origin = kind === "user_password" && passwordTarget === "service" ? `service:${destination}` : destination;
     const secret = String(data.get("secret"));
     const destinations = String(data.get("destinations") ?? "").split("\n")
       .map(line => line.trim()).filter(Boolean).map(line => {
@@ -94,12 +96,12 @@ export default function HttpCredentials({ kind }: { kind: HttpCredentialKind }) 
       {rows.map((row) => (
         <div key={row.name} className="space-y-2 rounded-md border p-3">
           <p className="break-all font-medium">{row.name}</p>
-          <p className="break-all text-sm">{row.origin && `${row.origin} · `}{t(`http_credentials.source_${row.source}`)}</p>
+          <p className="break-all text-sm">{row.origin && `${row.origin.replace(/^service:/, "")} · `}{t(`http_credentials.source_${row.source}`)}</p>
           {row.destinations?.map((destination) => (
             <p key={JSON.stringify(destination)} className="text-sm">{destination.username}@{destination.host}:{destination.port}</p>
           ))}
           <div className="flex flex-wrap gap-2">
-            <Button size="sm" disabled={disabled} onClick={() => { setRemoving(null); setHeader(row.header ?? "bearer"); setSource(row.source); setEditing(row); }}>
+            <Button size="sm" disabled={disabled} onClick={() => { setRemoving(null); setHeader(row.header ?? "bearer"); setSource(row.source); setPasswordTarget(row.origin.startsWith("https://") ? "https" : "service"); setEditing(row); }}>
               {t("plugin_tls.replace")}
             </Button>
             <Button size="sm" variant="ghost" disabled={disabled} onClick={() => { setEditing(null); setRemoving(row); }}>
@@ -108,7 +110,7 @@ export default function HttpCredentials({ kind }: { kind: HttpCredentialKind }) 
           </div>
         </div>
       ))}
-      <Button disabled={disabled} onClick={() => { setRemoving(null); setHeader("bearer"); setSource("local"); setEditing("new"); }}>
+      <Button disabled={disabled} onClick={() => { setRemoving(null); setHeader("bearer"); setSource("local"); setPasswordTarget("https"); setEditing("new"); }}>
         {t("http_credentials.add")}
       </Button>
       {editing && (
@@ -117,6 +119,18 @@ export default function HttpCredentials({ kind }: { kind: HttpCredentialKind }) 
             <span>{t("http_credentials.name")}</span>
             <input className={inputClass} name="name" required maxLength={64} pattern={"[A-Za-z0-9_\\-]+"} readOnly={editing !== "new"} defaultValue={editing === "new" ? "" : editing.name} />
           </label>
+          {kind === "user_password" && (
+            <div className="space-y-1">
+              <label htmlFor="credential-destination-type">{t("http_credentials.destination_type")}</label>
+              <Select id="credential-destination-type" aria-label={t("http_credentials.destination_type")}
+                value={passwordTarget} onChange={(value) => setPasswordTarget(value === "service" ? "service" : "https")}
+                options={[
+                  { value: "https", label: t("http_credentials.https_basic") },
+                  { value: "service", label: t("http_credentials.other_service") },
+                ]}
+              />
+            </div>
+          )}
           {kind === "ssh_key" ? (
             <label className="block space-y-1">
               <span>{t("http_credentials.ssh_destinations")}</span>
@@ -126,8 +140,12 @@ export default function HttpCredentials({ kind }: { kind: HttpCredentialKind }) 
             </label>
           ) : kind !== "totp" && (
           <label className="block space-y-1">
-            <span>{t(kind === "user_password" ? "http_credentials.service" : "http_credentials.origin")}</span>
-            <input className={inputClass} name="origin" type="url" required placeholder={kind === "user_password" ? "ldaps://directory.example.com:636" : "https://api.example.com"} defaultValue={editing === "new" ? "" : editing.origin} />
+            <span>{t(kind === "user_password" && passwordTarget === "service" ? "http_credentials.service" : "http_credentials.origin")}</span>
+            <input key={passwordTarget} className={inputClass} name="origin"
+              type={kind === "user_password" && passwordTarget === "service" ? "text" : "url"} required maxLength={253}
+              placeholder={kind === "user_password" && passwordTarget === "service" ? "ldaps://directory.example.com:636" : "https://api.example.com"}
+              defaultValue={editing === "new" || (kind === "user_password" && editing.origin.startsWith("https://") !== (passwordTarget === "https")) ? "" : editing.origin.replace(/^service:/, "")}
+            />
           </label>
           )}
           <div className="space-y-1">

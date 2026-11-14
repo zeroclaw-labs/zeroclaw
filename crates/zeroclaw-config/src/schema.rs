@@ -9226,6 +9226,8 @@ mod scoped_credential_source_tests {
             "ldaps://directory.example.com:636",
             "kerberos://EXAMPLE.COM",
             "ad://example.com",
+            "service:Corporate directory",
+            "service:postgresql://db.example.com:5432",
         ] {
             assert_eq!(
                 ScopedHttpCredential::password_service(value).as_deref(),
@@ -9234,6 +9236,8 @@ mod scoped_credential_source_tests {
         }
         for value in [
             "ldap://directory.example.com",
+            "service:",
+            "service:ldaps://user:password@directory.example.com",
             "ldaps://user:password@directory.example.com",
             "ad://example.com/path",
             "kerberos://EXAMPLE.COM?value=secret",
@@ -9280,6 +9284,16 @@ impl ScopedHttpCredential {
         if let Some(origin) = Self::https_origin(raw) {
             return (raw.trim_end_matches('/') == origin).then_some(origin);
         }
+        if let Some(service) = raw.strip_prefix("service:") {
+            let service = service.trim();
+            return (!service.is_empty()
+                && service.len() <= 253
+                && service.chars().all(|character| {
+                    character.is_alphanumeric() || " .-_:/()".contains(character)
+                }))
+            .then(|| format!("service:{service}"));
+        }
+        // Preserve records from the first version of the editor.
         let url = url::Url::parse(raw).ok()?;
         if !matches!(url.scheme(), "ldaps" | "kerberos" | "ad")
             || url.host_str().is_none()
