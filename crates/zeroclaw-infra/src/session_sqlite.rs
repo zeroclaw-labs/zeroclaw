@@ -2111,6 +2111,55 @@ mod tests {
     }
 
     #[test]
+    fn fts_index_tracks_public_mutations_and_reopening() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        let hits = |backend: &SqliteSessionBackend, keyword: &str| {
+            let mut keys: Vec<_> = backend
+                .search(&SessionQuery {
+                    keyword: Some(keyword.into()),
+                    limit: Some(10),
+                })
+                .into_iter()
+                .map(|session| session.key)
+                .collect();
+            keys.sort();
+            keys
+        };
+        backend
+            .append("chat", &ChatMessage::user("originaltoken 中文🦀"))
+            .unwrap();
+        backend
+            .append("control", &ChatMessage::user("originaltoken control"))
+            .unwrap();
+        assert_eq!(hits(&backend, "originaltoken"), ["chat", "control"]);
+
+        assert!(
+            backend
+                .update_last("chat", &ChatMessage::assistant("replacementtoken e\u{301}"))
+                .unwrap()
+        );
+        assert_eq!(hits(&backend, "originaltoken"), ["control"]);
+        assert_eq!(hits(&backend, "replacementtoken"), ["chat"]);
+        drop(backend);
+
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        assert_eq!(hits(&backend, "originaltoken"), ["control"]);
+        assert_eq!(hits(&backend, "replacementtoken"), ["chat"]);
+        assert!(backend.remove_last("chat").unwrap());
+        assert!(hits(&backend, "replacementtoken").is_empty());
+        assert_eq!(hits(&backend, "originaltoken"), ["control"]);
+
+        backend
+            .append("chat", &ChatMessage::user("cleartoken 中文"))
+            .unwrap();
+        assert_eq!(hits(&backend, "cleartoken"), ["chat"]);
+        assert_eq!(backend.clear_messages("chat").unwrap(), 1);
+        assert!(hits(&backend, "cleartoken").is_empty());
+        assert_eq!(hits(&backend, "originaltoken"), ["control"]);
+    }
+
+    #[test]
     fn cleanup_stale_removes_old_sessions() {
         let tmp = TempDir::new().unwrap();
         let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
