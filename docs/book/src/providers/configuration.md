@@ -8,6 +8,16 @@ The smallest config that loads clean has four section headers: a provider entry,
 
 If you write `config.toml` by hand, make `schema_version = 4` its first line. The tools above add it for you. Without it, ZeroClaw has to guess the file's version: it reads a file whose sections are plainly in the current shape as version 3, migrates it from there and warns you to add the key (`zeroclaw config migrate` writes it), but any other file is read as the oldest version and migrated.
 
+## OpenCode Go catalogue and capacity
+
+OpenCode Go uses the `opencode` family with an explicit Go `uri`; the alias name does not select Go. The legacy CLI selector `opencode-go` also selects the Go service. Its public model listing is separate from OpenCode Zen and needs no API key. Inference still needs a valid subscription credential.
+
+For a configured `opencode.go` alias, refresh the model list with `zeroclaw models refresh --model-provider opencode.go --force`. Use `zeroclaw doctor update-context-windows --model-provider opencode.go --dry-run` to preview the selected model's capacity, then omit `--dry-run` to write it. The doctor reads the public Go catalogue's `limit.context` value only for the exact configured model. An unknown model or failed fetch leaves capacity unset; an existing explicit `context_window` is preserved.
+
+Supported catalogue endpoints are `https://opencode.ai/zen/go/v1` and `https://opencode.ai/inference/go/v1`. The current chat endpoint `https://opencode.ai/inference/go/openai/v1` uses the latter catalogue. See the [OpenCode Go documentation](https://opencode.ai/docs/console/go/) for current service details.
+
+This discovery does not change context resolution after an in-session model switch. A different selected model still needs its own capacity resolution; the configured model's value must not be reused for it. That runtime work remains tracked in [#12413](https://github.com/zeroclaw-labs/zeroclaw/issues/12413).
+
 ## Field reference: provider entry
 
 Almost every family also takes the shared fields from `ModelProviderConfig`:
