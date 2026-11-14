@@ -210,6 +210,7 @@ impl LiveConfigAuthority {
     /// commits instead of using this.
     #[cfg(any(test, feature = "test-util"))]
     pub fn publish_for_test(&self, config: Config) -> zeroclaw_config::live::ConfigRevision {
+        let config = zeroclaw_config::migration::admit_test_input(&config);
         let revision = self.live.next_revision().expect("test revision available");
         self.live
             .publish(revision, config)

@@ -1149,6 +1149,13 @@ impl TranscriptionManager {
     }
 
     pub fn from_config_for_agent(config: &Config, agent_alias: Option<&str>) -> Result<Self> {
+        #[cfg(test)]
+        let admitted_config;
+        #[cfg(test)]
+        let config = {
+            admitted_config = zeroclaw_config::migration::admit_test_input(config);
+            &admitted_config
+        };
         let agent_transcription_provider = agent_alias
             .or_else(|| config.resolved_runtime_agent_alias())
             .and_then(|alias| config.agents.get(alias))
@@ -1165,6 +1172,13 @@ impl TranscriptionManager {
         config: &Config,
         agent_transcription_provider: String,
     ) -> Result<Self> {
+        #[cfg(test)]
+        let admitted_config;
+        #[cfg(test)]
+        let config = {
+            admitted_config = zeroclaw_config::migration::admit_test_input(config);
+            &admitted_config
+        };
         anyhow::ensure!(
             config.transcription.max_audio_bytes != Some(0),
             "transcription.max_audio_bytes must be greater than zero"

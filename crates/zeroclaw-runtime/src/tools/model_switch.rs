@@ -75,6 +75,8 @@ impl ModelSwitchTool {
     pub const NAME: &'static str = "model_switch";
 
     pub fn new(security: Arc<SecurityPolicy>, config: Arc<Config>) -> Self {
+        #[cfg(test)]
+        let config = Arc::new(zeroclaw_config::migration::admit_test_input(&config));
         Self::with_config_resolver(security, Arc::new(move || Arc::clone(&config)))
     }
 

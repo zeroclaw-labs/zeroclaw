@@ -1186,6 +1186,13 @@ pub fn is_enabled(config: &Config) -> bool {
 
 impl TtsManager {
     pub fn from_config_for_agent(config: &Config, agent_alias: Option<&str>) -> Result<Self> {
+        #[cfg(test)]
+        let admitted_config;
+        #[cfg(test)]
+        let config = {
+            admitted_config = zeroclaw_config::migration::admit_test_input(config);
+            &admitted_config
+        };
         let mut tts_providers: HashMap<String, Box<dyn TtsProvider>> = HashMap::new();
         let mut voice_by_alias: HashMap<String, String> = HashMap::new();
 

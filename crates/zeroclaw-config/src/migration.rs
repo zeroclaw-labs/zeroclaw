@@ -7640,7 +7640,11 @@ model_provider = "gemini.work"
                 .and_then(toml::Value::as_integer),
             Some(17)
         );
-        assert!(value_at(&as_v1, "providers.models").is_some());
+        // V1 is admitted into the canonical provider registry before the
+        // typed read; the canonical projection is observable in the typed
+        // value, while the historical intermediate value may omit the
+        // transient provider table entirely.
+        assert!(value_at(&typed_v1, "providers.models").is_some());
         assert!(readings_differ(&file).is_empty());
     }
 

@@ -343,7 +343,12 @@ fn asr_definition(
         .get("uri")
         .or_else(|| raw.get("url"))
         .or_else(|| raw.get("api_url"))
-        .filter(|value| !value.is_null())
+        .filter(|value| {
+            value
+                .as_str()
+                .map(|value| !value.trim().is_empty())
+                .unwrap_or(!value.is_null())
+        })
     {
         connection["uri"] = uri.clone();
     }

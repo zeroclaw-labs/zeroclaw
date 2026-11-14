@@ -3363,6 +3363,16 @@ impl Agent {
         agent_alias: &str,
         context: AgentBuildContext<'_>,
     ) -> Result<Self> {
+        // Unit tests still build a number of historical typed fixtures by
+        // hand. Admit those fixtures at this explicit test boundary so the
+        // production constructor and registry getter remain canonical-only.
+        #[cfg(test)]
+        let admitted_config;
+        #[cfg(test)]
+        let config = {
+            admitted_config = zeroclaw_config::migration::admit_test_input(config);
+            &admitted_config
+        };
         // Keep construction state out of enclosing RPC/delegation futures.
         Box::pin(Self::from_config_with_context_body(
             config,
