@@ -576,6 +576,35 @@ pub(crate) fn collapse_tool_context_older_than(
     out
 }
 
+/// Remove Anthropic extended-thinking signatures from retained tool-call
+/// messages after older tool context has been collapsed. Anthropic binds the
+/// signatures to the preceding transcript, so replaying them after removing
+/// that transcript can make later requests fail with an invalid-signature
+/// error. Callers must apply this only to the provider-facing copy; durable
+/// conversation history should retain the original response metadata.
+pub(crate) fn strip_anthropic_thinking_after_tool_context_collapse(messages: &mut [ChatMessage]) {
+    for message in messages
+        .iter_mut()
+        .filter(|message| message.role == "assistant")
+    {
+        let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&message.content) else {
+            continue;
+        };
+        let Some(object) = value.as_object_mut() else {
+            continue;
+        };
+        if object
+            .get("tool_calls")
+            .is_some_and(serde_json::Value::is_array)
+        {
+            object.remove("reasoning_content");
+            if let Ok(content) = serde_json::to_string(&value) {
+                message.content = content;
+            }
+        }
+    }
+}
+
 /// Drop the oldest whole turn (after leading system messages and an optional
 /// breadcrumb), preserving the most recent whole turn and the system prefix.
 /// `crumb_present` is the OWNER's authoritative record that the population
@@ -1875,6 +1904,30 @@ mod collapse_tests {
 
     fn summary(calls: usize) -> String {
         ChatMessage::pruned_tool_exchange_summary(calls)
+    }
+
+    #[test]
+    fn strips_anthropic_thinking_only_from_retained_tool_call_messages() {
+        let mut messages = vec![
+            asst(
+                r#"{"content":"reply","reasoning_content":"{\"thinking\":\"old context\",\"signature\":\"signed\"}"}"#,
+            ),
+            asst(
+                r#"{"tool_calls":[{"id":"call_1","name":"shell","arguments":"{}"}],"reasoning_content":"{\"thinking\":\"think\",\"signature\":\"signed\"}"}"#,
+            ),
+            asst("ordinary reply"),
+        ];
+
+        strip_anthropic_thinking_after_tool_context_collapse(&mut messages);
+
+        let ordinary_tool_history: serde_json::Value =
+            serde_json::from_str(&messages[0].content).expect("valid assistant record");
+        assert!(ordinary_tool_history.get("reasoning_content").is_some());
+        let tool_call: serde_json::Value =
+            serde_json::from_str(&messages[1].content).expect("valid tool call record");
+        assert!(tool_call.get("reasoning_content").is_none());
+        assert_eq!(tool_call["tool_calls"][0]["name"], "shell");
+        assert_eq!(messages[2].content, "ordinary reply");
     }
 
     fn assert_identity(c: &CollapsedToolContext, history: &[ChatMessage]) {

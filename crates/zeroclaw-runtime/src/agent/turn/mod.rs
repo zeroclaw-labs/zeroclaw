@@ -2181,12 +2181,20 @@ async fn run_tool_call_loop_impl<'a>(
         // the newest `keep_tool_context_turns + 1` have lost their tool rows.
         // The working history itself is untouched, so owners that persist it
         // (channel cache, ACP transcript, CLI session file) keep every row.
-        let collapsed = crate::agent::history_trim::collapse_tool_context_older_than(
+        let mut collapsed = crate::agent::history_trim::collapse_tool_context_older_than(
             turn_state.history,
             keep_tool_context_turns,
             turn_state.crumb_present,
             &known_tool_names,
         );
+        // Anthropic thinking signatures are transcript-bound. Once older tool
+        // rows are omitted from the provider request, retained signatures no
+        // longer match the request prefix. Strip them from this copy only.
+        if active_model_provider_name == "anthropic" && collapsed.dropped_messages > 0 {
+            crate::agent::history_trim::strip_anthropic_thinking_after_tool_context_collapse(
+                &mut collapsed.messages,
+            );
+        }
         if iteration == 0 && collapsed.dropped_messages > 0 {
             record_tool_context_collapse(&collapsed, keep_tool_context_turns, turn_id);
         }
