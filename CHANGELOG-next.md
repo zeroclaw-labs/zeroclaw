@@ -122,6 +122,7 @@ Plus the dashboard through ZeroRelay, a CLI-only server build, and tighter isola
 
 ### Plugins
 
+- **Tool plugins can wake agents asynchronously (`dispatch.wake`).** Tool manifests may declare `agent_dispatch` and bind `wit/v0/dispatch.wit` under `plugins-wit-v0-dispatch`; operators grant reachable agent aliases via `plugins.entries[].dispatch_agents` (default empty) and `dispatch_rate_per_min` (default `30`), with host-side per-target coalescing and a `MAX_PLUGIN_WAKE_DEPTH` (`2`) recursion ceiling (#12416).
 - **An interrupted `plugin install`'s stage** is cleared by the next install (#11855, closes #11792).
 - **Discovery admits a component only beside the manifest that described it,** so a discovery during `plugin update` can't pair one version's manifest with another's component (#12040, closes #11562).
 

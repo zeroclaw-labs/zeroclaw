@@ -354,6 +354,13 @@ These properties are optional, matching the guest's defaults. For a credential
 that must exist, add its name to `required` in `[config_schema]`; a denied grant
 or missing value will then prevent the component from starting.
 
+Add `agent_dispatch` only if the tool needs to enqueue asynchronous wake turns
+for configured agents: bind `wit/v0` with `features: ["plugins-wit-v0",
+"plugins-wit-v0-dispatch"]` and call `zeroclaw::plugin::dispatch::wake`.
+Declaring `agent_dispatch` seeds an empty instance row on install, and every
+target still stays denied until an operator adds aliases (or `"*"`) to
+`plugins.entries.<key>.dispatch_agents`.
+
 ### Tools that call the network
 
 Arguably the most common real-world tool shape is not a pure transform like
