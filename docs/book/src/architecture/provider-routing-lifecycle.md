@@ -56,6 +56,29 @@ The global `reliability.api_keys` pool is not a working failover mechanism today
 
 Empty completions receive the same bounded retry treatment instead of immediately becoming a blank assistant turn.
 
+Callers that need a cumulative generation limit can pass one
+`GenerationAttemptBudget` through `ProviderDispatch::chat_with_attempt_budget`.
+The caller owns the allowance. Adapters spend it immediately before generation
+I/O, and repairs, internal retries and configured failover share the same
+handle. A budget of two can therefore be consumed by an initial request and its
+transport retry, leaving no slot for a repair or another provider. Request
+construction and authentication do not spend slots. Failed or cancelled sends
+retain their debit because the server may have received the request.
+
+This bounded non-streaming entry point disables hidden HTTP retries and
+automatic redirects and preserves the selected native or prompt tool protocol.
+Unsupported adapters decline before generation, allowing
+Reliable to try another eligible configured candidate. Exhaustion is terminal
+for the operation. The CLI adapters and directly constructed native Ollama
+implementation currently decline this entry point. Configured Ollama uses the
+supported Compatible adapter. Ordinary chat and streaming keep their existing
+recovery policies. No runtime consumer is switched to bounded execution by
+the provider API addition itself.
+
+The allowance counts client submissions. Anthropic server-side fallback and
+gateway-internal routing can perform additional remote work behind one
+submission, so this API does not promise an inference-execution or billing cap.
+
 Invalid fallback declarations have two different boundaries. Dangling references, cycles, over-depth edges, blank model IDs, and duplicate primary models are reported and pruned as described in [Provider configuration](../providers/configuration.md#misconfiguration). A fallback profile that resolves but cannot supply its required credential or cannot be constructed fails provider initialization rather than silently changing the route.
 
 ## Streaming and replay boundary

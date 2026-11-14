@@ -216,6 +216,20 @@ impl ModelProvider for VisionOverrideProvider {
             .await
     }
 
+    async fn chat_with_attempt_budget(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        policy: zeroclaw_api::model_provider::ToolRoundPolicy,
+        budget: &zeroclaw_api::model_provider::GenerationAttemptBudget,
+    ) -> anyhow::Result<ChatResponse> {
+        mark_current_dispatch_composite();
+        ProviderDispatch::from_ref(&*self.inner)
+            .chat_with_attempt_budget(request, model, temperature, policy, budget)
+            .await
+    }
+
     async fn chat_with_tools(
         &self,
         messages: &[ChatMessage],

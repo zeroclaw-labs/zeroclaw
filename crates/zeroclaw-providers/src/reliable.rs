@@ -2455,6 +2455,458 @@ impl ReliableModelProvider {
     }
 }
 
+impl ReliableModelProvider {
+    async fn chat_inner(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        policy: zeroclaw_api::model_provider::ToolRoundPolicy,
+        budget: Option<&zeroclaw_api::model_provider::GenerationAttemptBudget>,
+    ) -> anyhow::Result<ChatResponse> {
+        mark_current_dispatch_composite();
+        let models = self.model_chain(model);
+        let mut failures = FailureEvents::default();
+        let mut streamed_refusal = take_stream_refusal_recovery();
+        let mut refusal_seen = streamed_refusal.clone();
+        let mut final_cause_is_semantic_empty = stream_recovery_was_semantic_empty();
+        let mut terminal_provider_keys = HashSet::new();
+        let mut effective_messages = request.messages.to_vec();
+        let mut context_truncated = false;
+        let mut rejected_attempt_usage = streamed_refusal
+            .as_ref()
+            .and_then(|refusal| refusal.usage.as_deref().cloned());
+        // A streamed refusal is already a terminal typed failure for its
+        // exact physical candidate. Retain it while skipping that candidate's
+        // non-streaming replay; a later distinct failure deliberately
+        // overwrites this cause below.
+        let mut final_cause = streamed_refusal.as_ref().cloned().map(anyhow::Error::new);
+        let mut final_cause_provider = streamed_refusal
+            .as_ref()
+            .and_then(|refusal| refusal.attempted_candidate.clone());
+
+        let has_other_candidate = models.len().saturating_mul(self.eligible_provider_count()) > 1;
+
+        for (model_slot, current_model) in models.iter().enumerate() {
+            for (entry_index, entry) in self.model_providers.iter().enumerate() {
+                if budget.is_some_and(|budget| budget.remaining() == 0) {
+                    return Err(crate::bounded::exhausted(provider_exhausted(
+                        reliable_terminal_error_with_cause(
+                            final_cause_provider
+                                .as_deref()
+                                .or_else(|| self.configured_provider_identity()),
+                            failures,
+                            rejected_attempt_usage,
+                            final_cause_is_semantic_empty,
+                            final_cause,
+                        ),
+                    )));
+                }
+                if !Self::provider_allowed_for_turn(entry) {
+                    Self::log_provider_policy_skip(entry);
+                    continue;
+                }
+                let skip_streamed_refusal = streamed_refusal.as_ref().is_some_and(|refusal| {
+                    refusal.requested_model == *current_model
+                        && model_slot == 0
+                        && refusal.attempted_candidate_index.map_or_else(
+                            || {
+                                refusal
+                                    .attempted_candidate
+                                    .as_deref()
+                                    .map_or(entry_index == 0, |candidate| {
+                                        candidate == entry.candidate_name()
+                                    })
+                            },
+                            |index| index == entry_index,
+                        )
+                });
+                if skip_streamed_refusal {
+                    final_cause_provider = Some(entry.candidate_name().to_string());
+                    streamed_refusal = None;
+                    continue;
+                }
+                let Some(retry_limit) =
+                    self.effective_retry_limit(model_slot, entry_index, has_other_candidate)
+                else {
+                    final_cause_provider = Some(entry.candidate_name().to_string());
+                    continue;
+                };
+                if terminal_provider_keys.contains(&entry.cooldown_key) {
+                    continue;
+                }
+                let provider_name = entry.display_name.as_str();
+                let served_model = entry.served_model(current_model);
+                if self.provider_should_skip_for_cooldown(entry) {
+                    self.log_cooldown_skip(provider_name, served_model);
+                    Self::record_cooldown_skip_failure(&mut failures, self.max_retries + 1);
+                    continue;
+                }
+
+                let mut backoff_ms = self.base_backoff_ms;
+                let mut last_error_detail: Option<String> = None;
+                let mut last_diagnostic: Option<ProviderErrorDiagnostic> = None;
+
+                for attempt in 0..=retry_limit {
+                    if budget.is_some_and(|budget| budget.remaining() == 0) {
+                        return Err(crate::bounded::exhausted(provider_exhausted(
+                            reliable_terminal_error_with_cause(
+                                final_cause_provider
+                                    .as_deref()
+                                    .or_else(|| self.configured_provider_identity()),
+                                failures,
+                                rejected_attempt_usage,
+                                final_cause_is_semantic_empty,
+                                final_cause,
+                            ),
+                        )));
+                    }
+                    commit_safeguard_fallback(None);
+                    let req = ChatRequest {
+                        messages: &effective_messages,
+                        tools: request.tools,
+                        thinking: request.thinking,
+                    };
+                    match with_exact_dispatch_route(
+                        entry.cooldown_key.clone(),
+                        entry.served_model(current_model).to_string(),
+                        async {
+                            let dispatch = ProviderDispatch::from_ref(entry.provider());
+                            match budget {
+                                Some(budget) => {
+                                    dispatch
+                                        .chat_with_attempt_budget(
+                                            req,
+                                            current_model,
+                                            temperature,
+                                            policy,
+                                            budget,
+                                        )
+                                        .await
+                                }
+                                None => {
+                                    dispatch
+                                        .chat_with_tool_round_policy(
+                                            req,
+                                            current_model,
+                                            temperature,
+                                            policy,
+                                        )
+                                        .await
+                                }
+                            }
+                        },
+                    )
+                    .await
+                    {
+                        Ok(mut resp) => {
+                            if is_empty_completion(&resp) {
+                                if budget.is_some() {
+                                    final_cause_is_semantic_empty = true;
+                                    final_cause_provider = Some(entry.candidate_name().to_string());
+                                }
+                                if let Some(usage) = resp.usage.clone()
+                                    && !has_reliable_call_accounting()
+                                {
+                                    accumulate_usage(&mut rejected_attempt_usage, Some(&usage));
+                                }
+                                if attempt < retry_limit
+                                    && budget.is_none_or(|budget| budget.remaining() > 0)
+                                {
+                                    self.backoff_after_empty_completion(
+                                        &mut failures,
+                                        provider_name,
+                                        served_model,
+                                        attempt,
+                                        &mut backoff_ms,
+                                    )
+                                    .await;
+                                    continue;
+                                }
+                                self.record_empty_completion_failure(
+                                    &mut failures,
+                                    provider_name,
+                                    served_model,
+                                    attempt,
+                                    false,
+                                );
+                                final_cause_is_semantic_empty = true;
+                                break;
+                            }
+                            if let Some(usage) = rejected_attempt_usage.take()
+                                && !has_reliable_call_accounting()
+                            {
+                                combine_response_usage(&mut resp, Some(usage));
+                            }
+                            if attempt > 0
+                                || served_model != model
+                                || model_slot != 0
+                                || entry_index != 0
+                                || context_truncated
+                                || self
+                                    .model_providers
+                                    .first()
+                                    .map(|entry| entry.display_name.as_str())
+                                    != Some(provider_name)
+                            {
+                                ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"model_provider": provider_name, "model": served_model, "attempt": attempt, "original_model": model, "context_truncated": context_truncated})), "ModelProvider recovered (failover/retry)");
+                                let primary = self
+                                    .model_providers
+                                    .first()
+                                    .map(|entry| entry.candidate_name())
+                                    .unwrap_or("");
+                                let primary_provider = self
+                                    .model_providers
+                                    .first()
+                                    .map(|entry| entry.display_name.as_str())
+                                    .unwrap_or("");
+                                let fallback_record = ProviderFallbackRecord::new_if_true_fallback(
+                                    primary_provider,
+                                    model,
+                                    provider_name,
+                                    served_model,
+                                    model_slot != 0 || entry_index != 0,
+                                    primary,
+                                    entry.candidate_name(),
+                                );
+                                record_successful_provider_fallback(fallback_record.as_ref());
+                                record_accepted_attempt(
+                                    entry,
+                                    current_model,
+                                    fallback_record
+                                        .as_ref()
+                                        .map(ProviderFallbackRecord::attribution),
+                                );
+                            } else {
+                                record_successful_provider_fallback(None);
+                                record_accepted_attempt(entry, current_model, None);
+                            }
+                            record_refusal_rescue(&refusal_seen, model, served_model);
+                            return Ok(resp);
+                        }
+                        Err(e) => {
+                            if budget.is_some()
+                                && (e.is::<zeroclaw_api::model_provider::BoundedChatUnsupported>() || e.chain().any(|source| source.is::<zeroclaw_api::model_provider::BoundedChatUnsupported>()))
+                            {
+                                final_cause = Some(e);
+                                final_cause_provider = Some(entry.candidate_name().to_string());
+                                break;
+                            }
+                            if budget.is_some() && (e.is::<zeroclaw_api::model_provider::GenerationAttemptBudgetExhausted>() || e.chain().any(|source| source.is::<zeroclaw_api::model_provider::GenerationAttemptBudgetExhausted>())) {
+                                return Err(crate::bounded::exhausted(provider_exhausted(reliable_terminal_error_with_cause(
+                                    Some(entry.candidate_name()), failures, rejected_attempt_usage,
+                                    false, Some(e),
+                                ))));
+                            }
+                            remember_refusal(&mut refusal_seen, &mut rejected_attempt_usage, &e);
+                            if is_semantic_empty_completion_error(&e) {
+                                if budget.is_some() {
+                                    final_cause_is_semantic_empty = true;
+                                    final_cause_provider = Some(entry.candidate_name().to_string());
+                                }
+                                if attempt < retry_limit
+                                    && budget.is_none_or(|budget| budget.remaining() > 0)
+                                {
+                                    self.backoff_after_empty_completion(
+                                        &mut failures,
+                                        provider_name,
+                                        served_model,
+                                        attempt,
+                                        &mut backoff_ms,
+                                    )
+                                    .await;
+                                    continue;
+                                }
+                                self.record_empty_completion_failure(
+                                    &mut failures,
+                                    provider_name,
+                                    served_model,
+                                    attempt,
+                                    false,
+                                );
+                                final_cause_is_semantic_empty = true;
+                                break;
+                            }
+                            final_cause_is_semantic_empty = false;
+                            // Context window exceeded: truncate history and retry
+                            if is_context_window_exceeded(&e)
+                                && !is_non_retryable(&e)
+                                && !context_truncated
+                            {
+                                let diagnostic = provider_error_diagnostic(&e);
+                                push_failure(
+                                    &mut failures,
+                                    attempt + 1,
+                                    self.max_retries + 1,
+                                    "context_window",
+                                    Some(&diagnostic),
+                                );
+                                let dropped = truncate_for_context(&mut effective_messages);
+                                if dropped > 0 {
+                                    record_provider_context_truncation();
+                                    context_truncated = true;
+                                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": provider_name, "model": served_model, "dropped": dropped, "remaining": effective_messages.len()})), "Context window exceeded; truncated history and retrying");
+                                    if budget.is_some() {
+                                        final_cause = Some(e);
+                                        final_cause_provider =
+                                            Some(entry.candidate_name().to_string());
+                                    }
+                                    continue; // Retry with truncated messages (counts as an attempt)
+                                }
+                                // No complete older turn can be removed safely.
+                                let truncation_limit =
+                                    context_truncation_limit(&effective_messages);
+                                let context_error = context_failure_aggregate(
+                                    &format!(
+                                        "Request exceeds model context window and cannot be reduced without \
+                                         breaking message/tool pairing ({truncation_limit}). Try using a model \
+                                         with a larger context window, reducing the number of tools/skills, or \
+                                         enabling compact_context in config."
+                                    ),
+                                    &failures,
+                                );
+                                return Err(reliable_terminal_error_with_cause(
+                                    Some(entry.candidate_name()),
+                                    failures,
+                                    rejected_attempt_usage,
+                                    false,
+                                    Some(e),
+                                )
+                                .context(context_error));
+                            }
+
+                            let non_retryable_rate_limit = is_non_retryable_rate_limit(&e);
+                            // Typed terminal decisions and business quota
+                            // win; overload wording only downgrades
+                            // heuristic non-retryable text (see
+                            // `is_terminal_provider_failure`).
+                            let non_retryable = is_terminal_provider_failure(&e);
+                            let rate_limited = is_rate_limited(&e);
+                            let failure_reason = failure_reason(rate_limited, non_retryable);
+                            let error_detail = compact_error_detail(&e);
+                            let diagnostic = provider_error_diagnostic(&e);
+                            last_error_detail = Some(error_detail.clone());
+                            last_diagnostic = Some(diagnostic.clone());
+
+                            push_failure(
+                                &mut failures,
+                                attempt + 1,
+                                self.max_retries + 1,
+                                failure_reason,
+                                Some(&diagnostic),
+                            );
+
+                            if rate_limited
+                                && !non_retryable_rate_limit
+                                && let Some(new_key) = self.rotate_key()
+                            {
+                                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": provider_name, "error": error_detail})), &format!("Rate limited; key rotation selected key ending ...{} \
+                                     but cannot apply (ModelProvider trait has no set_api_key). \
+                                     Retrying with original key.", &new_key[new_key.len().saturating_sub(4)..]));
+                            }
+
+                            if non_retryable {
+                                ::zeroclaw_log::record!(
+                                    WARN,
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Note
+                                    )
+                                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                    .with_attrs(
+                                        provider_failure_attrs(
+                                            provider_name,
+                                            served_model,
+                                            &error_detail,
+                                            &diagnostic,
+                                        )
+                                    ),
+                                    "Non-retryable error, moving on"
+                                );
+                                if has_typed_non_retryable_marker(&e) {
+                                    terminal_provider_keys.insert(entry.cooldown_key.clone());
+                                }
+                                final_cause = Some(e);
+                                final_cause_provider = Some(entry.candidate_name().to_string());
+                                break;
+                            }
+
+                            if rate_limited && self.model_providers.len() > 1 {
+                                self.cool_down_rate_limited_provider(entry, served_model, &e);
+                                final_cause = Some(e);
+                                final_cause_provider = Some(entry.candidate_name().to_string());
+                                break;
+                            }
+
+                            if attempt < retry_limit
+                                && budget.is_none_or(|budget| budget.remaining() > 0)
+                            {
+                                let wait = self.compute_backoff(backoff_ms, &e);
+                                ::zeroclaw_log::record!(
+                                    WARN,
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Note
+                                    )
+                                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                    .with_attrs(
+                                        provider_retry_attrs(
+                                            provider_name,
+                                            served_model,
+                                            attempt + 1,
+                                            wait,
+                                            failure_reason,
+                                            &error_detail,
+                                            &diagnostic,
+                                        )
+                                    ),
+                                    "ModelProvider call failed, retrying"
+                                );
+                                tokio::time::sleep(Duration::from_millis(wait)).await;
+                                backoff_ms = (backoff_ms.saturating_mul(2)).min(10_000);
+                            }
+                            final_cause = Some(e);
+                            final_cause_provider = Some(entry.candidate_name().to_string());
+                        }
+                    }
+                }
+
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(provider_exhausted_attrs(
+                            provider_name,
+                            served_model,
+                            last_error_detail.as_deref(),
+                            last_diagnostic.as_ref(),
+                        )),
+                    "Exhausted retries, trying next model_provider/model"
+                );
+            }
+
+            if *current_model != model {
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"original_model": model, "fallback_model": *current_model})), "Model fallback exhausted all model_providers, trying next fallback model");
+            }
+        }
+
+        let error = provider_exhausted(reliable_terminal_error_with_cause(
+            final_cause_provider
+                .as_deref()
+                .or_else(|| self.configured_provider_identity()),
+            failures,
+            rejected_attempt_usage,
+            final_cause_is_semantic_empty,
+            final_cause,
+        ));
+        Err(if budget.is_some_and(|budget| budget.remaining() == 0) {
+            crate::bounded::exhausted(error)
+        } else {
+            error
+        })
+    }
+}
+
 #[async_trait]
 impl ModelProvider for ReliableModelProvider {
     fn has_stable_request_identity(&self, model: &str) -> bool {
@@ -3598,363 +4050,20 @@ impl ModelProvider for ReliableModelProvider {
         temperature: Option<f64>,
         policy: zeroclaw_api::model_provider::ToolRoundPolicy,
     ) -> anyhow::Result<ChatResponse> {
-        mark_current_dispatch_composite();
-        let models = self.model_chain(model);
-        let mut failures = FailureEvents::default();
-        let mut streamed_refusal = take_stream_refusal_recovery();
-        let mut refusal_seen = streamed_refusal.clone();
-        let mut final_cause_is_semantic_empty = stream_recovery_was_semantic_empty();
-        let mut terminal_provider_keys = HashSet::new();
-        let mut effective_messages = request.messages.to_vec();
-        let mut context_truncated = false;
-        let mut rejected_attempt_usage = streamed_refusal
-            .as_ref()
-            .and_then(|refusal| refusal.usage.as_deref().cloned());
-        // A streamed refusal is already a terminal typed failure for its
-        // exact physical candidate. Retain it while skipping that candidate's
-        // non-streaming replay; a later distinct failure deliberately
-        // overwrites this cause below.
-        let mut final_cause = streamed_refusal.as_ref().cloned().map(anyhow::Error::new);
-        let mut final_cause_provider = streamed_refusal
-            .as_ref()
-            .and_then(|refusal| refusal.attempted_candidate.clone());
+        self.chat_inner(request, model, temperature, policy, None)
+            .await
+    }
 
-        let has_other_candidate = models.len().saturating_mul(self.eligible_provider_count()) > 1;
-
-        for (model_slot, current_model) in models.iter().enumerate() {
-            for (entry_index, entry) in self.model_providers.iter().enumerate() {
-                if !Self::provider_allowed_for_turn(entry) {
-                    Self::log_provider_policy_skip(entry);
-                    continue;
-                }
-                let skip_streamed_refusal = streamed_refusal.as_ref().is_some_and(|refusal| {
-                    refusal.requested_model == *current_model
-                        && model_slot == 0
-                        && refusal.attempted_candidate_index.map_or_else(
-                            || {
-                                refusal
-                                    .attempted_candidate
-                                    .as_deref()
-                                    .map_or(entry_index == 0, |candidate| {
-                                        candidate == entry.candidate_name()
-                                    })
-                            },
-                            |index| index == entry_index,
-                        )
-                });
-                if skip_streamed_refusal {
-                    final_cause_provider = Some(entry.candidate_name().to_string());
-                    streamed_refusal = None;
-                    continue;
-                }
-                let Some(retry_limit) =
-                    self.effective_retry_limit(model_slot, entry_index, has_other_candidate)
-                else {
-                    final_cause_provider = Some(entry.candidate_name().to_string());
-                    continue;
-                };
-                if terminal_provider_keys.contains(&entry.cooldown_key) {
-                    continue;
-                }
-                let provider_name = entry.display_name.as_str();
-                let served_model = entry.served_model(current_model);
-                if self.provider_should_skip_for_cooldown(entry) {
-                    self.log_cooldown_skip(provider_name, served_model);
-                    Self::record_cooldown_skip_failure(&mut failures, self.max_retries + 1);
-                    continue;
-                }
-
-                let mut backoff_ms = self.base_backoff_ms;
-                let mut last_error_detail: Option<String> = None;
-                let mut last_diagnostic: Option<ProviderErrorDiagnostic> = None;
-
-                for attempt in 0..=retry_limit {
-                    commit_safeguard_fallback(None);
-                    let req = ChatRequest {
-                        messages: &effective_messages,
-                        tools: request.tools,
-                        thinking: request.thinking,
-                    };
-                    match with_exact_dispatch_route(
-                        entry.cooldown_key.clone(),
-                        entry.served_model(current_model).to_string(),
-                        ProviderDispatch::from_ref(entry.provider()).chat_with_tool_round_policy(
-                            req,
-                            current_model,
-                            temperature,
-                            policy,
-                        ),
-                    )
-                    .await
-                    {
-                        Ok(mut resp) => {
-                            if is_empty_completion(&resp) {
-                                if let Some(usage) = resp.usage.clone()
-                                    && !has_reliable_call_accounting()
-                                {
-                                    accumulate_usage(&mut rejected_attempt_usage, Some(&usage));
-                                }
-                                if attempt < retry_limit {
-                                    self.backoff_after_empty_completion(
-                                        &mut failures,
-                                        provider_name,
-                                        served_model,
-                                        attempt,
-                                        &mut backoff_ms,
-                                    )
-                                    .await;
-                                    continue;
-                                }
-                                self.record_empty_completion_failure(
-                                    &mut failures,
-                                    provider_name,
-                                    served_model,
-                                    attempt,
-                                    false,
-                                );
-                                final_cause_is_semantic_empty = true;
-                                break;
-                            }
-                            if let Some(usage) = rejected_attempt_usage.take()
-                                && !has_reliable_call_accounting()
-                            {
-                                combine_response_usage(&mut resp, Some(usage));
-                            }
-                            if attempt > 0
-                                || served_model != model
-                                || model_slot != 0
-                                || entry_index != 0
-                                || context_truncated
-                                || self
-                                    .model_providers
-                                    .first()
-                                    .map(|entry| entry.display_name.as_str())
-                                    != Some(provider_name)
-                            {
-                                ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"model_provider": provider_name, "model": served_model, "attempt": attempt, "original_model": model, "context_truncated": context_truncated})), "ModelProvider recovered (failover/retry)");
-                                let primary = self
-                                    .model_providers
-                                    .first()
-                                    .map(|entry| entry.candidate_name())
-                                    .unwrap_or("");
-                                let primary_provider = self
-                                    .model_providers
-                                    .first()
-                                    .map(|entry| entry.display_name.as_str())
-                                    .unwrap_or("");
-                                let fallback_record = ProviderFallbackRecord::new_if_true_fallback(
-                                    primary_provider,
-                                    model,
-                                    provider_name,
-                                    served_model,
-                                    model_slot != 0 || entry_index != 0,
-                                    primary,
-                                    entry.candidate_name(),
-                                );
-                                record_successful_provider_fallback(fallback_record.as_ref());
-                                record_accepted_attempt(
-                                    entry,
-                                    current_model,
-                                    fallback_record
-                                        .as_ref()
-                                        .map(ProviderFallbackRecord::attribution),
-                                );
-                            } else {
-                                record_successful_provider_fallback(None);
-                                record_accepted_attempt(entry, current_model, None);
-                            }
-                            record_refusal_rescue(&refusal_seen, model, served_model);
-                            return Ok(resp);
-                        }
-                        Err(e) => {
-                            remember_refusal(&mut refusal_seen, &mut rejected_attempt_usage, &e);
-                            if is_semantic_empty_completion_error(&e) {
-                                if attempt < retry_limit {
-                                    self.backoff_after_empty_completion(
-                                        &mut failures,
-                                        provider_name,
-                                        served_model,
-                                        attempt,
-                                        &mut backoff_ms,
-                                    )
-                                    .await;
-                                    continue;
-                                }
-                                self.record_empty_completion_failure(
-                                    &mut failures,
-                                    provider_name,
-                                    served_model,
-                                    attempt,
-                                    false,
-                                );
-                                final_cause_is_semantic_empty = true;
-                                break;
-                            }
-                            final_cause_is_semantic_empty = false;
-                            // Context window exceeded: truncate history and retry
-                            if is_context_window_exceeded(&e)
-                                && !is_non_retryable(&e)
-                                && !context_truncated
-                            {
-                                let diagnostic = provider_error_diagnostic(&e);
-                                push_failure(
-                                    &mut failures,
-                                    attempt + 1,
-                                    self.max_retries + 1,
-                                    "context_window",
-                                    Some(&diagnostic),
-                                );
-                                let dropped = truncate_for_context(&mut effective_messages);
-                                if dropped > 0 {
-                                    record_provider_context_truncation();
-                                    context_truncated = true;
-                                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": provider_name, "model": served_model, "dropped": dropped, "remaining": effective_messages.len()})), "Context window exceeded; truncated history and retrying");
-                                    continue; // Retry with truncated messages (counts as an attempt)
-                                }
-                                // No complete older turn can be removed safely.
-                                let truncation_limit =
-                                    context_truncation_limit(&effective_messages);
-                                let context_error = context_failure_aggregate(
-                                    &format!(
-                                        "Request exceeds model context window and cannot be reduced without \
-                                         breaking message/tool pairing ({truncation_limit}). Try using a model \
-                                         with a larger context window, reducing the number of tools/skills, or \
-                                         enabling compact_context in config."
-                                    ),
-                                    &failures,
-                                );
-                                return Err(reliable_terminal_error_with_cause(
-                                    Some(entry.candidate_name()),
-                                    failures,
-                                    rejected_attempt_usage,
-                                    false,
-                                    Some(e),
-                                )
-                                .context(context_error));
-                            }
-
-                            let non_retryable_rate_limit = is_non_retryable_rate_limit(&e);
-                            // Typed terminal decisions and business quota
-                            // win; overload wording only downgrades
-                            // heuristic non-retryable text (see
-                            // `is_terminal_provider_failure`).
-                            let non_retryable = is_terminal_provider_failure(&e);
-                            let rate_limited = is_rate_limited(&e);
-                            let failure_reason = failure_reason(rate_limited, non_retryable);
-                            let error_detail = compact_error_detail(&e);
-                            let diagnostic = provider_error_diagnostic(&e);
-                            last_error_detail = Some(error_detail.clone());
-                            last_diagnostic = Some(diagnostic.clone());
-
-                            push_failure(
-                                &mut failures,
-                                attempt + 1,
-                                self.max_retries + 1,
-                                failure_reason,
-                                Some(&diagnostic),
-                            );
-
-                            if rate_limited
-                                && !non_retryable_rate_limit
-                                && let Some(new_key) = self.rotate_key()
-                            {
-                                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": provider_name, "error": error_detail})), &format!("Rate limited; key rotation selected key ending ...{} \
-                                     but cannot apply (ModelProvider trait has no set_api_key). \
-                                     Retrying with original key.", &new_key[new_key.len().saturating_sub(4)..]));
-                            }
-
-                            if non_retryable {
-                                ::zeroclaw_log::record!(
-                                    WARN,
-                                    ::zeroclaw_log::Event::new(
-                                        module_path!(),
-                                        ::zeroclaw_log::Action::Note
-                                    )
-                                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                                    .with_attrs(
-                                        provider_failure_attrs(
-                                            provider_name,
-                                            served_model,
-                                            &error_detail,
-                                            &diagnostic,
-                                        )
-                                    ),
-                                    "Non-retryable error, moving on"
-                                );
-                                if has_typed_non_retryable_marker(&e) {
-                                    terminal_provider_keys.insert(entry.cooldown_key.clone());
-                                }
-                                final_cause = Some(e);
-                                final_cause_provider = Some(entry.candidate_name().to_string());
-                                break;
-                            }
-
-                            if rate_limited && self.model_providers.len() > 1 {
-                                self.cool_down_rate_limited_provider(entry, served_model, &e);
-                                final_cause = Some(e);
-                                final_cause_provider = Some(entry.candidate_name().to_string());
-                                break;
-                            }
-
-                            if attempt < retry_limit {
-                                let wait = self.compute_backoff(backoff_ms, &e);
-                                ::zeroclaw_log::record!(
-                                    WARN,
-                                    ::zeroclaw_log::Event::new(
-                                        module_path!(),
-                                        ::zeroclaw_log::Action::Note
-                                    )
-                                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                                    .with_attrs(
-                                        provider_retry_attrs(
-                                            provider_name,
-                                            served_model,
-                                            attempt + 1,
-                                            wait,
-                                            failure_reason,
-                                            &error_detail,
-                                            &diagnostic,
-                                        )
-                                    ),
-                                    "ModelProvider call failed, retrying"
-                                );
-                                tokio::time::sleep(Duration::from_millis(wait)).await;
-                                backoff_ms = (backoff_ms.saturating_mul(2)).min(10_000);
-                            }
-                            final_cause = Some(e);
-                            final_cause_provider = Some(entry.candidate_name().to_string());
-                        }
-                    }
-                }
-
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(provider_exhausted_attrs(
-                            provider_name,
-                            served_model,
-                            last_error_detail.as_deref(),
-                            last_diagnostic.as_ref(),
-                        )),
-                    "Exhausted retries, trying next model_provider/model"
-                );
-            }
-
-            if *current_model != model {
-                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"original_model": model, "fallback_model": *current_model})), "Model fallback exhausted all model_providers, trying next fallback model");
-            }
-        }
-
-        Err(provider_exhausted(reliable_terminal_error_with_cause(
-            final_cause_provider
-                .as_deref()
-                .or_else(|| self.configured_provider_identity()),
-            failures,
-            rejected_attempt_usage,
-            final_cause_is_semantic_empty,
-            final_cause,
-        )))
+    async fn chat_with_attempt_budget(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        policy: zeroclaw_api::model_provider::ToolRoundPolicy,
+        budget: &zeroclaw_api::model_provider::GenerationAttemptBudget,
+    ) -> anyhow::Result<ChatResponse> {
+        self.chat_inner(request, model, temperature, policy, Some(budget))
+            .await
     }
 
     fn supports_streaming(&self) -> bool {

@@ -474,6 +474,106 @@ impl OpenAiModelProvider {
     }
 }
 
+impl OpenAiModelProvider {
+    async fn chat_inner(
+        &self,
+        request: ProviderChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        policy: zeroclaw_api::model_provider::ToolRoundPolicy,
+        budget: Option<&zeroclaw_api::model_provider::GenerationAttemptBudget>,
+    ) -> anyhow::Result<ProviderChatResponse> {
+        if let Some(budget) = budget {
+            budget.ensure_available()?;
+        }
+        let credential = self.credential.as_ref().ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"missing": "credentials"})),
+                "openai: API key not configured"
+            );
+            anyhow::Error::msg("OpenAI API key not set. Set OPENAI_API_KEY or edit config.toml.")
+        })?;
+
+        let adjusted_temperature =
+            temperature.map(|t| Self::adjust_temperature_for_model(model, t));
+
+        let tools = Self::convert_tools(request.tools);
+        let tools_count = tools.as_ref().map_or(0, Vec::len);
+        let native_request = NativeChatRequest {
+            model: model.to_string(),
+            messages: Self::convert_messages(request.messages),
+            temperature: adjusted_temperature,
+            tool_choice: tools
+                .as_ref()
+                .and_then(|t| (!t.is_empty()).then(|| "auto".to_string())),
+            parallel_tool_calls: (tools_count > 0
+                && policy == zeroclaw_api::model_provider::ToolRoundPolicy::Single
+                && self.supports_single_tool_rounds(model))
+            .then_some(false),
+            tools,
+            max_tokens: self.max_tokens,
+        };
+        if ::zeroclaw_log::debug_enabled() {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Send)
+                    .with_attrs(::serde_json::json!({
+                        "provider": "openai",
+                        "alias": &self.alias,
+                        "request_api": "chat_completions",
+                        "model": model,
+                        "stream": false,
+                        "tools_count": tools_count,
+                        "tool_choice": native_request.tool_choice.as_deref(),
+                    })),
+                "openai provider request prepared"
+            );
+        }
+
+        let client = match budget {
+            Some(_) => crate::bounded::timeout_client("model_provider.openai", self.timeout_secs)?,
+            None => self.http_client(),
+        };
+        let request = client
+            .post(format!("{}/chat/completions", self.base_url))
+            .header("Authorization", format!("Bearer {credential}"))
+            .json(&native_request);
+        let response = crate::bounded::send(request, budget, None).await?;
+
+        if !response.status().is_success() {
+            return Err(super::api_error("OpenAI", response).await);
+        }
+
+        let native_response: NativeChatResponse = response.json().await?;
+        let usage = native_response.usage.map(|u| TokenUsage {
+            input_tokens: u.prompt_tokens,
+            output_tokens: u.completion_tokens,
+            cached_input_tokens: u.prompt_tokens_details.and_then(|d| d.cached_tokens),
+            cache_creation_input_tokens: None,
+        });
+        let message = native_response
+            .choices
+            .into_iter()
+            .next()
+            .map(|c| c.message)
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                    "openai: empty choices in response"
+                );
+                anyhow::Error::msg("No response from OpenAI")
+            })?;
+        let mut result = Self::parse_native_response(message);
+        result.usage = usage;
+        Ok(result)
+    }
+}
+
 #[async_trait]
 impl ModelProvider for OpenAiModelProvider {
     fn supports_single_tool_rounds(&self, _model: &str) -> bool {
@@ -580,89 +680,20 @@ impl ModelProvider for OpenAiModelProvider {
         temperature: Option<f64>,
         policy: zeroclaw_api::model_provider::ToolRoundPolicy,
     ) -> anyhow::Result<ProviderChatResponse> {
-        let credential = self.credential.as_ref().ok_or_else(|| {
-            ::zeroclaw_log::record!(
-                ERROR,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({"missing": "credentials"})),
-                "openai: API key not configured"
-            );
-            anyhow::Error::msg("OpenAI API key not set. Set OPENAI_API_KEY or edit config.toml.")
-        })?;
+        self.chat_inner(request, model, temperature, policy, None)
+            .await
+    }
 
-        let adjusted_temperature =
-            temperature.map(|t| Self::adjust_temperature_for_model(model, t));
-
-        let tools = Self::convert_tools(request.tools);
-        let tools_count = tools.as_ref().map_or(0, Vec::len);
-        let native_request = NativeChatRequest {
-            model: model.to_string(),
-            messages: Self::convert_messages(request.messages),
-            temperature: adjusted_temperature,
-            tool_choice: tools
-                .as_ref()
-                .and_then(|t| (!t.is_empty()).then(|| "auto".to_string())),
-            parallel_tool_calls: (tools_count > 0
-                && policy == zeroclaw_api::model_provider::ToolRoundPolicy::Single
-                && self.supports_single_tool_rounds(model))
-            .then_some(false),
-            tools,
-            max_tokens: self.max_tokens,
-        };
-        if ::zeroclaw_log::debug_enabled() {
-            ::zeroclaw_log::record!(
-                DEBUG,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Send)
-                    .with_attrs(::serde_json::json!({
-                        "provider": "openai",
-                        "alias": &self.alias,
-                        "request_api": "chat_completions",
-                        "model": model,
-                        "stream": false,
-                        "tools_count": tools_count,
-                        "tool_choice": native_request.tool_choice.as_deref(),
-                    })),
-                "openai provider request prepared"
-            );
-        }
-
-        let response = self
-            .http_client()
-            .post(format!("{}/chat/completions", self.base_url))
-            .header("Authorization", format!("Bearer {credential}"))
-            .json(&native_request)
-            .send()
-            .await?;
-
-        if !response.status().is_success() {
-            return Err(super::api_error("OpenAI", response).await);
-        }
-
-        let native_response: NativeChatResponse = response.json().await?;
-        let usage = native_response.usage.map(|u| TokenUsage {
-            input_tokens: u.prompt_tokens,
-            output_tokens: u.completion_tokens,
-            cached_input_tokens: u.prompt_tokens_details.and_then(|d| d.cached_tokens),
-            cache_creation_input_tokens: None,
-        });
-        let message = native_response
-            .choices
-            .into_iter()
-            .next()
-            .map(|c| c.message)
-            .ok_or_else(|| {
-                ::zeroclaw_log::record!(
-                    ERROR,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
-                    "openai: empty choices in response"
-                );
-                anyhow::Error::msg("No response from OpenAI")
-            })?;
-        let mut result = Self::parse_native_response(message);
-        result.usage = usage;
-        Ok(result)
+    async fn chat_with_attempt_budget(
+        &self,
+        request: crate::traits::ChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        policy: zeroclaw_api::model_provider::ToolRoundPolicy,
+        budget: &zeroclaw_api::model_provider::GenerationAttemptBudget,
+    ) -> anyhow::Result<crate::traits::ChatResponse> {
+        self.chat_inner(request, model, temperature, policy, Some(budget))
+            .await
     }
 
     fn supports_native_tools(&self) -> bool {
@@ -1290,6 +1321,86 @@ impl OpenAiResponsesModelProvider {
     }
 }
 
+impl OpenAiResponsesModelProvider {
+    fn bounded_http_client(&self) -> anyhow::Result<Client> {
+        let builder = Client::builder()
+            .timeout(std::time::Duration::from_secs(self.timeout_secs))
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .default_headers(self.build_default_headers());
+        crate::bounded::client(builder, Some("model_provider.openai"))
+    }
+
+    async fn chat_inner(
+        &self,
+        request: ProviderChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        policy: zeroclaw_api::model_provider::ToolRoundPolicy,
+        budget: Option<&zeroclaw_api::model_provider::GenerationAttemptBudget>,
+    ) -> anyhow::Result<ProviderChatResponse> {
+        if let Some(budget) = budget {
+            budget.ensure_available()?;
+        }
+        let credential = self.credential.as_ref().ok_or_else(|| {
+            anyhow::Error::msg("OpenAI API key not set. Set OPENAI_API_KEY or edit config.toml.")
+        })?;
+        let (instructions, input) = build_responses_input(request.messages);
+        let instructions = if instructions.is_empty() {
+            None
+        } else {
+            Some(instructions)
+        };
+        let tools = convert_tools(request.tools);
+        let tools_count = tools.as_ref().map_or(0, Vec::len);
+        let mut req = self.build_request(instructions, input, tools, model, temperature, false);
+        if tools_count > 0
+            && policy == zeroclaw_api::model_provider::ToolRoundPolicy::Single
+            && self.supports_single_tool_rounds(model)
+        {
+            req.parallel_tool_calls = Some(false);
+        }
+        if ::zeroclaw_log::debug_enabled() {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Send)
+                    .with_attrs(::serde_json::json!({
+                        "provider": "openai",
+                        "alias": &self.alias,
+                        "request_api": "responses",
+                        "model": model,
+                        "stream": false,
+                        "tools_count": tools_count,
+                        "tool_choice": req.tool_choice.as_deref(),
+                        "parallel_tool_calls": req.parallel_tool_calls,
+                    })),
+                "openai responses provider request prepared"
+            );
+        }
+        let client = match budget {
+            Some(_) => self.bounded_http_client()?,
+            None => self.http_client(),
+        };
+        let request = self
+            .apply_opencode_session_header(
+                client
+                    .post(&self.responses_url)
+                    .header("Authorization", format!("Bearer {credential}")),
+            )
+            .json(&req);
+        let response = crate::bounded::send(request, budget, None).await?;
+        if !response.status().is_success() {
+            return Err(super::api_error("OpenAI", response).await);
+        }
+        let body: ResponsesApiBody = response.json().await?;
+        Ok(ProviderChatResponse {
+            text: extract_responses_api_text(&body),
+            tool_calls: extract_responses_api_tool_calls(&body),
+            usage: parse_responses_usage(body.usage.as_ref()),
+            reasoning_content: None,
+        })
+    }
+}
+
 #[async_trait]
 impl ModelProvider for OpenAiResponsesModelProvider {
     fn supports_single_tool_rounds(&self, _model: &str) -> bool {
@@ -1416,60 +1527,20 @@ impl ModelProvider for OpenAiResponsesModelProvider {
         temperature: Option<f64>,
         policy: zeroclaw_api::model_provider::ToolRoundPolicy,
     ) -> anyhow::Result<ProviderChatResponse> {
-        let credential = self.credential.as_ref().ok_or_else(|| {
-            anyhow::Error::msg("OpenAI API key not set. Set OPENAI_API_KEY or edit config.toml.")
-        })?;
-        let (instructions, input) = build_responses_input(request.messages);
-        let instructions = if instructions.is_empty() {
-            None
-        } else {
-            Some(instructions)
-        };
-        let tools = convert_tools(request.tools);
-        let tools_count = tools.as_ref().map_or(0, Vec::len);
-        let mut req = self.build_request(instructions, input, tools, model, temperature, false);
-        if tools_count > 0
-            && policy == zeroclaw_api::model_provider::ToolRoundPolicy::Single
-            && self.supports_single_tool_rounds(model)
-        {
-            req.parallel_tool_calls = Some(false);
-        }
-        if ::zeroclaw_log::debug_enabled() {
-            ::zeroclaw_log::record!(
-                DEBUG,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Send)
-                    .with_attrs(::serde_json::json!({
-                        "provider": "openai",
-                        "alias": &self.alias,
-                        "request_api": "responses",
-                        "model": model,
-                        "stream": false,
-                        "tools_count": tools_count,
-                        "tool_choice": req.tool_choice.as_deref(),
-                        "parallel_tool_calls": req.parallel_tool_calls,
-                    })),
-                "openai responses provider request prepared"
-            );
-        }
-        let response = self
-            .apply_opencode_session_header(
-                self.http_client()
-                    .post(&self.responses_url)
-                    .header("Authorization", format!("Bearer {credential}")),
-            )
-            .json(&req)
-            .send()
-            .await?;
-        if !response.status().is_success() {
-            return Err(super::api_error("OpenAI", response).await);
-        }
-        let body: ResponsesApiBody = response.json().await?;
-        Ok(ProviderChatResponse {
-            text: extract_responses_api_text(&body),
-            tool_calls: extract_responses_api_tool_calls(&body),
-            usage: parse_responses_usage(body.usage.as_ref()),
-            reasoning_content: None,
-        })
+        self.chat_inner(request, model, temperature, policy, None)
+            .await
+    }
+
+    async fn chat_with_attempt_budget(
+        &self,
+        request: crate::traits::ChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        policy: zeroclaw_api::model_provider::ToolRoundPolicy,
+        budget: &zeroclaw_api::model_provider::GenerationAttemptBudget,
+    ) -> anyhow::Result<crate::traits::ChatResponse> {
+        self.chat_inner(request, model, temperature, policy, Some(budget))
+            .await
     }
 
     fn stream_chat(
@@ -3808,5 +3879,37 @@ mod tests {
             message.contains("raise timeout_secs above 300s"),
             "idle message must name the knob that raises the bound: {message}"
         );
+    }
+}
+
+#[cfg(test)]
+mod attempt_budget_tests {
+    use super::*;
+    use crate::bounded::tests as fixture;
+
+    #[tokio::test]
+    async fn chat_completions_shares_budget_across_calls() {
+        let server = fixture::server(vec![
+            fixture::Reply::json(200, fixture::CHAT_OK),
+            fixture::Reply::json(200, fixture::CHAT_OK),
+        ])
+        .await;
+        let provider = OpenAiModelProvider::builder("fixture")
+            .credential(Some("fixture-key"))
+            .build();
+        fixture::assert_two_requests(&provider, &server).await;
+    }
+
+    #[tokio::test]
+    async fn responses_shares_budget_across_calls() {
+        let server = fixture::server(vec![
+            fixture::Reply::json(200, fixture::RESPONSES_OK),
+            fixture::Reply::json(200, fixture::RESPONSES_OK),
+        ])
+        .await;
+        let provider = OpenAiResponsesModelProvider::builder("fixture")
+            .credential(Some("fixture-key"))
+            .build();
+        fixture::assert_two_requests(&provider, &server).await;
     }
 }
