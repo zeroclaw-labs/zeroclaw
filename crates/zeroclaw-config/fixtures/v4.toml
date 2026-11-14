@@ -372,10 +372,9 @@ charset = "alphanumeric"
 length = 32
 
 [gateway.pairing_dashboard]
-code_ttl_secs = 3600
+code_ttl_secs = 600
 lockout_secs = 300
 max_failed_attempts = 5
-max_pending_codes = 3
 
 [gemini_cli]
 enabled = false

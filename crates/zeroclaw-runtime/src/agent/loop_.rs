@@ -1405,6 +1405,23 @@ pub fn apply_text_tool_prompt_policy(
     expose_text_tool_protocol
 }
 
+/// The cross-agent SOP step handle for a run over `memory`. A run started
+/// with an owner's plane (a pinned session's subagent child) re-assembles its
+/// steps under that owner, so a step agent's memory is the owner's plane for
+/// that agent rather than its shared plane.
+fn sop_reassembly_over<'a>(
+    config: &'a Config,
+    capabilities: Option<&'a crate::composition::BoundCapabilities>,
+    memory: &Arc<dyn Memory>,
+) -> crate::agent::turn::SopStepReassembly<'a> {
+    crate::agent::turn::SopStepReassembly {
+        config,
+        capabilities,
+        live_config: None,
+        memory_owner: memory.principal_scope(),
+    }
+}
+
 #[derive(Default)]
 pub struct AgentRunOverrides {
     pub security: Option<Arc<SecurityPolicy>>,
@@ -2505,11 +2522,11 @@ async fn run_inner(
                                 turn_id: &turn_id,
                                 served_route_sink: None,
                                 capability_binding: Some(&bound_capabilities),
-                                sop_reassembly: Some(crate::agent::turn::SopStepReassembly {
-                                    config: &config,
-                                    capabilities: Some(&bound_capabilities),
-                                    live_config: None,
-                                }),
+                                sop_reassembly: Some(sop_reassembly_over(
+                                    &config,
+                                    Some(&bound_capabilities),
+                                    &mem,
+                                )),
                             }),
                         ),
                     )
@@ -2675,6 +2692,7 @@ async fn run_inner(
                             model_provider.as_ref(),
                             &provider_name,
                             &model_name,
+                            effective_temperature,
                             observer.as_ref(),
                             &config.multimodal,
                             &config.pacing,
@@ -3168,11 +3186,11 @@ async fn run_inner(
                                     turn_id: &turn_id,
                                     served_route_sink: None,
                                     capability_binding: Some(&bound_capabilities),
-                                    sop_reassembly: Some(crate::agent::turn::SopStepReassembly {
-                                        config: &config,
-                                        capabilities: Some(&bound_capabilities),
-                                        live_config: None,
-                                    }),
+                                    sop_reassembly: Some(sop_reassembly_over(
+                                        &config,
+                                        Some(&bound_capabilities),
+                                        &mem,
+                                    )),
                                 }),
                             ),
                         )
@@ -4383,6 +4401,7 @@ async fn process_message_inner(
                         config: &config,
                         capabilities: Some(&bound_capabilities),
                         live_config,
+                        memory_owner: mem.principal_scope(),
                     }),
                     Some(&bound_capabilities),
                 ),
@@ -4397,6 +4416,29 @@ async fn process_message_inner(
 
 #[cfg(test)]
 mod tests {
+    /// A run over an owner's plane re-assembles its SOP steps under that
+    /// owner; a run over shared memory carries none.
+    #[test]
+    fn a_runs_sop_steps_reassemble_under_the_owner_of_its_memory() {
+        use zeroclaw_api::memory_traits::PrincipalScope;
+        let config = Config::default();
+        let shared: Arc<dyn Memory> = Arc::new(zeroclaw_memory::NoneMemory::new("none"));
+        assert!(
+            super::sop_reassembly_over(&config, None, &shared)
+                .memory_owner
+                .is_none()
+        );
+        let scope = PrincipalScope::new("user:alice").with_agent(Some("alpha".to_string()));
+        let routed: Arc<dyn Memory> = Arc::new(zeroclaw_memory::PrincipalPlaneMemory::new(
+            shared,
+            scope.clone(),
+        ));
+        assert_eq!(
+            super::sop_reassembly_over(&config, None, &routed).memory_owner,
+            Some(scope)
+        );
+    }
+
     use super::{
         apply_text_tool_prompt_policy, effort_scoped_provider_config, effort_turn_route,
         estimate_history_tokens, load_interactive_session_history, make_query_summary,
@@ -17469,6 +17511,7 @@ Let me check the result."#;
             ask_user_handle: None,
             reaction_handle: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             poll_handle: None,
+            session_memory: None,
             escalate_handle: None,
             channel_room_handle: None,
             unfiltered_tool_arcs: Vec::new(),
@@ -19782,6 +19825,7 @@ Let me check the result."#;
                 &model_provider,
                 "mock-provider",
                 "mock-model",
+                None,
                 &NoopObserver,
                 &config.multimodal,
                 &zeroclaw_config::schema::PacingConfig::default(),
@@ -19862,6 +19906,7 @@ Let me check the result."#;
                     &model_provider,
                     "mock-provider",
                     "mock-model",
+                    None,
                     &observer,
                     &zeroclaw_config::schema::MultimodalConfig::default(),
                     &zeroclaw_config::schema::PacingConfig::default(),
@@ -19949,6 +19994,7 @@ Let me check the result."#;
                     &model_provider,
                     "mock-provider",
                     "mock-model",
+                    None,
                     &observer,
                     &zeroclaw_config::schema::MultimodalConfig::default(),
                     &zeroclaw_config::schema::PacingConfig::default(),
@@ -20058,6 +20104,7 @@ Let me check the result."#;
             &model_provider,
             "mock-provider",
             "mock-model",
+            None,
             &observer,
             &zeroclaw_config::schema::MultimodalConfig::default(),
             &zeroclaw_config::schema::PacingConfig::default(),

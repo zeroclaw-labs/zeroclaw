@@ -1623,7 +1623,6 @@ mod tests {
                 8, 30, 600,
             )),
             device_registry: None,
-            pending_pairings: None,
             canvas_store: zeroclaw_runtime::tools::CanvasStore::new(),
             #[cfg(feature = "webauthn")]
             webauthn: None,
