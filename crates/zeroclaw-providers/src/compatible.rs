@@ -17053,7 +17053,7 @@ mod tests {
     fn models_with_pricing_drop_unrecognized_pricing_shape() {
         let body: ModelsResponse =
             serde_json::from_str(XAI_MODELS_WITH_TIERED_IMAGE_PRICING).unwrap();
-        let models = normalize_models_with_pricing(body);
+        let models = normalize_models_with_pricing(body, false);
         assert_eq!(models.len(), 2);
         assert!(
             models.iter().all(|m| m.pricing.is_none()),
@@ -17073,7 +17073,7 @@ mod tests {
             ]}"#,
         )
         .unwrap();
-        let models = normalize_models_with_pricing(body);
+        let models = normalize_models_with_pricing(body, false);
         let a = models[0]
             .pricing
             .as_ref()
