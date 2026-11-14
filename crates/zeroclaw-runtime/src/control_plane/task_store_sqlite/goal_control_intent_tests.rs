@@ -7,6 +7,29 @@ use crate::control_plane::task_store_sqlite::CONTROL_PLANE_SCHEMA_VERSION;
 use zeroclaw_commands::goal::GoalBudgetSelection;
 use zeroclaw_goal::task::{GoalControlIntent, GoalControlIntentKind, GoalControlIntentSettlement};
 
+struct ChildGuard(std::process::Child);
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn live_owner_process() -> ChildGuard {
+    ChildGuard(
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "control_plane::boot::tests::live_owner_process_helper",
+            ])
+            .env("ZEROCLAW_LIVE_OWNER_TEST_HELPER", "1")
+            .spawn()
+            .unwrap(),
+    )
+}
+
 fn start_intent(boot: &str) -> GoalControlIntent {
     GoalControlIntent {
         intent_id: uuid::Uuid::new_v4().to_string(),
@@ -659,13 +682,38 @@ async fn control_intent_claim_and_settlement_are_guarded() {
 async fn control_intent_restart_abandons_only_predecessor_open_intents() {
     let directory = tempfile::tempdir().unwrap();
     let store = SqliteTaskStore::new(directory.path()).unwrap();
-    let pending = start_intent("previous-boot");
-    let claimed = start_intent("previous-boot");
-    let applied = start_intent("previous-boot");
+    let mut child = live_owner_process();
+    let dead_owner_pid = child.0.id();
+    child.0.kill().unwrap();
+    child.0.wait().unwrap();
+    let mut pending = start_intent("previous-boot");
+    let mut claimed = start_intent("previous-boot");
+    let mut applied = start_intent("previous-boot");
+    for intent in [&mut pending, &mut claimed, &mut applied] {
+        intent.owner_pid = dead_owner_pid;
+    }
     let current = start_intent("current-boot");
-    for intent in [&pending, &claimed, &applied, &current] {
+    let mut uncertain = start_intent(&format!("zc-process-v1:{dead_owner_pid}:invalid:owner"));
+    uncertain.owner_pid = dead_owner_pid;
+    let unreadable = start_intent("unreadable-owner");
+    for intent in [
+        &pending,
+        &claimed,
+        &applied,
+        &current,
+        &uncertain,
+        &unreadable,
+    ] {
         store.record_control_intent(intent).await.unwrap();
     }
+    store
+        .conn
+        .lock()
+        .execute(
+            "UPDATE goal_control_intents SET owner_pid = 1.5 WHERE intent_id = ?1",
+            params![unreadable.intent_id],
+        )
+        .unwrap();
     for intent in [&claimed, &applied] {
         assert_eq!(
             store
@@ -688,10 +736,69 @@ async fn control_intent_restart_abandons_only_predecessor_open_intents() {
     }
     assert_eq!(state(&store, &applied.intent_id), ("applied".into(), None));
     assert_eq!(state(&store, &current.intent_id), ("pending".into(), None));
+    assert_eq!(
+        state(&store, &uncertain.intent_id),
+        ("pending".into(), None)
+    );
+    assert_eq!(
+        state(&store, &unreadable.intent_id),
+        ("pending".into(), None)
+    );
     drop(store);
     let reopened = SqliteTaskStore::new(directory.path()).unwrap();
     assert_eq!(
         state(&reopened, &current.intent_id),
         ("pending".into(), None)
+    );
+}
+
+#[tokio::test]
+async fn control_intent_restart_preserves_live_foreign_owner() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = SqliteTaskStore::new(directory.path()).unwrap();
+    let mut child = live_owner_process();
+    let owner_pid = child.0.id();
+    let owner_boot = format!("zc-process-v1:{owner_pid}:unknown:live-owner");
+    let mut pending = start_intent(&owner_boot);
+    let mut claimed = start_intent(&owner_boot);
+    pending.owner_pid = owner_pid;
+    claimed.owner_pid = owner_pid;
+    for intent in [&pending, &claimed] {
+        store.record_control_intent(intent).await.unwrap();
+    }
+    assert_eq!(
+        store
+            .claim_control_intent(&claimed.intent_id, &owner_boot)
+            .await
+            .unwrap(),
+        GoalTransitionResult::Applied
+    );
+
+    assert!(child.0.try_wait().unwrap().is_none());
+    store.reconcile_goal_boot_state("different-boot").unwrap();
+    assert!(child.0.try_wait().unwrap().is_none());
+    drop(store);
+    let reopened = SqliteTaskStore::new(directory.path()).unwrap();
+    assert_eq!(
+        state(&reopened, &pending.intent_id),
+        ("pending".into(), None)
+    );
+    assert_eq!(
+        state(&reopened, &claimed.intent_id),
+        ("claimed".into(), None)
+    );
+    assert_eq!(
+        reopened
+            .claim_control_intent(&pending.intent_id, &owner_boot)
+            .await
+            .unwrap(),
+        GoalTransitionResult::Applied
+    );
+    assert_eq!(
+        reopened
+            .settle_control_intent(&claimed.intent_id, GoalControlIntentSettlement::Applied)
+            .await
+            .unwrap(),
+        GoalTransitionResult::Applied
     );
 }

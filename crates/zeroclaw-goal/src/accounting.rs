@@ -134,7 +134,7 @@ impl GoalAccountingFailure {
     pub fn unsettled(operation: GoalUnsettledOperation, detail: &str) -> Self {
         let condition = match operation {
             GoalUnsettledOperation::NeverDispatched => {
-                "an admitted Goal model call that was never dispatched could not be released, so it remains pending"
+                "an admitted Goal model call that was never dispatched could not be confirmed as released, so it may remain pending"
             }
             GoalUnsettledOperation::Dispatched => {
                 "usage settlement for an earlier Goal model call did not become durable, so the call may remain pending"
@@ -406,6 +406,8 @@ mod tests {
             "registry secret",
         );
         assert!(unstarted.to_string().contains("never dispatched"));
+        assert!(unstarted.to_string().contains("may remain pending"));
+        assert!(!unstarted.to_string().contains("so it remains pending"));
         assert!(!unstarted.to_string().contains("outcome of an earlier"));
         let redacted = unstarted.redacted(|message| message.replace("secret", "[redacted]"));
         assert!(redacted.to_string().contains("registry [redacted]"));
