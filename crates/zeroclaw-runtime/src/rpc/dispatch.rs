@@ -10051,6 +10051,17 @@ impl RpcDispatcher {
         }
         editor::stage(&mut candidate, edit)
             .map_err(|error| rpc_err(INVALID_PARAMS, format!("{error:#}")))?;
+        #[cfg(any(test, feature = "test-util"))]
+        {
+            // The registry edit is now authoritative. Do not let the
+            // historical typed source rows re-project their pre-edit value
+            // on the next test-only admission.
+            let canonical_models = candidate.providers.models.canonical_models.clone();
+            candidate.providers.models = Default::default();
+            candidate.providers.models.canonical_models = canonical_models;
+            candidate.providers.tts = Default::default();
+            candidate.providers.transcription = Default::default();
+        }
         // A model can change without its connection changing. Match the real
         // embedding consumer (including routes), then rebuild its entire view
         // once rather than refreshing once per model on a shared connection.
