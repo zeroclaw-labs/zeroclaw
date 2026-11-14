@@ -1000,6 +1000,7 @@ impl AgentBuilder {
     /// builds. [`Self::build`] applies the `allowed_tools` and ACP
     /// memory-strip filters on top of the sealed set.
     pub fn tools(mut self, tools: crate::tools::scoped::ScopedToolRegistry) -> Self {
+        self.delegate_tool = tools.delegate_tool();
         self.tools = Some(tools);
         self
     }
