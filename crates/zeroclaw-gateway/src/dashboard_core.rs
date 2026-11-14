@@ -2778,6 +2778,94 @@ mod tests {
         );
     }
 
+    /// A trim the core makes after the reply survives the scoped chat's
+    /// `done`, as it does the in-process chat's, without standing in for the
+    /// measured prompt size. The next turn, with no trim, does not inherit it.
+    #[tokio::test]
+    async fn a_scoped_chats_terminal_trim_survives_done_without_changing_usage_or_next_turn() {
+        let fixture = Fixture::with_config(|config| {
+            config
+                .runtime_profiles
+                .get_mut("test-runtime")
+                .expect("the fixture's runtime")
+                .max_context_tokens = Some(100_000);
+            config
+                .providers
+                .models
+                .ensure("openai", "test-provider")
+                .expect("the fixture's provider")
+                .context_window = Some(200_000);
+        })
+        .await;
+        // One call measured over the budget, so the core trims after it.
+        Mock::given(http_method("POST"))
+            .and(http_path("/chat/completions"))
+            .and(body_string_contains("measure this one large"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "choices": [{"message": {"role": "assistant", "content": "measured"}}],
+                "usage": {"prompt_tokens": 180_000, "completion_tokens": 1, "total_tokens": 180_001},
+            })))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&fixture._model)
+            .await;
+        let addr = serve(fixture.router()).await;
+        let (alice, _) = fixture.sign_in("alice").await;
+        let mut socket = open_chat(addr, &alice, "support", "trimmed-chat")
+            .await
+            .expect("alice may chat with support");
+        await_frame(&mut socket, "session_start").await;
+        let old = chat_once(&mut socket, &"old request ".repeat(2_000)).await;
+        assert_eq!(old["type"], "done", "{old}");
+
+        socket
+            .send(ClientMessage::Text(
+                json!({"type": "message", "content": "measure this one large"})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+        let mut trims = Vec::new();
+        let done = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let frame = socket.next().await.expect("socket open").expect("frame");
+                let Ok(text) = frame.into_text() else {
+                    continue;
+                };
+                let frame: Value = serde_json::from_str(&text).unwrap();
+                match frame["type"].as_str() {
+                    Some("history_trimmed") => trims.push(frame),
+                    Some("done") => return frame,
+                    Some("error" | "aborted") => panic!("unexpected turn end: {frame}"),
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("the turn ends");
+        let trim = trims
+            .last()
+            .expect("the core's terminal trim reaches the socket");
+        assert!(
+            trim["dropped_messages"].as_u64().expect("dropped count") > 0,
+            "{trim}"
+        );
+        assert_eq!(trim["tokens_after_source"], "calibrated", "{trim}");
+        assert_eq!(done["context_input_tokens"], trim["tokens_after"], "{done}");
+        assert_eq!(done["context_input_tokens_source"], "calibrated", "{done}");
+        assert_eq!(done["last_input_tokens"], 180_000, "{done}");
+        assert_eq!(done["input_tokens"], 180_000, "{done}");
+        assert_eq!(done["max_context_tokens"], 100_000, "{done}");
+        assert_eq!(done["model_context_window"], 200_000, "{done}");
+        assert_ne!(done["context_input_tokens"], done["last_input_tokens"]);
+
+        let next = chat_once(&mut socket, "one more").await;
+        assert_eq!(next["type"], "done", "{next}");
+        assert!(next.get("context_input_tokens").is_none(), "{next}");
+        assert!(next.get("context_input_tokens_source").is_none(), "{next}");
+    }
+
     #[tokio::test]
     async fn a_scoped_chat_runs_as_its_principal_and_only_they_see_it() {
         let fixture = Fixture::new().await;

@@ -1,0 +1,42 @@
+[
+  {
+    "dropped_messages": 2,
+    "dropped_turns": 1,
+    "kept_turns": 1,
+    "reason": "context token budget exceeded",
+    "token_budget": 100000,
+    "tokens_after": 106366,
+    "tokens_after_source": "calibrated",
+    "tokens_before": 180087,
+    "tokens_before_source": "calibrated",
+    "type": "history_trimmed"
+  },
+  {
+    "context_input_tokens": 106366,
+    "context_input_tokens_source": "calibrated",
+    "cost_usd": null,
+    "full_response": "finished while nobody was watching",
+    "input_tokens": 180000,
+    "last_input_tokens": 180000,
+    "last_serving_model": "claude-test",
+    "last_serving_provider_ref": "anthropic.fixture",
+    "max_context_tokens": 100000,
+    "model": "claude-test",
+    "model_context_window": 200000,
+    "output_tokens": 1,
+    "provider": "anthropic.fixture",
+    "provider_ref": "anthropic.fixture",
+    "tokens_used": 180001,
+    "type": "done",
+    "usage_by_provider": [
+      {
+        "cached_input_tokens": 0,
+        "cost_usd": 0.0,
+        "input_tokens": 180000,
+        "model": "claude-test",
+        "output_tokens": 1,
+        "provider_ref": "anthropic.fixture"
+      }
+    ]
+  }
+]

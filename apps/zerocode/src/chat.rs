@@ -10193,9 +10193,9 @@ pub struct ChatState {
     /// provider (input + cached + output) is added on arrival. Cleared on
     /// session reset only.
     pub context_input_tokens: Option<u64>,
-    /// Provenance of `context_input_tokens` ("provider" or "estimate"). An
-    /// estimated count must be rendered as approximate, never as measured
-    /// usage. Always set and cleared together with the count it describes.
+    /// Provenance of `context_input_tokens`, using the wire values of
+    /// `zeroclaw_api::agent::TokenCountSource`. Derived counts are rendered as
+    /// approximate. Always set and cleared together with the count it describes.
     pub context_input_tokens_source: Option<String>,
     /// Preemptive-trim budget for this session (the bar fills toward this).
     pub context_max_tokens: Option<u64>,
@@ -12070,6 +12070,17 @@ impl ChatState {
                 self.entries
                     .push(ChatEntry::SystemMessage(Arc::<str>::from(notice)));
                 self.mark_dirty_append();
+                // A real trim supplies a new retained-context estimate. Its
+                // token_budget can be an emergency dispatch threshold, so the
+                // canonical budget/capacity still come only from ContextUsage.
+                // A zero-drop floor notice and a message-only trim do not
+                // replace the last count or its provenance.
+                if dropped_messages > 0
+                    && let Some(after) = tokens_after
+                {
+                    self.context_input_tokens = Some(after);
+                    self.context_input_tokens_source = tokens_after_source;
+                }
             }
             SessionUpdate::BudgetWarning {
                 current_usd,
@@ -27073,6 +27084,169 @@ mod tests {
                 if text.contains("Earlier conversation history was trimmed")
                     && !text.contains("could not be trimmed")
         ));
+    }
+
+    #[test]
+    fn history_trimmed_refreshes_the_displayed_context_budget() {
+        let mut s = state();
+        s.apply_update(SessionUpdate::ContextUsage {
+            session_id: "sess-1".to_string(),
+            input_tokens: Some(180_000),
+            input_tokens_source: Some("provider".to_string()),
+            max_context_tokens: Some(160_000),
+            model_context_window: Some(200_000),
+        });
+
+        // The terminal trim is emitted after the last accepted usage event, so
+        // the bar must adopt the trim's post-trim count while keeping the
+        // canonical budget. The event's threshold may be an emergency cap.
+        s.apply_update(SessionUpdate::HistoryTrimmed {
+            session_id: "sess-1".to_string(),
+            dropped_messages: 4,
+            dropped_turns: Some(1),
+            kept_turns: 1,
+            reason: "context token budget exceeded".to_string(),
+            token_budget: Some(128_000),
+            tokens_before: Some(180_000),
+            tokens_after: Some(90_000),
+            tokens_before_source: Some("provider".to_string()),
+            tokens_after_source: Some("calibrated".to_string()),
+            unsatisfiable_floor: None,
+        });
+
+        assert_eq!(s.context_input_tokens, Some(90_000));
+        assert_eq!(
+            s.context_input_tokens_source.as_deref(),
+            Some("calibrated"),
+            "the bar must describe the post-trim count, not the pre-trim provider sample"
+        );
+        assert_eq!(
+            s.context_max_tokens,
+            Some(160_000),
+            "the event threshold must not replace the canonical trim budget"
+        );
+        assert_eq!(
+            s.context_model_window,
+            Some(200_000),
+            "a trim does not re-resolve model capacity"
+        );
+    }
+
+    #[tokio::test]
+    async fn history_trimmed_rpc_updates_the_real_status_bar_without_changing_limits() {
+        let (mut chat, _writer_rx) = test_chat();
+        chat.phase = ChatPhase::Active(Box::new(state()));
+        let apply = |chat: &mut Chat, update: serde_json::Value| {
+            chat.rpc
+                .push_notification_for_test("session/update", update);
+            chat.tick_transport_events();
+            let (input, source, budget, window) = chat.ctx_tokens();
+            crate::app::tests::render_status_bar_cells(
+                crate::widgets::CtxBar::new(input, source, budget, window),
+                120,
+            )
+        };
+        let usage = |input: Option<u64>, budget: u64, window: Option<u64>| {
+            serde_json::json!({
+                "type": "context_usage", "session_id": "sess-1", "input_tokens": input,
+                "input_tokens_source": "provider", "max_context_tokens": budget,
+                "model_context_window": window,
+            })
+        };
+        let trim = |session: &str, dropped: usize, after: Option<u64>| {
+            serde_json::json!({
+                "type": "history_trimmed", "session_id": session,
+                "dropped_messages": dropped, "dropped_turns": usize::from(dropped > 0),
+                "kept_turns": 1, "reason": "context token budget exceeded",
+                "token_budget": 200_000, "tokens_before": 180_000,
+                "tokens_after": after, "tokens_before_source": "provider",
+                "tokens_after_source": "calibrated", "unsatisfiable_floor": true,
+            })
+        };
+        let before = apply(&mut chat, usage(Some(180_000), 160_000, Some(200_000)));
+        assert!(before.contains("180,000 / 200,000"), "{before}");
+        let unchanged = apply(&mut chat, trim("sess-1", 0, Some(90_000)));
+        assert_eq!(
+            unchanged, before,
+            "a floor notice without drops is not a new count"
+        );
+        assert_eq!(
+            apply(&mut chat, trim("other-session", 4, Some(90_000))),
+            before
+        );
+        assert_eq!(apply(&mut chat, trim("sess-1", 4, None)), before);
+
+        let after = apply(&mut chat, trim("sess-1", 4, Some(90_000)));
+        assert!(
+            after.contains("~ 90,000 / 200,000"),
+            "real terminal status cells: {after}"
+        );
+        assert!(
+            after.contains("~45%"),
+            "real terminal status percentage: {after}"
+        );
+        assert_eq!(
+            chat.ctx_tokens().2,
+            Some(160_000),
+            "emergency threshold cannot move the canonical marker"
+        );
+        assert!(
+            after.contains('│'),
+            "canonical trim marker remains visible: {after}"
+        );
+
+        let measured = apply(&mut chat, usage(Some(70_000), 160_000, Some(200_000)));
+        assert!(measured.contains("70,000 / 200,000"), "{measured}");
+        assert!(
+            !measured.contains('~'),
+            "later measured usage clears estimate provenance"
+        );
+        apply(&mut chat, usage(None, 160_000, Some(200_000)));
+        assert_eq!(chat.ctx_tokens().0, None);
+        assert_eq!(chat.ctx_tokens().1, None);
+
+        let disabled = apply(&mut chat, usage(Some(12_000), 0, None));
+        assert!(
+            !disabled.contains(" / "),
+            "no configured denominator: {disabled}"
+        );
+        let still_disabled = apply(&mut chat, trim("sess-1", 2, Some(6_000)));
+        assert!(
+            !still_disabled.contains(" / "),
+            "trim must not invent a denominator: {still_disabled}"
+        );
+        assert_eq!(chat.ctx_tokens().2, Some(0));
+    }
+
+    #[test]
+    fn history_trimmed_without_token_accounting_leaves_the_displayed_budget_alone() {
+        let mut s = state();
+        s.apply_update(SessionUpdate::ContextUsage {
+            session_id: "sess-1".to_string(),
+            input_tokens: Some(12_000),
+            input_tokens_source: Some("provider".to_string()),
+            max_context_tokens: Some(32_000),
+            model_context_window: Some(200_000),
+        });
+
+        s.apply_update(SessionUpdate::HistoryTrimmed {
+            session_id: "sess-1".to_string(),
+            dropped_messages: 2,
+            dropped_turns: Some(1),
+            kept_turns: 1,
+            reason: "history message limit exceeded".to_string(),
+            token_budget: None,
+            tokens_before: None,
+            tokens_after: None,
+            tokens_before_source: None,
+            tokens_after_source: None,
+            unsatisfiable_floor: None,
+        });
+
+        assert_eq!(s.context_input_tokens, Some(12_000));
+        assert_eq!(s.context_input_tokens_source.as_deref(), Some("provider"));
+        assert_eq!(s.context_max_tokens, Some(32_000));
+        assert_eq!(s.context_model_window, Some(200_000));
     }
 
     #[test]
