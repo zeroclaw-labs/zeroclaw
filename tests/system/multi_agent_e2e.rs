@@ -235,10 +235,18 @@ async fn peer_group_routes_messages_only_within_resolved_peer_set() {
         "gamma is on no peer group; resolved set is empty"
     );
 
+    // SecurityPolicy::for_agent creates the sender workspace under the install
+    // root, so keep config_path and data_dir inside a TempDir instead of the
+    // real ~/.zeroclaw install.
+    let install = TempDir::new().unwrap();
+    cfg.config_path = install.path().join("config.toml");
+    cfg.data_dir = install.path().join("data");
     let cfg = Arc::new(cfg);
     let control_plane_dir = TempDir::new().unwrap();
     let control_plane = ControlPlaneHandle::open(control_plane_dir.path()).unwrap();
-    let tool = SendMessageToPeerTool::new(cfg.clone(), "alpha").with_control_plane(control_plane);
+    let tool = SendMessageToPeerTool::new(cfg.clone(), "alpha")
+        .expect("sender policy")
+        .with_control_plane(control_plane);
 
     let to_gamma = tool
         .execute(json!({
@@ -297,6 +305,9 @@ async fn standalone_peer_send_registers_before_acceptance_and_rejects_an_unopena
     let data_dir = TempDir::new().unwrap();
     let mut cfg = Config {
         data_dir: data_dir.path().join("tasks"),
+        // SecurityPolicy::for_agent creates the sender workspace under the
+        // install root, which is derived from config_path.
+        config_path: data_dir.path().join("config.toml"),
         ..Config::default()
     };
     cfg.risk_profiles
@@ -322,6 +333,7 @@ async fn standalone_peer_send_registers_before_acceptance_and_rejects_an_unopena
 
     let args = json!({"channel": "telegram.prod", "target": "beta", "message": "hi"});
     let accepted = SendMessageToPeerTool::new(Arc::new(cfg.clone()), "alpha")
+        .expect("sender policy")
         .execute(args.clone())
         .await
         .expect("standalone tool result");
@@ -347,6 +359,7 @@ async fn standalone_peer_send_registers_before_acceptance_and_rejects_an_unopena
     std::fs::write(&blocked_path, b"occupied").expect("block the store directory");
     cfg.data_dir = blocked_path;
     let rejected = SendMessageToPeerTool::new(Arc::new(cfg), "alpha")
+        .expect("sender policy")
         .execute(args)
         .await
         .expect("store-open failure is a tool result");
@@ -402,10 +415,18 @@ async fn peer_group_dotted_channel_refs_remain_alias_scoped_for_dispatch() {
         "alias-scoped peer groups must not broaden to sibling channel aliases"
     );
 
+    // SecurityPolicy::for_agent creates the sender workspace under the install
+    // root, so keep config_path and data_dir inside a TempDir instead of the
+    // real ~/.zeroclaw install.
+    let install = TempDir::new().unwrap();
+    cfg.config_path = install.path().join("config.toml");
+    cfg.data_dir = install.path().join("data");
     let cfg = Arc::new(cfg);
     let control_plane_dir = TempDir::new().unwrap();
     let control_plane = ControlPlaneHandle::open(control_plane_dir.path()).unwrap();
-    let tool = SendMessageToPeerTool::new(cfg, "alpha").with_control_plane(control_plane);
+    let tool = SendMessageToPeerTool::new(cfg, "alpha")
+        .expect("sender policy")
+        .with_control_plane(control_plane);
     let prod = tool
         .execute(json!({
             "channel": "telegram.prod",
