@@ -2281,7 +2281,7 @@ impl OpenAiCompatibleModelProvider {
         let mut last_assistant_tool_call_ids: Vec<String> = Vec::new();
         let mut tool_name_map = std::collections::HashMap::new();
 
-        messages
+        let native = messages
             .iter()
             .map(|message| {
                 if message.role == "assistant"
@@ -2449,7 +2449,88 @@ impl OpenAiCompatibleModelProvider {
                     name: None,
                 }
             })
-            .collect()
+            .collect();
+
+        Self::relocate_tool_result_images(native)
+    }
+
+    /// Adapted from upstream #10502: strict compatible endpoints reject image
+    /// parts on the tool role. Relocate only already-normalized image parts;
+    /// the existing vision gate, IMAGE parsing and budgets remain authoritative.
+    fn relocate_tool_result_images(messages: Vec<NativeMessage>) -> Vec<NativeMessage> {
+        if !messages.iter().any(|message| {
+            message.role == "tool" && matches!(message.content, Some(MessageContent::Parts(_)))
+        }) {
+            return messages;
+        }
+
+        let mut out = Vec::with_capacity(messages.len() + 1);
+        let mut pending = Vec::new();
+        let mut image_ordinal = 0usize;
+        for mut message in messages {
+            if message.role == "tool" {
+                if matches!(message.content, Some(MessageContent::Parts(_)))
+                    && let Some(MessageContent::Parts(parts)) = message.content.take()
+                {
+                    let mut texts = Vec::new();
+                    let mut images = Vec::new();
+                    for part in parts {
+                        match part {
+                            MessagePart::Text { text } => texts.push(text),
+                            MessagePart::ImageUrl { .. } => images.push(part),
+                        }
+                    }
+                    if !images.is_empty() {
+                        image_ordinal += 1;
+                        // Match a bounded local ordinal in the producing tool
+                        // result and the relocated group. Never promote an
+                        // untrusted tool id, name or caption into user text.
+                        texts.push(format!(
+                            "[external tool output - image from tool result {image_ordinal} relocated to a following user message]"
+                        ));
+                        pending.push(MessagePart::Text {
+                            text: format!(
+                                "[external tool output - image from tool result {image_ordinal}]"
+                            ),
+                        });
+                        pending.extend(images);
+                    }
+                    message.content = Some(MessageContent::Text(texts.join("\n")));
+                }
+            } else if !pending.is_empty() {
+                // Keep parallel tool results contiguous. At the end of their
+                // run, merge into the next user message when present so strict
+                // chat templates do not receive consecutive user messages.
+                if message.role == "user" {
+                    let mut parts = match message.content.take() {
+                        Some(MessageContent::Parts(parts)) => parts,
+                        Some(MessageContent::Text(text)) => vec![MessagePart::Text { text }],
+                        None => Vec::new(),
+                    };
+                    parts.append(&mut pending);
+                    message.content = Some(MessageContent::Parts(parts));
+                } else {
+                    out.push(Self::tool_image_user_message(std::mem::take(&mut pending)));
+                }
+            }
+            out.push(message);
+        }
+        if !pending.is_empty() {
+            out.push(Self::tool_image_user_message(pending));
+        }
+        out
+    }
+
+    fn tool_image_user_message(parts: Vec<MessagePart>) -> NativeMessage {
+        NativeMessage {
+            role: "user".to_string(),
+            content: Some(MessageContent::Parts(parts)),
+            tool_call_id: None,
+            tool_calls: None,
+            reasoning_content: None,
+            reasoning: None,
+            name: None,
+        }
     }
 
     fn strip_native_tool_messages(&self, messages: &[ChatMessage]) -> Vec<ChatMessage> {
