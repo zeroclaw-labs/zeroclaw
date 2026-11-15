@@ -5461,13 +5461,53 @@ mod tests {
         config.gateway.dashboard_sign_in.session_lifetime_secs = 0;
         assert_editor_patch_rejected_without_mutation(
             config,
+            serde_json::json!([
+                {
+                    "op": "replace",
+                    "path": "/gateway/dashboard_sign_in/session_lifetime_secs",
+                    "value": 28800
+                },
+                {
+                    "op": "replace",
+                    "path": "/gateway/dashboard_sign_in/oidc",
+                    "value": ["missing"]
+                }
+            ]),
+            "dangling_reference",
+            Some("gateway.dashboard_sign_in.oidc"),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn editor_validation_dashboard_activation_rejects_invalid_lifetime() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = temp_config(&tmp);
+        config.gateway.dashboard_sign_in.session_lifetime_secs = 0;
+        config.gateway.require_pairing = true;
+        config.permission_profiles.insert(
+            "operator".into(),
+            zeroclaw_config::schema::PermissionProfileConfig::default(),
+        );
+        config.oidc.insert(
+            "corp".into(),
+            zeroclaw_config::schema::OidcConfig {
+                issuer: "https://sso.example.com".into(),
+                audience: "zeroclaw".into(),
+                claim_path: "groups".into(),
+                profile_map: [("staff".into(), "operator".into())].into_iter().collect(),
+                ..zeroclaw_config::schema::OidcConfig::default()
+            },
+        );
+        assert_editor_patch_rejected_without_mutation(
+            config,
             serde_json::json!([{
                 "op": "replace",
                 "path": "/gateway/dashboard_sign_in/oidc",
-                "value": ["missing"]
+                "value": ["corp"]
             }]),
-            "dangling_reference",
-            Some("gateway.dashboard_sign_in.oidc"),
+            "invalid_numeric_range",
+            Some("gateway.dashboard_sign_in.session_lifetime_secs"),
         )
         .await;
     }

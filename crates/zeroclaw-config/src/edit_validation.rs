@@ -442,7 +442,59 @@ mod tests {
     }
 
     #[test]
-    fn dashboard_sign_in_baseline_error_does_not_hide_a_new_error() {
+    fn dashboard_sign_in_activation_requires_a_valid_existing_lifetime() {
+        let mut baseline = Config::default();
+        baseline.gateway.dashboard_sign_in.session_lifetime_secs = 0;
+        baseline.gateway.require_pairing = true;
+        baseline.permission_profiles.insert(
+            "operator".into(),
+            crate::schema::PermissionProfileConfig::default(),
+        );
+        baseline.oidc.insert(
+            "corp".into(),
+            crate::schema::OidcConfig {
+                issuer: "https://sso.example.com".into(),
+                audience: "zeroclaw".into(),
+                claim_path: "groups".into(),
+                profile_map: [("staff".into(), "operator".into())].into_iter().collect(),
+                ..crate::schema::OidcConfig::default()
+            },
+        );
+
+        let mut candidate = baseline.clone();
+        candidate.gateway.dashboard_sign_in.oidc.push("corp".into());
+        candidate.mark_dirty("gateway.dashboard_sign_in.oidc");
+        assert_error(
+            validate_without_mutation(&candidate, &baseline),
+            ConfigApiCode::InvalidNumericRange,
+            Some("gateway.dashboard_sign_in.session_lifetime_secs"),
+        );
+
+        let mut repaired = candidate.clone();
+        repaired.gateway.dashboard_sign_in.session_lifetime_secs = 28_800;
+        repaired.mark_dirty("gateway.dashboard_sign_in.session_lifetime_secs");
+        assert!(validate_without_mutation(&repaired, &baseline).is_ok());
+
+        let mut enabled_baseline = baseline.clone();
+        enabled_baseline
+            .gateway
+            .dashboard_sign_in
+            .oidc
+            .push("corp".into());
+        let mut disabled = enabled_baseline.clone();
+        disabled.gateway.dashboard_sign_in.oidc.clear();
+        disabled.mark_dirty("gateway.dashboard_sign_in.oidc");
+        let warnings = validate_without_mutation(&disabled, &enabled_baseline)
+            .expect("disabling sign-in must remain possible while the lifetime is invalid");
+        assert!(
+            warnings.iter().any(|warning| {
+                warning.path == "gateway.dashboard_sign_in.session_lifetime_secs"
+            })
+        );
+    }
+
+    #[test]
+    fn dashboard_sign_in_repaired_lifetime_does_not_hide_a_new_error() {
         let mut baseline = Config::default();
         baseline.gateway.dashboard_sign_in.session_lifetime_secs = 0;
         let mut candidate = baseline.clone();
@@ -451,7 +503,9 @@ mod tests {
             .dashboard_sign_in
             .oidc
             .push("missing".into());
+        candidate.gateway.dashboard_sign_in.session_lifetime_secs = 28_800;
         candidate.mark_dirty("gateway.dashboard_sign_in.oidc");
+        candidate.mark_dirty("gateway.dashboard_sign_in.session_lifetime_secs");
 
         assert_error(
             validate_without_mutation(&candidate, &baseline),

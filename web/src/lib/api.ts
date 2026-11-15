@@ -690,8 +690,9 @@ async function withConfigWarningAuthority<T extends { warnings?: ValidationWarni
   const authority = captureConfigWarningAuthority();
   try {
     const result = await operation();
-    const safeResult = authority.isCurrent() ? result : { ...result, warnings: [] };
-    if (announce) announceConfigWarnings(safeResult.warnings);
+    const current = authority.isCurrent();
+    const safeResult = current ? result : { ...result, warnings: [] };
+    if (current) announceConfigWarnings(safeResult.warnings, announce);
     return safeResult;
   } finally {
     authority.dispose();

@@ -35,24 +35,29 @@ export function subscribeConfigWarningAuthority(listener: () => void): () => voi
   };
 }
 
-/** Notify the persistent dashboard surface when a caller does not render warnings locally. */
-export function announceConfigWarnings(warnings?: ValidationWarning[]): void {
-  if (!warnings?.length) return;
-  window.dispatchEvent(new window.CustomEvent(CONFIG_WARNINGS_EVENT, { detail: warnings }));
+/** Reconcile the persistent surface after a successful config write. */
+export function announceConfigWarnings(warnings: ValidationWarning[] | undefined, announce: boolean): void {
+  if (typeof window === 'undefined' || typeof window.CustomEvent !== 'function' ||
+      typeof window.dispatchEvent !== 'function') return;
+  window.dispatchEvent(new window.CustomEvent(CONFIG_WARNINGS_EVENT, {
+    detail: { warnings: warnings ?? [], announce },
+  }));
 }
 
 export function subscribeConfigWarnings(
-  listener: (warnings: ValidationWarning[]) => void,
+  listener: (warnings: ValidationWarning[], announce: boolean) => void,
 ): () => void {
   const onWarnings = (event: Event) => {
-    const warnings: unknown = (event as CustomEvent<unknown>).detail;
-    if (!Array.isArray(warnings)) return;
-    const valid = warnings.filter((warning): warning is ValidationWarning =>
+    const detail: unknown = (event as CustomEvent<unknown>).detail;
+    if (detail === null || typeof detail !== 'object' ||
+        !('warnings' in detail) || !Array.isArray(detail.warnings) ||
+        !('announce' in detail) || typeof detail.announce !== 'boolean') return;
+    const valid = detail.warnings.filter((warning): warning is ValidationWarning =>
       warning !== null && typeof warning === 'object' &&
       typeof warning.code === 'string' && typeof warning.path === 'string' &&
       typeof warning.message === 'string',
     );
-    if (valid.length) listener(valid);
+    listener(valid, detail.announce);
   };
   window.addEventListener(CONFIG_WARNINGS_EVENT, onWarnings);
   return () => window.removeEventListener(CONFIG_WARNINGS_EVENT, onWarnings);

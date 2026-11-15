@@ -14589,10 +14589,18 @@ impl Config {
         if !(DASHBOARD_SESSION_LIFETIME_MIN_SECS..=DASHBOARD_SESSION_LIFETIME_MAX_SECS)
             .contains(&sign_in.session_lifetime_secs)
         {
+            // Enabling sign-in must not retain an invalid lifetime, but
+            // disabling it must remain possible while that warning exists.
+            let related = if sign_in.enabled() {
+                vec!["gateway.dashboard_sign_in.oidc".to_string()]
+            } else {
+                Vec::new()
+            };
             retainable_bail!(
                 pass,
                 InvalidNumericRange,
                 "gateway.dashboard_sign_in.session_lifetime_secs",
+                related = &related,
                 "gateway.dashboard_sign_in.session_lifetime_secs must be between {DASHBOARD_SESSION_LIFETIME_MIN_SECS} and {DASHBOARD_SESSION_LIFETIME_MAX_SECS} seconds, got {}",
                 sign_in.session_lifetime_secs
             );

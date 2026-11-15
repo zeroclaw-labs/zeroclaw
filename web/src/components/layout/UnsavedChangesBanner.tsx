@@ -37,16 +37,12 @@ export default function UnsavedChangesBanner() {
   const [otherWarnings, setOtherWarnings] = useState<ValidationWarning[]>([]);
   const previousDirtyCount = useRef(dirtyCount);
 
-  useEffect(() => subscribeConfigWarnings((incoming) => {
-    setOtherWarnings((previous) => {
-      const merged = [...previous];
-      for (const warning of incoming) {
-        if (!merged.some((item) => item.code === warning.code && item.path === warning.path && item.message === warning.message)) {
-          merged.push(warning);
-        }
-      }
-      return merged;
-    });
+  useEffect(() => subscribeConfigWarnings((incoming, announce) => {
+    const remains = (warning: ValidationWarning) => incoming.some((item) =>
+      item.code === warning.code && item.path === warning.path && item.message === warning.message,
+    );
+    setOtherWarnings((previous) => announce ? incoming : previous.filter(remains));
+    setWarnings((previous) => previous.filter(remains));
   }), []);
 
   useEffect(() => {

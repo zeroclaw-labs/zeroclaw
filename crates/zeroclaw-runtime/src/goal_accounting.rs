@@ -476,7 +476,14 @@ impl GoalOperationAccountant {
             tracker.get_strict_usage_totals_for_task_with_pricing(&task_id)
         })
         .await
-        .context("join strict Goal usage lookup")?
+        .context("join strict Goal usage lookup")
+        .and_then(|result| result)
+        .map_err(|error| {
+            error.context(GoalAccountingFailure::incomplete(
+                GoalAccountingState::Complete,
+                false,
+            ))
+        })
     }
 
     /// Reject unusable token records, but retain structurally valid usage as
@@ -1645,7 +1652,13 @@ pub(crate) mod tests {
             .admit(GoalOperationRequest::new("fallback", "model"))
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("cost storage"));
+        assert!(format!("{error:#}").contains("cost storage"));
+        assert!(
+            error
+                .downcast_ref::<zeroclaw_goal::accounting::GoalAccountingFailure>()
+                .is_some(),
+            "an unreadable ledger must be classified as an accounting failure"
+        );
         assert!(
             error
                 .downcast_ref::<zeroclaw_goal::accounting::GoalOperationFenced>()

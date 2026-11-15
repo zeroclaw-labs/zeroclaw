@@ -49,6 +49,11 @@ test("config saves and toggles retain warnings only for the relevant result", as
     path: "nodes.mdns.peer_ttl_secs",
     message: "fixture retained diagnostic",
   };
+  const otherWarning: ValidationWarning = {
+    code: "pre_existing_validation_error",
+    path: "gateway.host",
+    message: "different retained diagnostic",
+  };
   const ratePrefix = "cost.rates.providers.models.openai.fixture-model";
   const ratePath = `${ratePrefix}.input_per_mtok`;
   const values: Record<string, string> = {
@@ -56,7 +61,7 @@ test("config saves and toggles retain warnings only for the relevant result", as
     "browser.timeout_ms": "5000",
     [ratePath]: "1",
   };
-  let mode: "warning" | "none" | "error" = "warning";
+  let mode: "warning" | "other" | "none" | "error" = "warning";
   let failNextReload = false;
   const previousFetch = globalThis.fetch;
   globalThis.fetch = async (input, init) => {
@@ -97,7 +102,7 @@ test("config saves and toggles retain warnings only for the relevant result", as
       if (mode === "error") {
         return Response.json({ code: "invalid_format", message: "fixture save failed" }, { status: 400 });
       }
-      return Response.json({ path: "fixture.path", initialized: ["fixture"], warnings: mode === "warning" ? [warning] : [] });
+      return Response.json({ path: "fixture.path", initialized: ["fixture"], warnings: mode === "warning" ? [warning] : mode === "other" ? [otherWarning] : [] });
     }
     assert.equal(url, "/api/config");
     assert.equal(init?.method, "PATCH");
@@ -106,7 +111,7 @@ test("config saves and toggles retain warnings only for the relevant result", as
     }
     const ops = JSON.parse(String(init.body)) as PatchOp[];
     for (const op of ops) values[op.path] = String(op.value);
-    return Response.json({ saved: true, results: ops, warnings: mode === "warning" ? [warning] : [] });
+    return Response.json({ saved: true, results: ops, warnings: mode === "warning" ? [warning] : mode === "other" ? [otherWarning] : [] });
   };
 
   let root: { render: (children: React.ReactNode) => void; unmount: () => void } | undefined;
@@ -178,6 +183,15 @@ test("config saves and toggles retain warnings only for the relevant result", as
     // Writers without their own warning display use the persistent banner.
     await act(async () => { await api.putProp("fixture.path", true); await flushEffects(); });
     assert.match(banner.textContent ?? "", /fixture retained diagnostic/);
+    mode = "other";
+    await act(async () => { await api.putProp("fixture.path", true); await flushEffects(); });
+    assert.match(banner.textContent ?? "", /different retained diagnostic/);
+    assert.doesNotMatch(banner.textContent ?? "", /fixture retained diagnostic/);
+    mode = "none";
+    await act(async () => { await api.putProp("fixture.path", true); await flushEffects(); });
+    assert.equal(banner.textContent, "", "a later clean write clears an old global warning");
+    mode = "warning";
+    await act(async () => { await api.putProp("fixture.path", true); await flushEffects(); });
     await act(async () => {
       await api.patchConfig([{ op: "replace", path: "fixture.path", value: true }]);
       await api.deleteProp("fixture.path");
@@ -190,6 +204,12 @@ test("config saves and toggles retain warnings only for the relevant result", as
     assert.match(banner.textContent ?? "", /fixture retained diagnostic/);
     await click(banner, "Discard all");
     assert.match(banner.textContent ?? "", /fixture retained diagnostic/);
+    mode = "none";
+    await edit("5500");
+    await click(form, "Save");
+    assert.equal(banner.textContent, "", "a clean local save clears an old global warning");
+    mode = "warning";
+    await act(async () => { await api.putProp("fixture.path", true); await flushEffects(); });
     await click(banner, "Dismiss warnings");
     mode = "none";
     await act(async () => { await api.putProp("fixture.path", true); await flushEffects(); });
@@ -247,11 +267,15 @@ test("config saves and toggles retain warnings only for the relevant result", as
       // Even an intervening return to the same session object must not make
       // an old response authoritative again.
       auth.setOidcSession(session);
+      globalThis.fetch = mockFetch;
+      await api.putProp("fixture.path", true);
       finishWrite(Response.json({ saved: true, results: [], warnings: [warning] }));
       assert.deepEqual((await pendingWrite).warnings, []);
       await flushEffects();
     });
-    assert.equal(banner.textContent, "");
+    assert.match(banner.textContent ?? "", /fixture retained diagnostic/,
+      "a stale response must not clear the current authority's warning");
+    await click(banner, "Dismiss warnings");
     globalThis.fetch = mockFetch;
     await act(async () => { auth.setOidcSession(null); await flushEffects(); });
 
