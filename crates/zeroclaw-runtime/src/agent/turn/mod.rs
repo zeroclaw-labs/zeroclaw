@@ -11622,6 +11622,306 @@ mod tool_lifecycle_abandonment_tests {
         }
     }
 
+    struct FallbackAccountingProvider {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        first: bool,
+        report_failed_usage: bool,
+        retry_once: bool,
+    }
+
+    struct CountedGoalAccounting {
+        inner: Arc<dyn zeroclaw_goal::accounting::GoalOperationAccounting>,
+        admissions: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl zeroclaw_goal::accounting::GoalOperationAccounting for CountedGoalAccounting {
+        async fn admit(
+            &self,
+            request: zeroclaw_goal::accounting::GoalOperationRequest,
+        ) -> anyhow::Result<()> {
+            self.admissions
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.admit(request).await
+        }
+
+        fn admission_guard(&self) -> anyhow::Result<zeroclaw_goal::accounting::GoalOperationGuard> {
+            self.inner.admission_guard()
+        }
+
+        fn mark_dispatch_entered(&self) {
+            self.inner.mark_dispatch_entered();
+        }
+
+        fn set_abandonment_settlement(
+            &self,
+            source: zeroclaw_goal::accounting::GoalAbandonmentSettlement,
+        ) {
+            self.inner.set_abandonment_settlement(source);
+        }
+
+        async fn quiesce(&self) {
+            self.inner.quiesce().await;
+        }
+
+        fn unsettled_failure(&self) -> Option<zeroclaw_goal::accounting::GoalAccountingFailure> {
+            self.inner.unsettled_failure()
+        }
+
+        async fn begin_dispatch(&self) -> anyhow::Result<zeroclaw_goal::task::GoalDispatchStart> {
+            self.inner.begin_dispatch().await
+        }
+
+        async fn settle(
+            &self,
+            settlement: zeroclaw_goal::accounting::GoalOperationSettlement,
+        ) -> anyhow::Result<()> {
+            self.inner.settle(settlement).await
+        }
+
+        async fn release_unstarted(&self) -> anyhow::Result<()> {
+            self.inner.release_unstarted().await
+        }
+
+        async fn pricing_complete(&self) -> anyhow::Result<bool> {
+            self.inner.pricing_complete().await
+        }
+    }
+
+    impl zeroclaw_api::attribution::Attributable for FallbackAccountingProvider {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Provider(
+                zeroclaw_api::attribution::ProviderKind::Model(
+                    zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            if self.first {
+                "first-leaf"
+            } else {
+                "second-leaf"
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for FallbackAccountingProvider {
+        async fn chat_with_system(
+            &self,
+            _: Option<&str>,
+            _: &str,
+            _: &str,
+            _: Option<f64>,
+        ) -> anyhow::Result<String> {
+            unreachable!("the fixture uses structured chat")
+        }
+
+        async fn chat(
+            &self,
+            _: zeroclaw_api::model_provider::ChatRequest<'_>,
+            model: &str,
+            _: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            let prior_calls = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let usage = |input, output| zeroclaw_api::model_provider::TokenUsage {
+                input_tokens: Some(input),
+                output_tokens: Some(output),
+                cached_input_tokens: Some(0),
+                cache_creation_input_tokens: Some(0),
+            };
+            if self.first && self.retry_once && prior_calls == 0 {
+                anyhow::bail!("HTTP 503 temporarily unavailable");
+            }
+            if self.first && !self.retry_once {
+                return Err(anyhow::Error::new(
+                    zeroclaw_api::model_provider::ModelRefusalError {
+                        requested_model: model.into(),
+                        category: None,
+                        usage: self.report_failed_usage.then(|| Box::new(usage(10, 2))),
+                        attempted_candidate: None,
+                        attempted_candidate_index: None,
+                    },
+                ));
+            }
+            Ok(ChatResponse {
+                text: Some("fallback answer".into()),
+                tool_calls: Vec::new(),
+                usage: Some(usage(15, 3)),
+                reasoning_content: None,
+            })
+        }
+    }
+
+    async fn assert_fallback_usage_fences_next_goal_call(
+        report_failed_usage: bool,
+        retry_once: bool,
+    ) {
+        use zeroclaw_goal::accounting::{GoalOperationAccountingFactory, GoalOperationRequest};
+        use zeroclaw_goal::{GoalAccountingState, GoalTaskRegistry};
+
+        let (store, _, tracker, scope, directory) = crate::goal_accounting::tests::fixture().await;
+        let rates = std::collections::HashMap::from([
+            ("scripted-model.input".to_owned(), 1.0),
+            ("scripted-model.output".to_owned(), 2.0),
+        ]);
+        let pricing = Arc::new(std::collections::HashMap::from([
+            ("primary".to_owned(), rates.clone()),
+            ("fallback".to_owned(), rates),
+        ]));
+        let pricer = Arc::new(crate::goal_accounting::ModelProviderGoalUsagePricer::new(
+            Arc::clone(&pricing),
+        ));
+        let factory = crate::goal_accounting::RuntimeGoalOperationAccountingFactory::new(
+            store.clone(),
+            Arc::clone(&tracker),
+            "main",
+            pricer,
+        )
+        .unwrap();
+        let accountant = factory.for_scope(scope.clone());
+        let admissions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed_accountant: Arc<dyn zeroclaw_goal::accounting::GoalOperationAccounting> =
+            Arc::new(CountedGoalAccounting {
+                inner: Arc::clone(&accountant),
+                admissions: Arc::clone(&admissions),
+            });
+        let first_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let second_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let provider = zeroclaw_providers::reliable::ReliableModelProvider::new(
+            "reliable",
+            vec![
+                (
+                    "primary".into(),
+                    Box::new(FallbackAccountingProvider {
+                        calls: Arc::clone(&first_calls),
+                        first: true,
+                        report_failed_usage,
+                        retry_once,
+                    }),
+                ),
+                (
+                    "fallback".into(),
+                    Box::new(FallbackAccountingProvider {
+                        calls: Arc::clone(&second_calls),
+                        first: false,
+                        report_failed_usage,
+                        retry_once,
+                    }),
+                ),
+            ],
+            u32::from(retry_once),
+            1,
+        );
+        let context =
+            crate::agent::cost::ToolLoopCostTrackingContext::new(Arc::clone(&tracker), pricing);
+        let observer = GateObserver::default();
+        let registry = registry_with(Vec::new());
+        let mut history = vec![ChatMessage::user("hi")];
+        let result = zeroclaw_goal::accounting::GOAL_OPERATION_ACCOUNTING
+            .scope(
+                Some(observed_accountant),
+                crate::agent::cost::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
+                    Some(context),
+                    run_scripted_loop_with_events(
+                        &provider,
+                        &registry,
+                        &observer,
+                        None,
+                        &zeroclaw_config::schema::PacingConfig::default(),
+                        "fallback-accounting",
+                        false,
+                        None,
+                        &mut history,
+                        100_000,
+                        None,
+                        None,
+                    ),
+                ),
+            )
+            .await;
+        assert_eq!(result.unwrap(), "fallback answer");
+        assert_eq!(admissions.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            first_calls.load(std::sync::atomic::Ordering::SeqCst),
+            if retry_once { 2 } else { 1 }
+        );
+        assert_eq!(
+            second_calls.load(std::sync::atomic::Ordering::SeqCst),
+            usize::from(!retry_once)
+        );
+        let goal = store.get_goal_task(scope.task_id()).await.unwrap().unwrap();
+        assert_eq!(goal.accounting_state, GoalAccountingState::OutcomeUnknown);
+        assert!(goal.pending_call_id.is_none());
+        assert!(goal.pending_call_epoch.is_none());
+        let error = accountant
+            .admit(GoalOperationRequest::new("fallback", "scripted-model"))
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<zeroclaw_goal::accounting::GoalAccountingFailure>()
+                .is_some()
+        );
+        assert_eq!(
+            first_calls.load(std::sync::atomic::Ordering::SeqCst),
+            if retry_once { 2 } else { 1 }
+        );
+        assert_eq!(
+            second_calls.load(std::sync::atomic::Ordering::SeqCst),
+            usize::from(!retry_once)
+        );
+        let expected_total = if report_failed_usage { 30 } else { 18 };
+        assert_eq!(
+            tracker
+                .get_strict_usage_totals_for_task_with_pricing(scope.task_id())
+                .unwrap()
+                .0,
+            expected_total
+        );
+        let records = std::fs::read_to_string(directory.path().join("state/costs.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| {
+                serde_json::from_str::<zeroclaw_config::cost::types::CostRecord>(line).unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(records.len(), if report_failed_usage { 2 } else { 1 });
+        assert!(
+            records
+                .iter()
+                .all(|record| record.task_id.as_deref() == Some(scope.task_id()))
+        );
+        assert!(
+            records
+                .iter()
+                .all(|record| record.usage.model == "scripted-model")
+        );
+        assert_eq!(
+            records.last().unwrap().provider_ref.as_deref(),
+            Some(if retry_once { "primary" } else { "fallback" })
+        );
+        if report_failed_usage {
+            assert_eq!(records[0].provider_ref.as_deref(), Some("primary"));
+        }
+    }
+
+    #[tokio::test]
+    async fn fallback_with_reported_failed_usage_fences_the_next_goal_call() {
+        assert_fallback_usage_fences_next_goal_call(true, false).await;
+    }
+
+    #[tokio::test]
+    async fn fallback_without_failed_usage_fences_the_next_goal_call() {
+        assert_fallback_usage_fences_next_goal_call(false, false).await;
+    }
+
+    #[tokio::test]
+    async fn retry_without_failed_usage_fences_the_next_goal_call() {
+        assert_fallback_usage_fences_next_goal_call(false, true).await;
+    }
+
     struct GateHook {
         sequence: Arc<Mutex<Vec<&'static str>>>,
         cancel: Option<CancellationToken>,
@@ -11732,6 +12032,63 @@ mod tool_lifecycle_abandonment_tests {
                     .any(|event| matches!(event, TurnEvent::Usage { .. }))
             );
         }
+    }
+
+    #[tokio::test]
+    async fn ordinary_budget_refusal_precedes_goal_admission_and_announcement() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let tracker = Arc::new(
+            crate::cost::CostTracker::new(
+                zeroclaw_config::schema::CostConfig {
+                    enabled: true,
+                    daily_limit_usd: -1.0,
+                    ..Default::default()
+                },
+                directory.path(),
+            )
+            .unwrap(),
+        );
+        let context = crate::agent::cost::ToolLoopCostTrackingContext::new(
+            Arc::clone(&tracker),
+            Arc::new(std::collections::HashMap::new()),
+        );
+        let accounting = Arc::new(GateAccounting::default());
+        let observer = GateObserver::default();
+        let (result, events) = crate::agent::cost::TOOL_LOOP_COST_TRACKING_CONTEXT
+            .scope(
+                Some(context),
+                run_goal_gate_fixture(
+                    Some(accounting.clone()),
+                    Arc::clone(&accounting.sequence),
+                    None,
+                    false,
+                    &observer,
+                ),
+            )
+            .await;
+        let error = result.unwrap_err();
+        assert_eq!(
+            zeroclaw_api::turn_stop::turn_stop(&error).unwrap().code,
+            zeroclaw_api::turn_stop::TurnStopCode::BudgetExhausted
+        );
+        assert!(accounting.sequence.lock().unwrap().is_empty());
+        assert!(accounting.settlements.lock().unwrap().is_empty());
+        assert!(!observer.0.lock().unwrap().iter().any(|event| matches!(
+            event,
+            crate::observability::ObserverEvent::LlmRequest { .. }
+        )));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, TurnEvent::Usage { .. }))
+        );
+        assert_eq!(
+            tracker
+                .get_summary_in_bounds(None, None)
+                .unwrap()
+                .request_count,
+            0
+        );
     }
 
     #[tokio::test]

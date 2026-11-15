@@ -402,8 +402,9 @@ pub(crate) async fn finish_after_max_iterations(
                     },
                     temperature,
                 };
-                // The provider race is inside the accounting scope. Its
-                // settlement is awaited even after timeout or cancellation.
+                // The provider race is inside the accounting scope. Goal
+                // settlement is awaited even after timeout or cancellation;
+                // ordinary turns retain their existing interruption behavior.
                 match access
                     .run_model_query_controlled(summary_request, &mut summary_attempts, control)
                     .await
@@ -450,7 +451,7 @@ pub(crate) async fn finish_after_max_iterations(
             // The provider error stays the source; the stop rides alongside
             // it so the exit is typed without losing what actually failed.
             return Err(zeroclaw_api::turn_stop::tag(
-                crate::agent::cost::with_visible_context(e, &exhaustion),
+                crate::agent::cost::with_goal_diagnostic_context(e, &exhaustion),
                 limit.stop(),
             ));
         }
@@ -921,6 +922,140 @@ mod graceful_summary_metering_tests {
     #[tokio::test]
     async fn graceful_summary_timeout_settles_prior_attempt_usage() {
         assert_interrupted_summary_settles(false).await;
+    }
+
+    async fn assert_ordinary_interrupted_summary_is_not_settled(cancel: bool) {
+        let directory = tempfile::TempDir::new().unwrap();
+        let tracker = Arc::new(
+            crate::cost::CostTracker::new(
+                CostConfig {
+                    enabled: true,
+                    ..CostConfig::default()
+                },
+                directory.path(),
+            )
+            .unwrap(),
+        );
+        let pricing = Arc::new(HashMap::from([(
+            "primary".to_owned(),
+            HashMap::from([
+                ("test-model.input".to_owned(), 1.0),
+                ("test-model.output".to_owned(), 2.0),
+            ]),
+        )]));
+        let context = ToolLoopCostTrackingContext::new(Arc::clone(&tracker), pricing);
+        let turn_usage = Arc::clone(&context.turn_usage);
+        let token = tokio_util::sync::CancellationToken::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = zeroclaw_providers::reliable::ReliableModelProvider::new(
+            "reliable",
+            vec![(
+                "primary".to_owned(),
+                Box::new(InterruptedSummaryProvider {
+                    calls: Arc::clone(&calls),
+                    cancel_on_second: cancel.then(|| token.clone()),
+                }),
+            )],
+            1,
+            50,
+        );
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(16);
+        let result = TOOL_LOOP_COST_TRACKING_CONTEXT
+            .scope(
+                Some(context),
+                run_controlled_summary(&provider, cancel.then_some(&token), Some(&event_tx)),
+            )
+            .await;
+        assert!(result.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        let usage = *turn_usage.lock();
+        assert_eq!((usage.input_tokens, usage.output_tokens), (0, 0));
+        assert_eq!(
+            tracker
+                .get_summary_in_bounds(None, None)
+                .unwrap()
+                .request_count,
+            0
+        );
+        while let Ok(event) = event_rx.try_recv() {
+            assert!(!matches!(event, TurnEvent::Usage { .. }));
+        }
+    }
+
+    #[tokio::test]
+    async fn graceful_summary_ordinary_cancel_does_not_settle_interrupted_attempts() {
+        assert_ordinary_interrupted_summary_is_not_settled(true).await;
+    }
+
+    #[tokio::test]
+    async fn graceful_summary_ordinary_timeout_does_not_settle_interrupted_attempts() {
+        assert_ordinary_interrupted_summary_is_not_settled(false).await;
+    }
+
+    struct FailingSummaryProvider;
+
+    #[async_trait]
+    impl ModelProvider for FailingSummaryProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("upstream exploded: detail-7")
+        }
+    }
+
+    impl Attributable for FailingSummaryProvider {
+        fn role(&self) -> Role {
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+        }
+
+        fn alias(&self) -> &str {
+            "failing-summary-provider"
+        }
+    }
+
+    #[tokio::test]
+    async fn graceful_summary_ordinary_failure_keeps_limit_as_display() {
+        let error = run_summary(&FailingSummaryProvider).await.unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            CompletionLimit::LocalIterations(2).explanation()
+        );
+        assert_eq!(
+            format!("{error:#}")
+                .matches("upstream exploded: detail-7")
+                .count(),
+            1
+        );
+        assert_eq!(
+            zeroclaw_api::turn_stop::turn_stop(&error).unwrap().code,
+            zeroclaw_api::turn_stop::TurnStopCode::MaxIterations
+        );
+    }
+
+    #[tokio::test]
+    async fn graceful_summary_goal_plain_failure_keeps_limit_as_display() {
+        let accountant = Arc::new(SummaryAccounting::default());
+        let accounting: Arc<dyn zeroclaw_goal::accounting::GoalOperationAccounting> =
+            accountant.clone();
+        let error = zeroclaw_goal::accounting::GOAL_OPERATION_ACCOUNTING
+            .scope(Some(accounting), run_summary(&FailingSummaryProvider))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            CompletionLimit::LocalIterations(2).explanation()
+        );
+        assert_eq!(
+            format!("{error:#}")
+                .matches("upstream exploded: detail-7")
+                .count(),
+            1
+        );
+        assert_eq!(accountant.settlements.lock().len(), 1);
     }
 
     #[tokio::test]

@@ -412,6 +412,7 @@ fn outcome_from_task_result(
     }
 }
 
+/// Scrub the diagnostic shared by logs, turn-completion events, and RPC errors.
 fn safe_turn_diagnostic(error: &anyhow::Error) -> String {
     crate::security::scrub(&crate::agent::loop_::scrub_credentials(&error.to_string()))
 }
@@ -1215,6 +1216,44 @@ mod tests {
         assert!(message.contains("fixture settlement failed"));
         assert!(message.contains("[REDACTED"));
         assert!(!message.contains("IHNlc2FtZQ"));
+    }
+
+    #[test]
+    fn ordinary_turn_diagnostics_redact_secrets_without_changing_clean_text() {
+        let secret = anyhow::Error::msg("provider failed token=QWxhZGRpbjpvcGVuIHNlc2FtZQ==");
+        let diagnostic = safe_turn_diagnostic(&secret);
+        assert!(diagnostic.contains("provider failed"));
+        assert!(diagnostic.contains("[REDACTED"));
+        assert!(!diagnostic.contains("IHNlc2FtZQ"));
+
+        let clean = "provider returned 400: max_tokens: 4096 exceeds limit";
+        assert_eq!(safe_turn_diagnostic(&anyhow::Error::msg(clean)), clean);
+    }
+
+    #[test]
+    fn terminal_completion_redacts_diagnostic_but_preserves_delivery_text() {
+        let expected = crate::agent::semantic_empty_terminal_completion_message(None);
+        let error =
+            anyhow::Error::new(zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion)
+                .context("provider failed token=QWxhZGRpbjpvcGVuIHNlc2FtZQ==");
+        let outcome = outcome_from_task_result(
+            Err(StreamedTurnError {
+                error,
+                committed_response: String::new(),
+                new_messages: Vec::new(),
+            }),
+            String::new(),
+        );
+        let Err(TurnError::TerminalCompletion {
+            diagnostic,
+            user_message,
+        }) = outcome
+        else {
+            panic!("terminal completion must retain its delivery message");
+        };
+        assert!(diagnostic.contains("[REDACTED"));
+        assert!(!diagnostic.contains("IHNlc2FtZQ"));
+        assert_eq!(user_message, expected);
     }
 
     #[test]

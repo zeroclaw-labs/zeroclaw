@@ -783,6 +783,25 @@ pub(crate) fn with_visible_context(error: anyhow::Error, context: &str) -> anyho
     error.context(VisibleErrorContext(format!("{context}: {detail}")))
 }
 
+/// Preserve a Goal accounting diagnostic in outer-only renderers without
+/// changing the ordinary summary error's display.
+pub(crate) fn with_goal_diagnostic_context(error: anyhow::Error, context: &str) -> anyhow::Error {
+    let has_goal_diagnostic = error.downcast_ref::<VisibleErrorContext>().is_some()
+        || error.downcast_ref::<OperationSettlementFailure>().is_some()
+        || error
+            .downcast_ref::<zeroclaw_goal::accounting::GoalAccountingFailure>()
+            .is_some()
+        || error.chain().any(|source| {
+            source.is::<OperationSettlementFailure>()
+                || source.is::<zeroclaw_goal::accounting::GoalAccountingFailure>()
+        });
+    if has_goal_diagnostic {
+        with_visible_context(error, context)
+    } else {
+        error.context(context.to_owned())
+    }
+}
+
 /// A dispatch entered without a recorded physical leaf has an unknown outcome:
 /// a streaming constructor may send a request before its stream is polled.
 /// It is never reported as missing usage or released. Known leaves follow

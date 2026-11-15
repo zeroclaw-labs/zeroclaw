@@ -1620,6 +1620,7 @@ enum ScriptedFault {
     VerifierAccountingFailure,
     SettleIncomplete,
     ParentOutcomeUnknown,
+    ParentFallbackOutcomeUnknown,
     PauseAfterParentOutcomeUnknown,
     VerifierOutcomeUnknown,
     CorruptGoalAfterParent,
@@ -1847,6 +1848,34 @@ impl GoalSessionExecutionLease for ScriptedLease {
                         .await?,
                     GoalTransitionResult::Applied
                 );
+            }
+            Some(ScriptedFault::ParentFallbackOutcomeUnknown) => {
+                let accounting = zeroclaw_goal::accounting::GOAL_OPERATION_ACCOUNTING
+                    .try_with(Clone::clone)?
+                    .expect("fixture requires Goal accounting");
+                accounting
+                    .admit(GoalOperationRequest::new("primary", "model"))
+                    .await?;
+                let _guard = accounting.admission_guard()?;
+                accounting.mark_dispatch_entered();
+                let event =
+                    |provider: &str, input, output| zeroclaw_goal::accounting::GoalUsageEvent {
+                        provider_ref: provider.into(),
+                        model: "model".into(),
+                        usage: zeroclaw_api::model_provider::TokenUsage {
+                            input_tokens: Some(input),
+                            output_tokens: Some(output),
+                            cached_input_tokens: Some(0),
+                            cache_creation_input_tokens: Some(0),
+                        },
+                        priceable: true,
+                    };
+                accounting
+                    .settle(GoalOperationSettlement {
+                        accounting_state: GoalAccountingState::OutcomeUnknown,
+                        events: vec![event("primary", 10, 2), event("fallback", 15, 3)],
+                    })
+                    .await?;
             }
             Some(ScriptedFault::CorruptGoalAfterParent) => self.corrupt_goal_record(scope)?,
             Some(ScriptedFault::AbandonWithBlockedLedger | ScriptedFault::DropSettlement) => {
@@ -2948,6 +2977,51 @@ async fn engine_parent_unknown_outcome_preserves_error_and_accounting_reason() {
 }
 
 #[tokio::test]
+async fn engine_fails_after_fallback_candidate_with_unknown_attempt_accounting() {
+    let mut fixture = EngineFixture::new(
+        &["fallback candidate"],
+        &[SCRIPTED_COMPLETE],
+        Some(ScriptedFault::ParentFallbackOutcomeUnknown),
+    )
+    .await;
+    let (tracker, factory) = real_goal_accounting(&fixture);
+    let result = fixture
+        .runtime
+        .execution_engine(factory)
+        .run(
+            &host_settings(&fixture.config),
+            fixture.request.take().unwrap(),
+        )
+        .await;
+    assert!(result.is_err());
+    assert_eq!(fixture.task().await.status, TaskStatus::Failed);
+    assert_eq!(
+        fixture.reason().await.as_deref(),
+        Some("accounting_missing_or_invalid")
+    );
+    assert!(
+        !fixture
+            .steps()
+            .iter()
+            .any(|step| matches!(step, ScriptedStep::Verifier(_)))
+    );
+    assert_eq!(
+        tracker
+            .get_strict_usage_totals_for_task_with_pricing(fixture.scope.task_id())
+            .unwrap()
+            .0,
+        30
+    );
+    assert_eq!(
+        std::fs::read_to_string(&fixture.driver.ledger_file)
+            .unwrap()
+            .lines()
+            .count(),
+        2
+    );
+}
+
+#[tokio::test]
 async fn engine_verifier_unknown_outcome_preserves_error_and_accounting_reason() {
     let mut fixture = EngineFixture::new(
         &["answer"],
@@ -3002,7 +3076,7 @@ async fn engine_unknown_outcome_does_not_overwrite_winning_pause() {
 
 #[tokio::test]
 async fn engine_parent_operation_error_keeps_its_classification() {
-    // Ordinary provider errors retain their operation failure reason and chain.
+    // This error occurs before any physical provider attempt is recorded.
     let mut fixture = EngineFixture::new(&[], &[], Some(ScriptedFault::ParentError)).await;
     let error = fixture.run().await.unwrap_err();
     assert!(format!("{error:#}").contains("Goal parent operation failed"));

@@ -271,7 +271,9 @@ impl ResolvedModelAccess<'_> {
             Ok(result) => result,
             Err(interruption) => {
                 let accounting = scope.take();
-                if dispatch_polled {
+                // Goal operations must settle known attempts before fencing a
+                // successor. Ordinary turns retain their prior drop behavior.
+                if dispatch_polled && crate::agent::cost::goal_operation_accounting_is_scoped() {
                     let attempts = accounting.attempts();
                     extend_rejected_summaries(settled_out, attempts);
                     crate::agent::cost::settle_interrupted_provider_attempts(attempts)
@@ -282,7 +284,7 @@ impl ResolvedModelAccess<'_> {
                                 &format!("while handling {interruption}"),
                             )
                         })?;
-                } else {
+                } else if !dispatch_polled {
                     release_unstarted_goal_operation_if_scoped()
                         .await
                         .map_err(|error| {
