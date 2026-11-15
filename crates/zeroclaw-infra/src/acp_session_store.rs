@@ -4656,6 +4656,79 @@ mod tests {
     }
 
     #[test]
+    fn persisted_tool_outputs_keep_utf8_boundaries_after_store_reopen() {
+        let (tmp, store) = open_store();
+        let mut expected_outputs = Vec::new();
+        for offset in 0..=3 {
+            let session = format!("unicode-cap-{offset}");
+            let (output, expected) = if offset == 0 {
+                let exact = format!("{}🦀", "x".repeat(MAX_PERSISTED_TOOL_OUTPUT_BYTES - 4));
+                (exact.clone(), exact)
+            } else {
+                let prefix = "x".repeat(MAX_PERSISTED_TOOL_OUTPUT_BYTES - offset);
+                (format!("{prefix}🦀结束"), format!("{prefix}…[truncated]"))
+            };
+            store
+                .create_session(&session, "default", "/tmp/workspace", None)
+                .unwrap();
+            store
+                .append_turn(
+                    &session,
+                    &[
+                        ConversationMessage::AssistantToolCalls {
+                            text: None,
+                            tool_calls: vec![ToolCall {
+                                id: "call-1".into(),
+                                name: "probe".into(),
+                                arguments: r#"{"text":"中文🦀"}"#.into(),
+                                extra_content: None,
+                            }],
+                            reasoning_content: None,
+                        },
+                        ConversationMessage::ToolResults(vec![ToolResultMessage {
+                            tool_call_id: "call-1".into(),
+                            tool_name: "probe".into(),
+                            content: output,
+                        }]),
+                    ],
+                )
+                .unwrap();
+
+            // Check the stored bytes before any transcript projection can run.
+            let persisted: String = store
+                .conn
+                .lock()
+                .query_row(
+                    "SELECT tc.payload FROM acp_tool_calls tc
+                 JOIN acp_messages m ON m.id = tc.message_id
+                 JOIN acp_sessions s ON s.id = m.session_id
+                 WHERE s.session_uuid = ?1 AND tc.event_kind = 'out'",
+                    [&session],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(persisted, expected, "offset {offset}");
+            expected_outputs.push((session, expected));
+        }
+        drop(store);
+
+        let reopened = AcpSessionStore::new(tmp.path()).unwrap();
+        for (session, expected) in expected_outputs {
+            let restored = reopened.load_session(&session).unwrap().unwrap();
+            assert_eq!(restored.messages.len(), 2);
+            match &restored.messages[1] {
+                ConversationMessage::ToolResults(results) => {
+                    assert_eq!(results.len(), 1);
+                    assert_eq!(results[0].tool_call_id, "call-1");
+                    assert_eq!(results[0].tool_name, "probe");
+                    assert_eq!(results[0].content, expected, "{session}");
+                }
+                other => panic!("expected ToolResults, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
     fn bounded_transcript_messages_caps_terminal_tool_output() {
         let messages = [
             ConversationMessage::AssistantToolCalls {
