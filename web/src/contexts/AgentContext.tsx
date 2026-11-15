@@ -364,6 +364,25 @@ export function AgentProvider({
   // hydration, a conversation switch or clear, a model switch, unmount and
   // the close of the socket do that (the reopen reloads and asks again).
   const detachedTurnWatchRef = useRef<AbortController | null>(null);
+  // The turn the current watch shows, so Stop can tell which turn the gateway
+  // disowned. Set only while `detachedTurnWatchRef` holds the same watch.
+  const watchedTurnRef = useRef<{ watch: AbortController; sid: string; turnId: string } | null>(null);
+  // The watched turn Stop got `no_active_response` for. The gateway also says
+  // that in the moment between a turn's end and its `idle` write, so this is
+  // only a suspicion until two checks that both started after the refusal
+  // still read the same turn running. Only the in-process route can refuse
+  // here: the core's abort, which also says it for a turn it will not stop,
+  // serves scoped accounts only, and their pages are `perSocket` and never
+  // watch a turn.
+  const stopRefusedRef = useRef<
+    { watch: AbortController; turnId: string; confirmations: number } | null
+  >(null);
+  // Turns whose stored state still read `running` after the gateway said it
+  // was not running them (a state write that failed): per conversation, that
+  // turn id. A later load does not lock the composer on that turn again; a
+  // turn with another id still does. Dropped once the conversation reads
+  // anything else.
+  const disownedTurnsRef = useRef(new Map<string, string>());
   // Set while a hydration may still start such a watch: from its first state
   // check until it has loaded the transcript. A clear or model switch in that
   // window aborts it, so a late `running` answer cannot start a watch the
@@ -459,8 +478,12 @@ export function AgentProvider({
     // reads as no: the page then keeps its single transcript load. So does a
     // check without an answer by its deadline, or one the watch ends: each
     // check is cancelled and stops being awaited, whatever its request does.
+    let runningTurnId = '';
     const turnStillRunning = async (): Promise<boolean> => {
       if (watch.signal.aborted) return false;
+      // Only a check that starts after Stop's refusal may confirm it: one
+      // already out may carry an answer the gateway gave before the turn ended.
+      const refusedAtStart = stopRefusedRef.current;
       const check = new AbortController();
       const end = () => check.abort();
       const deadline = setTimeout(end, STATE_CHECK_TIMEOUT_MS);
@@ -470,7 +493,32 @@ export function AgentProvider({
           check.signal.addEventListener('abort', () => reject(new Error('state check ended')));
         });
         const res = await Promise.race([sessionRuntime.getState(sid, check.signal), ended]);
-        return res.state === 'running';
+        const turnId = res.state === 'running' ? res.turn_id ?? '' : null;
+        const disowned = disownedTurnsRef.current.get(sid);
+        if (disowned !== undefined && disowned !== turnId) disownedTurnsRef.current.delete(sid);
+        if (turnId === null) return false;
+        if (disowned === turnId) return false;
+        if (
+          refusedAtStart
+          && refusedAtStart === stopRefusedRef.current
+          && refusedAtStart.watch === watch
+        ) {
+          if (refusedAtStart.turnId !== turnId) {
+            // Another turn runs now: the refusal was about the one that ended.
+            stopRefusedRef.current = null;
+          } else if (++refusedAtStart.confirmations >= 2) {
+            // Still `running`, twice, after the gateway said it runs no turn
+            // here: the stored state is stale. End the watch like a finished turn.
+            stopRefusedRef.current = null;
+            disownedTurnsRef.current.set(sid, turnId);
+            return false;
+          }
+        }
+        runningTurnId = turnId;
+        if (watchedTurnRef.current?.watch === watch) {
+          watchedTurnRef.current = { watch, sid, turnId };
+        }
+        return true;
       } catch {
         return false;
       } finally {
@@ -512,6 +560,7 @@ export function AgentProvider({
           if (runningBeforeLoad && !watch.signal.aborted && !typingRef.current) {
             watching = true;
             detachedTurnWatchRef.current = watch;
+            watchedTurnRef.current = { watch, sid, turnId: runningTurnId };
             typingRef.current = true;
             setTyping(true);
           }
@@ -564,6 +613,15 @@ export function AgentProvider({
     return () => {
       cancelled = true;
       watch.abort();
+      // Every path that re-runs this effect mid-watch has already ended the
+      // watch; should one not have, its lock must not outlive it.
+      if (detachedTurnWatchRef.current === watch) {
+        detachedTurnWatchRef.current = null;
+        typingRef.current = false;
+        setTyping(false);
+      }
+      if (watchedTurnRef.current?.watch === watch) watchedTurnRef.current = null;
+      if (stopRefusedRef.current?.watch === watch) stopRefusedRef.current = null;
     };
   }, [sessionId, sessionRuntime, transcriptVersion, perSocket]);
 
@@ -1703,10 +1761,26 @@ export function AgentProvider({
       setPendingApproval(null);
       const target = perSocket ? conversationIdRef.current : sessionId;
       if (!target) return;
+      const watched = watchedTurnRef.current;
+      let status: string | undefined;
       try {
-        await abortSession(target);
+        status = (await abortSession(target))?.status;
       } catch {
         // Best-effort abort
+      }
+      // The gateway runs no turn for a page that only watches one. Either the
+      // turn has just ended, and the watch's next check sees it leave
+      // `running`, or its stored state is stale, and that check ends the watch.
+      // A turn without an id cannot be told apart from the next one, so it
+      // is never suspected.
+      if (
+        status === 'no_active_response'
+        && watched
+        && watched.turnId !== ''
+        && detachedTurnWatchRef.current === watched.watch
+        && stopRefusedRef.current?.watch !== watched.watch
+      ) {
+        stopRefusedRef.current = { watch: watched.watch, turnId: watched.turnId, confirmations: 0 };
       }
     },
     pendingApproval,
