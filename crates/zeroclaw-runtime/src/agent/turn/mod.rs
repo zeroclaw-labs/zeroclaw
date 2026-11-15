@@ -3192,7 +3192,10 @@ async fn run_tool_call_loop_impl<'a>(
         if let Some(attempt) = accepted_attempt
             .filter(|attempt| attempt.is_model_attributed() && attempt.model() != served_model)
             && let Some(sink) = served_route_sink.as_ref()
-            && let Some(served) = sink.lock().expect("served-route sink lock").as_mut()
+            && let Some(served) = sink
+                .lock()
+                .map_err(|_| anyhow::Error::msg("served-route sink lock poisoned"))?
+                .as_mut()
         {
             // Provider-side fallback changes accounting identity, not the
             // configured route's context limits. Compare with the raw route so
@@ -7254,6 +7257,7 @@ vision_model_provider = "custom.vision"
             top_model: Option<&'static str>,
             prior: bool,
             handoff: bool,
+            poison_sink: bool,
             expected_model: &'static str,
             expected_route: &'static str,
             expected_cost: f64,
@@ -7265,6 +7269,7 @@ vision_model_provider = "custom.vision"
                 top_model: Some("model-b"),
                 prior: true,
                 handoff: false,
+                poison_sink: false,
                 expected_model: "model-b",
                 expected_route: "model-b",
                 expected_cost: 170.0 / 1_000_000.0,
@@ -7275,6 +7280,7 @@ vision_model_provider = "custom.vision"
                 top_model: Some("model-b"),
                 prior: true,
                 handoff: false,
+                poison_sink: false,
                 expected_model: "model-b",
                 expected_route: "model-b",
                 expected_cost: 170.0 / 1_000_000.0,
@@ -7285,6 +7291,7 @@ vision_model_provider = "custom.vision"
                 top_model: None,
                 prior: true,
                 handoff: false,
+                poison_sink: false,
                 expected_model: "(unattributed)",
                 expected_route: "model-a",
                 expected_cost: 0.0,
@@ -7295,6 +7302,7 @@ vision_model_provider = "custom.vision"
                 top_model: Some("model-b"),
                 prior: false,
                 handoff: true,
+                poison_sink: false,
                 expected_model: "model-b",
                 expected_route: "model-b",
                 expected_cost: 170.0 / 1_000_000.0,
@@ -7305,6 +7313,7 @@ vision_model_provider = "custom.vision"
                 top_model: None,
                 prior: false,
                 handoff: true,
+                poison_sink: false,
                 expected_model: "(unattributed)",
                 expected_route: "model-a",
                 expected_cost: 0.0,
@@ -7315,13 +7324,26 @@ vision_model_provider = "custom.vision"
                 top_model: None,
                 prior: false,
                 handoff: false,
+                poison_sink: false,
                 expected_model: "(unattributed)",
                 expected_route: "(unattributed)",
                 expected_cost: 5_445.0 / 1_000_000.0,
             },
+            Case {
+                requested: "model-a",
+                terminal_model: Some("model-b"),
+                top_model: Some("model-b"),
+                prior: true,
+                handoff: false,
+                poison_sink: true,
+                expected_model: "model-b",
+                expected_route: "model-b",
+                expected_cost: 170.0 / 1_000_000.0,
+            },
         ];
         for case in cases {
             let server = MockServer::start().await;
+            let route = Arc::new(Mutex::new(None));
             let mut body = serde_json::json!({
                 "content": [{"type": "text", "text": "done"}], "stop_reason": "end_turn",
                 "usage": {"input_tokens": 50, "output_tokens": 5}
@@ -7342,9 +7364,19 @@ vision_model_provider = "custom.vision"
             if let Some(model) = case.top_model {
                 body["model"] = serde_json::json!(model);
             }
+            let response_route = Arc::clone(&route);
+            let poison_sink = case.poison_sink;
             Mock::given(method("POST"))
                 .and(path("/v1/messages"))
-                .respond_with(ResponseTemplate::new(200).set_body_json(body))
+                .respond_with(move |_: &wiremock::Request| {
+                    if poison_sink {
+                        let _ = std::panic::catch_unwind(|| {
+                            let _guard = response_route.lock().unwrap();
+                            panic!("poison the served-route sink after dispatch");
+                        });
+                    }
+                    ResponseTemplate::new(200).set_body_json(body.clone())
+                })
                 .expect(1)
                 .mount(&server)
                 .await;
@@ -7384,7 +7416,6 @@ vision_model_provider = "custom.vision"
             let knobs = LoopKnobs::default();
             let limits = zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(100_000);
             let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(32);
-            let route = Arc::new(Mutex::new(None));
             let mut history = vec![ChatMessage::user("hello")];
             let result = TOOL_LOOP_COST_TRACKING_CONTEXT
                 .scope(
@@ -7449,9 +7480,18 @@ vision_model_provider = "custom.vision"
                         turn_id: "fallback-test",
                     }),
                 )
-                .await
-                .expect("turn succeeds");
-            assert!(result.contains("done"));
+                .await;
+            if case.poison_sink {
+                let error = result.expect_err("poisoned route sink must fail the turn");
+                assert!(
+                    error
+                        .to_string()
+                        .contains("served-route sink lock poisoned"),
+                    "unexpected error: {error:#}"
+                );
+            } else {
+                assert!(result.expect("turn succeeds").contains("done"));
+            }
             let usage: Vec<_> = std::iter::from_fn(|| event_rx.try_recv().ok())
                 .filter_map(|event| match event {
                     TurnEvent::Usage {
@@ -7502,13 +7542,15 @@ vision_model_provider = "custom.vision"
                 observer.responses.lock().unwrap().last().unwrap().1,
                 case.expected_model
             );
-            let route = route.lock().unwrap();
-            let route = route.as_ref().unwrap();
-            assert_eq!(route.model, case.expected_route);
-            assert_eq!(
-                route.context_limits.context_token_budget,
-                limits.context_token_budget
-            );
+            if !case.poison_sink {
+                let route = route.lock().unwrap();
+                let route = route.as_ref().unwrap();
+                assert_eq!(route.model, case.expected_route);
+                assert_eq!(
+                    route.context_limits.context_token_budget,
+                    limits.context_token_budget
+                );
+            }
             assert_eq!(history[0].content, "hello");
             let ledger =
                 std::fs::read_to_string(workspace.path().join("state").join("costs.jsonl"))
