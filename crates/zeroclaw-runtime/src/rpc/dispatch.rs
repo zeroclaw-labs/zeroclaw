@@ -42343,14 +42343,15 @@ mod tests {
         }
 
         let tmp = tempfile::TempDir::new().unwrap();
-        let cfg = zeroclaw_config::schema::Config {
+        let mut cfg = zeroclaw_config::schema::Config {
             config_path: tmp.path().join("config.toml"),
             data_dir: tmp.path().join("data"),
             providers: serde_json::from_value(serde_json::json!({
                 "connections": {
                     "openai": {
                         "kind": "openai",
-                        "auth": {"mode": "api_key", "api_key": "sk-initial"}
+                        "uri": mock_a.uri(),
+                        "auth": {"mode": "api_key", "api_key": "key-a"}
                     }
                 },
                 "models": {
@@ -42358,13 +42359,18 @@ mod tests {
                         "capability": "chat",
                         "provider": "openai",
                         "model": "gpt-test"
+                    },
+                    "embedding.openai": {
+                        "capability": "embedding",
+                        "provider": "openai",
+                        "model": "text-embedding-3-small",
+                        "metadata": {"dimensions": 1536}
                     }
                 }
             }))
             .expect("canonical memory refresh registry"),
             ..Default::default()
         };
-        let mut cfg = cfg;
         cfg.agents.insert(
             "agent".into(),
             zeroclaw_config::schema::AliasedAgentConfig {
@@ -42373,14 +42379,9 @@ mod tests {
                 ..Default::default()
             },
         );
-        cfg.set_prop_persistent("providers.models.openai.default.uri", &mock_a.uri())
-            .expect("set initial uri");
-        cfg.set_prop_persistent("providers.models.openai.default.api_key", "key-a")
-            .expect("set initial key");
         cfg.risk_profiles
             .insert("test-memory".into(), Default::default());
-        cfg.memory.embedding_provider = "openai.default".into();
-        cfg.memory.embedding_model = "text-embedding-3-small".into();
+        cfg.memory.embedding_model_ref = Some("embedding.openai".into());
         cfg.memory.embedding_dimensions = 3;
 
         // Long-lived handle built via the real factory → embedder points at A.
@@ -42399,9 +42400,8 @@ mod tests {
             zeroclaw_config::provider_registry::editor::snapshot(&dispatcher.ctx.config.read())
                 .expect("registry snapshot");
         let mut edit = expected.clone();
-        edit["connections"]["legacy.openai.default"]["uri"] = json!(mock_b.uri());
-        edit["connections"]["legacy.openai.default"]["auth"] =
-            json!({"mode":"api_key", "api_key":"key-b"});
+        edit["connections"]["openai"]["uri"] = json!(mock_b.uri());
+        edit["connections"]["openai"]["auth"] = json!({"mode":"api_key", "api_key":"key-b"});
         let res = dispatcher
             .handle_config_registry_set(&json!({"expected": expected, "registry": edit}))
             .await;
@@ -42443,10 +42443,30 @@ mod tests {
         let mut cfg = zeroclaw_config::schema::Config {
             config_path: tmp.path().join("config.toml"),
             data_dir: tmp.path().join("data"),
+            providers: serde_json::from_value(serde_json::json!({
+                "connections": {
+                    "openai": {
+                        "kind": "openai",
+                        "auth": {"mode": "api_key", "api_key": "sk-initial"}
+                    }
+                },
+                "models": {
+                    "openai.default": {
+                        "capability": "chat",
+                        "provider": "openai",
+                        "model": "gpt-test"
+                    },
+                    "embedding.openai": {
+                        "capability": "embedding",
+                        "provider": "openai",
+                        "model": "text-embedding-3-small",
+                        "metadata": {"dimensions": 1536}
+                    }
+                }
+            }))
+            .expect("canonical memory refresh registry"),
             ..Default::default()
         };
-        cfg.create_map_key("providers.models.openai", "default")
-            .unwrap();
         cfg.agents.insert(
             "agent".into(),
             zeroclaw_config::schema::AliasedAgentConfig {
@@ -42457,8 +42477,7 @@ mod tests {
         );
         cfg.risk_profiles
             .insert("test-memory".into(), Default::default());
-        cfg.memory.embedding_provider = "openai.default".into();
-        cfg.memory.embedding_model = "text-embedding-3-small".into();
+        cfg.memory.embedding_model_ref = Some("embedding.openai".into());
         cfg.memory.embedding_dimensions = 1536;
 
         // The agent's memory: AgentScopedMemory wrapping a concrete SQLite
