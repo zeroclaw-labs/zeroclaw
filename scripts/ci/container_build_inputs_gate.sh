@@ -32,7 +32,7 @@ else:
     )
 
 CARGO_BUILD = re.compile(r"cargo\s+(?:build|install|zigbuild|check|nextest)\b")
-ROOT_PACKAGE = re.compile(r"(?:-p[ =]zeroclaw\b|--bin\s+zeroclaw\b)")
+ROOT_PACKAGE = re.compile(r"(?:(?:-p|--package)[ =]zeroclaw\b|--bin\s+zeroclaw\b)")
 COPIES_RS = re.compile(
     r"^\s*(?:COPY|ADD)\s+(?:\*\.rs|build\.rs)\b", re.IGNORECASE | re.MULTILINE
 )
