@@ -41,6 +41,7 @@ pub mod dashboard_session;
 pub mod node_tool;
 pub mod nodes;
 pub mod openapi;
+mod openbao_write;
 #[cfg(feature = "plugins-wasm")]
 mod plugin_webhook;
 pub mod principal_gate;

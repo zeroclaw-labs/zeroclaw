@@ -1340,6 +1340,7 @@ struct HttpCredentialMutation {
     operation: PluginTlsCredentialOperation,
     credential: Option<zeroclaw_config::schema::ScopedHttpCredential>,
     permissions: Option<HttpCredentialPermissions>,
+    openbao_write: Option<crate::openbao_write::SecretWrite>,
 }
 
 #[derive(Deserialize)]
@@ -1410,6 +1411,7 @@ pub async fn list_http_credentials(
             rows.sort_by_key(|(name, _)| *name);
             Json(serde_json::json!({
                 "encryption_enabled": config.secrets.encrypt,
+                "openbao_write_prefix": crate::openbao_write::configured_prefix(),
                 "credentials": rows.into_iter().map(|(_, row)| row).collect::<Vec<_>>()
             }))
             .into_response()
@@ -1455,6 +1457,7 @@ pub async fn mutate_http_credential(
             let present = credentials.contains_key(&mutation.name);
             if let Some(permissions) = mutation.permissions {
                 if mutation.credential.is_some()
+                    || mutation.openbao_write.is_some()
                     || !matches!(mutation.operation, PluginTlsCredentialOperation::Replace)
                 {
                     return StatusCode::BAD_REQUEST.into_response();
@@ -1517,9 +1520,14 @@ pub async fn mutate_http_credential(
             let verb = match (mutation.operation, &mutation.credential, present) {
                 (PluginTlsCredentialOperation::Create, Some(_), false) => Verb::Create,
                 (PluginTlsCredentialOperation::Replace, Some(_), true) => Verb::Update,
-                (PluginTlsCredentialOperation::Delete, None, true) => Verb::Delete,
+                (PluginTlsCredentialOperation::Delete, None, true)
+                    if mutation.openbao_write.is_none() =>
+                {
+                    Verb::Delete
+                }
                 _ => return StatusCode::CONFLICT.into_response(),
             };
+            let mut external_write = None;
             if let Some(mut credential) = mutation.credential {
                 if let Some(previous) = credentials.get(&mutation.name) {
                     let store = SecretStore::new(dir, true);
@@ -1535,6 +1543,16 @@ pub async fn mutate_http_credential(
                     };
                     if std::mem::discriminant(&previous.auth)
                         != std::mem::discriminant(&credential.auth)
+                    {
+                        return StatusCode::BAD_REQUEST.into_response();
+                    }
+                    if let Some(write) = &mutation.openbao_write
+                        && (previous
+                            .source
+                            .command(write.reference(&previous.auth))
+                            .is_none()
+                            || !matches!(previous.source, ScopedCredentialSource::OpenBao)
+                            || write.reference(&previous.auth) != write.reference(&credential.auth))
                     {
                         return StatusCode::BAD_REQUEST.into_response();
                     }
@@ -1620,6 +1638,14 @@ pub async fn mutate_http_credential(
                 if !valid_auth {
                     return StatusCode::BAD_REQUEST.into_response();
                 }
+                if let Some(write) = mutation.openbao_write {
+                    if !matches!(credential.source, ScopedCredentialSource::OpenBao)
+                        || !write.valid_for(&credential.auth)
+                    {
+                        return StatusCode::BAD_REQUEST.into_response();
+                    }
+                    external_write = Some((write.reference(&credential.auth).to_owned(), write));
+                }
                 let Ok(ciphertext) = serde_json::to_string(&credential)
                     .map_err(anyhow::Error::from)
                     .and_then(|value| SecretStore::new(dir, true).encrypt(&value))
@@ -1640,6 +1666,11 @@ pub async fn mutate_http_credential(
                 Ok(authorization) => authorization,
                 Err(denied) => return denied.into_response(),
             };
+            if let Some((reference, write)) = external_write {
+                if let Err(status) = write.apply(&reference, present).await {
+                    return status.into_response();
+                }
+            }
             if persist_and_swap(&state, authorization, config, guard)
                 .await
                 .is_err()
