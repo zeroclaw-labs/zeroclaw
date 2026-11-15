@@ -2407,7 +2407,29 @@ mod inbound {
                 match cached {
                     Some(room) => room,
                     None => {
-                        let room = match client.get_dm_room(&user_id) {
+                        // `get_dm_room` resolves through the persisted
+                        // `m.direct` account data, which can point at a room
+                        // the owner already left (typical after a bot
+                        // restart): a notice sent there would land in a room
+                        // the owner no longer reads, with no error. Reuse a
+                        // resolved room only while the owner is still joined.
+                        let existing = match client.get_dm_room(&user_id) {
+                            Some(room) => {
+                                let owner_joined = matches!(
+                                    room.get_member(&user_id).await,
+                                    Ok(Some(member))
+                                        if *member.membership()
+                                            == matrix_sdk::ruma::events::room::member::MembershipState::Join
+                                );
+                                if owner_joined {
+                                    Some(room)
+                                } else {
+                                    None
+                                }
+                            }
+                            None => None,
+                        };
+                        let room = match existing {
                             Some(room) => room,
                             None => {
                                 let room = client.create_dm(&user_id).await.map_err(|e| {
@@ -2436,9 +2458,11 @@ mod inbound {
                                     user_id.clone().into();
                                 let entry = direct.entry(key).or_default();
                                 let room_id_owned = room.room_id().to_owned();
-                                if !entry.contains(&room_id_owned) {
-                                    entry.push(room_id_owned);
-                                }
+                                // Replace rather than append: the previous
+                                // entry may hold stale rooms the owner has
+                                // left, which would keep clients offering a
+                                // dead DM under People.
+                                *entry = vec![room_id_owned];
                                 if let Err(e) = account.set_account_data(direct).await {
                                     ::zeroclaw_log::record!(
                                         WARN,
