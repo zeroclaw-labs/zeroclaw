@@ -145,7 +145,14 @@ fn packed_branch_commit_updates_the_cached_cargo_version() {
     .unwrap();
     fs::write(
         repository.checkout.join("build.rs"),
-        "fn main() { zeroclaw_buildinfo::emit(); }\n",
+        r#"use std::io::Write;
+fn main() {
+    zeroclaw_buildinfo::emit();
+    let mut log = std::fs::OpenOptions::new().create(true).append(true)
+        .open(std::env::var_os("STAMP_TEST_LOG").unwrap()).unwrap();
+    writeln!(log, "run").unwrap();
+}
+"#,
     )
     .unwrap();
     fs::write(
@@ -159,11 +166,14 @@ fn packed_branch_commit_updates_the_cached_cargo_version() {
     );
     repository.run(&repository.checkout, &["commit", "-qm", "add consumer"]);
     repository.run(&repository.checkout, &["pack-refs", "--all", "--prune"]);
+    let build_log = repository.root.join("build-runs.log");
     let run_consumer = || {
         let output = Command::new(env!("CARGO"))
             .args(["run", "--offline", "--quiet"])
             .current_dir(&repository.checkout)
             .env("CARGO_TARGET_DIR", repository.root.join("target"))
+            .env("STAMP_TEST_LOG", &build_log)
+            .env_remove(BUILD_ID_ENV)
             .output()
             .unwrap();
         assert!(
@@ -178,12 +188,24 @@ fn packed_branch_commit_updates_the_cached_cargo_version() {
         before,
         version_string("1.2.3", &build_id(&repository.checkout))
     );
+    assert_eq!(fs::read_to_string(&build_log).unwrap().lines().count(), 1);
+    assert_eq!(run_consumer(), before);
+    assert_eq!(
+        fs::read_to_string(&build_log).unwrap().lines().count(),
+        1,
+        "an unchanged packed branch must keep the cached build script"
+    );
     repository.run(
         &repository.checkout,
         &["commit", "-qm", "advance consumer", "--allow-empty"],
     );
     let after = run_consumer();
-    eprintln!("packed-ref consumer: before={before:?}; after={after:?}");
+    let build_runs = fs::read_to_string(&build_log).unwrap().lines().count();
+    eprintln!("packed-ref consumer: before={before:?}; after={after:?}; build runs={build_runs}");
+    assert_eq!(
+        build_runs, 2,
+        "only the new commit should rerun the build script"
+    );
     assert_ne!(
         after, before,
         "Cargo must invalidate the stamp when a packed branch gains a loose ref"
