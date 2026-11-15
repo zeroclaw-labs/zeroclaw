@@ -618,6 +618,13 @@ mod run_model_query_tests {
 
     #[tokio::test]
     async fn run_model_query_prices_anthropic_fallback_attempts_by_attribution() {
+        if super::super::run_anthropic_test_in_fresh_process(
+            "agent::turn::execution::run_model_query_tests::run_model_query_prices_anthropic_fallback_attempts_by_attribution",
+            "ZEROCLAW_ANTHROPIC_FALLBACK_QUERY_TEST_CHILD",
+        ) {
+            return;
+        }
+
         use std::collections::HashMap;
         use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method, matchers::path};
         use zeroclaw_providers::anthropic::AnthropicModelProvider;

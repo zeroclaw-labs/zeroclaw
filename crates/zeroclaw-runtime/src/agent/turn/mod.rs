@@ -6593,6 +6593,28 @@ mod trim_budget_tests {
 }
 
 #[cfg(test)]
+fn run_anthropic_test_in_fresh_process(test_name: &str, child_env: &str) -> bool {
+    // The real provider uses a process-wide HTTP-client cache. Keep these
+    // fixtures separate from connections spawned by other tests' runtimes.
+    if std::env::var_os(child_env).is_some() {
+        return false;
+    }
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", test_name, "--test-threads=1", "--nocapture"])
+        .env(child_env, "1")
+        .output()
+        .expect("run isolated Anthropic test");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains("1 passed"),
+        "isolated test failed: {}\n{stdout}\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    true
+}
+
+#[cfg(test)]
 mod active_route_context_tests {
     use super::*;
     use std::collections::{HashMap, HashSet};
@@ -7179,6 +7201,13 @@ vision_model_provider = "custom.vision"
     }
     #[tokio::test]
     async fn anthropic_fallback_turn_events_keep_route_limits_and_attempt_identity() {
+        if super::run_anthropic_test_in_fresh_process(
+            "agent::turn::active_route_context_tests::anthropic_fallback_turn_events_keep_route_limits_and_attempt_identity",
+            "ZEROCLAW_ANTHROPIC_FALLBACK_TURN_TEST_CHILD",
+        ) {
+            return;
+        }
+
         use crate::agent::cost::{TOOL_LOOP_COST_TRACKING_CONTEXT, ToolLoopCostTrackingContext};
         use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method, matchers::path};
         use zeroclaw_api::attribution::{Attributable, ModelProviderKind, ProviderKind, Role};
