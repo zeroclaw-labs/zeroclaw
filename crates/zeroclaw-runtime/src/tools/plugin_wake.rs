@@ -500,10 +500,6 @@ impl AgentWakeBackend for RuntimeAgentWakeBackend {
             "plugin wake accepted for in-process delivery"
         );
 
-        // Built from `&cfg` before `cfg` moves into the turn below: a detached
-        // spawn does not inherit the caller's task-locals, so the woken turn
-        // would otherwise record no cost at all.
-        let cost_ctx = tool_loop_cost_tracking_context_for_agent(&cfg, &canonical);
         let live_config = self.live_config.clone();
         let coordinator = Arc::clone(&self.coordinator);
         let spawn_key = slot_key.clone();
@@ -524,6 +520,10 @@ impl AgentWakeBackend for RuntimeAgentWakeBackend {
             loop {
                 let turn_alias = spawn_canonical.clone();
                 let turn_prompt = plan.prompt.clone();
+                // Build from `&plan.cfg` per turn so a coalesced follow-up sees
+                // updated cost-tracking and pricing config from its own
+                // admitted snapshot rather than reusing the first turn's view.
+                let cost_ctx = tool_loop_cost_tracking_context_for_agent(&plan.cfg, &turn_alias);
                 let turn_usage = cost_ctx
                     .as_ref()
                     .map(|_| Arc::new(Mutex::new(TurnUsage::default())));
@@ -573,6 +573,11 @@ impl AgentWakeBackend for RuntimeAgentWakeBackend {
 
                 // Drain a wake that coalesced while this turn ran. `None` means
                 // nothing is pending, so release the slot and stop.
+                //
+                // Charge one budget token for the follow-up turn using the
+                // current live rate limit before starting it: overwriting the
+                // same pending wake never charges extra, and an exhausted
+                // bucket drops the follow-up rather than bypassing the cap.
                 let next = {
                     let mut slots = coordinator.slots.lock();
                     let next = match slots.get_mut(&spawn_key) {
@@ -588,6 +593,80 @@ impl AgentWakeBackend for RuntimeAgentWakeBackend {
                     spawned_guard.disarm();
                     return;
                 };
+
+                let follow_up_snapshot = match live_config.as_ref() {
+                    Some(handle) => Arc::new(handle.read().clone()),
+                    None => Arc::clone(&plan.cfg),
+                };
+                let follow_up_entry = follow_up_snapshot
+                    .plugins
+                    .entries
+                    .iter()
+                    .find(|entry| entry.name == spawn_key.0);
+                let Some(entry) = follow_up_entry else {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "plugin": package,
+                                "agent": spawn_canonical,
+                            })),
+                        "coalesced plugin wake cancelled: instance config row removed"
+                    );
+                    return;
+                };
+                if !entry
+                    .dispatch_agents
+                    .iter()
+                    .any(|allowed| allowed == "*" || allowed.eq_ignore_ascii_case(&spawn_canonical))
+                {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "plugin": package,
+                                "agent": spawn_canonical,
+                            })),
+                        "coalesced plugin wake cancelled: target no longer granted"
+                    );
+                    return;
+                }
+                if !follow_up_snapshot
+                    .agents
+                    .get(&spawn_canonical)
+                    .is_some_and(|agent| agent.enabled)
+                {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "plugin": package,
+                                "agent": spawn_canonical,
+                            })),
+                        "coalesced plugin wake cancelled: target agent disabled or removed"
+                    );
+                    return;
+                }
+                let rate_limit = entry
+                    .dispatch_rate_per_min
+                    .unwrap_or(DEFAULT_DISPATCH_RATE_PER_MIN);
+                if !coordinator.try_consume_token(&spawn_key.0, rate_limit) {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "plugin": package,
+                                "agent": spawn_canonical,
+                                "rate_per_min": rate_limit,
+                            })),
+                        "coalesced plugin wake cancelled: wake rate limit exhausted"
+                    );
+                    return;
+                }
 
                 let admission = match next
                     .execution_capability
@@ -617,7 +696,24 @@ impl AgentWakeBackend for RuntimeAgentWakeBackend {
                 let cfg = admission
                     .as_ref()
                     .map(AgentExecutionAdmission::config)
-                    .unwrap_or_else(|| Arc::clone(&plan.cfg));
+                    .unwrap_or(follow_up_snapshot);
+                if !cfg
+                    .agents
+                    .get(&spawn_canonical)
+                    .is_some_and(|agent| agent.enabled)
+                {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "plugin": package,
+                                "agent": spawn_canonical,
+                            })),
+                        "coalesced plugin wake cancelled: admitted target agent is disabled"
+                    );
+                    return;
+                }
                 let next_depth = next.depth.saturating_add(1);
                 let task = match admit_wake_task(
                     Some(task_store.as_ref()),
@@ -1844,5 +1940,386 @@ mod tests {
             1,
             "a refused wake registers nothing further"
         );
+    }
+
+    #[tokio::test]
+    async fn coalesced_followup_enforces_rate_limit() {
+        use axum::{Json, Router, extract::State, routing::post};
+
+        #[derive(Clone)]
+        struct RequestState {
+            count: Arc<Mutex<u32>>,
+            entered: Arc<tokio::sync::Notify>,
+            release: Arc<tokio::sync::Notify>,
+        }
+        async fn capture_chat(
+            State(state): State<RequestState>,
+            Json(_body): Json<serde_json::Value>,
+        ) -> Json<serde_json::Value> {
+            *state.count.lock() += 1;
+            state.entered.notify_one();
+            state.release.notified().await;
+            Json(serde_json::json!({
+                "choices": [{"message": {"content": "ok"}}]
+            }))
+        }
+
+        let request_count = Arc::new(Mutex::new(0));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("mock provider listener should bind");
+        let mock_addr = listener.local_addr().expect("mock provider addr");
+        let app = Router::new()
+            .route("/v1/chat/completions", post(capture_chat))
+            .with_state(RequestState {
+                count: Arc::clone(&request_count),
+                entered: Arc::clone(&entered),
+                release: Arc::clone(&release),
+            });
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("mock provider server should run");
+        });
+
+        let workspace = tempfile::TempDir::new().expect("temp data dir");
+        let mut config = base_config(workspace.path());
+        config.providers.models.ollama.insert(
+            "default".to_string(),
+            OllamaModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("mock-model".to_string()),
+                    uri: Some(format!("http://{mock_addr}")),
+                    timeout_secs: Some(10),
+                    ..ModelProviderConfig::default()
+                },
+                ..OllamaModelProviderConfig::default()
+            },
+        );
+        // Budget = 1 token/min: the initial turn spends it, so a coalesced
+        // follow-up queued during that turn must be dropped when drained.
+        config.plugins.entries = vec![entry(&instance_key(), &["recipient"], Some(1))];
+
+        let control_plane =
+            ControlPlaneHandle::open(workspace.path()).expect("isolated control plane");
+        let store = Arc::clone(&control_plane.store);
+        let authority = crate::LiveConfigAuthority::new(config.clone());
+        let coordinator = Arc::new(SharedWakeCoordinator::new());
+        let backend = RuntimeAgentWakeBackend::for_tests(
+            Arc::new(config),
+            Some(authority.live_handle()),
+            Some(authority.execution_capability()),
+            Some(control_plane),
+            Arc::clone(&coordinator),
+        );
+
+        assert_eq!(
+            backend
+                .wake(&scope(), Some("sender-1"), "recipient", "first")
+                .await,
+            Ok(())
+        );
+        tokio::time::timeout(Duration::from_secs(10), entered.notified())
+            .await
+            .expect("first turn reaches mock provider");
+
+        // Repeated wakes overwrite the single pending slot without charging.
+        for caller in ["sender-2", "sender-3", "sender-4"] {
+            assert_eq!(
+                backend
+                    .wake(&scope(), Some(caller), "recipient", caller)
+                    .await,
+                Ok(())
+            );
+        }
+        release.notify_one();
+
+        await_slots_released(&coordinator).await;
+        let tasks = tasks_for(store.as_ref(), "recipient").await;
+        assert_eq!(
+            tasks.len(),
+            1,
+            "rate=1 must drop the coalesced follow-up after the initial turn: {tasks:?}"
+        );
+        assert_eq!(*request_count.lock(), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn coalesced_followup_is_cancelled_when_target_is_disabled_mid_turn() {
+        use axum::{Json, Router, extract::State, routing::post};
+
+        #[derive(Clone)]
+        struct RequestState {
+            count: Arc<Mutex<u32>>,
+            entered: Arc<tokio::sync::Notify>,
+            release: Arc<tokio::sync::Notify>,
+        }
+        async fn capture_chat(
+            State(state): State<RequestState>,
+            Json(_body): Json<serde_json::Value>,
+        ) -> Json<serde_json::Value> {
+            *state.count.lock() += 1;
+            state.entered.notify_one();
+            state.release.notified().await;
+            Json(serde_json::json!({
+                "choices": [{"message": {"content": "ok"}}]
+            }))
+        }
+
+        let request_count = Arc::new(Mutex::new(0));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("mock provider listener should bind");
+        let mock_addr = listener.local_addr().expect("mock provider addr");
+        let app = Router::new()
+            .route("/v1/chat/completions", post(capture_chat))
+            .with_state(RequestState {
+                count: Arc::clone(&request_count),
+                entered: Arc::clone(&entered),
+                release: Arc::clone(&release),
+            });
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("mock provider server should run");
+        });
+
+        let workspace = tempfile::TempDir::new().expect("temp data dir");
+        let mut config = base_config(workspace.path());
+        config.providers.models.ollama.insert(
+            "default".to_string(),
+            OllamaModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("mock-model".to_string()),
+                    uri: Some(format!("http://{mock_addr}")),
+                    timeout_secs: Some(10),
+                    ..ModelProviderConfig::default()
+                },
+                ..OllamaModelProviderConfig::default()
+            },
+        );
+        config.plugins.entries = vec![entry(&instance_key(), &["recipient"], Some(600))];
+
+        let control_plane =
+            ControlPlaneHandle::open(workspace.path()).expect("isolated control plane");
+        let store = Arc::clone(&control_plane.store);
+        let authority = crate::LiveConfigAuthority::new(config.clone());
+        let coordinator = Arc::new(SharedWakeCoordinator::new());
+        let backend = RuntimeAgentWakeBackend::for_tests(
+            Arc::new(config),
+            Some(authority.live_handle()),
+            Some(authority.execution_capability()),
+            Some(control_plane),
+            Arc::clone(&coordinator),
+        );
+
+        assert_eq!(
+            backend
+                .wake(&scope(), Some("sender-1"), "recipient", "first")
+                .await,
+            Ok(())
+        );
+        tokio::time::timeout(Duration::from_secs(10), entered.notified())
+            .await
+            .expect("first turn reaches mock provider");
+
+        assert_eq!(
+            backend
+                .wake(&scope(), Some("sender-2"), "recipient", "second")
+                .await,
+            Ok(())
+        );
+
+        // Disable the target agent in live config while the first turn runs.
+        let mut updated = authority.live_handle().read().clone();
+        updated
+            .agents
+            .get_mut("recipient")
+            .expect("recipient agent")
+            .enabled = false;
+        authority.publish_for_test(updated);
+
+        release.notify_one();
+        await_slots_released(&coordinator).await;
+
+        let tasks = tasks_for(store.as_ref(), "recipient").await;
+        assert_eq!(
+            tasks.len(),
+            1,
+            "disabled target must cancel the pending follow-up turn: {tasks:?}"
+        );
+        assert_eq!(*request_count.lock(), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn coalesced_followup_rebuilds_cost_context_from_fresh_config() {
+        use crate::cost::CostTracker;
+        use axum::{Json, Router, extract::State, routing::post};
+
+        #[derive(Clone)]
+        struct RequestState {
+            count: Arc<Mutex<u32>>,
+            entered: Arc<tokio::sync::Notify>,
+            release: Arc<tokio::sync::Notify>,
+        }
+        async fn capture_chat(
+            State(state): State<RequestState>,
+            Json(_body): Json<serde_json::Value>,
+        ) -> Json<serde_json::Value> {
+            *state.count.lock() += 1;
+            state.entered.notify_one();
+            state.release.notified().await;
+            Json(serde_json::json!({
+                "choices": [{"message": {"content": "ok"}}],
+                "usage": {"prompt_tokens": 1_000, "completion_tokens": 200}
+            }))
+        }
+
+        let request_count = Arc::new(Mutex::new(0));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("mock provider listener should bind");
+        let mock_addr = listener.local_addr().expect("mock provider addr");
+        let app = Router::new()
+            .route("/v1/chat/completions", post(capture_chat))
+            .with_state(RequestState {
+                count: Arc::clone(&request_count),
+                entered: Arc::clone(&entered),
+                release: Arc::clone(&release),
+            });
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("mock provider server should run");
+        });
+
+        let workspace = tempfile::TempDir::new().expect("temp data dir");
+        let mut config = base_config(workspace.path());
+        // First turn starts with cost tracking disabled (so first turn's
+        // cost_ctx is None).
+        config.cost = CostConfig {
+            enabled: false,
+            track_per_agent: true,
+            ..CostConfig::default()
+        };
+        config.providers.models.ollama.insert(
+            "default".to_string(),
+            OllamaModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("mock-model".to_string()),
+                    uri: Some(format!("http://{mock_addr}")),
+                    timeout_secs: Some(10),
+                    pricing: HashMap::from([
+                        ("mock-model.input".to_string(), 3.0),
+                        ("mock-model.output".to_string(), 15.0),
+                    ]),
+                    ..ModelProviderConfig::default()
+                },
+                ..OllamaModelProviderConfig::default()
+            },
+        );
+        config.plugins.entries = vec![entry(&instance_key(), &["recipient"], Some(600))];
+
+        let control_plane =
+            ControlPlaneHandle::open(workspace.path()).expect("isolated control plane");
+        let store = Arc::clone(&control_plane.store);
+        let authority = crate::LiveConfigAuthority::new(config.clone());
+        let coordinator = Arc::new(SharedWakeCoordinator::new());
+        let backend = RuntimeAgentWakeBackend::for_tests(
+            Arc::new(config.clone()),
+            Some(authority.live_handle()),
+            Some(authority.execution_capability()),
+            Some(control_plane),
+            Arc::clone(&coordinator),
+        );
+
+        assert_eq!(
+            backend
+                .wake(&scope(), Some("sender-1"), "recipient", "first")
+                .await,
+            Ok(())
+        );
+        tokio::time::timeout(Duration::from_secs(10), entered.notified())
+            .await
+            .expect("first turn reaches mock provider");
+
+        assert_eq!(
+            backend
+                .wake(&scope(), Some("sender-2"), "recipient", "second")
+                .await,
+            Ok(())
+        );
+
+        // Enable cost tracking + updated pricing while the first turn runs.
+        let mut updated = authority.live_handle().read().clone();
+        updated.cost.enabled = true;
+        updated.cost.track_per_agent = true;
+        updated
+            .providers
+            .models
+            .ollama
+            .get_mut("default")
+            .expect("ollama default")
+            .base
+            .pricing = HashMap::from([
+            ("mock-model.input".to_string(), 6.0),
+            ("mock-model.output".to_string(), 30.0),
+        ]);
+        authority.publish_for_test(updated.clone());
+
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(10), entered.notified())
+            .await
+            .expect("follow-up turn reaches mock provider");
+        release.notify_one();
+
+        let tasks = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let tasks = tasks_for(store.as_ref(), "recipient").await;
+                if tasks.len() >= 2 && tasks.iter().all(|task| task.status.is_terminal()) {
+                    return tasks;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("both turns should complete");
+        assert_eq!(tasks.len(), 2);
+        await_slots_released(&coordinator).await;
+
+        let tracker = CostTracker::get_or_init_global(updated.cost.clone(), &updated.data_dir)
+            .expect("cost tracker should initialize once enabled");
+        let mut recipient_summary = None;
+        for _ in 0..20_000 {
+            let summary = tracker
+                .get_summary_for_agent("recipient")
+                .expect("recipient cost summary should be queryable");
+            if summary.request_count >= 1 {
+                recipient_summary = Some(summary);
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let recipient_summary =
+            recipient_summary.expect("follow-up turn must record cost under fresh config");
+        assert_eq!(
+            recipient_summary.request_count, 1,
+            "only the follow-up turn ran with cost tracking enabled"
+        );
+        let expected_cost = (1_000.0 * 6.0 / 1_000_000.0) + (200.0 * 30.0 / 1_000_000.0);
+        assert!(
+            (recipient_summary.session_cost_usd - expected_cost).abs() < 1e-9,
+            "follow-up turn must use updated pricing ({} vs {expected_cost})",
+            recipient_summary.session_cost_usd
+        );
+        server.abort();
     }
 }
