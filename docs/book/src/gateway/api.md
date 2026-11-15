@@ -126,15 +126,15 @@ related check; otherwise the write is rejected. Retained diagnostics use the
 If a non-continuable baseline error hides a later error, fixing the first one
 alone can still be rejected because the later error cannot be classified as
 pre-existing. A batch correcting both may be required.
-Secret and initialization responses keep their documented shapes and do not
-include warnings. A pre-existing error retained during one of those writes is
-saved unchanged and reported only in the gateway log.
+Initialization responses include a `warnings` field when warnings are present.
+Secret responses do not include warnings; a pre-existing error retained during
+such a write is saved unchanged and reported in the gateway log.
 
 The complete write set is authorized before this cross-field validation. A
 caller without `Config:Read` receives a generic validation failure instead of
 configuration details. On successful writes, any warnings are represented by
 one `config_warning_details_hidden` warning; callers with read access receive
-the full warnings. Secret and initialization responses still omit warnings.
+the full warnings. Secret responses still omit warnings.
 
 For lists addressed by a natural key, indexed validation diagnostics are matched
 to the edited entry when its identity can be resolved. An ambiguous or unknown

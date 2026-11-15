@@ -1,5 +1,7 @@
 import type { ValidationWarning } from './api';
-import { getOidcSession, getToken, subscribeOidcSession } from './auth';
+import {
+  getOidcSession, getToken, PAIRING_TOKEN_STORAGE_KEY, subscribeOidcSession, subscribePairingToken,
+} from './auth';
 
 const CONFIG_WARNINGS_EVENT = 'zeroclaw-config-warnings';
 
@@ -8,7 +10,7 @@ export function captureConfigWarningAuthority(): { isCurrent: () => boolean; dis
   const session = getOidcSession();
   const token = session ? null : getToken();
   let unchanged = true;
-  const dispose = subscribeOidcSession(() => { unchanged = false; });
+  const dispose = subscribeConfigWarningAuthority(() => { unchanged = false; });
   return {
     isCurrent: () => unchanged && getOidcSession() === session && (session !== null || getToken() === token),
     dispose,
@@ -16,11 +18,20 @@ export function captureConfigWarningAuthority(): { isCurrent: () => boolean; dis
 }
 
 export function subscribeConfigWarningAuthority(listener: () => void): () => void {
-  const unsubscribe = subscribeOidcSession(listener);
-  window.addEventListener('storage', listener);
+  const unsubscribeSession = subscribeOidcSession(listener);
+  const onPairingChange = () => { if (getOidcSession() === null) listener(); };
+  const unsubscribeToken = subscribePairingToken(onPairingChange);
+  const unsubscribe = () => { unsubscribeSession(); unsubscribeToken(); };
+  if (typeof window === 'undefined' || typeof window.addEventListener !== 'function') {
+    return unsubscribe;
+  }
+  const onStorage = (event: StorageEvent) => {
+    if (event.key === null || event.key === PAIRING_TOKEN_STORAGE_KEY) onPairingChange();
+  };
+  window.addEventListener('storage', onStorage);
   return () => {
     unsubscribe();
-    window.removeEventListener('storage', listener);
+    window.removeEventListener('storage', onStorage);
   };
 }
 

@@ -97,8 +97,9 @@ fn paths_overlap(left: &str, right: &str) -> bool {
     left == right || is_path_prefix(left, right) || is_path_prefix(right, left)
 }
 
-fn split_list_index(path: &str) -> Option<(&str, usize, &str)> {
-    let (collection, indexed) = path.split_once('[')?;
+fn split_list_index(path: &str, offset: usize) -> Option<(&str, usize, &str)> {
+    let (collection, indexed) = path.split_at(offset);
+    let indexed = indexed.strip_prefix('[')?;
     let (index, suffix) = indexed.split_once(']')?;
     if index.is_empty() || !index.bytes().all(|byte| byte.is_ascii_digit()) {
         return None;
@@ -147,34 +148,48 @@ fn edit_overlaps(candidate: &Config, diagnostic_path: &str, dirty: &str) -> bool
     if paths_overlap(diagnostic_path, dirty) {
         return true;
     }
-    let Some((collection, index, inner)) = split_list_index(diagnostic_path) else {
-        return false;
-    };
-    if !dirty
-        .strip_prefix(collection)
-        .is_some_and(|suffix| suffix.starts_with('.'))
-    {
-        return false;
+    // Natural keys may contain brackets, so locate a resolvable list boundary.
+    for (offset, _) in diagnostic_path.match_indices('[').rev() {
+        let Some((collection, index, inner)) = split_list_index(diagnostic_path, offset) else {
+            continue;
+        };
+        let Some(keys) = natural_keys(candidate, collection) else {
+            continue;
+        };
+        if !dirty
+            .strip_prefix(collection)
+            .is_some_and(|suffix| suffix.starts_with('.'))
+        {
+            return false;
+        }
+        let (prefix, field) = collection.rsplit_once('.').unwrap_or(("", collection));
+        return match crate::helpers::route_vec_path(
+            dirty,
+            prefix,
+            field,
+            "",
+            keys.iter()
+                .enumerate()
+                .map(|(index, key)| (index, key.as_str())),
+        ) {
+            crate::helpers::VecRoute::Hit {
+                index: dirty_index,
+                inner_name,
+            } => {
+                dirty_index == index
+                    && (inner.is_empty()
+                        || paths_overlap(inner, &inner_name)
+                        || inner
+                            .split_once('[')
+                            .is_some_and(|(prefix, _)| paths_overlap(prefix, &inner_name)))
+            }
+            crate::helpers::VecRoute::Miss | crate::helpers::VecRoute::Ambiguous { .. } => true,
+        };
     }
-    let Some(keys) = natural_keys(candidate, collection) else {
-        return true;
-    };
-    let (prefix, field) = collection.rsplit_once('.').unwrap_or(("", collection));
-    match crate::helpers::route_vec_path(
-        dirty,
-        prefix,
-        field,
-        "",
-        keys.iter()
-            .enumerate()
-            .map(|(index, key)| (index, key.as_str())),
-    ) {
-        crate::helpers::VecRoute::Hit {
-            index: dirty_index,
-            inner_name,
-        } => dirty_index == index && (inner.is_empty() || paths_overlap(inner, &inner_name)),
-        crate::helpers::VecRoute::Miss | crate::helpers::VecRoute::Ambiguous { .. } => true,
-    }
+    // An unresolvable indexed path remains conservative for related edits.
+    diagnostic_path
+        .split_once('[')
+        .is_some_and(|(prefix, _)| paths_overlap(prefix, dirty))
 }
 
 fn enumerate_baseline_diagnostics(baseline: &Config) -> Vec<DiagnosticIdentity> {
@@ -991,6 +1006,66 @@ mod tests {
         let warnings = validate_without_mutation(&other, &baseline).unwrap();
         assert_eq!(warnings.len(), 1);
         assert_eq!(warnings[0].path, "plugins.entries.p.tls_profiles[0]");
+    }
+
+    #[test]
+    fn nested_tls_natural_keys_with_brackets_preserve_edit_scope() {
+        use crate::schema::PluginTlsProfileConfig;
+
+        for instance in ["plugin[1]", "plugin[name]"] {
+            let profile = |name: &str| PluginTlsProfileConfig {
+                name: name.into(),
+                hosts: vec!["example.test".into()],
+                system_roots: true,
+                custom_ca_secret: None,
+                client_certificate_secret: None,
+                client_private_key_secret: None,
+            };
+            let mut first = profile("a");
+            first.client_certificate_secret = Some("client_cert".into());
+            let mut baseline = Config::default();
+            baseline.plugins.entries.push(PluginEntryConfig {
+                name: instance.into(),
+                egress_hosts: vec!["example.test".into()],
+                tls_profiles: vec![first, profile("b")],
+                ..Default::default()
+            });
+            baseline.plugins.entries.push(PluginEntryConfig {
+                name: "plugin[other]".into(),
+                egress_hosts: vec!["example.test".into()],
+                tls_profiles: vec![profile("a")],
+                ..Default::default()
+            });
+
+            let mut edited = baseline.clone();
+            edited.mark_dirty(&format!(
+                "plugins.entries.{instance}.tls_profiles.a.client_private_key_secret"
+            ));
+            assert_error(
+                validate_without_mutation(&edited, &baseline),
+                ConfigApiCode::InvalidFormat,
+                Some(&format!("plugins.entries.{instance}.tls_profiles[0]")),
+            );
+
+            let mut other = baseline.clone();
+            other.mark_dirty(&format!("plugins.entries.{instance}.tls_profiles.b.hosts"));
+            let warnings = validate_without_mutation(&other, &baseline).unwrap();
+            assert_eq!(warnings.len(), 1);
+            assert_eq!(
+                warnings[0].path,
+                format!("plugins.entries.{instance}.tls_profiles[0]")
+            );
+            assert!(edit_overlaps(
+                &baseline,
+                &format!("plugins.entries.{instance}.tls_profiles[0].hosts[0]"),
+                &format!("plugins.entries.{instance}.tls_profiles.a.hosts.primary"),
+            ));
+
+            let mut other_instance = baseline.clone();
+            other_instance.mark_dirty("plugins.entries.plugin[other].tls_profiles.a.hosts");
+            let warnings = validate_without_mutation(&other_instance, &baseline).unwrap();
+            assert_eq!(warnings.len(), 1);
+        }
     }
 
     #[test]

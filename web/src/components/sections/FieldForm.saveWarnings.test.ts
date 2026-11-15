@@ -15,7 +15,7 @@ test("config saves and toggles retain warnings only for the relevant result", as
   const globalKeys = [
     "window", "document", "navigator", "HTMLElement", "HTMLInputElement",
     "HTMLSelectElement", "HTMLButtonElement", "Node", "Element", "Event",
-    "MouseEvent", "KeyboardEvent", "Text", "getComputedStyle",
+    "MouseEvent", "KeyboardEvent", "Text", "localStorage", "getComputedStyle",
     "requestAnimationFrame", "cancelAnimationFrame", "IS_REACT_ACT_ENVIRONMENT",
   ] as const;
   const previous = new Map<string, PropertyDescriptor | undefined>();
@@ -34,6 +34,7 @@ test("config saves and toggles retain warnings only for the relevant result", as
     MouseEvent: domWindow.MouseEvent,
     KeyboardEvent: domWindow.KeyboardEvent,
     Text: domWindow.Text,
+    localStorage: domWindow.localStorage,
     getComputedStyle: domWindow.getComputedStyle.bind(domWindow),
     requestAnimationFrame: (callback: FrameRequestCallback) => setTimeout(() => callback(Date.now()), 0),
     cancelAnimationFrame: (id: number) => clearTimeout(id),
@@ -205,6 +206,24 @@ test("config saves and toggles retain warnings only for the relevant result", as
     // an old response arrives after the session loses config access.
     await act(async () => { await api.putProp("fixture.path", true); await flushEffects(); });
     assert.match(banner.textContent ?? "", /fixture retained diagnostic/);
+    await act(async () => {
+      domWindow.dispatchEvent(new domWindow.StorageEvent("storage", { key: "unrelated-chat" }));
+      await flushEffects();
+    });
+    assert.match(banner.textContent ?? "", /fixture retained diagnostic/);
+    await act(async () => {
+      domWindow.dispatchEvent(new domWindow.StorageEvent("storage", { key: "zeroclaw_token" }));
+      await flushEffects();
+    });
+    assert.equal(banner.textContent, "");
+    await act(async () => { await api.putProp("fixture.path", true); await flushEffects(); });
+    assert.match(banner.textContent ?? "", /fixture retained diagnostic/);
+    await act(async () => {
+      domWindow.dispatchEvent(new domWindow.StorageEvent("storage"));
+      await flushEffects();
+    });
+    assert.equal(banner.textContent, "");
+    await act(async () => { await api.putProp("fixture.path", true); await flushEffects(); });
     const session = {
       kind: "oidc" as const, provider: "oidc.fixture", principal_id: "fixture-user",
       display_name: "Fixture", admin: false, expires_at: 4_000_000_000,
@@ -212,6 +231,12 @@ test("config saves and toggles retain warnings only for the relevant result", as
     };
     await act(async () => { auth.setOidcSession(session); await flushEffects(); });
     assert.equal(banner.textContent, "");
+    await act(async () => { await api.putProp("fixture.path", true); await flushEffects(); });
+    await act(async () => {
+      domWindow.dispatchEvent(new domWindow.StorageEvent("storage", { key: "zeroclaw_token" }));
+      await flushEffects();
+    });
+    assert.match(banner.textContent ?? "", /fixture retained diagnostic/);
     const mockFetch = globalThis.fetch;
     let finishWrite!: (response: Response) => void;
     const delayed = new Promise<Response>((resolve) => { finishWrite = resolve; });
@@ -229,6 +254,39 @@ test("config saves and toggles retain warnings only for the relevant result", as
     assert.equal(banner.textContent, "");
     globalThis.fetch = mockFetch;
     await act(async () => { auth.setOidcSession(null); await flushEffects(); });
+
+    let finishPairingWrite!: (response: Response) => void;
+    const delayedPairingWrite = new Promise<Response>((resolve) => { finishPairingWrite = resolve; });
+    globalThis.fetch = async () => delayedPairingWrite;
+    const pendingPairingWrite = api.patchConfig([{ op: "replace", path: "fixture.path", value: true }]);
+    await act(async () => {
+      domWindow.dispatchEvent(new domWindow.StorageEvent("storage", { key: "zeroclaw_token" }));
+      finishPairingWrite(Response.json({ saved: true, results: [], warnings: [warning] }));
+      assert.deepEqual((await pendingPairingWrite).warnings, []);
+      await flushEffects();
+    });
+    assert.equal(banner.textContent, "");
+    globalThis.fetch = mockFetch;
+
+    await act(async () => { auth.setToken("fixture-token-a"); await flushEffects(); });
+    let finishLocalPairingWrite!: (response: Response) => void;
+    const delayedLocalPairingWrite = new Promise<Response>((resolve) => { finishLocalPairingWrite = resolve; });
+    globalThis.fetch = async () => delayedLocalPairingWrite;
+    const pendingLocalPairingWrite = api.patchConfig([{ op: "replace", path: "fixture.path", value: true }]);
+    await act(async () => {
+      auth.setToken("fixture-token-b");
+      auth.setToken("fixture-token-a");
+      finishLocalPairingWrite(Response.json({ saved: true, results: [], warnings: [warning] }));
+      assert.deepEqual((await pendingLocalPairingWrite).warnings, []);
+      await flushEffects();
+    });
+    assert.equal(banner.textContent, "");
+    globalThis.fetch = mockFetch;
+    await act(async () => { await api.putProp("fixture.path", true); await flushEffects(); });
+    await act(async () => { auth.setToken("fixture-token-a"); await flushEffects(); });
+    assert.match(banner.textContent ?? "", /fixture retained diagnostic/);
+    await act(async () => { auth.clearToken(); await flushEffects(); });
+    assert.equal(banner.textContent, "");
 
     await edit("6000");
     await click(form, "Save");
