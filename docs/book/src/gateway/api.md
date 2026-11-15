@@ -200,7 +200,15 @@ gateway certificate works without disabling verification). The webpki and
 operating-system trust stores are not consulted, so no public or enterprise CA
 that the machine already trusts can stand in for this gateway. The file is read
 as a chain, so a gateway certificate issued by a CA works when that CA is in the
-file as well:
+file as well.
+
+That makes every certificate in `cert_path` a trust anchor, not a pin on one
+gateway certificate. If the file holds a CA, any other valid certificate that
+CA issues for the same host is accepted too, while hostname and certificate
+verification still apply. A root that is only installed on the machine is not
+trusted on that basis.
+
+The commands that use this client:
 
 - `zeroclaw gateway get-paircode` (and `--new` / `--rotate` / `--rotate-device`)
 - `zeroclaw gateway restart` (graceful `/admin/shutdown` before relaunch)
