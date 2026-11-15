@@ -551,3 +551,217 @@ async fn candidate_path_never_overrides_exact_agent_and_key_metadata() {
             .is_some()
     );
 }
+
+#[tokio::test]
+async fn streamed_key_lookup_isolates_like_wildcards_case_and_corrupt_metadata() {
+    let tmp = TempDir::new().unwrap();
+    let memory = TachiMemory::new("tachi", tmp.path()).unwrap();
+
+    for (agent, key, content) in [
+        ("a_one", "k_1", "agent a_one key k_1"),
+        ("a_one", "k%1", "agent a_one key k%1"),
+        ("a_one", "kx1", "agent a_one key kx1"),
+        ("axone", "k_1", "agent axone key k_1"),
+        ("A_one", "k_1", "agent A_one key k_1"),
+    ] {
+        memory
+            .store_with_agent(
+                key,
+                content,
+                MemoryCategory::Core,
+                None,
+                None,
+                None,
+                Some(agent),
+            )
+            .await
+            .unwrap();
+    }
+
+    assert_eq!(
+        memory
+            .get_for_agent("k_1", "a_one")
+            .await
+            .unwrap()
+            .unwrap()
+            .content,
+        "agent a_one key k_1"
+    );
+    assert_eq!(
+        memory
+            .get_for_agent("k%1", "a_one")
+            .await
+            .unwrap()
+            .unwrap()
+            .content,
+        "agent a_one key k%1"
+    );
+    assert_eq!(
+        memory
+            .get_for_agent("k_1", "axone")
+            .await
+            .unwrap()
+            .unwrap()
+            .content,
+        "agent axone key k_1"
+    );
+    assert_eq!(
+        memory
+            .get_for_agent("k_1", "A_one")
+            .await
+            .unwrap()
+            .unwrap()
+            .content,
+        "agent A_one key k_1"
+    );
+    assert!(
+        memory
+            .get_for_agent("k%1", "axone")
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    // Archive one row and confirm it stays hidden before adding an active legacy duplicate.
+    let a_one_row = memory.get_for_agent("kx1", "a_one").await.unwrap().unwrap();
+    let mut duplicate = {
+        let store = memory.store_handle().lock();
+        let entry = store.get(&a_one_row.id).unwrap().unwrap();
+        store.archive_memory(&a_one_row.id).unwrap();
+        entry
+    };
+    assert!(
+        memory
+            .get_for_agent("kx1", "a_one")
+            .await
+            .unwrap()
+            .is_none(),
+        "archived row with no active duplicate must stay hidden"
+    );
+    {
+        let mut store = memory.store_handle().lock();
+        duplicate.id = Uuid::new_v4().to_string();
+        duplicate.path = format!(
+            "{}legacy/kx1",
+            TachiMemory::agent_path_prefix(Some("a_one"))
+        );
+        duplicate.text = "legacy active kx1".into();
+        store.upsert(&duplicate).unwrap();
+    }
+    assert_eq!(
+        memory
+            .get_for_agent("kx1", "a_one")
+            .await
+            .unwrap()
+            .unwrap()
+            .content,
+        "legacy active kx1"
+    );
+
+    // Insert spoofed rows sharing `a_one`'s exact hash suffix and metadata, differing
+    // only in `_` wildcard (`axone`) and ASCII case (`A_one`). Binary prefix matching
+    // must ignore both.
+    let a_one_prefix = TachiMemory::agent_path_prefix(Some("a_one"));
+    let k_1_id = memory
+        .get_for_agent("k_1", "a_one")
+        .await
+        .unwrap()
+        .unwrap()
+        .id;
+    {
+        let mut store = memory.store_handle().lock();
+        let base_entry = store.get(&k_1_id).unwrap().unwrap();
+        for (replacement, spoof_key) in [
+            ("/agents/axone__", "spoof_only_wildcard"),
+            ("/agents/A_one__", "spoof_only_case"),
+        ] {
+            let spoof_prefix = a_one_prefix.replacen("/agents/a_one__", replacement, 1);
+            assert_ne!(spoof_prefix, a_one_prefix);
+            let mut spoof = base_entry.clone();
+            spoof.id = Uuid::new_v4().to_string();
+            spoof.path = format!("{spoof_prefix}spoofed/k_1");
+            spoof.text = "spoofed path".into();
+            store.upsert(&spoof).unwrap();
+
+            // Distinct key absent from real `a_one` rows prevents ASCII `path ASC`
+            // ordering + `pop()` from masking a prefix-check regression.
+            let mut isolated_spoof = base_entry.clone();
+            isolated_spoof.id = Uuid::new_v4().to_string();
+            isolated_spoof.path = format!("{spoof_prefix}spoofed/{spoof_key}");
+            isolated_spoof.text = "spoofed isolated path".into();
+            isolated_spoof.metadata[METADATA_ZC_KEY] = serde_json::json!(spoof_key);
+            store.upsert(&isolated_spoof).unwrap();
+        }
+        assert_eq!(
+            TachiMemory::rows_matching_key(&store, "k_1", Some("a_one"))
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+    for spoof_key in ["spoof_only_wildcard", "spoof_only_case"] {
+        assert!(
+            memory
+                .get_for_agent(spoof_key, "a_one")
+                .await
+                .unwrap()
+                .is_none(),
+            "spoofed prefix for {spoof_key} must never match a_one"
+        );
+    }
+    assert_eq!(
+        memory
+            .get_for_agent("k_1", "a_one")
+            .await
+            .unwrap()
+            .unwrap()
+            .content,
+        "agent a_one key k_1"
+    );
+
+    // Inject corrupt metadata inside `axone`'s literal prefix: `axone` must fail
+    // closed even when querying an unrelated key, while `a_one` stays healthy.
+    memory
+        .store_with_agent(
+            "poison_target",
+            "poison",
+            MemoryCategory::Core,
+            None,
+            None,
+            None,
+            Some("axone"),
+        )
+        .await
+        .unwrap();
+    let poison_id = memory
+        .get_for_agent("poison_target", "axone")
+        .await
+        .unwrap()
+        .unwrap()
+        .id;
+    let db_path = tmp.path().join("memory").join("tachi.db");
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch("DROP TRIGGER IF EXISTS memories_reserved_refs_update_guard;")
+            .unwrap();
+        conn.execute(
+            "UPDATE memories SET metadata = '{corrupt' WHERE id = ?1",
+            [&poison_id],
+        )
+        .unwrap();
+    }
+    let err = memory
+        .get_for_agent("k_1", "axone")
+        .await
+        .expect_err("corrupt metadata in literal agent prefix must fail closed");
+    assert!(err.to_string().contains("key candidate lookup failed"));
+    assert_eq!(
+        memory
+            .get_for_agent("k_1", "a_one")
+            .await
+            .unwrap()
+            .unwrap()
+            .content,
+        "agent a_one key k_1"
+    );
+}

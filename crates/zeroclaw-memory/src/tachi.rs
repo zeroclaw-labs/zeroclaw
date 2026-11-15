@@ -497,22 +497,29 @@ impl TachiMemory {
         }
     }
 
-    /// Use the admitted live kernel handle and its typed, projected query. No
-    /// independent SQLite connection, raw SQL, schema change or lookup cache.
-    /// Only matching ids load text/vector bodies. Every lookup scans metadata
-    /// once so canonical paths cannot hide legacy duplicates or change which
-    /// row wins. This does not promise an indexed/O(1) key lookup.
+    /// Use the admitted live kernel handle and its exact streamed metadata
+    /// candidate lookup (`find_metadata_key_candidates`). No independent SQLite
+    /// connection, raw SQL, schema change or lookup cache. Only matching ids
+    /// cross the kernel boundary and load text/vector bodies; corrupt
+    /// nonmatching metadata within the literal path prefix still fails closed,
+    /// and matching rows preserve legacy `path ASC, timestamp DESC` ordering.
+    /// This does not promise an indexed/O(1) key lookup.
     fn rows_matching_key(
         store: &MemoryStore,
         key: &str,
         agent: Option<&str>,
     ) -> anyhow::Result<Vec<portable_kernel::MemoryEntry>> {
+        // Memcore enforces 1..=4096 for max_matches and fails closed rather than
+        // truncating if a single logical key ever exceeds this cap.
+        const MAX_KEY_CANDIDATES: usize = 4096;
         let prefix = Self::agent_path_prefix(agent);
-        // LIKE's '_' and case folding can broaden candidates, so the literal
-        // path prefix and exact metadata remain authoritative below.
-        let pattern = format!("{prefix}%");
+        let mut predicates = Vec::with_capacity(2);
+        predicates.push((METADATA_ZC_KEY, key));
+        if let Some(agent) = agent {
+            predicates.push((METADATA_ZC_AGENT, agent));
+        }
         let candidates = store
-            .list_memories_by_path_prefix(&pattern)
+            .find_metadata_key_candidates(&prefix, &predicates, MAX_KEY_CANDIDATES)
             .map_err(|error| {
                 ::zeroclaw_log::record!(
                     ERROR,
@@ -523,20 +530,8 @@ impl TachiMemory {
                 );
                 anyhow::Error::msg(format!("tachi key candidate lookup failed: {error}"))
             })?;
-        let mut result = Vec::new();
+        let mut result = Vec::with_capacity(candidates.len());
         for row in candidates {
-            if !row.path.starts_with(&prefix) {
-                continue;
-            }
-            let metadata: serde_json::Value = serde_json::from_str(&row.metadata)
-                .context("invalid tachi key candidate metadata")?;
-            if metadata.get(METADATA_ZC_KEY).and_then(|v| v.as_str()) != Some(key)
-                || agent.is_some_and(|agent| {
-                    metadata.get(METADATA_ZC_AGENT).and_then(|v| v.as_str()) != Some(agent)
-                })
-            {
-                continue;
-            }
             // The projection includes archived rows. Use the normal typed get
             // to retain this adapter's active-only visibility.
             if let Some(entry) = store.get(&row.id).map_err(|error| {

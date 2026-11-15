@@ -1,7 +1,7 @@
 {
   "async-imap-0.12.0": "sha256-jWYnemBPEsI0zOEhfGZBqZo/2vEhO91hOumpbGl12i8=",
-  "memcore-2.0.0": "sha256-h4OW+dImo0QSi5zyzE+r6XcXf4v4kM79m30PNlXUjWk=",
-  "portable-kernel-1.9.0": "sha256-h4OW+dImo0QSi5zyzE+r6XcXf4v4kM79m30PNlXUjWk=",
+  "memcore-2.0.0": "sha256-m9uvndO3KPaSmYiBDrVihoBUPBSh5wZ0OcR5zag2EQc=",
+  "portable-kernel-1.9.0": "sha256-m9uvndO3KPaSmYiBDrVihoBUPBSh5wZ0OcR5zag2EQc=",
   "tungstenite-0.29.0": "sha256-Xkc94GqSVK2GLrW193xtrBFNqTwmm6SULZeA0R6f2f4=",
-  "vault-kit-0.1.0": "sha256-h4OW+dImo0QSi5zyzE+r6XcXf4v4kM79m30PNlXUjWk="
+  "vault-kit-0.1.0": "sha256-m9uvndO3KPaSmYiBDrVihoBUPBSh5wZ0OcR5zag2EQc="
 }

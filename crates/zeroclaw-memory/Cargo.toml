@@ -26,8 +26,8 @@ serde_json = { version = "1.0", default-features = false, features = ["std"] }
 sha2 = "0.10"
 tokio = { version = "1.50", default-features = false, features = ["fs", "io-util", "macros", "process", "sync", "time"] }
 uuid = { version = "1.22", default-features = false, features = ["v4", "std"] }
-# Scoped recent reads on the existing kernel and system-entropy compatibility baseline.
-portable_kernel = { package = "portable-kernel", version = "1.9.0", git = "https://github.com/kckylechen1/Tachi.git", rev = "08686594e09d69ac3a2a0cdb4daa430f3f38598b", default-features = false, optional = true }
+# Scoped recent reads + streamed key candidates on the safe ZeroClaw support baseline.
+portable_kernel = { package = "portable-kernel", version = "1.9.0", git = "https://github.com/kckylechen1/Tachi.git", rev = "b8b10642372ac6910afb2e2bab5265c1d2041a9e", default-features = false, optional = true }
 tempfile = { version = "3.26", optional = true }
 
 [features]

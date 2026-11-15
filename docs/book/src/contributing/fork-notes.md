@@ -136,7 +136,7 @@ own ZeroClaw's Soul, User Model, personality policy or Tachi delegation bridge.
 ### Portable kernel adoption (#560)
 
 `memory-tachi` pins `portable-kernel` 1.9.0 at Tachi revision
-`08686594e09d69ac3a2a0cdb4daa430f3f38598b`, without default/admin features.
+`b8b10642372ac6910afb2e2bab5265c1d2041a9e`, without default/admin features.
 This retains the SQLite 3.54.1 security backport at
 `c35ace357375f0e3a9db32d7a3bb529507a72291` and the vault-kit system-entropy
 backport at `a4147e40e937f2863cd0e124d64061defe0ed433` from
@@ -144,12 +144,16 @@ backport at `a4147e40e937f2863cd0e124d64061defe0ed433` from
 The vault nonce and salt sizes, encrypted formats and fail-closed entropy
 behavior remain unchanged. It does not adopt unrelated Tachi main changes.
 The support workspace also retains the dependency security fixes from
-[Tachi #2323](https://github.com/kckylechen1/Tachi/pull/2323).
-The scoped recent-read backport in [Tachi #2322](https://github.com/kckylechen1/Tachi/pull/2322)
-applies host agent, session, namespace and lexical time predicates before the
-SQL limit, while the adapter retains its final host admission check. Large
-agent allowlists use bounded queries and merge their results before applying
-the global limit; each query hydrates at most that limit of full rows.
+[Tachi #2323](https://github.com/kckylechen1/Tachi/pull/2323), the exact
+metadata key candidate streaming backport from
+[Tachi #2320](https://github.com/kckylechen1/Tachi/pull/2320)
+(`find_metadata_key_candidates`), and the scoped recent-read backport in
+[Tachi #2322](https://github.com/kckylechen1/Tachi/pull/2322).
+The scoped recent-read contract applies host agent, session, namespace and
+lexical time predicates before the SQL limit, while the adapter retains its
+final host admission check. Large agent allowlists use bounded queries and merge
+their results before applying the global limit; each query hydrates at most that
+limit of full rows.
 The SQLite backport uses the previous
 `b0c754a0cd3e4e7ffd0199691e08954942b492bd` baseline, adapting the native dependency
 and connection APIs from [Tachi #2284](https://github.com/kckylechen1/Tachi/pull/2284).
