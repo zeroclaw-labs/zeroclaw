@@ -76,9 +76,11 @@ pub fn run_tachi_governance_on_handle(
 // Partition on the same metadata keys the TachiMemory write path uses —
 // shared consts so a rename cannot drift between store and governance.
 use crate::tachi::{
-    METADATA_ZC_AGENT as META_ZC_AGENT, METADATA_ZC_CATEGORY as META_ZC_CATEGORY,
-    METADATA_ZC_NAMESPACE as META_ZC_NAMESPACE, TachiMemory,
+    METADATA_SUPERSEDED_BY, METADATA_ZC_AGENT as META_ZC_AGENT,
+    METADATA_ZC_CATEGORY as META_ZC_CATEGORY, METADATA_ZC_NAMESPACE as META_ZC_NAMESPACE,
+    TachiMemory,
 };
+use portable_kernel::store::scoped_read::{MetadataTextFilter, RecentMemoryQuery, TextMembership};
 
 /// Scope key for near-dup partitions. Conversation rows never merge across
 /// sessions or into a global fact; non-Conversation session provenance does not
@@ -130,18 +132,26 @@ fn near_dup_scope_key(entry: &MemoryEntry) -> NearDupScope {
 /// would fold one RomanBath character's memory into another's. Crossing a
 /// Conversation session could archive the only fact visible to that session.
 ///
-/// **Scan window:** the intake list is a single global
-/// [`NEAR_DUP_RAW_SCAN_CAP`] scan over `/agents` (path-ASC, so path-early
-/// agents win the window); only the O(n²) pair scan runs per partition.
-/// Per-partition intake is a possible follow-up if starvation shows up.
+/// **Scan window:** the intake list queries `/agents` via
+/// [`MemoryStore::list_recent_matching`] (`timestamp DESC, id ASC`, bounded to
+/// [`NEAR_DUP_RAW_SCAN_CAP`] active rows with soft-superseded entries excluded
+/// in SQL before `LIMIT`); only the O(n²) pair scan runs per partition.
 fn run_near_dup_light_sleep(
     store: &mut MemoryStore,
     threshold: f64,
 ) -> anyhow::Result<(usize, usize)> {
     let scan_limit = NEAR_DUP_RAW_SCAN_CAP.max(64);
-    let entries = store
-        .list_by_path("/agents", scan_limit, false)
+    let mut query = RecentMemoryQuery::new("/agents", scan_limit);
+    query.filters.push(MetadataTextFilter {
+        field: METADATA_SUPERSEDED_BY.into(),
+        values: vec![String::new()],
+        membership: TextMembership::AnyOf,
+        missing_value: Some(String::new()),
+    });
+    let mut entries = store
+        .list_recent_matching(&query)
         .map_err(|e| anyhow::Error::msg(format!("tachi governance: list failed: {e}")))?;
+    entries.retain(|entry| !TachiMemory::is_soft_superseded(entry));
     if entries.len() < 2 {
         return Ok((0, 0));
     }
@@ -265,7 +275,9 @@ fn is_better_survivor(a: &MemoryEntry, b: &MemoryEntry) -> bool {
     match a.importance.partial_cmp(&b.importance) {
         Some(std::cmp::Ordering::Greater) => true,
         Some(std::cmp::Ordering::Less) => false,
-        _ => match a.timestamp.cmp(&b.timestamp) {
+        _ => match TachiMemory::effective_updated_sort_key(a)
+            .cmp(&TachiMemory::effective_updated_sort_key(b))
+        {
             std::cmp::Ordering::Greater => true,
             std::cmp::Ordering::Less => false,
             std::cmp::Ordering::Equal => a.id > b.id,
@@ -756,5 +768,186 @@ mod tests {
                 .run_light_sleep_governance()
                 .is_ok()
         );
+    }
+
+    #[tokio::test]
+    async fn near_dup_governance_ignores_soft_superseded_rows() {
+        let tmp = TempDir::new().unwrap();
+        let mem = TachiMemory::with_embedder(
+            "tachi",
+            tmp.path(),
+            Arc::new(crate::embeddings::NoopEmbedding),
+            0.7,
+            0.3,
+        )
+        .unwrap();
+        mem.store_with_options(
+            "old_superseded",
+            "deploy freeze begins at 02:00 utc tonight for release cut",
+            MemoryCategory::Core,
+            None,
+            StoreOptions {
+                importance: Some(0.95),
+                ..StoreOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        mem.store_with_options(
+            "active_replacement",
+            "deploy freeze begins at 02:00 utc tonight for release",
+            MemoryCategory::Core,
+            None,
+            StoreOptions {
+                importance: Some(0.70),
+                ..StoreOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let old = mem.get("old_superseded").await.unwrap().expect("old row");
+        let active = mem
+            .get("active_replacement")
+            .await
+            .unwrap()
+            .expect("active replacement");
+        mem.supersede(std::slice::from_ref(&old.id), &active.id)
+            .await
+            .unwrap();
+
+        let report = mem.run_light_sleep_governance_report().unwrap();
+        assert_eq!(
+            report.near_dup_archived, 0,
+            "soft-superseded row must not collapse/archive active replacement"
+        );
+        let kept = mem
+            .get("active_replacement")
+            .await
+            .unwrap()
+            .expect("active replacement must remain unarchived");
+        assert!(kept.superseded_by.is_none());
+        let recalled = mem
+            .recall("deploy freeze", 5, None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            recalled
+                .iter()
+                .map(|entry| entry.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![active.id.as_str()]
+        );
+    }
+
+    #[test]
+    fn near_dup_governance_not_starved_by_pinned_soft_superseded_backlog() {
+        let tmp = TempDir::new().unwrap();
+        let mem = TachiMemory::new("tachi", tmp.path()).unwrap();
+        {
+            let mut store = mem.store_handle().lock();
+            let mut backlog = Vec::with_capacity(4_050);
+            for i in 0..4_050 {
+                backlog.push(MemoryEntry {
+                    id: format!("sup-{i:04}"),
+                    path: format!("/agents/aaa/default/core/sup-{i:04}"),
+                    summary: format!("superseded {i}"),
+                    text: format!("superseded historical fact number {i}"),
+                    importance: 0.95,
+                    timestamp: "2026-07-01T00:00:00.000Z".into(),
+                    valid_from: "2026-07-01T00:00:00.000Z".into(),
+                    valid_until: None,
+                    category: "fact".into(),
+                    topic: String::new(),
+                    keywords: Vec::new(),
+                    persons: Vec::new(),
+                    entities: Vec::new(),
+                    location: String::new(),
+                    source: "zeroclaw-test".into(),
+                    scope: "general".into(),
+                    archived: false,
+                    access_count: 0,
+                    scored_count: 0,
+                    last_use_at: None,
+                    last_access: None,
+                    revision: 1,
+                    vector: None,
+                    retention_policy: Some("pinned".into()),
+                    domain: None,
+                    metadata: serde_json::json!({
+                        "zeroclaw_key": format!("sup-{i:04}"),
+                        "zeroclaw_category": "core",
+                        "zeroclaw_namespace": "default",
+                        "zeroclaw_agent": "aaa",
+                        "pinned": true,
+                        "superseded_by": "winner",
+                    }),
+                    recall_count: 0,
+                    query_diversity: 0,
+                    tier: "raw".into(),
+                });
+            }
+            store.upsert_batch(&backlog).unwrap();
+
+            let base = "Active duplicate deployment runbook step for zzz agent production release checklist verification";
+            for (id, text, importance) in [
+                ("zzz-dup-lose", base.to_string(), 0.5),
+                ("zzz-dup-win", format!("{base} v2"), 0.9),
+            ] {
+                store
+                    .upsert(&MemoryEntry {
+                        id: id.into(),
+                        path: format!("/agents/zzz/default/core/{id}"),
+                        summary: text.clone(),
+                        text,
+                        importance,
+                        timestamp: "2026-07-10T00:00:00.000Z".into(),
+                        valid_from: "2026-07-10T00:00:00.000Z".into(),
+                        valid_until: None,
+                        category: "fact".into(),
+                        topic: String::new(),
+                        keywords: Vec::new(),
+                        persons: Vec::new(),
+                        entities: Vec::new(),
+                        location: String::new(),
+                        source: "zeroclaw-test".into(),
+                        scope: "general".into(),
+                        archived: false,
+                        access_count: 0,
+                        scored_count: 0,
+                        last_use_at: None,
+                        last_access: None,
+                        revision: 1,
+                        vector: None,
+                        retention_policy: None,
+                        domain: None,
+                        metadata: serde_json::json!({
+                            "zeroclaw_key": id,
+                            "zeroclaw_category": "core",
+                            "zeroclaw_namespace": "default",
+                            "zeroclaw_agent": "zzz",
+                        }),
+                        recall_count: 0,
+                        query_diversity: 0,
+                        tier: "raw".into(),
+                    })
+                    .unwrap();
+            }
+        }
+
+        let report = mem.run_light_sleep_governance_report().unwrap();
+        assert_eq!(
+            report.near_dup_archived, 1,
+            "active near-dup pair must not be starved by >4000 pinned soft-superseded rows: {report:?}"
+        );
+        let store = mem.store_handle().lock();
+        assert!(
+            store
+                .get_with_options("zzz-dup-lose", true)
+                .unwrap()
+                .unwrap()
+                .archived
+        );
+        assert!(!store.get("zzz-dup-win").unwrap().unwrap().archived);
     }
 }

@@ -28,9 +28,11 @@ use crate::policy::PolicyEnforcer;
 use crate::redact::{self, RedactCategory};
 use crate::threat::{self, Scope};
 use crate::traits::{
-    ExportFilter, Memory, MemoryCategory, MemoryEntry, MemoryStats, ProceduralMessage, StoreOptions,
+    ExportFilter, Memory, MemoryCategory, MemoryEntry, MemoryStats, ProceduralMessage,
+    RecallEntryPredicate, StoreOptions,
 };
 use async_trait::async_trait;
+use std::sync::Arc;
 use zeroclaw_config::schema::MemoryPolicyConfig;
 
 /// Read-time over-fetch factor. Filtered recalls ask the backend for
@@ -247,7 +249,7 @@ impl<M: Memory> ScannedMemory<M> {
     }
 
     /// Re-scan one recalled entry; `true` means the entry passes.
-    fn entry_passes_read_scan(&self, entry: &MemoryEntry, scope: Scope) -> bool {
+    fn scan_entry_for_read(entry: &MemoryEntry, scope: Scope) -> bool {
         let findings = threat::scan(&entry.content, scope);
         if findings.is_empty() {
             return true;
@@ -270,6 +272,32 @@ impl<M: Memory> ScannedMemory<M> {
         false
     }
 
+    fn entry_passes_read_scan(&self, entry: &MemoryEntry, scope: Scope) -> bool {
+        Self::scan_entry_for_read(entry, scope)
+    }
+
+    fn read_predicate(
+        &self,
+        outer: Option<Arc<RecallEntryPredicate>>,
+    ) -> anyhow::Result<Option<Arc<RecallEntryPredicate>>> {
+        let scan_scope = self.read_scope()?;
+        Ok(match (scan_scope, outer) {
+            (None, None) => None,
+            (None, Some(pred)) => Some(pred),
+            (Some(scope), None) => {
+                let pred: Arc<RecallEntryPredicate> =
+                    Arc::new(move |entry: &MemoryEntry| Self::scan_entry_for_read(entry, scope));
+                Some(pred)
+            }
+            (Some(scope), Some(outer_pred)) => {
+                let pred: Arc<RecallEntryPredicate> = Arc::new(move |entry: &MemoryEntry| {
+                    outer_pred(entry) && Self::scan_entry_for_read(entry, scope)
+                });
+                Some(pred)
+            }
+        })
+    }
+
     fn filter_recalled(&self, entries: Vec<MemoryEntry>) -> anyhow::Result<Vec<MemoryEntry>> {
         let Some(scope) = self.read_scope()? else {
             return Ok(entries);
@@ -278,16 +306,6 @@ impl<M: Memory> ScannedMemory<M> {
             .into_iter()
             .filter(|entry| self.entry_passes_read_scan(entry, scope))
             .collect())
-    }
-
-    fn filter_recalled_limited(
-        &self,
-        entries: Vec<MemoryEntry>,
-        limit: usize,
-    ) -> anyhow::Result<Vec<MemoryEntry>> {
-        let mut filtered = self.filter_recalled(entries)?;
-        filtered.truncate(limit);
-        Ok(filtered)
     }
 
     fn filter_single(&self, entry: Option<MemoryEntry>) -> anyhow::Result<Option<MemoryEntry>> {
@@ -315,6 +333,18 @@ impl<M: Memory> Memory for ScannedMemory<M> {
             .refresh_embedder(model_provider, api_key, model, dimensions);
     }
 
+    fn run_light_sleep_governance(&self) -> anyhow::Result<()> {
+        self.inner.run_light_sleep_governance()
+    }
+
+    async fn run_llm_enrichment(
+        &self,
+        provider: &dyn zeroclaw_api::model_provider::ModelProvider,
+        model: &str,
+    ) -> anyhow::Result<usize> {
+        self.inner.run_llm_enrichment(provider, model).await
+    }
+
     async fn store(
         &self,
         key: &str,
@@ -335,17 +365,16 @@ impl<M: Memory> Memory for ScannedMemory<M> {
         since: Option<&str>,
         until: Option<&str>,
     ) -> anyhow::Result<Vec<MemoryEntry>> {
-        let entries = self
-            .inner
-            .recall(
-                query,
-                Self::read_fetch_limit(limit),
-                session_id,
-                since,
-                until,
-            )
-            .await?;
-        self.filter_recalled_limited(entries, limit)
+        self.recall_with_filter(
+            query,
+            limit,
+            session_id,
+            since,
+            until,
+            Self::read_fetch_limit(limit),
+            None,
+        )
+        .await
     }
 
     async fn get(&self, key: &str) -> anyhow::Result<Option<MemoryEntry>> {
@@ -477,18 +506,17 @@ impl<M: Memory> Memory for ScannedMemory<M> {
         since: Option<&str>,
         until: Option<&str>,
     ) -> anyhow::Result<Vec<MemoryEntry>> {
-        let entries = self
-            .inner
-            .recall_namespaced(
-                namespace,
-                query,
-                Self::read_fetch_limit(limit),
-                session_id,
-                since,
-                until,
-            )
-            .await?;
-        self.filter_recalled_limited(entries, limit)
+        self.recall_namespaced_with_filter(
+            namespace,
+            query,
+            limit,
+            session_id,
+            since,
+            until,
+            Self::read_fetch_limit(limit),
+            None,
+        )
+        .await
     }
 
     async fn export(&self, filter: &ExportFilter) -> anyhow::Result<Vec<MemoryEntry>> {
@@ -527,6 +555,23 @@ impl<M: Memory> Memory for ScannedMemory<M> {
             .await
     }
 
+    async fn store_with_options_and_agent(
+        &self,
+        key: &str,
+        content: &str,
+        category: MemoryCategory,
+        session_id: Option<&str>,
+        options: StoreOptions,
+        agent_id: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let content = self.process_content(key, content, options.namespace.as_deref())?;
+        self.enforce_policy(key, options.namespace.as_deref(), &category)
+            .await?;
+        self.inner
+            .store_with_options_and_agent(key, &content, category, session_id, options, agent_id)
+            .await
+    }
+
     async fn store_with_agent(
         &self,
         key: &str,
@@ -555,22 +600,100 @@ impl<M: Memory> Memory for ScannedMemory<M> {
         since: Option<&str>,
         until: Option<&str>,
     ) -> anyhow::Result<Vec<MemoryEntry>> {
-        let entries = self
-            .inner
-            .recall_for_agents(
-                allowed_agent_ids,
-                query,
-                Self::read_fetch_limit(limit),
-                session_id,
-                since,
-                until,
-            )
-            .await?;
-        self.filter_recalled_limited(entries, limit)
+        self.recall_for_agents_with_filter(
+            allowed_agent_ids,
+            query,
+            limit,
+            session_id,
+            since,
+            until,
+            Self::read_fetch_limit(limit),
+            None,
+        )
+        .await
     }
 
     async fn ensure_agent_uuid(&self, agent_alias: &str) -> anyhow::Result<String> {
         self.inner.ensure_agent_uuid(agent_alias).await
+    }
+
+    async fn recall_with_filter(
+        &self,
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+        since: Option<&str>,
+        until: Option<&str>,
+        refill_limit: usize,
+        filter: Option<Arc<RecallEntryPredicate>>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        let combined = self.read_predicate(filter)?;
+        let effective_refill = refill_limit.max(Self::read_fetch_limit(limit));
+        self.inner
+            .recall_with_filter(
+                query,
+                limit,
+                session_id,
+                since,
+                until,
+                effective_refill,
+                combined,
+            )
+            .await
+    }
+
+    async fn recall_namespaced_with_filter(
+        &self,
+        namespace: &str,
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+        since: Option<&str>,
+        until: Option<&str>,
+        refill_limit: usize,
+        filter: Option<Arc<RecallEntryPredicate>>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        let combined = self.read_predicate(filter)?;
+        let effective_refill = refill_limit.max(Self::read_fetch_limit(limit));
+        self.inner
+            .recall_namespaced_with_filter(
+                namespace,
+                query,
+                limit,
+                session_id,
+                since,
+                until,
+                effective_refill,
+                combined,
+            )
+            .await
+    }
+
+    async fn recall_for_agents_with_filter(
+        &self,
+        allowed_agent_ids: &[&str],
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+        since: Option<&str>,
+        until: Option<&str>,
+        refill_limit: usize,
+        filter: Option<Arc<RecallEntryPredicate>>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        let combined = self.read_predicate(filter)?;
+        let effective_refill = refill_limit.max(Self::read_fetch_limit(limit));
+        self.inner
+            .recall_for_agents_with_filter(
+                allowed_agent_ids,
+                query,
+                limit,
+                session_id,
+                since,
+                until,
+                effective_refill,
+                combined,
+            )
+            .await
     }
 }
 

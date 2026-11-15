@@ -837,6 +837,18 @@ pub enum MemoryCommands {
         #[arg(long)]
         approved_by: String,
     },
+    /// Convert a quiescent native brain.db database into a new, verified Tachi database.
+    MigrateNative {
+        /// Existing native brain.db database; never modified.
+        #[arg(long)]
+        source: std::path::PathBuf,
+        /// New Tachi database path; must not exist.
+        #[arg(long)]
+        destination: std::path::PathBuf,
+        /// Operator identity recorded in the migration receipt.
+        #[arg(long)]
+        approved_by: String,
+    },
     /// List memory entries with optional filters
     List {
         /// Filter by category (core, daily, conversation, or custom name)

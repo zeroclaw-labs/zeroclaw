@@ -5,6 +5,8 @@
 pub const MEMORY_CONTEXT_OPEN: &str = "[Memory context]";
 /// Closing delimiter for recalled memory injected into provider context.
 pub const MEMORY_CONTEXT_CLOSE: &str = "[/Memory context]";
+/// Whether this build includes the embedded Tachi `portable-kernel` backend.
+pub const TACHI_COMPILED: bool = cfg!(feature = "tachi");
 
 pub mod admissibility;
 pub mod agent_scoped;
@@ -29,6 +31,8 @@ pub mod lucid;
 pub mod markdown;
 pub mod merge;
 pub mod migration;
+#[cfg(feature = "tachi")]
+pub mod native_migration;
 pub mod none;
 pub mod normalize;
 mod point_scope;
@@ -740,7 +744,7 @@ pub fn create_memory_with_storage_and_routes(
                 "tachi light-sleep governance skipped"
             );
         }
-        return Ok(Box::new(mem));
+        return wrap_scanned_and_audit(mem, &config.policy, workspace_dir, config.audit_enabled);
     }
 
     #[cfg(not(feature = "tachi"))]
@@ -930,6 +934,20 @@ pub fn create_memory_for_migration(config: &Config) -> anyhow::Result<Box<dyn Me
         );
     }
 
+    #[cfg(feature = "tachi")]
+    if matches!(classify_memory_backend(&backend), MemoryBackendKind::Tachi) {
+        let mem = TachiMemory::new("tachi", &config.data_dir)?;
+        return wrap_scanned_and_audit(mem, &policy, &config.data_dir, false);
+    }
+
+    #[cfg(not(feature = "tachi"))]
+    if backend == "tachi" {
+        anyhow::bail!(
+            "memory backend 'tachi' requested but this build was compiled without \
+             `memory-tachi`; rebuild with `--features memory-tachi`"
+        );
+    }
+
     create_memory_with_builders(
         &backend,
         &config.data_dir,
@@ -1016,15 +1034,15 @@ pub async fn create_memory_for_agent(
             "memory.consolidation_extract_facts"
         };
         let global_kind = backend_kind_from_dotted(&config.memory.backend);
-        if global_kind != "sqlite" {
+        if !matches!(global_kind.as_str(), "sqlite" | "tachi") {
             anyhow::bail!(
-                "{flag} = true requires memory.backend = \"sqlite\" (typed memory storage is SQLite-only), but memory.backend = {:?}",
+                "{flag} = true requires memory.backend = \"sqlite\" or \"tachi\" (typed memory storage is SQLite-only/Tachi-only), but memory.backend = {:?}",
                 config.memory.backend
             );
         }
-        if !matches!(backend_kind, ConfigBackend::Sqlite) {
+        if !matches!(backend_kind, ConfigBackend::Sqlite | ConfigBackend::Tachi) {
             anyhow::bail!(
-                "{flag} = true requires every agent on the sqlite memory backend (typed memory storage is SQLite-only), but agents.{agent_alias}.memory.backend = {backend_kind:?}"
+                "{flag} = true requires every agent on the sqlite or tachi memory backend (typed memory storage is SQLite-only/Tachi-only), but agents.{agent_alias}.memory.backend = {backend_kind:?}"
             );
         }
     }
@@ -1080,7 +1098,45 @@ pub async fn create_memory_for_agent(
         )?));
     }
 
-    let inner = create_memory_from_config(config, api_key)?;
+    let agent_backend_name = match backend_kind {
+        ConfigBackend::Sqlite => "sqlite",
+        ConfigBackend::Lucid => "lucid",
+        ConfigBackend::Tachi => "tachi",
+        ConfigBackend::Markdown => "markdown",
+        ConfigBackend::None => "none",
+        ConfigBackend::Postgres => "postgres",
+        ConfigBackend::Qdrant => "qdrant",
+    };
+
+    let inner = if backend_kind == ConfigBackend::default()
+        || backend_kind_from_dotted(&config.memory.backend) == agent_backend_name
+    {
+        create_memory_from_config(config, api_key)?
+    } else {
+        let mut agent_memory = config.memory.clone();
+        agent_memory.backend = agent_backend_name.to_string();
+        let active_storage = match backend_kind {
+            ConfigBackend::Lucid => config
+                .storage
+                .lucid
+                .get("default")
+                .map_or(ActiveStorage::None, ActiveStorage::Lucid),
+            ConfigBackend::Sqlite => config
+                .storage
+                .sqlite
+                .get("default")
+                .map_or(ActiveStorage::None, ActiveStorage::Sqlite),
+            _ => ActiveStorage::None,
+        };
+        create_memory_with_storage_and_routes(
+            &agent_memory,
+            &config.embedding_routes,
+            active_storage,
+            &config.data_dir,
+            api_key,
+            Some(&config.providers.models),
+        )?
+    };
     let inner_arc: Arc<dyn Memory> = Arc::from(inner);
 
     let bound_id = inner_arc.ensure_agent_uuid(agent_alias).await?;

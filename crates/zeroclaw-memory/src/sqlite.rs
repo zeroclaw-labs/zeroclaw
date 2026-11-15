@@ -1,4 +1,4 @@
-mod key_scope;
+pub(crate) mod key_scope;
 
 use super::embeddings::EmbeddingProvider;
 use super::traits::{

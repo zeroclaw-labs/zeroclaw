@@ -26,20 +26,20 @@ pub struct SourceFileDigest {
     pub sha256: Option<String>,
 }
 
-pub(super) fn suffixed(path: &Path, suffix: &str) -> PathBuf {
+pub(crate) fn suffixed(path: &Path, suffix: &str) -> PathBuf {
     let mut name = path.as_os_str().to_owned();
     name.push(suffix);
     PathBuf::from(name)
 }
 
 #[cfg(unix)]
-pub(super) fn physical_identity(metadata: &Metadata) -> Result<String> {
+pub(crate) fn physical_identity(metadata: &Metadata) -> Result<String> {
     use std::os::unix::fs::MetadataExt;
     Ok(format!("unix:{}:{}", metadata.dev(), metadata.ino()))
 }
 
 #[cfg(not(unix))]
-pub(super) fn physical_identity(_metadata: &Metadata) -> Result<String> {
+pub(crate) fn physical_identity(_metadata: &Metadata) -> Result<String> {
     anyhow::bail!(
         "offline kernel migration currently supports Unix physical file identity and owner-only permissions only"
     )
@@ -65,7 +65,7 @@ fn same_file_state(before: &Metadata, after: &Metadata) -> Result<bool> {
         && modified(before)? == modified(after)?)
 }
 
-pub(super) fn file_digest(path: &Path) -> Result<String> {
+pub(crate) fn file_digest(path: &Path) -> Result<String> {
     let mut file = File::open(path)?;
     digest_reader(&mut file)
 }
@@ -83,7 +83,7 @@ fn digest_reader(file: &mut File) -> Result<String> {
     Ok(format!("{:x}", hash.finalize()))
 }
 
-pub(super) fn census(path: &Path) -> Result<Vec<SourceFileDigest>> {
+pub(crate) fn census(path: &Path) -> Result<Vec<SourceFileDigest>> {
     let mut files = Vec::new();
     for suffix in SOURCE_SUFFIXES {
         let file_path = suffixed(path, suffix);
@@ -134,7 +134,7 @@ pub(super) fn census(path: &Path) -> Result<Vec<SourceFileDigest>> {
     Ok(files)
 }
 
-pub(super) fn verify_unchanged(path: &Path, expected: &[SourceFileDigest]) -> Result<()> {
+pub(crate) fn verify_unchanged(path: &Path, expected: &[SourceFileDigest]) -> Result<()> {
     ensure!(
         census(path)? == expected,
         "source file set, physical identity, metadata, or content changed; offline migration refused"
@@ -142,7 +142,7 @@ pub(super) fn verify_unchanged(path: &Path, expected: &[SourceFileDigest]) -> Re
     Ok(())
 }
 
-pub(super) fn stable_copy(
+pub(crate) fn stable_copy(
     source: &Path,
     private_copy: &Path,
     after_copy: impl FnOnce() -> Result<()>,

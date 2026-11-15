@@ -1,7 +1,8 @@
 //! Audit trail for memory operations.
 
 use super::traits::{
-    ExportFilter, Memory, MemoryCategory, MemoryEntry, MemoryStats, ProceduralMessage, StoreOptions,
+    ExportFilter, Memory, MemoryCategory, MemoryEntry, MemoryStats, ProceduralMessage,
+    RecallEntryPredicate, StoreOptions,
 };
 use async_trait::async_trait;
 use chrono::Local;
@@ -575,6 +576,92 @@ impl<M: Memory> Memory for AuditedMemory<M> {
 
     async fn ensure_agent_uuid(&self, alias: &str) -> anyhow::Result<String> {
         self.inner.ensure_agent_uuid(alias).await
+    }
+
+    async fn recall_with_filter(
+        &self,
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+        since: Option<&str>,
+        until: Option<&str>,
+        refill_limit: usize,
+        filter: Option<Arc<RecallEntryPredicate>>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        self.log_audit(
+            AuditOp::Recall,
+            None,
+            None,
+            session_id,
+            Some(&format!("query={query}")),
+        );
+        self.inner
+            .recall_with_filter(query, limit, session_id, since, until, refill_limit, filter)
+            .await
+    }
+
+    async fn recall_namespaced_with_filter(
+        &self,
+        namespace: &str,
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+        since: Option<&str>,
+        until: Option<&str>,
+        refill_limit: usize,
+        filter: Option<Arc<RecallEntryPredicate>>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        self.log_audit(
+            AuditOp::Recall,
+            None,
+            Some(namespace),
+            session_id,
+            Some(&format!("query={query}")),
+        );
+        self.inner
+            .recall_namespaced_with_filter(
+                namespace,
+                query,
+                limit,
+                session_id,
+                since,
+                until,
+                refill_limit,
+                filter,
+            )
+            .await
+    }
+
+    async fn recall_for_agents_with_filter(
+        &self,
+        allowed_agent_ids: &[&str],
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+        since: Option<&str>,
+        until: Option<&str>,
+        refill_limit: usize,
+        filter: Option<Arc<RecallEntryPredicate>>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        self.log_audit(
+            AuditOp::Recall,
+            None,
+            None,
+            session_id,
+            Some(&format!("query={query}")),
+        );
+        self.inner
+            .recall_for_agents_with_filter(
+                allowed_agent_ids,
+                query,
+                limit,
+                session_id,
+                since,
+                until,
+                refill_limit,
+                filter,
+            )
+            .await
     }
 }
 

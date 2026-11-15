@@ -29,7 +29,7 @@ pub(super) fn encode(key: &str, session: Option<&str>) -> anyhow::Result<(String
     Ok((format!("{TAG}{uuid}"), physical))
 }
 
-pub(super) fn decode(id: &str, physical: String) -> String {
+pub(crate) fn decode(id: &str, physical: String) -> String {
     let Some(uuid) = id.strip_prefix(TAG) else {
         return physical;
     };

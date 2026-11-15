@@ -16,7 +16,7 @@
 //!
 //! # Known limitations
 //!
-//! - `reindex` and `supersede` are not implemented (trait defaults).
+//! - `reindex` is not implemented (trait default).
 //! - Embedding-identity reconciliation (`auto_reindex_on_identity_change`) is
 //!   sqlite-specific and not mirrored here.
 //! - Snapshot / auto-hydrate are not wired for this backend.
@@ -30,17 +30,18 @@
 
 use super::embeddings::EmbeddingProvider;
 use super::traits::{
-    ExportFilter, Memory, MemoryCategory, MemoryEntry, MemoryStats, StoreOptions,
-    is_recent_recall_query,
+    ExportFilter, Memory, MemoryCategory, MemoryEntry, MemoryStats, RecallEntryPredicate,
+    StoreOptions, is_recent_recall_query,
 };
 use crate::kernel_store::{KernelStoreKind, MIGRATE_CLI_HINT};
 use crate::point_scope::PointScope;
 use anyhow::Context;
 use async_trait::async_trait;
-use chrono::Local;
+use chrono::{DateTime, SecondsFormat, Utc};
 use parking_lot::{Mutex, RwLock};
 use portable_kernel::{DbOpenContext, HybridWeights, MemoryStore, SearchOptions};
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use uuid::Uuid;
@@ -58,6 +59,9 @@ const METADATA_SESSION_ID: &str = "session_id";
 const METADATA_TENANT_ID: &str = "tenant_id";
 const METADATA_PINNED: &str = "pinned";
 const METADATA_KIND: &str = "kind";
+pub(crate) const METADATA_SUPERSEDED_BY: &str = "superseded_by";
+pub(crate) const METADATA_ZC_CREATED_AT: &str = "zc_created_at";
+pub(crate) const METADATA_ZC_UPDATED_AT: &str = "zc_updated_at";
 const DEFAULT_AGENT: &str = "default";
 const DEFAULT_NAMESPACE: &str = "default";
 /// Initial page size when growing a prefix scan to completeness.
@@ -190,7 +194,7 @@ impl TachiMemory {
         }
     }
 
-    fn category_to_memcore(category: &MemoryCategory) -> String {
+    pub(crate) fn category_to_memcore(category: &MemoryCategory) -> String {
         match category {
             MemoryCategory::Core => "fact".into(),
             MemoryCategory::Daily => "experience".into(),
@@ -273,7 +277,16 @@ impl TachiMemory {
         )
     }
 
-    fn scoped_storage_path(
+    pub(crate) fn scope_for_namespace(namespace: Option<&str>) -> String {
+        match namespace {
+            Some("default") | None => "general".to_string(),
+            Some("user") => "user".to_string(),
+            Some(ns) if ns.starts_with("user:") => "user".to_string(),
+            _ => "project".to_string(),
+        }
+    }
+
+    pub(crate) fn scoped_storage_path(
         agent_id: Option<&str>,
         namespace: Option<&str>,
         category: &MemoryCategory,
@@ -301,7 +314,7 @@ impl TachiMemory {
         }
     }
 
-    fn build_metadata(
+    pub(crate) fn build_metadata(
         key: &str,
         category: &MemoryCategory,
         session_id: Option<&str>,
@@ -356,6 +369,36 @@ impl TachiMemory {
             .map(str::to_string)
     }
 
+    pub(crate) fn is_soft_superseded(entry: &portable_kernel::MemoryEntry) -> bool {
+        Self::metadata_str(&entry.metadata, METADATA_SUPERSEDED_BY).is_some_and(|s| !s.is_empty())
+    }
+
+    pub(crate) fn format_utc_millis(dt: DateTime<Utc>) -> String {
+        dt.to_rfc3339_opts(SecondsFormat::Millis, true)
+    }
+
+    pub(crate) fn format_utc_nanos(dt: DateTime<Utc>) -> String {
+        dt.to_rfc3339_opts(SecondsFormat::Nanos, true)
+    }
+
+    pub(crate) fn canonical_sort_nanos(raw: &str) -> String {
+        DateTime::parse_from_rfc3339(raw)
+            .map(|dt| Self::format_utc_nanos(dt.with_timezone(&Utc)))
+            .unwrap_or_else(|_| raw.to_string())
+    }
+
+    pub(crate) fn effective_updated_sort_key(entry: &portable_kernel::MemoryEntry) -> String {
+        if let Some(raw_updated) = Self::metadata_str(&entry.metadata, METADATA_ZC_UPDATED_AT)
+            && let Ok(parsed) = DateTime::parse_from_rfc3339(&raw_updated)
+        {
+            let utc = parsed.with_timezone(&Utc);
+            if Self::format_utc_millis(utc) == entry.timestamp {
+                return Self::format_utc_nanos(utc);
+            }
+        }
+        Self::canonical_sort_nanos(&entry.timestamp)
+    }
+
     async fn compute_embedding(&self, text: &str) -> Option<Vec<f32>> {
         let embedder = self.embedder.read().clone();
         if embedder.dimensions() == 0 {
@@ -364,7 +407,10 @@ impl TachiMemory {
         embedder.embed_one(text).await.ok()
     }
 
-    fn memcore_to_zeroclaw(entry: portable_kernel::MemoryEntry, score: Option<f64>) -> MemoryEntry {
+    pub(crate) fn memcore_to_zeroclaw(
+        entry: portable_kernel::MemoryEntry,
+        score: Option<f64>,
+    ) -> MemoryEntry {
         let metadata = entry.metadata.clone();
         let key = Self::metadata_str(&metadata, METADATA_ZC_KEY).unwrap_or_else(|| {
             entry
@@ -384,20 +430,25 @@ impl TachiMemory {
         let kind = metadata
             .get(METADATA_KIND)
             .and_then(|v| serde_json::from_value(v.clone()).ok());
+        let superseded_by =
+            Self::metadata_str(&metadata, METADATA_SUPERSEDED_BY).filter(|s| !s.is_empty());
         let agent_id = Self::metadata_str(&metadata, METADATA_ZC_AGENT);
         let namespace = Self::metadata_str(&metadata, METADATA_ZC_NAMESPACE)
             .unwrap_or_else(|| DEFAULT_NAMESPACE.to_string());
+        let timestamp = Self::metadata_str(&metadata, METADATA_ZC_CREATED_AT)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(entry.timestamp);
         MemoryEntry {
             id: entry.id,
             key,
             content: entry.text,
             category,
-            timestamp: entry.timestamp,
+            timestamp,
             session_id,
             score,
             namespace,
             importance: Some(entry.importance),
-            superseded_by: None,
+            superseded_by,
             kind,
             pinned,
             tenant_id,
@@ -406,61 +457,72 @@ impl TachiMemory {
         }
     }
 
+    fn parse_rfc3339_utc(raw: &str) -> Option<DateTime<Utc>> {
+        DateTime::parse_from_rfc3339(raw)
+            .ok()
+            .map(|dt| dt.with_timezone(&Utc))
+    }
+
     fn entry_in_window(timestamp: &str, since: Option<&str>, until: Option<&str>) -> bool {
-        if let Some(s) = since
-            && timestamp < s
-        {
-            return false;
+        let entry_dt = Self::parse_rfc3339_utc(timestamp);
+        if let Some(s) = since {
+            let ok = match (entry_dt, Self::parse_rfc3339_utc(s)) {
+                (Some(ts), Some(bound)) => ts >= bound,
+                _ => timestamp >= s,
+            };
+            if !ok {
+                return false;
+            }
         }
-        if let Some(u) = until
-            && timestamp > u
-        {
-            return false;
+        if let Some(u) = until {
+            let ok = match (entry_dt, Self::parse_rfc3339_utc(u)) {
+                (Some(ts), Some(bound)) => ts <= bound,
+                _ => timestamp <= u,
+            };
+            if !ok {
+                return false;
+            }
         }
         true
     }
 
-    fn filter_entries(
-        entries: Vec<MemoryEntry>,
+    fn entry_matches_filters(
+        entry: &MemoryEntry,
         session_id: Option<&str>,
         since: Option<&str>,
         until: Option<&str>,
         namespace: Option<&str>,
         allowed_agents: Option<&[&str]>,
-        limit: usize,
-    ) -> Vec<MemoryEntry> {
-        entries
-            .into_iter()
-            .filter(|entry| {
-                if let Some(sid) = session_id
-                    && entry.session_id.as_deref() != Some(sid)
-                {
-                    return false;
-                }
-                if !Self::entry_in_window(&entry.timestamp, since, until) {
-                    return false;
-                }
-                if let Some(ns) = namespace
-                    && entry.namespace != ns
-                {
-                    return false;
-                }
-                // Ambient recall (no namespace scope) structurally excludes
-                // the reserved Soul namespace; only `recall_namespaced`
-                // opts in.
-                if namespace.is_none() && entry.namespace == crate::SOUL_NAMESPACE {
-                    return false;
-                }
-                if let Some(allowed) = allowed_agents {
-                    let agent = entry.agent_id.as_deref().unwrap_or(DEFAULT_AGENT);
-                    if !allowed.contains(&agent) {
-                        return false;
-                    }
-                }
-                true
-            })
-            .take(limit)
-            .collect()
+    ) -> bool {
+        if entry.superseded_by.is_some() {
+            return false;
+        }
+        if let Some(sid) = session_id
+            && entry.session_id.as_deref() != Some(sid)
+        {
+            return false;
+        }
+        if !Self::entry_in_window(&entry.timestamp, since, until) {
+            return false;
+        }
+        if let Some(ns) = namespace
+            && entry.namespace != ns
+        {
+            return false;
+        }
+        // Ambient recall (no namespace scope) structurally excludes
+        // the reserved Soul namespace; only `recall_namespaced`
+        // opts in.
+        if namespace.is_none() && entry.namespace == crate::SOUL_NAMESPACE {
+            return false;
+        }
+        if let Some(allowed) = allowed_agents {
+            let agent = entry.agent_id.as_deref().unwrap_or(DEFAULT_AGENT);
+            if !allowed.contains(&agent) {
+                return false;
+            }
+        }
+        true
     }
 
     /// Grow `list_by_path` until the page is not full. If the page is still
@@ -550,9 +612,9 @@ impl TachiMemory {
         // Preserve list_by_path's ordering before PointScope and point reads'
         // pop(), or writes' first matching identity, including legacy rows.
         result.sort_by(|a, b| {
-            a.path
-                .cmp(&b.path)
-                .then_with(|| b.timestamp.cmp(&a.timestamp))
+            a.path.cmp(&b.path).then_with(|| {
+                Self::effective_updated_sort_key(b).cmp(&Self::effective_updated_sort_key(a))
+            })
         });
         Ok(result)
     }
@@ -606,15 +668,12 @@ impl TachiMemory {
         } else {
             self.compute_embedding(content).await
         };
-        let now = Local::now().to_rfc3339();
+        let now_dt = Utc::now();
+        let now_millis = Self::format_utc_millis(now_dt);
+        let now_nanos = Self::format_utc_nanos(now_dt);
         let importance = importance.unwrap_or(0.7);
-        let scope = match namespace {
-            Some("default") | None => "general".to_string(),
-            Some("user") => "user".to_string(),
-            Some(ns) if ns.starts_with("user:") => "user".to_string(),
-            _ => "project".to_string(),
-        };
-        let metadata =
+        let scope = Self::scope_for_namespace(namespace);
+        let mut metadata =
             Self::build_metadata(key, &category, session_id, namespace, agent_id, &options);
         let pinned = options.pinned;
 
@@ -704,14 +763,33 @@ impl TachiMemory {
                 }
             };
 
+            let created_at_nanos = existing
+                .as_ref()
+                .and_then(|e| {
+                    Self::metadata_str(&e.metadata, METADATA_ZC_CREATED_AT)
+                        .filter(|s| !s.is_empty())
+                        .or_else(|| Some(Self::canonical_sort_nanos(&e.timestamp)))
+                })
+                .unwrap_or_else(|| now_nanos.clone());
+            if let Some(obj) = metadata.as_object_mut() {
+                obj.insert(
+                    METADATA_ZC_CREATED_AT.to_string(),
+                    serde_json::Value::String(created_at_nanos),
+                );
+                obj.insert(
+                    METADATA_ZC_UPDATED_AT.to_string(),
+                    serde_json::Value::String(now_nanos),
+                );
+            }
+
             let entry = portable_kernel::MemoryEntry {
                 id,
                 path: path_c,
                 summary: content_c.chars().take(100).collect(),
                 text: content_c,
                 importance,
-                timestamp: now.clone(),
-                valid_from: now,
+                timestamp: now_millis.clone(),
+                valid_from: now_millis,
                 valid_until: None,
                 category: category_c,
                 topic: String::new(),
@@ -780,6 +858,7 @@ impl TachiMemory {
         .await?
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn recall_internal(
         &self,
         query: &str,
@@ -790,82 +869,347 @@ impl TachiMemory {
         namespace: Option<&str>,
         allowed_agents: Option<&[&str]>,
         path_prefix: Option<String>,
+        extra_filter: Option<Arc<RecallEntryPredicate>>,
     ) -> anyhow::Result<Vec<MemoryEntry>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
         let prefix = path_prefix.unwrap_or_else(|| "/agents".to_string());
         if is_recent_recall_query(query) {
             let store = self.store.clone();
-            // Apply host scope before the limited read; retain output admission.
-            let selections = recent::queries(
-                prefix,
-                limit,
-                session_id,
-                since,
-                until,
-                namespace,
-                allowed_agents,
-            );
-            let mut entries =
-                tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<MemoryEntry>> {
-                    let store = store.lock();
-                    let rows = recent::read(&store, &selections, limit)?;
-                    Ok(rows
-                        .into_iter()
-                        .map(|row| Self::memcore_to_zeroclaw(row, Some(1.0)))
-                        .collect())
-                })
-                .await??;
-            entries = Self::filter_entries(
-                entries,
-                session_id,
-                since,
-                until,
-                namespace,
-                allowed_agents,
-                limit,
-            );
-            return Ok(entries);
+            let max_grow = self.max_list_grow.max(1);
+            let session_c = session_id.map(str::to_owned);
+            let since_c = since.map(str::to_owned);
+            let until_c = until.map(str::to_owned);
+            let namespace_c = namespace.map(str::to_owned);
+            let allowed_c: Option<Vec<String>> = allowed_agents
+                .map(|agents| agents.iter().map(|agent| (*agent).to_owned()).collect());
+            return tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<MemoryEntry>> {
+                let store = store.lock();
+                let allowed_refs: Option<Vec<&str>> = allowed_c
+                    .as_ref()
+                    .map(|agents| agents.iter().map(String::as_str).collect());
+                let min_window_seed = if since_c.is_some() || until_c.is_some() {
+                    64
+                } else {
+                    16
+                };
+                let mut fetch_limit = limit
+                    .saturating_add(16)
+                    .max(min_window_seed)
+                    .min(max_grow)
+                    .max(1);
+                loop {
+                    // Apply host scope before the limited read; `since`/`until`
+                    // filter `created_at` after mapping because SQL `timestamp`
+                    // tracks `updated_at`.
+                    let selections = recent::queries(
+                        prefix.clone(),
+                        fetch_limit,
+                        session_c.as_deref(),
+                        namespace_c.as_deref(),
+                        allowed_refs.as_deref(),
+                    );
+                    let (rows, max_saturated_tail_ts) =
+                        recent::read(&store, &selections, fetch_limit)?;
+                    let mut survived = Vec::with_capacity(limit.min(rows.len()));
+                    let mut last_survivor_db_ts: Option<String> = None;
+                    for row in rows {
+                        let row_db_ts = row.timestamp.clone();
+                        let entry = Self::memcore_to_zeroclaw(row, Some(1.0));
+                        // Re-evaluate `extra_filter` on every widening pass because
+                        // another handle may update row content or namespace under the
+                        // same `entry.id` between passes.
+                        if Self::entry_matches_filters(
+                            &entry,
+                            session_c.as_deref(),
+                            since_c.as_deref(),
+                            until_c.as_deref(),
+                            namespace_c.as_deref(),
+                            allowed_refs.as_deref(),
+                        ) && extra_filter.as_deref().is_none_or(|pred| pred(&entry))
+                        {
+                            last_survivor_db_ts = Some(row_db_ts);
+                            survived.push(entry);
+                            if survived.len() >= limit {
+                                break;
+                            }
+                        }
+                    }
+                    let need_more_for_window =
+                        max_saturated_tail_ts.is_some() && survived.len() < limit;
+                    let boundary_tie_possible = last_survivor_db_ts
+                        .as_ref()
+                        .zip(max_saturated_tail_ts.as_ref())
+                        .is_some_and(|(kth_ts, sat_ts)| kth_ts.as_str() <= sat_ts.as_str());
+                    if (!need_more_for_window && !boundary_tie_possible) || fetch_limit >= max_grow
+                    {
+                        return Ok(survived);
+                    }
+                    fetch_limit = fetch_limit.saturating_mul(2).min(max_grow);
+                }
+            })
+            .await?;
         }
 
         let query_vec = self.compute_embedding(query).await;
         let store = self.store.clone();
+        let db_path = self.db_path.clone();
         let query_c = query.to_string();
         let weights = self.hybrid_weights();
         let path_prefix_c = Some(prefix);
+        let session_c = session_id.map(str::to_owned);
+        let since_c = since.map(str::to_owned);
+        let until_c = until.map(str::to_owned);
+        let namespace_c = namespace.map(str::to_owned);
+        let allowed_c: Option<Vec<String>> =
+            allowed_agents.map(|agents| agents.iter().map(|agent| (*agent).to_owned()).collect());
 
-        let mut results =
-            tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<MemoryEntry>> {
-                let store = store.lock();
-                let vec_available = store.vec_available;
+        let results = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<MemoryEntry>> {
+            let store = store.lock();
+            let total_rows = usize::try_from(
+                store
+                    .stats(false)
+                    .map_err(|e| anyhow::Error::msg(format!("tachi stats failed: {e}")))?
+                    .total,
+            )
+            .unwrap_or(usize::MAX);
+            if total_rows == 0 {
+                return Ok(Vec::new());
+            }
+
+            let vec_available = store.vec_available;
+            let allowed_refs: Option<Vec<&str>> = allowed_c
+                .as_ref()
+                .map(|agents| agents.iter().map(String::as_str).collect());
+            let mut fetch_k = limit.max(6).min(total_rows);
+
+            loop {
+                let candidates_per_channel = fetch_k.saturating_mul(4).max(20);
                 let opts = SearchOptions {
-                    top_k: limit.max(6),
-                    candidates_per_channel: limit.max(20),
-                    weights,
-                    path_prefix: path_prefix_c,
-                    query_vec,
+                    top_k: fetch_k,
+                    candidates_per_channel,
+                    weights: weights.clone(),
+                    path_prefix: path_prefix_c.clone(),
+                    query_vec: query_vec.clone(),
                     vec_available,
-                    record_access: true,
+                    record_access: false,
                     ..Default::default()
                 };
                 let hits = store
                     .search(&query_c, Some(opts))
                     .map_err(|e| anyhow::Error::msg(format!("tachi search failed: {e}")))?;
-                Ok(hits
-                    .into_iter()
-                    .map(|hit| Self::memcore_to_zeroclaw(hit.entry, Some(hit.score.final_score)))
-                    .collect())
-            })
-            .await??;
+                let raw_len = hits.len();
+                let mut survived = Vec::with_capacity(limit.min(raw_len));
+                let mut survived_access = Vec::with_capacity(limit.min(raw_len));
 
-        results = Self::filter_entries(
-            results,
-            session_id,
-            since,
-            until,
-            namespace,
-            allowed_agents,
-            limit,
-        );
+                for hit in hits {
+                    let fts_matched = hit.score.fts.is_finite() && hit.score.fts > 0.0;
+                    let entry = Self::memcore_to_zeroclaw(hit.entry, Some(hit.score.final_score));
+                    if Self::entry_matches_filters(
+                        &entry,
+                        session_c.as_deref(),
+                        since_c.as_deref(),
+                        until_c.as_deref(),
+                        namespace_c.as_deref(),
+                        allowed_refs.as_deref(),
+                    ) && extra_filter.as_deref().is_none_or(|pred| pred(&entry))
+                    {
+                        survived_access.push((entry.id.clone(), fts_matched));
+                        survived.push(entry);
+                        if survived.len() >= limit {
+                            break;
+                        }
+                    }
+                }
+
+                if survived.len() >= limit || raw_len < fetch_k || fetch_k >= total_rows {
+                    if !survived_access.is_empty() {
+                        Self::record_surviving_search_access(
+                            &store,
+                            &db_path,
+                            &query_c,
+                            &survived_access,
+                        )?;
+                    }
+                    return Ok(survived);
+                }
+
+                fetch_k = fetch_k.saturating_mul(2).min(total_rows);
+            }
+        })
+        .await??;
+
         Ok(results)
+    }
+
+    fn open_verified_rw_connection(
+        store: &MemoryStore,
+        db_path: &Path,
+        operation: &str,
+    ) -> anyhow::Result<rusqlite::Connection> {
+        store
+            .verify_opened_physical_db_identity(db_path)
+            .map_err(|e| {
+                anyhow::Error::msg(format!("tachi {operation} identity check failed: {e}"))
+            })?;
+        let conn = rusqlite::Connection::open_with_flags(
+            db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .with_context(|| format!("failed to open tachi db for {operation}"))?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .with_context(|| format!("failed to set busy_timeout for {operation}"))?;
+        // Register the kernel's trigger predicate function in its unprivileged
+        // (`0`) state so SQLite can prepare `UPDATE` statements while keeping
+        // `memories_reserved_refs_update_guard` fully armed.
+        conn.create_scalar_function(
+            "tachi_reserved_reference_write_enabled",
+            0,
+            rusqlite::functions::FunctionFlags::SQLITE_UTF8
+                | rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
+            |_| Ok(0_i64),
+        )
+        .context("failed to register unprivileged reference-guard function")?;
+        Ok(conn)
+    }
+
+    fn fnv1a_query_hash(query: &str) -> String {
+        let mut hash: u32 = 2_166_136_261;
+        for byte in query.bytes() {
+            hash ^= u32::from(byte);
+            hash = hash.wrapping_mul(16_777_619);
+        }
+        format!("{hash:08x}")
+    }
+
+    fn record_surviving_search_access(
+        store: &MemoryStore,
+        db_path: &Path,
+        query: &str,
+        survived: &[(String, bool)],
+    ) -> anyhow::Result<()> {
+        let mut conn = Self::open_verified_rw_connection(store, db_path, "search access update")?;
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .context("failed to begin tachi search access transaction")?;
+
+        let mut seen = HashSet::with_capacity(survived.len());
+        let mut ordered_ids = Vec::with_capacity(survived.len());
+        let mut fts_ids = HashSet::with_capacity(survived.len());
+        for (id, fts_matched) in survived {
+            if *fts_matched {
+                fts_ids.insert(id.as_str());
+            }
+            if seen.insert(id.as_str()) {
+                ordered_ids.push(id.as_str());
+            }
+        }
+
+        let mut existing_ids = Vec::with_capacity(ordered_ids.len());
+        {
+            let mut select_stmt = tx
+                .prepare("SELECT path, category FROM memories WHERE id = ?1 AND archived = 0")
+                .context("failed to prepare tachi search access lookup")?;
+            for id in ordered_ids {
+                anyhow::ensure!(
+                    !id.starts_with("wiki-rem:"),
+                    "tachi search access refused on reserved REM id '{id}'"
+                );
+                let row: Option<(String, String)> =
+                    match select_stmt.query_row([id], |r| Ok((r.get(0)?, r.get(1)?))) {
+                        Ok(cols) => Some(cols),
+                        Err(rusqlite::Error::QueryReturnedNoRows) => None,
+                        Err(err) => {
+                            return Err(err).with_context(|| {
+                                format!("failed to read surviving memory '{id}' for access update")
+                            });
+                        }
+                    };
+                let Some((path, category)) = row else {
+                    // Concurrently deleted or archived by another handle after
+                    // candidate retrieval: skip cleanly without substituting
+                    // any filtered/unreturned candidate.
+                    continue;
+                };
+                anyhow::ensure!(
+                    !category.trim().eq_ignore_ascii_case("sticky")
+                        && path != "/sticky"
+                        && !path.starts_with("/sticky/"),
+                    "retired sticky row '{id}' cannot be recorded as recalled"
+                );
+                existing_ids.push(id);
+            }
+        }
+
+        if existing_ids.is_empty() {
+            tx.commit()
+                .context("failed to commit empty tachi search access transaction")?;
+            return Ok(());
+        }
+
+        let now_utc = Self::format_utc_millis(Utc::now());
+        let query_hash = Self::fnv1a_query_hash(query);
+        let promote_legacy =
+            !portable_kernel::recall_config::RecallConfig::get().use_provenance_recency;
+
+        for id in existing_ids {
+            tx.execute(
+                "UPDATE memories \
+                 SET scored_count = scored_count + 1, \
+                     access_count = access_count + 1, \
+                     last_access = ?1 \
+                 WHERE id = ?2 AND archived = 0",
+                rusqlite::params![now_utc, id],
+            )
+            .with_context(|| format!("tachi search access update failed on '{id}'"))?;
+
+            tx.execute(
+                "INSERT INTO access_history (memory_id, accessed_at, query_hash) VALUES (?1, ?2, ?3)",
+                rusqlite::params![id, now_utc, query_hash],
+            )
+            .with_context(|| format!("tachi access_history insert failed on '{id}'"))?;
+
+            if fts_ids.contains(id) {
+                tx.execute(
+                    "UPDATE memories SET recall_count = recall_count + 1 WHERE id = ?1 AND archived = 0",
+                    rusqlite::params![id],
+                )
+                .with_context(|| format!("tachi recall_count update failed on '{id}'"))?;
+            }
+
+            if !query_hash.is_empty() {
+                let seen_count: i64 = tx
+                    .query_row(
+                        "SELECT COUNT(*) FROM access_history WHERE memory_id = ?1 AND query_hash = ?2",
+                        rusqlite::params![id, query_hash],
+                        |r| r.get(0),
+                    )
+                    .with_context(|| format!("tachi query_diversity count failed on '{id}'"))?;
+                if seen_count == 1 {
+                    tx.execute(
+                        "UPDATE memories SET query_diversity = query_diversity + 1 WHERE id = ?1 AND archived = 0",
+                        rusqlite::params![id],
+                    )
+                    .with_context(|| format!("tachi query_diversity update failed on '{id}'"))?;
+                }
+            }
+
+            if promote_legacy {
+                tx.execute(
+                    "UPDATE memories SET tier = 'consolidated' \
+                     WHERE id = ?1 AND archived = 0 AND tier = 'raw' \
+                       AND recall_count >= 3 AND query_diversity >= 3",
+                    rusqlite::params![id],
+                )
+                .with_context(|| format!("tachi tier promotion update failed on '{id}'"))?;
+            }
+        }
+
+        tx.commit()
+            .context("failed to commit tachi search access transaction")?;
+        Ok(())
     }
 
     fn swap_embedder(&self, embedder: Arc<dyn EmbeddingProvider>) {
@@ -977,8 +1321,10 @@ impl Memory for TachiMemory {
         since: Option<&str>,
         until: Option<&str>,
     ) -> anyhow::Result<Vec<MemoryEntry>> {
-        self.recall_internal(query, limit, session_id, since, until, None, None, None)
-            .await
+        self.recall_internal(
+            query, limit, session_id, since, until, None, None, None, None,
+        )
+        .await
     }
 
     async fn recall_namespaced(
@@ -997,6 +1343,7 @@ impl Memory for TachiMemory {
             since,
             until,
             Some(namespace),
+            None,
             None,
             None,
         )
@@ -1027,8 +1374,8 @@ impl Memory for TachiMemory {
         session_id: Option<&str>,
     ) -> anyhow::Result<Vec<MemoryEntry>> {
         let mut entries = self.list_all().await?;
-        // Ambient listing excludes the reserved Soul namespace.
-        entries.retain(|e| e.namespace != crate::SOUL_NAMESPACE);
+        // Ambient listing excludes the reserved Soul namespace and superseded history.
+        entries.retain(|e| e.namespace != crate::SOUL_NAMESPACE && e.superseded_by.is_none());
         if let Some(cat) = category {
             entries.retain(|e| &e.category == cat);
         }
@@ -1094,7 +1441,11 @@ impl Memory for TachiMemory {
 
     async fn export_agent(&self, agent_alias: &str) -> anyhow::Result<Vec<MemoryEntry>> {
         let mut entries = self.list_agent_entries(agent_alias).await?;
-        entries.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+        entries.sort_by(|a, b| {
+            Self::canonical_sort_nanos(&a.timestamp)
+                .cmp(&Self::canonical_sort_nanos(&b.timestamp))
+                .then_with(|| a.id.cmp(&b.id))
+        });
         Ok(entries)
     }
 
@@ -1212,6 +1563,29 @@ impl Memory for TachiMemory {
         .await
     }
 
+    async fn store_with_options_and_agent(
+        &self,
+        key: &str,
+        content: &str,
+        category: MemoryCategory,
+        session_id: Option<&str>,
+        options: StoreOptions,
+        agent_id: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let namespace = options.namespace.clone();
+        self.store_internal(
+            key,
+            content,
+            category,
+            session_id,
+            namespace.as_deref(),
+            options.importance,
+            agent_id,
+            options,
+        )
+        .await
+    }
+
     async fn store_with_agent(
         &self,
         key: &str,
@@ -1244,8 +1618,77 @@ impl Memory for TachiMemory {
         since: Option<&str>,
         until: Option<&str>,
     ) -> anyhow::Result<Vec<MemoryEntry>> {
+        self.recall_for_agents_with_filter(
+            allowed_agent_ids,
+            query,
+            limit,
+            session_id,
+            since,
+            until,
+            limit,
+            None,
+        )
+        .await
+    }
+
+    async fn recall_with_filter(
+        &self,
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+        since: Option<&str>,
+        until: Option<&str>,
+        _refill_limit: usize,
+        filter: Option<Arc<RecallEntryPredicate>>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        self.recall_internal(
+            query, limit, session_id, since, until, None, None, None, filter,
+        )
+        .await
+    }
+
+    async fn recall_namespaced_with_filter(
+        &self,
+        namespace: &str,
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+        since: Option<&str>,
+        until: Option<&str>,
+        _refill_limit: usize,
+        filter: Option<Arc<RecallEntryPredicate>>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        self.recall_internal(
+            query,
+            limit,
+            session_id,
+            since,
+            until,
+            Some(namespace),
+            None,
+            None,
+            filter,
+        )
+        .await
+    }
+
+    async fn recall_for_agents_with_filter(
+        &self,
+        allowed_agent_ids: &[&str],
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+        since: Option<&str>,
+        until: Option<&str>,
+        _refill_limit: usize,
+        filter: Option<Arc<RecallEntryPredicate>>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
         if allowed_agent_ids.is_empty() {
-            return self.recall(query, limit, session_id, since, until).await;
+            return self
+                .recall_internal(
+                    query, limit, session_id, since, until, None, None, None, filter,
+                )
+                .await;
         }
         if allowed_agent_ids.len() == 1 {
             let prefix = format!(
@@ -1262,6 +1705,7 @@ impl Memory for TachiMemory {
                     None,
                     Some(allowed_agent_ids),
                     Some(prefix),
+                    filter,
                 )
                 .await;
         }
@@ -1274,33 +1718,118 @@ impl Memory for TachiMemory {
             None,
             Some(allowed_agent_ids),
             Some("/agents".into()),
+            filter,
         )
         .await
     }
 
     async fn export(&self, filter: &ExportFilter) -> anyhow::Result<Vec<MemoryEntry>> {
-        let mut entries = self
-            .list(filter.category.as_ref(), filter.session_id.as_deref())
-            .await?;
+        let mut entries = self.list_all().await?;
         entries.retain(|e| {
+            if filter.namespace.as_deref() != Some(crate::SOUL_NAMESPACE)
+                && e.namespace == crate::SOUL_NAMESPACE
+            {
+                return false;
+            }
+            if let Some(ref cat) = filter.category
+                && &e.category != cat
+            {
+                return false;
+            }
+            if let Some(ref sid) = filter.session_id
+                && e.session_id.as_deref() != Some(sid.as_str())
+            {
+                return false;
+            }
             if let Some(ref ns) = filter.namespace
                 && e.namespace != *ns
             {
                 return false;
             }
-            if let Some(ref since) = filter.since
-                && e.timestamp.as_str() < since.as_str()
-            {
-                return false;
-            }
-            if let Some(ref until) = filter.until
-                && e.timestamp.as_str() > until.as_str()
-            {
+            if !Self::entry_in_window(
+                &e.timestamp,
+                filter.since.as_deref(),
+                filter.until.as_deref(),
+            ) {
                 return false;
             }
             true
         });
+        entries.sort_by(|a, b| {
+            Self::canonical_sort_nanos(&a.timestamp)
+                .cmp(&Self::canonical_sort_nanos(&b.timestamp))
+                .then_with(|| a.id.cmp(&b.id))
+        });
         Ok(entries)
+    }
+
+    async fn supersede(&self, superseded_ids: &[String], new_id: &str) -> anyhow::Result<()> {
+        if superseded_ids.is_empty() {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            !new_id.trim().is_empty(),
+            "supersede target id must not be blank"
+        );
+        let store = self.store.clone();
+        let db_path = self.db_path.clone();
+        let ids = superseded_ids.to_vec();
+        let winner = new_id.to_string();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let store = store.lock();
+            // Perform a metadata-only update inside a single IMMEDIATE transaction
+            // while holding the store mutex. `MemoryStore::update_with_revision` and
+            // `upsert` run `scrub_think_tags` on `text`/`summary`, which would trim
+            // whitespace or strip literal `<think>` blocks on migrated historical rows.
+            let mut conn = Self::open_verified_rw_connection(&store, &db_path, "supersede")?;
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .context("failed to begin tachi supersede transaction")?;
+            let json_path = format!("$.{METADATA_SUPERSEDED_BY}");
+            let now_utc = Self::format_utc_millis(Utc::now());
+            for id in &ids {
+                anyhow::ensure!(
+                    !id.starts_with("wiki-rem:"),
+                    "tachi supersede refused on reserved REM id '{id}'"
+                );
+                tx.execute(
+                    "UPDATE memories \
+                     SET metadata = json_set( \
+                         CASE WHEN json_valid(metadata) AND json_type(metadata) = 'object' \
+                              THEN metadata \
+                              ELSE '{}' \
+                         END, \
+                         ?1, \
+                         ?2 \
+                     ), \
+                         updated_at = ?3, \
+                         revision = revision + 1 \
+                     WHERE id = ?4 AND archived = 0",
+                    rusqlite::params![json_path, winner, now_utc, id],
+                )
+                .with_context(|| format!("tachi supersede update failed on '{id}'"))?;
+            }
+            tx.commit()
+                .context("failed to commit tachi supersede transaction")?;
+            Ok(())
+        })
+        .await?
+    }
+
+    async fn count_in_scope(
+        &self,
+        namespace: Option<&str>,
+        category: Option<&MemoryCategory>,
+    ) -> anyhow::Result<u64> {
+        let entries = self.list_all().await?;
+        Ok(entries
+            .into_iter()
+            .filter(|entry| {
+                entry.superseded_by.is_none()
+                    && namespace.is_none_or(|ns| entry.namespace == ns)
+                    && category.is_none_or(|cat| &entry.category == cat)
+            })
+            .count() as u64)
     }
 
     async fn stats(&self) -> anyhow::Result<MemoryStats> {
@@ -1326,14 +1855,8 @@ impl Memory for TachiMemory {
                 {
                     pinned_rows += 1;
                 }
-                // memcore soft-hides superseded rows from default list; count
-                // only what we can see in metadata if present.
-                if row
-                    .metadata
-                    .get("superseded_by")
-                    .and_then(|v| v.as_str())
-                    .is_some()
-                {
+                // ZeroClaw reversible soft-hide marker stored in metadata[METADATA_SUPERSEDED_BY].
+                if Self::is_soft_superseded(row) {
                     superseded_rows += 1;
                 }
                 bytes += row.text.len() as u64;
@@ -1975,5 +2498,771 @@ mod tests {
         mem.store("row_0", "payload updated", MemoryCategory::Core, None)
             .await
             .expect("exact-path update must not require the fallback scan");
+    }
+
+    #[tokio::test]
+    async fn supersede_soft_hides_losers_and_clears_on_restore() {
+        let (_tmp, mem) = temp_tachi();
+        mem.swap_embedder(Arc::new(RecordingSoulEmbedding::default()));
+
+        mem.store_with_options(
+            "old_fact",
+            "the office is in Denver",
+            MemoryCategory::Core,
+            Some("s"),
+            StoreOptions::default(),
+        )
+        .await
+        .unwrap();
+        mem.store_with_options(
+            "new_fact",
+            "the office moved to Austin",
+            MemoryCategory::Core,
+            Some("s"),
+            StoreOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        let old = mem.get("old_fact").await.unwrap().expect("old row present");
+        let new = mem.get("new_fact").await.unwrap().expect("new row present");
+        assert_eq!(
+            mem.store
+                .lock()
+                .get(&old.id)
+                .unwrap()
+                .unwrap()
+                .vector
+                .as_ref()
+                .map(Vec::len),
+            Some(1024)
+        );
+
+        mem.supersede(std::slice::from_ref(&old.id), &new.id)
+            .await
+            .unwrap();
+
+        let recalled = mem
+            .recall("office", 10, Some("s"), None, None)
+            .await
+            .unwrap();
+        assert!(recalled.iter().all(|e| e.key != "old_fact"));
+        assert!(recalled.iter().any(|e| e.key == "new_fact"));
+
+        let recent = mem
+            .recall("__recent__", 10, Some("s"), None, None)
+            .await
+            .unwrap();
+        assert!(recent.iter().all(|e| e.key != "old_fact"));
+        assert!(recent.iter().any(|e| e.key == "new_fact"));
+
+        let listed = mem
+            .list(Some(&MemoryCategory::Core), Some("s"))
+            .await
+            .unwrap();
+        assert!(listed.iter().all(|e| e.key != "old_fact"));
+        assert!(listed.iter().any(|e| e.key == "new_fact"));
+
+        assert_eq!(
+            mem.count_in_scope(Some("default"), Some(&MemoryCategory::Core))
+                .await
+                .unwrap(),
+            1
+        );
+
+        let hidden = mem
+            .get("old_fact")
+            .await
+            .unwrap()
+            .expect("supersede is reversible, the row still exists");
+        assert_eq!(hidden.superseded_by.as_deref(), Some(new.id.as_str()));
+        assert_eq!(
+            mem.store
+                .lock()
+                .get(&old.id)
+                .unwrap()
+                .unwrap()
+                .vector
+                .as_ref()
+                .map(Vec::len),
+            Some(1024),
+            "supersede must preserve existing embeddings"
+        );
+
+        let exported = mem.export(&ExportFilter::default()).await.unwrap();
+        let exported_old = exported
+            .iter()
+            .find(|e| e.key == "old_fact")
+            .expect("export retains superseded rows");
+        assert_eq!(exported_old.superseded_by.as_deref(), Some(new.id.as_str()));
+        assert_eq!(mem.stats().await.unwrap().superseded_rows, 1);
+
+        // Re-storing the key restores visibility by clearing METADATA_SUPERSEDED_BY.
+        mem.store_with_options(
+            "old_fact",
+            "the office reopened in Denver",
+            MemoryCategory::Core,
+            Some("s"),
+            StoreOptions::default(),
+        )
+        .await
+        .unwrap();
+        let restored = mem.get("old_fact").await.unwrap().unwrap();
+        assert!(restored.superseded_by.is_none());
+        assert_eq!(
+            mem.count_in_scope(Some("default"), Some(&MemoryCategory::Core))
+                .await
+                .unwrap(),
+            2
+        );
+        assert_eq!(mem.stats().await.unwrap().superseded_rows, 0);
+        assert!(
+            mem.list(Some(&MemoryCategory::Core), Some("s"))
+                .await
+                .unwrap()
+                .iter()
+                .any(|e| e.key == "old_fact")
+        );
+    }
+
+    #[tokio::test]
+    async fn count_in_scope_excludes_superseded_and_filters_scope() {
+        let (_tmp, mem) = temp_tachi();
+        mem.store_with_options(
+            "a_core_1",
+            "first",
+            MemoryCategory::Core,
+            None,
+            StoreOptions {
+                namespace: Some("ns-a".into()),
+                ..StoreOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        mem.store_with_options(
+            "a_core_2",
+            "second",
+            MemoryCategory::Core,
+            None,
+            StoreOptions {
+                namespace: Some("ns-a".into()),
+                ..StoreOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        mem.store_with_options(
+            "a_daily",
+            "daily note",
+            MemoryCategory::Daily,
+            None,
+            StoreOptions {
+                namespace: Some("ns-a".into()),
+                ..StoreOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        mem.store_with_options(
+            "b_core",
+            "other ns",
+            MemoryCategory::Core,
+            None,
+            StoreOptions {
+                namespace: Some("ns-b".into()),
+                ..StoreOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let winner = mem.get("a_core_2").await.unwrap().unwrap();
+        let loser = mem.get("a_core_1").await.unwrap().unwrap();
+        mem.supersede(std::slice::from_ref(&loser.id), &winner.id)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            mem.count_in_scope(Some("ns-a"), Some(&MemoryCategory::Core))
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(mem.count_in_scope(Some("ns-a"), None).await.unwrap(), 2);
+        assert_eq!(
+            mem.count_in_scope(None, Some(&MemoryCategory::Core))
+                .await
+                .unwrap(),
+            2
+        );
+        assert_eq!(mem.count_in_scope(None, None).await.unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn store_with_options_and_agent_preserves_metadata() {
+        let (_tmp, mem) = temp_tachi();
+        let options = StoreOptions {
+            namespace: Some("ops".into()),
+            importance: Some(0.85),
+            kind: Some(zeroclaw_api::memory_traits::MemoryKind::Semantic(
+                zeroclaw_api::memory_traits::SemanticSubtype::Decision,
+            )),
+            pinned: true,
+            tenant_id: Some("acme".into()),
+        };
+        mem.store_with_options_and_agent(
+            "deploy_rule",
+            "Use staged rollout",
+            MemoryCategory::Core,
+            Some("sess-9"),
+            options,
+            Some("agent-alpha"),
+        )
+        .await
+        .unwrap();
+
+        let fetched = mem
+            .get_for_agent("deploy_rule", "agent-alpha")
+            .await
+            .unwrap()
+            .expect("agent-attributed typed entry must exist");
+        assert_eq!(fetched.namespace, "ops");
+        assert_eq!(fetched.session_id.as_deref(), Some("sess-9"));
+        assert_eq!(fetched.importance, Some(0.85));
+        assert_eq!(
+            fetched.kind,
+            Some(zeroclaw_api::memory_traits::MemoryKind::Semantic(
+                zeroclaw_api::memory_traits::SemanticSubtype::Decision
+            ))
+        );
+        assert!(fetched.pinned);
+        assert_eq!(fetched.tenant_id.as_deref(), Some("acme"));
+        assert_eq!(fetched.agent_alias.as_deref(), Some("agent-alpha"));
+        assert_eq!(fetched.agent_id.as_deref(), Some("agent-alpha"));
+        assert_eq!(mem.stats().await.unwrap().pinned_rows, 1);
+    }
+
+    #[tokio::test]
+    async fn recall_records_access_only_on_surviving_hits() {
+        let (_tmp, mem) = temp_tachi();
+        // Case A: soft-superseded rank-1 hit must not have its access counters bumped.
+        mem.store_with_options(
+            "superseded_top",
+            "alpha alpha alpha unique_kw",
+            MemoryCategory::Core,
+            None,
+            StoreOptions {
+                importance: Some(0.95),
+                ..StoreOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        mem.store_with_options(
+            "active_second",
+            "alpha unique_kw",
+            MemoryCategory::Core,
+            None,
+            StoreOptions {
+                importance: Some(0.4),
+                ..StoreOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        let superseded = mem.get("superseded_top").await.unwrap().unwrap();
+        let active = mem.get("active_second").await.unwrap().unwrap();
+        mem.supersede(std::slice::from_ref(&superseded.id), &active.id)
+            .await
+            .unwrap();
+
+        let hits = mem
+            .recall("alpha unique_kw", 1, None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            hits.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(),
+            vec![active.id.as_str()]
+        );
+        {
+            let store = mem.store.lock();
+            let skipped = store.get(&superseded.id).unwrap().unwrap();
+            let kept = store.get(&active.id).unwrap().unwrap();
+            assert_eq!(skipped.access_count, 0);
+            assert_eq!(skipped.recall_count, 0);
+            assert_eq!(kept.access_count, 1);
+            assert_eq!(kept.recall_count, 1);
+        }
+
+        // Case B: two legacy unscoped Conversation rows sharing the exact same
+        // storage_path across distinct sessions — only the matching session gets bumped.
+        let shared_path = TachiMemory::storage_path(
+            None,
+            None,
+            &MemoryCategory::Conversation,
+            "shared_legacy_key",
+        );
+        {
+            let mut store = mem.store.lock();
+            for (id, session, text, importance) in [
+                (
+                    "legacy-s1",
+                    "s1",
+                    "shared_kw shared_kw legacy session one",
+                    0.95,
+                ),
+                ("legacy-s2", "s2", "shared_kw legacy session two", 0.40),
+            ] {
+                let entry = portable_kernel::MemoryEntry {
+                    id: id.to_string(),
+                    path: shared_path.clone(),
+                    summary: text.to_string(),
+                    text: text.to_string(),
+                    importance,
+                    timestamp: "2026-07-09T00:00:00.000Z".into(),
+                    valid_from: "2026-07-09T00:00:00.000Z".into(),
+                    valid_until: None,
+                    category: "experience".into(),
+                    topic: String::new(),
+                    keywords: Vec::new(),
+                    persons: Vec::new(),
+                    entities: Vec::new(),
+                    location: String::new(),
+                    source: "zeroclaw".into(),
+                    scope: "general".into(),
+                    archived: false,
+                    access_count: 0,
+                    scored_count: 0,
+                    last_use_at: None,
+                    last_access: None,
+                    revision: 1,
+                    vector: None,
+                    retention_policy: None,
+                    domain: None,
+                    metadata: TachiMemory::build_metadata(
+                        "shared_legacy_key",
+                        &MemoryCategory::Conversation,
+                        Some(session),
+                        None,
+                        None,
+                        &StoreOptions::default(),
+                    ),
+                    recall_count: 0,
+                    query_diversity: 0,
+                    tier: portable_kernel::types::default_tier(),
+                };
+                store.upsert(&entry).unwrap();
+            }
+        }
+
+        let scoped_hits = mem
+            .recall("shared_kw", 1, Some("s2"), None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            scoped_hits
+                .iter()
+                .map(|e| e.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["legacy-s2"]
+        );
+        let store = mem.store.lock();
+        let s1_after = store.get("legacy-s1").unwrap().unwrap();
+        let s2_after = store.get("legacy-s2").unwrap().unwrap();
+        assert_eq!(s1_after.access_count, 0);
+        assert_eq!(s1_after.recall_count, 0);
+        assert_eq!(s2_after.access_count, 1);
+        assert_eq!(s2_after.recall_count, 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_cross_handle_delete_never_substitutes_filtered_candidate_access() {
+        let (tmp, handle_a) = temp_tachi();
+        let handle_b = TachiMemory::new("tachi", tmp.path()).unwrap();
+
+        handle_a
+            .store_with_options(
+                "safe_a",
+                "interleaveprobe interleaveprobe safe primary record",
+                MemoryCategory::Core,
+                None,
+                StoreOptions {
+                    importance: Some(0.95),
+                    ..StoreOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+        handle_a
+            .store_with_options(
+                "filtered_b",
+                "interleaveprobe filtered secondary record",
+                MemoryCategory::Core,
+                None,
+                StoreOptions {
+                    importance: Some(0.50),
+                    ..StoreOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let safe_a_id = handle_a.get("safe_a").await.unwrap().unwrap().id;
+        let filtered_b_id = handle_a.get("filtered_b").await.unwrap().unwrap().id;
+
+        // Deterministic interleaving: after handle_a's candidate retrieval returns
+        // [safe_a, filtered_b] (with record_access=false), handle_b deletes safe_a
+        // before handle_a commits its access-recording transaction, while extra_filter
+        // rejects filtered_b. Access recording must skip the deleted safe_a ID and
+        // never substitute filtered_b.
+        let deleter = handle_b.clone();
+        let target_id = safe_a_id.clone();
+        let filter: Arc<RecallEntryPredicate> = Arc::new(move |entry: &MemoryEntry| {
+            if entry.key == "safe_a" {
+                let removed = deleter.store.lock().delete(&target_id).unwrap();
+                assert!(removed, "handle_b must delete safe_a mid-recall");
+                true
+            } else {
+                false
+            }
+        });
+
+        let hits = handle_a
+            .recall_with_filter("interleaveprobe", 1, None, None, None, 4, Some(filter))
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, safe_a_id);
+
+        let verify = handle_b.store.lock();
+        assert!(verify.get(&safe_a_id).unwrap().is_none());
+        let b_after = verify.get(&filtered_b_id).unwrap().unwrap();
+        assert_eq!(
+            b_after.access_count, 0,
+            "filtered candidate must not receive substituted access_count"
+        );
+        assert_eq!(
+            b_after.recall_count, 0,
+            "filtered candidate must not receive substituted recall_count"
+        );
+        assert_eq!(
+            b_after.scored_count, 0,
+            "filtered candidate must not receive substituted scored_count"
+        );
+    }
+
+    #[tokio::test]
+    async fn supersede_preserves_submillisecond_timestamps_and_mixed_ordering() {
+        let dir = TempDir::new().unwrap();
+        let source = dir.path().join("mixed.db");
+        let conn = rusqlite::Connection::open(&source).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE memories (
+                 id TEXT PRIMARY KEY,
+                 key TEXT NOT NULL,
+                 content TEXT NOT NULL,
+                 category TEXT NOT NULL,
+                 created_at TEXT NOT NULL
+             );
+             INSERT INTO memories (id, key, content, category, created_at) VALUES
+                 ('m-mid', 'k-mid', 'migrated mid subms', 'core', '2026-07-10T10:00:00.123500Z'),
+                 ('m-high', 'k-high', 'migrated high subms', 'core', '2026-07-10T10:00:00.123900Z');",
+        )
+        .unwrap();
+        drop(conn);
+
+        let dst_ws = dir.path().join("ws");
+        std::fs::create_dir_all(dst_ws.join("memory")).unwrap();
+        let dest = dst_ws.join("memory").join("tachi.db");
+        crate::native_migration::migrate_native_brain_store(&source, &dest, "captain@test")
+            .unwrap();
+
+        let mem = TachiMemory::new("tachi", &dst_ws).unwrap();
+        {
+            // Insert a millisecond-only raw row in the same millisecond to verify
+            // mixed .123Z vs .123500000Z vs .123900000Z sorting in export/recall.
+            let mut store = mem.store.lock();
+            let raw = portable_kernel::MemoryEntry {
+                id: "r-low".into(),
+                path: TachiMemory::storage_path(None, None, &MemoryCategory::Core, "k-low"),
+                summary: "raw millis row".into(),
+                text: "raw millis row".into(),
+                importance: 0.7,
+                timestamp: "2026-07-10T10:00:00.123Z".into(),
+                valid_from: "2026-07-10T10:00:00.123Z".into(),
+                valid_until: None,
+                category: "fact".into(),
+                topic: String::new(),
+                keywords: Vec::new(),
+                persons: Vec::new(),
+                entities: Vec::new(),
+                location: String::new(),
+                source: "zeroclaw".into(),
+                scope: "general".into(),
+                archived: false,
+                access_count: 0,
+                scored_count: 0,
+                last_use_at: None,
+                last_access: None,
+                revision: 1,
+                vector: None,
+                retention_policy: None,
+                domain: None,
+                metadata: TachiMemory::build_metadata(
+                    "k-low",
+                    &MemoryCategory::Core,
+                    None,
+                    None,
+                    None,
+                    &StoreOptions::default(),
+                ),
+                recall_count: 0,
+                query_diversity: 0,
+                tier: portable_kernel::types::default_tier(),
+            };
+            store.upsert(&raw).unwrap();
+        }
+
+        mem.supersede(&["m-high".to_string()], "m-mid")
+            .await
+            .unwrap();
+        let after_supersede = mem.get("k-high").await.unwrap().expect("m-high exists");
+        assert_eq!(after_supersede.timestamp, "2026-07-10T10:00:00.123900000Z");
+
+        let exported = mem.export(&ExportFilter::default()).await.unwrap();
+        assert_eq!(
+            exported.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(),
+            vec!["r-low", "m-mid", "m-high"]
+        );
+
+        let recent_active = mem.recall("", 5, None, None, None).await.unwrap();
+        assert_eq!(
+            recent_active
+                .iter()
+                .map(|e| e.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["m-mid", "r-low"]
+        );
+    }
+
+    #[tokio::test]
+    async fn widening_reevaluates_extra_filter_when_same_id_entry_mutates_across_rounds() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        // Part 1: Hybrid widening — another handle rewrites `safe_a` to flagged
+        // content while keeping `safe_a.id` unchanged between widening rounds.
+        let (tmp_hybrid, hybrid_a) = temp_tachi();
+        let hybrid_b = TachiMemory::new("tachi", tmp_hybrid.path()).unwrap();
+
+        hybrid_a
+            .store_with_options(
+                "safe_a",
+                "wideninghybrid wideninghybrid wideninghybrid safe alpha",
+                MemoryCategory::Core,
+                None,
+                StoreOptions {
+                    importance: Some(0.95),
+                    ..StoreOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+        for idx in 0..7 {
+            hybrid_a
+                .store_with_options(
+                    &format!("filler_{idx}"),
+                    "wideninghybrid wideninghybrid filler",
+                    MemoryCategory::Core,
+                    None,
+                    StoreOptions {
+                        importance: Some(0.90),
+                        ..StoreOptions::default()
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        hybrid_a
+            .store_with_options(
+                "safe_tail",
+                "wideninghybrid tail note with extra unrequested context words",
+                MemoryCategory::Core,
+                None,
+                StoreOptions {
+                    importance: Some(0.10),
+                    ..StoreOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let safe_a_id = hybrid_a.get("safe_a").await.unwrap().unwrap().id;
+        let safe_tail_id = hybrid_a.get("safe_tail").await.unwrap().unwrap().id;
+        let hybrid_evals = Arc::new(AtomicUsize::new(0));
+        let hybrid_mutated = Arc::new(AtomicBool::new(false));
+        let evals_c = Arc::clone(&hybrid_evals);
+        let mutated_c = Arc::clone(&hybrid_mutated);
+        let writer = hybrid_b.clone();
+        let target_id = safe_a_id.clone();
+
+        let hybrid_filter: Arc<RecallEntryPredicate> = Arc::new(move |entry: &MemoryEntry| {
+            if entry.key == "safe_a" {
+                evals_c.fetch_add(1, Ordering::SeqCst);
+                let allowed = !entry.content.contains("BLOCK_ME");
+                if !mutated_c.swap(true, Ordering::SeqCst) {
+                    let mut guard = writer.store.lock();
+                    let mut updated = guard.get(&target_id).unwrap().unwrap();
+                    updated.text =
+                        "wideninghybrid wideninghybrid wideninghybrid BLOCK_ME rewritten".into();
+                    updated.summary = updated.text.clone();
+                    guard.upsert(&updated).unwrap();
+                }
+                allowed
+            } else {
+                !entry.key.starts_with("filler_") && !entry.content.contains("BLOCK_ME")
+            }
+        });
+
+        let hybrid_hits = hybrid_a
+            .recall_with_filter(
+                "wideninghybrid",
+                2,
+                None,
+                None,
+                None,
+                2,
+                Some(hybrid_filter),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            hybrid_evals.load(Ordering::SeqCst),
+            2,
+            "hybrid widening must re-evaluate extra_filter instead of reusing round-1 verdict"
+        );
+        assert_eq!(
+            hybrid_hits
+                .iter()
+                .map(|e| e.key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["safe_tail"]
+        );
+        {
+            let hybrid_verify = hybrid_b.store.lock();
+            let safe_a_after = hybrid_verify.get(&safe_a_id).unwrap().unwrap();
+            assert_eq!(safe_a_after.access_count, 0);
+            assert_eq!(safe_a_after.recall_count, 0);
+            let safe_tail_after = hybrid_verify.get(&safe_tail_id).unwrap().unwrap();
+            assert_eq!(safe_tail_after.access_count, 1);
+            assert_eq!(safe_tail_after.recall_count, 1);
+        }
+
+        // Part 2: Recent widening — another handle rewrites `recent_a`'s namespace
+        // while keeping `recent_a.id` unchanged between recent widening rounds.
+        let (tmp_recent, recent_a) = temp_tachi();
+        let recent_b = TachiMemory::new("tachi", tmp_recent.path()).unwrap();
+
+        let seed_recent = |store: &Mutex<MemoryStore>, id: &str, key: &str, ts: &str| {
+            let raw = portable_kernel::MemoryEntry {
+                id: id.into(),
+                path: TachiMemory::storage_path(None, None, &MemoryCategory::Core, key),
+                summary: format!("recent {key}"),
+                text: format!("recent {key}"),
+                importance: 0.7,
+                timestamp: ts.into(),
+                valid_from: ts.into(),
+                valid_until: None,
+                category: "fact".into(),
+                topic: String::new(),
+                keywords: Vec::new(),
+                persons: Vec::new(),
+                entities: Vec::new(),
+                location: String::new(),
+                source: "zeroclaw".into(),
+                scope: "general".into(),
+                archived: false,
+                access_count: 0,
+                scored_count: 0,
+                last_use_at: None,
+                last_access: None,
+                revision: 1,
+                vector: None,
+                retention_policy: None,
+                domain: None,
+                metadata: TachiMemory::build_metadata(
+                    key,
+                    &MemoryCategory::Core,
+                    None,
+                    None,
+                    None,
+                    &StoreOptions::default(),
+                ),
+                recall_count: 0,
+                query_diversity: 0,
+                tier: portable_kernel::types::default_tier(),
+            };
+            store.lock().upsert(&raw).unwrap();
+        };
+
+        seed_recent(
+            &recent_a.store,
+            "r-tail",
+            "recent_tail",
+            "2026-07-10T10:00:00Z",
+        );
+        for idx in 0..18 {
+            seed_recent(
+                &recent_a.store,
+                &format!("r-fill-{idx}"),
+                &format!("filler_{idx}"),
+                &format!("2026-07-10T10:00:{:02}Z", idx + 1),
+            );
+        }
+        seed_recent(&recent_a.store, "r-a", "recent_a", "2026-07-10T10:00:19Z");
+
+        let recent_evals = Arc::new(AtomicUsize::new(0));
+        let recent_mutated = Arc::new(AtomicBool::new(false));
+        let recent_evals_c = Arc::clone(&recent_evals);
+        let recent_mutated_c = Arc::clone(&recent_mutated);
+        let recent_writer = recent_b.clone();
+
+        let recent_filter: Arc<RecallEntryPredicate> = Arc::new(move |entry: &MemoryEntry| {
+            if entry.key == "recent_a" {
+                recent_evals_c.fetch_add(1, Ordering::SeqCst);
+                let allowed = entry.namespace == DEFAULT_NAMESPACE;
+                if !recent_mutated_c.swap(true, Ordering::SeqCst) {
+                    let mut guard = recent_writer.store.lock();
+                    let mut updated = guard.get("r-a").unwrap().unwrap();
+                    if let Some(obj) = updated.metadata.as_object_mut() {
+                        obj.insert(
+                            METADATA_ZC_NAMESPACE.into(),
+                            serde_json::Value::String("restricted".into()),
+                        );
+                    }
+                    guard.upsert(&updated).unwrap();
+                }
+                allowed
+            } else {
+                entry.namespace == DEFAULT_NAMESPACE && !entry.key.starts_with("filler_")
+            }
+        });
+
+        let recent_hits = recent_a
+            .recall_with_filter("", 2, None, None, None, 2, Some(recent_filter))
+            .await
+            .unwrap();
+        assert_eq!(
+            recent_evals.load(Ordering::SeqCst),
+            2,
+            "recent widening must re-evaluate extra_filter instead of reusing round-1 verdict"
+        );
+        assert_eq!(
+            recent_hits
+                .iter()
+                .map(|e| e.key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["recent_tail"]
+        );
     }
 }

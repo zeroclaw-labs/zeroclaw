@@ -195,6 +195,57 @@ fn memory_storage_refs_from_snapshot_are_accepted() {
 }
 
 #[test]
+fn quickstart_fresh_tachi_memory_uses_bare_backend_and_gates_on_feature() {
+    let mut cfg = Config::default();
+    let snapshot = snapshot_state(&cfg);
+    assert_eq!(
+        snapshot.memory_kinds.iter().any(|kind| kind == "tachi"),
+        zeroclaw_memory::TACHI_COMPILED
+    );
+
+    let choice = SelectorChoice::Fresh(MemoryChoice::Tachi);
+    let mut errors = Vec::new();
+    let applied = apply_memory(&mut cfg, &choice, &mut errors, None);
+
+    if zeroclaw_memory::TACHI_COMPILED {
+        assert!(errors.is_empty(), "apply_memory errors: {errors:?}");
+        assert_eq!(applied.as_deref(), Some("tachi"));
+        assert_eq!(cfg.memory.backend, "tachi");
+        assert!(
+            cfg.validate().is_ok(),
+            "Config with bare tachi memory backend must validate"
+        );
+
+        let mut builder_cfg = Config::default();
+        let mut submission = fresh_submission("tachi_bot");
+        submission.memory = SelectorChoice::Fresh(MemoryChoice::Tachi);
+        let mut staged = Vec::new();
+        let mut submit_errors = Vec::new();
+        let applied_agent = apply_into(
+            &mut builder_cfg,
+            &submission,
+            &mut staged,
+            &mut submit_errors,
+            None,
+        );
+        assert!(
+            submit_errors.is_empty(),
+            "apply_into errors: {submit_errors:?}"
+        );
+        assert!(applied_agent.is_some());
+        assert_eq!(builder_cfg.memory.backend, "tachi");
+    } else {
+        assert!(applied.is_none());
+        assert!(
+            errors
+                .iter()
+                .any(|err| err.message.contains("memory-tachi")),
+            "expected feature-gate QuickstartError, got {errors:?}"
+        );
+    }
+}
+
+#[test]
 fn apply_serializes_provider_fields_as_snake_case() {
     let mut cfg = Config::default();
     let submission = fresh_submission("bot");

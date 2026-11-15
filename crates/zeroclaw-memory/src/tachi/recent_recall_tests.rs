@@ -316,7 +316,7 @@ async fn large_agent_allowlists_merge_batches_before_the_global_limit() {
 }
 
 #[tokio::test]
-async fn recent_time_bounds_preserve_literal_comparison_and_zero_limit() {
+async fn recent_time_bounds_honor_inclusive_rfc3339_instants_literal_fallback_and_zero_limit() {
     let tmp = TempDir::new().unwrap();
     let memory = TachiMemory::new("tachi", tmp.path()).unwrap();
     {
@@ -329,15 +329,29 @@ async fn recent_time_bounds_preserve_literal_comparison_and_zero_limit() {
             store.upsert(&row(id, None, None, None, timestamp)).unwrap();
         }
     }
-    for (since, expected) in [
-        ("2026-07-09T00:00:00.000Z", vec!["at-end", "at-start"]),
-        ("2026-07-09T00:00:00Z", vec!["at-end"]),
+    for (since, until, expected) in [
+        (
+            "2026-07-09T00:00:00.000Z",
+            "2026-07-10T00:00:00.000Z",
+            vec!["at-end", "at-start"],
+        ),
+        (
+            "2026-07-09T00:00:00Z",
+            "2026-07-10T00:00:00Z",
+            vec!["at-end", "at-start"],
+        ),
+        (
+            "2026-07-09T08:00:00+08:00",
+            "2026-07-10T08:00:00+08:00",
+            vec!["at-end", "at-start"],
+        ),
+        ("2026-07-10", "2026-07-10T23:59:59Z", vec!["at-end"]),
     ] {
         let actual = memory
-            .recall("*", 10, None, Some(since), Some("2026-07-10T00:00:00.000Z"))
+            .recall("*", 10, None, Some(since), Some(until))
             .await
             .unwrap();
-        assert_eq!(ids(&actual), expected);
+        assert_eq!(ids(&actual), expected, "since={since} until={until}");
     }
     assert!(
         memory

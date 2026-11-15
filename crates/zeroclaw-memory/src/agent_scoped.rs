@@ -1,5 +1,6 @@
 use super::traits::{
-    ExportFilter, Memory, MemoryCategory, MemoryEntry, ProceduralMessage, StoreOptions,
+    ExportFilter, Memory, MemoryCategory, MemoryEntry, ProceduralMessage, RecallEntryPredicate,
+    StoreOptions,
 };
 use anyhow::Result;
 use async_trait::async_trait;
@@ -498,14 +499,126 @@ impl Memory for AgentScopedMemory {
         since: Option<&str>,
         until: Option<&str>,
     ) -> Result<Vec<MemoryEntry>> {
-        let entries = self
-            .recall(query, limit * 2, session_id, since, until)
-            .await?;
-        Ok(entries
-            .into_iter()
-            .filter(|e| e.namespace == namespace)
-            .take(limit)
-            .collect())
+        self.recall_namespaced_with_filter(
+            namespace,
+            query,
+            limit,
+            session_id,
+            since,
+            until,
+            limit.saturating_mul(2),
+            None,
+        )
+        .await
+    }
+
+    async fn recall_with_filter(
+        &self,
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+        since: Option<&str>,
+        until: Option<&str>,
+        refill_limit: usize,
+        filter: Option<Arc<RecallEntryPredicate>>,
+    ) -> Result<Vec<MemoryEntry>> {
+        let allowed = self.allowed_slice();
+        self.inner
+            .recall_for_agents_with_filter(
+                &allowed,
+                query,
+                limit,
+                session_id,
+                since,
+                until,
+                refill_limit,
+                filter,
+            )
+            .await
+    }
+
+    async fn recall_namespaced_with_filter(
+        &self,
+        namespace: &str,
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+        since: Option<&str>,
+        until: Option<&str>,
+        refill_limit: usize,
+        filter: Option<Arc<RecallEntryPredicate>>,
+    ) -> Result<Vec<MemoryEntry>> {
+        if namespace == crate::SOUL_NAMESPACE {
+            return Ok(Vec::new());
+        }
+        let allowed = self.allowed_slice();
+        let ns_owned = namespace.to_string();
+        let pred: Arc<RecallEntryPredicate> = match filter {
+            Some(outer) => Arc::new(move |e: &MemoryEntry| e.namespace == ns_owned && outer(e)),
+            None => Arc::new(move |e: &MemoryEntry| e.namespace == ns_owned),
+        };
+        self.inner
+            .recall_for_agents_with_filter(
+                &allowed,
+                query,
+                limit,
+                session_id,
+                since,
+                until,
+                refill_limit.max(limit.saturating_mul(2)),
+                Some(pred),
+            )
+            .await
+    }
+
+    async fn recall_for_agents_with_filter(
+        &self,
+        caller_allowed: &[&str],
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+        since: Option<&str>,
+        until: Option<&str>,
+        refill_limit: usize,
+        filter: Option<Arc<RecallEntryPredicate>>,
+    ) -> Result<Vec<MemoryEntry>> {
+        if caller_allowed.is_empty() {
+            let bound: Vec<&str> = self.allowed_agent_ids.iter().map(String::as_str).collect();
+            return self
+                .inner
+                .recall_for_agents_with_filter(
+                    &bound,
+                    query,
+                    limit,
+                    session_id,
+                    since,
+                    until,
+                    refill_limit,
+                    filter,
+                )
+                .await;
+        }
+
+        let intersected: Vec<&str> = caller_allowed
+            .iter()
+            .copied()
+            .filter(|id| self.allowed_agent_ids.contains(*id))
+            .collect();
+        if intersected.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.inner
+            .recall_for_agents_with_filter(
+                &intersected,
+                query,
+                limit,
+                session_id,
+                since,
+                until,
+                refill_limit,
+                filter,
+            )
+            .await
     }
 
     async fn export(&self, filter: &ExportFilter) -> Result<Vec<MemoryEntry>> {

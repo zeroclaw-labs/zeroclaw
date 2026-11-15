@@ -12,7 +12,7 @@ mod format;
 mod host;
 mod schema;
 mod snapshot;
-mod source;
+pub(crate) mod source;
 
 #[cfg(all(test, unix))]
 mod tests;
@@ -343,18 +343,22 @@ fn validate_target_with_boundary(
     Ok(actual)
 }
 
-fn open_store(path: &Path, kind: KernelStoreKind, context: DbOpenContext) -> Result<MemoryStore> {
+pub(crate) fn open_store(
+    path: &Path,
+    kind: KernelStoreKind,
+    context: DbOpenContext,
+) -> Result<MemoryStore> {
     Ok(MemoryStore::open_with_context(
         utf8(path)?,
         &kind.context(context),
     )?)
 }
 
-fn utf8(path: &Path) -> Result<&str> {
+pub(crate) fn utf8(path: &Path) -> Result<&str> {
     path.to_str().context("kernel database path is not UTF-8")
 }
 
-fn open_read_only_snapshot(path: &Path) -> Result<Connection> {
+pub(crate) fn open_read_only_snapshot(path: &Path) -> Result<Connection> {
     let conn = Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -366,13 +370,13 @@ fn open_read_only_snapshot(path: &Path) -> Result<Connection> {
     Ok(conn)
 }
 
-fn close_connection(conn: Connection) -> Result<()> {
+pub(crate) fn close_connection(conn: Connection) -> Result<()> {
     conn.close()
         .map_err(|(_, error)| error)
         .context("close migration SQLite connection")
 }
 
-fn backup(source: &Connection, path: &Path) -> Result<()> {
+pub(crate) fn backup(source: &Connection, path: &Path) -> Result<()> {
     let mut destination = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
     destination.busy_timeout(Duration::from_secs(5))?;
     {
@@ -396,7 +400,7 @@ fn backup(source: &Connection, path: &Path) -> Result<()> {
     close_connection(destination)
 }
 
-fn checkpoint(path: &Path) -> Result<()> {
+pub(crate) fn checkpoint(path: &Path) -> Result<()> {
     let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
     conn.busy_timeout(Duration::from_secs(5))?;
     let (busy, log, copied): (i64, i64, i64) =
@@ -422,7 +426,7 @@ fn checkpoint(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn private_tempfile(directory: &Path, prefix: &str) -> Result<NamedTempFile> {
+pub(crate) fn private_tempfile(directory: &Path, prefix: &str) -> Result<NamedTempFile> {
     let file = tempfile::Builder::new()
         .prefix(prefix)
         .suffix(".db")
@@ -431,7 +435,7 @@ fn private_tempfile(directory: &Path, prefix: &str) -> Result<NamedTempFile> {
     Ok(file)
 }
 
-fn create_private_file(path: &Path) -> Result<File> {
+pub(crate) fn create_private_file(path: &Path) -> Result<File> {
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -444,7 +448,7 @@ fn create_private_file(path: &Path) -> Result<File> {
     Ok(file)
 }
 
-fn set_private_permissions(path: &Path, directory: bool) -> Result<()> {
+pub(crate) fn set_private_permissions(path: &Path, directory: bool) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -461,7 +465,7 @@ fn set_private_permissions(path: &Path, directory: bool) -> Result<()> {
     }
 }
 
-fn refuse_occupied_target(path: &Path) -> Result<()> {
+pub(crate) fn refuse_occupied_target(path: &Path) -> Result<()> {
     for suffix in TARGET_SUFFIXES {
         match std::fs::symlink_metadata(source::suffixed(path, suffix)) {
             Ok(_) => bail!("migration target database or sidecar is already occupied ({suffix})"),
@@ -472,15 +476,15 @@ fn refuse_occupied_target(path: &Path) -> Result<()> {
     Ok(())
 }
 
-struct HeldDirectory {
-    path: PathBuf,
-    file: File,
+pub(crate) struct HeldDirectory {
+    pub(crate) path: PathBuf,
+    pub(crate) file: File,
     #[cfg(unix)]
     owner_uid: Option<u32>,
 }
 
 impl HeldDirectory {
-    fn open(path: &Path) -> Result<Self> {
+    pub(crate) fn open(path: &Path) -> Result<Self> {
         let directory = Self {
             path: path.to_owned(),
             file: File::open(path)?,
@@ -491,7 +495,7 @@ impl HeldDirectory {
         Ok(directory)
     }
 
-    fn verify(&self) -> Result<()> {
+    pub(crate) fn verify(&self) -> Result<()> {
         let metadata = std::fs::symlink_metadata(&self.path)?;
         ensure!(
             metadata.is_dir()
@@ -512,7 +516,7 @@ impl HeldDirectory {
         Ok(())
     }
 
-    fn require_private_owner(&mut self, staging: &Path) -> Result<()> {
+    pub(crate) fn require_private_owner(&mut self, staging: &Path) -> Result<()> {
         self.verify()?;
         #[cfg(unix)]
         {
@@ -609,12 +613,14 @@ struct Publication<'a> {
     source_files: &'a [SourceFileDigest],
 }
 
-fn publish(
+pub(crate) fn publish_verified_target(
     target: NamedTempFile,
     destination: &Path,
     parent: HeldDirectory,
-    verification: Publication<'_>,
+    source_path: &Path,
+    source_files: &[SourceFileDigest],
     after_publication: impl FnOnce(&Path) -> Result<()>,
+    validate_published: impl FnOnce(&Path, &dyn Fn() -> Result<()>) -> Result<()>,
 ) -> Result<()> {
     let marker_path = source::suffixed(target.path(), ".migration-marker");
     let marker_bytes = std::fs::read(&marker_path)
@@ -648,18 +654,11 @@ fn publish(
     after_publication(destination)?;
     // A validation failure is rollback of these newly owned files, never a
     // repair of an existing target or an unlink of an unowned replacement.
-    validate_target_with_boundary(
-        destination,
-        verification.kind,
-        verification.inventory,
-        verification.expected,
-        Some((verification.receipt_key, verification.receipt_json)),
-        || published.verify(destination),
-    )?;
+    validate_published(destination, &|| published.verify(destination))?;
     published.verify(destination)?;
     checkpoint(destination)?;
     published.verify(destination)?;
-    source::verify_unchanged(verification.source_path, verification.source_files)?;
+    source::verify_unchanged(source_path, source_files)?;
     for owned in &published.files {
         owned.file.sync_all()?;
     }
@@ -667,4 +666,32 @@ fn publish(
     published.verify(destination)?;
     published.retained = true;
     Ok(())
+}
+
+fn publish(
+    target: NamedTempFile,
+    destination: &Path,
+    parent: HeldDirectory,
+    verification: Publication<'_>,
+    after_publication: impl FnOnce(&Path) -> Result<()>,
+) -> Result<()> {
+    publish_verified_target(
+        target,
+        destination,
+        parent,
+        verification.source_path,
+        verification.source_files,
+        after_publication,
+        |dest, boundary| {
+            validate_target_with_boundary(
+                dest,
+                verification.kind,
+                verification.inventory,
+                verification.expected,
+                Some((verification.receipt_key, verification.receipt_json)),
+                boundary,
+            )?;
+            Ok(())
+        },
+    )
 }

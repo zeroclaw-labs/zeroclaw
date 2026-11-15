@@ -524,25 +524,27 @@ pub fn snapshot_state(cfg: &Config) -> QuickstartState {
     }
 }
 
-/// Snake-case wire keys for every `MemoryBackendKind` variant. Exhaustive
+/// Snake-case wire keys for available `MemoryBackendKind` variants. Exhaustive
 /// match probe catches missing variants at compile time; serde produces
 /// the wire key so there's no parallel mapping.
 fn memory_kind_keys() -> Vec<String> {
     use zeroclaw_config::multi_agent::MemoryBackendKind as M;
-    [M::Sqlite, M::Markdown, M::Lucid, M::None]
+    [M::Sqlite, M::Tachi, M::Markdown, M::Lucid, M::None]
         .into_iter()
-        .map(|k| {
+        .filter_map(|k| {
             // Exhaustiveness guard: adding a new variant forces this match to fail
             // to compile until the contributor decides whether the new backend
             // belongs in the quickstart picker. The retired postgres/qdrant
-            // variants only parse for old configs and are never offered.
+            // variants only parse for old configs and are never offered; tachi is
+            // offered only when this build includes `memory-tachi`.
             match k {
-                M::Sqlite | M::Markdown | M::Lucid | M::None | M::Postgres | M::Qdrant => (),
+                M::Sqlite | M::Markdown | M::Lucid | M::None => (),
+                M::Tachi if zeroclaw_memory::TACHI_COMPILED => (),
+                M::Tachi | M::Postgres | M::Qdrant => return None,
             }
             serde_json::to_value(k)
                 .ok()
                 .and_then(|v| v.as_str().map(str::to_string))
-                .unwrap_or_default()
         })
         .collect()
 }
@@ -1357,8 +1359,20 @@ fn apply_memory(
                 .ok()
                 .and_then(|v| v.as_str().map(str::to_string))
                 .unwrap_or_else(|| format!("{kind:?}").to_lowercase());
-            if matches!(kind, MemoryChoice::None) {
-                if let Err(err) = config.set_prop_persistent("memory.backend", "none") {
+            if matches!(kind, MemoryChoice::Tachi) && !zeroclaw_memory::TACHI_COMPILED {
+                errors.push(QuickstartError::for_surface(
+                    ctx,
+                    QuickstartStep::Memory,
+                    "backend",
+                    "memory backend 'tachi' requires a build with `memory-tachi` enabled"
+                        .to_string(),
+                    "cli-quickstart-error-tachi-not-compiled",
+                    &[],
+                ));
+                return None;
+            }
+            if matches!(kind, MemoryChoice::None | MemoryChoice::Tachi) {
+                if let Err(err) = config.set_prop_persistent("memory.backend", &kind_name) {
                     errors.push(QuickstartError::new(
                         QuickstartStep::Memory,
                         "backend",
@@ -1366,7 +1380,7 @@ fn apply_memory(
                     ));
                     return None;
                 }
-                return Some("none".to_string());
+                return Some(kind_name);
             }
             let backend_ref = format!("{kind_name}.{kind_name}");
             let parent_path = format!("storage.{kind_name}");

@@ -47,6 +47,11 @@ pub async fn handle_command(command: crate::MemoryCommands, config: &Config) -> 
             store,
             approved_by,
         } => handle_kernel_migration(&source, &destination, store, &approved_by),
+        crate::MemoryCommands::MigrateNative {
+            source,
+            destination,
+            approved_by,
+        } => handle_native_migration(&source, &destination, &approved_by),
         crate::MemoryCommands::List {
             category,
             session,
@@ -60,6 +65,34 @@ pub async fn handle_command(command: crate::MemoryCommands, config: &Config) -> 
         }
         crate::MemoryCommands::Reindex => handle_reindex(config).await,
     }
+}
+
+#[cfg(feature = "memory-tachi")]
+fn ensure_offline_migration_preconditions(
+    approved_by: &str,
+    approval_key: &str,
+    approval_fallback: &str,
+    platform_key: &str,
+    platform_fallback: &str,
+) -> Result<()> {
+    if approved_by.trim().is_empty() {
+        bail!(mt(approval_key, approval_fallback));
+    }
+    if !cfg!(unix) {
+        bail!(mt(platform_key, platform_fallback));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "memory-tachi")]
+fn print_offline_migration_receipt<T: serde::Serialize>(
+    receipt: &T,
+    complete_key: &str,
+    complete_fallback: &str,
+) -> Result<()> {
+    println!("{}", serde_json::to_string_pretty(receipt)?);
+    eprintln!("{}", mt(complete_key, complete_fallback));
+    Ok(())
 }
 
 /// Run the explicit offline conversion without loading the agent configuration.
@@ -80,18 +113,13 @@ pub fn handle_kernel_migration(
     }
     #[cfg(feature = "memory-tachi")]
     {
-        if approved_by.trim().is_empty() {
-            bail!(mt(
-                "cli-memory-kernel-approval-required",
-                "Provide a non-empty operator identity with --approved-by."
-            ));
-        }
-        if !cfg!(unix) {
-            bail!(mt(
-                "cli-memory-kernel-platform-required",
-                "Offline kernel migration requires Unix file identity and owner-only permissions. Run it on a Unix system."
-            ));
-        }
+        ensure_offline_migration_preconditions(
+            approved_by,
+            "cli-memory-kernel-approval-required",
+            "Provide a non-empty operator identity with --approved-by.",
+            "cli-memory-kernel-platform-required",
+            "Offline kernel migration requires Unix file identity and owner-only permissions. Run it on a Unix system.",
+        )?;
         let kind = match store {
             crate::KernelMigrationStoreKind::Memory => {
                 zeroclaw_memory::kernel_store::KernelStoreKind::Memory
@@ -106,15 +134,45 @@ pub fn handle_kernel_migration(
             kind,
             approved_by,
         )?;
-        println!("{}", serde_json::to_string_pretty(&receipt)?);
-        eprintln!(
-            "{}",
-            mt(
-                "cli-memory-kernel-migration-complete",
-                "Verified migration complete. Review the receipt before switching database paths."
-            )
-        );
-        Ok(())
+        print_offline_migration_receipt(
+            &receipt,
+            "cli-memory-kernel-migration-complete",
+            "Verified migration complete. Review the receipt before switching database paths.",
+        )
+    }
+}
+
+/// Run the explicit offline conversion from native `brain.db` into Tachi `tachi.db`
+/// without loading the agent configuration. Successful stdout contains only the
+/// structured migration receipt.
+pub fn handle_native_migration(source: &Path, destination: &Path, approved_by: &str) -> Result<()> {
+    #[cfg(not(feature = "memory-tachi"))]
+    {
+        let _ = (source, destination, approved_by);
+        bail!(mt(
+            "cli-memory-native-feature-required",
+            "Native brain migration requires a build with the memory-tachi feature."
+        ));
+    }
+    #[cfg(feature = "memory-tachi")]
+    {
+        ensure_offline_migration_preconditions(
+            approved_by,
+            "cli-memory-native-approval-required",
+            "Provide a non-empty operator identity with --approved-by.",
+            "cli-memory-native-platform-required",
+            "Offline native brain migration requires Unix file identity and owner-only permissions. Run it on a Unix system.",
+        )?;
+        let receipt = zeroclaw_memory::native_migration::migrate_native_brain_store(
+            source,
+            destination,
+            approved_by,
+        )?;
+        print_offline_migration_receipt(
+            &receipt,
+            "cli-memory-native-migration-complete",
+            "Verified native brain migration complete. Review the receipt before switching database paths.",
+        )
     }
 }
 
@@ -711,5 +769,51 @@ mod tests {
 
         let msg = err.to_string();
         assert!(msg.contains("'qdrant'"), "got: {msg}");
+    }
+
+    #[test]
+    fn native_migration_requires_explicit_paths_and_operator() {
+        let args = [
+            "memory",
+            "migrate-native",
+            "--source",
+            "brain.db",
+            "--destination",
+            "tachi.db",
+            "--approved-by",
+            "operator",
+        ];
+        let parsed = MemoryCli::try_parse_from(args).unwrap();
+        assert!(matches!(
+            parsed.command,
+            crate::MemoryCommands::MigrateNative { .. }
+        ));
+        for start in [2, 4, 6] {
+            let mut missing = args.to_vec();
+            missing.drain(start..start + 2);
+            assert!(MemoryCli::try_parse_from(missing).is_err());
+        }
+    }
+
+    #[cfg(not(feature = "memory-tachi"))]
+    #[test]
+    fn native_migration_feature_off_does_not_touch_paths() {
+        let dir = TempDir::new().unwrap();
+        let source = dir.path().join("source.db");
+        let destination = dir.path().join("destination.db");
+        let error = handle_native_migration(&source, &destination, "operator").unwrap_err();
+        assert!(error.to_string().contains("memory-tachi"));
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[cfg(feature = "memory-tachi")]
+    #[test]
+    fn native_migration_blank_approval_does_not_touch_paths() {
+        let dir = TempDir::new().unwrap();
+        let source = dir.path().join("source.db");
+        let destination = dir.path().join("destination.db");
+        let error = handle_native_migration(&source, &destination, "   ").unwrap_err();
+        assert!(error.to_string().contains("--approved-by"));
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 }

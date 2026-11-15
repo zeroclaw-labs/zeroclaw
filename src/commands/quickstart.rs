@@ -618,6 +618,7 @@ pub async fn run_quickstart_cli(
                     MemoryChoice::Sqlite
                     | MemoryChoice::Markdown
                     | MemoryChoice::Lucid
+                    | MemoryChoice::Tachi
                     | MemoryChoice::None
                     | MemoryChoice::Postgres
                     | MemoryChoice::Qdrant => (),

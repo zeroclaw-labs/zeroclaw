@@ -14,6 +14,10 @@ pub enum MemoryReadPolicy {
     SessionScoped,
 }
 
+/// Predicate applied to candidate entries before `limit` truncation and durable
+/// access accounting.
+pub type RecallEntryPredicate = dyn Fn(&MemoryEntry) -> bool + Send + Sync;
+
 /// Filter criteria for bulk memory export (GDPR Art. 20 data portability).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ExportFilter {
@@ -718,6 +722,105 @@ pub trait Memory: Send + Sync + crate::attribution::Attributable {
     /// override to do the real lookup.
     async fn ensure_agent_uuid(&self, alias: &str) -> anyhow::Result<String> {
         Ok(alias.to_string())
+    }
+
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    async fn recall_with_filter(
+        &self,
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+        since: Option<&str>,
+        until: Option<&str>,
+        refill_limit: usize,
+        filter: Option<std::sync::Arc<RecallEntryPredicate>>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        let fetch_limit = if filter.is_some() {
+            refill_limit
+        } else {
+            limit
+        };
+        let entries = self
+            .recall(query, fetch_limit, session_id, since, until)
+            .await?;
+        Ok(match filter {
+            Some(pred) => entries
+                .into_iter()
+                .filter(|e| pred(e))
+                .take(limit)
+                .collect(),
+            None => entries.into_iter().take(limit).collect(),
+        })
+    }
+
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    async fn recall_namespaced_with_filter(
+        &self,
+        namespace: &str,
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+        since: Option<&str>,
+        until: Option<&str>,
+        refill_limit: usize,
+        filter: Option<std::sync::Arc<RecallEntryPredicate>>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        let fetch_limit = if filter.is_some() {
+            refill_limit
+        } else {
+            limit
+        };
+        let entries = self
+            .recall_namespaced(namespace, query, fetch_limit, session_id, since, until)
+            .await?;
+        Ok(match filter {
+            Some(pred) => entries
+                .into_iter()
+                .filter(|e| pred(e))
+                .take(limit)
+                .collect(),
+            None => entries.into_iter().take(limit).collect(),
+        })
+    }
+
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    async fn recall_for_agents_with_filter(
+        &self,
+        allowed_agent_ids: &[&str],
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+        since: Option<&str>,
+        until: Option<&str>,
+        refill_limit: usize,
+        filter: Option<std::sync::Arc<RecallEntryPredicate>>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        let fetch_limit = if filter.is_some() {
+            refill_limit
+        } else {
+            limit
+        };
+        let entries = self
+            .recall_for_agents(
+                allowed_agent_ids,
+                query,
+                fetch_limit,
+                session_id,
+                since,
+                until,
+            )
+            .await?;
+        Ok(match filter {
+            Some(pred) => entries
+                .into_iter()
+                .filter(|e| pred(e))
+                .take(limit)
+                .collect(),
+            None => entries.into_iter().take(limit).collect(),
+        })
     }
 }
 

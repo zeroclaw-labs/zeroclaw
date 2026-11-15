@@ -49,6 +49,8 @@ pub enum MemoryBackendKind {
     /// Hybrid local SQLite + external Lucid CLI
     /// (`crates/zeroclaw-memory/src/lucid.rs`).
     Lucid,
+    /// Embedded Tachi portable kernel (`crates/zeroclaw-memory/src/tachi.rs`).
+    Tachi,
 }
 
 /// Per-agent workspace and cross-agent access configuration.
@@ -288,6 +290,7 @@ external_peers = ["@user_1", "@user_2"]
             (MemoryBackendKind::Qdrant, "\"qdrant\""),
             (MemoryBackendKind::Markdown, "\"markdown\""),
             (MemoryBackendKind::Lucid, "\"lucid\""),
+            (MemoryBackendKind::Tachi, "\"tachi\""),
         ];
         for (kind, expected) in cases {
             let json = serde_json::to_string(&kind).unwrap();

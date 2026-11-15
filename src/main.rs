@@ -1376,6 +1376,18 @@ enum MemoryCommands {
         #[arg(long)]
         approved_by: String,
     },
+    /// Convert a quiescent native brain.db database into a new, verified Tachi database.
+    MigrateNative {
+        /// Existing native brain.db database; never modified.
+        #[arg(long)]
+        source: PathBuf,
+        /// New Tachi database path; must not exist.
+        #[arg(long)]
+        destination: PathBuf,
+        /// Operator identity recorded in the migration receipt.
+        #[arg(long)]
+        approved_by: String,
+    },
     /// List memory entries with optional filters
     List {
         #[arg(long)]
@@ -1590,19 +1602,35 @@ fn main() -> Result<()> {
     // a missing or malformed agent config cannot block recovery. Use the OS
     // locale here; resolving the configured locale would read that config.
     if let Ok(matches) = command.clone().try_get_matches_from(std::env::args_os())
-        && let Commands::Memory {
-            memory_command:
-                MemoryCommands::MigrateKernel {
-                    source,
-                    destination,
-                    store,
-                    approved_by,
-                },
-        } = Cli::from_arg_matches(&matches)?.command
+        && let Commands::Memory { memory_command } = Cli::from_arg_matches(&matches)?.command
     {
-        #[cfg(feature = "agent-runtime")]
-        crate::i18n::init(&sys_locale::get_locale().unwrap_or_else(|| "en".to_string()));
-        return memory::cli::handle_kernel_migration(&source, &destination, store, &approved_by);
+        match memory_command {
+            MemoryCommands::MigrateKernel {
+                source,
+                destination,
+                store,
+                approved_by,
+            } => {
+                #[cfg(feature = "agent-runtime")]
+                crate::i18n::init(&sys_locale::get_locale().unwrap_or_else(|| "en".to_string()));
+                return memory::cli::handle_kernel_migration(
+                    &source,
+                    &destination,
+                    store,
+                    &approved_by,
+                );
+            }
+            MemoryCommands::MigrateNative {
+                source,
+                destination,
+                approved_by,
+            } => {
+                #[cfg(feature = "agent-runtime")]
+                crate::i18n::init(&sys_locale::get_locale().unwrap_or_else(|| "en".to_string()));
+                return memory::cli::handle_native_migration(&source, &destination, &approved_by);
+            }
+            _ => {}
+        }
     }
 
     // Locale detection runs while clap builds localized help, so expose the CLI

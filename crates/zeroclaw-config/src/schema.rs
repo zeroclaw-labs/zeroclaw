@@ -14229,21 +14229,25 @@ impl Config {
                 .next()
                 .unwrap_or_default()
                 .to_ascii_lowercase();
-            if backend_kind != "sqlite" {
+            if !matches!(backend_kind.as_str(), "sqlite" | "tachi") {
                 validation_bail!(
                     InvalidFormat,
                     flag_path,
-                    "{flag_path} = true requires memory.backend = \"sqlite\" (typed memory storage is SQLite-only), but memory.backend = {:?}",
+                    "{flag_path} = true requires memory.backend = \"sqlite\" or \"tachi\" (typed memory storage is SQLite-only/Tachi-only), but memory.backend = {:?}",
                     self.memory.backend
                 );
             }
             for (alias, agent) in &self.agents {
-                if agent.memory.backend != crate::multi_agent::MemoryBackendKind::Sqlite {
+                if !matches!(
+                    agent.memory.backend,
+                    crate::multi_agent::MemoryBackendKind::Sqlite
+                        | crate::multi_agent::MemoryBackendKind::Tachi
+                ) {
                     let agent_backend = agent.memory.backend;
                     validation_bail!(
                         InvalidFormat,
                         format!("agents.{alias}.memory.backend"),
-                        "{flag_path} = true requires every agent on the sqlite memory backend (typed memory storage is SQLite-only), but agents.{alias}.memory.backend = {agent_backend:?}",
+                        "{flag_path} = true requires every agent on the sqlite or tachi memory backend (typed memory storage is SQLite-only/Tachi-only), but agents.{alias}.memory.backend = {agent_backend:?}",
                     );
                 }
             }

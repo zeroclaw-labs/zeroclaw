@@ -12621,6 +12621,20 @@ async fn validate_accepts_typed_memory_flags_on_mixed_case_sqlite() {
 }
 
 #[test]
+async fn validate_accepts_typed_memory_flags_on_tachi() {
+    let mut config = multi_agent_test_config();
+    config.memory.types.enabled = true;
+    config.memory.consolidation_extract_facts = true;
+    config.memory.backend = "tachi".to_string();
+    let alpha = config.agents.get_mut("alpha").unwrap();
+    alpha.memory.backend = crate::multi_agent::MemoryBackendKind::Tachi;
+
+    config
+        .validate()
+        .expect("typed memory on tachi everywhere must pass validation");
+}
+
+#[test]
 async fn validate_allows_non_sqlite_backend_when_typed_memory_flags_off() {
     let mut config = multi_agent_test_config();
     config.memory.backend = "markdown.work".to_string();
