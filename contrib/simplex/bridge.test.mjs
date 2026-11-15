@@ -34,6 +34,12 @@ test('bridge carries private text, excludes sent/group events, and rejects unenc
     const item = {chatInfo: {type: 'direct', contact: {contactId: 17}}, chatItem: {meta: {itemId: 42}, chatDir: {type: 'directRcv'}, content: {type: 'rcvMsgContent', msgContent: {type: 'text', text: 'Hello'}}}};
     socket.send(JSON.stringify({resp: {type: 'newChatItems', chatItems: [item]}}));
     assert.deepEqual(await next(), {type: 'message', contact: '17', id: '42', text: 'Hello'});
+    const link = structuredClone(item);
+    link.chatItem.meta.itemId = 43;
+    link.chatItem.content.msgContent = {type: 'link', text: 'Please read https://example.test/profile',
+      preview: {uri: 'https://example.test/profile', title: 'Preview only', image: 'data:image/png;base64,fixture'}};
+    socket.send(JSON.stringify({resp: {type: 'newChatItems', chatItems: [link]}}));
+    assert.deepEqual(await next(), {type: 'message', contact: '17', id: '43', text: 'Please read https://example.test/profile'});
     item.chatItem.chatDir.type = 'directSnd';
     socket.send(JSON.stringify({resp: {type: 'newChatItems', chatItems: [item]}}));
     socket.send(JSON.stringify({resp: {type: 'callInvitation', callInvitation: {contact: {contactId: 17}, callType: {media: 'audio', capabilities: {encryption: false}}}}}));

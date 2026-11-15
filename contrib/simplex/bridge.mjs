@@ -52,7 +52,9 @@ async function event(resp) {
         if (item.chatInfo?.type !== 'direct' || item.chatItem?.chatDir?.type !== 'directRcv') continue;
         if (await notes.invitation(item)) continue;
         const body = item.chatItem.content;
-        if (body?.type !== 'rcvMsgContent' || body.msgContent?.type !== 'text') continue;
+        // Link previews are ordinary user text with optional preview metadata.
+        if (body?.type !== 'rcvMsgContent' || !['text', 'link'].includes(body.msgContent?.type)
+            || typeof body.msgContent.text !== 'string') continue;
         await emit({type: 'message', contact: contactId(item.chatInfo.contact.contactId),
           id: String(item.chatItem.meta.itemId), text: body.msgContent.text});
       }
