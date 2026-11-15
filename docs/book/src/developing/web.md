@@ -107,6 +107,7 @@ for example `secret/agents`. OpenBao then offers **Add** to create a
 record and **Link existing secret** to register an existing reference.
 The editable reference defaults to `<prefix>/<alias>/<field>`.
 Existing read-side OpenBao identity and ACLs still govern later use.
+Set `BAO_CACERT` to a PEM CA bundle if the vault uses a private CA.
 
 The authenticated operator supplies a short-lived write token for each
 write. Give that token `create` for new records or `patch` plus `read`

@@ -80,13 +80,18 @@ impl SecretWrite {
         {
             return Err(disabled);
         }
-        let client = Client::builder()
+        let mut client = Client::builder()
             .https_only(true)
             .redirect(Policy::none())
             .no_proxy()
-            .timeout(Duration::from_secs(8))
-            .build()
-            .map_err(|_| upstream)?;
+            .timeout(Duration::from_secs(8));
+        if let Some(path) = std::env::var_os("BAO_CACERT") {
+            let pem = std::fs::read(path).map_err(|_| disabled)?;
+            for cert in reqwest::Certificate::from_pem_bundle(&pem).map_err(|_| disabled)? {
+                client = client.add_root_certificate(cert);
+            }
+        }
+        let client = client.build().map_err(|_| upstream)?;
         let endpoint = |kind: &str| -> Result<Url, StatusCode> {
             let mut url = base.clone();
             url.path_segments_mut()
