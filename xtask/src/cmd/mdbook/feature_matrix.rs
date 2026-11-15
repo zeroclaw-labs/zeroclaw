@@ -7,11 +7,10 @@ use anyhow::Result;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::Path;
-use std::sync::Arc;
 
 use serde::Deserialize;
+use zeroclaw_api::tool::DEFAULT_TOOL_NAMES;
 use zeroclaw_config::schema::ChannelsConfig;
-use zeroclaw_runtime::tools::default_tools;
 
 const SNIPPET_DIR: &str = "docs/book/src/_snippets";
 const PARITY_FILE: &str = "docs/book/feature-matrix-parity.toml";
@@ -155,13 +154,11 @@ fn providers_rows(parity: &Parity) -> Result<Vec<Row>> {
 }
 
 fn tools_rows(parity: &Parity) -> Result<Vec<Row>> {
-    let security = Arc::new(zeroclaw_runtime::security::SecurityPolicy::default());
     let mut rows = Vec::new();
     let mut walked = std::collections::BTreeSet::new();
-    for tool in default_tools(security) {
-        let name = tool.name().to_string();
-        walked.insert(name.clone());
-        let (openclaw, hermes) = external_cells(parity.tools.get(&name));
+    for &name in DEFAULT_TOOL_NAMES {
+        walked.insert(name.to_string());
+        let (openclaw, hermes) = external_cells(parity.tools.get(name));
         rows.push(Row {
             label: format!("`{name}`"),
             zeroclaw: Status::Supported,

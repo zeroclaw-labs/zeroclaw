@@ -362,6 +362,21 @@ pub trait Tool: Send + Sync + crate::attribution::Attributable {
     }
 }
 
+/// Canonical ordered list of built-in default tool names registered by
+/// `zeroclaw_runtime::tools::default_tools`.
+///
+/// Exposed as lightweight metadata here so `xtask` can render the tool feature
+/// matrix without depending on `zeroclaw-runtime`. Kept in lockstep by
+/// `zeroclaw_runtime::tools::tests::default_tools_names_match_api_metadata`.
+pub const DEFAULT_TOOL_NAMES: &[&str] = &[
+    "shell",
+    "file_read",
+    "file_write",
+    "file_edit",
+    "glob_search",
+    "content_search",
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;

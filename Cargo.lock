@@ -4512,7 +4512,6 @@ dependencies = [
  "zeroclaw-api",
  "zeroclaw-config",
  "zeroclaw-providers",
- "zeroclaw-runtime",
  "zeroclaw-schema-markdown",
 ]
 

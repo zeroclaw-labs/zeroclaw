@@ -659,6 +659,14 @@ fn default_tools_names() {
 }
 
 #[test]
+fn default_tools_names_match_api_metadata() {
+    let security = Arc::new(SecurityPolicy::default());
+    let tools = default_tools(security);
+    let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+    assert_eq!(names.as_slice(), zeroclaw_api::tool::DEFAULT_TOOL_NAMES);
+}
+
+#[test]
 fn default_tools_all_have_descriptions() {
     let security = Arc::new(SecurityPolicy::default());
     let tools = default_tools(security);
