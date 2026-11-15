@@ -227,7 +227,13 @@ pub(super) fn legacy_model(
     if !extra.is_empty() {
         connection["extra"] = extra.into();
     }
-    if kind == "openai" && raw.get("requires_openai_auth").and_then(Value::as_bool) == Some(true) {
+    if kind == "openai"
+        && raw.get("requires_openai_auth").and_then(Value::as_bool) == Some(true)
+        && raw
+            .get("api_key")
+            .and_then(Value::as_str)
+            .is_none_or(|key| key.trim().is_empty())
+    {
         connection["auth"] = json!({"mode":"codex"});
     } else if (kind == "qwen"
         && raw

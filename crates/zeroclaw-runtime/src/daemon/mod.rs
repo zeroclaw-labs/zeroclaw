@@ -8046,14 +8046,23 @@ mod tests {
 
         let commit = live.begin_config_commit().await.unwrap();
         let mut published = commit.current_config();
-        published
-            .providers
+        let mut registry = published
+            .provider_registry()
+            .expect("the opted-in provider exists");
+        let connection_id = registry
             .models
-            .ollama
-            .get_mut("priced")
-            .expect("the opted-in provider exists")
-            .base
-            .live_pricing = false;
+            .get("ollama.priced")
+            .expect("the opted-in model exists")
+            .provider()
+            .clone();
+        let connection = registry
+            .connections
+            .get_mut(&connection_id)
+            .expect("the opted-in connection exists");
+        let mut raw = serde_json::to_value(&*connection).expect("connection serializes");
+        raw["api"]["chat"]["live_pricing"] = serde_json::json!(false);
+        *connection = serde_json::from_value(raw).expect("connection remains valid");
+        published.providers.connections = registry.connections;
         let revision = commit.next_revision().unwrap();
         commit.publish(revision, published).unwrap();
         assert!(

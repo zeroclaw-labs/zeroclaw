@@ -6324,7 +6324,7 @@ permissions = ["http_client"]
         )));
 
         let tools = {
-            let registry_config = Arc::new(Config::default());
+            let registry_config = Arc::new(cfg.clone());
             let registry_config = {
                 let mut fixture = (*registry_config).clone();
                 fixture.browser = browser.clone();
@@ -6637,13 +6637,8 @@ permissions = ["http_client"]
 
         // `config` (arg 1) carries the canonical shared data_dir — exactly how
         // the production callers pass it (a clone of the runtime config).
-        let config = Config {
-            data_dir: data_dir.clone(),
-            ..Config::default()
-        };
-
         let tools = {
-            let registry_config = Arc::new(config);
+            let registry_config = Arc::new(root_config.clone());
             let registry_config = {
                 let mut fixture = (*registry_config).clone();
                 fixture.browser = browser.clone();
@@ -7127,7 +7122,7 @@ permissions = ["http_client"]
             .to_string();
 
         let tools = {
-            let registry_config = Arc::new(Config::default());
+            let registry_config = Arc::new(cfg.clone());
             let registry_config = {
                 let mut fixture = (*registry_config).clone();
                 fixture.browser = browser.clone();
@@ -8337,7 +8332,6 @@ permissions = ["http_client"]
                 fixture.browser = BrowserConfig::default();
                 fixture.http_request = HttpRequestConfig::default();
                 fixture.web_fetch = WebFetchConfig::default();
-                fixture.agents = HashMap::new();
                 std::sync::Arc::new(fixture)
             };
             let registry_runtime: std::sync::Arc<dyn zeroclaw_config::platform::RuntimeAdapter> =
@@ -8637,7 +8631,7 @@ permissions = ["http_client"]
                 fixture.browser = browser.clone();
                 fixture.http_request = http.clone();
                 fixture.web_fetch = web_fetch.clone();
-                fixture.agents = delegate_targets.clone();
+                fixture.agents.extend(delegate_targets.clone());
                 fixture.composio.api_key = Some("inventory-placeholder".to_owned());
                 fixture.composio.enabled = fixture.composio.api_key.is_some();
                 std::sync::Arc::new(fixture)

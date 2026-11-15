@@ -6056,7 +6056,7 @@ mod tests {
             Err(error) => error,
         };
         assert!(
-            error.to_string().contains("no root config"),
+            error.to_string().contains("admitted root config"),
             "unexpected error: {error:#}"
         );
         assert!(
@@ -12316,14 +12316,14 @@ mod tests {
         });
         let mut fixture = delegate_memory_fixture(Some(uri)).await;
         let mut config = fixture.tool.root_config.as_deref().unwrap().clone();
-        config
+        if let zeroclaw_config::provider_registry::ModelDefinition::Chat(model) = config
             .providers
             .models
-            .custom
-            .get_mut("local")
-            .unwrap()
-            .base
-            .native_tools = Some(true);
+            .canonical_model_mut(&"custom.local".into())
+            .expect("canonical local model exists")
+        {
+            model.options.native_tools = Some(true);
+        }
         let mut third = fixture.target_config.clone();
         third.risk_profile = "third".into();
         let third_profile = config.risk_profiles["agentic_test"].clone();
@@ -16495,7 +16495,7 @@ options = { extract_text_tool_calls = false }
             data_dir: workspace.to_path_buf(),
             agents: sample_agents(),
             providers: serde_json::from_value(json!({
-                "connections": {"fixture": {"kind":"custom", "uri":server.uri()}},
+                "connections": {"fixture": {"kind":"ollama", "uri":server.uri()}},
                 "models": {
                     "ollama.researcher": {"capability":"chat", "provider":"fixture", "model":"fixture-model"},
                     "openrouter.coder": {"capability":"chat", "provider":"fixture", "model":"fixture-model"}
@@ -16503,6 +16503,7 @@ options = { extract_text_tool_calls = false }
             })).unwrap(),
             ..Default::default()
         };
+        let config = zeroclaw_config::migration::admit_test_input(&config);
         let tool = with_in_memory_task_store(
             DelegateTool::new(sample_agents(), None, test_security())
                 .with_workspace_dir(workspace.to_path_buf())

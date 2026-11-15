@@ -10875,6 +10875,12 @@ impl RpcDispatcher {
 
     async fn handle_config_map_key_create(&self, params: &Value) -> RpcResult {
         let req: ConfigMapKeyCreateParams = parse_params(params)?;
+        if matches!(
+            req.path.as_str(),
+            "connections" | "models" | "model_presets" | "fallback"
+        ) {
+            return self.handle_config_registry_key_create(req).await;
+        }
         let key_path = format!("{}.{}", req.path, req.key);
         zeroclaw_config::schema::reject_retired_provider_edit_path(
             &self.ctx.config.read(),
@@ -10950,6 +10956,12 @@ impl RpcDispatcher {
 
     async fn handle_config_map_key_delete(&self, params: &Value) -> RpcResult {
         let req: ConfigMapKeyDeleteParams = parse_params(params)?;
+        if matches!(
+            req.path.as_str(),
+            "connections" | "models" | "model_presets" | "fallback"
+        ) {
+            return self.handle_config_registry_key_delete(req).await;
+        }
         let key_path = format!("{}.{}", req.path, req.key);
         zeroclaw_config::schema::reject_retired_provider_edit_path(
             &self.ctx.config.read(),
@@ -11292,6 +11304,116 @@ impl RpcDispatcher {
                 rewritten: 1,
                 warnings: Vec::new(),
             })
+        })
+    }
+
+    async fn handle_config_registry_key_create(&self, req: ConfigMapKeyCreateParams) -> RpcResult {
+        use zeroclaw_config::provider_registry::editor;
+
+        self.selector_config_write(Method::ConfigMapKeyCreate, "providers")?;
+        let commit = self
+            .ctx
+            .begin_config_commit()
+            .await
+            .map_err(config_commit_admission_error)?;
+        self.recheck_config_write_authority(
+            Method::ConfigMapKeyCreate,
+            Some("providers"),
+            &commit,
+        )?;
+        let mut working = commit.current_config();
+        let registry = working
+            .provider_registry()
+            .map_err(|error| rpc_err(INVALID_PARAMS, error.to_string()))?;
+        let definition = if req.path == "models" {
+            let base = registry
+                .models
+                .keys()
+                .filter(|reference| {
+                    req.key
+                        .strip_prefix(&format!("{}.", reference.as_str()))
+                        .is_some_and(|suffix| !suffix.is_empty())
+                })
+                .max_by_key(|reference| reference.as_str().len())
+                .and_then(|reference| registry.models.get(reference))
+                .map(serde_json::to_value)
+                .transpose()
+                .map_err(|error| rpc_err(INTERNAL_ERROR, error.to_string()))?
+                .unwrap_or_else(|| {
+                    let provider = req
+                        .key
+                        .rsplit_once('.')
+                        .map(|(prefix, _)| prefix)
+                        .and_then(|prefix| registry.models.get(prefix))
+                        .map(|model| model.provider().clone())
+                        .unwrap_or_else(|| "legacy.custom.default".into());
+                    serde_json::json!({
+                        "capability": "chat",
+                        "provider": provider,
+                    })
+                });
+            base
+        } else {
+            serde_json::json!({})
+        };
+        editor::create_entry(&mut working, &req.path, &req.key, definition)
+            .map_err(|error| rpc_err(INVALID_PARAMS, format!("{error:#}")))?;
+        let scope = if req.path == "models" {
+            LiveSessionRefreshScope::ModelRoutes
+        } else {
+            LiveSessionRefreshScope::SharedConstruction
+        };
+        let revision = self
+            .commit_config_with_live_session_refresh(
+                working,
+                commit,
+                &scope,
+                RpcConfigCommitEffects::default(),
+            )
+            .await?;
+        to_result(ConfigMapKeyCreateResult {
+            path: req.path,
+            key: req.key,
+            created: true,
+            revision: Some(revision.into()),
+        })
+    }
+
+    async fn handle_config_registry_key_delete(&self, req: ConfigMapKeyDeleteParams) -> RpcResult {
+        use zeroclaw_config::provider_registry::editor;
+
+        self.selector_config_write(Method::ConfigMapKeyDelete, "providers")?;
+        let commit = self
+            .ctx
+            .begin_config_commit()
+            .await
+            .map_err(config_commit_admission_error)?;
+        self.recheck_config_write_authority(
+            Method::ConfigMapKeyDelete,
+            Some("providers"),
+            &commit,
+        )?;
+        let mut working = commit.current_config();
+        editor::delete_entry(&mut working, &req.path, &req.key)
+            .map_err(|error| rpc_err(INVALID_PARAMS, format!("{error:#}")))?;
+        let scope = if req.path == "models" {
+            LiveSessionRefreshScope::ModelRoutes
+        } else {
+            LiveSessionRefreshScope::SharedConstruction
+        };
+        let revision = self
+            .commit_config_with_live_session_refresh(
+                working,
+                commit,
+                &scope,
+                RpcConfigCommitEffects::default(),
+            )
+            .await?;
+        to_result(ConfigMapKeyDeleteResult {
+            path: req.path,
+            key: req.key,
+            deleted: true,
+            revision: Some(revision.into()),
         })
     }
 
@@ -22077,17 +22199,22 @@ mod tests {
     #[test]
     fn oidc_principal_writes_config_at_an_unchanged_generation() {
         run_on_a_large_stack(|| async move {
+            use zeroclaw_config::provider_registry::editor;
+
             let tmp = tempfile::TempDir::new().unwrap();
             let (ctx, _chat_backend, _acp_store) =
                 persistence_enforcement_ctx(oidc_session_config(&tmp));
             let (mut oidc, mut rx) = oidc_peer(&ctx);
 
+            let expected = editor::snapshot(&ctx.config.read()).unwrap();
+            let mut registry = expected.clone();
+            registry["models"]["openai.test-provider"]["model"] = json!("oidc-model");
             let response = rpc(
                 &mut oidc,
                 &mut rx,
                 1,
-                "config/set",
-                json!({"prop": "providers.models.openai.test-provider.model", "value": "oidc-model"}),
+                "config/provider-registry-set",
+                json!({"expected": expected, "registry": registry}),
             )
             .await;
             assert!(response.get("error").is_none(), "{response}");
@@ -22099,12 +22226,15 @@ mod tests {
             // save again on the same connection.
             let listed = rpc(&mut oidc, &mut rx, 2, "config/list", json!({})).await;
             assert!(listed.get("error").is_none(), "{listed}");
+            let expected = editor::snapshot(&ctx.config.read()).unwrap();
+            let mut registry = expected.clone();
+            registry["models"]["openai.test-provider"]["model"] = json!("oidc-model-2");
             let again = rpc(
                 &mut oidc,
                 &mut rx,
                 3,
-                "config/set",
-                json!({"prop": "providers.models.openai.test-provider.model", "value": "oidc-model-2"}),
+                "config/provider-registry-set",
+                json!({"expected": expected, "registry": registry}),
             )
             .await;
             assert!(again.get("error").is_none(), "{again}");
@@ -22122,6 +22252,8 @@ mod tests {
     #[test]
     fn tightening_required_acr_through_config_set_forces_the_connection_to_reverify() {
         run_on_a_large_stack(|| async move {
+            use zeroclaw_config::provider_registry::editor;
+
             let tmp = tempfile::TempDir::new().unwrap();
             // Permit oidc.* writes so the ACR edit itself is authorized; the
             // fixture principal already holds Config:Update.
@@ -22136,15 +22268,15 @@ mod tests {
 
             // Control: a provider edit changes no authorization input, so the
             // established binding keeps working afterward.
+            let expected = editor::snapshot(&ctx.config.read()).unwrap();
+            let mut registry = expected.clone();
+            registry["models"]["openai.test-provider"]["model"] = json!("still-usable");
             let control = rpc(
                 &mut oidc,
                 &mut rx,
                 1,
-                "config/set",
-                json!({
-                    "prop": "providers.models.openai.test-provider.model",
-                    "value": "still-usable"
-                }),
+                "config/provider-registry-set",
+                json!({"expected": expected, "registry": registry}),
             )
             .await;
             assert!(control.get("error").is_none(), "control edit: {control}");
@@ -42284,6 +42416,13 @@ mod tests {
         };
         cfg.create_map_key("providers.models.openai", "default")
             .unwrap();
+        cfg.agents.insert(
+            "agent".into(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                model_provider: "openai.default".into(),
+                ..Default::default()
+            },
+        );
         cfg.set_prop_persistent("providers.models.openai.default.uri", &mock_a.uri())
             .expect("set initial uri");
         cfg.set_prop_persistent("providers.models.openai.default.api_key", "key-a")
@@ -42303,19 +42442,18 @@ mod tests {
         let mut dispatcher = RpcDispatcher::new(ctx, tx, "test-peer".into());
         dispatcher.set_authenticated_for_test();
 
-        // Rotate the provider profile's endpoint + key through config/set.
-        for (prop, value) in [
-            ("providers.models.openai.default.uri", mock_b.uri()),
-            (
-                "providers.models.openai.default.api_key",
-                "key-b".to_string(),
-            ),
-        ] {
-            let res = dispatcher
-                .handle_config_set(&json!({ "prop": prop, "value": value }))
-                .await;
-            assert!(res.is_ok(), "config/set {prop} must succeed: {res:?}");
-        }
+        // Rotate the canonical connection endpoint and key atomically.
+        let expected =
+            zeroclaw_config::provider_registry::editor::snapshot(&dispatcher.ctx.config.read())
+                .expect("registry snapshot");
+        let mut edit = expected.clone();
+        edit["connections"]["legacy.openai.default"]["uri"] = json!(mock_b.uri());
+        edit["connections"]["legacy.openai.default"]["auth"] =
+            json!({"mode":"api_key", "api_key":"key-b"});
+        let res = dispatcher
+            .handle_config_registry_set(&json!({"expected": expected, "registry": edit}))
+            .await;
+        assert!(res.is_ok(), "registry update must succeed: {res:?}");
 
         // Next embed must go to the NEW endpoint with the NEW key.
         mem.store("k1", "hello wiremock", MemoryCategory::Core, None)
@@ -42357,6 +42495,13 @@ mod tests {
         };
         cfg.create_map_key("providers.models.openai", "default")
             .unwrap();
+        cfg.agents.insert(
+            "agent".into(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                model_provider: "openai.default".into(),
+                ..Default::default()
+            },
+        );
         cfg.memory.embedding_provider = "openai.default".into();
         cfg.memory.embedding_model = "text-embedding-3-small".into();
         cfg.memory.embedding_dimensions = 1536;
@@ -42455,12 +42600,12 @@ mod tests {
         }
 
         let cfg_after = dispatcher.ctx.config.read().clone();
-        let stored = cfg_after
-            .providers
-            .models
-            .anthropic
-            .get("default")
-            .and_then(|e| e.base.api_key.clone());
+        let stored = cfg_after.provider_registry().ok().and_then(|registry| {
+            registry
+                .connections
+                .get("legacy.anthropic.default")
+                .and_then(|connection| connection.api_key().map(str::to_owned))
+        });
         assert_eq!(
             stored.as_deref(),
             Some("sk-live-secret"),
@@ -44866,8 +45011,8 @@ model = "before"
         // Deleting the referenced provider must be refused.
         let err = dispatcher
             .handle_config_map_key_delete(&json!({
-                "path": "providers.models.openai",
-                "key": "test-provider"
+                "path": "models",
+                "key": "openai.test-provider"
             }))
             .await
             .expect_err("delete of hard-referenced provider alias must fail");
@@ -44887,8 +45032,8 @@ model = "before"
         // session unaffected.
         let res = dispatcher
             .handle_config_map_key_delete(&json!({
-                "path": "providers.models.openai",
-                "key": "extra-provider"
+                "path": "models",
+                "key": "openai.extra-provider"
             }))
             .await;
         assert!(
@@ -45183,7 +45328,7 @@ model = "nested-fast-model"
         );
         dispatcher
             .handle_config_map_key_create(&json!({
-                "path": "providers.models.openai.test-provider.models", "key": "default"
+                "path": "models", "key": "openai.test-provider.default"
             }))
             .await
             .unwrap();
@@ -45236,7 +45381,7 @@ model = "nested-fast-model"
         );
         dispatcher
             .handle_config_map_key_create(&json!({
-                "path": "providers.models.openai.test-provider.models", "key": "default"
+                "path": "models", "key": "openai.test-provider.default"
             }))
             .await
             .unwrap();
@@ -45394,8 +45539,8 @@ options = { temperature = 0.2 }
         );
         let err = dispatcher
             .handle_config_map_key_delete(&json!({
-                "path": "providers.models.openai.test-provider.models",
-                "key": "fast"
+                "path": "models",
+                "key": "openai.test-provider.fast"
             }))
             .await
             .expect_err("a referenced nested model must not be deleted");
@@ -45405,12 +45550,10 @@ options = { temperature = 0.2 }
                 .ctx
                 .config
                 .read()
-                .providers
+                .provider_registry()
+                .expect("registry remains live")
                 .models
-                .find("openai", "test-provider")
-                .expect("profile remains live")
-                .models
-                .contains_key("fast")
+                .contains_key("openai.test-provider.fast")
         );
         let saved = tokio::fs::read_to_string(tmp.path().join("config.toml"))
             .await
@@ -45419,12 +45562,10 @@ options = { temperature = 0.2 }
             toml::from_str(&saved).expect("saved config must reload");
         assert!(
             reloaded
-                .providers
+                .provider_registry()
+                .expect("saved registry remains")
                 .models
-                .find("openai", "test-provider")
-                .expect("saved profile remains")
-                .models
-                .contains_key("fast")
+                .contains_key("openai.test-provider.fast")
         );
         assert_eq!(
             reloaded
@@ -47991,21 +48132,14 @@ options = { temperature = 0.2 }
     }
 
     fn provider_model(config: &zeroclaw_config::schema::Config, provider: &str) -> Option<String> {
-        match provider {
-            "anthropic" => config
-                .providers
-                .models
-                .anthropic
-                .get("default")
-                .and_then(|entry| entry.base.model.clone()),
-            "openai" => config
-                .providers
-                .models
-                .openai
-                .get("default")
-                .and_then(|entry| entry.base.model.clone()),
-            other => panic!("unexpected provider {other}"),
-        }
+        config
+            .provider_registry()
+            .ok()?
+            .resolve_chat(&zeroclaw_config::provider_registry::ModelRef::from(
+                format!("{provider}.default"),
+            ))
+            .ok()
+            .and_then(|model| model.upstream_model().map(str::to_owned))
     }
 
     /// Failed-save boundary: a `config/set` whose persistence fails must
@@ -48685,18 +48819,20 @@ options = { temperature = 0.2 }
         let cfg = make_two_provider_test_config(&tmp);
         let (dispatcher_a, dispatcher_b, _sessions) = make_two_dispatchers_sharing_context(cfg);
 
-        let params_a = json!({
-            "prop": "providers.models.anthropic.default.model",
-            "value": "concurrent-a"
-        });
-        let params_b = json!({
-            "prop": "providers.models.openai.default.model",
-            "value": "concurrent-b"
-        });
+        let params_a = registry_edit_params(
+            &dispatcher_a,
+            &["models", "anthropic.default", "model"],
+            json!("concurrent-a"),
+        );
+        let params_b = registry_edit_params(
+            &dispatcher_b,
+            &["models", "openai.default", "model"],
+            json!("concurrent-b"),
+        );
 
         let (result_a, result_b) = tokio::join!(
-            dispatcher_a.handle_config_set(&params_a),
-            dispatcher_b.handle_config_set(&params_b),
+            dispatcher_a.handle_config_registry_set(&params_a),
+            dispatcher_b.handle_config_registry_set(&params_b),
         );
         assert!(
             result_a.is_ok(),
@@ -51660,12 +51796,18 @@ options = { temperature = 0.2 }
         // stale refresh leaks through, the successor would flip to
         // "refreshed-model".
         publish_test_config(&dispatcher.ctx, |config| {
-            config
-                .providers
-                .models
-                .ensure("openai", "test-provider")
-                .expect("openai.test-provider slot exists")
-                .model = Some("old-model".into());
+            let _ = zeroclaw_config::provider_registry::editor::update(config, |registry| {
+                let model = registry
+                    .models
+                    .get_mut(&zeroclaw_config::provider_registry::ModelRef::from(
+                        "openai.test-provider",
+                    ))
+                    .expect("openai.test-provider model exists");
+                if let zeroclaw_config::provider_registry::ModelDefinition::Chat(chat) = model {
+                    chat.model = Some("old-model".into());
+                }
+                Ok(())
+            });
         });
 
         // Replace the session via ACP rehydration while the stale refresh is
