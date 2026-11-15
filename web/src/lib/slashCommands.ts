@@ -36,6 +36,18 @@ export const COMMANDS: readonly CommandSpec[] = [
   { name: 'upload', usage: '/upload', descriptionKey: 'agent.cmd_help_upload' },
 ] as const;
 
+/**
+ * Commands that change the agent for everyone (`/model` writes its config) or
+ * need the upload endpoint. A signed-in account without the operator dashboard
+ * can use neither.
+ */
+const OPERATOR_COMMANDS: ReadonlySet<CommandName> = new Set(['model', 'upload']);
+
+/** The commands offered to this caller; everything when `operator` is true. */
+export function commandsFor(operator: boolean): readonly CommandSpec[] {
+  return operator ? COMMANDS : COMMANDS.filter((c) => !OPERATOR_COMMANDS.has(c.name));
+}
+
 export interface ParsedCommand {
   /** The command name without the leading slash, lower-cased. */
   command: string;
@@ -73,13 +85,16 @@ export function parseCommand(input: string): ParsedCommand {
  * Commands whose name starts with `prefix` (without leading slash). Used to
  * drive the autocomplete hint popover. An empty prefix returns all commands.
  */
-export function matchCommands(prefix: string): CommandSpec[] {
+export function matchCommands(
+  prefix: string,
+  commands: readonly CommandSpec[] = COMMANDS,
+): CommandSpec[] {
   const p = prefix.toLowerCase();
-  return COMMANDS.filter((c) => c.name.startsWith(p));
+  return commands.filter((c) => c.name.startsWith(p));
 }
 
 /** Markdown body for `/help`, derived from {@link COMMANDS}. */
-export function helpText(): string {
-  const lines = COMMANDS.map((c) => `- \`${c.usage}\` — ${t(c.descriptionKey)}`);
+export function helpText(commands: readonly CommandSpec[] = COMMANDS): string {
+  const lines = commands.map((c) => `- \`${c.usage}\` — ${t(c.descriptionKey)}`);
   return `**${t('agent.cmd_help_header')}**\n${lines.join('\n')}\n\n${t('agent.cmd_help_escape')}`;
 }
