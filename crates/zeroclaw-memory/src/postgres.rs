@@ -506,6 +506,8 @@ impl PostgresMemory {
         #[allow(clippy::cast_possible_wrap)]
         let limit_i64 = limit as i64;
 
+        let has_v3_cols = self.vector_column;
+
         run_on_os_thread(move || -> Result<Vec<MemoryEntry>> {
             let has_session = sid.is_some();
             let has_agent = allowed.is_some();
@@ -513,11 +515,16 @@ impl PostgresMemory {
             let until = until_owned.is_some();
             let (where_frag, next_idx) =
                 Self::scoped_where(2, has_session, has_agent, since, until);
+            let v3_cols = if has_v3_cols {
+                "m.namespace, m.importance, "
+            } else {
+                ""
+            };
 
             let stmt = format!(
                 "
                 SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, \
-                       m.namespace, m.importance, a.alias AS agent_alias, m.agent_id,
+                       {v3_cols}a.alias AS agent_alias, m.agent_id,
                        (
                          CASE WHEN to_tsvector('simple', m.key) @@ plainto_tsquery('simple', $1)
                            THEN ts_rank_cd(to_tsvector('simple', m.key), plainto_tsquery('simple', $1)) * 2.0
@@ -1389,6 +1396,22 @@ mod tests {
             .expect("set ZEROCLAW_TEST_POSTGRES_URL to run ignored PostgreSQL tests")
     }
 
+    /// Whether the test cluster can install the pgvector extension. Tests that
+    /// assert vector-stage behavior skip (rather than fail) when this is false,
+    /// mirroring how the backend degrades to keyword-only in production.
+    fn pgvector_available(database_url: &str) -> bool {
+        Client::connect(database_url, NoTls)
+            .and_then(|mut client| {
+                client
+                    .query(
+                        "SELECT 1 FROM pg_available_extensions WHERE name = 'vector'",
+                        &[],
+                    )
+                    .map(|rows| !rows.is_empty())
+            })
+            .unwrap_or(false)
+    }
+
     #[test]
     fn scoped_where_assigns_placeholders_in_push_order() {
         // No session, no agent, no window: empty fragment, index unchanged.
@@ -1712,6 +1735,13 @@ mod tests {
     #[ignore = "requires ZEROCLAW_TEST_POSTGRES_URL"]
     fn postgres_embed_on_write_and_vector_recall_end_to_end() {
         let database_url = postgres_test_url();
+        if !pgvector_available(&database_url) {
+            eprintln!(
+                "skipping: pgvector extension is not installable on the test cluster; \
+                 the vector stage it would exercise is unavailable by design"
+            );
+            return;
+        }
         let schema = TestSchema::create(&database_url, "hybrid");
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
