@@ -11326,7 +11326,7 @@ impl RpcDispatcher {
             .provider_registry()
             .map_err(|error| rpc_err(INVALID_PARAMS, error.to_string()))?;
         let definition = if req.path == "models" {
-            let base = registry
+            registry
                 .models
                 .keys()
                 .filter(|reference| {
@@ -11351,8 +11351,7 @@ impl RpcDispatcher {
                         "capability": "chat",
                         "provider": provider,
                     })
-                });
-            base
+                })
         } else {
             serde_json::json!({})
         };
