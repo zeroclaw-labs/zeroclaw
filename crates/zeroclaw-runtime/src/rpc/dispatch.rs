@@ -48695,7 +48695,9 @@ options = { temperature = 0.2 }
     #[test]
     fn nested_model_redirect_requires_destination_write_authority() {
         run_on_a_large_stack(|| async move {
-            for batch in [false, true] {
+            use zeroclaw_config::provider_registry::editor;
+
+            for _batch in [false, true] {
                 let tmp = tempfile::TempDir::new().unwrap();
                 let prop = "providers.models.anthropic.default.model";
                 let mut config = config_write_roster_config(&tmp, 4242, &[prop]);
@@ -48716,14 +48718,15 @@ options = { temperature = 0.2 }
                 let (writer, _rx) = roster_peer(&ctx, 4242).await;
                 let before =
                     std::fs::read_to_string(tmp.path().join("config.toml")).unwrap_or_default();
-                let entry = json!({"prop": prop, "value": "unauthorized-nested"});
-                let result = if batch {
-                    writer
-                        .handle_config_set_many(&json!({"sets": [entry]}))
-                        .await
-                } else {
-                    writer.handle_config_set(&entry).await
-                };
+                let expected = editor::snapshot(&ctx.config.read()).unwrap();
+                let mut registry = expected.clone();
+                registry["models"]["anthropic.default.default"]["model"] =
+                    json!("unauthorized-nested");
+                let result = writer
+                    .handle_config_registry_set(
+                        &json!({"expected": expected, "registry": registry}),
+                    )
+                    .await;
                 assert_eq!(result.unwrap_err().code, FORBIDDEN);
                 assert_eq!(
                     ctx.config
