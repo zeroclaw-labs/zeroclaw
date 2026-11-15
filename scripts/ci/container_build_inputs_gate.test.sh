@@ -40,12 +40,18 @@ RUN cargo build --release --locked -p zeroclaw
 EOF
 expect_fail "missing root build script" "$build_only" "never copies root build.rs"
 
-for selector in '--package zeroclaw' '--package=zeroclaw' '-p=zeroclaw'; do
+for selector in '--package zeroclaw' '--package=zeroclaw' '-p=zeroclaw' \
+    '-pzeroclaw' '--bin=zeroclaw' '--package "zeroclaw"' '--package    zeroclaw'; do
     selected="${fixture_dir}/package-selector.Dockerfile"
     sed "s/-p zeroclaw/$selector/" "$build_only" > "$selected"
     expect_fail "missing build script with $selector" "$selected" "never copies root build.rs"
     printf '\nCOPY build.rs .\n' >> "$selected"
     expect_pass "explicit build script with $selector" "$selected"
+done
+
+for selector in '--package zeroclaw-tools' '-p zeroclaw-buildinfo' '--bin zeroclaw-acp-bridge'; do
+    sed "s/-p zeroclaw/$selector/" "$build_only" > "$selected"
+    expect_pass "unrelated target with $selector" "$selected"
 done
 
 rs_copy="${fixture_dir}/rs-copy.Dockerfile"
