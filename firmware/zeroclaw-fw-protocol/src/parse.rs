@@ -37,7 +37,7 @@ fn value_start(line: &[u8], key: &[u8]) -> Option<usize> {
 }
 
 /// Parse an integer value from a JSON key like `"pin":13` or `"value":1`.
-/// Returns `None` if the key is not found.
+/// Returns `None` if the key is not found or the value is outside `i32` bounds.
 pub fn parse_arg(line: &[u8], key: &[u8]) -> Option<i32> {
     let rest = &line[value_start(line, key)?..];
     let mut num: i32 = 0;
@@ -51,14 +51,20 @@ pub fn parse_arg(line: &[u8], key: &[u8]) -> Option<i32> {
 
     let start = j;
     while j < rest.len() && rest[j].is_ascii_digit() {
-        num = num * 10 + (rest[j] - b'0') as i32;
+        let digit = i32::from(rest[j] - b'0');
+        num = num.checked_mul(10)?;
+        num = if neg {
+            num.checked_sub(digit)?
+        } else {
+            num.checked_add(digit)?
+        };
         j += 1;
     }
     if j == start {
         return None;
     }
 
-    Some(if neg { -num } else { num })
+    Some(num)
 }
 
 /// Check if a JSON line contains `"cmd":"<cmd>"`.
@@ -121,6 +127,24 @@ mod tests {
     fn parse_arg_negative() {
         let line = br#"{"args":{"pin":-1}}"#;
         assert_eq!(parse_arg(line, b"pin"), Some(-1));
+    }
+
+    #[test]
+    fn parse_arg_accepts_both_i32_bounds() {
+        assert_eq!(parse_arg(br#"{"pin":2147483647}"#, b"pin"), Some(i32::MAX));
+        assert_eq!(parse_arg(br#"{"pin":-2147483648}"#, b"pin"), Some(i32::MIN));
+    }
+
+    #[test]
+    fn parse_arg_rejects_out_of_range_integers() {
+        for line in [
+            br#"{"pin":2147483648}"#.as_slice(),
+            br#"{"pin":-2147483649}"#,
+            br#"{"pin":4294967309}"#,
+            br#"{"pin":999999999999999999999999999999}"#,
+        ] {
+            assert_eq!(parse_arg(line, b"pin"), None);
+        }
     }
 
     #[test]

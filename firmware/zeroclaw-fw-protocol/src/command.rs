@@ -98,4 +98,13 @@ mod tests {
             Some(Command::GpioRead { pin: -1 })
         );
     }
+
+    #[test]
+    fn parse_gpio_read_out_of_range_pin_uses_the_invalid_pin_fallback() {
+        let line = br#"{"id":"3","cmd":"gpio_read","args":{"pin":4294967309}}"#;
+        assert_eq!(
+            Command::from_line(line),
+            Some(Command::GpioRead { pin: -1 })
+        );
+    }
 }
