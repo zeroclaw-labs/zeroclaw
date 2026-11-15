@@ -2588,9 +2588,14 @@ mod tests {
                 .await
                 .unwrap();
         assert!(diagnostics.iter().any(|item| {
-            item.message == "model_provider \"qwen.oauth\" is valid"
-                && item.severity == Severity::Ok
+            item.message == "qwen.oauth: model: qwen-turbo" && item.severity == Severity::Ok
         }));
+        assert!(
+            !diagnostics.iter().any(|item| item
+                .message
+                .starts_with("model_provider \"qwen.oauth\" is invalid:")),
+            "{diagnostics:?}"
+        );
         assert_eq!(
             fetch_provider_catalog(
                 &zeroclaw_config::migration::admit_test_input(&config),

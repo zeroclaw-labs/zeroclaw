@@ -726,9 +726,13 @@ options.temperature = "null"
             "test".into(),
             AliasedAgentConfig {
                 model_provider: "custom.local".into(),
+                risk_profile: "test".into(),
                 ..Default::default()
             },
         );
+        config
+            .risk_profiles
+            .insert("test".into(), Default::default());
         let generation = Arc::new(std::sync::RwLock::new(Arc::new(
             zeroclaw_config::migration::admit_test_input(&config),
         )));
@@ -739,11 +743,21 @@ options.temperature = "null"
             "test",
         );
         let mut next = (**generation.read().unwrap()).clone();
-        let profile = next.providers.models.ensure("custom", "local").unwrap();
-        profile.api_key = Some("next-test-key".into());
-        let entry = profile.models.get_mut("default").unwrap();
-        entry.id = Some("nested-next".into());
-        entry.temperature = Some(0.6);
+        let expected = zeroclaw_config::provider_registry::editor::snapshot(&next).unwrap();
+        let mut registry = expected.clone();
+        let connection = registry["models"]["custom.local"]["provider"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        registry["connections"][&connection]["auth"] =
+            json!({"mode":"api_key", "api_key":"next-test-key"});
+        registry["models"]["custom.local"]["model"] = json!("nested-next");
+        registry["models"]["custom.local"]["options"]["temperature"] = json!(0.6);
+        zeroclaw_config::provider_registry::editor::stage(
+            &mut next,
+            zeroclaw_config::provider_registry::editor::RegistryEdit { expected, registry },
+        )
+        .unwrap();
         *generation.write().unwrap() =
             Arc::new(zeroclaw_config::migration::admit_test_input(&next));
 

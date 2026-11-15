@@ -6740,13 +6740,9 @@ permissions = ["http_client"]
         root_config.backup.include_dirs = vec!["config".into()];
         root_config.data_retention.enabled = true;
         root_config.data_retention.retention_days = 1;
-        let config = Config {
-            data_dir: data_dir.clone(),
-            ..Config::default()
-        };
 
         let tools = {
-            let registry_config = Arc::new(config);
+            let registry_config = Arc::new(root_config);
             let registry_config = {
                 let mut fixture = (*registry_config).clone();
                 fixture.browser = browser.clone();

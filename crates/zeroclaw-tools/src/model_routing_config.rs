@@ -1699,6 +1699,14 @@ mod tests {
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         };
+        if config.config_path.exists() {
+            let saved = std::fs::read_to_string(&config.config_path).unwrap();
+            let mut loaded = zeroclaw_config::migration::migrate_to_current(&saved).unwrap();
+            loaded.config_path = config.config_path;
+            loaded.data_dir = config.data_dir;
+            loaded.loaded_from = Some(loaded.config_path.clone());
+            return Arc::new(loaded);
+        }
         config.providers = serde_json::from_value(json!({
             "connections":{"fixture.connection":{"kind":"openai"}},
             "models":{"chat.fixture":{"capability":"chat","provider":"fixture.connection","model":"fixture"}}
@@ -1855,6 +1863,13 @@ mod tests {
                 .success
         );
 
+        let bound = tool
+            .execute(
+                json!({"action":"upsert_agent", "name":"default", "model_provider":"chat.fixture"}),
+            )
+            .await
+            .unwrap();
+        assert!(bound.success, "{bound:?}");
         let result = tool
             .execute(json!({"action": "set_default", "temperature": 0.3}))
             .await
@@ -1936,7 +1951,7 @@ mod tests {
             .lock_owned()
             .await;
         let args = json!({
-            "action": "set_default", "model_provider": "openai.default", "temperature": 0.2
+            "action": "set_default", "model_provider": "chat.fixture", "temperature": 0.2
         });
         let blocked = tokio::time::timeout(
             std::time::Duration::from_millis(250),
@@ -1953,9 +1968,11 @@ mod tests {
         drop(guard);
         assert!(tool.execute(args).await.unwrap().success);
         assert_eq!(
-            read_saved_provider_entry(&path, "openai", "default")
-                .unwrap()
-                .temperature,
+            zeroclaw_config::migration::migrate_to_current(
+                &std::fs::read_to_string(&path).unwrap()
+            )
+            .unwrap()
+            .resolve_model_temperature("chat.fixture"),
             Some(0.2)
         );
     }
@@ -2418,6 +2435,7 @@ preset = "chat.shared"
                 ..AliasedAgentConfig::default()
             },
         );
+        let config = zeroclaw_config::migration::admit_test_input(&config);
         config.save().await.unwrap();
 
         let serialized = std::fs::read_to_string(&cfg_path).unwrap();
@@ -3003,54 +3021,41 @@ preset = "chat.shared"
     async fn upsert_agent_rejects_provider_mutations_on_reused_ref() {
         let _test_serial = CONFIG_EDIT_TESTS.lock().await;
         let tmp = TempDir::new().unwrap();
-        let cfg_path = tmp.path().join("config.toml");
-        let tool = ModelRoutingConfigTool::new(Box::pin(test_config(&tmp)).await, test_security());
-
-        for (name, model_provider) in [("truefoundry", "custom"), ("coder", "openai")] {
+        let cfg = test_config(&tmp).await;
+        let cfg_path = cfg.config_path.clone();
+        let tool = ModelRoutingConfigTool::new(cfg, test_security());
+        for name in ["researcher", "coder"] {
             let result = tool
-                .execute(json!({
-                    "action": "upsert_agent",
-                    "name": name,
-                    "model_provider": model_provider,
-                    "model": "original-model"
-                }))
+                .execute(
+                    json!({"action":"upsert_agent", "name":name, "model_provider":"chat.fixture"}),
+                )
                 .await
                 .unwrap();
-            assert!(result.success, "{:?}", result.error);
+            assert!(result.success, "{result:?}");
         }
-
         let before = std::fs::read_to_string(&cfg_path).unwrap();
-        let provider_before = serde_json::to_value(
-            read_saved_provider_entry(&cfg_path, "custom", "truefoundry")
-                .expect("provider setup must create custom.truefoundry"),
-        )
-        .unwrap();
-
         for (field, value) in [
             ("model", json!("replacement-model")),
             ("api_key", json!("replacement-key")),
             ("temperature", json!(1.2)),
         ] {
-            let mut args = json!({
-                "action": "upsert_agent",
-                "name": "coder",
-                "model_provider": "custom.truefoundry"
-            });
+            let mut args =
+                json!({"action":"upsert_agent", "name":"coder", "model_provider":"chat.fixture"});
             args[field] = value;
-
             let result = tool.execute(args).await.unwrap();
             assert!(!result.success, "{field} unexpectedly accepted");
+            assert!(
+                result
+                    .error
+                    .as_deref()
+                    .unwrap()
+                    .contains("belongs to the model/connection definition")
+            );
             assert_eq!(
                 std::fs::read_to_string(&cfg_path).unwrap(),
                 before,
                 "{field}"
             );
-            let provider_after = serde_json::to_value(
-                read_saved_provider_entry(&cfg_path, "custom", "truefoundry")
-                    .expect("reused provider must remain configured"),
-            )
-            .unwrap();
-            assert_eq!(provider_after, provider_before, "{field}");
         }
     }
 
@@ -3333,39 +3338,25 @@ preset = "chat.shared"
         let tmp = TempDir::new().unwrap();
         let stale_snapshot = test_config(&tmp).await;
         let tool = ModelRoutingConfigTool::new(stale_snapshot.clone(), test_security());
-
-        // The tool's own construction-time snapshot has no credentials for
-        // this alias at all, so probing directly against it is a legitimate
-        // skip (no API key means nothing to validate).
-        let against_stale = tool
-            .probe_model(stale_snapshot.as_ref(), "openai.default")
-            .await;
+        let against_stale = tool.probe_model(&stale_snapshot, "chat.fixture").await;
         assert_eq!(
             against_stale.unwrap(),
             ModelProbeOutcome::SkippedNoCredentials
         );
-
-        // A config that has since been saved carries a credential the stale
-        // snapshot never had (mismatched on purpose, so construction fails
-        // locally rather than reaching the network). Both configs offer the
-        // same alias, so this exercises alias resolution: the probe must
-        // resolve from the config it is given, not the startup snapshot.
         let mut saved = (*stale_snapshot).clone();
-        {
-            let entry = saved.providers.models.ensure("openai", "default").unwrap();
-            entry.api_key = Some("sk-ant-not-an-openai-key".to_string());
-            entry.model = Some("gpt-test".to_string());
-        }
-
-        let against_saved = tool
-            .probe_model(
-                &zeroclaw_config::migration::admit_test_input(&saved),
-                "openai.default",
-            )
-            .await;
+        let expected = zeroclaw_config::provider_registry::editor::snapshot(&saved).unwrap();
+        let mut registry = expected.clone();
+        registry["connections"]["fixture.connection"]["auth"] =
+            json!({"mode":"api_key", "api_key":"sk-ant-not-an-openai-key"});
+        zeroclaw_config::provider_registry::editor::stage(
+            &mut saved,
+            zeroclaw_config::provider_registry::editor::RegistryEdit { expected, registry },
+        )
+        .unwrap();
+        let against_saved = tool.probe_model(&saved, "chat.fixture").await;
         assert!(
-            against_saved.is_err(),
-            "probe must resolve credentials from the saved alias config, not the stale runtime snapshot"
+            matches!(against_saved, Err(ProbeFailure::Construction { .. })),
+            "{against_saved:?}"
         );
     }
 
@@ -3570,90 +3561,51 @@ preset = "chat.shared"
         let _env_guard = env_override_test_lock().await;
         let tmp = TempDir::new().unwrap();
         let base = test_config(&tmp).await;
-
-        // A test-owned alias, so the process-wide env vars below cannot
-        // collide with another test's alias.
-        const ALIAS: &str = "probe_env_case";
-
-        // Disk carries a well-formed openai key. Alone, it would construct
-        // successfully and reach the network. No `uri` here: a custom endpoint
-        // disables the provider factory's key-prefix pre-flight, which is the
-        // no-network signal phase 1 relies on.
         let mut saved = (*base).clone();
-        {
-            let entry = saved.providers.models.ensure("openai", ALIAS).unwrap();
-            entry.api_key = Some("sk-disk-key".to_string());
-            entry.model = Some("gpt-test".to_string());
-        }
-
-        // Phase 1 — the credential the probe actually uses. Only the key is
-        // overridden here: the disk key is well-formed openai and would
-        // construct cleanly, while the env key is anthropic-shaped, so
-        // construction failing is observable proof of which layer was read,
-        // with no network request.
-        let key_var = "ZEROCLAW_providers__models__openai__probe_env_case__api_key";
-        let tool = ModelRoutingConfigTool::new(Arc::clone(&base), test_security());
+        saved.providers = serde_json::from_value(json!({
+            "connections":{"probe.env.case":{"kind":"openai", "auth":{"mode":"api_key", "api_key":"sk-disk-key"}}},
+            "models":{"chat.probe.env":{"capability":"chat", "provider":"probe.env.case", "model":"gpt-test"}}
+        })).unwrap();
+        let key_var = "ZEROCLAW_providers__connections__probe.env.case__auth__api_key";
+        let tool = ModelRoutingConfigTool::new(base, test_security());
         let probe = {
             let _key = TestEnvVar::set(&_env_guard, key_var, "sk-ant-env-key");
-            tool.probe_model(
-                &zeroclaw_config::migration::admit_test_input(&saved),
-                &format!("openai.{ALIAS}"),
-            )
-            .await
+            tool.probe_model(&saved, "chat.probe.env").await
         };
-
-        let failure = probe.expect_err(
-            "the env-overridden anthropic-shaped key must reach provider construction; the \
-             disk key would have constructed cleanly",
-        );
-        assert!(
-            matches!(failure, ProbeFailure::Construction { .. }),
-            "an unusable effective credential is a construction failure, not a request failure"
-        );
+        let failure =
+            probe.expect_err("the environment credential must reach provider construction");
+        assert!(matches!(failure, ProbeFailure::Construction { .. }));
         assert!(
             failure.to_string().contains("API key prefix mismatch"),
-            "the probe must receive the runtime-effective credential: {failure}"
+            "{failure}"
         );
-
-        // Phase 2 — the sibling fields. Overriding the endpoint too, and
-        // inspecting the effective config the probe builds from, proves the
-        // whole override layer is applied rather than the credential alone.
-        // This phase is pure config resolution; nothing is dispatched.
-        let uri_var = "ZEROCLAW_providers__models__openai__probe_env_case__uri";
         let effective = {
             let _key = TestEnvVar::set(&_env_guard, key_var, "sk-ant-env-key");
-            let _uri = TestEnvVar::set(&_env_guard, uri_var, "https://env.invalid/v1");
-            ModelRoutingConfigTool::effective_config_for_probe(
-                &zeroclaw_config::migration::admit_test_input(&saved),
-            )
-            .await
+            let _uri = TestEnvVar::set(
+                &_env_guard,
+                "ZEROCLAW_providers__connections__probe.env.case__uri",
+                "https://env.invalid/v1",
+            );
+            ModelRoutingConfigTool::effective_config_for_probe(&saved)
+                .await
+                .unwrap()
         };
-
-        let effective = effective.expect("effective config must build");
-        let entry = effective
-            .providers
-            .models
-            .find("openai", ALIAS)
-            .expect("the alias must survive the override layer");
+        let registry = effective.provider_registry().unwrap();
+        let selected = registry.resolve_chat(&"chat.probe.env".into()).unwrap();
         assert_eq!(
-            entry.api_key.as_deref(),
-            Some("sk-ant-env-key"),
-            "credential must come from the environment layer"
+            selected.selection.connection.api_key(),
+            Some("sk-ant-env-key")
         );
         assert_eq!(
-            entry.uri.as_deref(),
-            Some("https://env.invalid/v1"),
-            "endpoint must come from the environment layer, or a credential could be sent to the \
-             wrong host"
+            selected.selection.connection.uri(),
+            Some("https://env.invalid/v1")
         );
         assert_eq!(
-            zeroclaw_providers::model::runtime_options(&effective, "", &format!("openai.{ALIAS}"))
+            zeroclaw_providers::model::runtime_options(&effective, "", "chat.probe.env")
                 .unwrap()
                 .provider_api_url
                 .as_deref(),
-            Some("https://env.invalid/v1"),
-            "the representative runtime option resolved for the probe must also be \
-             environment-effective"
+            Some("https://env.invalid/v1")
         );
     }
 
@@ -4089,7 +4041,7 @@ preset = "chat.shared"
     /// Removing a saved credential through the same long-lived tool must not
     /// revive its construction-time key when the next update probes the alias.
     #[tokio::test]
-    async fn set_default_does_not_probe_after_upsert_agent_removes_the_saved_key() {
+    async fn set_default_does_not_probe_after_registry_edit_removes_the_saved_key() {
         use wiremock::MockServer;
 
         let _env_guard = env_override_test_lock().await;
@@ -4112,10 +4064,18 @@ preset = "chat.shared"
             test_security(),
         );
         let mut current = (*test_config(&tmp).await).clone();
-        let entry = current.providers.models.ensure("openai", ALIAS).unwrap();
-        entry.uri = Some(format!("{}/v1", server.uri()));
-        entry.model = Some("gpt-before".into());
-        entry.api_key = None;
+        let expected = zeroclaw_config::provider_registry::editor::snapshot(&current).unwrap();
+        let mut registry = expected.clone();
+        let connection = registry["models"][format!("openai.{ALIAS}")]["provider"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        registry["connections"][&connection]["auth"] = json!({"mode":"api_key"});
+        zeroclaw_config::provider_registry::editor::stage(
+            &mut current,
+            zeroclaw_config::provider_registry::editor::RegistryEdit { expected, registry },
+        )
+        .unwrap();
         current.save().await.unwrap();
         let result = tool
             .execute(json!({

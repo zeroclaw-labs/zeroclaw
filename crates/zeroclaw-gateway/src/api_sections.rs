@@ -979,17 +979,26 @@ async fn select_section(
         }
         Section::ModelProviders | Section::TtsProviders | Section::TranscriptionProviders => {
             let family = section_enum.as_str();
-            let created = working
-                .create_map_key(&format!("{family}.{key}"), &alias)
-                .map_err(|msg| {
-                    error_response(
-                        ConfigApiError::new(
-                            ConfigApiCode::PathNotFound,
-                            format!("could not select {family} `{key}` alias `{alias}`: {msg}"),
-                        )
-                        .with_path(format!("{family}.{key}")),
+            let canonical_exists = matches!(section_enum, Section::ModelProviders)
+                && working
+                    .providers
+                    .models
+                    .canonical_model(&format!("{key}.{alias}").as_str().into())
+                    .is_some();
+            let created = if canonical_exists {
+                Ok(false)
+            } else {
+                working.create_map_key(&format!("{family}.{key}"), &alias)
+            }
+            .map_err(|msg| {
+                error_response(
+                    ConfigApiError::new(
+                        ConfigApiCode::PathNotFound,
+                        format!("could not select {family} `{key}` alias `{alias}`: {msg}"),
                     )
-                });
+                    .with_path(format!("{family}.{key}")),
+                )
+            });
             let created = match created {
                 Ok(c) => c,
                 Err(resp) => return resp,

@@ -33,25 +33,18 @@ use zeroclaw_macros::Configurable;
 /// [`Config::application_capabilities`] and queried per changed path.
 #[derive(Debug, Clone)]
 pub struct ApplicationCapabilities {
-    fields: Vec<(String, ApplicationCapability)>,
+    fields: Vec<(Vec<String>, ApplicationCapability)>,
 }
 
 impl ApplicationCapabilities {
     /// Resolve potential application for `path`, defaulting to reload.
     pub fn capability(&self, path: &[String]) -> ApplicationCapability {
-        // Dotted metadata cannot distinguish an opaque dotted key from nesting.
-        if path.is_empty()
-            || path
-                .iter()
-                .any(|part| part.is_empty() || part.contains('.'))
-        {
+        if path.is_empty() || path.iter().any(String::is_empty) {
             return ApplicationCapability::ReloadRequired;
         }
-        let name = path.join(".");
-        let subtree = format!("{name}.");
         let mut matched = false;
         for (field_name, application) in &self.fields {
-            if *field_name == name || field_name.starts_with(&subtree) {
+            if field_name.starts_with(path) {
                 matched = true;
                 if *application != ApplicationCapability::ModelProviderRefresh {
                     return ApplicationCapability::ReloadRequired;
@@ -23367,13 +23360,51 @@ impl Config {
     /// Snapshot this config's per-property application metadata once, so
     /// many paths can be classified without re-deriving `prop_fields()`.
     pub fn application_capabilities(&self) -> ApplicationCapabilities {
-        ApplicationCapabilities {
-            fields: self
-                .prop_fields()
-                .into_iter()
-                .map(|field| (field.name, field.application))
-                .collect(),
+        let mut fields = self
+            .prop_fields()
+            .into_iter()
+            .map(|field| {
+                (
+                    field.name.split('.').map(str::to_owned).collect(),
+                    field.application,
+                )
+            })
+            .collect::<Vec<_>>();
+        // Registry keys are opaque TOML keys. Derive their exact paths from
+        // the admitted registry instead of flattening them through prop_fields.
+        fn visit(
+            value: &serde_json::Value,
+            path: &mut Vec<String>,
+            fields: &mut Vec<(Vec<String>, ApplicationCapability)>,
+        ) {
+            if let serde_json::Value::Object(table) = value
+                && !table.is_empty()
+            {
+                for (key, value) in table {
+                    path.push(key.clone());
+                    visit(value, path, fields);
+                    path.pop();
+                }
+            } else {
+                fields.push((path.clone(), ApplicationCapability::ModelProviderRefresh));
+            }
         }
+        if let Ok(registry) = self.providers.canonical_registry_unvalidated()
+            && let Ok(document) = serde_json::to_value(registry)
+        {
+            for section in ["connections", "models", "model_presets", "fallback"] {
+                if let Some(value) = document.get(section)
+                    && value.as_object().is_some_and(|table| !table.is_empty())
+                {
+                    visit(
+                        value,
+                        &mut vec!["providers".into(), section.into()],
+                        &mut fields,
+                    );
+                }
+            }
+        }
+        ApplicationCapabilities { fields }
     }
 
     /// The resolved peer policy for `<channel_type>.<alias>`: every granted
@@ -29358,6 +29389,62 @@ mod tests {
             candidate.application_capability(&paths[0]),
             ApplicationCapability::ModelProviderRefresh
         );
+    }
+
+    #[::core::prelude::v1::test]
+    fn canonical_registry_application_paths_preserve_opaque_keys() {
+        let mut previous = Config::default();
+        previous.providers = serde_json::from_value(serde_json::json!({
+            "connections": {"gateway.prod": {"kind":"custom", "uri":"https://example.invalid/v1"}},
+            "models": {"chat.fast.v2": {"capability":"chat", "provider":"gateway.prod", "model":"before", "options":{"temperature":0.2}}}
+        })).unwrap();
+        let mut candidate = previous.clone();
+        crate::provider_registry::editor::update(&mut candidate, |registry| {
+            let crate::provider_registry::ModelDefinition::Chat(model) =
+                registry.models.get_mut("chat.fast.v2").unwrap()
+            else {
+                unreachable!()
+            };
+            model.model = Some("after".into());
+            model.options.temperature = Some(crate::provider_registry::Override::Clear);
+            Ok(())
+        })
+        .unwrap();
+        let paths = Config::semantic_changed_paths(&previous, &candidate).unwrap();
+        assert!(paths.contains(&vec![
+            "providers".into(),
+            "models".into(),
+            "chat.fast.v2".into(),
+            "model".into()
+        ]));
+        let capabilities = candidate.application_capabilities();
+        for path in paths {
+            assert_eq!(
+                capabilities.capability(&path),
+                ApplicationCapability::ModelProviderRefresh,
+                "{path:?}"
+            );
+        }
+        for section in ["models", "connections"] {
+            let key = if section == "models" {
+                "chat.fast.v2"
+            } else {
+                "gateway.prod"
+            };
+            assert_eq!(
+                capabilities.capability(&["providers".into(), section.into(), key.into()]),
+                ApplicationCapability::ModelProviderRefresh
+            );
+            assert_eq!(
+                capabilities.capability(&[
+                    "providers".into(),
+                    section.into(),
+                    key.into(),
+                    "unknown".into()
+                ]),
+                ApplicationCapability::ReloadRequired
+            );
+        }
     }
 
     #[::core::prelude::v1::test]
@@ -38890,15 +38977,7 @@ automation_enabled = true
     }
 
     #[test]
-    async fn v1_known_provider_migrates_with_globals_folded_onto_typed_slot() {
-        // Top-level `model_provider` + `model` + `default_temperature` flow
-        // onto the migrated typed-slot entry. Vendor-canonical names like
-        // `openai` map straight to their typed slot; `wire_api` and
-        // `requires_openai_auth` survive the move.
-        //
-        // (Unknown V1 names like `sub2api` are intentionally silent-dropped
-        // by the V2→V3 migration — see the `Unknown/passthrough` arm of
-        // `normalize_provider_type` in schema/v2.rs.)
+    async fn v1_known_provider_migrates_into_the_canonical_registry() {
         let raw = r#"
 default_temperature = 0.7
 model_provider = "openai"
@@ -38910,26 +38989,31 @@ uri = "https://api.openai.com/v1"
 wire_api = "responses"
 requires_openai_auth = true
 "#;
-
-        let parsed =
-            crate::migration::migrated_provider_input_fixture(raw).expect("migration succeeds");
-        assert!(
-            parsed
-                .providers
-                .models
-                .contains_model_provider_type("openai"),
-            "vendor-canonical V1 provider should land in its typed slot",
+        let parsed = crate::migration::migrate_to_current(raw).expect("migration succeeds");
+        let registry = parsed.provider_registry().unwrap();
+        let selected = registry.resolve_chat(&"openai.default".into()).unwrap();
+        assert_eq!(selected.upstream_model(), Some("gpt-5.3-codex"));
+        assert_eq!(selected.selection.connection.kind(), "openai");
+        assert_eq!(selected.selection.connection.api_key(), Some("sk-test"));
+        assert_eq!(
+            selected.selection.connection.uri(),
+            Some("https://api.openai.com/v1")
         );
-        let profile = parsed
-            .providers
-            .models
-            .find("openai", "default")
-            .expect("openai.default entry");
-        assert_eq!(profile.api_key.as_deref(), Some("sk-test"));
-        assert_eq!(profile.uri.as_deref(), Some("https://api.openai.com/v1"));
-        assert_eq!(profile.model.as_deref(), Some("gpt-5.3-codex"));
-        assert_eq!(profile.wire_api, Some(WireApi::Responses));
-        assert!(profile.requires_openai_auth);
+        assert_eq!(
+            parsed.resolve_model_temperature("openai.default"),
+            Some(0.7)
+        );
+        let wire = serde_json::to_value(&registry).unwrap();
+        let provider = wire["models"]["openai.default"]["provider"]
+            .as_str()
+            .unwrap();
+        assert_eq!(
+            wire["connections"][provider]["api"]["chat"]["wire_api"],
+            "responses"
+        );
+        // An explicit V1 API key remains authoritative over the old Codex flag.
+        assert_eq!(wire["connections"][provider]["auth"]["mode"], "api_key");
+        assert!(parsed.providers.models.iter_entries().next().is_none());
     }
 
     #[test]

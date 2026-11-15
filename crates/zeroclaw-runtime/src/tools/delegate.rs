@@ -6064,14 +6064,14 @@ mod tests {
             "no provider was built for the target"
         );
 
-        // An unbound configless delegate keeps the legacy factory.
+        // An unbound delegate also requires the canonical model registry.
         let unbound = DelegateTool::new(HashMap::new(), None, Arc::new(SecurityPolicy::default()));
         assert!(
             unbound
                 .build_target_provider("helper", None, "openai.fast")
                 .await
-                .is_ok(),
-            "an unbound delegate still builds its target from the factory"
+                .is_err(),
+            "an unbound delegate must not bypass the canonical model registry"
         );
     }
     use crate::control_plane::{
@@ -16491,9 +16491,20 @@ options = { extract_text_tool_calls = false }
             })))
             .mount(&server)
             .await;
+        let mut agents = sample_agents();
+        for agent in agents.values_mut() {
+            agent.risk_profile = "fixture".into();
+            agent.runtime_profile = "fixture".into();
+        }
+        agents.insert("caller".into(), agents["researcher"].clone());
         let config = Config {
             data_dir: workspace.to_path_buf(),
-            agents: sample_agents(),
+            agents: agents.clone(),
+            risk_profiles: HashMap::from([("fixture".into(), RiskProfileConfig {
+                delegation_policy: zeroclaw_config::autonomy::DelegationPolicy { mode: zeroclaw_config::autonomy::DelegationMode::Allow },
+                ..Default::default()
+            })]),
+            runtime_profiles: HashMap::from([("fixture".into(), RuntimeProfileConfig::default())]),
             providers: serde_json::from_value(json!({
                 "connections": {"fixture": {"kind":"ollama", "uri":server.uri()}},
                 "models": {
@@ -16505,7 +16516,8 @@ options = { extract_text_tool_calls = false }
         };
         let config = zeroclaw_config::migration::admit_test_input(&config);
         let tool = with_in_memory_task_store(
-            DelegateTool::new(sample_agents(), None, test_security())
+            DelegateTool::new(agents, None, security_allowing())
+                .with_caller_alias("caller")
                 .with_workspace_dir(workspace.to_path_buf())
                 .with_root_config(Arc::new(config)),
         );
@@ -16523,7 +16535,7 @@ options = { extract_text_tool_calls = false }
             .await
             .expect("owned provider requests");
         assert_eq!(requests.len(), 1, "the real typed provider dispatched once");
-        assert_eq!(requests[0].url.path(), "/v1/chat/completions");
+        assert_eq!(requests[0].url.path(), "/api/chat");
         let body: serde_json::Value =
             serde_json::from_slice(&requests[0].body).expect("typed provider JSON request");
         assert_eq!(body["model"], "fixture-model");

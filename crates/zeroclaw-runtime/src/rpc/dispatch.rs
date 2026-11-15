@@ -10879,7 +10879,10 @@ impl RpcDispatcher {
             req.path.as_str(),
             "connections" | "models" | "model_presets" | "fallback"
         ) {
-            return self.handle_config_registry_key_create(req).await;
+            return Err(rpc_err(
+                INVALID_PARAMS,
+                "Registry entries require an explicit definition; use config/provider-registry-set",
+            ));
         }
         let key_path = format!("{}.{}", req.path, req.key);
         zeroclaw_config::schema::reject_retired_provider_edit_path(
@@ -11304,77 +11307,6 @@ impl RpcDispatcher {
                 rewritten: 1,
                 warnings: Vec::new(),
             })
-        })
-    }
-
-    async fn handle_config_registry_key_create(&self, req: ConfigMapKeyCreateParams) -> RpcResult {
-        use zeroclaw_config::provider_registry::editor;
-
-        self.selector_config_write(Method::ConfigMapKeyCreate, "providers")?;
-        let commit = self
-            .ctx
-            .begin_config_commit()
-            .await
-            .map_err(config_commit_admission_error)?;
-        self.recheck_config_write_authority(
-            Method::ConfigMapKeyCreate,
-            Some("providers"),
-            &commit,
-        )?;
-        let mut working = commit.current_config();
-        let registry = working
-            .provider_registry()
-            .map_err(|error| rpc_err(INVALID_PARAMS, error.to_string()))?;
-        let definition = if req.path == "models" {
-            registry
-                .models
-                .keys()
-                .filter(|reference| {
-                    req.key
-                        .strip_prefix(&format!("{}.", reference.as_str()))
-                        .is_some_and(|suffix| !suffix.is_empty())
-                })
-                .max_by_key(|reference| reference.as_str().len())
-                .and_then(|reference| registry.models.get(reference))
-                .map(serde_json::to_value)
-                .transpose()
-                .map_err(|error| rpc_err(INTERNAL_ERROR, error.to_string()))?
-                .unwrap_or_else(|| {
-                    let provider = req
-                        .key
-                        .rsplit_once('.')
-                        .map(|(prefix, _)| prefix)
-                        .and_then(|prefix| registry.models.get(prefix))
-                        .map(|model| model.provider().clone())
-                        .unwrap_or_else(|| "legacy.custom.default".into());
-                    serde_json::json!({
-                        "capability": "chat",
-                        "provider": provider,
-                    })
-                })
-        } else {
-            serde_json::json!({})
-        };
-        editor::create_entry(&mut working, &req.path, &req.key, definition)
-            .map_err(|error| rpc_err(INVALID_PARAMS, format!("{error:#}")))?;
-        let scope = if req.path == "models" {
-            LiveSessionRefreshScope::ModelRoutes
-        } else {
-            LiveSessionRefreshScope::SharedConstruction
-        };
-        let revision = self
-            .commit_config_with_live_session_refresh(
-                working,
-                commit,
-                &scope,
-                RpcConfigCommitEffects::default(),
-            )
-            .await?;
-        to_result(ConfigMapKeyCreateResult {
-            path: req.path,
-            key: req.key,
-            created: true,
-            revision: Some(revision.into()),
         })
     }
 
@@ -22092,7 +22024,10 @@ mod tests {
                     // functional session fixture is not tripped by the
                     // BLOCKER 2 constrained-principal refusal.
                     (Resource::Tools, vec![Verb::Execute]),
-                    (Resource::Config, vec![Verb::Read, Verb::Update]),
+                    (
+                        Resource::Config,
+                        vec![Verb::Create, Verb::Read, Verb::Update, Verb::Delete],
+                    ),
                 ]),
                 ..PermissionProfileConfig::default()
             },
@@ -42419,6 +42354,7 @@ mod tests {
             "agent".into(),
             zeroclaw_config::schema::AliasedAgentConfig {
                 model_provider: "openai.default".into(),
+                risk_profile: "test-memory".into(),
                 ..Default::default()
             },
         );
@@ -42426,6 +42362,8 @@ mod tests {
             .expect("set initial uri");
         cfg.set_prop_persistent("providers.models.openai.default.api_key", "key-a")
             .expect("set initial key");
+        cfg.risk_profiles
+            .insert("test-memory".into(), Default::default());
         cfg.memory.embedding_provider = "openai.default".into();
         cfg.memory.embedding_model = "text-embedding-3-small".into();
         cfg.memory.embedding_dimensions = 3;
@@ -42498,9 +42436,12 @@ mod tests {
             "agent".into(),
             zeroclaw_config::schema::AliasedAgentConfig {
                 model_provider: "openai.default".into(),
+                risk_profile: "test-memory".into(),
                 ..Default::default()
             },
         );
+        cfg.risk_profiles
+            .insert("test-memory".into(), Default::default());
         cfg.memory.embedding_provider = "openai.default".into();
         cfg.memory.embedding_model = "text-embedding-3-small".into();
         cfg.memory.embedding_dimensions = 1536;
@@ -45281,7 +45222,7 @@ model = "nested-fast-model"
     }
 
     #[tokio::test]
-    async fn implicit_nested_selection_mutations_refresh_live_session() {
+    async fn canonical_model_renames_do_not_reselect_an_independent_model() {
         let tmp = tempfile::TempDir::new().unwrap();
         let mut config = make_model_refresh_test_config(&tmp);
         let provider = config
@@ -45320,16 +45261,29 @@ model = "nested-fast-model"
             .unwrap();
         assert_eq!(
             model_name_for_session(&dispatcher, &session_id).await,
-            "old-model"
+            "default-model"
         );
         assert_eq!(
             temperature_for_session(&dispatcher, &session_id).await,
-            Some(0.2)
+            Some(0.7)
         );
+        let definition = serde_json::to_value(
+            dispatcher
+                .ctx
+                .config
+                .read()
+                .provider_registry()
+                .unwrap()
+                .models["openai.test-provider.other"]
+                .clone(),
+        )
+        .unwrap();
         dispatcher
-            .handle_config_map_key_create(&json!({
-                "path": "models", "key": "openai.test-provider.default"
-            }))
+            .handle_config_registry_set(&registry_edit_params(
+                &dispatcher,
+                &["models", "openai.test-provider.default"],
+                definition,
+            ))
             .await
             .unwrap();
         dispatcher
@@ -45342,21 +45296,29 @@ model = "nested-fast-model"
             .unwrap();
         assert_eq!(
             model_name_for_session(&dispatcher, &session_id).await,
-            "new-default"
+            "default-model"
+        );
+        dispatcher
+            .handle_config_registry_set(&registry_edit_params(
+                &dispatcher,
+                &["models", "openai.test-provider", "model"],
+                json!("new-primary"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            model_name_for_session(&dispatcher, &session_id).await,
+            "new-primary"
         );
         let config = dispatcher.ctx.config.read().clone();
         assert_eq!(
-            config
-                .resolve_model_selection("openai.test-provider")
-                .unwrap()
-                .model_id
-                .as_deref(),
-            Some("new-default")
+            config.resolve_model_id("openai.test-provider").as_deref(),
+            Some("new-primary")
         );
     }
 
     #[tokio::test]
-    async fn creating_default_refreshes_a_previously_sole_nested_selection() {
+    async fn creating_an_independent_default_does_not_reselect_a_migrated_model() {
         let tmp = tempfile::TempDir::new().unwrap();
         let mut config = make_model_refresh_test_config(&tmp);
         config
@@ -45379,19 +45341,32 @@ model = "nested-fast-model"
             model_name_for_session(&dispatcher, &session_id).await,
             "sole-model"
         );
+        let definition = serde_json::to_value(
+            dispatcher
+                .ctx
+                .config
+                .read()
+                .provider_registry()
+                .unwrap()
+                .models["openai.test-provider"]
+                .clone(),
+        )
+        .unwrap();
         dispatcher
-            .handle_config_map_key_create(&json!({
-                "path": "models", "key": "openai.test-provider.default"
-            }))
+            .handle_config_registry_set(&registry_edit_params(
+                &dispatcher,
+                &["models", "openai.test-provider.default"],
+                definition,
+            ))
             .await
             .unwrap();
         assert_eq!(
             model_name_for_session(&dispatcher, &session_id).await,
-            "old-model"
+            "sole-model"
         );
         assert_eq!(
             temperature_for_session(&dispatcher, &session_id).await,
-            Some(0.2)
+            Some(0.8)
         );
     }
 
@@ -48436,22 +48411,20 @@ options = { temperature = 0.2 }
     fn config_map_key_create_delete_and_rename_recheck_after_admission() {
         run_on_a_large_stack(|| async move {
             for (method, params) in [
-                (
-                    "create",
-                    json!({"path": "providers.models.openai", "key": "fresh"}),
-                ),
-                (
-                    "delete",
-                    json!({"path": "providers.models.openai", "key": "default"}),
-                ),
+                ("create", json!({"path": "agents", "key": "fresh"})),
+                ("delete", json!({"path": "models", "key": "openai.default"})),
                 (
                     "rename",
-                    json!({"path": "providers.models.openai", "from": "default", "to": "renamed"}),
+                    json!({"path": "models", "from": "openai.default", "to": "openai.renamed"}),
                 ),
             ] {
                 let tmp = tempfile::TempDir::new().unwrap();
                 let config_path = tmp.path().join("config.toml");
-                let ctx = enforcement_ctx(config_write_roster_config(&tmp, 4242, &["providers.*"]));
+                let ctx = enforcement_ctx(config_write_roster_config(
+                    &tmp,
+                    4242,
+                    &["providers.*", "agents.*"],
+                ));
                 let (alice, _rx) = roster_peer(&ctx, 4242).await;
                 let before = std::fs::read_to_string(&config_path).unwrap_or_default();
 
@@ -48481,8 +48454,8 @@ options = { temperature = 0.2 }
                         .read()
                         .providers
                         .models
-                        .openai
-                        .contains_key("default"),
+                        .canonical_model(&"openai.default".into())
+                        .is_some(),
                     "map-key {method}: the live config must be untouched"
                 );
             }
@@ -48715,7 +48688,7 @@ options = { temperature = 0.2 }
                             ..Default::default()
                         },
                     );
-                let ctx = enforcement_ctx(config);
+                let ctx = enforcement_ctx(zeroclaw_config::migration::admit_test_input(&config));
                 let (writer, _rx) = roster_peer(&ctx, 4242).await;
                 let before =
                     std::fs::read_to_string(tmp.path().join("config.toml")).unwrap_or_default();
@@ -48732,9 +48705,7 @@ options = { temperature = 0.2 }
                 assert_eq!(
                     ctx.config
                         .read()
-                        .resolve_model_selection("anthropic.default")
-                        .unwrap()
-                        .model_id
+                        .resolve_model_id("anthropic.default")
                         .as_deref(),
                     Some("nested-before")
                 );

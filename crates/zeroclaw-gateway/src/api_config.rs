@@ -5042,31 +5042,41 @@ model = "effective-before"
     }
 
     #[tokio::test]
-    async fn delete_map_key_handler_refuses_model_provider_hard_ref_without_mutation() {
+    async fn registry_put_refuses_model_hard_ref_without_mutation() {
         let tmp = tempfile::tempdir().unwrap();
         let mut config = temp_config(&tmp);
-        config
-            .providers
-            .models
-            .ensure("anthropic", "default")
-            .unwrap();
+        config.providers = serde_json::from_value(serde_json::json!({
+            "connections": {"anthropic": {"kind":"anthropic"}},
+            "models": {"anthropic.default": {"capability":"chat", "provider":"anthropic", "model":"claude-test"}}
+        })).unwrap();
         config.agents.insert(
             "researcher".to_string(),
             zeroclaw_config::schema::AliasedAgentConfig {
                 model_provider: "anthropic.default".into(),
+                risk_profile: "test".into(),
                 ..Default::default()
             },
         );
+        config
+            .risk_profiles
+            .insert("test".into(), Default::default());
         config.save().await.unwrap();
-
+        let disk_before = std::fs::read(&config.config_path).unwrap();
         let state = test_state(config);
+        let expected =
+            zeroclaw_config::provider_registry::editor::snapshot(&state.config.read()).unwrap();
+        let mut registry = expected.clone();
+        registry["models"]
+            .as_object_mut()
+            .unwrap()
+            .remove("anthropic.default");
         let (status, json) = response_json(
-            handle_delete_map_key(
+            handle_registry_put(
                 axum::extract::State(state.clone()),
                 None,
-                axum::extract::Query(MapKeyQuery {
-                    path: "providers.models.anthropic".to_string(),
-                    key: "default".to_string(),
+                axum::Json(zeroclaw_config::provider_registry::editor::RegistryEdit {
+                    expected,
+                    registry,
                 }),
             )
             .await,
@@ -5076,11 +5086,17 @@ model = "effective-before"
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(json["code"], "validation_failed");
         let cfg = state.config.read();
-        assert!(cfg.providers.models.find("anthropic", "default").is_some());
+        assert!(
+            cfg.providers
+                .models
+                .canonical_model(&"anthropic.default".into())
+                .is_some()
+        );
         assert_eq!(
             cfg.agents["researcher"].model_provider.as_str(),
             "anthropic.default"
         );
+        assert_eq!(std::fs::read(&cfg.config_path).unwrap(), disk_before);
     }
 
     #[tokio::test]
@@ -5194,10 +5210,10 @@ model = "effective-before"
             state
                 .config
                 .read()
-                .get_map_keys("providers.tts.elevenlabs")
-                .unwrap_or_default()
-                .iter()
-                .any(|k| k == "default"),
+                .provider_registry()
+                .unwrap()
+                .models
+                .contains_key("elevenlabs.default"),
             "unsupported provider delete must not fall back to raw deletion"
         );
     }
