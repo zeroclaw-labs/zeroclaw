@@ -129,3 +129,66 @@ fn detached_head_is_watched_when_a_commit_advances_it() {
     assert_ne!(fs::read(&head).unwrap(), previous_ref);
     assert_ne!(build_id(&repository.checkout), previous_id);
 }
+
+#[test]
+fn packed_branch_commit_updates_the_cached_cargo_version() {
+    let repository = Repository::new();
+    fs::create_dir(repository.checkout.join("src")).unwrap();
+    fs::write(
+        repository.checkout.join("Cargo.toml"),
+        format!(
+            "[package]\nname = \"stamp-fixture\"\nversion = \"1.2.3\"\nedition = \"2024\"\n\
+         [build-dependencies]\nzeroclaw-buildinfo = {{ path = {:?} }}\n",
+            env!("CARGO_MANIFEST_DIR")
+        ),
+    )
+    .unwrap();
+    fs::write(
+        repository.checkout.join("build.rs"),
+        "fn main() { zeroclaw_buildinfo::emit(); }\n",
+    )
+    .unwrap();
+    fs::write(
+        repository.checkout.join("src/main.rs"),
+        "fn main() { println!(\"{}\", env!(\"ZEROCLAW_VERSION\")); }\n",
+    )
+    .unwrap();
+    repository.run(
+        &repository.checkout,
+        &["add", "Cargo.toml", "build.rs", "src/main.rs"],
+    );
+    repository.run(&repository.checkout, &["commit", "-qm", "add consumer"]);
+    repository.run(&repository.checkout, &["pack-refs", "--all", "--prune"]);
+    let run_consumer = || {
+        let output = Command::new(env!("CARGO"))
+            .args(["run", "--offline", "--quiet"])
+            .current_dir(&repository.checkout)
+            .env("CARGO_TARGET_DIR", repository.root.join("target"))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    };
+    let before = run_consumer();
+    assert_eq!(
+        before,
+        version_string("1.2.3", &build_id(&repository.checkout))
+    );
+    repository.run(
+        &repository.checkout,
+        &["commit", "-qm", "advance consumer", "--allow-empty"],
+    );
+    let after = run_consumer();
+    assert_ne!(
+        after, before,
+        "Cargo must invalidate the stamp when a packed branch gains a loose ref"
+    );
+    assert_eq!(
+        after,
+        version_string("1.2.3", &build_id(&repository.checkout))
+    );
+}
