@@ -344,12 +344,33 @@ async fn handle_socket(
         .as_ref()
         .is_some_and(device::Binding::restricted);
     if let Some(binding) = &bridge_scope {
-        let alias_matches = !restricted
-            || state.session_backend.as_ref().is_none_or(|backend| {
+        let alias_matches = if !restricted {
+            true
+        } else if let Some(backend) = state.session_backend.as_ref().map(Arc::clone) {
+            let key = session_key.clone();
+            let expected_alias = agent_alias.clone();
+            tokio::task::spawn_blocking(move || {
                 backend
-                    .get_session_agent_alias(&session_key)
-                    .is_ok_and(|stored| stored.is_none_or(|alias| alias == agent_alias))
-            });
+                    .get_session_agent_alias(&key)
+                    .is_ok_and(|stored| stored.is_none_or(|alias| alias == expected_alias))
+            })
+            .await
+            .unwrap_or_else(|err| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "session_key": session_key,
+                            "error": format!("{err}"),
+                        })),
+                    "WS session alias check blocking task failed"
+                );
+                false
+            })
+        } else {
+            true
+        };
         if !alias_matches
             || !binding.allows(&state.config.read(), &agent_alias, &session_id, "chat")
         {
@@ -364,28 +385,59 @@ async fn handle_socket(
         }
     }
 
-    // Hydrate session metadata from persistence (if available). Agent
-    // construction is deferred until after the optional `connect` frame so the
-    // client can provide a per-session cwd for the security sandbox root.
+    // Hydrate session metadata from persistence on Tokio's blocking pool (if
+    // available). On `SqliteSessionBackend` (the default), `get_session_metadata`
+    // avoids loading message payloads; legacy JSONL falls back inside
+    // `spawn_blocking`. Conversation history is loaded lazily only when
+    // `ConversationHub::attach` builds a new conversation (`#379` / `#647` P2).
+    // Agent construction is deferred until after the optional `connect` frame
+    // so the client can provide a per-session cwd for the security sandbox root.
     let config = state.config.read().clone();
     let mut resumed = false;
     let mut message_count: usize = 0;
     let mut effective_name: Option<String> = None;
     {
-        let _lifecycle = lifecycle.lock().await;
-        if let Some(ref backend) = state.session_backend {
-            let messages = backend.load(&session_key);
-            if !messages.is_empty() {
-                message_count = messages.len();
-                resumed = true;
-            }
-            if !restricted {
-                effective_name = stamp_session(
-                    backend.as_ref(),
-                    &session_key,
-                    &agent_alias,
-                    session_name.as_deref(),
-                );
+        let lifecycle_guard = lifecycle.clone().lock_owned().await;
+        if let Some(backend) = state.session_backend.as_ref().map(Arc::clone) {
+            let key = session_key.clone();
+            let alias = agent_alias.clone();
+            let requested_name = (!restricted).then(|| session_name.clone()).flatten();
+            match run_blocking_with_lifecycle(
+                lifecycle_guard,
+                &session_key,
+                "session_metadata_hydrate",
+                move || {
+                    let metadata = backend.get_session_metadata(&key);
+                    let name = if restricted {
+                        None
+                    } else {
+                        stamp_session(backend.as_ref(), &key, &alias, requested_name.as_deref())
+                    };
+                    (metadata, name)
+                },
+            )
+            .await
+            {
+                Ok((guard, (metadata, stamped_name))) => {
+                    drop(guard);
+                    if let Some(meta) = metadata
+                        && meta.message_count > 0
+                    {
+                        message_count = meta.message_count;
+                        resumed = true;
+                    }
+                    effective_name = stamped_name;
+                }
+                Err(err) => {
+                    send_ws_fatal_error(
+                        &mut sender,
+                        "SESSION_INIT_FAILED",
+                        format!("Failed to load session metadata: {err}"),
+                        "Session metadata hydration failed",
+                    )
+                    .await;
+                    return;
+                }
             }
         }
     }
@@ -529,26 +581,40 @@ async fn handle_socket(
 
     // Every socket that opens this session with this agent shares one
     // conversation: one agent, one history, one running turn (#376).
-    // The client handshake must not hold the lifecycle guard. Re-read history
-    // under it so DELETE cannot be undone by a pre-deletion history snapshot.
-    let lifecycle_guard = lifecycle.lock().await;
-    if let Some(backend) = &state.session_backend {
-        stamp_session(
-            backend.as_ref(),
+    // The client handshake must not hold the lifecycle guard. Stamp session
+    // metadata under it, and defer loading stored history into
+    // `ConversationHub::attach`'s init factory so sockets joining an existing
+    // live conversation perform zero redundant full-history reads (#379 / #647 P2).
+    let lifecycle_guard = lifecycle.clone().lock_owned().await;
+    let lifecycle_guard = if let Some(backend) = state.session_backend.as_ref().map(Arc::clone) {
+        let key = session_key.clone();
+        let alias = agent_alias.clone();
+        let requested_name = (!restricted).then(|| session_name.clone()).flatten();
+        match run_blocking_with_lifecycle(
+            lifecycle_guard,
             &session_key,
-            &agent_alias,
-            if restricted {
-                None
-            } else {
-                session_name.as_deref()
+            "session_attach_stamp",
+            move || {
+                stamp_session(backend.as_ref(), &key, &alias, requested_name.as_deref());
             },
-        );
-    }
-    let stored_messages = state
-        .session_backend
-        .as_ref()
-        .map(|backend| backend.load(&session_key))
-        .unwrap_or_default();
+        )
+        .await
+        {
+            Ok((guard, ())) => guard,
+            Err(err) => {
+                send_ws_fatal_error(
+                    &mut sender,
+                    "SESSION_STAMP_FAILED",
+                    format!("Failed to stamp session metadata: {err}"),
+                    "Session metadata stamp failed",
+                )
+                .await;
+                return;
+            }
+        }
+    } else {
+        lifecycle_guard
+    };
     let conversation_key = format!("{session_key}\u{1f}{agent_alias}");
     let attached = state
         .ws_conversations
@@ -560,7 +626,6 @@ async fn handle_socket(
                 &session_key,
                 &session_cwd,
                 memory_session_id.clone(),
-                &stored_messages,
                 seed,
             )
         })
@@ -576,20 +641,13 @@ async fn handle_socket(
                     .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
                 "Agent initialization failed"
             );
-            let err = serde_json::json!({
-                "type": "error",
-                "message": format!("Failed to initialise agent: {e}"),
-                "code": "AGENT_INIT_FAILED"
-            });
-            let _ = sender.send(Message::Text(err.to_string().into())).await;
-            let _ = sender
-                .send(Message::Close(Some(axum::extract::ws::CloseFrame {
-                    code: 1011,
-                    reason: axum::extract::ws::Utf8Bytes::from_static(
-                        "Agent initialization failed",
-                    ),
-                })))
-                .await;
+            send_ws_fatal_error(
+                &mut sender,
+                "AGENT_INIT_FAILED",
+                format!("Failed to initialise agent: {e}"),
+                "Agent initialization failed",
+            )
+            .await;
             return;
         }
     };
@@ -844,15 +902,13 @@ struct WsTurnScope {
 /// Build the agent for a new shared conversation and wire its approval
 /// prompts to the conversation's subscribers. Also returns the history-trim
 /// event from restoring the stored messages, if restoring trimmed them.
-#[allow(clippy::too_many_arguments)]
 async fn build_ws_session(
     config: &zeroclaw_config::schema::Config,
     state: &AppState,
     agent_alias: &str,
-    _session_key: &str,
+    session_key: &str,
     session_cwd: &Path,
     memory_session_id: String,
-    stored_messages: &[zeroclaw_providers::ChatMessage],
     seed: Seed,
 ) -> anyhow::Result<(WsSession, Option<zeroclaw_api::agent::TurnEvent>)> {
     let ws_memory = match resolve_ws_memory_handle(config, agent_alias).await {
@@ -889,10 +945,30 @@ async fn build_ws_session(
     // what lets ask_user/poll/escalate_to_human default to this conversation.
     agent.set_channel_name(WS_CHANNEL_KEY.to_string());
     agent.set_memory_session_id(Some(memory_session_id));
+    let stored_messages = if let Some(backend) = state.session_backend.as_ref().map(Arc::clone) {
+        let key = session_key.to_string();
+        tokio::task::spawn_blocking(move || backend.load(&key))
+            .await
+            .map_err(|err| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "session_key": session_key,
+                            "error": format!("{err}"),
+                        })),
+                    "WS session history load blocking task panicked"
+                );
+                anyhow::Error::msg(format!("failed to join WS history load task: {err}"))
+            })?
+    } else {
+        Vec::new()
+    };
     let restore_trim_event = if stored_messages.is_empty() {
         None
     } else {
-        agent.seed_history_with_event(stored_messages)
+        agent.seed_history_with_event(&stored_messages)
     };
 
     let Seed {
@@ -1950,6 +2026,60 @@ async fn run_ws_turns(
         initial_claim = false;
     }
     state.ws_conversations.release_if_unused(&conversation);
+}
+
+/// Run a synchronous `SessionBackend` task on Tokio's blocking pool while owning
+/// the session's lifecycle guard, so cancelling the awaiting future on gateway
+/// shutdown cannot release the lifecycle lock before the blocking write finishes.
+async fn run_blocking_with_lifecycle<T, F>(
+    lifecycle_guard: tokio::sync::OwnedMutexGuard<()>,
+    session_key: &str,
+    context: &str,
+    work: F,
+) -> Result<(tokio::sync::OwnedMutexGuard<()>, T), tokio::task::JoinError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    tokio::task::spawn_blocking(move || {
+        let _guard = &lifecycle_guard;
+        let out = work();
+        (lifecycle_guard, out)
+    })
+    .await
+    .inspect_err(|err| {
+        ::zeroclaw_log::record!(
+            ERROR,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({
+                    "session_key": session_key,
+                    "context": context,
+                    "error": format!("{err}"),
+                })),
+            "WS lifecycle blocking task failed"
+        );
+    })
+}
+
+async fn send_ws_fatal_error(
+    sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    code: &str,
+    message: String,
+    close_reason: &'static str,
+) {
+    let err = serde_json::json!({
+        "type": "error",
+        "message": message,
+        "code": code,
+    });
+    let _ = sender.send(Message::Text(err.to_string().into())).await;
+    let _ = sender
+        .send(Message::Close(Some(axum::extract::ws::CloseFrame {
+            code: 1011,
+            reason: axum::extract::ws::Utf8Bytes::from_static(close_reason),
+        })))
+        .await;
 }
 
 /// Record the owning agent and optional name for a session on connect, and
@@ -3468,6 +3598,10 @@ mod tests {
 
     mod completion_tests {
         include!("ws/completion_tests.rs");
+    }
+
+    mod lazy_history_tests {
+        include!("ws/lazy_history_tests.rs");
     }
 
     struct SideQueryTestGate {
