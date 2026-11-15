@@ -8,11 +8,15 @@ pub mod bedrock;
 pub mod catalog;
 pub mod compatible;
 pub mod copilot;
+pub mod decision;
 pub mod dispatch;
+pub mod embedding;
 pub mod factory;
 pub mod gemini;
 pub mod gemini_cli;
 pub mod grok_cli;
+pub mod transcription;
+pub mod tts;
 // glm.rs excluded — not compiled in upstream (dead code with known issues)
 pub mod hailo_ollama;
 pub mod kilocli;

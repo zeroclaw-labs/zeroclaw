@@ -17,7 +17,7 @@ pub mod conflict;
 pub mod consolidation;
 pub mod decay;
 pub mod dedup;
-pub mod embeddings;
+use zeroclaw_providers::embedding as embeddings;
 pub mod hygiene;
 pub mod importance;
 pub mod knowledge_graph;
@@ -48,14 +48,14 @@ pub mod vector;
 
 pub use agent_scoped::{AgentMemoryGrant, AgentScopedMemory};
 pub use agent_scoped_markdown::{AgentScopedMarkdownMemory, MarkdownPeer};
+#[allow(unused_imports)]
+use anyhow::Context;
 pub use audit::AuditedMemory;
 #[allow(unused_imports)]
 pub use backend::{
     MemoryBackendKind, MemoryBackendProfile, classify_memory_backend, default_memory_backend_key,
     memory_backend_profile, selectable_memory_backends,
 };
-#[allow(unused_imports)]
-pub use embeddings::EmbeddingIdentity;
 pub use lucid::LucidMemory;
 pub use markdown::MarkdownMemory;
 pub use none::NoneMemory;
@@ -72,16 +72,14 @@ pub use response_cache::ResponseCache;
 pub use retrieval::{RetrievalConfig, RetrievalPipeline};
 pub use scanned::ScannedMemory;
 pub use sqlite::SqliteMemory;
+use std::path::Path;
+use std::sync::Arc;
 pub use traits::Memory;
 #[allow(unused_imports)]
 pub use traits::{
     ExportFilter, MemoryCategory, MemoryEntry, ProceduralMessage, is_recent_recall_query,
     normalize_recent_recall_query,
 };
-
-use anyhow::Context;
-use std::path::Path;
-use std::sync::Arc;
 use zeroclaw_config::providers::ModelProviders;
 use zeroclaw_config::schema::{
     ActiveStorage, Config, EmbeddingRouteConfig, MemoryConfig, MemoryPolicyConfig,
@@ -659,7 +657,7 @@ fn build_memory_with_storage(
 
     fn create_embedder(
         resolved_embedding: Option<&ResolvedEmbeddingConfig>,
-    ) -> Arc<dyn embeddings::EmbeddingProvider> {
+    ) -> Arc<dyn zeroclaw_api::embedding::EmbeddingProvider> {
         match resolved_embedding {
             Some(resolved) => Arc::from(embeddings::create_embedding_provider(
                 &resolved.model_provider,
@@ -697,7 +695,7 @@ fn build_memory_with_storage(
         {
             reconcile_embedding_identity(
                 &mem,
-                &embeddings::EmbeddingIdentity {
+                &zeroclaw_api::embedding::EmbeddingIdentity {
                     provider: resolved_embedding.model_provider.clone(),
                     model: resolved_embedding.model.clone(),
                     dimensions: resolved_embedding.dimensions,
@@ -821,7 +819,7 @@ enum EmbeddingIdentityOutcome {
 
 fn reconcile_embedding_identity(
     mem: &SqliteMemory,
-    current: &embeddings::EmbeddingIdentity,
+    current: &zeroclaw_api::embedding::EmbeddingIdentity,
     auto_reindex: bool,
 ) -> EmbeddingIdentityOutcome {
     let stored = match mem.stored_embedding_identity() {
@@ -1332,7 +1330,7 @@ mod tests {
     struct StaticEmbedding(usize);
 
     #[async_trait::async_trait]
-    impl embeddings::EmbeddingProvider for StaticEmbedding {
+    impl zeroclaw_api::embedding::EmbeddingProvider for StaticEmbedding {
         fn name(&self) -> &str {
             "static"
         }
@@ -1358,8 +1356,12 @@ mod tests {
         .unwrap()
     }
 
-    fn ident(provider: &str, model: &str, dimensions: usize) -> embeddings::EmbeddingIdentity {
-        embeddings::EmbeddingIdentity {
+    fn ident(
+        provider: &str,
+        model: &str,
+        dimensions: usize,
+    ) -> zeroclaw_api::embedding::EmbeddingIdentity {
+        zeroclaw_api::embedding::EmbeddingIdentity {
             provider: provider.into(),
             model: model.into(),
             dimensions,

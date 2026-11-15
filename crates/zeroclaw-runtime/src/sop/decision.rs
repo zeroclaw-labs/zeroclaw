@@ -16,18 +16,14 @@
 //! supervision rather than removing it.
 
 use std::collections::BTreeMap;
-use std::time::Duration;
 
 use anyhow::{Context, Result, bail, ensure};
+#[cfg(test)]
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::types::{Sop, SopEvent, SopExecutionMode};
-
-/// Upper bound on one decision request. Dispatch awaits the model outside the
-/// engine lock, but the triggering transport is still waiting on the result.
-const DECISION_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Untrusted payload bytes forwarded to the model. Payloads past this are cut
 /// on a char boundary; the model sees that it was truncated.
@@ -226,110 +222,10 @@ fn mode_description(mode: SopExecutionMode) -> &'static str {
     }
 }
 
-// ── Wire protocol (TypeSafe `/v1/systemone`, also served by `laya-serve`) ──
-
-/// One typed question. Only the two shapes dispatch needs are modeled.
-#[derive(Debug, Clone, Serialize)]
-#[serde(tag = "type", rename_all = "lowercase")]
-pub enum Question {
-    Noul {
-        instructions: String,
-    },
-    Choice {
-        instructions: String,
-        criteria: BTreeMap<String, String>,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(tag = "type", rename_all = "lowercase")]
-pub enum Answer {
-    Noul {
-        noul: f64,
-    },
-    Choice {
-        choice: String,
-        probabilities: BTreeMap<String, f64>,
-        confidence: f64,
-    },
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct Answers {
-    #[serde(default)]
-    pub model: Option<String>,
-    pub answers: BTreeMap<String, Answer>,
-    #[serde(default)]
-    pub usage: Option<Usage>,
-}
-
-#[derive(Debug, Clone, Copy, Deserialize)]
-pub struct Usage {
-    #[serde(default)]
-    pub input_tokens: u64,
-}
-
-/// Seam for the decision call. The daemon injects [`SystemOneClient`]; tests
-/// inject a scripted model.
-#[async_trait]
-pub trait DecisionModel: Send + Sync {
-    /// Short identifier recorded with each decision (`jev-latest`, `laya`, ...).
-    fn id(&self) -> &str;
-    async fn ask(&self, state: Value, questions: BTreeMap<String, Question>) -> Result<Answers>;
-}
-
-/// HTTP client for any `/v1/systemone` endpoint. Point `base_url` at
-/// `https://api.typesafe.ai` for Jev or at a local `laya-serve` for Laya.
-pub struct SystemOneClient {
-    http: reqwest::Client,
-    endpoint: String,
-    model: String,
-    api_key: Option<String>,
-}
-
-impl SystemOneClient {
-    pub fn new(base_url: &str, model: &str, api_key: Option<String>) -> Result<Self> {
-        let http = reqwest::Client::builder()
-            .timeout(DECISION_TIMEOUT)
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .context("building decision-model HTTP client")?;
-        Ok(Self {
-            http,
-            endpoint: format!("{}/v1/systemone", base_url.trim_end_matches('/')),
-            model: model.to_string(),
-            api_key: api_key.filter(|k| !k.is_empty()),
-        })
-    }
-}
-
-#[async_trait]
-impl DecisionModel for SystemOneClient {
-    fn id(&self) -> &str {
-        &self.model
-    }
-
-    async fn ask(&self, state: Value, questions: BTreeMap<String, Question>) -> Result<Answers> {
-        let body = json!({ "model": self.model, "state": state, "questions": questions });
-        let mut request = self.http.post(&self.endpoint).json(&body);
-        if let Some(key) = &self.api_key {
-            request = request.bearer_auth(key);
-        }
-        let response = request
-            .send()
-            .await
-            .context("decision model request failed")?;
-        let status = response.status();
-        if !status.is_success() {
-            // The body is not echoed: it may reflect request content.
-            bail!("decision model returned HTTP {}", status.as_u16());
-        }
-        response
-            .json::<Answers>()
-            .await
-            .context("decision model response was not a System One answer set")
-    }
-}
+#[cfg(test)]
+use zeroclaw_api::decision::Usage;
+use zeroclaw_api::decision::{Answer, Answers, DecisionModel, Question};
+use zeroclaw_providers::decision::SystemOneClient;
 
 // ── Decision ────────────────────────────────────────────────────
 

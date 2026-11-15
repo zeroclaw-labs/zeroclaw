@@ -104,26 +104,7 @@ fn validate_audio(audio_data: &[u8], file_name: &str) -> Result<(String, &'stati
 
 // ── TranscriptionProvider trait ─────────────────────────────────
 
-/// Trait for speech-to-text transcription_provider implementations.
-#[async_trait]
-pub trait TranscriptionProvider: Send + Sync + ::zeroclaw_api::attribution::Attributable {
-    /// Human-readable transcription_provider name (e.g. "groq", "openai").
-    fn name(&self) -> &str;
-
-    /// Transcribe raw audio bytes. `file_name` includes the extension for
-    /// format detection (e.g. "voice.ogg").
-    async fn transcribe(&self, audio_data: &[u8], file_name: &str) -> Result<String>;
-
-    /// List of supported audio file extensions.
-    fn supported_formats(&self) -> Vec<String> {
-        vec![
-            "flac", "mp3", "mpeg", "mpga", "mp4", "m4a", "ogg", "oga", "opus", "wav", "webm",
-        ]
-        .into_iter()
-        .map(String::from)
-        .collect()
-    }
-}
+use zeroclaw_api::asr::AsrProvider;
 
 /// The Whisper `prompt` field biases recognition toward expected vocabulary;
 /// a blank value would bias it toward nothing, so it is not sent.
@@ -202,7 +183,7 @@ impl GroqProvider {
 }
 
 #[async_trait]
-impl TranscriptionProvider for GroqProvider {
+impl AsrProvider for GroqProvider {
     fn name(&self) -> &str {
         "groq"
     }
@@ -309,7 +290,7 @@ impl OpenAiWhisperProvider {
 }
 
 #[async_trait]
-impl TranscriptionProvider for OpenAiWhisperProvider {
+impl AsrProvider for OpenAiWhisperProvider {
     fn name(&self) -> &str {
         "openai"
     }
@@ -418,7 +399,7 @@ impl DeepgramProvider {
 }
 
 #[async_trait]
-impl TranscriptionProvider for DeepgramProvider {
+impl AsrProvider for DeepgramProvider {
     fn name(&self) -> &str {
         "deepgram"
     }
@@ -523,7 +504,7 @@ impl AssemblyAiProvider {
 }
 
 #[async_trait]
-impl TranscriptionProvider for AssemblyAiProvider {
+impl AsrProvider for AssemblyAiProvider {
     fn name(&self) -> &str {
         "assemblyai"
     }
@@ -722,7 +703,7 @@ impl GoogleSttProvider {
 }
 
 #[async_trait]
-impl TranscriptionProvider for GoogleSttProvider {
+impl AsrProvider for GoogleSttProvider {
     fn name(&self) -> &str {
         "google"
     }
@@ -884,7 +865,7 @@ impl LocalWhisperProvider {
 }
 
 #[async_trait]
-impl TranscriptionProvider for LocalWhisperProvider {
+impl AsrProvider for LocalWhisperProvider {
     fn name(&self) -> &str {
         "local_whisper"
     }
@@ -958,7 +939,7 @@ async fn parse_whisper_response(resp: reqwest::Response) -> Result<String> {
 /// agent's `transcription_provider` reference is the resolved alias for
 /// `transcribe()` calls. there is no global default-provider concept.
 pub struct TranscriptionManager {
-    transcription_providers: HashMap<String, Box<dyn TranscriptionProvider>>,
+    transcription_providers: HashMap<String, Box<dyn AsrProvider>>,
     max_audio_bytes: Option<usize>,
     /// Resolved alias for the agent that owns this manager. Empty when
     /// the agent has no transcription preference (opt-out).
@@ -994,8 +975,7 @@ impl TranscriptionManager {
             bail!("transcription.max_audio_bytes must be greater than zero");
         }
 
-        let mut transcription_providers: HashMap<String, Box<dyn TranscriptionProvider>> =
-            HashMap::new();
+        let mut transcription_providers: HashMap<String, Box<dyn AsrProvider>> = HashMap::new();
 
         Self::register_legacy_providers(&mut transcription_providers, config);
         if let Some(typed) = typed {
@@ -1044,7 +1024,7 @@ impl TranscriptionManager {
     }
 
     fn register_legacy_providers(
-        transcription_providers: &mut HashMap<String, Box<dyn TranscriptionProvider>>,
+        transcription_providers: &mut HashMap<String, Box<dyn AsrProvider>>,
         config: &TranscriptionConfig,
     ) {
         if let Ok(groq) = GroqProvider::from_config("groq", config) {
@@ -1094,7 +1074,7 @@ impl TranscriptionManager {
     }
 
     fn register_typed_providers(
-        transcription_providers: &mut HashMap<String, Box<dyn TranscriptionProvider>>,
+        transcription_providers: &mut HashMap<String, Box<dyn AsrProvider>>,
         typed: &TranscriptionProviders,
     ) {
         for (family, alias, entry) in typed.iter_entries() {
@@ -1102,7 +1082,7 @@ impl TranscriptionManager {
             if transcription_providers.contains_key(&dotted) {
                 continue;
             }
-            let result: Result<Box<dyn TranscriptionProvider>> = match entry {
+            let result: Result<Box<dyn AsrProvider>> = match entry {
                 TranscriptionProviderEntry::Groq(provider_config) => {
                     GroqProvider::from_typed_config(alias, provider_config)
                         .map(|provider| Box::new(provider) as _)
@@ -1462,7 +1442,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl TranscriptionProvider for StaticTranscriptionProvider {
+    impl AsrProvider for StaticTranscriptionProvider {
         fn name(&self) -> &str {
             "static"
         }
@@ -1491,8 +1471,7 @@ mod tests {
         max_audio_bytes: Option<usize>,
     ) -> (TranscriptionManager, Arc<AtomicUsize>) {
         let calls = Arc::new(AtomicUsize::new(0));
-        let mut transcription_providers: HashMap<String, Box<dyn TranscriptionProvider>> =
-            HashMap::new();
+        let mut transcription_providers: HashMap<String, Box<dyn AsrProvider>> = HashMap::new();
         transcription_providers.insert(
             "static".to_string(),
             Box::new(StaticTranscriptionProvider {

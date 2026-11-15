@@ -32,7 +32,7 @@ pub use binding::{
 pub use capability::{
     CapabilityContext, CapabilityInfo, CapabilityResult, SopCapability, SopCapabilityRegistry,
 };
-pub use decision::{DecisionModel, SopDecision, SopDecisionSpec, SystemOneClient};
+pub use decision::{SopDecision, SopDecisionSpec};
 pub use engine::{
     CancelOutcome, MaintenanceSummary, OrphanedRunSettlement, SopEngine,
     err_is_cancellation_persistence_retained, err_is_resume_at_capacity,
@@ -70,6 +70,7 @@ pub use types::{
     StepToolCall,
 };
 pub use wire::{WireEdit, WireError, WireOp, apply_wire};
+use zeroclaw_api::decision::DecisionModel;
 
 use anyhow::Result;
 use std::path::{Path, PathBuf};
@@ -116,7 +117,7 @@ pub struct SopEngineAdapters {
     pub llm: Option<Arc<dyn capability::LlmGenerateAdapter>>,
     /// Extra decision models by alias, added to (and overriding) the ones built
     /// from `[decision_models]`. Used by tests and embedders.
-    pub decision: std::collections::HashMap<String, Arc<dyn decision::DecisionModel>>,
+    pub decision: std::collections::HashMap<String, Arc<dyn DecisionModel>>,
 }
 
 /// Build a single shared SopEngine + SopAuditLogger pair.
