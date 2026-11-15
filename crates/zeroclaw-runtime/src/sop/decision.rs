@@ -18,8 +18,6 @@
 use std::collections::BTreeMap;
 
 use anyhow::{Context, Result, bail, ensure};
-#[cfg(test)]
-use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -222,8 +220,6 @@ fn mode_description(mode: SopExecutionMode) -> &'static str {
     }
 }
 
-#[cfg(test)]
-use zeroclaw_api::decision::Usage;
 use zeroclaw_api::decision::{Answer, Answers, DecisionModel, Question};
 use zeroclaw_providers::decision::SystemOneClient;
 

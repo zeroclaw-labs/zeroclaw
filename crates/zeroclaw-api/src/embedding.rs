@@ -33,15 +33,9 @@ pub trait EmbeddingProvider: Send + Sync {
 
     /// Embed a single text
     async fn embed_one(&self, text: &str) -> anyhow::Result<Vec<f32>> {
-        let mut results = self.embed(&[text]).await?;
-        results.pop().ok_or_else(|| {
-            ::zeroclaw_log::record!(
-                ERROR,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure),
-                "embed_one: provider returned no embedding"
-            );
-            anyhow::Error::msg("Empty embedding result")
-        })
+        self.embed(&[text])
+            .await?
+            .pop()
+            .ok_or_else(|| anyhow::Error::msg("Empty embedding result"))
     }
 }

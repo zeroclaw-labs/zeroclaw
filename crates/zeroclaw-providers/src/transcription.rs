@@ -24,7 +24,7 @@ const GOOGLE_API_KEY_HEADER: &str = "x-goog-api-key";
 /// Map file extension to MIME type for Whisper-compatible transcription APIs.
 /// Canonical accepted-extension predicate — channels reuse this instead of
 /// keeping their own copy of the accepted set.
-pub(crate) fn mime_for_audio(extension: &str) -> Option<&'static str> {
+pub fn mime_for_audio(extension: &str) -> Option<&'static str> {
     match extension.to_ascii_lowercase().as_str() {
         "flac" => Some("audio/flac"),
         "mp3" | "mpeg" | "mpga" => Some("audio/mpeg"),
@@ -41,8 +41,7 @@ pub(crate) fn mime_for_audio(extension: &str) -> Option<&'static str> {
 /// `mime_for_audio`. `None` when the MIME does not map to a format
 /// `resolve_audio_format` accepts. Codec parameters (e.g.
 /// "audio/ogg; codecs=opus") are stripped before matching.
-#[cfg(any(feature = "channel-matrix", test))]
-pub(crate) fn extension_for_audio_mime(mime: &str) -> Option<&'static str> {
+pub fn extension_for_audio_mime(mime: &str) -> Option<&'static str> {
     let mime = mime.split(';').next().unwrap_or(mime).trim();
     match mime.to_ascii_lowercase().as_str() {
         "audio/flac" => Some("flac"),
@@ -1012,7 +1011,7 @@ impl TranscriptionManager {
     /// Build from the canonical runtime config while binding an already
     /// resolved provider reference. Channel factories use this when routing
     /// has selected an owner separately from the runtime-default agent.
-    pub(crate) fn from_config_with_provider(
+    pub fn from_config_with_provider(
         config: &Config,
         agent_transcription_provider: String,
     ) -> Result<Self> {
@@ -1205,11 +1204,9 @@ impl TranscriptionManager {
     }
 
     /// The provider `transcribe` will dispatch to, or empty when unbound.
-    /// Test-only: lets channel tests assert the binding without a network
-    /// call. Gated on the two channels whose tests assert it, so no feature
-    /// shape compiles an unused method.
-    #[cfg(all(test, any(feature = "channel-slack", feature = "whatsapp-web")))]
-    pub(crate) fn bound_provider(&self) -> &str {
+    /// Exposes the selected binding without a network call or a second
+    /// provider-selection lookup in downstream consumers.
+    pub fn bound_provider(&self) -> &str {
         &self.agent_transcription_provider
     }
 
@@ -1239,18 +1236,6 @@ impl TranscriptionManager {
 /// 4. Otherwise leave the choice unbound: with several providers a silent
 ///    pick would route audio to an arbitrary vendor, and `transcribe` fails
 ///    loud instead.
-#[cfg(any(
-    feature = "channel-telegram",
-    feature = "channel-discord",
-    feature = "channel-slack",
-    feature = "channel-mattermost",
-    feature = "whatsapp-web",
-    feature = "channel-lark",
-    feature = "channel-line",
-    feature = "channel-qq",
-    feature = "channel-matrix",
-    feature = "voice-wake"
-))]
 fn bind_channel_provider(
     manager: TranscriptionManager,
     agent_provider: &str,
@@ -1289,19 +1274,7 @@ fn bind_channel_provider(
 ///
 /// Returns the manager constructor's error: transcription is enabled but no
 /// provider registered, or an invalid audio bound.
-#[cfg(any(
-    feature = "channel-telegram",
-    feature = "channel-discord",
-    feature = "channel-slack",
-    feature = "channel-mattermost",
-    feature = "whatsapp-web",
-    feature = "channel-lark",
-    feature = "channel-line",
-    feature = "channel-qq",
-    feature = "channel-matrix",
-    feature = "voice-wake"
-))]
-pub(crate) fn build_channel_transcription_manager(
+pub fn build_channel_transcription_manager(
     config: &Config,
     agent_provider: &str,
 ) -> Result<TranscriptionManager> {
@@ -1318,19 +1291,7 @@ pub(crate) fn build_channel_transcription_manager(
 /// returns `None` when transcription is disabled or the manager cannot be
 /// built; the failure is logged once here rather than in every channel, and
 /// the channel stays up without transcription.
-#[cfg(any(
-    feature = "channel-telegram",
-    feature = "channel-discord",
-    feature = "channel-slack",
-    feature = "channel-mattermost",
-    feature = "whatsapp-web",
-    feature = "channel-lark",
-    feature = "channel-line",
-    feature = "channel-qq",
-    feature = "channel-matrix",
-    feature = "voice-wake"
-))]
-pub(crate) fn manager_from_snapshot(
+pub fn manager_from_snapshot(
     config: &TranscriptionConfig,
 ) -> Option<std::sync::Arc<TranscriptionManager>> {
     if !config.enabled {
