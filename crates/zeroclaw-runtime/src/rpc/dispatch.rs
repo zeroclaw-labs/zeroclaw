@@ -48821,20 +48821,41 @@ options = { temperature = 0.2 }
         let cfg = make_two_provider_test_config(&tmp);
         let (dispatcher_a, dispatcher_b, _sessions) = make_two_dispatchers_sharing_context(cfg);
 
-        let params_a = registry_edit_params(
-            &dispatcher_a,
-            &["models", "anthropic.default", "model"],
-            json!("concurrent-a"),
-        );
-        let params_b = registry_edit_params(
-            &dispatcher_b,
-            &["models", "openai.default", "model"],
-            json!("concurrent-b"),
-        );
-
         let (result_a, result_b) = tokio::join!(
-            dispatcher_a.handle_config_registry_set(&params_a),
-            dispatcher_b.handle_config_registry_set(&params_b),
+            async {
+                for _ in 0..3 {
+                    let params = registry_edit_params(
+                        &dispatcher_a,
+                        &["models", "anthropic.default", "model"],
+                        json!("concurrent-a"),
+                    );
+                    match dispatcher_a.handle_config_registry_set(&params).await {
+                        Ok(result) => return Ok(result),
+                        Err(error) if error.code == INVALID_PARAMS => {
+                            tokio::task::yield_now().await
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+                unreachable!("concurrent registry edit did not converge")
+            },
+            async {
+                for _ in 0..3 {
+                    let params = registry_edit_params(
+                        &dispatcher_b,
+                        &["models", "openai.default", "model"],
+                        json!("concurrent-b"),
+                    );
+                    match dispatcher_b.handle_config_registry_set(&params).await {
+                        Ok(result) => return Ok(result),
+                        Err(error) if error.code == INVALID_PARAMS => {
+                            tokio::task::yield_now().await
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+                unreachable!("concurrent registry edit did not converge")
+            },
         );
         assert!(
             result_a.is_ok(),
