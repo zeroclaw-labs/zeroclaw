@@ -123,6 +123,30 @@ use **Link existing secret** with the same reference to recover. A
 retry of **Add** cannot overwrite it. A gateway timeout may also leave
 the result uncertain. Verify in OpenBao before retrying.
 
-Other external providers currently support the same reference editor
-with **Link existing secret**. The external creation action is enabled
-only for a backend with a provisioner.
+### Other external vaults
+
+Each writer is opt-in. Set the matching prefix on the gateway host. The
+browser suggests a reference inside that scope, and editing the reference
+remains subject to the scope and the provider ACL. The operator enters
+write authorization per operation. The existing CLI-based read flows
+retain their own credentials.
+
+| Provider | Gateway setting and example | Operator write authority |
+| --- | --- | --- |
+| 1Password | `ZEROCLAW_1PASSWORD_WRITE_PREFIX=op://<vault-id>` and `ZEROCLAW_1PASSWORD_CONNECT_URL=https://connect.example.com` | A Connect write token scoped to the vault. Set `ZEROCLAW_1PASSWORD_CONNECT_CA` to a PEM bundle if the origin uses a private CA. |
+| Azure Key Vault | `ZEROCLAW_AZURE_WRITE_PREFIX=vault-name/jarvis-` | A bearer token for Azure Key Vault with metadata-list and secret-set permissions in the configured scope. Public Azure endpoint. |
+| AWS Secrets Manager | `ZEROCLAW_AWS_WRITE_PREFIX=us-east-1/jarvis` | Temporary AWS STS access key, secret access key and session token with CreateSecret and PutSecretValue permissions for the scope. Commercial AWS endpoints. |
+| Google Secret Manager | `ZEROCLAW_GOOGLE_WRITE_PREFIX=project-id/jarvis-` | An OAuth access token with the cloud-platform scope and permissions to create secrets and add versions. Global secrets, using `latest` references. |
+
+The 1Password writer checks for an existing item title and stores the
+item and field IDs returned by Connect. Rotation patches the field by
+ID. Azure checks version metadata before setting a value. Azure Set
+Secret and 1Password item creation lack a conditional create by name.
+Use a dedicated vault or name prefix with one writer to avoid races with
+external writers. AWS and Google reject creation of an existing name
+at the provider.
+
+Google creates the resource and its first version in separate requests.
+If the version write fails, verify the resource in Google Cloud, then
+link the existing identifier and use **Replace** to add the version.
+Retried adds cannot replace an existing AWS or Google resource.

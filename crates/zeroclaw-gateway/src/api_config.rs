@@ -1340,7 +1340,8 @@ struct HttpCredentialMutation {
     operation: PluginTlsCredentialOperation,
     credential: Option<zeroclaw_config::schema::ScopedHttpCredential>,
     permissions: Option<HttpCredentialPermissions>,
-    openbao_write: Option<crate::openbao_write::SecretWrite>,
+    #[serde(alias = "openbao_write")]
+    vault_write: Option<crate::openbao_write::SecretWrite>,
 }
 
 #[derive(Deserialize)]
@@ -1399,12 +1400,14 @@ pub async fn list_http_credentials(
                     ScopedHttpAuth::SshKey { destinations, .. } => Some(destinations),
                     _ => None,
                 };
+                let reference = crate::openbao_write::SecretWrite::reference(&record.auth);
+                let reference = record.source.command(reference).is_some().then_some(reference);
                 let http_allowed = record.origin.starts_with("https://")
                     .then_some(record.http_allowed);
                 rows.push((
                     name,
                     serde_json::json!({
-                        "name": name, "origin": record.origin, "kind": kind, "source": record.source, "destinations": destinations, "header": header, "http_allowed": http_allowed
+                        "name": name, "origin": record.origin, "kind": kind, "source": record.source, "destinations": destinations, "header": header, "http_allowed": http_allowed, "reference": reference
                     }),
                 ));
             }
@@ -1412,6 +1415,7 @@ pub async fn list_http_credentials(
             Json(serde_json::json!({
                 "encryption_enabled": config.secrets.encrypt,
                 "openbao_write_prefix": crate::openbao_write::configured_prefix(),
+                "vault_write_prefixes": crate::cloud_vault_write::prefixes(),
                 "credentials": rows.into_iter().map(|(_, row)| row).collect::<Vec<_>>()
             }))
             .into_response()
@@ -1457,7 +1461,7 @@ pub async fn mutate_http_credential(
             let present = credentials.contains_key(&mutation.name);
             if let Some(permissions) = mutation.permissions {
                 if mutation.credential.is_some()
-                    || mutation.openbao_write.is_some()
+                    || mutation.vault_write.is_some()
                     || !matches!(mutation.operation, PluginTlsCredentialOperation::Replace)
                 {
                     return StatusCode::BAD_REQUEST.into_response();
@@ -1521,7 +1525,7 @@ pub async fn mutate_http_credential(
                 (PluginTlsCredentialOperation::Create, Some(_), false) => Verb::Create,
                 (PluginTlsCredentialOperation::Replace, Some(_), true) => Verb::Update,
                 (PluginTlsCredentialOperation::Delete, None, true)
-                    if mutation.openbao_write.is_none() =>
+                    if mutation.vault_write.is_none() =>
                 {
                     Verb::Delete
                 }
@@ -1546,13 +1550,11 @@ pub async fn mutate_http_credential(
                     {
                         return StatusCode::BAD_REQUEST.into_response();
                     }
-                    if let Some(write) = &mutation.openbao_write
-                        && (previous
-                            .source
-                            .command(write.reference(&previous.auth))
-                            .is_none()
-                            || !matches!(previous.source, ScopedCredentialSource::OpenBao)
-                            || write.reference(&previous.auth) != write.reference(&credential.auth))
+                    if mutation.vault_write.is_some()
+                        && (std::mem::discriminant(&previous.source)
+                            != std::mem::discriminant(&credential.source)
+                            || crate::openbao_write::SecretWrite::reference(&previous.auth)
+                                != crate::openbao_write::SecretWrite::reference(&credential.auth))
                     {
                         return StatusCode::BAD_REQUEST.into_response();
                     }
@@ -1638,13 +1640,15 @@ pub async fn mutate_http_credential(
                 if !valid_auth {
                     return StatusCode::BAD_REQUEST.into_response();
                 }
-                if let Some(write) = mutation.openbao_write {
-                    if !matches!(credential.source, ScopedCredentialSource::OpenBao)
-                        || !write.valid_for(&credential.auth)
+                if let Some(write) = &mutation.vault_write {
+                    if matches!(credential.source, ScopedCredentialSource::Local)
+                        || !write.valid_for(
+                            &credential.auth,
+                            matches!(credential.source, ScopedCredentialSource::Aws),
+                        )
                     {
                         return StatusCode::BAD_REQUEST.into_response();
                     }
-                    external_write = Some((write.reference(&credential.auth).to_owned(), write));
                 }
                 let Ok(ciphertext) = serde_json::to_string(&credential)
                     .map_err(anyhow::Error::from)
@@ -1653,6 +1657,9 @@ pub async fn mutate_http_credential(
                     return StatusCode::INTERNAL_SERVER_ERROR.into_response();
                 };
                 credentials.insert(mutation.name.clone(), ciphertext);
+                if let Some(write) = mutation.vault_write {
+                    external_write = Some((credential, write, dir.to_path_buf()));
+                }
             } else {
                 credentials.remove(&mutation.name);
             }
@@ -1666,9 +1673,35 @@ pub async fn mutate_http_credential(
                 Ok(authorization) => authorization,
                 Err(denied) => return denied.into_response(),
             };
-            if let Some((reference, write)) = external_write {
-                if let Err(status) = write.apply(&reference, present).await {
-                    return status.into_response();
+            if let Some((mut credential, write, dir)) = external_write {
+                let reference = crate::openbao_write::SecretWrite::reference(&credential.auth);
+                let result = if matches!(credential.source, ScopedCredentialSource::OpenBao) {
+                    write.apply(reference, present).await.map(|()| None)
+                } else {
+                    crate::cloud_vault_write::apply(credential.source, write, reference, present)
+                        .await
+                };
+                match result {
+                    Ok(Some(canonical)) => {
+                        match &mut credential.auth {
+                            ScopedHttpAuth::Totp { seed } => *seed = canonical,
+                            ScopedHttpAuth::SshKey { private_key, .. } => *private_key = canonical,
+                            ScopedHttpAuth::UserPassword { password, .. } => *password = canonical,
+                            ScopedHttpAuth::ApiKey { value, .. } => *value = canonical,
+                        }
+                        let Ok(ciphertext) = serde_json::to_string(&credential)
+                            .map_err(anyhow::Error::from)
+                            .and_then(|value| SecretStore::new(&dir, true).encrypt(&value))
+                        else {
+                            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                        };
+                        config
+                            .http_request
+                            .scoped_credentials
+                            .insert(mutation.name, ciphertext);
+                    }
+                    Ok(None) => {}
+                    Err(status) => return status.into_response(),
                 }
             }
             if persist_and_swap(&state, authorization, config, guard)

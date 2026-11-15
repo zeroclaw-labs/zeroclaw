@@ -7,12 +7,14 @@ use zeroclaw_config::schema::ScopedHttpAuth;
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct SecretWrite {
-    value: String,
-    token: String,
+    pub(crate) value: String,
+    pub(crate) token: String,
+    pub(crate) aws_access_key_id: Option<String>,
+    pub(crate) aws_secret_access_key: Option<String>,
 }
 
 impl SecretWrite {
-    pub(crate) fn reference<'a>(&self, auth: &'a ScopedHttpAuth) -> &'a str {
+    pub(crate) fn reference(auth: &ScopedHttpAuth) -> &str {
         match auth {
             ScopedHttpAuth::Totp { seed } => seed,
             ScopedHttpAuth::SshKey { private_key, .. } => private_key,
@@ -21,12 +23,27 @@ impl SecretWrite {
         }
     }
 
-    pub(crate) fn valid_for(&self, auth: &ScopedHttpAuth) -> bool {
+    pub(crate) fn valid_for(&self, auth: &ScopedHttpAuth, aws: bool) -> bool {
         let value = self.value.as_str();
         if self.token.is_empty()
-            || self.token.len() > 1024
+            || self.token.len() > 16384
             || !self.token.bytes().all(|b| b.is_ascii_graphic())
         {
+            return false;
+        }
+        let valid_aws = match (&self.aws_access_key_id, &self.aws_secret_access_key) {
+            (Some(id), Some(key)) => {
+                aws && id.len() == 20
+                    && id
+                        .bytes()
+                        .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+                    && key.len() == 40
+                    && key.bytes().all(|b| b.is_ascii_graphic())
+            }
+            (None, None) => !aws,
+            _ => false,
+        };
+        if !valid_aws {
             return false;
         }
         match auth {

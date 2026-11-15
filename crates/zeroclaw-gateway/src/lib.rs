@@ -35,6 +35,7 @@ pub mod api_webhook;
 pub mod auth_rate_limit;
 pub mod canvas;
 mod chat_core;
+mod cloud_vault_write;
 pub mod core_rpc;
 pub mod dashboard_core;
 pub mod dashboard_session;

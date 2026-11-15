@@ -1385,7 +1385,7 @@ export interface MapKeyResponse {
 export type HttpCredentialKind = "user_password" | "api_key" | "ssh_key" | "totp";
 export type HttpCredentialSource = "local" | "open_bao" | "one_password" | "azure" | "aws" | "google";
 export type SshDestination = { host: string; port: number; username: string };
-export type HttpCredentialRow = { name: string; origin: string; kind: HttpCredentialKind; source: HttpCredentialSource; destinations?: SshDestination[] | null; http_allowed?: boolean | null; header?: "bearer" | "x_api_key" | null };
+export type HttpCredentialRow = { reference?: string | null; name: string; origin: string; kind: HttpCredentialKind; source: HttpCredentialSource; destinations?: SshDestination[] | null; http_allowed?: boolean | null; header?: "bearer" | "x_api_key" | null };
 type HttpCredentialAuth =
   | { kind: "totp"; seed: string }
   | { kind: "user_password"; username: string; password: string }
@@ -1395,13 +1395,13 @@ type HttpCredentialAuth =
 const httpCredentialsPath = "/api/config/http-credentials";
 
 export function listHttpCredentials() {
-  return apiFetch<{ encryption_enabled: boolean; credentials: HttpCredentialRow[]; openbao_write_prefix?: string }>(
+  return apiFetch<{ encryption_enabled: boolean; credentials: HttpCredentialRow[]; openbao_write_prefix?: string; vault_write_prefixes?: Partial<Record<HttpCredentialSource, string | null>> }>(
     httpCredentialsPath,
   );
 }
 
 export function changeHttpCredential(mutation:
-  | { name: string; operation: "create" | "replace"; credential: { origin: string; source: HttpCredentialSource; auth: HttpCredentialAuth }; openbao_write?: { value: string; token: string } }
+  | { name: string; operation: "create" | "replace"; credential: { origin: string; source: HttpCredentialSource; auth: HttpCredentialAuth }; vault_write?: { value: string; token: string; aws_access_key_id?: string; aws_secret_access_key?: string } }
   | { name: string; operation: "replace"; permissions: { http_allowed: boolean } | { destinations: SshDestination[] } }
   | { name: string; operation: "delete" }
 ) {

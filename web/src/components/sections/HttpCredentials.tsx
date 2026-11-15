@@ -1,6 +1,6 @@
 import { type FormEvent, useEffect, useState } from "react";
 import { Button, Select } from "@/components/ui";
-import { changeHttpCredential, listHttpCredentials, type HttpCredentialKind, type HttpCredentialRow, type HttpCredentialSource } from "@/lib/api";
+import { HttpError, changeHttpCredential, listHttpCredentials, type HttpCredentialKind, type HttpCredentialRow, type HttpCredentialSource } from "@/lib/api";
 import { t } from "@/lib/i18n";
 
 type Catalog = Awaited<ReturnType<typeof listHttpCredentials>>;
@@ -39,10 +39,16 @@ export default function HttpCredentials({ kind }: { kind: HttpCredentialKind }) 
   const [linkExisting, setLinkExisting] = useState(false);
   const [nameDraft, setNameDraft] = useState("");
   const [referenceOverride, setReferenceOverride] = useState<string>();
-  const canWriteOpenBao = source === "open_bao" && !!catalog?.openbao_write_prefix;
+  const prefix = source === "open_bao" ? catalog?.openbao_write_prefix : catalog?.vault_write_prefixes?.[source];
+  const canWrite = source !== "local" && !!prefix;
   const field = { totp: "seed", ssh_key: "private_key", api_key: "token", user_password: "password" }[kind];
-  const defaultReference = canWriteOpenBao && editing === "new" && /^[A-Za-z0-9_-]+$/.test(nameDraft)
-    ? `${catalog?.openbao_write_prefix}/${nameDraft}/${field}` : "";
+  const defaultReference = (() => {
+    if (editing && editing !== "new") return editing.source === source ? editing.reference ?? "" : "";
+    if (!prefix || !/^[A-Za-z0-9_-]+$/.test(nameDraft)) return "";
+    if (source === "azure") return prefix + nameDraft.replace(/_/g, "-");
+    if (source === "google") return prefix + nameDraft + "/latest";
+    return [prefix, nameDraft, source === "aws" ? undefined : field].filter(Boolean).join("/");
+  })();
 
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState("");
@@ -64,8 +70,10 @@ export default function HttpCredentials({ kind }: { kind: HttpCredentialKind }) 
       await changeHttpCredential(mutation);
       setCatalog(await listHttpCredentials());
       setMessage(t(mutation.operation === "delete" ? "plugin_tls.deleted" : "plugin_tls.saved"));
-    } catch {
-      setMessage(t("plugin_tls.failed"));
+    } catch (error) {
+      const status = error instanceof HttpError ? error.status : undefined;
+      setMessage(t(status === 424 ? "http_credentials.external_partial"
+        : status === 409 ? "http_credentials.external_conflict" : "plugin_tls.failed"));
     } finally {
       setBusy(false);
     }
@@ -83,11 +91,17 @@ export default function HttpCredentials({ kind }: { kind: HttpCredentialKind }) 
     const value = kind === "totp" ? raw.replace(/[\s-]+/g, "").replace(/=+$/, "").toUpperCase()
       : kind === "ssh_key" ? raw.trim() : raw;
     const token = String(data.get("writer_token") ?? "").trim();
-    if (canWriteOpenBao && !linkExisting && ((editing === "new" && !value.trim()) || (value && !token))) {
+    if (canWrite && !linkExisting && ((editing === "new" && !value.trim()) || (value && !token))) {
       setMessage(t("http_credentials.write_required"));
       return;
     }
-    const write = canWriteOpenBao && !linkExisting && value !== "" ? { value, token } : undefined;
+    const write = canWrite && !linkExisting && value !== "" ? {
+      value, token,
+      ...(source === "aws" ? {
+        aws_access_key_id: String(data.get("aws_access_key_id") ?? "").trim(),
+        aws_secret_access_key: String(data.get("aws_secret_access_key") ?? "").trim(),
+      } : {}),
+    } : undefined;
     const destinations = parseSshDestinations(String(data.get("destinations") ?? ""));
     const auth = kind === "totp"
       ? { kind, seed: source === "local" ? secret.replace(/[\s-]+/g, "").replace(/=+$/, "").toUpperCase() : secret.trim() } as const
@@ -98,7 +112,7 @@ export default function HttpCredentials({ kind }: { kind: HttpCredentialKind }) 
       : { kind, username: String(data.get("username")), password: secret } as const;
     form.reset();
     setEditing(null);
-    void update({ name, operation: editing === "new" ? "create" : "replace", credential: { origin, source, auth }, openbao_write: write });
+    void update({ name, operation: editing === "new" ? "create" : "replace", credential: { origin, source, auth }, vault_write: write });
   }
 
   const rows = catalog?.credentials.filter((row) => row.kind === kind) ?? [];
@@ -201,11 +215,11 @@ export default function HttpCredentials({ kind }: { kind: HttpCredentialKind }) 
                 onChange={event => setReferenceOverride(event.target.value)} placeholder={sources[source]} spellCheck={false} autoComplete="off" required />
             )}
           </label>
-          {canWriteOpenBao && editing === "new" && <label className="flex items-center gap-2">
+          {canWrite && editing === "new" && <label className="flex items-center gap-2">
             <input type="checkbox" checked={linkExisting} onChange={event => setLinkExisting(event.target.checked)} />
             {t("http_credentials.link_existing")}
           </label>}
-          {canWriteOpenBao && !linkExisting && <>
+          {canWrite && !linkExisting && <>
             <label className="block space-y-1">
               <span>{t("http_credentials.external_value")}</span>
               {kind === "ssh_key" ? <textarea className={inputClass} name="external_value" spellCheck={false} autoComplete="off" required={editing === "new"} />
@@ -213,13 +227,23 @@ export default function HttpCredentials({ kind }: { kind: HttpCredentialKind }) 
             </label>
             {editing !== "new" && <p className="text-sm">{t("http_credentials.preserve_external")}</p>}
             <label className="block space-y-1">
-              <span>{t("http_credentials.writer_token")}</span>
+              <span>{t(source === "aws" ? "http_credentials.aws_session_token" : "http_credentials.writer_token")}</span>
               <input className={inputClass} name="writer_token" type="password" autoComplete="off" required={editing === "new"} />
             </label>
+            {source === "aws" && <>
+              <label className="block space-y-1">
+                <span>{t("http_credentials.aws_access_key")}</span>
+                <input className={inputClass} name="aws_access_key_id" autoComplete="off" required={editing === "new"} />
+              </label>
+              <label className="block space-y-1">
+                <span>{t("http_credentials.aws_secret_key")}</span>
+                <input className={inputClass} name="aws_secret_access_key" type="password" autoComplete="off" required={editing === "new"} />
+              </label>
+            </>}
           </>}
-          {source !== "local" && !canWriteOpenBao && <p className="text-sm">{t("http_credentials.reference_only")}</p>}
+          {source !== "local" && !canWrite && <p className="text-sm">{t("http_credentials.reference_only")}</p>}
           <div className="flex flex-wrap gap-2">
-            <Button type="submit" disabled={disabled}>{t(editing === "new" ? source !== "local" && (!canWriteOpenBao || linkExisting) ? "http_credentials.link_existing" : "http_credentials.add" : "plugin_tls.replace")}</Button>
+            <Button type="submit" disabled={disabled}>{t(editing === "new" ? source !== "local" && (!canWrite || linkExisting) ? "http_credentials.link_existing" : "http_credentials.add" : "plugin_tls.replace")}</Button>
             <Button type="button" variant="ghost" onClick={() => setEditing(null)}>{t("common.cancel")}</Button>
           </div>
         </form>
