@@ -3190,12 +3190,13 @@ async fn run_tool_call_loop_impl<'a>(
             served.context_limits = served_context_limits;
         }
         if let Some(attempt) = accepted_attempt
-            .filter(|attempt| attempt.is_model_attributed() && attempt.model() != served_model_key)
+            .filter(|attempt| attempt.is_model_attributed() && attempt.model() != served_model)
             && let Some(sink) = served_route_sink.as_ref()
             && let Some(served) = sink.lock().expect("served-route sink lock").as_mut()
         {
             // Provider-side fallback changes accounting identity, not the
-            // configured route's context limits.
+            // configured route's context limits. Compare with the raw route so
+            // a chainless `hint:` dispatch cannot replace the resolved name.
             served.model = attempt.model().to_string();
         }
 

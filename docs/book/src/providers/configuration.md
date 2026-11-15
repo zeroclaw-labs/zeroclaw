@@ -754,6 +754,8 @@ the response's model when the iteration omits it. Conflicting model IDs leave
 the attempt unattributed. An unrecognized or ambiguous breakdown retains only
 the top-level observation, without model attribution. Usage with no established
 model is labeled `(unattributed)` in the accounting report and is not priced.
+Because its cost is unknown, that usage does not increase the ordinary daily
+or monthly dollar totals used by cost limits.
 The ordinary ledger omits declined attempts with invalid counters, such as a
 missing token count; the accepted row instead uses the response's top-level
 usage. In an otherwise decodable, recognized breakdown, a malformed counter
