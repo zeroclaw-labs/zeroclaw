@@ -41,7 +41,9 @@ EOF
 expect_fail "missing root build script" "$build_only" "never copies root build.rs"
 
 for selector in '--package zeroclaw' '--package=zeroclaw' '-p=zeroclaw' \
-    '-pzeroclaw' '--bin=zeroclaw' '--package "zeroclaw"' '--package    zeroclaw'; do
+    '-pzeroclaw' '--bin=zeroclaw' '--package "zeroclaw"' '--package    zeroclaw' \
+    '-p zeroclaw@0.9.0' '--package=zeroclaw@0.9.0' \
+    '--package "zeroclaw@0.9.0"' '--package zeroclaw:0.9.0'; do
     selected="${fixture_dir}/package-selector.Dockerfile"
     sed "s/-p zeroclaw/$selector/" "$build_only" > "$selected"
     expect_fail "missing build script with $selector" "$selected" "never copies root build.rs"
@@ -49,7 +51,8 @@ for selector in '--package zeroclaw' '--package=zeroclaw' '-p=zeroclaw' \
     expect_pass "explicit build script with $selector" "$selected"
 done
 
-for selector in '--package zeroclaw-tools' '-p zeroclaw-buildinfo' '--bin zeroclaw-acp-bridge'; do
+for selector in '--package zeroclaw-tools' '-p zeroclaw-buildinfo' \
+    '--bin zeroclaw-acp-bridge' '-p zeroclaw-tools@0.9.0'; do
     sed "s/-p zeroclaw/$selector/" "$build_only" > "$selected"
     expect_pass "unrelated target with $selector" "$selected"
 done
