@@ -62,9 +62,8 @@ fn extend_rejected_summaries(out: &mut Vec<SettledAttemptSummary>, attempts: &[A
             input_tokens: billable.usage.input_tokens,
             cached_input_tokens: billable.usage.cached_input_tokens,
             output_tokens: billable.usage.output_tokens,
-            cost_usd: crate::agent::cost::compute_cost_usd(
-                billable.attempt.provider_ref(),
-                billable.attempt.model(),
+            cost_usd: crate::agent::cost::compute_attempt_cost_usd(
+                billable.attempt,
                 billable.usage,
             ),
             accepted: false,
@@ -125,10 +124,14 @@ impl ResolvedModelAccess<'_> {
         let attempts = accounting.attempts();
 
         let accepted_route = accounting.accepted_route().cloned();
+        let accepted_attempt = accepted_route.as_ref().and_then(|_| attempts.last());
         let (served_provider, served_model) = accepted_route
             .as_ref()
             .map(|route| (route.provider_ref().to_string(), route.model().to_string()))
             .unwrap_or_else(|| (self.provider_name.to_string(), self.model.to_string()));
+        let (accounted_provider, accounted_model) = accepted_attempt
+            .map(|attempt| (attempt.provider_ref(), attempt.model()))
+            .unwrap_or((&served_provider, &served_model));
         match result {
             Ok(response) => {
                 // A terminal response without final text or tools was billed
@@ -152,10 +155,11 @@ impl ResolvedModelAccess<'_> {
                 // Only a semantically valid result controls accepted context
                 // usage and successful response telemetry.
                 let accepted_cost_usd = response.usage.as_ref().and_then(|usage| {
-                    crate::agent::cost::record_tool_loop_cost_usage(
-                        &served_provider,
-                        &served_model,
+                    crate::agent::cost::record_accepted_attempt_cost_usage(
+                        accounted_provider,
+                        accounted_model,
                         usage,
+                        accepted_attempt,
                     )
                     .map(|(_, cost_usd)| cost_usd)
                 });
@@ -163,8 +167,8 @@ impl ResolvedModelAccess<'_> {
                 // terminal identity stays coherent); the caller emits it with
                 // `accepted: true`.
                 settled_out.push(SettledAttemptSummary {
-                    provider_ref: served_provider,
-                    model: served_model,
+                    provider_ref: accounted_provider.to_string(),
+                    model: accounted_model.to_string(),
                     input_tokens: response.usage.as_ref().and_then(|usage| usage.input_tokens),
                     cached_input_tokens: response
                         .usage
@@ -610,6 +614,139 @@ mod run_model_query_tests {
         assert!(summaries[1].accepted);
         assert_eq!(summaries[1].input_tokens, Some(80));
         assert_eq!(summaries[1].output_tokens, Some(7));
+    }
+
+    #[tokio::test]
+    async fn run_model_query_prices_anthropic_fallback_attempts_by_attribution() {
+        use std::collections::HashMap;
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method, matchers::path};
+        use zeroclaw_providers::anthropic::AnthropicModelProvider;
+
+        for attributed in [true, false] {
+            let server = MockServer::start().await;
+            let terminal = if attributed {
+                serde_json::json!({"type": "fallback_message", "model": "model-b", "input_tokens": 50, "output_tokens": 5})
+            } else {
+                serde_json::json!({"type": "fallback_message"})
+            };
+            let mut body = serde_json::json!({
+                "content": [{"type": "text", "text": "done"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 50, "output_tokens": 5, "iterations": [
+                    {"type": "message", "model": "model-a", "input_tokens": 100, "output_tokens": 10},
+                    terminal
+                ]}
+            });
+            if attributed {
+                body["model"] = serde_json::json!("model-b");
+            }
+            Mock::given(method("POST"))
+                .and(path("/v1/messages"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(body))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let provider = AnthropicModelProvider::builder("test")
+                .credential(Some("test-key"))
+                .base_url(&server.uri())
+                .server_fallback_models(vec!["model-b".to_string()])
+                .build();
+            let workspace = tempfile::TempDir::new().unwrap();
+            let tracker = Arc::new(
+                crate::cost::CostTracker::new(
+                    zeroclaw_config::schema::CostConfig::default(),
+                    workspace.path(),
+                )
+                .unwrap(),
+            );
+            let ctx = ToolLoopCostTrackingContext::new(
+                tracker,
+                Arc::new(HashMap::from([(
+                    "anthropic.test".to_string(),
+                    HashMap::from([
+                        ("model-a.input".to_string(), 1.0),
+                        ("model-a.output".to_string(), 2.0),
+                        ("model-b.input".to_string(), 3.0),
+                        ("model-b.output".to_string(), 4.0),
+                        ("(unattributed).input".to_string(), 99.0),
+                        ("(unattributed).output".to_string(), 99.0),
+                    ]),
+                )])),
+            );
+            let turn_usage = Arc::clone(&ctx.turn_usage);
+            let messages = [ChatMessage::user("hello")];
+            let mut summaries = Vec::new();
+            TOOL_LOOP_COST_TRACKING_CONTEXT
+                .scope(Some(ctx), async {
+                    ResolvedModelAccess {
+                        model_provider: &provider,
+                        provider_name: "anthropic.test",
+                        model: "model-a",
+                        dispatch_model: "model-a",
+                        temperature: None,
+                    }
+                    .run_model_query(
+                        ChatRequest {
+                            messages: &messages,
+                            tools: None,
+                            thinking: None,
+                        },
+                        &mut summaries,
+                    )
+                    .await
+                })
+                .await
+                .expect("fallback response");
+            assert_eq!(summaries.len(), 2);
+            assert_eq!(summaries[0].model, "model-a");
+            assert!(!summaries[0].accepted);
+            assert!((summaries[0].cost_usd.unwrap() - 120.0 / 1_000_000.0).abs() < 1e-12);
+            assert_eq!(
+                summaries[1].model,
+                if attributed {
+                    "model-b"
+                } else {
+                    "(unattributed)"
+                }
+            );
+            assert!(summaries[1].accepted);
+            let expected = if attributed { 170.0 / 1_000_000.0 } else { 0.0 };
+            assert!((summaries[1].cost_usd.unwrap() - expected).abs() < 1e-12);
+            let usage = *turn_usage.lock();
+            assert_eq!(
+                (
+                    usage.input_tokens,
+                    usage.output_tokens,
+                    usage.last_input_tokens
+                ),
+                (150, 15, 50)
+            );
+            assert!((usage.cost_usd - (120.0 / 1_000_000.0 + expected)).abs() < 1e-12);
+            let ledger =
+                std::fs::read_to_string(workspace.path().join("state").join("costs.jsonl"))
+                    .expect("persisted cost ledger");
+            let rows: Vec<zeroclaw_config::cost::types::CostRecord> = ledger
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0].usage.model, "model-a");
+            assert_eq!(rows[0].usage.total_tokens, 110);
+            assert_eq!(
+                rows[1].usage.model,
+                if attributed {
+                    "model-b"
+                } else {
+                    "(unattributed)"
+                }
+            );
+            assert_eq!(rows[1].usage.total_tokens, 55);
+            assert_eq!(rows[1].usage.pricing_available, attributed);
+            assert_eq!(
+                rows[1].usage.unpriced_tokens,
+                if attributed { 0 } else { 55 }
+            );
+        }
     }
 
     #[tokio::test]

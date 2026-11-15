@@ -1594,11 +1594,8 @@ async fn emit_rejected_attempt_usage(
 ) {
     if let Some(tx) = event_tx {
         for billable in crate::agent::cost::billable_provider_attempts(attempts) {
-            let cost_usd = crate::agent::cost::compute_cost_usd(
-                billable.attempt.provider_ref(),
-                billable.attempt.model(),
-                billable.usage,
-            );
+            let cost_usd =
+                crate::agent::cost::compute_attempt_cost_usd(billable.attempt, billable.usage);
             let _ = tx
                 .send(TurnEvent::Usage {
                     input_tokens: billable.usage.input_tokens,
@@ -3154,6 +3151,7 @@ async fn run_tool_call_loop_impl<'a>(
         // truth that the done-frame cost_usd can be derived from.
         emit_rejected_attempt_usage(ctx.event_tx, &attempts[..attempts.len().saturating_sub(1)])
             .await;
+        let accepted_attempt = accepted_route.as_ref().and_then(|_| attempts.last());
         record_accepted_chat_response(
             &ctx,
             &served_provider,
@@ -3166,6 +3164,7 @@ async fn run_tool_call_loop_impl<'a>(
             llm_started_at,
             iteration,
             accepted_route.as_ref(),
+            accepted_attempt,
         )
         .await;
 
@@ -3189,6 +3188,15 @@ async fn run_tool_call_loop_impl<'a>(
             // attribution name.
             served.model = served_model_key.to_string();
             served.context_limits = served_context_limits;
+        }
+        if let Some(attempt) = accepted_attempt
+            .filter(|attempt| attempt.is_model_attributed() && attempt.model() != served_model_key)
+            && let Some(sink) = served_route_sink.as_ref()
+            && let Some(served) = sink.lock().expect("served-route sink lock").as_mut()
+        {
+            // Provider-side fallback changes accounting identity, not the
+            // configured route's context limits.
+            served.model = attempt.model().to_string();
         }
 
         // A provider transport success is only a candidate. Commit (or clear)
@@ -6779,6 +6787,7 @@ mod active_route_context_tests {
             Instant::now(),
             0,
             None,
+            None,
         )
         .await;
 
@@ -7167,6 +7176,327 @@ vision_model_provider = "custom.vision"
             calls.load(Ordering::SeqCst) >= 1,
             "the text primary must have been called at least once"
         );
+    }
+    #[tokio::test]
+    async fn anthropic_fallback_turn_events_keep_route_limits_and_attempt_identity() {
+        use crate::agent::cost::{TOOL_LOOP_COST_TRACKING_CONTEXT, ToolLoopCostTrackingContext};
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method, matchers::path};
+        use zeroclaw_api::attribution::{Attributable, ModelProviderKind, ProviderKind, Role};
+        use zeroclaw_api::model_provider::{ChatRequest, ModelProvider};
+        use zeroclaw_providers::anthropic::AnthropicModelProvider;
+
+        struct NonStreamingAnthropic(AnthropicModelProvider);
+        impl Attributable for NonStreamingAnthropic {
+            fn role(&self) -> Role {
+                Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+            }
+            fn alias(&self) -> &str {
+                "test"
+            }
+        }
+        #[async_trait::async_trait]
+        impl ModelProvider for NonStreamingAnthropic {
+            async fn chat_with_system(
+                &self,
+                system: Option<&str>,
+                message: &str,
+                model: &str,
+                temperature: Option<f64>,
+            ) -> Result<String> {
+                self.0
+                    .chat_with_system(system, message, model, temperature)
+                    .await
+            }
+            async fn chat(
+                &self,
+                request: ChatRequest<'_>,
+                model: &str,
+                temperature: Option<f64>,
+            ) -> Result<ChatResponse> {
+                self.0.chat(request, model, temperature).await
+            }
+        }
+
+        #[derive(Debug)]
+        struct Case {
+            requested: &'static str,
+            terminal_model: Option<&'static str>,
+            top_model: Option<&'static str>,
+            prior: bool,
+            handoff: bool,
+            expected_model: &'static str,
+            expected_route: &'static str,
+            expected_cost: f64,
+        }
+        let cases = [
+            Case {
+                requested: "model-a",
+                terminal_model: Some("model-b"),
+                top_model: Some("model-b"),
+                prior: true,
+                handoff: false,
+                expected_model: "model-b",
+                expected_route: "model-b",
+                expected_cost: 170.0 / 1_000_000.0,
+            },
+            Case {
+                requested: "model-a",
+                terminal_model: None,
+                top_model: Some("model-b"),
+                prior: true,
+                handoff: false,
+                expected_model: "model-b",
+                expected_route: "model-b",
+                expected_cost: 170.0 / 1_000_000.0,
+            },
+            Case {
+                requested: "model-a",
+                terminal_model: None,
+                top_model: None,
+                prior: true,
+                handoff: false,
+                expected_model: "(unattributed)",
+                expected_route: "model-a",
+                expected_cost: 0.0,
+            },
+            Case {
+                requested: "model-a",
+                terminal_model: None,
+                top_model: Some("model-b"),
+                prior: false,
+                handoff: true,
+                expected_model: "model-b",
+                expected_route: "model-b",
+                expected_cost: 170.0 / 1_000_000.0,
+            },
+            Case {
+                requested: "model-a",
+                terminal_model: None,
+                top_model: None,
+                prior: false,
+                handoff: true,
+                expected_model: "(unattributed)",
+                expected_route: "model-a",
+                expected_cost: 0.0,
+            },
+            Case {
+                requested: "(unattributed)",
+                terminal_model: None,
+                top_model: None,
+                prior: false,
+                handoff: false,
+                expected_model: "(unattributed)",
+                expected_route: "(unattributed)",
+                expected_cost: 5_445.0 / 1_000_000.0,
+            },
+        ];
+        for case in cases {
+            let server = MockServer::start().await;
+            let mut body = serde_json::json!({
+                "content": [{"type": "text", "text": "done"}], "stop_reason": "end_turn",
+                "usage": {"input_tokens": 50, "output_tokens": 5}
+            });
+            if case.prior {
+                let mut terminal = serde_json::json!({"type": "fallback_message", "input_tokens": 50, "output_tokens": 5});
+                if let Some(model) = case.terminal_model {
+                    terminal["model"] = serde_json::json!(model);
+                }
+                body["usage"]["iterations"] = serde_json::json!([
+                    {"type": "message", "model": "model-a", "input_tokens": 100, "output_tokens": 10}, terminal
+                ]);
+            }
+            if case.handoff {
+                body["content"] =
+                    serde_json::json!([{"type": "fallback"}, {"type": "text", "text": "done"}]);
+            }
+            if let Some(model) = case.top_model {
+                body["model"] = serde_json::json!(model);
+            }
+            Mock::given(method("POST"))
+                .and(path("/v1/messages"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(body))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let provider = NonStreamingAnthropic(
+                AnthropicModelProvider::builder("test")
+                    .credential(Some("test-key"))
+                    .base_url(&server.uri())
+                    .server_fallback_models(vec!["model-b".to_string()])
+                    .build(),
+            );
+            let workspace = tempfile::TempDir::new().unwrap();
+            let tracker = Arc::new(
+                crate::cost::CostTracker::new(
+                    zeroclaw_config::schema::CostConfig::default(),
+                    workspace.path(),
+                )
+                .unwrap(),
+            );
+            let cost_context = ToolLoopCostTrackingContext::new(
+                tracker,
+                Arc::new(HashMap::from([(
+                    "anthropic.test".to_string(),
+                    HashMap::from([
+                        ("model-a.input".to_string(), 1.0),
+                        ("model-a.output".to_string(), 2.0),
+                        ("model-b.input".to_string(), 3.0),
+                        ("model-b.output".to_string(), 4.0),
+                        ("(unattributed).input".to_string(), 99.0),
+                        ("(unattributed).output".to_string(), 99.0),
+                    ]),
+                )])),
+            );
+            let observer = RouteObserver::default();
+            let tools = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![]);
+            let pacing = zeroclaw_config::schema::PacingConfig::default();
+            let multimodal = zeroclaw_config::schema::MultimodalConfig::default();
+            let knobs = LoopKnobs::default();
+            let limits = zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(100_000);
+            let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(32);
+            let route = Arc::new(Mutex::new(None));
+            let mut history = vec![ChatMessage::user("hello")];
+            let result = TOOL_LOOP_COST_TRACKING_CONTEXT
+                .scope(
+                    Some(cost_context),
+                    run_tool_call_loop(ToolLoop {
+                        parent_agent_alias: None,
+                        served_route_sink: Some(Arc::clone(&route)),
+                        sop_reassembly: None,
+                        capability_binding: None,
+                        exec: ResolvedAgentExecution::resolve(
+                            ResolvedModelAccess {
+                                model_provider: &provider,
+                                provider_name: "anthropic.test",
+                                model: case.requested,
+                                dispatch_model: case.requested,
+                                temperature: None,
+                            },
+                            ResolvedIo {
+                                tools_registry: &tools,
+                                observer: &observer,
+                                silent: true,
+                                approval: None,
+                                multimodal_config: &multimodal,
+                                config: None,
+                                hooks: None,
+                                activated_tools: None,
+                                model_switch_callback: None,
+                                receipt_generator: None,
+                                security: None,
+                            },
+                            ResolvedRuntimeKnobs {
+                                max_tool_iterations: 2,
+                                excluded_tools: &[],
+                                dedup_exempt_tools: &[],
+                                pacing: &pacing,
+                                strict_tool_parsing: false,
+                                parallel_tools: false,
+                                max_tool_result_chars: 30_000,
+                                keep_tool_context_turns: 2,
+                                context_limits: limits,
+                                context_limits_resolver: None,
+                                knobs: &knobs,
+                            },
+                        ),
+                        history: &mut history,
+                        history_has_trim_breadcrumb: &mut false,
+                        injected_memory_preamble: &mut None,
+                        channel_name: "test",
+                        channel_reply_target: None,
+                        cancellation_token: None,
+                        on_delta: None,
+                        shared_budget: None,
+                        channel: None,
+                        collected_receipts: None,
+                        event_tx: Some(event_tx),
+                        steering: None,
+                        new_messages_out: None,
+                        image_cache: None,
+                        memory: None,
+                        ingress: zeroclaw_api::ingress::IngressContext::agent_direct(),
+                        agent_alias: None,
+                        turn_id: "fallback-test",
+                    }),
+                )
+                .await
+                .expect("turn succeeds");
+            assert!(result.contains("done"));
+            let usage: Vec<_> = std::iter::from_fn(|| event_rx.try_recv().ok())
+                .filter_map(|event| match event {
+                    TurnEvent::Usage {
+                        model,
+                        input_tokens,
+                        output_tokens,
+                        cost_usd,
+                        accepted,
+                        context_token_budget,
+                        model_context_window,
+                        ..
+                    } => Some((
+                        model,
+                        input_tokens,
+                        output_tokens,
+                        cost_usd,
+                        accepted,
+                        context_token_budget,
+                        model_context_window,
+                    )),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(usage.len(), usize::from(case.prior) + 1, "case: {case:?}");
+            if case.prior {
+                assert_eq!(
+                    (&*usage[0].0, usage[0].1, usage[0].2, usage[0].4),
+                    ("model-a", Some(100), Some(10), false)
+                );
+            }
+            let accepted = usage.last().unwrap();
+            assert_eq!(
+                (&*accepted.0, accepted.1, accepted.2, accepted.4),
+                (case.expected_model, Some(50), Some(5), true)
+            );
+            assert_eq!(accepted.5, Some(limits.context_token_budget as u64));
+            assert_eq!(
+                accepted.6,
+                limits
+                    .configured_model_context_window()
+                    .map(|value| value as u64)
+            );
+            assert!(
+                (accepted.3.unwrap() - case.expected_cost).abs() < 1e-12,
+                "case: {case:?}"
+            );
+            assert_eq!(
+                observer.responses.lock().unwrap().last().unwrap().1,
+                case.expected_model
+            );
+            let route = route.lock().unwrap();
+            let route = route.as_ref().unwrap();
+            assert_eq!(route.model, case.expected_route);
+            assert_eq!(
+                route.context_limits.context_token_budget,
+                limits.context_token_budget
+            );
+            assert_eq!(history[0].content, "hello");
+            let ledger =
+                std::fs::read_to_string(workspace.path().join("state").join("costs.jsonl"))
+                    .unwrap();
+            let rows: Vec<zeroclaw_config::cost::types::CostRecord> = ledger
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            assert_eq!(rows.len(), usize::from(case.prior) + 1, "case: {case:?}");
+            let row = &rows.last().unwrap().usage;
+            assert_eq!(row.model, case.expected_model);
+            assert_eq!(row.total_tokens, 55);
+            assert_eq!(row.pricing_available, case.expected_cost > 0.0);
+            assert_eq!(
+                row.unpriced_tokens,
+                if case.expected_cost > 0.0 { 0 } else { 55 }
+            );
+        }
     }
 }
 

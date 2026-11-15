@@ -164,6 +164,9 @@ Each `TokenUsage` record carries two pricing-provenance fields:
 - `pricing_available`: compatibility summary of that provenance. New records
   set it to `false` when `unpriced_tokens > 0`.
 
+An `(unattributed)` lower-bound row stays unpriced even if a rate is configured
+under that name, unless it identifies an actual model with that literal name.
+
 Ledger rows written before these fields existed deserialize with
 `pricing_available = true` and `unpriced_tokens = 0`. Zero spend on a legacy
 row therefore does **not** prove that historical pricing was available; the

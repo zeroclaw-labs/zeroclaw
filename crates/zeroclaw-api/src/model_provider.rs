@@ -492,10 +492,12 @@ pub type StreamResult<T> = std::result::Result<T, StreamError>;
 /// A provider safety refusal that completed at the transport layer but cannot
 /// be accepted as an assistant response.
 ///
-/// The optional usage belongs to the refusing attempt. It is carried on the
-/// typed cause so reliability and turn accounting can bill that work without
-/// treating it as accepted-response context usage. `category` is diagnostic
-/// metadata only and must not be rendered to users.
+/// The optional usage belongs to the returned refusing attempt. It is carried
+/// on the typed cause so reliability and turn accounting can bill that work
+/// without treating it as accepted-response context usage. If the provider
+/// reports multiple server-side attempts in a dispatch-accounted call, earlier
+/// attempts are accounted for separately rather than summed into this usage.
+/// `category` is diagnostic metadata only and must not be rendered to users.
 #[derive(Debug, Clone, thiserror::Error)]
 #[error("anthropic refusal: model declined this request (safety classifiers)")]
 pub struct ModelRefusalError {
