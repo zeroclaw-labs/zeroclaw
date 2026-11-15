@@ -137,12 +137,16 @@ impl SecretWrite {
                 },
                 endpoint("data")?,
             )
-            .header("X-Vault-Token", token)
-            .json(&json!({ "options": {"cas": version}, "data": { (*field): self.value } }));
+            .header("X-Vault-Token", token);
         if replace {
             request = request.header("Content-Type", "application/merge-patch+json");
         }
-        let status = request.send().await.map_err(|_| upstream)?.status();
+        let status = request
+            .json(&json!({ "options": {"cas": version}, "data": { (*field): self.value } }))
+            .send()
+            .await
+            .map_err(|_| upstream)?
+            .status();
         if status.is_success() {
             Ok(())
         } else if status.as_u16() == 400 {
