@@ -2501,7 +2501,16 @@ mod inbound {
         // flows through the ordinary pipeline, marked `edited`.
         let mut edited = false;
         let body = match inbound::classify_replacement(&raw) {
-            Some(inbound::InboundEdit::Text { body, .. }) if ctx.config.edited_messages => {
+            Some(inbound::InboundEdit::Text { original, body }) if ctx.config.edited_messages => {
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({
+                            "original_event_id": original,
+                            "event_id": ev.event_id.to_string(),
+                        })),
+                    "matrix: accept replacement event"
+                );
                 edited = true;
                 body
             }
