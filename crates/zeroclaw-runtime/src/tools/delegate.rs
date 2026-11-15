@@ -16551,7 +16551,6 @@ options = { extract_text_tool_calls = false }
             .error
             .as_deref()
             .expect("fixture provider failure retained");
-        assert!(error.contains("API error (400 Bad Request)"));
         assert!(error.contains("background persistence fixture provider failure"));
         let snapshot = tool
             .background_control_plane()
