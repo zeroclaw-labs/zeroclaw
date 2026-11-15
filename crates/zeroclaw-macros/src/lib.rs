@@ -156,7 +156,8 @@ fn attrs_have_serde_meta(attrs: &[syn::Attribute], ident: &str) -> bool {
         tab,
         group,
         multiline,
-        field_metadata
+        field_metadata,
+        secret_hook
     )
 )]
 pub fn derive_configurable(input: TokenStream) -> TokenStream {
@@ -179,6 +180,26 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
         Ok(None) => quote! {},
         Err(err) => return err.to_compile_error().into(),
     };
+    let secret_hook = match extract_secret_hook(&input.attrs) {
+        Ok(Some(path)) => Some(path),
+        Ok(None) => None,
+        Err(err) => return err.to_compile_error().into(),
+    };
+    let secret_fields_hook = secret_hook.as_ref().map(|path| {
+        quote! { #path::secret_fields(self, &mut fields); }
+    });
+    let encrypt_secrets_hook = secret_hook.as_ref().map(|path| {
+        quote! { #path::encrypt_secrets(self, store)?; }
+    });
+    let decrypt_secrets_hook = secret_hook.as_ref().map(|path| {
+        quote! { #path::decrypt_secrets(self, store)?; }
+    });
+    let mask_secrets_hook = secret_hook.as_ref().map(|path| {
+        quote! { #path::mask_secrets(self); }
+    });
+    let restore_secrets_hook = secret_hook.as_ref().map(|path| {
+        quote! { #path::restore_secrets_from(self, current); }
+    });
     let integration_descriptor_method = match build_integration_descriptor_method(&input.attrs) {
         Ok(method) => method,
         Err(err) => return err.to_compile_error().into(),
@@ -1115,6 +1136,26 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                                 self.#field_ident.insert(map_key.to_string(), <#value_ty>::default());
                                 return Ok(true);
                             }
+                            // Deeper: a map-keyed section living INSIDE one of this
+                            // map's values (e.g. `providers.models.<type>.<alias>.models`).
+                            // Route the `<key>` off, then delegate the remainder to the
+                            // value type's own create_map_key (rebased to its prefix).
+                            if let Some((hm_key, inner_section)) = crate::config::route_hashmap_path(
+                                section_path,
+                                prefix,
+                                #field_name_lit,
+                                <#value_ty>::configurable_prefix(),
+                                self.#field_ident.keys().map(String::as_str),
+                            ) {
+                                let hm_key = hm_key.to_string();
+                                if let Some(inner) = self.#field_ident.get_mut(&hm_key) {
+                                    match inner.create_map_key(&inner_section, map_key) {
+                                        Ok(created) => return Ok(created),
+                                        Err(e) if e.starts_with("no map-keyed/list section at ") => {}
+                                        Err(e) => return Err(e),
+                                    }
+                                }
+                            }
                         }
                     });
 
@@ -1129,6 +1170,21 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                             };
                             if section_path == expected {
                                 return Some(self.#field_ident.keys().cloned().collect());
+                            }
+                            // Deeper: delegate a section inside one of the values
+                            // (e.g. `providers.models.<type>.<alias>.models`).
+                            if let Some((hm_key, inner_section)) = crate::config::route_hashmap_path(
+                                section_path,
+                                prefix,
+                                #field_name_lit,
+                                <#value_ty>::configurable_prefix(),
+                                self.#field_ident.keys().map(String::as_str),
+                            ) {
+                                if let Some(inner) = self.#field_ident.get(hm_key) {
+                                    if let Some(keys) = inner.get_map_keys(&inner_section) {
+                                        return Some(keys);
+                                    }
+                                }
                             }
                         }
                     });
@@ -1145,6 +1201,23 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                             if section_path == expected {
                                 let removed = self.#field_ident.remove(map_key).is_some();
                                 return Ok(removed);
+                            }
+                            // Deeper: delegate a section inside one of the values.
+                            if let Some((hm_key, inner_section)) = crate::config::route_hashmap_path(
+                                section_path,
+                                prefix,
+                                #field_name_lit,
+                                <#value_ty>::configurable_prefix(),
+                                self.#field_ident.keys().map(String::as_str),
+                            ) {
+                                let hm_key = hm_key.to_string();
+                                if let Some(inner) = self.#field_ident.get_mut(&hm_key) {
+                                    match inner.delete_map_key(&inner_section, map_key) {
+                                        Ok(removed) => return Ok(removed),
+                                        Err(e) if e.starts_with("no map-keyed/list section at ") => {}
+                                        Err(e) => return Err(e),
+                                    }
+                                }
                             }
                         }
                     });
@@ -1173,6 +1246,23 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                                     return Ok(true);
                                 }
                                 return Ok(false);
+                            }
+                            // Deeper: delegate a section inside one of the values.
+                            if let Some((hm_key, inner_section)) = crate::config::route_hashmap_path(
+                                section_path,
+                                prefix,
+                                #field_name_lit,
+                                <#value_ty>::configurable_prefix(),
+                                self.#field_ident.keys().map(String::as_str),
+                            ) {
+                                let hm_key = hm_key.to_string();
+                                if let Some(inner) = self.#field_ident.get_mut(&hm_key) {
+                                    match inner.rename_map_key(&inner_section, map_key, new_key) {
+                                        Ok(renamed) => return Ok(renamed),
+                                        Err(e) if e.starts_with("no map-keyed/list section at ") => {}
+                                        Err(e) => return Err(e),
+                                    }
+                                }
                             }
                         }
                     });
@@ -1962,36 +2052,108 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                 // create_map_key for non-Option nested fields. This is how
                 // the root Config picks up `providers.models` (declared on
                 // ProvidersConfig, not on Config).
+                //
+                // For `#[serde(flatten)]` fields the inner type shares this
+                // struct's dotted namespace but may declare a DIFFERENT
+                // `#[prefix]` (e.g. outer `providers.models.openai` flattening
+                // inner `providers.models`). The map-key methods key off the
+                // inner type's own prefix, so the section path must be rebased
+                // outer→inner before delegating — exactly as the flatten prop
+                // delegation above does. Non-flatten nested fields share the
+                // path space directly, so they delegate verbatim.
                 let field_ty = &field.ty;
-                map_key_recurse.push(quote! {
-                    out.extend(<#field_ty>::map_key_sections());
-                });
-                get_map_keys_recurse.push(quote! {
-                    if let Some(keys) = self.#field_ident.get_map_keys(section_path) {
-                        return Some(keys);
-                    }
-                });
-                create_map_key_recurse.push(quote! {
-                    match self.#field_ident.create_map_key(section_path, map_key) {
-                        Ok(created) => return Ok(created),
-                        Err(e) if e.starts_with("no map-keyed/list section at ") => {}
-                        Err(e) => return Err(e),
-                    }
-                });
-                delete_map_key_recurse.push(quote! {
-                    match self.#field_ident.delete_map_key(section_path, map_key) {
-                        Ok(removed) => return Ok(removed),
-                        Err(e) if e.starts_with("no map-keyed/list section at ") => {}
-                        Err(e) => return Err(e),
-                    }
-                });
-                rename_map_key_recurse.push(quote! {
-                    match self.#field_ident.rename_map_key(section_path, map_key, new_key) {
-                        Ok(renamed) => return Ok(renamed),
-                        Err(e) if e.starts_with("no map-keyed/list section at ") => {}
-                        Err(e) => return Err(e),
-                    }
-                });
+                if is_serde_flatten {
+                    // Rebase helper: strip this struct's prefix off `section_path`
+                    // and reprepend the inner type's prefix. Returns None when the
+                    // path isn't under our prefix (then delegation is skipped).
+                    let rebase = quote! {
+                        {
+                            let outer_prefix = Self::configurable_prefix();
+                            let inner_prefix = <#field_ty>::configurable_prefix();
+                            let leaf = if outer_prefix.is_empty() {
+                                Some(section_path)
+                            } else {
+                                section_path
+                                    .strip_prefix(outer_prefix)
+                                    .and_then(|s| s.strip_prefix('.'))
+                            };
+                            leaf.map(|leaf| {
+                                if inner_prefix.is_empty() {
+                                    leaf.to_string()
+                                } else {
+                                    format!("{inner_prefix}.{leaf}")
+                                }
+                            })
+                        }
+                    };
+                    map_key_recurse.push(quote! {
+                        out.extend(<#field_ty>::map_key_sections());
+                    });
+                    get_map_keys_recurse.push(quote! {
+                        if let Some(inner_section) = #rebase {
+                            if let Some(keys) = self.#field_ident.get_map_keys(&inner_section) {
+                                return Some(keys);
+                            }
+                        }
+                    });
+                    create_map_key_recurse.push(quote! {
+                        if let Some(inner_section) = #rebase {
+                            match self.#field_ident.create_map_key(&inner_section, map_key) {
+                                Ok(created) => return Ok(created),
+                                Err(e) if e.starts_with("no map-keyed/list section at ") => {}
+                                Err(e) => return Err(e),
+                            }
+                        }
+                    });
+                    delete_map_key_recurse.push(quote! {
+                        if let Some(inner_section) = #rebase {
+                            match self.#field_ident.delete_map_key(&inner_section, map_key) {
+                                Ok(removed) => return Ok(removed),
+                                Err(e) if e.starts_with("no map-keyed/list section at ") => {}
+                                Err(e) => return Err(e),
+                            }
+                        }
+                    });
+                    rename_map_key_recurse.push(quote! {
+                        if let Some(inner_section) = #rebase {
+                            match self.#field_ident.rename_map_key(&inner_section, map_key, new_key) {
+                                Ok(renamed) => return Ok(renamed),
+                                Err(e) if e.starts_with("no map-keyed/list section at ") => {}
+                                Err(e) => return Err(e),
+                            }
+                        }
+                    });
+                } else {
+                    map_key_recurse.push(quote! {
+                        out.extend(<#field_ty>::map_key_sections());
+                    });
+                    get_map_keys_recurse.push(quote! {
+                        if let Some(keys) = self.#field_ident.get_map_keys(section_path) {
+                            return Some(keys);
+                        }
+                    });
+                    create_map_key_recurse.push(quote! {
+                        match self.#field_ident.create_map_key(section_path, map_key) {
+                            Ok(created) => return Ok(created),
+                            Err(e) if e.starts_with("no map-keyed/list section at ") => {}
+                            Err(e) => return Err(e),
+                        }
+                    });
+                    delete_map_key_recurse.push(quote! {
+                        match self.#field_ident.delete_map_key(section_path, map_key) {
+                            Ok(removed) => return Ok(removed),
+                            Err(e) if e.starts_with("no map-keyed/list section at ") => {}
+                            Err(e) => return Err(e),
+                        }
+                    });
+                    rename_map_key_recurse.push(quote! {
+                        match self.#field_ident.rename_map_key(section_path, map_key, new_key) {
+                            Ok(renamed) => return Ok(renamed),
+                            Err(e) if e.starts_with("no map-keyed/list section at ") => {}
+                            Err(e) => return Err(e),
+                        }
+                    });
+                }
 
                 // Vec<T> handling moved to its own `else if extract_vec_inner`
                 // branch above so the per-prop method dispatch (set_prop,
@@ -2202,6 +2364,7 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
             pub fn secret_fields(&self) -> Vec<crate::config::SecretFieldInfo> {
                 let mut fields = vec![#(#secret_field_entries),*];
                 #(#nested_collect)*
+                #secret_fields_hook
                 fields
             }
 
@@ -2216,6 +2379,7 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
             pub fn encrypt_secrets(&mut self, store: &crate::security::SecretStore) -> anyhow::Result<()> {
                 #(#encrypt_ops)*
                 #(#nested_encrypt)*
+                #encrypt_secrets_hook
                 Ok(())
             }
 
@@ -2223,6 +2387,7 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
             pub fn decrypt_secrets(&mut self, store: &crate::security::SecretStore) -> anyhow::Result<()> {
                 #(#decrypt_ops)*
                 #(#nested_decrypt)*
+                #decrypt_secrets_hook
                 Ok(())
             }
 
@@ -2397,9 +2562,11 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
         impl crate::traits::MaskSecrets for #struct_name {
             fn mask_secrets(&mut self) {
                 #(#mask_ops)*
+                #mask_secrets_hook
             }
             fn restore_secrets_from(&mut self, current: &Self) {
                 #(#restore_ops)*
+                #restore_secrets_hook
             }
         }
     };
@@ -2716,6 +2883,32 @@ fn extract_field_metadata_hook(attrs: &[syn::Attribute]) -> syn::Result<Option<s
             return Err(syn::Error::new_spanned(
                 attr,
                 "expected field_metadata = \"path\"",
+            ));
+        };
+        let syn::Expr::Lit(expr_lit) = &nv.value else {
+            return Err(syn::Error::new_spanned(&nv.value, "expected a path string"));
+        };
+        let Lit::Str(path) = &expr_lit.lit else {
+            return Err(syn::Error::new_spanned(&nv.value, "expected a path string"));
+        };
+        hook = Some(path.parse::<syn::Path>()?);
+    }
+    Ok(hook)
+}
+
+fn extract_secret_hook(attrs: &[syn::Attribute]) -> syn::Result<Option<syn::Path>> {
+    let mut hook = None;
+    for attr in attrs {
+        if !attr.path().is_ident("secret_hook") {
+            continue;
+        }
+        if hook.is_some() {
+            return Err(syn::Error::new_spanned(attr, "duplicate secret_hook"));
+        }
+        let Meta::NameValue(nv) = &attr.meta else {
+            return Err(syn::Error::new_spanned(
+                attr,
+                "expected secret_hook = \"path\"",
             ));
         };
         let syn::Expr::Lit(expr_lit) = &nv.value else {
@@ -3066,6 +3259,58 @@ fn extract_vec_inner(ty: &syn::Type) -> Option<&syn::Type> {
 }
 fn extract_hashmap_value_type(ty: &syn::Type) -> Option<&syn::Type> {
     extract_type_arg("HashMap", 1, ty)
+}
+
+/// Deserialize a configuration through a transient input DTO, then normalize
+/// it before exposing the authoritative value. Both DTO and value use the
+/// original field definitions, so schema fields cannot drift between them.
+#[proc_macro_attribute]
+pub fn normalize_config_input(args: TokenStream, item: TokenStream) -> TokenStream {
+    let normalize = parse_macro_input!(args as syn::Path);
+    let schema = parse_macro_input!(item as syn::ItemStruct);
+    let Fields::Named(fields) = &schema.fields else {
+        return syn::Error::new_spanned(&schema, "configuration requires named fields")
+            .to_compile_error()
+            .into();
+    };
+    let name = &schema.ident;
+    let input_name = quote::format_ident!("{}Input", name);
+    let input_fields = fields.named.iter().map(|field| {
+        let mut field = field.clone();
+        field
+            .attrs
+            .retain(|attr| attr.path().is_ident("serde") || attr.path().is_ident("cfg"));
+        field
+    });
+    let input_attrs = schema
+        .attrs
+        .iter()
+        .filter(|attr| attr.path().is_ident("serde"));
+    let assignments = fields.named.iter().map(|field| {
+        let name = &field.ident;
+        let conditions = field
+            .attrs
+            .iter()
+            .filter(|attr| attr.path().is_ident("cfg"));
+        quote! { #(#conditions)* #name: input.#name }
+    });
+    quote! {
+        #schema
+        #[derive(::serde::Deserialize)]
+        #(#input_attrs)*
+        struct #input_name { #(#input_fields,)* }
+        impl<'de> ::serde::Deserialize<'de> for #name {
+            fn deserialize<D: ::serde::Deserializer<'de>>(
+                deserializer: D,
+            ) -> ::core::result::Result<Self, D::Error> {
+                let input = <#input_name as ::serde::Deserialize>::deserialize(deserializer)?;
+                let mut config = Self { #(#assignments,)* };
+                #normalize(&mut config).map_err(::serde::de::Error::custom)?;
+                Ok(config)
+            }
+        }
+    }
+    .into()
 }
 
 #[cfg(test)]
