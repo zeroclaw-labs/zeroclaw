@@ -42600,9 +42600,10 @@ mod tests {
 
         let cfg_after = dispatcher.ctx.config.read().clone();
         let stored = cfg_after.provider_registry().ok().and_then(|registry| {
+            let model = registry.resolve_chat(&"anthropic.default".into()).ok()?;
             registry
                 .connections
-                .get("legacy.anthropic.default")
+                .get(model.selection.model.provider())
                 .and_then(|connection| connection.api_key().map(str::to_owned))
         });
         assert_eq!(
