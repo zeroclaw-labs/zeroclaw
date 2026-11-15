@@ -6084,7 +6084,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 .get("chat")
                 .and_then(|c| c.get("id"))
                 .and_then(serde_json::Value::as_i64);
-            let body = if let (Some(mid), Some(cid)) = (reply_mid, chat_id) {
+            if let (Some(mid), Some(cid)) = (reply_mid, chat_id) {
                 let key = format!("{cid}:{mid}");
                 if let Some(text) = self.voice_transcriptions.lock().get(&key) {
                     format!("[Voice] {text}")
@@ -6099,8 +6099,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 }
             } else {
                 "[Voice message]".to_string()
-            };
-            body
+            }
         } else if reply.get("photo").is_some() {
             "[Photo]".to_string()
         } else if reply.get("document").is_some() {
