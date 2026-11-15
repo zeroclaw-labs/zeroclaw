@@ -30,7 +30,6 @@ pub mod glob_search;
 pub mod http_request;
 pub mod image_gen;
 pub mod image_info;
-pub mod knowledge_tool;
 pub mod llm_task;
 pub mod mcp_client;
 pub mod mcp_context;

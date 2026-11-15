@@ -1408,7 +1408,6 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.section.channels': 'Channels',
     'agent.section.profile': 'Profile',
     'agent.section.skills': 'Skills',
-    'agent.section.knowledge': 'Knowledge',
     'agent.section.mcp': 'MCP',
     'agent.section.peers': 'Peers',
     'agent.section.cron': 'Cron',

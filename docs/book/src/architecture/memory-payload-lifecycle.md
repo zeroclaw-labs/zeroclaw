@@ -250,7 +250,6 @@ Canonical docs:
 - [Runtime state and persistence](./runtime-state-and-persistence.md)
 - [History management](../agents/history-management.md)
 - [Runtime internals](../agents/internals.md)
-- [Relationship memory](../tools/relationship-memory.md)
 - [Tool receipts](../security/tool-receipts.md)
 
 Key code entry points:

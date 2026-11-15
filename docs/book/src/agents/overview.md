@@ -14,7 +14,7 @@ that **joins** two halves:
 
 - **Config references** (the relational side): pointers to things configured
   elsewhere, a model provider, a risk profile, a runtime profile, channels,
-  skill / knowledge / MCP bundles, cron jobs. Each is a dotted alias. The agent
+  skill / MCP bundles, cron jobs. Each is a dotted alias. The agent
   owns none of these; it points at them, and many agents can point at the same
   one or diverge freely.
 - **Filesystem components** (the on-disk side): a per-agent workspace directory,

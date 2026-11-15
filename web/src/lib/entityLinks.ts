@@ -19,7 +19,6 @@ const ENTITY_SECTION = {
   'risk-profile':      { section: 'risk_profiles',    shape: 'alias'  },
   'runtime-profile':   { section: 'runtime_profiles', shape: 'alias'  },
   'skill-bundle':      { section: 'skill_bundles',    shape: 'alias'  },
-  'knowledge-bundle':  { section: 'knowledge_bundles',shape: 'alias'  },
   'mcp-bundle':        { section: 'mcp_bundles',      shape: 'alias'  },
   'peer-group':        { section: 'peer_groups',      shape: 'alias'  },
   cron:                { section: 'cron',             shape: 'alias'  },

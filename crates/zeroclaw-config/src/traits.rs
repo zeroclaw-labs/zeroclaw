@@ -30,7 +30,6 @@ pub enum AliasSource {
     Cards,
     Agents,
     SkillBundles,
-    KnowledgeBundles,
     McpBundles,
 }
 
@@ -48,7 +47,6 @@ impl AliasSource {
             Self::Cards => "cards",
             Self::Agents => "agents",
             Self::SkillBundles => "skill_bundles",
-            Self::KnowledgeBundles => "knowledge_bundles",
             Self::McpBundles => "mcp_bundles",
         }
     }

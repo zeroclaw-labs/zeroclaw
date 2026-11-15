@@ -41,7 +41,6 @@ fn email_factory_respects_compile_feature_and_channel_activation() {
         let tmp = TempDir::new().unwrap();
         let mut cfg = test_config(&tmp);
         cfg.composition = Some(zeroclaw_config::composition::Composition::Full);
-        cfg.knowledge.enabled = false;
         if let Some(enabled) = enabled {
             cfg.channels.email.insert(
                 "fixture".into(),
@@ -866,7 +865,6 @@ fn registry_keeps_root_advisor_and_bridge_snapshot_separate_from_runtime_config(
         let tmp = TempDir::new().unwrap();
         let mut root_config = test_config(&tmp);
         root_config.composition = Some(zeroclaw_config::composition::Composition::Full);
-        root_config.knowledge.enabled = false;
         root_config.agents.insert(
             "test-agent".into(),
             AliasedAgentConfig {

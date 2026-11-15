@@ -24,8 +24,8 @@ here is where each kind of reference leads:
   the agent answers on. When two agents share a channel, a
   [peer group](../channels/peer-groups.md) decides whether they can address each
   other.
-- **Bundles** ([Tools](../tools/overview.md)): reusable groups of skills,
-  knowledge, and MCP servers attached by alias.
+- **Bundles** ([Tools](../tools/overview.md)): reusable groups of skills
+  and MCP servers attached by alias.
 - **Cron**: named scheduled jobs bound to the agent.
 
 ## The per-agent overrides

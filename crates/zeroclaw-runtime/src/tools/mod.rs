@@ -53,7 +53,6 @@ pub use zeroclaw_tools::glob_search::GlobSearchTool;
 pub use zeroclaw_tools::http_request::HttpRequestTool;
 pub use zeroclaw_tools::image_gen::ImageGenTool;
 pub use zeroclaw_tools::image_info::ImageInfoTool;
-pub use zeroclaw_tools::knowledge_tool::KnowledgeTool;
 pub use zeroclaw_tools::llm_task::LlmTaskTool;
 pub use zeroclaw_tools::mcp_client::{McpRegistry, McpServer};
 pub use zeroclaw_tools::mcp_context;
@@ -463,6 +462,9 @@ pub(crate) const RETIRED_OPERATOR_TOOL_NAMES: &[&str] = &[
     // ever wanted again, belong to an HTTP skill or MCP wrapper.
     "calculator",
     "weather",
+    // Knowledge graph tool retired: its private knowledge.db store was a
+    // second graph next to the Tachi memory kernel's own edges.
+    "knowledge",
     "sop_execute",
     "sop_advance",
     "sop_approve",
@@ -1128,33 +1130,11 @@ pub fn all_tools_with_runtime(
     );
     tool_arcs.push(Arc::new(escalate_tool));
 
-    // Knowledge graph tool
-    if root_config.knowledge.enabled {
-        let db_path_str = root_config.knowledge.db_path.replace(
-            '~',
-            &directories::UserDirs::new()
-                .map(|u| u.home_dir().to_string_lossy().to_string())
-                .unwrap_or_else(|| ".".to_string()),
-        );
-        let db_path = std::path::PathBuf::from(&db_path_str);
-        match zeroclaw_memory::knowledge_graph::KnowledgeGraph::new(
-            &db_path,
-            root_config.knowledge.max_nodes,
-        ) {
-            Ok(graph) => {
-                tool_arcs.push(Arc::new(KnowledgeTool::new(Arc::new(graph))));
-            }
-            Err(e) => {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                    "knowledge graph disabled due to init error"
-                );
-            }
-        }
-    }
+    // `knowledge` is retired: the graph tool and its private knowledge.db
+    // store were deleted (relationship memory belongs to the Tachi memory
+    // kernel). The name stays reserved in RETIRED_OPERATOR_TOOL_NAMES and a
+    // leftover `[knowledge]` config section warns via the retired-surface
+    // tombstone instead of reaching this assembly.
 
     // `delegate` is retired (wall 1): the legacy full-parent-inheritance
     // delegation tool is no longer constructed on any composition. Its

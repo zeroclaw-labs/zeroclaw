@@ -11,7 +11,6 @@ export interface AgentSummary {
    * string when unset (the agent inherits the default — sqlite). */
   memoryBackend: string;
   skillBundles: string[];
-  knowledgeBundles: string[];
   mcpBundles: string[];
   /** Cron alias list from `[agents.<alias>].cron_jobs`. */
   cronJobs: string[];
@@ -111,7 +110,6 @@ export async function loadAgentSummaries(): Promise<AgentSummary[]> {
         runtimeProfile: stringField('runtime_profile'),
         memoryBackend: stringField('memory.backend'),
         skillBundles: entryAsStringArray(lookup('skill_bundles')),
-        knowledgeBundles: entryAsStringArray(lookup('knowledge_bundles')),
         mcpBundles: entryAsStringArray(lookup('mcp_bundles')),
         cronJobs: entryAsStringArray(lookup('cron_jobs')),
         peerGroups: [],

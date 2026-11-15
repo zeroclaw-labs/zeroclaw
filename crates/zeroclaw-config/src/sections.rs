@@ -312,7 +312,7 @@ sections! {
     },
 
     // Tier 4 — Capabilities. Bundles that agents reference via
-    // skill_bundles / mcp_bundle / knowledge_bundles.
+    // skill_bundles / mcp_bundle.
     Skills => {
         key:   "skills",
         shape: DirectForm,
@@ -362,13 +362,6 @@ sections! {
         help:  "Named bundles of MCP servers, granted to agents that list the bundle \
                 in their `mcp_bundles`. Secure by default: an agent gets only the \
                 servers its bundles grant; with no bundle it gets no MCP servers.",
-    },
-    KnowledgeBundles => {
-        key:   "knowledge_bundles",
-        shape: OneTierAliasMap,
-        group: Tools,
-        help:  "Named bundles of knowledge sources (RAG indexes, doc folders). Agents \
-                reference a bundle to surface relevant snippets at inference time.",
     },
 
     // Tier 5 — Modal IO. Optional voice in/out providers.
@@ -519,7 +512,6 @@ pub fn section_has_signal(cfg: &crate::schema::Config, section: Section) -> bool
         | Section::Cron
         | Section::Mcp
         | Section::McpBundles
-        | Section::KnowledgeBundles
         | Section::Composition
         | Section::QuickstartState => false,
     }
@@ -533,10 +525,6 @@ mod tests {
     fn humanize_strips_dots_underscores_and_hyphens() {
         assert_eq!(humanize_section_key("mcp.servers"), "Mcp servers");
         assert_eq!(humanize_section_key("mcp_bundles"), "Mcp bundles");
-        assert_eq!(
-            humanize_section_key("knowledge-bundles"),
-            "Knowledge bundles"
-        );
         assert_eq!(Section::McpServers.label(), "Mcp servers");
         assert_eq!(Section::McpBundles.label(), "Mcp bundles");
     }
@@ -559,11 +547,6 @@ mod tests {
         let kebab_then_snake: &[(&str, &str, Section)] = &[
             ("peer-groups", "peer_groups", Section::PeerGroups),
             ("mcp-bundles", "mcp_bundles", Section::McpBundles),
-            (
-                "knowledge-bundles",
-                "knowledge_bundles",
-                Section::KnowledgeBundles,
-            ),
             ("skill-bundles", "skill_bundles", Section::SkillBundles),
             ("risk-profiles", "risk_profiles", Section::RiskProfiles),
             (
@@ -603,7 +586,6 @@ mod tests {
             Section::Cron,
             Section::McpServers,
             Section::McpBundles,
-            Section::KnowledgeBundles,
             Section::SkillBundles,
             Section::RiskProfiles,
             Section::RuntimeProfiles,
@@ -655,7 +637,6 @@ mod tests {
             Section::RuntimeProfiles,
             Section::SkillBundles,
             Section::McpBundles,
-            Section::KnowledgeBundles,
             Section::Channels,
         ] {
             assert!(
@@ -766,10 +747,6 @@ mod tests {
         );
         assert_eq!(section_group_for_key("mcp.servers"), SectionGroup::Tools);
         assert_eq!(section_group_for_key("mcp_bundles"), SectionGroup::Tools);
-        assert_eq!(
-            section_group_for_key("knowledge_bundles"),
-            SectionGroup::Tools
-        );
         assert_eq!(section_group_for_key("cron"), SectionGroup::Agent);
         assert_eq!(section_group_for_key("storage"), SectionGroup::Storage);
         // Kebab spelling resolves like snake.

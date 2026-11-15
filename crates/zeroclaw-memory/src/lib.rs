@@ -26,7 +26,6 @@ pub mod hygiene;
 pub mod importance;
 #[cfg(feature = "tachi")]
 pub mod kernel_store;
-pub mod knowledge_graph;
 pub mod lucid;
 pub mod markdown;
 pub mod merge;

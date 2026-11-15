@@ -739,11 +739,6 @@ pub struct Config {
     #[nested]
     pub skill_bundles: HashMap<String, SkillBundleConfig>,
 
-    /// Named knowledge bundles (`[knowledge_bundles.<alias>]`).
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    #[nested]
-    pub knowledge_bundles: HashMap<String, KnowledgeBundleConfig>,
-
     /// Named MCP server bundles (`[mcp_bundles.<alias>]`).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
@@ -806,12 +801,6 @@ pub struct Config {
     #[nested]
     #[group = "Network"]
     pub node_transport: NodeTransportConfig,
-
-    /// Knowledge graph configuration (`[knowledge]`).
-    #[serde(default)]
-    #[nested]
-    #[group = "Tools"]
-    pub knowledge: KnowledgeConfig,
 
     /// Standalone image generation tool configuration (`[image_gen]`).
     #[serde(default)]
@@ -3455,11 +3444,6 @@ pub struct AliasedAgentConfig {
     #[tab(Bundles)]
     #[serde(default)]
     pub skill_bundles: Vec<String>,
-    /// Knowledge bundle aliases. Additive: the agent loads every listed
-    /// bundle.
-    #[tab(Bundles)]
-    #[serde(default)]
-    pub knowledge_bundles: Vec<String>,
     /// MCP bundle aliases. Each entry references `mcp_bundles[key]`, a named
     /// group of MCP servers. Secure by default: an agent is granted only the
     /// servers named by its bundles. An agent with no `mcp_bundles` receives
@@ -3619,7 +3603,6 @@ impl Default for AliasedAgentConfig {
             card: crate::providers::CardRef::default(),
             runtime_profile: crate::providers::RuntimeProfileRef::default(),
             skill_bundles: Vec::new(),
-            knowledge_bundles: Vec::new(),
             mcp_bundles: Vec::new(),
             acp_enable_mcp: false,
             cron_jobs: Vec::new(),
@@ -4324,7 +4307,7 @@ impl Config {
     }
 
     /// `<install>/shared/` — directory shared across every agent on this
-    /// host. Holds skills, skill bundles, knowledge bundles, and any
+    /// host. Holds skills, skill bundles, and any
     /// other content not scoped to a single agent's workspace. Distinct
     /// from `agent_workspace_dir(alias)` (per-agent state) and
     /// `data_dir` (databases + runtime state).
@@ -7636,51 +7619,6 @@ impl Default for DataRetentionConfig {
     }
 }
 
-// ── Knowledge ───────────────────────────────────────────────────
-
-/// Knowledge graph configuration for capturing and reusing expertise.
-#[allow(clippy::struct_excessive_bools)]
-#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "knowledge"]
-pub struct KnowledgeConfig {
-    /// Enable the knowledge graph tool. Default: false.
-    #[serde(default)]
-    pub enabled: bool,
-    /// Path to the knowledge graph SQLite database.
-    #[serde(default = "default_knowledge_db_path")]
-    pub db_path: String,
-    /// Maximum number of knowledge nodes. Default: 100000.
-    #[serde(default = "default_knowledge_max_nodes")]
-    pub max_nodes: usize,
-    /// Automatically capture knowledge from conversations. Default: false.
-    #[serde(default)]
-    pub auto_capture: bool,
-    /// Proactively suggest relevant knowledge on queries. Default: true.
-    #[serde(default = "default_true")]
-    pub suggest_on_query: bool,
-}
-
-fn default_knowledge_db_path() -> String {
-    default_path_under_config_dir("knowledge.db")
-}
-
-fn default_knowledge_max_nodes() -> usize {
-    100_000
-}
-
-impl Default for KnowledgeConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            db_path: default_knowledge_db_path(),
-            max_nodes: default_knowledge_max_nodes(),
-            auto_capture: false,
-            suggest_on_query: true,
-        }
-    }
-}
-
 // ── Standalone Image Generation ─────────────────────────────────
 
 /// Standalone image generation tool configuration (`[image_gen]`).
@@ -9733,21 +9671,6 @@ impl SkillBundleConfig {
         }
         !self.exclude.iter().any(|s| s == name)
     }
-}
-
-/// Named knowledge bundle (`[knowledge_bundles.<alias>]`).
-///
-/// A reusable set of knowledge sources (documents, URLs, or RAG corpus paths)
-/// that can be attached to an agent by alias.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "knowledge_bundle"]
-#[serde(default)]
-pub struct KnowledgeBundleConfig {
-    /// Paths or URLs to include in this knowledge bundle.
-    pub sources: Vec<String>,
-    /// Tags for filtering or categorising sources within the bundle.
-    pub tags: Vec<String>,
 }
 
 /// Named MCP server bundle (`[mcp_bundles.<alias>]`).
@@ -12164,7 +12087,6 @@ impl Default for Config {
             cards: HashMap::new(),
             companion_memory: crate::companion::CompanionMemoryConfig::default(),
             skill_bundles: HashMap::new(),
-            knowledge_bundles: HashMap::new(),
             mcp_bundles: HashMap::new(),
             peer_groups: HashMap::new(),
             hooks: HooksConfig::default(),
@@ -12176,7 +12098,6 @@ impl Default for Config {
             nodes: NodesConfig::default(),
             onboard_state: OnboardStateConfig::default(),
             node_transport: NodeTransportConfig::default(),
-            knowledge: KnowledgeConfig::default(),
             image_gen: ImageGenConfig::default(),
             file_upload: FileUploadConfig::default(),
             file_upload_bundle: FileUploadBundleConfig::default(),
@@ -14876,24 +14797,6 @@ impl Config {
             validation_bail!(InvalidFormat, path, "{reason}");
         }
 
-        // Knowledge graph
-        if self.knowledge.enabled {
-            if self.knowledge.max_nodes == 0 {
-                validation_bail!(
-                    InvalidNumericRange,
-                    "knowledge.max_nodes",
-                    "knowledge.max_nodes must be greater than 0"
-                );
-            }
-            if self.knowledge.db_path.trim().is_empty() {
-                validation_bail!(
-                    RequiredFieldEmpty,
-                    "knowledge.db_path",
-                    "knowledge.db_path must not be empty"
-                );
-            }
-        }
-
         // Proxy (delegate to existing validation)
         self.proxy.validate()?;
 
@@ -15162,11 +15065,6 @@ impl Config {
             // directly to the right inline error in the dashboard form.
             let bare_multi: &[(&str, &str, &[String])] = &[
                 ("skill_bundles", "skill_bundles", &agent.skill_bundles),
-                (
-                    "knowledge_bundles",
-                    "knowledge_bundles",
-                    &agent.knowledge_bundles,
-                ),
                 ("mcp_bundles", "mcp_bundles", &agent.mcp_bundles),
             ];
             for (section, field, values) in bare_multi {

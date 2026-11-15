@@ -1880,7 +1880,6 @@ async fn config_toml_roundtrip() {
         cards: HashMap::new(),
         companion_memory: crate::companion::CompanionMemoryConfig::default(),
         skill_bundles: HashMap::new(),
-        knowledge_bundles: HashMap::new(),
         mcp_bundles: HashMap::new(),
         peer_groups: HashMap::new(),
         hooks: HooksConfig::default(),
@@ -1891,7 +1890,6 @@ async fn config_toml_roundtrip() {
         nodes: NodesConfig::default(),
         onboard_state: OnboardStateConfig::default(),
         node_transport: NodeTransportConfig::default(),
-        knowledge: KnowledgeConfig::default(),
         image_gen: ImageGenConfig::default(),
         file_upload: FileUploadConfig::default(),
         file_upload_bundle: FileUploadBundleConfig::default(),
@@ -2554,7 +2552,7 @@ async fn config_save_prunes_unchanged_default_blocks() {
     // Fresh-init config without any operator edits should write a
     // tiny config.toml — only `schema_version` and any operator-
     // touched fields. The hundreds of all-default blocks
-    // (knowledge, memory, observability, etc.) must not appear.
+    // (memory, observability, etc.) must not appear.
     let dir =
         std::env::temp_dir().join(format!("zeroclaw_save_prune_test_{}", uuid::Uuid::new_v4()));
     fs::create_dir_all(&dir).await.unwrap();
@@ -2575,13 +2573,7 @@ async fn config_save_prunes_unchanged_default_blocks() {
 
     // Defaulted nested struct blocks must NOT appear in a fresh
     // save. Pick representative samples from across the schema:
-    for block in [
-        "[memory]",
-        "[knowledge]",
-        "[observability]",
-        "[gateway]",
-        "[cost]",
-    ] {
+    for block in ["[memory]", "[observability]", "[gateway]", "[cost]"] {
         assert!(
             !raw.contains(block),
             "pruned config.toml must not emit defaulted block {block}; got:\n{raw}",
@@ -2707,7 +2699,6 @@ async fn config_save_and_load_tmpdir() {
         cards: HashMap::new(),
         companion_memory: crate::companion::CompanionMemoryConfig::default(),
         skill_bundles: HashMap::new(),
-        knowledge_bundles: HashMap::new(),
         mcp_bundles: HashMap::new(),
         peer_groups: HashMap::new(),
         hooks: HooksConfig::default(),
@@ -2718,7 +2709,6 @@ async fn config_save_and_load_tmpdir() {
         nodes: NodesConfig::default(),
         onboard_state: OnboardStateConfig::default(),
         node_transport: NodeTransportConfig::default(),
-        knowledge: KnowledgeConfig::default(),
         image_gen: ImageGenConfig::default(),
         file_upload: FileUploadConfig::default(),
         file_upload_bundle: FileUploadBundleConfig::default(),
@@ -4087,14 +4077,17 @@ async fn default_path_under_config_dir_respects_zeroclaw_config_dir() {
     // SAFETY: test-only, single-threaded test runner.
     unsafe { std::env::set_var("ZEROCLAW_CONFIG_DIR", &custom_dir) };
 
-    let result = default_path_under_config_dir("knowledge.db");
+    let result = default_path_under_config_dir("estop-state.json");
 
     // SAFETY: test-only, single-threaded test runner.
     unsafe { std::env::remove_var("ZEROCLAW_CONFIG_DIR") };
 
     assert_eq!(
         result,
-        custom_dir.join("knowledge.db").to_string_lossy().as_ref(),
+        custom_dir
+            .join("estop-state.json")
+            .to_string_lossy()
+            .as_ref(),
         "expected path under ZEROCLAW_CONFIG_DIR, got: {result}"
     );
 }

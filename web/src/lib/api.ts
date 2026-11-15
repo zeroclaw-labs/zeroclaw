@@ -1261,7 +1261,6 @@ export interface AgentOptionsResponse {
   risk_profiles: string[];
   runtime_profiles: string[];
   skill_bundles: string[];
-  knowledge_bundles: string[];
   mcp_bundles: string[];
   agents: string[];
   memory_namespaces?: string[];

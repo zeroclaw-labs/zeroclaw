@@ -103,6 +103,14 @@ use serde::{Deserialize, Serialize};
 /// - `cost_optimized_routing_removed`: a runtime profile still sets
 ///   `auto_classify.cost_optimized_hint`. The unused cost selector was
 ///   removed; the three complexity hints and ordinary named routes remain.
+/// - `knowledge_graph_removed`: a `[knowledge]` section is still present. The
+///   knowledge-graph tool and its private `knowledge.db` store were retired —
+///   relationship memory belongs to the Tachi memory kernel, not a second
+///   local graph — so the section is ignored (see `RETIRED_CONFIG_SURFACES`).
+/// - `knowledge_bundles_removed`: a `[knowledge_bundles.<alias>]` section or
+///   an `agents.<alias>.knowledge_bundles` list is still present. The bundles
+///   only fed the retired knowledge-graph tool, so both surfaces are ignored
+///   (see `RETIRED_CONFIG_SURFACES` and `RETIRED_CONFIG_FIELDS`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct ValidationWarning {
@@ -147,6 +155,8 @@ pub const RETIRED_CONFIG_SURFACES: &[(&str, &str)] = &[
         "gateway.pairing_dashboard",
         "gateway_pairing_dashboard_removed",
     ),
+    ("knowledge", "knowledge_graph_removed"),
+    ("knowledge_bundles", "knowledge_bundles_removed"),
     ("delegate", "delegate_config_removed"),
     ("claude_code", "raw_launcher_config_removed"),
     ("claude_code_runner", "raw_launcher_config_removed"),
@@ -311,6 +321,7 @@ pub const RETIRED_CONFIG_FIELDS: &[(&str, &str)] = &[
         "runtime_profiles.*.auto_classify.cost_optimized_hint",
         "cost_optimized_routing_removed",
     ),
+    ("agents.*.knowledge_bundles", "knowledge_bundles_removed"),
     (
         "providers.models.ollama.*.num_ctx",
         "ollama_native_options_removed",

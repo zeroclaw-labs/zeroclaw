@@ -204,7 +204,7 @@ non-dirty entries and comments where possible, stamps the current
 `schema_version`, and writes through an atomic temp-file replacement.
 
 That path is also responsible for map-key sections. Creating an alias such as a
-model provider, MCP server, skill bundle, or knowledge bundle must dirty the
+model provider, MCP server, or skill bundle must dirty the
 right section so the alias survives a save and reload. A config edit that only
 updates the in-memory dashboard state is not complete.
 
@@ -285,8 +285,9 @@ restart according to the runtime boundary above.
 A field can be schema-visible before every runtime path consumes it. That is
 acceptable only when the docs and review notes say so plainly.
 
-For example, `knowledge_bundles` is schema-visible and appears in config
-section APIs. A PR that adds or changes such a surface must be precise about
+For example, a map-key section can be schema-visible and appear in config
+section APIs while a runtime consumer is still being wired. A PR that adds or
+changes such a surface must be precise about
 whether it only stores configuration, wires the runtime behavior, or completes
 both.
 

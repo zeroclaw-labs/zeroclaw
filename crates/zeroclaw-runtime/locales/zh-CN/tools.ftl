@@ -38,7 +38,6 @@ tool-git-operations-error-not-in-repo = 当前路径 '{ $path }' 不在 Git 仓�
 tool-glob-search = 在工作区内搜索匹配 glob 模式的文件。返回相对于工作区根目录的匹配文件路径排序列表。示例：'**/*.rs'（所有 Rust 文件）、'src/**/mod.rs'（src 中所有的 mod.rs）。
 tool-http-request = 向外部 API 发起 HTTP 请求。支持 GET、POST、PUT、DELETE、PATCH、HEAD、OPTIONS 方法。安全约束：仅限允许列表中的域名，不允许本地/私有主机，可配置超时和响应大小限制。
 tool-image-info = 读取图像文件元数据（格式、尺寸、大小），并可选择返回 base64 编码的数据。
-tool-knowledge = 管理架构决策、解决方案模式、经验教训、专家和关系链接的知识图谱。
 tool-discord-search = 搜索存储在 discord.db 中的 Discord 消息历史。用于查找过往消息、总结频道活动或查看用户说过的话。支持关键词搜索和可选过滤器：channel_id、since、until。
 tool-memory-forget = 按 key 移除一条记忆。用于删除过时的事实或敏感数据。返回该记忆是否被找到并移除。
 tool-memory-recall = 在长期记忆中搜索相关的事实、偏好或上下文。返回按相关性排序的评分结果。省略查询或传入裸 * 以返回近期记忆。

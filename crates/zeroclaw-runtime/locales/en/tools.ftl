@@ -67,8 +67,6 @@ tool-http-request = Make HTTP requests to external APIs. Supports GET, POST, PUT
 
 tool-image-info = Read image file metadata (format, dimensions, size) and optionally return base64-encoded data.
 
-tool-knowledge = Manage a knowledge graph of architecture decisions, solution patterns, lessons learned, experts, and relationship links.
-
 tool-discord-search = Search Discord message history stored in discord.db. Use to find past messages, summarize channel activity, or look up what users said. Supports keyword search and optional filters: channel_id, since, until.
 
 tool-propose-soul-change = Propose how you would like to grow, for your owner to approve. Use layer "story" to add a line about what has happened between you and your owner (story_kind "self": your concerns, interests, and working habits; story_kind "bond": shared names, references, running jokes, and ways of working), or to retire an entry that no longer fits (retire_index). A story line is never an instruction about tone, warmth, length, or humor. Use "tone" to change a dial: one level at a time, challenge only upward, and not again within 28 days of an approved change to that dial. Use "principles" to add a principle. Nothing changes until your owner approves. Propose only what reflects a lasting pattern, not a one-off request. Your name and identity are your owner's to decide.

@@ -1289,12 +1289,6 @@ export interface components {
              */
             identity: components["schemas"]["IdentityConfig"];
             /**
-             * @description Knowledge bundle aliases. Additive: the agent loads every listed
-             *     bundle.
-             * @default []
-             */
-            knowledge_bundles: string[];
-            /**
              * @description MCP bundle aliases. Each entry references `mcp_bundles[key]`, a named
              *     group of MCP servers. Secure by default: an agent is granted only the
              *     servers named by its bundles. An agent with no `mcp_bundles` receives
@@ -4488,21 +4482,6 @@ export interface components {
              *     }
              */
             jira: components["schemas"]["JiraConfig"];
-            /**
-             * @description Knowledge graph configuration (`[knowledge]`).
-             * @default {
-             *       "auto_capture": false,
-             *       "db_path": "/Users/kckylechen/.zeroclaw/knowledge.db",
-             *       "enabled": false,
-             *       "max_nodes": 100000,
-             *       "suggest_on_query": true
-             *     }
-             */
-            knowledge: components["schemas"]["KnowledgeConfig"];
-            /** @description Named knowledge bundles (`[knowledge_bundles.<alias>]`). */
-            knowledge_bundles?: {
-                [key: string]: components["schemas"]["KnowledgeBundleConfig"];
-            };
             /**
              * @description Link enricher configuration (`[link_enricher]`).
              * @default {
@@ -10470,53 +10449,6 @@ export interface components {
             vision?: boolean | null;
             /** @description Wire protocol flavor: `responses` for OpenAI's Responses API (`POST /v1/responses`), `chat_completions` for the legacy chat wire and most OpenAI-compatible gateways. New OpenAI provider slots default to `responses`; other families default to chat-completions (or ignore the field). Only override if you're forcing an unusual combination. */
             wire_api?: components["schemas"]["WireApi"] | null;
-        };
-        /**
-         * @description Named knowledge bundle (`[knowledge_bundles.<alias>]`).
-         *
-         *     A reusable set of knowledge sources (documents, URLs, or RAG corpus paths)
-         *     that can be attached to an agent by alias.
-         */
-        KnowledgeBundleConfig: {
-            /**
-             * @description Paths or URLs to include in this knowledge bundle.
-             * @default []
-             */
-            sources: string[];
-            /**
-             * @description Tags for filtering or categorising sources within the bundle.
-             * @default []
-             */
-            tags: string[];
-        };
-        /** @description Knowledge graph configuration for capturing and reusing expertise. */
-        KnowledgeConfig: {
-            /**
-             * @description Automatically capture knowledge from conversations. Default: false.
-             * @default false
-             */
-            auto_capture: boolean;
-            /**
-             * @description Path to the knowledge graph SQLite database.
-             * @default /Users/kckylechen/.zeroclaw/knowledge.db
-             */
-            db_path: string;
-            /**
-             * @description Enable the knowledge graph tool. Default: false.
-             * @default false
-             */
-            enabled: boolean;
-            /**
-             * Format: uint
-             * @description Maximum number of knowledge nodes. Default: 100000.
-             * @default 100000
-             */
-            max_nodes: number;
-            /**
-             * @description Proactively suggest relevant knowledge on queries. Default: true.
-             * @default true
-             */
-            suggest_on_query: boolean;
         };
         /** @description Named model_provider profile definition. */
         LambdaAiModelProviderConfig: {

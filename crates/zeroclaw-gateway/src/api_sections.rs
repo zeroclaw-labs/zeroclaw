@@ -299,7 +299,6 @@ pub struct AgentOptionsResponse {
     pub risk_profiles: Vec<String>,
     pub runtime_profiles: Vec<String>,
     pub skill_bundles: Vec<String>,
-    pub knowledge_bundles: Vec<String>,
     pub mcp_bundles: Vec<String>,
     pub agents: Vec<String>,
 }
@@ -322,7 +321,6 @@ pub fn build_agent_options(cfg: &zeroclaw_config::schema::Config) -> AgentOption
         risk_profiles: cfg.resolve_alias_source(AliasSource::RiskProfiles),
         runtime_profiles: cfg.resolve_alias_source(AliasSource::RuntimeProfiles),
         skill_bundles: cfg.resolve_alias_source(AliasSource::SkillBundles),
-        knowledge_bundles: cfg.resolve_alias_source(AliasSource::KnowledgeBundles),
         mcp_bundles: cfg.resolve_alias_source(AliasSource::McpBundles),
         agents: cfg.resolve_alias_source(AliasSource::Agents),
     }
@@ -585,7 +583,6 @@ fn picker_items_for(
         | Section::Cron
         | Section::McpServers
         | Section::McpBundles
-        | Section::KnowledgeBundles
         | Section::SkillBundles
         | Section::RiskProfiles
         | Section::RuntimeProfiles
@@ -1014,7 +1011,6 @@ pub async fn handle_section_select(
         | Section::Cron
         | Section::McpServers
         | Section::McpBundles
-        | Section::KnowledgeBundles
         | Section::SkillBundles
         | Section::RiskProfiles
         | Section::RuntimeProfiles
@@ -1206,8 +1202,6 @@ mod tests {
         cfg.create_map_key("runtime_profiles", "alpha_runtime")
             .unwrap();
         cfg.create_map_key("skill_bundles", "alpha_skills").unwrap();
-        cfg.create_map_key("knowledge_bundles", "alpha_knowledge")
-            .unwrap();
         cfg.create_map_key("mcp_bundles", "alpha_mcp").unwrap();
         cfg.create_map_key("agents", "alpha_agent").unwrap();
 
@@ -1217,7 +1211,6 @@ mod tests {
         assert_eq!(resp.risk_profiles, vec!["alpha_risk".to_string()]);
         assert_eq!(resp.runtime_profiles, vec!["alpha_runtime".to_string()]);
         assert_eq!(resp.skill_bundles, vec!["alpha_skills".to_string()]);
-        assert_eq!(resp.knowledge_bundles, vec!["alpha_knowledge".to_string()],);
         assert_eq!(resp.mcp_bundles, vec!["alpha_mcp".to_string()]);
         assert_eq!(resp.agents, vec!["alpha_agent".to_string()]);
     }
@@ -1832,7 +1825,6 @@ mod tests {
             "peer_groups",
             "cron",
             "mcp_bundles",
-            "knowledge_bundles",
             "skill_bundles",
             "risk_profiles",
             "runtime_profiles",
@@ -1852,7 +1844,6 @@ mod tests {
             ("peer_groups", "team_chat"),
             ("cron", "daily_brief"),
             ("mcp_bundles", "core_tools"),
-            ("knowledge_bundles", "house_docs"),
             ("skill_bundles", "ops_skills"),
             ("risk_profiles", "tight"),
             ("runtime_profiles", "fast_model"),
@@ -1896,7 +1887,6 @@ mod tests {
             Section::Cron,
             Section::Mcp,
             Section::McpBundles,
-            Section::KnowledgeBundles,
             Section::SkillBundles,
             Section::RiskProfiles,
             Section::RuntimeProfiles,

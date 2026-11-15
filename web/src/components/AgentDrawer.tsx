@@ -6,7 +6,6 @@ import {
   FOCUSABLE_SELECTOR_FORM,
 } from '@/hooks/useFocusTrap';
 import {
-  BookOpen,
   Bot,
   Brain,
   Clock,
@@ -111,7 +110,6 @@ export default function AgentDrawer({
 
   const channelCount = agent.channels.length;
   const skillCount = agent.skillBundles.length;
-  const knowledgeCount = agent.knowledgeBundles.length;
   const mcpCount = agent.mcpBundles.length;
   const cronCount = agent.cronJobs.length;
   const peerCount = agent.peerGroups.length;
@@ -277,22 +275,6 @@ export default function AgentDrawer({
                   title={`${t('agent.open_config_prefix')}skill-bundles.${s}${t('agent.open_config_suffix')}`}
                 >
                   {s}
-                </EntityLink>
-              ))}
-            </DetailGroup>
-          )}
-
-          {knowledgeCount > 0 && (
-            <DetailGroup icon={BookOpen} label={t('agent.section.knowledge')}>
-              {agent.knowledgeBundles.map((k) => (
-                <EntityLink
-                  key={k}
-                  kind="knowledge-bundle"
-                  id={k}
-                  className={CHIP_CLASS}
-                  title={`${t('agent.open_config_prefix')}knowledge-bundles.${k}${t('agent.open_config_suffix')}`}
-                >
-                  {k}
                 </EntityLink>
               ))}
             </DetailGroup>

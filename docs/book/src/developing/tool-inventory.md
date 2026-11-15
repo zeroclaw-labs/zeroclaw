@@ -61,7 +61,7 @@ boundaries because they add platform, dependency, network, or UI surface area.
 | WASM plugin tools | Removed with the WASM plugin host. | Retired: extensions go through MCP servers. |
 | `calculator`, `weather` | Removed from the model surface; implementations deleted. | Retired outright. The names stay reserved in `RETIRED_OPERATOR_TOOL_NAMES` so no assembly path can re-register them. A weather lookup, if ever wanted again, belongs to an HTTP skill or MCP wrapper. |
 | `execute_pipeline` | Config-gated tool chaining. | Keep gated until tool chaining policy, per-step receipts, and caller allowlists are stable enough to judge whether it is core. |
-| `knowledge` | Config-gated knowledge surface. | Keep gated while relationship memory and graph workflows are still being promoted into user-facing docs and skills. |
+| `knowledge` | Removed from the model surface; tool, graph store and config retired. | Retired: its private `knowledge.db` graph was a second store next to the Tachi memory kernel's own edges. `[knowledge]` / `[knowledge_bundles]` sections warn via the retired-surface tombstone. |
 | `file_upload`, `file_upload_bundle`, `file_download` | Config-gated data movement. | Keep gated; these are policy-sensitive data movement tools and need an explicit replacement before externalization. |
 | `backup`, `data_management` | Retired from the model surface. | Operator-only via the gateway operator API (`/api/agents/<alias>/backup*`, `/api/agents/<alias>/data-retention*`), which the `[backup]` / `[data_retention]` sections configure. See "Retired Operator Tools" below. |
 | `screenshot`, `image_info` | Visual/UI tool surface. | Keep for now; classify with the visual/UI tool surface once plugin and dashboard boundaries settle. |

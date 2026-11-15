@@ -683,7 +683,6 @@ const AGENT_SINGLE_ALIAS_FIELDS: Record<string, keyof AgentOptionsResponse> = {
 const AGENT_MULTI_ALIAS_FIELDS: Record<string, keyof AgentOptionsResponse> = {
   channels: "channels",
   "skill_bundles": "skill_bundles",
-  "knowledge_bundles": "knowledge_bundles",
   "mcp_bundles": "mcp_bundles",
 };
 
@@ -775,7 +774,6 @@ const AGENT_ALIAS_SOURCE_PATH: Record<keyof AgentOptionsResponse, string> = {
   risk_profiles: "/config/risk_profiles",
   runtime_profiles: "/config/runtime_profiles",
   skill_bundles: "/config/skill_bundles",
-  knowledge_bundles: "/config/knowledge_bundles",
   mcp_bundles: "/config/mcp_bundles",
   agents: "/config/agents",
   memory_namespaces: "/config/memory_namespaces",

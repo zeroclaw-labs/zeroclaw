@@ -98,7 +98,6 @@ export const fieldDescriptions: FieldDescriptions = {
     "delegates": "Explicit delegate roster: additional agent aliases this agent may\ndelegate to, beyond same-profile peers. Possibly empty. String\nentries are accepted for concise manual editing and load as bounded\ndelegates; saved config emits object entries with explicit modes.\nEntries may name agents on a different risk profile. `Config::validate()`\nfails loud on a dangling alias, duplicate alias, or self-reference.",
     "enabled": "Whether this agent is active. Set false to disable without removing the definition.",
     "identity": "Per-agent identity format (`[agents.<alias>.identity]`). Each\nagent renders its own IDENTITY.md / SOUL.md inside its\nper-agent workspace; this block selects the format (OpenClaw or\nAIEOS) and optional inline/file source for the agent's identity\ndocument.",
-    "knowledge_bundles": "Knowledge bundle aliases. Additive: the agent loads every listed\nbundle.",
     "mcp_bundles": "MCP bundle aliases. Each entry references `mcp_bundles[key]`, a named\ngroup of MCP servers. Secure by default: an agent is granted only the\nservers named by its bundles. An agent with no `mcp_bundles` receives\nno MCP servers (omission is not a grant). See\n`Config::mcp_servers_for_agent`.",
     "memory": "Per-agent memory backend selection (`[agents.<alias>.memory]`).\nThe `backend` field is locked at agent creation and immutable on\nsubsequent loads. Defaults to `Sqlite`. See\n`crate::multi_agent::AgentMemoryConfig`.",
     "model_provider": "Dotted model-provider alias (e.g. `\"anthropic.<alias>\"`).\nResolves through `model_providers.<type>.<alias>` at runtime;\n`Config::validate()` fails loud on dangling references.",
@@ -591,8 +590,6 @@ export const fieldDescriptions: FieldDescriptions = {
     "http_request": "HTTP request tool configuration (`[http_request]`).",
     "image_gen": "Standalone image generation tool configuration (`[image_gen]`).",
     "jira": "Jira integration configuration (`[jira]`).",
-    "knowledge": "Knowledge graph configuration (`[knowledge]`).",
-    "knowledge_bundles": "Named knowledge bundles (`[knowledge_bundles.<alias>]`).",
     "link_enricher": "Link enricher configuration (`[link_enricher]`).",
     "linkedin": "LinkedIn integration configuration (`[linkedin]`).",
     "locale": "Locale for tool descriptions (e.g. `\"en\"`, `\"zh-CN\"`).\n\nWhen set, tool descriptions shown in system prompts are loaded from\nFluent `.ftl` locale files. Falls back to embedded English, then to\nhardcoded descriptions.\n\nIf omitted or empty, the locale is auto-detected from the host\nsystem's locale (defaulting to `\"en\"` if that can't be determined).",
@@ -1475,17 +1472,6 @@ export const fieldDescriptions: FieldDescriptions = {
     "uri": "Endpoint URI the client hits. Override the family's default endpoint when pointing at a self-hosted gateway (LiteLLM, vLLM, Ollama), a custom proxy, or any non-standard URL. Leave unset to use the family's default URI from its `ModelEndpoint` impl. Set this to the FULL endpoint URL; there is no separate path-suffix field.",
     "vision": "Override the provider's vision (image input) capability.\n`None` (default) uses the provider family's built-in default. Several\nfamilies (llama.cpp, the generic OpenAI-compatible endpoint, etc.)\nassume vision-capable because they can serve multimodal models. Set\n`vision = false` for a text-only model served by such a family (e.g. a\ntext LLM behind llama.cpp) so image messages are routed to a configured\n`[multimodal] vision_model_provider` instead of being sent to a model\nthat rejects them. `Some(true)` forces vision on.",
     "wire_api": "Wire protocol flavor: `responses` for OpenAI's Responses API (`POST /v1/responses`), `chat_completions` for the legacy chat wire and most OpenAI-compatible gateways. New OpenAI provider slots default to `responses`; other families default to chat-completions (or ignore the field). Only override if you're forcing an unusual combination."
-  },
-  "KnowledgeBundleConfig": {
-    "sources": "Paths or URLs to include in this knowledge bundle.",
-    "tags": "Tags for filtering or categorising sources within the bundle."
-  },
-  "KnowledgeConfig": {
-    "auto_capture": "Automatically capture knowledge from conversations. Default: false.",
-    "db_path": "Path to the knowledge graph SQLite database.",
-    "enabled": "Enable the knowledge graph tool. Default: false.",
-    "max_nodes": "Maximum number of knowledge nodes. Default: 100000.",
-    "suggest_on_query": "Proactively suggest relevant knowledge on queries. Default: true."
   },
   "LambdaAiModelProviderConfig": {
     "api_key": "Secret API token for this model_provider. Grab it from the model_provider's dashboard (OpenAI platform, Anthropic console, OpenRouter keys page, etc.). Stored via the OS keyring when possible; never commit it to config.toml directly.",

@@ -218,8 +218,6 @@ zeroclaw skills list --agent default
 
 When the skill appears only in the global group, install it into a bundle and ensure the agent lists that bundle in `agents.<alias>.skill_bundles`.
 
-For a worked example that turns a built-in tool into a reusable operator workflow, see [using relationship memory from skills](./relationship-memory-skill-template.md).
-
 ## Prompt-triggered capability suggestions
 
 ZeroClaw can optionally suggest an installable skill capability when a submitted prompt clearly names something that exists in cached registry metadata but is not installed. The server-side path runs after submission and before the normal LLM turn. It only returns a suggestion; it does not install the skill, enable it, write memory, or treat the skill body as global instructions.
@@ -277,6 +275,5 @@ Because reflection forwards turn content to the model provider, the task, the to
 ## See also
 
 - [Tools overview](./overview.md)
-- [Using relationship memory from skills](./relationship-memory-skill-template.md)
 - [Security overview](../security/overview.md)
 - [Tool receipts](../security/tool-receipts.md)
