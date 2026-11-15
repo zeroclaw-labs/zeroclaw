@@ -109,6 +109,10 @@ pub struct AnthropicModelProvider {
     /// paths that rebuild the provider per call (e.g. the per-iteration
     /// vision route) start it empty each time.
     schema_cache: zeroclaw_api::schema::SchemaCleanCache,
+    /// Send `thinking.block_binding = drop_block` with adaptive thinking.
+    /// On for Anthropic's own API; off for a custom `uri`, since an
+    /// Anthropic-compatible proxy may not accept the beta.
+    thinking_block_binding: bool,
 }
 
 #[cfg(test)]
@@ -192,6 +196,70 @@ struct NativeThinkingConfig {
     /// of the request body entirely, matching pre-beta requests byte-for-byte.
     #[serde(skip_serializing_if = "Option::is_none")]
     display: Option<ThinkingDisplay>,
+    /// Anthropic's `thinking.block_binding` beta field. A replayed thinking
+    /// block is bound to the conversation that preceded it. Where the API
+    /// checks that binding, any edit to earlier history (trimming old turns,
+    /// collapsing old tool rounds, a changed system prompt) makes it reject
+    /// the request. With `drop_block` it drops the blocks that no longer
+    /// verify, and every later one, instead. Setting the field also opts an
+    /// account the API does not check into the check, so there those blocks
+    /// are dropped rather than passed through. Set only for adaptive thinking
+    /// against Anthropic's own API; `None` leaves the key out of the request
+    /// body entirely.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    block_binding: Option<NativeBlockBinding>,
+}
+
+#[derive(Debug, Serialize)]
+struct NativeBlockBinding {
+    prefix_mismatch_behavior: &'static str,
+}
+
+/// Beta feature enabling the `thinking.block_binding` request field. A request
+/// that sends the field without it is rejected.
+const ANTHROPIC_THINKING_BINDING_BETA: &str = "thinking-binding-controls-2026-08-01";
+
+/// Record a response's `input_transformations`: replayed thinking blocks the
+/// API dropped (`thinking_dropped`) or let through on an unenforced request
+/// (`thinking_mismatch_allowed`). Counts by type and reason only; the entries'
+/// message paths and the blocks themselves stay out of the log.
+fn record_input_transformations(model: &str, entries: &[serde_json::Value]) {
+    if entries.is_empty() {
+        return;
+    }
+    let mut by_kind: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+    for entry in entries {
+        let kind = entry
+            .get("type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        let reason = entry
+            .get("reason")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        *by_kind.entry(format!("{kind}:{reason}")).or_default() += 1;
+    }
+    ::zeroclaw_log::record!(
+        INFO,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+            .with_category(::zeroclaw_log::EventCategory::Provider)
+            .with_attrs(::serde_json::json!({
+                "model": model,
+                "entries": entries.len(),
+                "by_kind": by_kind,
+            })),
+        "anthropic dropped or flagged replayed thinking blocks"
+    );
+}
+
+/// `anthropic-beta` values the request's thinking config needs beyond the
+/// display beta. Derived from the body so the field and its beta never diverge.
+fn thinking_binding_betas(thinking: Option<&NativeThinkingConfig>) -> &'static [&'static str] {
+    if thinking.is_some_and(|config| config.block_binding.is_some()) {
+        &[ANTHROPIC_THINKING_BINDING_BETA]
+    } else {
+        &[]
+    }
 }
 
 /// Beta features carried by OAuth (Claude Code setup) tokens.
@@ -590,6 +658,10 @@ struct NativeChatResponse {
     /// read by [`AnthropicModelProvider::server_fallback_notice`].
     #[serde(default)]
     model: Option<String>,
+    /// Replayed thinking blocks the API dropped or let through after a
+    /// history check; present when the request sent the binding beta.
+    #[serde(default)]
+    input_transformations: Vec<serde_json::Value>,
 }
 
 /// `stop_details` on a refusal response. `explanation` is deliberately not
@@ -672,6 +744,7 @@ pub struct AnthropicBuilder {
     timeout_secs: Option<u64>,
     server_fallback_models: Vec<String>,
     cache_ttl: Option<CacheTtl>,
+    thinking_block_binding: Option<bool>,
 }
 
 impl AnthropicBuilder {
@@ -727,11 +800,23 @@ impl AnthropicBuilder {
         self
     }
 
+    /// Force the `thinking.block_binding` decision, so tests can exercise the
+    /// field against a local mock endpoint.
+    #[cfg(test)]
+    pub(crate) fn thinking_block_binding(mut self, on: bool) -> Self {
+        self.thinking_block_binding = Some(on);
+        self
+    }
+
     pub fn build(self) -> AnthropicModelProvider {
+        let base_url = self.base_url.unwrap_or_else(|| BASE_URL.to_string());
+        let thinking_block_binding = self
+            .thinking_block_binding
+            .unwrap_or(base_url.trim_end_matches('/') == BASE_URL);
         AnthropicModelProvider {
             alias: self.alias,
             credential: self.credential,
-            base_url: self.base_url.unwrap_or_else(|| BASE_URL.to_string()),
+            base_url,
             single_tool_rounds_supported: self.single_tool_rounds_supported,
             max_tokens: self
                 .max_tokens
@@ -742,6 +827,7 @@ impl AnthropicBuilder {
             server_fallback_models: self.server_fallback_models,
             cache_ttl: self.cache_ttl.unwrap_or_default(),
             schema_cache: zeroclaw_api::schema::SchemaCleanCache::new(),
+            thinking_block_binding,
         }
     }
 }
@@ -759,6 +845,7 @@ impl AnthropicModelProvider {
             timeout_secs: None,
             server_fallback_models: Vec::new(),
             cache_ttl: None,
+            thinking_block_binding: None,
         }
     }
 
@@ -2160,6 +2247,10 @@ impl AnthropicModelProvider {
     }
 
     fn parse_native_response(response: NativeChatResponse) -> ProviderChatResponse {
+        record_input_transformations(
+            response.model.as_deref().unwrap_or("unknown"),
+            &response.input_transformations,
+        );
         let stop_reason = response.stop_reason.as_deref().unwrap_or("unknown");
         let content_block_count = response.content.len();
         let mut content_block_types = Vec::with_capacity(content_block_count);
@@ -2416,6 +2507,7 @@ impl AnthropicModelProvider {
                                 kind: "enabled",
                                 budget_tokens: Some(params.budget_tokens),
                                 display: params.display,
+                                block_binding: None,
                             },
                             self.max_tokens.max(min_required),
                         )
@@ -2425,6 +2517,7 @@ impl AnthropicModelProvider {
                             kind: "adaptive",
                             budget_tokens: None,
                             display: params.display,
+                            block_binding: self.adaptive_block_binding(),
                         },
                         self.max_tokens,
                     ),
@@ -2433,6 +2526,14 @@ impl AnthropicModelProvider {
             }
             None => (temperature, None, self.max_tokens),
         }
+    }
+
+    /// The `thinking.block_binding` object for an adaptive-thinking request,
+    /// or `None` where this provider leaves the field out.
+    fn adaptive_block_binding(&self) -> Option<NativeBlockBinding> {
+        self.thinking_block_binding.then_some(NativeBlockBinding {
+            prefix_mismatch_behavior: "drop_block",
+        })
     }
 
     fn http_client(&self) -> Client {
@@ -2583,6 +2684,13 @@ impl AnthropicModelProvider {
                         cache_creation_input_tokens = Some(v);
                     }
                     ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"model": model, "input_tokens": observed_input, "cached_input_tokens": observed_cached, "cache_creation_input_tokens": observed_cache_create})), "stream: message_start");
+                    if let Some(entries) = event
+                        .get("message")
+                        .and_then(|m| m.get("input_transformations"))
+                        .and_then(|v| v.as_array())
+                    {
+                        record_input_transformations(model, entries);
+                    }
                 }
                 "content_block_start" => {
                     if let Some(block) = event.get("content_block") {
@@ -3090,11 +3198,10 @@ impl ModelProvider for AnthropicModelProvider {
         // Non-streaming: opt into server-side fallback when configured, unless
         // native thinking is active on this request.
         let fallbacks = self.server_fallbacks_for(model, thinking_config.as_ref());
-        let extra_betas: &[&str] = if fallbacks.is_some() {
-            &[ANTHROPIC_SERVER_FALLBACK_BETA]
-        } else {
-            &[]
-        };
+        let mut extra_betas: Vec<&str> = thinking_binding_betas(thinking_config.as_ref()).to_vec();
+        if fallbacks.is_some() {
+            extra_betas.push(ANTHROPIC_SERVER_FALLBACK_BETA);
+        }
         let native_request = NativeChatRequest {
             model: model.to_string(),
             max_tokens: effective_max_tokens,
@@ -3116,7 +3223,7 @@ impl ModelProvider for AnthropicModelProvider {
             .json(&native_request);
 
         let response = self
-            .apply_auth(req, credential, thinking_display_beta, extra_betas)
+            .apply_auth(req, credential, thinking_display_beta, &extra_betas)
             .send()
             .await?;
         if !response.status().is_success() {
@@ -3315,6 +3422,7 @@ impl ModelProvider for AnthropicModelProvider {
         let thinking_display_beta = thinking_config
             .as_ref()
             .is_some_and(|config| config.display.is_some());
+        let thinking_betas = thinking_binding_betas(thinking_config.as_ref());
 
         if thinking_config.is_some() && !thinking_display_beta {
             ::zeroclaw_log::record!(
@@ -3370,7 +3478,7 @@ impl ModelProvider for AnthropicModelProvider {
                     req = req.header("x-api-key", &credential);
                 }
                 if let Some(beta_features) =
-                    anthropic_beta_features(is_oauth, thinking_display_beta, &[])
+                    anthropic_beta_features(is_oauth, thinking_display_beta, thinking_betas)
                 {
                     req = req.header("anthropic-beta", beta_features);
                 }
@@ -3527,7 +3635,7 @@ impl ModelProvider for AnthropicModelProvider {
                 req = req.header("x-api-key", &credential);
             }
             if let Some(beta_features) =
-                anthropic_beta_features(is_oauth, thinking_display_beta, &[])
+                anthropic_beta_features(is_oauth, thinking_display_beta, thinking_betas)
             {
                 req = req.header("anthropic-beta", beta_features);
             }
@@ -4750,8 +4858,11 @@ data: {\"type\":\"message_stop\"}\n\n";
             let config = config.unwrap_or_else(|| panic!("thinking config for {model}"));
             assert_eq!(
                 serde_json::to_value(&config).unwrap(),
-                serde_json::json!({"type": "adaptive"}),
-                "{model} must emit adaptive with no budget"
+                serde_json::json!({
+                    "type": "adaptive",
+                    "block_binding": {"prefix_mismatch_behavior": "drop_block"}
+                }),
+                "{model} must emit adaptive with no budget, and drop_block on the Anthropic API"
             );
             assert_eq!(temp, Some(1.0), "{model}");
             assert_eq!(max_tokens, provider.max_tokens, "{model}");
@@ -10689,6 +10800,7 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"refusal\"},\"usag
                 kind: "enabled",
                 budget_tokens: Some(1_024),
                 display: Some(ThinkingDisplay::Updates),
+                block_binding: None,
             }),
             fallbacks: None,
         };
@@ -10701,6 +10813,7 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"refusal\"},\"usag
                 kind: "enabled",
                 budget_tokens: Some(1_024),
                 display: None,
+                block_binding: None,
             }),
             ..request
         };
@@ -11014,6 +11127,7 @@ data: {\"type\":\"message_stop\"}\n\n";
                 kind: "adaptive",
                 budget_tokens: None,
                 display: Some(ThinkingDisplay::Updates),
+                block_binding: None,
             }),
             fallbacks: None,
         };
@@ -11346,5 +11460,271 @@ data: {\"type\":\"message_stop\"}\n\n";
             vec![0, 2, 4],
             "the fifth image must rewrite only the three oldest image messages"
         );
+    }
+
+    // ----- thinking.block_binding (drop_block) -------------------------
+
+    fn adaptive_thinking_params(
+        display: Option<ThinkingDisplay>,
+    ) -> zeroclaw_api::model_provider::NativeThinkingParams {
+        zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: 1_024,
+            display,
+        }
+    }
+
+    #[test]
+    fn adaptive_thinking_sends_drop_block_to_the_anthropic_api() {
+        let provider = AnthropicModelProvider::builder("test").build();
+        let (_, config, _) = provider.resolve_thinking(
+            Some(adaptive_thinking_params(None)),
+            None,
+            "claude-opus-5-5",
+        );
+        let config = config.expect("adaptive thinking config");
+        assert_eq!(
+            serde_json::to_value(&config).expect("serialize")["block_binding"],
+            serde_json::json!({"prefix_mismatch_behavior": "drop_block"})
+        );
+        assert_eq!(
+            thinking_binding_betas(Some(&config)),
+            &[ANTHROPIC_THINKING_BINDING_BETA]
+        );
+    }
+
+    #[test]
+    fn custom_uri_leaves_block_binding_out() {
+        let provider = AnthropicModelProvider::builder("test")
+            .base_url("https://anthropic-proxy.example")
+            .build();
+        let (_, config, _) = provider.resolve_thinking(
+            Some(adaptive_thinking_params(None)),
+            None,
+            "claude-opus-5-5",
+        );
+        let config = config.expect("adaptive thinking config");
+        assert!(
+            serde_json::to_value(&config)
+                .expect("serialize")
+                .get("block_binding")
+                .is_none(),
+            "a custom uri must keep the pre-beta body"
+        );
+        assert!(thinking_binding_betas(Some(&config)).is_empty());
+    }
+
+    #[test]
+    fn default_base_url_spelled_out_still_counts_as_the_anthropic_api() {
+        let provider = AnthropicModelProvider::builder("test")
+            .base_url("https://api.anthropic.com/")
+            .build();
+        let (_, config, _) = provider.resolve_thinking(
+            Some(adaptive_thinking_params(None)),
+            None,
+            "claude-fable-5-1",
+        );
+        assert!(
+            config
+                .expect("adaptive thinking config")
+                .block_binding
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn budget_thinking_never_sends_block_binding() {
+        // The API accepts `block_binding` only with `thinking.type: "adaptive"`.
+        let provider = AnthropicModelProvider::builder("test").build();
+        let (_, config, _) = provider.resolve_thinking(
+            Some(adaptive_thinking_params(None)),
+            None,
+            "claude-sonnet-4-6",
+        );
+        let config = config.expect("budget thinking config");
+        assert_eq!(config.kind, "enabled");
+        assert!(config.block_binding.is_none());
+        assert!(thinking_binding_betas(Some(&config)).is_empty());
+        assert!(thinking_binding_betas(None).is_empty());
+    }
+
+    type CapturedRequests =
+        std::sync::Arc<std::sync::Mutex<Vec<(Option<String>, serde_json::Value)>>>;
+
+    /// Mock `/v1/messages` that records each request's `anthropic-beta` header
+    /// and body, and answers JSON or SSE depending on the request's `stream`.
+    async fn spawn_capturing_messages_server(
+        json_body: serde_json::Value,
+        sse_body: &'static str,
+    ) -> (
+        std::net::SocketAddr,
+        tokio::task::JoinHandle<()>,
+        CapturedRequests,
+    ) {
+        use axum::{
+            Json, Router,
+            http::{HeaderMap, header},
+            response::{IntoResponse, Response},
+            routing::post,
+        };
+        use tokio::net::TcpListener;
+
+        let captured: CapturedRequests = std::sync::Arc::default();
+        let sink = captured.clone();
+        let app = Router::new().route(
+            "/v1/messages",
+            post(
+                move |headers: HeaderMap, Json(req): Json<serde_json::Value>| {
+                    let sink = sink.clone();
+                    let json_body = json_body.clone();
+                    async move {
+                        let beta = headers
+                            .get("anthropic-beta")
+                            .and_then(|v| v.to_str().ok())
+                            .map(str::to_string);
+                        let streaming = req.get("stream").and_then(|v| v.as_bool()) == Some(true);
+                        sink.lock().expect("capture lock").push((beta, req));
+                        if streaming {
+                            Response::builder()
+                                .header(header::CONTENT_TYPE, "text/event-stream")
+                                .body(axum::body::Body::from(sse_body))
+                                .expect("sse response")
+                        } else {
+                            Json(json_body).into_response()
+                        }
+                    }
+                },
+            ),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let handle = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+        (addr, handle, captured)
+    }
+
+    fn binding_test_provider(addr: std::net::SocketAddr, binding: bool) -> AnthropicModelProvider {
+        AnthropicModelProvider::builder("test")
+            .credential(Some("test-key"))
+            .base_url(&format!("http://{addr}"))
+            .thinking_block_binding(binding)
+            .build()
+    }
+
+    fn json_reply_with_drops() -> serde_json::Value {
+        serde_json::json!({
+            "content": [{"type": "text", "text": "ok"}],
+            "stop_reason": "end_turn",
+            "model": "claude-opus-5-5",
+            "usage": {"input_tokens": 10, "output_tokens": 1},
+            "input_transformations": [
+                {"type": "thinking_dropped", "path": "messages.1.content.0", "reason": "prefix_binding_mismatch"},
+                {"type": "some_future_entry", "reason": "unknown_to_us"}
+            ]
+        })
+    }
+
+    const SSE_REPLY_WITH_DROPS: &str = "event: message_start\n\
+data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-opus-5-5\",\"usage\":{\"input_tokens\":10},\"input_transformations\":[{\"type\":\"thinking_dropped\",\"path\":\"messages.1.content.0\",\"reason\":\"prefix_binding_mismatch\"}]}}\n\n\
+event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n\
+event: content_block_stop\n\
+data: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+event: message_delta\n\
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n\
+event: message_stop\n\
+data: {\"type\":\"message_stop\"}\n\n";
+
+    fn assert_binding_sent(captured: &CapturedRequests) {
+        let requests = captured.lock().expect("capture lock");
+        assert_eq!(requests.len(), 1, "exactly one request expected");
+        let (beta, body) = &requests[0];
+        assert!(
+            beta.as_deref()
+                .is_some_and(|b| b.split(',').any(|v| v == ANTHROPIC_THINKING_BINDING_BETA)),
+            "the binding beta must ride with the field: {beta:?}"
+        );
+        assert_eq!(
+            body["thinking"]["block_binding"]["prefix_mismatch_behavior"],
+            serde_json::json!("drop_block")
+        );
+        assert_eq!(body["thinking"]["type"], serde_json::json!("adaptive"));
+    }
+
+    #[tokio::test]
+    async fn chat_sends_drop_block_with_its_beta_and_reads_drops() {
+        let (addr, server, captured) =
+            spawn_capturing_messages_server(json_reply_with_drops(), SSE_REPLY_WITH_DROPS).await;
+        let provider = binding_test_provider(addr, true);
+        let messages = vec![ChatMessage::user("hello")];
+        let request = ProviderChatRequest {
+            messages: messages.as_slice(),
+            tools: None,
+            thinking: Some(adaptive_thinking_params(None)),
+        };
+        let result = provider.chat(request, "claude-opus-5-5", None).await;
+        server.abort();
+        assert_eq!(result.expect("chat succeeds").text.as_deref(), Some("ok"));
+        assert_binding_sent(&captured);
+    }
+
+    #[tokio::test]
+    async fn stream_chat_sends_drop_block_on_both_thinking_paths() {
+        // Without `display` the provider sends thinking non-streaming to keep
+        // signed blocks intact; with it, the request streams. Both carry the field.
+        for display in [None, Some(ThinkingDisplay::Updates)] {
+            let (addr, server, captured) =
+                spawn_capturing_messages_server(json_reply_with_drops(), SSE_REPLY_WITH_DROPS)
+                    .await;
+            let provider = binding_test_provider(addr, true);
+            let messages = vec![ChatMessage::user("hello")];
+            let request = ProviderChatRequest {
+                messages: messages.as_slice(),
+                tools: None,
+                thinking: Some(adaptive_thinking_params(display)),
+            };
+            let events: Vec<_> = provider
+                .stream_chat(
+                    request,
+                    "claude-opus-5-5",
+                    None,
+                    StreamOptions {
+                        enabled: true,
+                        count_tokens: false,
+                    },
+                )
+                .collect()
+                .await;
+            server.abort();
+            assert!(
+                events.iter().all(Result::is_ok),
+                "stream must not error (display {display:?})"
+            );
+            assert_binding_sent(&captured);
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_without_binding_keeps_the_pre_beta_wire_format() {
+        let (addr, server, captured) =
+            spawn_capturing_messages_server(json_reply_with_drops(), SSE_REPLY_WITH_DROPS).await;
+        let provider = binding_test_provider(addr, false);
+        let messages = vec![ChatMessage::user("hello")];
+        let request = ProviderChatRequest {
+            messages: messages.as_slice(),
+            tools: None,
+            thinking: Some(adaptive_thinking_params(None)),
+        };
+        provider
+            .chat(request, "claude-opus-5-5", None)
+            .await
+            .expect("chat succeeds");
+        server.abort();
+        let requests = captured.lock().expect("capture lock");
+        let (beta, body) = &requests[0];
+        assert!(beta.is_none(), "no beta header without the field: {beta:?}");
+        assert!(body["thinking"].get("block_binding").is_none());
     }
 }
