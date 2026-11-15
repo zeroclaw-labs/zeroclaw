@@ -11149,13 +11149,9 @@ mod tests {
                     "Default forbidden_paths must include {dir} on Windows"
                 );
             }
-            // Unix ~/.gnupg / ~/.config are replaced by %APPDATA% / %LOCALAPPDATA% trees.
-            assert!(
-                !p.forbidden_paths
-                    .iter()
-                    .any(|f| f == "~/.gnupg" || f == "~/.config")
-            );
-            for dot in &["~/.ssh", "~/.aws"] {
+            // The %APPDATA% / %LOCALAPPDATA% trees are added alongside the Unix
+            // spellings; ~/.gnupg and ~/.config stay protected on Windows too.
+            for dot in &["~/.ssh", "~/.gnupg", "~/.aws", "~/.config"] {
                 assert!(
                     p.forbidden_paths.iter().any(|f| f == *dot),
                     "Default forbidden_paths must include {dot}"
