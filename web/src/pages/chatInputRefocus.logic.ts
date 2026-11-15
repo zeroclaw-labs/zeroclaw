@@ -4,8 +4,8 @@
  * `handleSend` gave it, so nothing would otherwise return it.
  *
  * - `arm`: a turn is running; remember to refocus when it ends.
- * - `wait`: the turn ended but the box is still disabled (disconnected or not
- *   hydrated); stay armed until it is enabled.
+ * - `wait`: the turn ended but the box is still disabled (nothing to send on
+ *   yet, or not hydrated); stay armed until it is enabled.
  * - `focus`: focus the box.
  * - `skip`: the turn ended in a hidden pane, or the user moved focus to another
  *   control during the turn; disarm without taking focus.

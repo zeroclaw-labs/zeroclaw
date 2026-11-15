@@ -1000,6 +1000,27 @@ test('the composer takes focus back when a turn ends, unless hidden or focus mov
   await unmount(mounted.renderer);
 });
 
+test('a per-socket conversation closed mid-turn gives the enabled composer its focus back', async () => {
+  await withSession(scopedSession, async () => {
+    const runtime = new FakeSessionRuntime();
+    const mounted = await mountChat(runtime, true);
+    const socket = await startConversation(mounted, runtime, 'hello', 'core-1');
+    assert.equal(textarea(mounted.renderer).props.disabled, true, 'locked during the turn');
+    const before = composerFocusCalls;
+
+    await act(async () => { socket.emitClose(1006); });
+    await settle();
+
+    assert.equal(mounted.context().connected, false);
+    assert.equal(mounted.context().startsConversationOnSend, true);
+    assert.equal(textarea(mounted.renderer).props.disabled, false, 'usable without a socket');
+    assert.equal(composerFocusCalls - before, 1, 'focus returns without reconnecting');
+    assert.equal(runtime.sockets.length, 1, 'no new socket was opened for the focus');
+    assert.equal(socket.connectCalls, 1);
+    await unmount(mounted.renderer);
+  });
+});
+
 test('a late close from the previous session socket cannot clear the active approval', async () => {
   const runtime = new FakeSessionRuntime();
   runtime.queueMessages('A', () => Promise.resolve(messagesResponse('A', true)));

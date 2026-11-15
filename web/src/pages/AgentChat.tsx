@@ -305,7 +305,9 @@ export function AgentChatInner({
     const action = nextChatInputRefocus({
       armed: refocusArmedRef.current,
       typing,
-      inputEnabled: connected && hydrated,
+      // Same readiness as the textarea's `disabled` prop: with one conversation
+      // per socket, a close mid-turn leaves the box usable while disconnected.
+      inputEnabled: canSend && hydrated,
       inputVisible: el !== null && el.getClientRects().length > 0,
       focusOwner: chatInputFocusOwner(
         document.activeElement,
@@ -317,7 +319,7 @@ export function AgentChatInner({
     if (action === 'arm') refocusArmedRef.current = true;
     if (action === 'focus' || action === 'skip') refocusArmedRef.current = false;
     if (action === 'focus') el?.focus();
-  }, [typing, connected, hydrated]);
+  }, [typing, canSend, hydrated]);
 
   // Scroll to bottom on new messages / streaming.
   // Note: WebSocket lifecycle, hydration, and tool_call/tool_result handling
