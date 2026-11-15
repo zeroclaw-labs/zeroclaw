@@ -42343,13 +42343,28 @@ mod tests {
         }
 
         let tmp = tempfile::TempDir::new().unwrap();
-        let mut cfg = zeroclaw_config::schema::Config {
+        let cfg = zeroclaw_config::schema::Config {
             config_path: tmp.path().join("config.toml"),
             data_dir: tmp.path().join("data"),
+            providers: serde_json::from_value(serde_json::json!({
+                "connections": {
+                    "openai": {
+                        "kind": "openai",
+                        "auth": {"mode": "api_key", "api_key": "sk-initial"}
+                    }
+                },
+                "models": {
+                    "openai.default": {
+                        "capability": "chat",
+                        "provider": "openai",
+                        "model": "gpt-test"
+                    }
+                }
+            }))
+            .expect("canonical memory refresh registry"),
             ..Default::default()
         };
-        cfg.create_map_key("providers.models.openai", "default")
-            .unwrap();
+        let mut cfg = cfg;
         cfg.agents.insert(
             "agent".into(),
             zeroclaw_config::schema::AliasedAgentConfig {
@@ -42492,7 +42507,7 @@ mod tests {
         let res = dispatcher
             .handle_config_registry_set(&registry_edit_params(
                 &dispatcher,
-                &["connections", "legacy.openai.default", "auth", "api_key"],
+                &["connections", "openai", "auth", "api_key"],
                 json!("sk-rotated"),
             ))
             .await;

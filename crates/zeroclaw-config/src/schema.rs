@@ -29393,11 +29393,13 @@ mod tests {
 
     #[::core::prelude::v1::test]
     fn canonical_registry_application_paths_preserve_opaque_keys() {
-        let mut previous = Config::default();
-        previous.providers = serde_json::from_value(serde_json::json!({
-            "connections": {"gateway.prod": {"kind":"custom", "uri":"https://example.invalid/v1"}},
-            "models": {"chat.fast.v2": {"capability":"chat", "provider":"gateway.prod", "model":"before", "options":{"temperature":0.2}}}
-        })).unwrap();
+        let previous = Config {
+            providers: serde_json::from_value(serde_json::json!({
+                "connections": {"gateway.prod": {"kind":"custom", "uri":"https://example.invalid/v1"}},
+                "models": {"chat.fast.v2": {"capability":"chat", "provider":"gateway.prod", "model":"before", "options":{"temperature":0.2}}}
+            })).unwrap(),
+            ..Default::default()
+        };
         let mut candidate = previous.clone();
         crate::provider_registry::editor::update(&mut candidate, |registry| {
             let crate::provider_registry::ModelDefinition::Chat(model) =

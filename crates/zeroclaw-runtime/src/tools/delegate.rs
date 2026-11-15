@@ -16535,7 +16535,10 @@ options = { extract_text_tool_calls = false }
             .await
             .expect("owned provider requests");
         assert_eq!(requests.len(), 1, "the real typed provider dispatched once");
-        assert_eq!(requests[0].url.path(), "/api/chat");
+        // The Ollama family is deliberately routed through its OpenAI-compatible
+        // wire in the shared factory, so a custom endpoint receives the chat
+        // completion path rather than Ollama's native /api/chat payload.
+        assert_eq!(requests[0].url.path(), "/v1/chat/completions");
         let body: serde_json::Value =
             serde_json::from_slice(&requests[0].body).expect("typed provider JSON request");
         assert_eq!(body["model"], "fixture-model");

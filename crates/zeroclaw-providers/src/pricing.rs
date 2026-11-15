@@ -571,14 +571,33 @@ model = "fast-id"
     }
 
     fn opt_out(config: &mut Config) {
-        config
-            .providers
-            .models
-            .ollama
-            .get_mut("priced")
-            .expect("the opted-in provider exists")
-            .base
-            .live_pricing = false;
+        // `LiveConfig::new` admits test input into the canonical registry before
+        // publishing it, so live writes must edit the canonical connection API
+        // rather than reach back into the retired typed provider map.
+        let mut providers = serde_json::to_value(&config.providers).unwrap();
+        let connections = providers
+            .get_mut("connections")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("canonical provider connections");
+        let mut changed = false;
+        for connection in connections.values_mut() {
+            let Some(chat) = connection
+                .get_mut("api")
+                .and_then(serde_json::Value::as_object_mut)
+                .and_then(|api| api.get_mut("chat"))
+            else {
+                continue;
+            };
+            if chat.get("live_pricing").is_some() {
+                chat["live_pricing"] = serde_json::Value::Bool(false);
+                changed = true;
+            }
+        }
+        assert!(
+            changed,
+            "the opted-in provider exists in the canonical registry"
+        );
+        config.providers = serde_json::from_value(providers).unwrap();
     }
 
     #[test]
