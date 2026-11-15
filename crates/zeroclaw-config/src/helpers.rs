@@ -1210,6 +1210,7 @@ mod tests {
 
 #[cfg(test)]
 mod registry_reflection_tests {
+    use crate::traits::MaskSecrets;
     use serde::{Deserialize, Serialize};
     use std::collections::HashMap;
     use zeroclaw_macros::Configurable;
