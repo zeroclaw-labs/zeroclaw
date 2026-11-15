@@ -1623,6 +1623,7 @@ enum ScriptedFault {
     ParentFallbackOutcomeUnknown,
     PauseAfterParentOutcomeUnknown,
     VerifierOutcomeUnknown,
+    CorruptLedgerAfterParent,
     CorruptGoalAfterParent,
     CorruptGoalAfterVerifier,
     CorruptTaskAfterAppend,
@@ -1876,6 +1877,39 @@ impl GoalSessionExecutionLease for ScriptedLease {
                         events: vec![event("primary", 10, 2), event("fallback", 15, 3)],
                     })
                     .await?;
+            }
+            Some(ScriptedFault::CorruptLedgerAfterParent) => {
+                use std::io::Write as _;
+
+                let accounting = zeroclaw_goal::accounting::GOAL_OPERATION_ACCOUNTING
+                    .try_with(Clone::clone)?
+                    .expect("fixture requires Goal accounting");
+                accounting
+                    .admit(GoalOperationRequest::new("primary", "model"))
+                    .await?;
+                let guard = accounting.admission_guard()?;
+                accounting.mark_dispatch_entered();
+                accounting
+                    .settle(GoalOperationSettlement {
+                        accounting_state: GoalAccountingState::Complete,
+                        events: vec![zeroclaw_goal::accounting::GoalUsageEvent {
+                            provider_ref: "primary".into(),
+                            model: "model".into(),
+                            usage: zeroclaw_api::model_provider::TokenUsage {
+                                input_tokens: Some(10),
+                                output_tokens: Some(2),
+                                cached_input_tokens: Some(0),
+                                cache_creation_input_tokens: Some(0),
+                            },
+                            priceable: true,
+                        }],
+                    })
+                    .await?;
+                drop(guard);
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&self.ledger_file)?
+                    .write_all(b"{\"partial\":")?;
             }
             Some(ScriptedFault::CorruptGoalAfterParent) => self.corrupt_goal_record(scope)?,
             Some(ScriptedFault::AbandonWithBlockedLedger | ScriptedFault::DropSettlement) => {
@@ -2817,6 +2851,84 @@ async fn engine_incomplete_accounting_names_the_durable_condition() {
         fixture.reason().await.as_deref(),
         Some("accounting_missing_or_invalid")
     );
+}
+
+#[tokio::test]
+async fn engine_torn_ledger_after_settlement_is_an_accounting_failure() {
+    let mut fixture = EngineFixture::new(
+        &["candidate"],
+        &[],
+        Some(ScriptedFault::CorruptLedgerAfterParent),
+    )
+    .await;
+    assert_eq!(
+        fixture
+            .store
+            .update_session_goal_limits(
+                fixture.scope.task_id(),
+                fixture.scope.session_id(),
+                fixture.scope.execution_epoch(),
+                Some(100),
+                Some(1.0),
+            )
+            .await
+            .unwrap(),
+        GoalTransitionResult::Applied
+    );
+    let tracker = Arc::new(
+        zeroclaw_config::cost::CostTracker::new(
+            zeroclaw_config::schema::CostConfig::default(),
+            fixture._directory.path(),
+        )
+        .unwrap(),
+    );
+    let rates = std::collections::HashMap::from([
+        ("model.input".to_owned(), 1.0),
+        ("model.output".to_owned(), 2.0),
+    ]);
+    let pricer = Arc::new(
+        zeroclaw_runtime::goal_accounting::ModelProviderGoalUsagePricer::new(Arc::new(
+            std::collections::HashMap::from([("primary".to_owned(), rates)]),
+        )),
+    );
+    let factory = Arc::new(
+        zeroclaw_runtime::goal_accounting::RuntimeGoalOperationAccountingFactory::new(
+            fixture.store.clone() as Arc<dyn GoalTaskRegistry>,
+            tracker,
+            "main",
+            pricer,
+        )
+        .unwrap(),
+    );
+    let error = fixture
+        .runtime
+        .execution_engine(factory)
+        .run(
+            &host_settings(&fixture.config),
+            fixture.request.take().unwrap(),
+        )
+        .await
+        .unwrap_err();
+    assert!(error.downcast_ref::<GoalAccountingFailure>().is_some());
+    assert!(
+        error
+            .to_string()
+            .contains("failed to read Goal accounting after an operation")
+    );
+    assert_eq!(fixture.task().await.status, TaskStatus::Failed);
+    assert_eq!(
+        fixture.reason().await.as_deref(),
+        Some("accounting_missing_or_invalid")
+    );
+    assert_eq!(fixture.steps(), vec![ScriptedStep::Parent(Vec::new())]);
+    let ledger = std::fs::read_to_string(&fixture.driver.ledger_file).unwrap();
+    let mut lines = ledger.lines();
+    let record: zeroclaw_config::cost::types::CostRecord =
+        serde_json::from_str(lines.next().unwrap()).unwrap();
+    assert_eq!(record.usage.total_tokens, 12);
+    assert_eq!(record.task_id.as_deref(), Some(fixture.scope.task_id()));
+    assert_eq!(lines.next(), Some("{\"partial\":"));
+    assert_eq!(lines.next(), None);
 }
 
 async fn assert_pricing_read_failure_settles_epoch(fail_on_call: usize) {

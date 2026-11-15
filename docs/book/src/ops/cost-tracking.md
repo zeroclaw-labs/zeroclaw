@@ -159,6 +159,18 @@ When actual provider-route attribution is available, a `CostRecord` can also
 carry `provider_ref`. Older rows may omit it and deserialize without it; the
 field does not change the ledger's existing ownership or pricing rules.
 
+Goal accounting requires every non-empty ledger line to be readable. It
+accepts blank lines and complete JSON records concatenated on one line, but an
+unreadable fragment anywhere in the shared ledger makes Goal usage uncertain,
+even when it cannot be attributed to the current Goal. The Goal fails closed
+instead of admitting another model call with an unreliable budget.
+
+Before repairing a damaged ledger, stop its writers and preserve an unchanged
+copy for investigation. Restore or reconcile the missing records only from
+evidence that establishes their completeness. Removing an unreadable fragment
+or restoring an older, incomplete backup does not make the missing usage zero
+or prove that a subsequent Goal's accounting is complete.
+
 Each `TokenUsage` record carries two pricing-provenance fields:
 
 - `unpriced_tokens`: the input, cached-input, or output token subset whose

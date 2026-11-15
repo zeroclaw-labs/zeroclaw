@@ -308,17 +308,30 @@ impl GoalExecutionEngine {
                 .await);
         }
         if goal.effective_cost_limit_usd.is_some() {
-            let error = match accountant.pricing_complete().await {
+            let (reason, error) = match accountant.pricing_complete().await {
                 Ok(true) => return Ok(()),
-                Ok(false) => anyhow::Error::msg(
-                    "Goal cost budget lacks complete pricing for actual provider usage",
+                Ok(false) => (
+                    "pricing_unavailable",
+                    anyhow::Error::msg(
+                        "Goal cost budget lacks complete pricing for actual provider usage",
+                    ),
                 ),
-                Err(error) => with_visible_context(
-                    error,
-                    "failed to check pricing for actual Goal provider usage",
+                Err(error) if is_accounting_failure(&error) => (
+                    "accounting_missing_or_invalid",
+                    with_visible_context(
+                        error,
+                        "failed to read Goal accounting after an operation",
+                    ),
+                ),
+                Err(error) => (
+                    "pricing_unavailable",
+                    with_visible_context(
+                        error,
+                        "failed to check pricing for actual Goal provider usage",
+                    ),
                 ),
             };
-            return Err(self.fail_with(scope, "pricing_unavailable", error).await);
+            return Err(self.fail_with(scope, reason, error).await);
         }
         Ok(())
     }
