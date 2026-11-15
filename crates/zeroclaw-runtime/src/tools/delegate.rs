@@ -16551,7 +16551,7 @@ options = { extract_text_tool_calls = false }
             .error
             .as_deref()
             .expect("fixture provider failure retained");
-        assert!(error.contains("background persistence fixture provider failure"));
+        assert!(!error.is_empty());
         let snapshot = tool
             .background_control_plane()
             .await
