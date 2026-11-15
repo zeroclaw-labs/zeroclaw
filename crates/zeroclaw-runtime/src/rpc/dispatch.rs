@@ -51798,7 +51798,7 @@ options = { temperature = 0.2 }
         // stale refresh leaks through, the successor would flip to
         // "refreshed-model".
         publish_test_config(&dispatcher.ctx, |config| {
-            let _ = zeroclaw_config::provider_registry::editor::update(config, |registry| {
+            zeroclaw_config::provider_registry::editor::update(config, |registry| {
                 let model = registry
                     .models
                     .get_mut(&zeroclaw_config::provider_registry::ModelRef::from(
@@ -51809,7 +51809,8 @@ options = { temperature = 0.2 }
                     chat.model = Some("old-model".into());
                 }
                 Ok(())
-            });
+            })
+            .expect("canonical test rewind must remain valid");
         });
 
         // Replace the session via ACP rehydration while the stale refresh is
