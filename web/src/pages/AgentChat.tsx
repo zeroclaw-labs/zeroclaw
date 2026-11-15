@@ -44,10 +44,11 @@ function fmtTokens(n: number): string {
 }
 
 /** Context bar component showing context window usage. */
-function ContextBar({ contextMaxTokens, contextModelWindow, contextInputTokens }: {
+function ContextBar({ contextMaxTokens, contextModelWindow, contextInputTokens, contextInputTokensSource }: {
   contextMaxTokens: number | null;
   contextModelWindow: number | null;
   contextInputTokens: number | null;
+  contextInputTokensSource: string | null;
 }) {
   const state = resolveContextBarState(
     contextMaxTokens,
@@ -56,7 +57,9 @@ function ContextBar({ contextMaxTokens, contextModelWindow, contextInputTokens }
   );
   if (!state) return null;
 
-  const label = `${t('agent.context_usage')}: ${fmtTokens(state.used).padStart(7)} / ${fmtTokens(state.denominator).padStart(7)}  [${state.cells}]  ${state.percent.toFixed(0)}%`;
+  // Reuse the separator cells so measured and derived labels have equal width.
+  const approx = contextInputTokensSource === 'estimate' || contextInputTokensSource === 'calibrated' ? '~' : ' ';
+  const label = `${t('agent.context_usage')}:${approx}${fmtTokens(state.used).padStart(7)} / ${fmtTokens(state.denominator).padStart(7)}  [${state.cells}] ${approx}${state.percent.toFixed(0)}%`;
 
   return (
     <div className="px-4 py-1.5 border-b text-[11px] font-mono flex items-center gap-2" style={{ borderColor: 'var(--pc-border)', background: 'var(--pc-bg-surface)' }}>
@@ -193,6 +196,7 @@ export function AgentChatInner({
     contextMaxTokens,
     contextModelWindow,
     contextInputTokens,
+    contextInputTokensSource,
   } = useAgent();
   // A signed-in account without the operator dashboard can't switch the
   // agent's model (that rewrites its config for everyone), upload, or open the
@@ -1012,7 +1016,7 @@ export function AgentChatInner({
                     : t('agent.disconnected_status')}
             </span>
           </div>
-          <ContextBar contextMaxTokens={contextMaxTokens} contextModelWindow={contextModelWindow} contextInputTokens={contextInputTokens} />
+          <ContextBar contextMaxTokens={contextMaxTokens} contextModelWindow={contextModelWindow} contextInputTokens={contextInputTokens} contextInputTokensSource={contextInputTokensSource} />
         </div>
       </div>
     </div>
