@@ -143,6 +143,9 @@ fn instructions(dir: &Path, package_version: &str, build_id: &str) -> Vec<String
 }
 
 #[cfg(test)]
+mod git_layout_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
