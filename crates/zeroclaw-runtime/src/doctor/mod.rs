@@ -2573,6 +2573,10 @@ mod tests {
         config.providers.models.qwen.insert(
             "oauth".into(),
             QwenModelProviderConfig {
+                base: zeroclaw_config::schema::ModelProviderConfig {
+                    model: Some("qwen-turbo".into()),
+                    ..Default::default()
+                },
                 oauth_refresh_token: Some("catalog-test-refresh-token".into()),
                 oauth_resource_url: Some(format!("{}/v1", server.uri())),
                 ..Default::default()
