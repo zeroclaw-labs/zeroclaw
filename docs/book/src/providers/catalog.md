@@ -492,8 +492,9 @@ catalog cap.
 
 That catalog record also marks reasoning as mandatory and enabled by
 default on the server. This slot omits a `reasoning` object and omits
-`reasoning_effort`. It does not send a disable flag. Server-side reasoning
-still applies.
+`reasoning_effort`, even when `reasoning_effort` or
+`reasoning_effort_passthrough` is set on the runtime options. It does not
+send a disable flag. Server-side reasoning still applies.
 
 Use the canonical `llmtr` slot only.
 

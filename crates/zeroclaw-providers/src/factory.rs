@@ -161,6 +161,12 @@ pub(crate) trait CompatFamilySpec {
 
     const PUBLIC_MODEL_LISTING: bool = false;
 
+    /// Drop `reasoning_effort` and `reasoning_effort_passthrough` from the
+    /// caller's runtime options before building the provider. For gateways
+    /// that manage reasoning server-side, so a global reasoning setting cannot
+    /// change the request body.
+    const OMITS_REASONING_EFFORT: bool = false;
+
     /// Build the base compat provider with both catalog consts applied. Use
     /// this from inside `build_compat` overrides so the catalog hooks ride
     /// along with any family-specific modifiers.
@@ -229,6 +235,17 @@ impl<T: CompatFamilySpec> FamilyProviderFactory for T {
         api_url: Option<&str>,
         opts: &ModelProviderRuntimeOptions,
     ) -> Result<Box<dyn ModelProvider>> {
+        let stripped;
+        let opts = if T::OMITS_REASONING_EFFORT {
+            stripped = ModelProviderRuntimeOptions {
+                reasoning_effort: None,
+                reasoning_effort_passthrough: false,
+                ..opts.clone()
+            };
+            &stripped
+        } else {
+            opts
+        };
         if let Some(p) = build_responses_provider_if_requested(
             self.wire_api(),
             alias,
@@ -676,10 +693,12 @@ impl CompatFamilySpec for LlmtrModelProviderConfig {
     /// A successful listing is not an API-key check.
     const PUBLIC_MODEL_LISTING: bool = true;
     const SERVES_MODEL_CONTEXT_CATALOG: bool = true;
+    /// The gateway enables reasoning server-side. A caller's
+    /// `reasoning_effort` or `reasoning_effort_passthrough` is dropped here so
+    /// it never reaches the request body.
+    const OMITS_REASONING_EFFORT: bool = true;
     // Chat completions only. `wire_api` stays the trait default (`None`), so a
-    // stored `responses` value cannot select `POST /v1/responses`. Reasoning
-    // stays omitted: the gateway enables it server-side, and this profile does
-    // not send a `reasoning` object or force `reasoning_effort`.
+    // stored `responses` value cannot select `POST /v1/responses`.
 }
 impl CompatFamilySpec for SyntheticModelProviderConfig {
     const DISPLAY: &'static str = "Synthetic";
@@ -2856,6 +2875,7 @@ mod tests {
                 provider_max_tokens: Some(64),
                 wire_api: Some("responses".into()),
                 reasoning_effort: Some("high".into()),
+                reasoning_effort_passthrough: true,
                 ..ModelProviderRuntimeOptions::default()
             },
         )
@@ -2865,7 +2885,7 @@ mod tests {
             "chat_completions",
             "llmtr must not follow an automatic Responses route"
         );
-        for model in [LLMTR_EXAMPLE_MODEL, "llmtr/namespace/kept-intact"] {
+        for model in [LLMTR_EXAMPLE_MODEL, "llmtr/namespace/kept-intact", "o3"] {
             let text = chat
                 .simple_chat("ping", model, None)
                 .await
@@ -2894,7 +2914,7 @@ mod tests {
             .iter()
             .filter(|hit| hit.method == "POST" && hit.path == "/v1/chat/completions")
             .collect();
-        assert_eq!(chats.len(), 2, "expected two chat posts, saw {seen:?}");
+        assert_eq!(chats.len(), 3, "expected three chat posts, saw {seen:?}");
         let mut models = Vec::new();
         for hit in chats {
             assert_eq!(hit.auth.as_deref(), Some("Bearer llmtr-test-key"));
@@ -2924,6 +2944,7 @@ mod tests {
             vec![
                 "llmtr/namespace/kept-intact".to_string(),
                 "minimax/minimax-m3.1-flash".to_string(),
+                "o3".to_string(),
             ]
         );
 
