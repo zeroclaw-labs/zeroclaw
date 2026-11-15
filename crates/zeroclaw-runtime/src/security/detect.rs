@@ -17,7 +17,8 @@ pub struct SandboxExtraRoots {
     pub write_only: Vec<PathBuf>,
     /// Absolute forbidden paths from `SecurityPolicy` (tilde already expanded).
     /// Seatbelt applies these as deny rules under the home-dotfile grant so a
-    /// configured `~/.private-secrets` cannot ride the `HOME/.` prefix.
+    /// configured `~/.private-secrets` cannot ride an allowlisted toolchain
+    /// dotfile such as `~/.cargo`.
     pub forbidden: Vec<PathBuf>,
 }
 

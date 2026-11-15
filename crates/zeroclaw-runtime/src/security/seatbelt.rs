@@ -115,7 +115,7 @@ impl SeatbeltSandbox {
             home.as_deref(),
         );
         if let Some(home) = home.as_deref() {
-            for name in HOME_CREDENTIAL_PATHS {
+            for name in HOME_DOTFILE_CREDENTIALS {
                 forbidden.push(resolve_policy_root(&home.join(name), &mut symlinks)?);
             }
         }
@@ -358,17 +358,18 @@ fn ancestor_metadata_rules<'a>(roots: impl IntoIterator<Item = &'a Path>) -> Str
     rules
 }
 
-/// Home-relative credential paths that stay closed under the home-dotfile
-/// grant: the canonical `~/...` entries from `default_forbidden_paths()` plus
-/// dotfiles that commonly hold saved passwords or tokens.
-const HOME_CREDENTIAL_PATHS: &[&str] = &[
-    ".ssh",
-    ".gnupg",
-    ".aws",
-    ".config",
-    ".netrc",
-    ".git-credentials",
-];
+/// Home-relative dotfiles a sandboxed command may read so the toolchains it
+/// builds with can load their own configuration. Deliberately narrow: every
+/// other path under the home, including the ZeroClaw install directory
+/// (`~/.zeroclaw`, which holds the provider keys and the secret-store key) and
+/// credential stores such as `~/.docker`, `~/.kube`, `~/.npmrc`, `~/.pypirc`,
+/// `~/.password-store` and the shell histories, stays closed by
+/// `(deny default)` unless the operator grants it explicitly.
+const HOME_DOTFILE_ALLOWLIST: &[&str] = &[".cargo", ".rustup", ".nvm", ".gitconfig"];
+
+/// Files inside an allowlisted dotfile that hold credentials rather than
+/// toolchain configuration.
+const HOME_DOTFILE_CREDENTIALS: &[&str] = &[".cargo/credentials", ".cargo/credentials.toml"];
 
 fn path_has_hidden_component(path: &Path) -> bool {
     path.components().any(|component| match component {
@@ -377,16 +378,17 @@ fn path_has_hidden_component(path: &Path) -> bool {
     })
 }
 
-/// Read grant for the given account's home dotfiles (tool configs such as
+/// Read grant for the allowlisted home dotfiles (tool configs such as
 /// `~/.cargo` or `~/.gitconfig`), followed by deny rules for the credential
 /// paths that grant would otherwise open. Seatbelt last-match wins, so the
-/// denies follow the allow. Only the given home is granted; other accounts'
+/// denies follow the allows. Only the given home is granted; other accounts'
 /// homes stay closed. Returns an empty string when no absolute home is known
 /// (no `/Users/[^/]+` fallback).
 ///
-/// The grant uses a `prefix` filter on `<home>/.` instead of a regex, so the
-/// home goes through the same string-literal escaping seam as every other
-/// path and cannot break out of its literal.
+/// Every grant is a `subpath` filter on one allowlisted entry instead of a
+/// single `<home>/.` prefix, so the home goes through the same string-literal
+/// escaping seam as every other path and cannot break out of its literal, and
+/// a newly added dotfile directory cannot become readable by accident.
 fn home_dotfile_rules(home: Option<&Path>, forbidden: &[PathBuf]) -> String {
     let Some(home) = home.filter(|home| home.is_absolute()) else {
         return String::new();
@@ -402,13 +404,15 @@ fn home_dotfile_rules(home: Option<&Path>, forbidden: &[PathBuf]) -> String {
         }
     }
 
-    let home_literal = seatbelt_string_literal(&home.to_string_lossy());
-    let mut rules = format!(
-        "\n;; Allow reading the current user's home dotfiles for tool configs\n\
-         (allow file-read* (prefix \"{home_literal}/.\"))\n"
+    let mut rules = String::from(
+        "\n;; Allow reading the home dotfiles of the toolchains sandboxed commands use\n",
     );
+    for name in HOME_DOTFILE_ALLOWLIST {
+        let literal = seatbelt_string_literal(&home.join(name).to_string_lossy());
+        rules.push_str(&format!("(allow file-read* (subpath \"{literal}\"))\n"));
+    }
     let mut denied = BTreeSet::new();
-    for name in HOME_CREDENTIAL_PATHS {
+    for name in HOME_DOTFILE_CREDENTIALS {
         denied.insert(home.join(name));
     }
     // Resolved forbidden paths whose first home-relative component is a
@@ -794,32 +798,66 @@ mod tests {
     }
 
     #[test]
-    fn generate_policy_home_dotfile_grant_is_scoped_to_home_with_path_boundary() {
+    fn generate_policy_home_dotfile_grant_covers_only_the_allowlist() {
         let home = Path::new("/Users/alice.smith");
         let policy =
             generate_policy_for_home(&PathBuf::from("/tmp/test"), &[], &[], &[], &[], Some(home));
-        assert!(
-            policy.contains(r#"(allow file-read* (prefix "/Users/alice.smith/."))"#),
-            "grant must cover dotfiles below the home, not a dot in the account name; policy={policy}"
-        );
-        assert!(
-            !policy.contains("/Users/[^/]+"),
-            "must not grant every account's home via /Users/[^/]+"
-        );
-        for name in HOME_CREDENTIAL_PATHS {
+        for name in HOME_DOTFILE_ALLOWLIST {
             let path = format!("/Users/alice.smith/{name}");
             assert!(
+                policy.contains(&format!(r#"(allow file-read* (subpath "{path}"))"#)),
+                "toolchain dotfile {path} must stay readable; policy={policy}"
+            );
+        }
+        assert!(
+            !policy.contains("(prefix \""),
+            "no blanket home-dotfile prefix grant; policy={policy}"
+        );
+        assert!(
+            !policy.contains("/Users/[^/]+/\\."),
+            "must not grant every account's home via /Users/[^/]+; policy={policy}"
+        );
+        // Every dotfile outside the allowlist is closed by `(deny default)` and
+        // must not be named as a grant: the ZeroClaw install directory holds
+        // provider keys and the secret-store key.
+        for name in [
+            ".zeroclaw",
+            ".docker",
+            ".kube",
+            ".npmrc",
+            ".pypirc",
+            ".password-store",
+            ".zsh_history",
+        ] {
+            let path = format!("/Users/alice.smith/{name}");
+            assert!(
+                !policy.contains(&format!(r#"(allow file-read* (subpath "{path}"))"#)),
+                "{path} must not be granted; policy={policy}"
+            );
+        }
+    }
+
+    #[test]
+    fn generate_policy_home_dotfile_denies_credentials_inside_the_allowlist() {
+        let home = Path::new("/Users/alice");
+        let policy =
+            generate_policy_for_home(&PathBuf::from("/tmp/test"), &[], &[], &[], &[], Some(home));
+        for name in HOME_DOTFILE_CREDENTIALS {
+            let path = format!("/Users/alice/{name}");
+            assert!(
                 policy.contains(&format!(r#"(deny file-read* (subpath "{path}"))"#)),
-                "must deny reads of {path}"
+                "must deny reads of {path}; policy={policy}"
             );
             assert!(
                 policy.contains(&format!(r#"(deny file-write* (subpath "{path}"))"#)),
-                "must deny writes of {path}"
+                "must deny writes of {path}; policy={policy}"
             );
         }
-        let grant = policy.find("(prefix \"/Users/alice.smith/.\")").unwrap();
+        let grant = policy
+            .find(r#"(allow file-read* (subpath "/Users/alice/.cargo"))"#)
+            .unwrap();
         let deny = policy
-            .find("(deny file-read* (subpath \"/Users/alice.smith/.ssh\"))")
+            .find(r#"(deny file-read* (subpath "/Users/alice/.cargo/credentials"))"#)
             .unwrap();
         assert!(
             grant < deny,
@@ -840,8 +878,8 @@ mod tests {
             Some(home),
         );
         assert!(
-            policy.contains(r#"(allow file-read* (prefix "/Users/alice/."))"#),
-            "grant must remain; policy={policy}"
+            policy.contains(r#"(allow file-read* (subpath "/Users/alice/.cargo"))"#),
+            "toolchain grant must remain; policy={policy}"
         );
         assert!(
             policy.contains(r#"(deny file-read* (subpath "/Users/alice/.private-secrets"))"#),
@@ -851,7 +889,9 @@ mod tests {
             policy.contains(r#"(deny file-write* (subpath "/Users/alice/.private-secrets"))"#),
             "configured forbidden path must deny writes; policy={policy}"
         );
-        let grant = policy.find(r#"(prefix "/Users/alice/.")"#).unwrap();
+        let grant = policy
+            .find(r#"(allow file-read* (subpath "/Users/alice/.cargo"))"#)
+            .unwrap();
         let deny = policy
             .find(r#"(deny file-read* (subpath "/Users/alice/.private-secrets"))"#)
             .unwrap();
@@ -890,8 +930,8 @@ mod tests {
             Some(home),
         );
         assert!(
-            policy.contains(r#"(allow file-read* (prefix "/real/."))"#),
-            "grant must remain; policy={policy}"
+            policy.contains(r#"(allow file-read* (subpath "/real/.cargo"))"#),
+            "toolchain grant must remain; policy={policy}"
         );
         for path in [
             "/alias/.private-secrets",
@@ -922,8 +962,8 @@ mod tests {
             Some(home),
         );
         assert!(
-            !policy.contains(r#"(allow file-read* (prefix "/Users/alice/."))"#),
-            "HOME forbidden must suppress the convenience grant; policy={policy}"
+            !policy.contains(r#"(allow file-read* (subpath "/Users/alice/.cargo"))"#),
+            "HOME forbidden must suppress the toolchain grant; policy={policy}"
         );
     }
 
@@ -940,8 +980,8 @@ mod tests {
             Some(home),
         );
         assert!(
-            !policy.contains(r#"(allow file-read* (prefix "/Users/alice/."))"#),
-            "ancestor forbidden must suppress the convenience grant; policy={policy}"
+            !policy.contains(r#"(allow file-read* (subpath "/Users/alice/.cargo"))"#),
+            "ancestor forbidden must suppress the toolchain grant; policy={policy}"
         );
     }
 
@@ -951,10 +991,13 @@ mod tests {
         let policy =
             generate_policy_for_home(&PathBuf::from("/tmp/test"), &[], &[], &[], &[], Some(home));
         assert!(
-            policy.contains(r#"(allow file-read* (prefix "/Users/o\"brien\\x/."))"#),
+            policy.contains(r#"(allow file-read* (subpath "/Users/o\"brien\\x/.cargo"))"#),
             "home must be escaped as an SBPL string literal; policy={policy}"
         );
-        assert!(policy.contains(r#"(deny file-read* (subpath "/Users/o\"brien\\x/.ssh"))"#));
+        assert!(
+            policy
+                .contains(r#"(deny file-read* (subpath "/Users/o\"brien\\x/.cargo/credentials"))"#)
+        );
     }
 
     #[test]
@@ -962,7 +1005,7 @@ mod tests {
         for home in [None, Some(Path::new("relative/home"))] {
             let policy =
                 generate_policy_for_home(&PathBuf::from("/tmp/test"), &[], &[], &[], &[], home);
-            assert!(!policy.contains("(prefix "), "home={home:?}");
+            assert!(!policy.contains(".cargo"), "home={home:?}");
             assert!(!policy.contains("/Users/"), "home={home:?}");
         }
     }
@@ -1633,12 +1676,34 @@ mod tests {
         };
         let tool_file = write(".cargo/config.toml", "tool-ok");
         let private_file = write("Documents/private.txt", "private");
+        // A toolchain helper inside an allowlisted dotfile must still run, so
+        // narrowing the grant does not break `~/.cargo/bin` tooling.
+        let toolchain_probe = write(
+            ".cargo/bin/toolchain-probe",
+            "#!/bin/sh\necho toolchain-ok\n",
+        );
+        std::fs::set_permissions(
+            &toolchain_probe,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
         let credential_files = [
             write(".ssh/id_test", "secret"),
             write(".aws/credentials", "secret"),
             write(".config/gh/hosts.yml", "secret"),
             write(".netrc", "secret"),
             write(".git-credentials", "secret"),
+            // The ZeroClaw install directory holds provider keys and the
+            // secret-store key, so it must not ride the toolchain grant.
+            write(".zeroclaw/.secret_key", "secret"),
+            write(".zeroclaw/config.toml", "secret"),
+            write(".docker/config.json", "secret"),
+            write(".kube/config", "secret"),
+            write(".npmrc", "secret"),
+            write(".password-store/store.gpg", "secret"),
+            write(".zsh_history", "secret"),
+            // Credentials live inside `~/.cargo`, so that deny is explicit.
+            write(".cargo/credentials.toml", "secret"),
         ];
 
         let sandbox =
@@ -1652,6 +1717,14 @@ mod tests {
             String::from_utf8_lossy(&allow.stderr)
         );
         assert_eq!(String::from_utf8_lossy(&allow.stdout), "tool-ok");
+
+        let probe = sandboxed_sh(&sandbox, &workspace, r#"exec "$0""#, &toolchain_probe);
+        assert!(
+            probe.status.success(),
+            "allowlisted toolchain helper must still run: {}",
+            String::from_utf8_lossy(&probe.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&probe.stdout), "toolchain-ok\n");
 
         let private = sandboxed_sh(&sandbox, &workspace, r#"cat "$0""#, &private_file);
         assert!(
