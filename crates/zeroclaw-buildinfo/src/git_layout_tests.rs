@@ -183,6 +183,7 @@ fn packed_branch_commit_updates_the_cached_cargo_version() {
         &["commit", "-qm", "advance consumer", "--allow-empty"],
     );
     let after = run_consumer();
+    eprintln!("packed-ref consumer: before={before:?}; after={after:?}");
     assert_ne!(
         after, before,
         "Cargo must invalidate the stamp when a packed branch gains a loose ref"
