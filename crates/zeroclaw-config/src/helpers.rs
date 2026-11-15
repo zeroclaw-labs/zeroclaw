@@ -1225,6 +1225,7 @@ mod registry_reflection_tests {
     #[prefix = "profiles"]
     struct Profile {
         #[nested]
+        #[resource_key]
         models: HashMap<String, Model>,
     }
 
