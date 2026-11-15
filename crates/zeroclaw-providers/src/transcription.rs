@@ -1266,7 +1266,7 @@ fn bind_channel_provider(
 ///
 /// Registers every configured provider — legacy `[transcription]` and typed
 /// `[providers.transcription.<type>.<alias>]` alike — and binds the provider
-/// per [`bind_channel_provider`]. Built from `Config` rather than a
+/// to the channel's configured selection. Built from `Config` rather than a
 /// `TranscriptionConfig` snapshot so typed providers are visible and
 /// reloadable provider policy is never copied into a channel handle.
 ///
@@ -2845,21 +2845,6 @@ mod tests {
 }
 
 #[cfg(test)]
-#[cfg(all(
-    test,
-    any(
-        feature = "channel-telegram",
-        feature = "channel-discord",
-        feature = "channel-slack",
-        feature = "channel-mattermost",
-        feature = "whatsapp-web",
-        feature = "channel-lark",
-        feature = "channel-line",
-        feature = "channel-qq",
-        feature = "channel-matrix",
-        feature = "voice-wake"
-    )
-))]
 mod channel_builder_tests {
     use super::*;
 

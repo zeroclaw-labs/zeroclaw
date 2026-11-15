@@ -78,9 +78,6 @@ pub use crate::whatsapp::WhatsAppChannel;
 pub use zeroclaw_api::channel::{
     Channel, ChannelMessage, DraftProgress, DraftProgressKind, ListenerHealth, SendMessage,
 };
-use zeroclaw_api::tts::TtsProvider;
-use zeroclaw_providers::transcription;
-use zeroclaw_providers::tts::TtsManager;
 // Local channel types (in misc, not zeroclaw-channels)
 pub use crate::cli::CliChannel;
 pub use crate::link_enricher;
