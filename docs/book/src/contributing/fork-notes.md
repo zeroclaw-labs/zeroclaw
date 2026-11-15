@@ -62,6 +62,7 @@ See [runtime internals](../agents/internals.md#repeated-tool-failure-recovery).
 | Portable memory kernel behind `memory-tachi` (`zeroclaw-memory/tachi`) | absent | deliberate; distinct ZeroClaw memory and companion roles |
 | `vault:<NAME>` secret references resolved from Tachi Vault and preserved on disk | `op://` only at `87461d1ac5` | deliberate; Tachi Vault owns credentials |
 | HyperMemory custom CRUD backend | absent | retired; never re-add |
+| Builtin `calculator` / `weather` tools (`crates/zeroclaw-tools/src/{calculator,weather_tool}.rs`) | present | retired; implementations deleted, names reserved in `RETIRED_OPERATOR_TOOL_NAMES`. Weather, if ever needed again, is an HTTP skill / MCP wrapper, not a builtin |
 
 ### Known gaps
 

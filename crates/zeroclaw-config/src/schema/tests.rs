@@ -2052,8 +2052,8 @@ auto_approve = ["my_custom_tool", "another_tool"]
     for default_tool in &[
         "file_read",
         "memory_recall",
-        "weather",
-        "calculator",
+        "glob_search",
+        "content_search",
         "web_fetch",
     ] {
         assert!(
@@ -2113,7 +2113,7 @@ async fn auto_approve_no_duplicates() {
 default_temperature = 0.7
 
 [risk_profiles.default]
-auto_approve = ["weather", "file_read"]
+auto_approve = ["glob_search", "file_read"]
 "#;
     let parsed = parse_test_config(raw);
     let profile = parsed.risk_profiles.get("default").unwrap();
@@ -2121,7 +2121,7 @@ auto_approve = ["weather", "file_read"]
         profile
             .auto_approve
             .iter()
-            .filter(|t| *t == "weather")
+            .filter(|t| *t == "glob_search")
             .count(),
         1
     );

@@ -35,7 +35,6 @@ pub use zeroclaw_tools::ask_user::ChannelMapHandle;
 pub use zeroclaw_tools::backup_tool::BackupTool;
 pub use zeroclaw_tools::browser::{BrowserTool, ComputerUseConfig};
 pub use zeroclaw_tools::browser_open::BrowserOpenTool;
-pub use zeroclaw_tools::calculator::CalculatorTool;
 pub use zeroclaw_tools::content_search::ContentSearchTool;
 pub use zeroclaw_tools::data_management::DataManagementTool;
 pub use zeroclaw_tools::discord_search::DiscordSearchTool;
@@ -78,7 +77,6 @@ pub use zeroclaw_tools::sessions::{
 };
 pub use zeroclaw_tools::text_browser::TextBrowserTool;
 pub use zeroclaw_tools::tool_search::ToolSearchTool;
-pub use zeroclaw_tools::weather_tool::WeatherTool;
 pub use zeroclaw_tools::web_fetch::WebFetchTool;
 pub use zeroclaw_tools::web_search_tool::WebSearchTool;
 pub use zeroclaw_tools::wrappers::{PathGuardedTool, RateLimitedTool};
@@ -403,7 +401,6 @@ pub fn build_mcp_capability_tools(
 pub const BUILTIN_TOOL_INTEGRATIONS: &[(&str, &str)] = &[
     ("Shell", "Terminal command execution"),
     ("File System", "Read/write files"),
-    ("Weather", "Forecasts & conditions (wttr.in)"),
     (
         "Reasoning SubAgent",
         "Run one bounded, contract-admitted reasoning child (V1 entry point)",
@@ -461,6 +458,11 @@ pub(crate) const RETIRED_OPERATOR_TOOL_NAMES: &[&str] = &[
     "security_ops",
     "backup",
     "data_management",
+    // Toy built-ins retired outright (fork decision 2026-11-15): the
+    // implementations are deleted, not operator-gated. Weather lookups, if
+    // ever wanted again, belong to an HTTP skill or MCP wrapper.
+    "calculator",
+    "weather",
     "sop_execute",
     "sop_advance",
     "sop_approve",
@@ -779,8 +781,6 @@ pub fn all_tools_with_runtime(
             },
         ),
     ));
-    tool_arcs.push(Arc::new(CalculatorTool::new()));
-    tool_arcs.push(Arc::new(WeatherTool::new()));
     tool_arcs.push(Arc::new(TodoWriteTool::new()));
 
     // Durable cross-session commitment list (#567). Owner identity is the

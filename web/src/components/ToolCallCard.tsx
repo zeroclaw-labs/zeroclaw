@@ -2,7 +2,7 @@ import type { LucideIcon } from 'lucide-react';
 import {
   Terminal, FileText, FilePlus, FileEdit, Search, FolderSearch,
   Globe, ExternalLink, Download, Wifi, Database, GitBranch,
-  Image, Camera, Calculator, Wrench, CheckCircle2, Loader2,
+  Image, Camera, Wrench, CheckCircle2, Loader2,
 } from 'lucide-react';
 import { Card, Badge } from '@/components/ui';
 import { t } from '@/lib/i18n';
@@ -36,7 +36,6 @@ const TOOL_ICON_MAP: Record<string, LucideIcon> = {
   git_operations: GitBranch,
   image_gen: Image,
   screenshot: Camera,
-  calculator: Calculator,
 };
 
 const INLINE_THRESHOLD = 80;

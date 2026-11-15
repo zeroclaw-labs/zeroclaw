@@ -50,7 +50,6 @@ tool-tool-search = 获取延迟加载的 MCP 工具的完整 schema 定义，以
 tool-web-fetch = 获取网页并将其内容以干净的纯文本形式返回。HTML 页面会自动转换为可读文本。JSON 和纯文本响应按原样返回。仅支持 GET 请求；会跟随重定向。安全性：仅限白名单域名，不允许本地/私有主机。
 tool-web-search-tool = 在网络上搜索信息。返回包含标题、URL 和描述的相关搜索结果。使用此工具查找最新信息、新闻或研究主题。
 tool-workspace = 管理多客户端工作区。子命令：list、switch、create、info、export。每个工作区提供隔离的内存、审计、密钥和工具限制。
-tool-weather = 获取全球任意位置的当前天气状况和预报。支持城市名称（任意语言或文字）、IATA 机场代码（例如 'LAX'）、GPS 坐标（例如 '51.5,-0.1'）、邮政编码以及基于域名的地理定位。返回温度、体感温度、湿度、风速/风向、降水量、能见度、气压、紫外线指数和云量。可选 0-3 天的逐小时预报。单位默认使用公制（°C、km/h、mm），也可按请求设置为英制（°F、mph、英寸）。无需 API 密钥。
 
 tool-browser-screenshot-error-args-not-object = 截图参数必须是 JSON 对象
 tool-browser-screenshot-error-computeruse-non-string-path = 截图的 'path' 参数必须是字符串，实际为 { $path }

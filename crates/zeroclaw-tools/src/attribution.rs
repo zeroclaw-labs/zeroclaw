@@ -10,7 +10,6 @@ use crate::ask_user::AskUserTool;
 use crate::backup_tool::BackupTool;
 use crate::browser::BrowserTool;
 use crate::browser_open::BrowserOpenTool;
-use crate::calculator::CalculatorTool;
 use crate::content_search::ContentSearchTool;
 use crate::data_management::DataManagementTool;
 use crate::discord_search::DiscordSearchTool;
@@ -41,7 +40,6 @@ use crate::sessions::{
 };
 use crate::text_browser::TextBrowserTool;
 use crate::tool_search::ToolSearchTool;
-use crate::weather_tool::WeatherTool;
 use crate::web_fetch::WebFetchTool;
 use crate::web_search_tool::WebSearchTool;
 
@@ -49,7 +47,6 @@ tool_attribution!(AskUserTool, ToolKind::Wait);
 tool_attribution!(BackupTool, ToolKind::Plugin);
 tool_attribution!(BrowserTool, ToolKind::Plugin);
 tool_attribution!(BrowserOpenTool, ToolKind::Plugin);
-tool_attribution!(CalculatorTool, ToolKind::Plugin);
 tool_attribution!(ContentSearchTool, ToolKind::Search);
 tool_attribution!(DataManagementTool, ToolKind::Plugin);
 tool_attribution!(DiscordSearchTool, ToolKind::Search);
@@ -85,7 +82,6 @@ tool_attribution!(SessionsListTool, ToolKind::Plugin);
 tool_attribution!(SessionsSendTool, ToolKind::Plugin);
 tool_attribution!(TextBrowserTool, ToolKind::Plugin);
 tool_attribution!(ToolSearchTool, ToolKind::Search);
-tool_attribution!(WeatherTool, ToolKind::Plugin);
 tool_attribution!(WebFetchTool, ToolKind::FetchUrl);
 tool_attribution!(WebSearchTool, ToolKind::Search);
 
@@ -94,27 +90,31 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    use crate::calculator::CalculatorTool;
     use zeroclaw_api::attribution::{Attributable, Role};
+    use zeroclaw_policy::SecurityPolicy;
+
+    fn subject() -> ImageInfoTool {
+        ImageInfoTool::new(Arc::new(SecurityPolicy::default()))
+    }
 
     #[test]
     fn macro_sets_role_to_tool_kind() {
-        let tool = CalculatorTool;
+        let tool = subject();
         assert_eq!(tool.role(), Role::Tool(ToolKind::Plugin));
-        assert_eq!(tool.alias(), "calculator");
+        assert_eq!(tool.alias(), "image_info");
     }
 
     #[test]
     fn attributable_via_arc_matches_inner() {
-        let inner = CalculatorTool;
-        let arc: Arc<CalculatorTool> = Arc::new(inner);
-        assert_eq!(arc.alias(), "calculator");
+        let inner = subject();
+        let arc: Arc<ImageInfoTool> = Arc::new(inner);
+        assert_eq!(arc.alias(), "image_info");
         assert_eq!(arc.role(), Role::Tool(ToolKind::Plugin));
     }
 
     #[test]
     fn tool_name_has_no_dot_separator() {
-        let tool = CalculatorTool;
+        let tool = subject();
         assert!(
             !tool.alias().contains('.'),
             "alias `{}` must not contain `.` — would break `<kind>.<alias>` composite parsing",
@@ -124,7 +124,7 @@ mod tests {
 
     #[test]
     fn tool_name_is_nonempty() {
-        let tool = CalculatorTool;
+        let tool = subject();
         assert!(!tool.alias().is_empty());
     }
 }

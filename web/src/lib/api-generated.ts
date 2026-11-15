@@ -17842,11 +17842,9 @@ export interface components {
              *       "memory_recall",
              *       "web_search_tool",
              *       "web_fetch",
-             *       "calculator",
              *       "glob_search",
              *       "content_search",
              *       "image_info",
-             *       "weather",
              *       "tool_search",
              *       "browser",
              *       "browser_open"

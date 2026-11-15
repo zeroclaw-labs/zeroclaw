@@ -59,6 +59,7 @@ boundaries because they add platform, dependency, network, or UI surface area.
 | `http_request`, `web_fetch`, `web_search_tool` | Config-gated network access. | Keep first-party while SSRF, allowlist, provider routing, and receipt behavior remain ZeroClaw-owned. Revisit only after MCP/plugin replacements can express the same network policy. |
 | SOP tools (`sop_list`, `sop_execute`, `sop_advance`, `sop_approve`, `sop_status`, `sop_workshop`) | Removed with the SOP run side. | Retired: no agent-facing SOP run tools remain; runs are Tachi-side ProcedureRuns through the procedure_v1 seam. |
 | WASM plugin tools | Removed with the WASM plugin host. | Retired: extensions go through MCP servers. |
+| `calculator`, `weather` | Removed from the model surface; implementations deleted. | Retired outright. The names stay reserved in `RETIRED_OPERATOR_TOOL_NAMES` so no assembly path can re-register them. A weather lookup, if ever wanted again, belongs to an HTTP skill or MCP wrapper. |
 | `execute_pipeline` | Config-gated tool chaining. | Keep gated until tool chaining policy, per-step receipts, and caller allowlists are stable enough to judge whether it is core. |
 | `knowledge` | Config-gated knowledge surface. | Keep gated while relationship memory and graph workflows are still being promoted into user-facing docs and skills. |
 | `file_upload`, `file_upload_bundle`, `file_download` | Config-gated data movement. | Keep gated; these are policy-sensitive data movement tools and need an explicit replacement before externalization. |
@@ -103,7 +104,6 @@ replacement surface exists. Until then, keep them compatible and policy-visible.
 | `email_search`, `email_read` | Channel companion plugin or MCP server. | Email search/read is useful but tied to external account auth and channel setup rather than the baseline agent contract. |
 | `discord_search` | Channel companion plugin or archive-query skill. | It depends on a Discord archive database produced by the channel; keep it close to that channel until the archive API is explicit. |
 | `image_gen` | Skill package or MCP server. | These are optional workflows or vendor/data-service wrappers rather than core execution primitives. |
-| `weather` | Skill package or HTTP-backed skill; later plugin or MCP server if parity needs custom formatting or policy. | The current built-in is a no-key `wttr.in` wrapper. A minimal lookup fits the HTTP skill shape, but full externalization still needs parity for formatted output, the `tool.weather` proxy policy, and the built-in tool name / auto-approve behavior. |
 | `git_operations` | CLI-backed integration or narrowly scoped plugin. | It has local and remote repository side effects, so any external replacement must preserve policy checks, receipts, and explicit operator visibility. |
 
 ## No Action Yet
@@ -111,8 +111,6 @@ replacement surface exists. Until then, keep them compatible and policy-visible.
 Leave these surfaces in place until another design slice produces better
 evidence:
 
-- `calculator`: tiny, dependency-light, and harmless enough that moving it out
-  may cost more complexity than it saves.
 - `tool_search` and deferred MCP activation: part of the current MCP discovery
   flow, but the exact long-term boundary depends on the v0.8.2 plugin/MCP work.
 - Session reset/delete tools: implementations exist, but the agent registry does

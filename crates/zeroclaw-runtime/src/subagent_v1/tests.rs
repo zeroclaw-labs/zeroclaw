@@ -1585,8 +1585,8 @@ fn admission_refuses_any_parent_registry_tool_name() {
         "file_write",
         "file_edit",
         "file_read",
-        "weather",
-        "calculator",
+        "glob_search",
+        "content_search",
         "memory_store",
         "memory_recall",
         // Retired in-kernel spawn tools stay unrepresentable in v1 profiles.

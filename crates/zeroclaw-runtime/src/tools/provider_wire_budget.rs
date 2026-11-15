@@ -519,7 +519,11 @@ async fn provider_wire_budget_default_and_lean_no_skills() {
     print_budget("hyperion_lean", &lean_budget);
 
     assert!(
-        default_budget.names.len() >= 40,
+        default_budget.names.len() >= 35,
+        // Lowered from 40 when calculator and weather retired (the knowledge
+        // tool was config-gated off and never counted); the guard only needs
+        // to stay far above the default_tools(6) failure mode, and the
+        // retirement campaign may shave a few more built-ins.
         "production path is all_tools_with_runtime, not default_tools(6); got {:?}",
         default_budget.names
     );
