@@ -2655,6 +2655,74 @@ mod tests {
         }
     }
 
+    /// `zeroclaw estop` refuses to run because nothing enforces it, so every
+    /// catalogue must say so in its own language, name the command in the
+    /// refusal, and carry the `--help` and status wording that matches it. A
+    /// catalogue that copies English fails as untranslated.
+    #[test]
+    fn estop_not_enforced_strings_are_translated_in_every_locale() {
+        let cases: [(&str, &[(&str, &str)]); 5] = [
+            ("cli-estop-not-enforced", &[]),
+            ("cli-estop-about", &[]),
+            ("cli-estop-status-about", &[]),
+            ("cli-estop-resume-about", &[]),
+            ("cli-status-estop", &[("v", "true")]),
+        ];
+
+        // The phrase each locale uses to say the command is not enforced.
+        // Without it a catalogue could go back to describing `estop` as
+        // engaging or resuming a stop and still be a translated string.
+        let not_enforced = |locale: &str, key: &str| -> &'static str {
+            match (locale, key) {
+                ("en", _) => "not enforced",
+                ("es", _) => "no se hace cumplir",
+                ("fr", "cli-estop-not-enforced") => "pas appliqué",
+                ("fr", _) => "non appliqué",
+                ("ja", "cli-estop-not-enforced") => "適用されていません",
+                ("ja", _) => "未適用",
+                ("zh-CN", _) => "未生效",
+                _ => unreachable!("unexpected locale {locale}"),
+            }
+        };
+
+        let english_source = include_str!("../locales/en/cli.ftl");
+        for (key, args) in cases {
+            let english = format_ftl_message(english_source, "en", key, args)
+                .unwrap_or_else(|| panic!("{key} should format in en"));
+
+            for (source, locale) in [
+                (include_str!("../locales/en/cli.ftl"), "en"),
+                (include_str!("../locales/es/cli.ftl"), "es"),
+                (include_str!("../locales/fr/cli.ftl"), "fr"),
+                (include_str!("../locales/ja/cli.ftl"), "ja"),
+                (include_str!("../locales/zh-CN/cli.ftl"), "zh-CN"),
+            ] {
+                let value = format_ftl_message(source, locale, key, args)
+                    .unwrap_or_else(|| panic!("{key} should format in {locale}"));
+                assert!(
+                    !value.trim().is_empty(),
+                    "{key} must not be empty in {locale}"
+                );
+                assert!(
+                    value.to_lowercase().contains(not_enforced(locale, key)),
+                    "{key} in {locale} should say the command is not enforced; got: {value:?}"
+                );
+                if key == "cli-estop-not-enforced" {
+                    assert!(
+                        value.contains("zeroclaw estop"),
+                        "{key} in {locale} should name the command; got: {value:?}"
+                    );
+                }
+                if locale != "en" {
+                    assert_ne!(
+                        value, english,
+                        "{key} in {locale} is the English string verbatim, so that catalogue was never translated"
+                    );
+                }
+            }
+        }
+    }
+
     /// The install and remove refusals for something the host never admitted
     /// at a package name.
     ///
