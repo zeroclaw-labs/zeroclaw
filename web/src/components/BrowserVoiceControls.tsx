@@ -4,7 +4,7 @@ import { Mic, MicOff, Volume2, VolumeX } from 'lucide-react';
 import type { ChatMessage } from '@/contexts/AgentContext';
 import { t } from '@/lib/i18n';
 import { speechText } from '@/lib/speechText';
-import { useGlobalVoiceTimeout, readGlobalVoiceTimeout, localRecognitionStatus, recognitionConstructor, shortPressAction, useBrowserVoices, useVoicePreferences, type Recognition } from '@/lib/browserVoice';
+import { voicePlaybackIdle, useGlobalVoiceTimeout, readGlobalVoiceTimeout, localRecognitionStatus, recognitionConstructor, shortPressAction, useBrowserVoices, useVoicePreferences, type Recognition } from '@/lib/browserVoice';
 
 const readableMessage = (message: ChatMessage) => speechText(displayMessageText(message));
 
@@ -24,6 +24,13 @@ export default function BrowserVoiceControls({ messages, hydrated, typing, onTra
   const continuous = override ?? prefs.automatic;
   const [listening, setListening] = useState(false);
   const [speaking, setSpeaking] = useState(false);
+  const [, refreshPlayback] = useState(0);
+  useEffect(() => {
+    const idle = () => refreshPlayback(current => current + 1);
+    window.addEventListener(voicePlaybackIdle, idle);
+    return () => window.removeEventListener(voicePlaybackIdle, idle);
+  }, []);
+  const playbackIdle = () => window.dispatchEvent(new Event(voicePlaybackIdle));
   const [error, setError] = useState('');
   const root = useRef<HTMLDivElement>(null);
   const recognition = useRef<Recognition | null>(null);
@@ -37,7 +44,7 @@ export default function BrowserVoiceControls({ messages, hydrated, typing, onTra
   const stopSpeech = () => {
     if (utterance.current) {
       utterance.current.onend = null; utterance.current.onerror = null;
-      window.speechSynthesis.cancel(); utterance.current = null;
+      window.speechSynthesis.cancel(); utterance.current = null; playbackIdle();
     }
     setSpeaking(false);
   };
@@ -58,13 +65,14 @@ export default function BrowserVoiceControls({ messages, hydrated, typing, onTra
     if (!ready || !prefs.reading || !visible() || recognition.current) return false;
     const voice = voices.find(v => v.voiceURI === prefs.voice);
     if (!voice || !('speechSynthesis' in window)) { setError(t('voice.select_voice')); return false; }
+    if (!utterance.current && (window.speechSynthesis.speaking || window.speechSynthesis.pending)) return false;
     stopSpeech();
     const readable = readableMessage(message);
     if (!readable) return false;
     const next = new SpeechSynthesisUtterance(readable);
     next.voice = voice; next.lang = prefs.language; next.rate = prefs.rate;
-    next.onend = () => { utterance.current = null; setSpeaking(false); };
-    next.onerror = () => { utterance.current = null; setSpeaking(false); setError(t('voice.speech_error')); };
+    next.onend = () => { utterance.current = null; setSpeaking(false); playbackIdle(); };
+    next.onerror = () => { utterance.current = null; setSpeaking(false); playbackIdle(); setError(t('voice.speech_error')); };
     utterance.current = next; setSpeaking(true); setError(''); window.speechSynthesis.speak(next);
     return true;
   };

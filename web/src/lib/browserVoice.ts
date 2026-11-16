@@ -2,6 +2,8 @@ import { useEffect, useState } from 'react';
 import { apiFetch, getProp, putProp } from './api';
 import { getToken } from './auth';
 
+export const voicePlaybackIdle = 'zeroclaw-voice-playback-idle';
+
 export interface VoicePreferences {
   dictation: boolean;
   reading: boolean;

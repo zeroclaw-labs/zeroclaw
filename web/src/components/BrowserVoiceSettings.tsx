@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { t } from '@/lib/i18n';
 import { apiFetch } from '@/lib/api';
 import { Button, Select } from '@/components/ui';
-import { useGlobalVoiceTimeout, saveGlobalVoiceTimeout, localRecognitionStatus, recognitionConstructor, saveVoicePreferences, useBrowserVoices, useVoicePreferences, type VoicePreferences } from '@/lib/browserVoice';
+import { voicePlaybackIdle, useGlobalVoiceTimeout, saveGlobalVoiceTimeout, localRecognitionStatus, recognitionConstructor, saveVoicePreferences, useBrowserVoices, useVoicePreferences, type VoicePreferences } from '@/lib/browserVoice';
 
 interface PairedDevice { id: string; name: string | null; device_type: string | null }
 interface DeviceInventory { devices: PairedDevice[]; current_device_id: string | null }
@@ -55,13 +55,18 @@ export default function BrowserVoiceSettings() {
   }, []);
   const [draft, setDraft] = useState<VoicePreferences | null>(null);
   const prefs = draft ?? saved;
+  const [rateDraft, setRateDraft] = useState<number | null>(null);
+  useEffect(() => setRateDraft(null), [selectedDeviceId, prefs.rate]);
+  const commitRate = (rate: number) => {
+    if (rate !== prefs.rate && !saving) void update({ rate });
+  };
   const [saving, setSaving] = useState(false);
   const voices = useBrowserVoices();
   const [localStatus, setLocalStatus] = useState('checking');
   const [error, setError] = useState('');
   const [installing, setInstalling] = useState(false);
   const sample = useRef<SpeechSynthesisUtterance | null>(null);
-  useEffect(() => () => { if (sample.current) window.speechSynthesis.cancel(); }, []);
+  useEffect(() => () => { if (sample.current) { window.speechSynthesis.cancel(); window.dispatchEvent(new Event(voicePlaybackIdle)); } }, []);
   useEffect(() => {
     let active = true;
     if (!currentDevice) { setLocalStatus('unavailable'); return; }
@@ -174,17 +179,21 @@ export default function BrowserVoiceSettings() {
         </div>
         {currentDevice && !voices.length && <p>{t('voice.no_voices')}</p>}
         {!currentDevice && <p>{t('voice.remote_device_resources')}</p>}
-        <label>{t('voice.rate')} {prefs.rate}×
-          <input className="block w-full" type="range" min="0.5" max="2" step="0.1" value={prefs.rate} onChange={e => update({ rate: Number(e.target.value) })} />
+        <label>{t('voice.rate')} {rateDraft ?? prefs.rate}×
+          <input className="block w-full" type="range" min="0.5" max="2" step="0.1" value={rateDraft ?? prefs.rate}
+            onChange={e => setRateDraft(e.currentTarget.valueAsNumber)}
+            onPointerUp={e => commitRate(e.currentTarget.valueAsNumber)}
+            onKeyUp={e => commitRate(e.currentTarget.valueAsNumber)}
+            onBlur={e => commitRate(e.currentTarget.valueAsNumber)} />
         </label>
         {currentDevice && <Button size="sm" disabled={!prefs.voice || !voices.some(v => v.voiceURI === prefs.voice)} onClick={() => {
           const utterance = new SpeechSynthesisUtterance(t('voice.sample_text'));
           utterance.voice = voices.find(v => v.voiceURI === prefs.voice) || null;
           utterance.lang = prefs.language; utterance.rate = prefs.rate;
           sample.current = utterance;
-          utterance.onend = () => { sample.current = null; };
-          utterance.onerror = () => { sample.current = null; setError(t('voice.speech_error')); };
-          window.speechSynthesis.cancel(); window.speechSynthesis.speak(utterance);
+          utterance.onend = () => { sample.current = null; window.dispatchEvent(new Event(voicePlaybackIdle)); };
+          utterance.onerror = () => { sample.current = null; window.dispatchEvent(new Event(voicePlaybackIdle)); setError(t('voice.speech_error')); };
+          window.speechSynthesis.speak(utterance);
         }}>{t('voice.sample')}</Button>}
         <label><input type="checkbox" checked={prefs.automatic} onChange={e => update({ automatic: e.target.checked })} /> {t('voice.automatic')}</label>
         <p className="text-pc-text-muted">{t('voice.gesture')}</p>
