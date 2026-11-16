@@ -207,6 +207,9 @@ RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/regist
            target/"$RUST_TARGET"/release/incremental/zeroclaw-* \
            target/"$RUST_TARGET"/release/deps/zeroclaw_* \
            target/"$RUST_TARGET"/release/incremental/zeroclaw_* \
+           target/"$RUST_TARGET"/release/.fingerprint/zeroclaw-api-* \
+           target/"$RUST_TARGET"/release/deps/zeroclaw_api-* \
+           target/"$RUST_TARGET"/release/incremental/zeroclaw_api-* \
            target/"$RUST_TARGET"/release/.fingerprint/xtask-* \
            target/"$RUST_TARGET"/release/deps/xtask-* \
            target/"$RUST_TARGET"/release/.fingerprint/fill-translations-* \

@@ -169,6 +169,9 @@ RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/regist
            target/release/incremental/zeroclaw-* \
            target/release/deps/zeroclaw_* \
            target/release/incremental/zeroclaw_* \
+           target/release/.fingerprint/zeroclaw-api-* \
+           target/release/deps/zeroclaw_api-* \
+           target/release/incremental/zeroclaw_api-* \
            target/release/.fingerprint/xtask-* \
            target/release/deps/xtask-* \
            target/release/.fingerprint/fill-translations-* \

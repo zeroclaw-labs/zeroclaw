@@ -78,7 +78,7 @@ CARGO_TOOLCHAIN="${ZC_CARGO_TOOLCHAIN:-}"
 CARGO_CMD=(cargo)
 if [ -n "$CARGO_TOOLCHAIN" ]; then
   CARGO_CMD=(cargo "$CARGO_TOOLCHAIN")
-elif command -v rustup >/dev/null 2>&1 && rustup toolchain list | grep -q '^1\.99\.1-'; then
+elif command -v rustup >/dev/null 2>&1 && rustup toolchain list | grep -q '^1\.100\.0-'; then
   CARGO_CMD=(cargo +1.100.0)
 fi
 
