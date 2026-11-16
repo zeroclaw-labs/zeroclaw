@@ -21076,6 +21076,549 @@ target = "memory_recall"
         );
     }
 
+    /// The tools a bounded hop rebuilds for its target that start child work
+    /// of their own: `spawn_subagent`, `cron_run` and `send_message_to_peer`.
+    ///
+    /// The caller's turn is bound to supplied capabilities and a principal, so
+    /// the work these tools start must resolve through that binding, as it
+    /// does from the caller's own registry. In a session owned by a principal
+    /// the subagent child must also run on that owner's plane for the target.
+    /// Every agent these tests can reach has its configured provider route on
+    /// a counting endpoint: work built from config instead of the binding has
+    /// to connect there first.
+    mod rebuilt_child_starting_tools {
+        use super::*;
+        use crate::composition::test_support::{
+            CountingEndpoint, RecordingMemory, RecordingProviders, STUB_REPLY, counting_endpoint,
+            recording_capabilities,
+        };
+        use crate::tools::spawn_subagent::CHILD_MEMORY_SINK;
+
+        const TARGET: &str = "fs_researcher";
+        const PEER: &str = "peer_recipient";
+        const PEER_CHANNEL: &str = "telegram.prod";
+
+        fn caller_principal() -> zeroclaw_api::principal::PrincipalId {
+            zeroclaw_api::principal::PrincipalId::for_oidc(
+                "https://issuer.example",
+                "subject-rebuilt-child",
+            )
+        }
+
+        /// The owner of the caller's session, bound under the caller's alias.
+        fn owner_scope() -> PrincipalScope {
+            PrincipalScope::new("user:alice").with_agent(Some("executive_assistant".to_string()))
+        }
+
+        /// The owner's plane for the target.
+        fn owner_target_scope() -> PrincipalScope {
+            PrincipalScope::new("user:alice").with_agent(Some(TARGET.to_string()))
+        }
+
+        /// Serves one store for every agent, so a test can read back what a
+        /// child wrote through the handle it was given.
+        struct OneStore(Arc<dyn Memory>);
+
+        #[async_trait]
+        impl crate::composition::MemorySource for OneStore {
+            async fn memory(
+                &self,
+                _request: &crate::composition::MemoryRequest<'_>,
+            ) -> anyhow::Result<Arc<dyn Memory>> {
+                Ok(Arc::clone(&self.0))
+            }
+        }
+
+        /// Keeps a nested agent turn off the host: no memory backend, plugins,
+        /// MCP servers or skill creation from config, and no provider retry.
+        fn offline_child_config(config: &mut Config) {
+            config.memory.backend = "none".into();
+            config.memory.auto_save = false;
+            config.plugins.enabled = false;
+            config.plugins.auto_discover = false;
+            config.mcp.enabled = false;
+            config.skills.skill_creation.enabled = false;
+            config.reliability.provider_retries = 0;
+            config.reliability.scheduler_retries = 0;
+            config.scheduler.enabled = true;
+        }
+
+        /// Points `[providers.models.ollama.<alias>]`, the route the fixture
+        /// configures for `alias`, at `url`.
+        fn route_agent_to(config: &mut Config, alias: &str, url: &str) {
+            config.providers.models.ollama.insert(
+                alias.to_string(),
+                zeroclaw_config::schema::OllamaModelProviderConfig {
+                    base: ModelProviderConfig {
+                        model: Some("configured-model".to_string()),
+                        uri: Some(url.to_string()),
+                        timeout_secs: Some(5),
+                        ..ModelProviderConfig::default()
+                    },
+                    ..zeroclaw_config::schema::OllamaModelProviderConfig::default()
+                },
+            );
+        }
+
+        struct Hop {
+            _tmp: TempDir,
+            tool: DelegateTool,
+            target_config: AliasedAgentConfig,
+            config: Arc<Config>,
+            endpoint: CountingEndpoint,
+            providers: Arc<RecordingProviders>,
+            memory: Arc<RecordingMemory>,
+            store: Arc<dyn Memory>,
+        }
+
+        /// The full bounded fixture for `tool_name`, with the target's route on
+        /// a counting endpoint. `bind` binds the delegate to recording
+        /// capabilities for [`caller_principal`] with the native recipe (no
+        /// recipe makes the hop supplied-only, which rebuilds nothing);
+        /// `serve_one_store` has the binding's memory source serve `store`.
+        async fn hop(
+            tool_name: &str,
+            bind: bool,
+            serve_one_store: bool,
+            configure: impl FnOnce(&mut Config, &str),
+        ) -> Hop {
+            let endpoint = counting_endpoint().await;
+            let url = endpoint.url.clone();
+            let BoundedDelegateFsFixture {
+                _tmp,
+                tool,
+                target_config,
+                config,
+                ..
+            } = bounded_delegate_full_fixture(tool_name, |config| {
+                offline_child_config(config);
+                route_agent_to(config, TARGET, &url);
+                configure(config, &url);
+            })
+            .await;
+            let store: Arc<dyn Memory> = Arc::new(
+                SqliteMemory::new("rebuilt-child-store", &config.data_dir.join("child-store"))
+                    .unwrap(),
+            );
+            let providers = Arc::new(RecordingProviders::default());
+            let memory = Arc::new(RecordingMemory::default());
+            let tool = if bind {
+                let mut capabilities = recording_capabilities(
+                    Arc::clone(&providers),
+                    Arc::clone(&memory),
+                    Arc::new(crate::composition::defaults::NoSuppliedTools),
+                );
+                if serve_one_store {
+                    capabilities.memory = Arc::new(OneStore(Arc::clone(&store)));
+                }
+                tool.with_memory(Arc::clone(&store))
+                    .with_capabilities(capabilities, Some(caller_principal()))
+            } else {
+                tool
+            };
+            Hop {
+                _tmp,
+                tool,
+                target_config,
+                config,
+                endpoint,
+                providers,
+                memory,
+                store,
+            }
+        }
+
+        /// Runs the target's bounded turn, in which the model calls
+        /// `tool_name` once with `tool_args` and then echoes its result.
+        async fn run_target(
+            hop: &Hop,
+            tool_name: &'static str,
+            tool_args: serde_json::Value,
+        ) -> ToolResult {
+            let model_provider = BoundedSingleToolCallThenFinalModelProvider {
+                tool_name,
+                tool_args,
+            };
+            hop.tool
+                .execute_agentic(
+                    TARGET,
+                    &hop.target_config,
+                    "custom",
+                    "delegate-fs-test-model",
+                    &model_provider,
+                    "start the child work",
+                    Some(0.2),
+                )
+                .await
+                .expect("the bounded hop runs")
+        }
+
+        /// A nested agent turn inside the delegated turn is deeper than the
+        /// harness's default thread stack allows, so each test runs on workers
+        /// with a larger stack and re-raises the body's own panic.
+        fn on_deep_stack<F>(body: F)
+        where
+            F: std::future::Future<Output = ()> + Send + 'static,
+        {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .thread_stack_size(64 * 1024 * 1024)
+                .build()
+                .expect("test runtime builds");
+            runtime.block_on(async move {
+                if let Err(error) = zeroclaw_spawn::spawn!(body).await {
+                    match error.try_into_panic() {
+                        Ok(payload) => std::panic::resume_unwind(payload),
+                        Err(error) => panic!("the test body did not finish: {error}"),
+                    }
+                }
+            });
+        }
+
+        /// `spawn_subagent` rebuilt for the target starts its child on the
+        /// caller's binding: the child asks the caller's provider source for
+        /// the target on behalf of the caller's principal, opens the target's
+        /// memory through the caller's memory source, and never connects to the
+        /// target's configured endpoint.
+        #[test]
+        fn bounded_rebuilt_spawn_subagent_runs_child_on_callers_binding() {
+            on_deep_stack(async {
+                let hop = hop("spawn_subagent", true, false, |_, _| {}).await;
+                let sink = Arc::new(std::sync::Mutex::new(None));
+                let result = CHILD_MEMORY_SINK
+                    .scope(
+                        Arc::clone(&sink),
+                        run_target(&hop, "spawn_subagent", json!({"prompt": "say hello"})),
+                    )
+                    .await;
+                let started = sink.lock().unwrap().is_some();
+                assert!(
+                    started,
+                    "precondition: the rebuilt spawn_subagent started its child run; \
+                     delegate output: {}",
+                    result.output
+                );
+
+                let principal = caller_principal();
+                let seen = hop.providers.seen.lock().clone();
+                let connections = hop.endpoint.connections();
+                assert!(
+                    seen.iter().any(|request| request.agent_alias == TARGET)
+                        && seen
+                            .iter()
+                            .filter(|request| request.agent_alias == TARGET)
+                            .all(|request| request.principal.as_ref() == Some(&principal)),
+                    "the child must ask the caller's provider source for {TARGET} on behalf \
+                     of the caller's principal; seen: {seen:?}; connections to the target's \
+                     configured endpoint: {connections}; delegate output: {}",
+                    result.output
+                );
+                assert_eq!(
+                    connections, 0,
+                    "the child must not build {TARGET}'s configured provider; delegate \
+                     output: {}",
+                    result.output
+                );
+                let memory_agents = hop.memory.agents.lock().clone();
+                assert!(
+                    memory_agents.iter().any(|alias| alias == TARGET),
+                    "the child must open {TARGET}'s memory through the caller's memory \
+                     source; asked for: {memory_agents:?}"
+                );
+                assert!(
+                    result.output.contains(STUB_REPLY),
+                    "the child's answer comes from the caller's provider source; delegate \
+                     output: {}",
+                    result.output
+                );
+            });
+        }
+
+        /// `cron_run` rebuilt for the target runs the target's agent job on the
+        /// caller's sources. The job's turn carries no principal, as on the
+        /// normal registry path, so only the sources are pinned here.
+        #[test]
+        fn bounded_rebuilt_cron_run_runs_job_on_callers_binding() {
+            on_deep_stack(async {
+                let hop = hop("cron_run", true, false, |_, _| {}).await;
+                let job = crate::cron::add_agent_job(
+                    &hop.config,
+                    TARGET,
+                    Some("target-agent-job".to_string()),
+                    crate::cron::Schedule::Every {
+                        every_ms: 3_600_000,
+                    },
+                    "say hello",
+                    crate::cron::SessionTarget::Isolated,
+                    None,
+                    None,
+                    false,
+                    Some(Vec::new()),
+                    true,
+                )
+                .unwrap();
+
+                let result = run_target(&hop, "cron_run", json!({ "job_id": job.id })).await;
+                let runs = crate::cron::list_runs(&hop.config, &job.id, 10).unwrap();
+                assert_eq!(
+                    runs.len(),
+                    1,
+                    "precondition: the rebuilt cron_run executed {TARGET}'s job; delegate \
+                     output: {}",
+                    result.output
+                );
+
+                let seen = hop.providers.seen.lock().clone();
+                let connections = hop.endpoint.connections();
+                assert!(
+                    seen.iter().any(|request| request.agent_alias == TARGET)
+                        && seen
+                            .iter()
+                            .filter(|request| request.agent_alias == TARGET)
+                            .all(|request| request.principal.is_none()),
+                    "the job's turn must ask the caller's provider source for {TARGET}, with \
+                     no principal as on the normal path; seen: {seen:?}; connections to the \
+                     target's configured endpoint: {connections}; delegate output: {}",
+                    result.output
+                );
+                assert_eq!(
+                    connections, 0,
+                    "the job's turn must not build {TARGET}'s configured provider; delegate \
+                     output: {}",
+                    result.output
+                );
+                let memory_agents = hop.memory.agents.lock().clone();
+                assert!(
+                    memory_agents.iter().any(|alias| alias == TARGET),
+                    "the job's turn must open {TARGET}'s memory through the caller's memory \
+                     source; asked for: {memory_agents:?}"
+                );
+            });
+        }
+
+        /// `send_message_to_peer` rebuilt for the target relays to a peer agent
+        /// whose turn runs detached from the delegated turn. That turn must
+        /// still resolve through the caller's binding and principal.
+        #[test]
+        fn bounded_rebuilt_send_message_to_peer_relays_on_callers_binding() {
+            on_deep_stack(async {
+                let hop = hop("send_message_to_peer", true, false, |config, url| {
+                    use zeroclaw_config::multi_agent::{AgentAlias, PeerGroupConfig};
+                    route_agent_to(config, PEER, url);
+                    config.risk_profiles.insert(
+                        "peer".to_string(),
+                        zeroclaw_config::schema::RiskProfileConfig::default(),
+                    );
+                    config.agents.insert(
+                        PEER.to_string(),
+                        AliasedAgentConfig {
+                            channels: vec![PEER_CHANNEL.into()],
+                            model_provider: "ollama.peer_recipient".into(),
+                            risk_profile: "peer".into(),
+                            ..AliasedAgentConfig::default()
+                        },
+                    );
+                    config
+                        .agents
+                        .get_mut(TARGET)
+                        .expect("the fixture configures the target")
+                        .channels = vec![PEER_CHANNEL.into()];
+                    config.peer_groups.insert(
+                        "rebuilt-relay".to_string(),
+                        PeerGroupConfig {
+                            channel: "telegram".into(),
+                            agents: vec![AgentAlias::new(TARGET), AgentAlias::new(PEER)],
+                            ..PeerGroupConfig::default()
+                        },
+                    );
+                })
+                .await;
+
+                let result = run_target(
+                    &hop,
+                    "send_message_to_peer",
+                    json!({
+                        "channel": PEER_CHANNEL,
+                        "target": PEER,
+                        "message": "post a one-line status",
+                    }),
+                )
+                .await;
+                assert!(
+                    result.output.contains("task_id="),
+                    "precondition: the rebuilt send_message_to_peer accepted the relay for \
+                     in-process delivery; delegate output: {}",
+                    result.output
+                );
+
+                // The relayed turn is detached: wait until it has asked a
+                // provider source or reached the configured endpoint.
+                let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+                loop {
+                    let asked = hop
+                        .providers
+                        .seen
+                        .lock()
+                        .iter()
+                        .any(|request| request.agent_alias == PEER);
+                    if asked
+                        || hop.endpoint.connections() > 0
+                        || tokio::time::Instant::now() >= deadline
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+
+                let principal = caller_principal();
+                let seen = hop.providers.seen.lock().clone();
+                let connections = hop.endpoint.connections();
+                assert!(
+                    seen.iter().any(|request| {
+                        request.agent_alias == PEER
+                            && request.principal.as_ref() == Some(&principal)
+                    }),
+                    "the relayed turn must ask the caller's provider source for {PEER} on \
+                     behalf of the caller's principal; seen: {seen:?}; connections to the \
+                     configured endpoint: {connections}"
+                );
+                assert_eq!(
+                    connections, 0,
+                    "the relayed turn must not build {PEER}'s configured provider"
+                );
+            });
+        }
+
+        /// In a session owned by a principal, the child of the rebuilt
+        /// `spawn_subagent` runs on that owner's plane for the target, as the
+        /// child of the normal registry's `spawn_subagent` runs on the owner's
+        /// plane for its agent.
+        #[test]
+        fn bounded_rebuilt_spawn_subagent_child_stays_on_owner_plane() {
+            on_deep_stack(async {
+                let hop = hop("spawn_subagent", true, true, |_, _| {}).await;
+                hop.tool
+                    .bind_principal_scope(owner_scope())
+                    .expect("the session's owner binds");
+                let sink = Arc::new(std::sync::Mutex::new(None));
+                let result = CHILD_MEMORY_SINK
+                    .scope(
+                        Arc::clone(&sink),
+                        run_target(&hop, "spawn_subagent", json!({"prompt": "say hello"})),
+                    )
+                    .await;
+                let started = sink.lock().unwrap().take();
+                let Some(handed) = started else {
+                    panic!(
+                        "precondition: the rebuilt spawn_subagent started its child run; \
+                         delegate output: {}",
+                        result.output
+                    );
+                };
+                let Some(handed) = handed else {
+                    panic!(
+                        "in a session owned by user:alice the rebuilt spawn_subagent must hand \
+                         its child the owner's plane for {TARGET}; it handed none, so the child \
+                         opens {TARGET}'s shared memory itself; delegate output: {}",
+                        result.output
+                    );
+                };
+                assert_eq!(
+                    handed.principal_scope(),
+                    Some(owner_target_scope()),
+                    "the child runs on the owner's plane for the target, not the caller's"
+                );
+                handed
+                    .store(
+                        "rebuilt-child-key",
+                        "REBUILT-CHILD",
+                        MemoryCategory::Core,
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                assert!(
+                    hop.store.get("rebuilt-child-key").await.unwrap().is_none(),
+                    "the child's write must not reach the shared plane"
+                );
+                assert!(
+                    hop.store
+                        .get_for_principal(&owner_target_scope(), "rebuilt-child-key")
+                        .await
+                        .unwrap()
+                        .is_some(),
+                    "the child's write lands on the owner's plane for the target"
+                );
+            });
+        }
+
+        /// Control: without an owner the child is handed no memory and opens
+        /// the target's own, as the normal registry's child of an unowned
+        /// session does. Binding the owner's route must not reach this case.
+        #[test]
+        fn bounded_rebuilt_spawn_subagent_unowned_child_opens_its_own_memory() {
+            on_deep_stack(async {
+                let hop = hop("spawn_subagent", true, true, |_, _| {}).await;
+                let sink = Arc::new(std::sync::Mutex::new(None));
+                let result = CHILD_MEMORY_SINK
+                    .scope(
+                        Arc::clone(&sink),
+                        run_target(&hop, "spawn_subagent", json!({"prompt": "say hello"})),
+                    )
+                    .await;
+                let started = sink.lock().unwrap().take();
+                let Some(handed) = started else {
+                    panic!(
+                        "precondition: the rebuilt spawn_subagent started its child run; \
+                         delegate output: {}",
+                        result.output
+                    );
+                };
+                assert!(
+                    handed.is_none(),
+                    "an unowned session's child is handed no memory; it was handed one \
+                     scoped to {:?}",
+                    handed.as_ref().map(|memory| memory.principal_scope())
+                );
+            });
+        }
+
+        /// Control: a delegate no entry point bound keeps the config-backed
+        /// child, as the normal registry's `spawn_subagent` does with an empty
+        /// slot. The child reaches the target's configured endpoint.
+        #[test]
+        fn bounded_rebuilt_spawn_subagent_unbound_delegate_keeps_config_backed_child() {
+            on_deep_stack(async {
+                let hop = hop("spawn_subagent", false, false, |_, _| {}).await;
+                let sink = Arc::new(std::sync::Mutex::new(None));
+                let result = CHILD_MEMORY_SINK
+                    .scope(
+                        Arc::clone(&sink),
+                        run_target(&hop, "spawn_subagent", json!({"prompt": "say hello"})),
+                    )
+                    .await;
+                let started = sink.lock().unwrap().is_some();
+                assert!(
+                    started,
+                    "precondition: the rebuilt spawn_subagent started its child run; \
+                     delegate output: {}",
+                    result.output
+                );
+                assert!(
+                    hop.endpoint.connections() >= 1,
+                    "an unbound delegate's child builds {TARGET}'s configured provider; \
+                     delegate output: {}",
+                    result.output
+                );
+                assert!(
+                    hop.providers.seen.lock().is_empty(),
+                    "nothing was bound, so no supplied source is asked"
+                );
+            });
+        }
+    }
+
     /// Test double for `zeroclaw_tools::coding_cli::CodingCliExecutor` used ONLY by
     /// `bounded_delegate_claude_code_...` below. `claude_code` (like the other
     /// coding-CLI tools) shells out to a real external binary via this trait -
