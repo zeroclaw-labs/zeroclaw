@@ -208,6 +208,12 @@ struct NativeThinkingConfig {
     /// body entirely.
     #[serde(skip_serializing_if = "Option::is_none")]
     block_binding: Option<NativeBlockBinding>,
+    /// Set when the request asked for no native thinking but the model
+    /// thinks by default: the config then only carries `block_binding`, and
+    /// the request keeps the streaming, fallback and temperature handling of
+    /// a request without native thinking. Never serialized.
+    #[serde(skip)]
+    implicit: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -362,6 +368,14 @@ pub(crate) fn anthropic_thinking_style(model: &str) -> AnthropicThinkingStyle {
         Some(version) if version >= (4, 7) => AnthropicThinkingStyle::Adaptive,
         _ => AnthropicThinkingStyle::Budget,
     }
+}
+
+/// Whether `model` runs adaptive thinking when the request omits `thinking`.
+/// Claude models numbered 5 or later do (Fable and Mythos always think);
+/// Opus 4.7 and 4.8 run without thinking unless asked, and earlier models
+/// need `enabled`. IDs with no such version are treated as not thinking.
+pub(crate) fn anthropic_thinks_by_default(model: &str) -> bool {
+    claude_model_version(model).is_some_and(|version| version >= (5, 0))
 }
 
 /// `(major, minor)` of the first `claude-<family>-<major>[-<minor>]` token
@@ -904,7 +918,7 @@ impl AnthropicModelProvider {
         model: &str,
         thinking: Option<&NativeThinkingConfig>,
     ) -> Option<Vec<NativeFallbackEntry>> {
-        if thinking.is_some() {
+        if thinking.is_some_and(|config| !config.implicit) {
             return None;
         }
         let filtered: Vec<NativeFallbackEntry> = self
@@ -2508,6 +2522,7 @@ impl AnthropicModelProvider {
                                 budget_tokens: Some(params.budget_tokens),
                                 display: params.display,
                                 block_binding: None,
+                                implicit: false,
                             },
                             self.max_tokens.max(min_required),
                         )
@@ -2518,14 +2533,38 @@ impl AnthropicModelProvider {
                             budget_tokens: None,
                             display: params.display,
                             block_binding: self.adaptive_block_binding(),
+                            implicit: false,
                         },
                         self.max_tokens,
                     ),
                 };
                 (Some(1.0), Some(config), max_tokens)
             }
-            None => (temperature, None, self.max_tokens),
+            None => (
+                temperature,
+                self.implicit_thinking_config(model),
+                self.max_tokens,
+            ),
         }
+    }
+
+    /// For a request with no native thinking to a model that thinks anyway:
+    /// an explicit `adaptive` config, which those models treat the same as an
+    /// omitted one, so the signed blocks they return carry `block_binding`
+    /// when replayed. `None` where this provider sends no binding, or the
+    /// model does not think by default.
+    fn implicit_thinking_config(&self, model: &str) -> Option<NativeThinkingConfig> {
+        if !anthropic_thinks_by_default(model) {
+            return None;
+        }
+        let block_binding = self.adaptive_block_binding()?;
+        Some(NativeThinkingConfig {
+            kind: "adaptive",
+            budget_tokens: None,
+            display: None,
+            block_binding: Some(block_binding),
+            implicit: true,
+        })
     }
 
     /// The `thinking.block_binding` object for an adaptive-thinking request,
@@ -3190,7 +3229,7 @@ impl ModelProvider for AnthropicModelProvider {
                         "max_tokens": effective_max_tokens,
                         "tools_count": tools_count,
                         "tool_choice": tool_choice.as_ref().and_then(|value| value.get("type")).and_then(|value| value.as_str()),
-                        "thinking_enabled": thinking_config.is_some(),
+                        "thinking_enabled": thinking_config.as_ref().is_some_and(|config| !config.implicit),
                     })),
                 "anthropic provider request prepared"
             );
@@ -3198,6 +3237,13 @@ impl ModelProvider for AnthropicModelProvider {
         // Non-streaming: opt into server-side fallback when configured, unless
         // native thinking is active on this request.
         let fallbacks = self.server_fallbacks_for(model, thinking_config.as_ref());
+        // A request that opts into server-side fallback keeps its pre-binding
+        // shape: a fallback target need not think by default.
+        let thinking_config = if fallbacks.is_some() {
+            thinking_config.filter(|config| !config.implicit)
+        } else {
+            thinking_config
+        };
         let mut extra_betas: Vec<&str> = thinking_binding_betas(thinking_config.as_ref()).to_vec();
         if fallbacks.is_some() {
             extra_betas.push(ANTHROPIC_SERVER_FALLBACK_BETA);
@@ -3424,7 +3470,10 @@ impl ModelProvider for AnthropicModelProvider {
             .is_some_and(|config| config.display.is_some());
         let thinking_betas = thinking_binding_betas(thinking_config.as_ref());
 
-        if thinking_config.is_some() && !thinking_display_beta {
+        let native_thinking = thinking_config
+            .as_ref()
+            .is_some_and(|config| !config.implicit);
+        if native_thinking && !thinking_display_beta {
             ::zeroclaw_log::record!(
                 INFO,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -3565,7 +3614,7 @@ impl ModelProvider for AnthropicModelProvider {
                         "max_tokens": effective_max_tokens,
                         "tools_count": tools_count,
                         "tool_choice": tool_choice.as_ref().and_then(|value| value.get("type")).and_then(|value| value.as_str()),
-                        "thinking_enabled": thinking_config.is_some(),
+                        "thinking_enabled": thinking_config.as_ref().is_some_and(|config| !config.implicit),
                         "thinking_display_beta": thinking_display_beta,
                     })),
                 "anthropic streaming provider request prepared"
@@ -10801,6 +10850,7 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"refusal\"},\"usag
                 budget_tokens: Some(1_024),
                 display: Some(ThinkingDisplay::Updates),
                 block_binding: None,
+                implicit: false,
             }),
             fallbacks: None,
         };
@@ -10814,6 +10864,7 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"refusal\"},\"usag
                 budget_tokens: Some(1_024),
                 display: None,
                 block_binding: None,
+                implicit: false,
             }),
             ..request
         };
@@ -11128,6 +11179,7 @@ data: {\"type\":\"message_stop\"}\n\n";
                 budget_tokens: None,
                 display: Some(ThinkingDisplay::Updates),
                 block_binding: None,
+                implicit: false,
             }),
             fallbacks: None,
         };
@@ -11726,5 +11778,160 @@ data: {\"type\":\"message_stop\"}\n\n";
         let (beta, body) = &requests[0];
         assert!(beta.is_none(), "no beta header without the field: {beta:?}");
         assert!(body["thinking"].get("block_binding").is_none());
+    }
+
+    #[test]
+    fn models_that_think_by_default_get_drop_block_without_a_thinking_config() {
+        let provider = AnthropicModelProvider::builder("test").build();
+        for model in [
+            "claude-opus-5-5",
+            "claude-sonnet-5-5",
+            "claude-haiku-5-5",
+            "claude-fable-5-1",
+            "claude-fable-5-2-fast",
+            "claude-opus-5",
+        ] {
+            let (temperature, config, _) = provider.resolve_thinking(None, Some(0.7), model);
+            let config = config.unwrap_or_else(|| panic!("{model} thinks by default"));
+            assert!(config.implicit, "{model}");
+            assert_eq!(
+                serde_json::to_value(&config).expect("serialize"),
+                serde_json::json!({
+                    "type": "adaptive",
+                    "block_binding": {"prefix_mismatch_behavior": "drop_block"}
+                }),
+                "{model}"
+            );
+            assert_eq!(temperature, Some(0.7), "{model}: no forced temperature");
+        }
+    }
+
+    #[test]
+    fn models_that_do_not_think_by_default_keep_no_thinking_config() {
+        let provider = AnthropicModelProvider::builder("test").build();
+        for model in [
+            "claude-opus-4-8",
+            "claude-opus-4-7",
+            "claude-sonnet-4-6",
+            "claude-mythos-preview",
+            "some-other-model",
+        ] {
+            let (_, config, _) = provider.resolve_thinking(None, Some(0.7), model);
+            assert!(config.is_none(), "{model} must keep its request unchanged");
+        }
+        let proxied = AnthropicModelProvider::builder("test")
+            .base_url("https://anthropic-proxy.example")
+            .build();
+        let (_, config, _) = proxied.resolve_thinking(None, Some(0.7), "claude-opus-5-5");
+        assert!(config.is_none(), "a custom uri keeps the pre-beta body");
+    }
+
+    #[tokio::test]
+    async fn chat_without_thinking_config_still_binds_a_model_that_thinks_by_default() {
+        let (addr, server, captured) =
+            spawn_capturing_messages_server(json_reply_with_drops(), SSE_REPLY_WITH_DROPS).await;
+        let provider = binding_test_provider(addr, true);
+        let messages = vec![ChatMessage::user("hello")];
+        let request = ProviderChatRequest {
+            messages: messages.as_slice(),
+            tools: None,
+            thinking: None,
+        };
+        provider
+            .chat(request, "claude-opus-5-5", None)
+            .await
+            .expect("chat succeeds");
+        server.abort();
+        assert_binding_sent(&captured);
+    }
+
+    #[tokio::test]
+    async fn stream_chat_without_thinking_config_still_streams_and_binds() {
+        let (addr, server, captured) =
+            spawn_capturing_messages_server(json_reply_with_drops(), SSE_REPLY_WITH_DROPS).await;
+        let provider = binding_test_provider(addr, true);
+        let messages = vec![ChatMessage::user("hello")];
+        let request = ProviderChatRequest {
+            messages: messages.as_slice(),
+            tools: None,
+            thinking: None,
+        };
+        let events: Vec<_> = provider
+            .stream_chat(
+                request,
+                "claude-sonnet-5-5",
+                None,
+                StreamOptions {
+                    enabled: true,
+                    count_tokens: false,
+                },
+            )
+            .collect()
+            .await;
+        server.abort();
+        assert!(events.iter().all(Result::is_ok), "stream must not error");
+        assert_binding_sent(&captured);
+        let requests = captured.lock().expect("capture lock");
+        assert_eq!(
+            requests[0].1["stream"],
+            serde_json::json!(true),
+            "no native thinking was asked for, so the request must still stream"
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_to_a_model_that_does_not_think_by_default_is_unchanged() {
+        let (addr, server, captured) =
+            spawn_capturing_messages_server(json_reply_with_drops(), SSE_REPLY_WITH_DROPS).await;
+        let provider = binding_test_provider(addr, true);
+        let messages = vec![ChatMessage::user("hello")];
+        let request = ProviderChatRequest {
+            messages: messages.as_slice(),
+            tools: None,
+            thinking: None,
+        };
+        provider
+            .chat(request, "claude-opus-4-8", None)
+            .await
+            .expect("chat succeeds");
+        server.abort();
+        let requests = captured.lock().expect("capture lock");
+        let (beta, body) = &requests[0];
+        assert!(beta.is_none(), "no beta header: {beta:?}");
+        assert!(body.get("thinking").is_none(), "no thinking field: {body}");
+    }
+
+    #[tokio::test]
+    async fn server_fallbacks_keep_their_request_shape_without_a_thinking_config() {
+        let (addr, server, captured) =
+            spawn_capturing_messages_server(json_reply_with_drops(), SSE_REPLY_WITH_DROPS).await;
+        let provider = AnthropicModelProvider::builder("test")
+            .credential(Some("test-key"))
+            .base_url(&format!("http://{addr}"))
+            .thinking_block_binding(true)
+            .server_fallback_models(vec!["claude-opus-4-8".to_string()])
+            .build();
+        let messages = vec![ChatMessage::user("hello")];
+        let request = ProviderChatRequest {
+            messages: messages.as_slice(),
+            tools: None,
+            thinking: None,
+        };
+        provider
+            .chat(request, "claude-opus-5-5", None)
+            .await
+            .expect("chat succeeds");
+        server.abort();
+        let requests = captured.lock().expect("capture lock");
+        let (beta, body) = &requests[0];
+        assert_eq!(
+            body["fallbacks"],
+            serde_json::json!([{"model": "claude-opus-4-8"}])
+        );
+        assert!(
+            body.get("thinking").is_none(),
+            "fallback requests stay unbound: {body}"
+        );
+        assert_eq!(beta.as_deref(), Some(ANTHROPIC_SERVER_FALLBACK_BETA));
     }
 }
