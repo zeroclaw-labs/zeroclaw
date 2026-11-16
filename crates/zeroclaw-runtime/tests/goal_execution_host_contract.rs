@@ -1641,6 +1641,7 @@ enum AnthropicCase {
     MissingTerminalModel,
     CompleteRefusal,
     CompleteHandoff,
+    CompleteHandoffStreamed,
     UnattributedTerminal,
 }
 
@@ -1648,6 +1649,7 @@ struct ExecutionScript {
     parents: VecDeque<String>,
     verifiers: VecDeque<String>,
     steps: Vec<ScriptedStep>,
+    events: Vec<zeroclaw_api::agent::TurnEvent>,
     fault: Option<ScriptedFault>,
 }
 
@@ -1671,11 +1673,51 @@ struct ScriptedLease {
 }
 
 impl ScriptedLease {
-    async fn run_anthropic(case: AnthropicCase) -> anyhow::Result<String> {
+    async fn run_anthropic(&self, case: AnthropicCase) -> anyhow::Result<String> {
         use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method, matchers::path};
+        use zeroclaw_api::attribution::{Attributable, ModelProviderKind, ProviderKind, Role};
+        use zeroclaw_api::model_provider::{ChatRequest, ChatResponse, ModelProvider};
+        use zeroclaw_providers::anthropic::AnthropicModelProvider;
         use zeroclaw_runtime::tools::scoped::{ScopedAssembly, ScopedToolRegistry};
 
+        struct NonStreamingAnthropic(AnthropicModelProvider);
+
+        impl Attributable for NonStreamingAnthropic {
+            fn role(&self) -> Role {
+                Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+            }
+
+            fn alias(&self) -> &str {
+                "test"
+            }
+        }
+
+        #[async_trait]
+        impl ModelProvider for NonStreamingAnthropic {
+            async fn chat_with_system(
+                &self,
+                system: Option<&str>,
+                message: &str,
+                model: &str,
+                temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                self.0
+                    .chat_with_system(system, message, model, temperature)
+                    .await
+            }
+
+            async fn chat(
+                &self,
+                request: ChatRequest<'_>,
+                model: &str,
+                temperature: Option<f64>,
+            ) -> anyhow::Result<ChatResponse> {
+                self.0.chat(request, model, temperature).await
+            }
+        }
+
         let server = MockServer::start().await;
+        let streamed = matches!(case, AnthropicCase::CompleteHandoffStreamed);
         let content = if matches!(case, AnthropicCase::NoHandoff) {
             serde_json::json!([{"type": "text", "text": "done"}])
         } else {
@@ -1685,26 +1727,33 @@ impl ScriptedLease {
             case,
             AnthropicCase::HandoffRefusal | AnthropicCase::CompleteRefusal
         );
-        let mut usage = serde_json::json!({"input_tokens": 50, "output_tokens": 5});
+        let terminal_input = if streamed { 12 } else { 50 };
+        let mut usage = serde_json::json!({"input_tokens": terminal_input, "output_tokens": 5});
         if matches!(
             case,
             AnthropicCase::MissingTerminalModel
                 | AnthropicCase::CompleteRefusal
                 | AnthropicCase::CompleteHandoff
+                | AnthropicCase::CompleteHandoffStreamed
                 | AnthropicCase::UnattributedTerminal
         ) {
             let terminal = if matches!(
                 case,
-                AnthropicCase::CompleteRefusal | AnthropicCase::CompleteHandoff
+                AnthropicCase::CompleteRefusal
+                    | AnthropicCase::CompleteHandoff
+                    | AnthropicCase::CompleteHandoffStreamed
             ) {
-                serde_json::json!({"type": "fallback_message", "model": "model-b", "input_tokens": 50, "output_tokens": 5})
+                serde_json::json!({"type": "fallback_message", "model": "model-b", "input_tokens": terminal_input, "output_tokens": 5})
             } else {
                 serde_json::json!({"type": "fallback_message"})
             };
-            usage["iterations"] = serde_json::json!([
-                {"type": "message", "model": "model-a", "input_tokens": 100, "output_tokens": 10},
-                terminal
-            ]);
+            let first = if streamed {
+                serde_json::json!({"type": "message", "model": "model-a", "input_tokens": 10,
+                    "cache_read_input_tokens": 4, "cache_creation_input_tokens": 1, "output_tokens": 2})
+            } else {
+                serde_json::json!({"type": "message", "model": "model-a", "input_tokens": 100, "output_tokens": 10})
+            };
+            usage["iterations"] = serde_json::json!([first, terminal]);
         }
         let mut response_body = serde_json::json!({
             "model": "model-b",
@@ -1721,11 +1770,16 @@ impl ScriptedLease {
             .expect(1)
             .mount(&server)
             .await;
-        let provider = zeroclaw_providers::anthropic::AnthropicModelProvider::builder("test")
+        let provider = AnthropicModelProvider::builder("test")
             .credential(Some("test-key"))
             .base_url(&server.uri())
             .server_fallback_models(vec!["model-b".to_owned()])
             .build();
+        let provider: Box<dyn ModelProvider> = if streamed {
+            Box::new(NonStreamingAnthropic(provider))
+        } else {
+            Box::new(provider)
+        };
         let config = Config::default();
         let security = Arc::new(zeroclaw_runtime::security::SecurityPolicy::default());
         let tools = ScopedToolRegistry::assemble(ScopedAssembly {
@@ -1748,7 +1802,7 @@ impl ScriptedLease {
         .registry;
         let directory = tempfile::tempdir()?;
         let mut agent = zeroclaw_runtime::agent::Agent::builder()
-            .model_provider(Box::new(provider))
+            .model_provider(provider)
             .tools(tools)
             .exclude_memory(true)
             .observer(Arc::new(zeroclaw_runtime::observability::NoopObserver {}))
@@ -1759,7 +1813,18 @@ impl ScriptedLease {
             .model_name("model-a".to_owned())
             .model_provider_name("primary".to_owned())
             .build()?;
-        agent.turn("work on the goal").await
+        if streamed {
+            let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(64);
+            let result = agent
+                .turn_streamed("work on the goal", event_tx, None)
+                .await
+                .map(|(response, _)| response);
+            self.script.lock().unwrap().events =
+                std::iter::from_fn(|| event_rx.try_recv().ok()).collect();
+            result
+        } else {
+            agent.turn("work on the goal").await
+        }
     }
 
     async fn pause(&self, scope: &GoalExecutionScope) {
@@ -1982,7 +2047,7 @@ impl GoalSessionExecutionLease for ScriptedLease {
                     .await?;
             }
             Some(ScriptedFault::ParentAnthropic(case)) => {
-                return Self::run_anthropic(case).await;
+                return self.run_anthropic(case).await;
             }
             Some(ScriptedFault::CorruptLedgerAfterParent) => {
                 use std::io::Write as _;
@@ -2072,6 +2137,15 @@ impl GoalSessionExecutionLease for ScriptedLease {
         };
         match fault {
             Some(ScriptedFault::PauseDuringVerifier) => self.pause(scope).await,
+            Some(ScriptedFault::ParentAnthropic(AnthropicCase::CompleteHandoffStreamed)) => {
+                let accounting = zeroclaw_goal::accounting::GOAL_OPERATION_ACCOUNTING
+                    .try_with(Clone::clone)?
+                    .expect("fixture requires Goal accounting");
+                accounting
+                    .admit(GoalOperationRequest::new("primary", "model-a"))
+                    .await?;
+                accounting.release_unstarted().await?;
+            }
             Some(ScriptedFault::VerifierAccountingFailure) => {
                 return Err(Self::accounting_error());
             }
@@ -2312,6 +2386,7 @@ impl EngineFixture {
                 parents: parents.iter().map(|text| (*text).to_owned()).collect(),
                 verifiers: verifiers.iter().map(|text| (*text).to_owned()).collect(),
                 steps: Vec::new(),
+                events: Vec::new(),
                 fault,
             })),
             control_db: directory.path().join("control/control_plane.db"),
@@ -3342,6 +3417,7 @@ async fn engine_classifies_real_anthropic_fallback_accounting() {
         AnthropicCase::MissingTerminalModel,
         AnthropicCase::CompleteRefusal,
         AnthropicCase::CompleteHandoff,
+        AnthropicCase::CompleteHandoffStreamed,
         AnthropicCase::UnattributedTerminal,
     ] {
         let mut fixture = EngineFixture::new(
@@ -3370,6 +3446,8 @@ async fn engine_classifies_real_anthropic_fallback_accounting() {
             HashMap::from([
                 ("model-a.input".to_owned(), 1.0),
                 ("model-a.output".to_owned(), 2.0),
+                ("model-a.cached_input".to_owned(), 0.5),
+                ("model-a.cache_write".to_owned(), 1.5),
                 ("model-b.input".to_owned(), 3.0),
                 ("model-b.output".to_owned(), 4.0),
                 ("(unattributed).input".to_owned(), 99.0),
@@ -3382,19 +3460,28 @@ async fn engine_classifies_real_anthropic_fallback_accounting() {
                 Arc::clone(&tracker),
                 "main",
                 Arc::new(
-                    zeroclaw_runtime::goal_accounting::ModelProviderGoalUsagePricer::new(pricing),
+                    zeroclaw_runtime::goal_accounting::ModelProviderGoalUsagePricer::new(
+                        Arc::clone(&pricing),
+                    ),
                 ),
             )
             .unwrap(),
         );
-        let result = fixture
-            .runtime
-            .execution_engine(factory)
-            .run(
-                &host_settings(&fixture.config),
-                fixture.request.take().unwrap(),
-            )
-            .await;
+        let streamed = matches!(case, AnthropicCase::CompleteHandoffStreamed);
+        let engine = fixture.runtime.execution_engine(factory);
+        let settings = host_settings(&fixture.config);
+        let request = fixture.request.take().unwrap();
+        let result = if streamed {
+            use zeroclaw_runtime::agent::cost::{
+                TOOL_LOOP_COST_TRACKING_CONTEXT, ToolLoopCostTrackingContext,
+            };
+            let context = ToolLoopCostTrackingContext::new(Arc::clone(&tracker), pricing);
+            TOOL_LOOP_COST_TRACKING_CONTEXT
+                .scope(Some(context), engine.run(&settings, request))
+                .await
+        } else {
+            engine.run(&settings, request).await
+        };
         let steps = fixture.steps();
         assert_eq!(
             steps
@@ -3405,13 +3492,17 @@ async fn engine_classifies_real_anthropic_fallback_accounting() {
         );
         let complete_refusal = matches!(case, AnthropicCase::CompleteRefusal);
         let no_handoff = matches!(case, AnthropicCase::NoHandoff);
-        let complete_handoff = matches!(case, AnthropicCase::CompleteHandoff);
+        let complete_handoff = matches!(
+            case,
+            AnthropicCase::CompleteHandoff | AnthropicCase::CompleteHandoffStreamed
+        );
         let unattributed = matches!(case, AnthropicCase::UnattributedTerminal);
         let chain = matches!(
             case,
             AnthropicCase::MissingTerminalModel
                 | AnthropicCase::CompleteRefusal
                 | AnthropicCase::CompleteHandoff
+                | AnthropicCase::CompleteHandoffStreamed
                 | AnthropicCase::UnattributedTerminal
         );
         if !no_handoff && !complete_handoff {
@@ -3468,7 +3559,13 @@ async fn engine_classifies_real_anthropic_fallback_accounting() {
                 .get_strict_usage_totals_for_task_with_pricing(fixture.scope.task_id())
                 .unwrap()
                 .0,
-            if chain { 165 } else { 55 }
+            if streamed {
+                34
+            } else if chain {
+                165
+            } else {
+                55
+            }
         );
         let ledger = std::fs::read_to_string(&fixture.driver.ledger_file).unwrap();
         let rows: Vec<zeroclaw_config::cost::types::CostRecord> = ledger
@@ -3483,10 +3580,10 @@ async fn engine_classifies_real_anthropic_fallback_accounting() {
         );
         if chain {
             assert_eq!(rows[0].usage.model, "model-a");
-            assert_eq!(rows[0].usage.total_tokens, 110);
+            assert_eq!(rows[0].usage.total_tokens, if streamed { 17 } else { 110 });
         }
         let terminal = rows.last().unwrap();
-        assert_eq!(terminal.usage.total_tokens, 55);
+        assert_eq!(terminal.usage.total_tokens, if streamed { 17 } else { 55 });
         assert_eq!(
             terminal.usage.model,
             if no_handoff {
@@ -3504,9 +3601,68 @@ async fn engine_classifies_real_anthropic_fallback_accounting() {
         } else {
             assert!(terminal.usage.pricing_available);
         }
-        if complete_handoff {
+        if complete_handoff && !streamed {
             assert!((rows[0].usage.cost_usd - 0.00012).abs() < 1e-12);
             assert!((terminal.usage.cost_usd - 0.00017).abs() < 1e-12);
+        }
+        if streamed {
+            assert!(rows.iter().all(|row| {
+                row.task_id.as_deref() == Some(fixture.scope.task_id())
+                    && row.provider_ref.as_deref() == Some("primary")
+            }));
+            assert_eq!(rows[0].usage.input_tokens, 15);
+            assert_eq!(rows[0].usage.cached_input_tokens, 4);
+            assert_eq!(rows[0].usage.cache_creation_input_tokens, 1);
+            assert!((rows[0].usage.cost_usd - 0.000_017_5).abs() < 1e-12);
+            assert!((terminal.usage.cost_usd - 0.000_056).abs() < 1e-12);
+
+            let script = fixture.driver.script.lock().unwrap();
+            let usage: Vec<_> = script
+                .events
+                .iter()
+                .filter_map(|event| match event {
+                    zeroclaw_api::agent::TurnEvent::Usage {
+                        provider_ref,
+                        model,
+                        input_tokens,
+                        output_tokens,
+                        cost_usd,
+                        accepted,
+                        ..
+                    } => Some((
+                        provider_ref,
+                        model,
+                        *input_tokens,
+                        *output_tokens,
+                        *cost_usd,
+                        *accepted,
+                    )),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(usage.len(), 2);
+            assert_eq!(
+                (
+                    usage[0].0.as_str(),
+                    usage[0].1.as_str(),
+                    usage[0].2,
+                    usage[0].3,
+                    usage[0].5
+                ),
+                ("primary", "model-a", Some(15), Some(2), false)
+            );
+            assert_eq!(
+                (
+                    usage[1].0.as_str(),
+                    usage[1].1.as_str(),
+                    usage[1].2,
+                    usage[1].3,
+                    usage[1].5
+                ),
+                ("primary", "model-b", Some(12), Some(5), true)
+            );
+            assert!((usage[0].4.unwrap() - rows[0].usage.cost_usd).abs() < 1e-12);
+            assert!((usage[1].4.unwrap() - terminal.usage.cost_usd).abs() < 1e-12);
         }
     }
 }
