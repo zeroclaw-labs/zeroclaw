@@ -1420,6 +1420,7 @@ pub async fn list_http_credentials(
             Json(serde_json::json!({
                 "encryption_enabled": config.secrets.encrypt,
                 "openbao_write_prefix": crate::openbao_write::configured_prefix(),
+                "openbao_managed_writer": crate::openbao_write::managed_writer(),
                 "credentials": rows.into_iter().map(|(_, row)| row).collect::<Vec<_>>()
             }))
             .into_response()
