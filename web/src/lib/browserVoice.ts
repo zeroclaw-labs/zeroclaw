@@ -3,6 +3,26 @@ import { apiFetch, getProp, putProp } from './api';
 import { getToken } from './auth';
 
 export const voicePlaybackIdle = 'zeroclaw-voice-playback-idle';
+let activeVoicePlayback: SpeechSynthesisUtterance | null = null;
+
+export function voicePlaybackBusy(): boolean {
+  return activeVoicePlayback !== null || window.speechSynthesis.speaking || window.speechSynthesis.pending;
+}
+
+export function playVoice(utterance: SpeechSynthesisUtterance): boolean {
+  if (voicePlaybackBusy()) return false;
+  activeVoicePlayback = utterance;
+  window.speechSynthesis.speak(utterance);
+  return true;
+}
+
+export function releaseVoice(utterance: SpeechSynthesisUtterance, cancel = false) {
+  if (activeVoicePlayback !== utterance) return;
+  if (cancel) window.speechSynthesis.cancel();
+  activeVoicePlayback = null;
+  window.dispatchEvent(new Event(voicePlaybackIdle));
+}
+
 
 export interface VoicePreferences {
   dictation: boolean;

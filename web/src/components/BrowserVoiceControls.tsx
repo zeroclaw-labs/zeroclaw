@@ -4,7 +4,7 @@ import { Mic, MicOff, Volume2, VolumeX } from 'lucide-react';
 import type { ChatMessage } from '@/contexts/AgentContext';
 import { t } from '@/lib/i18n';
 import { speechText } from '@/lib/speechText';
-import { voicePlaybackIdle, useGlobalVoiceTimeout, readGlobalVoiceTimeout, localRecognitionStatus, recognitionConstructor, shortPressAction, useBrowserVoices, useVoicePreferences, type Recognition } from '@/lib/browserVoice';
+import { playVoice, releaseVoice, voicePlaybackBusy, voicePlaybackIdle, useGlobalVoiceTimeout, readGlobalVoiceTimeout, localRecognitionStatus, recognitionConstructor, shortPressAction, useBrowserVoices, useVoicePreferences, type Recognition } from '@/lib/browserVoice';
 
 const readableMessage = (message: ChatMessage) => speechText(displayMessageText(message));
 
@@ -30,7 +30,6 @@ export default function BrowserVoiceControls({ messages, hydrated, typing, onTra
     window.addEventListener(voicePlaybackIdle, idle);
     return () => window.removeEventListener(voicePlaybackIdle, idle);
   }, []);
-  const playbackIdle = () => window.dispatchEvent(new Event(voicePlaybackIdle));
   const [error, setError] = useState('');
   const root = useRef<HTMLDivElement>(null);
   const recognition = useRef<Recognition | null>(null);
@@ -44,7 +43,7 @@ export default function BrowserVoiceControls({ messages, hydrated, typing, onTra
   const stopSpeech = () => {
     if (utterance.current) {
       utterance.current.onend = null; utterance.current.onerror = null;
-      window.speechSynthesis.cancel(); utterance.current = null; playbackIdle();
+      const stopped = utterance.current; utterance.current = null; releaseVoice(stopped, true);
     }
     setSpeaking(false);
   };
@@ -65,15 +64,16 @@ export default function BrowserVoiceControls({ messages, hydrated, typing, onTra
     if (!ready || !prefs.reading || !visible() || recognition.current) return false;
     const voice = voices.find(v => v.voiceURI === prefs.voice);
     if (!voice || !('speechSynthesis' in window)) { setError(t('voice.select_voice')); return false; }
-    if (!utterance.current && (window.speechSynthesis.speaking || window.speechSynthesis.pending)) return false;
+    if (!utterance.current && voicePlaybackBusy()) return false;
     stopSpeech();
     const readable = readableMessage(message);
     if (!readable) return false;
     const next = new SpeechSynthesisUtterance(readable);
     next.voice = voice; next.lang = prefs.language; next.rate = prefs.rate;
-    next.onend = () => { utterance.current = null; setSpeaking(false); playbackIdle(); };
-    next.onerror = () => { utterance.current = null; setSpeaking(false); playbackIdle(); setError(t('voice.speech_error')); };
-    utterance.current = next; setSpeaking(true); setError(''); window.speechSynthesis.speak(next);
+    next.onend = () => { utterance.current = null; setSpeaking(false); releaseVoice(next); };
+    next.onerror = () => { utterance.current = null; setSpeaking(false); releaseVoice(next); setError(t('voice.speech_error')); };
+    if (!playVoice(next)) return false;
+    utterance.current = next; setSpeaking(true); setError('');
     return true;
   };
   const replies = messages.filter(m => m.role === 'agent' && !m.toolCall && !m.ephemeral && !m.notice && m.content.trim());
@@ -219,7 +219,14 @@ export default function BrowserVoiceControls({ messages, hydrated, typing, onTra
   const shortPress = () => {
     if (longPressed.current) { longPressed.current = false; return; }
     if (shortPressAction(continuous, speaking) === 'off') { setOverride(false); stopSpeech(); }
-    else if (latest) { stopCapture(); speak(latest); }
+    else if (latest) {
+      stopCapture();
+      if (!utterance.current && 'speechSynthesis' in window && voicePlaybackBusy()) {
+        setError(t('voice.playback_busy'));
+      } else {
+        speak(latest);
+      }
+    }
   };
   const release = () => { if (timer.current) clearTimeout(timer.current); timer.current = null; };
   const css = 'inline-flex h-10 w-10 shrink-0 items-center justify-center touch-manipulation select-none p-2 rounded-lg border border-pc-border hover:bg-pc-hover text-pc-text-secondary disabled:opacity-40';

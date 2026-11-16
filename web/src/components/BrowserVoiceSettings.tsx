@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { t } from '@/lib/i18n';
 import { apiFetch } from '@/lib/api';
 import { Button, Select } from '@/components/ui';
-import { voicePlaybackIdle, useGlobalVoiceTimeout, saveGlobalVoiceTimeout, localRecognitionStatus, recognitionConstructor, saveVoicePreferences, useBrowserVoices, useVoicePreferences, type VoicePreferences } from '@/lib/browserVoice';
+import { playVoice, releaseVoice, voicePlaybackBusy, useGlobalVoiceTimeout, saveGlobalVoiceTimeout, localRecognitionStatus, recognitionConstructor, saveVoicePreferences, useBrowserVoices, useVoicePreferences, type VoicePreferences } from '@/lib/browserVoice';
 
 interface PairedDevice { id: string; name: string | null; device_type: string | null }
 interface DeviceInventory { devices: PairedDevice[]; current_device_id: string | null }
@@ -66,7 +66,7 @@ export default function BrowserVoiceSettings() {
   const [error, setError] = useState('');
   const [installing, setInstalling] = useState(false);
   const sample = useRef<SpeechSynthesisUtterance | null>(null);
-  useEffect(() => () => { if (sample.current) { window.speechSynthesis.cancel(); window.dispatchEvent(new Event(voicePlaybackIdle)); } }, []);
+  useEffect(() => () => { if (sample.current) releaseVoice(sample.current, true); }, []);
   useEffect(() => {
     let active = true;
     if (!currentDevice) { setLocalStatus('unavailable'); return; }
@@ -187,13 +187,14 @@ export default function BrowserVoiceSettings() {
             onBlur={e => commitRate(e.currentTarget.valueAsNumber)} />
         </label>
         {currentDevice && <Button size="sm" disabled={!prefs.voice || !voices.some(v => v.voiceURI === prefs.voice)} onClick={() => {
+          if (voicePlaybackBusy()) { setError(t('voice.playback_busy')); return; }
+          setError('');
           const utterance = new SpeechSynthesisUtterance(t('voice.sample_text'));
           utterance.voice = voices.find(v => v.voiceURI === prefs.voice) || null;
           utterance.lang = prefs.language; utterance.rate = prefs.rate;
-          sample.current = utterance;
-          utterance.onend = () => { sample.current = null; window.dispatchEvent(new Event(voicePlaybackIdle)); };
-          utterance.onerror = () => { sample.current = null; window.dispatchEvent(new Event(voicePlaybackIdle)); setError(t('voice.speech_error')); };
-          window.speechSynthesis.speak(utterance);
+          utterance.onend = () => { sample.current = null; releaseVoice(utterance); };
+          utterance.onerror = () => { sample.current = null; releaseVoice(utterance); setError(t('voice.speech_error')); };
+          if (playVoice(utterance)) sample.current = utterance;
         }}>{t('voice.sample')}</Button>}
         <label><input type="checkbox" checked={prefs.automatic} onChange={e => update({ automatic: e.target.checked })} /> {t('voice.automatic')}</label>
         <p className="text-pc-text-muted">{t('voice.gesture')}</p>
