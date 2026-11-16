@@ -1901,6 +1901,12 @@ pub(crate) fn cron_list_tool(
 /// `cron::get_job_for_agent(.., &self.agent_alias)` and then EXECUTES it, so
 /// a `Bounded` cross-profile target reusing the caller's instance could fire
 /// the caller's jobs, which run under the identity stored on the job.
+///
+/// `binding` is the capabilities the registry being built runs on. A job
+/// this tool launches resolves its providers, memory and tools through them,
+/// as it does from a registry `RuntimeCapabilities::prepare_registry` bound;
+/// `None` leaves the slot empty, which is the config-backed behavior of an
+/// unbound registry.
 pub(crate) fn cron_run_tool(
     config: Arc<zeroclaw_config::schema::Config>,
     security: Arc<SecurityPolicy>,
@@ -1908,15 +1914,20 @@ pub(crate) fn cron_run_tool(
     runtime: Arc<dyn RuntimeAdapter>,
     caller_ceiling: Option<caller_ceiling::CallerCeiling>,
     execution_capability: Option<AgentExecutionCapability>,
+    binding: Option<&crate::composition::BoundCapabilities>,
 ) -> Arc<dyn Tool> {
-    Arc::new(CronRunTool::new_with_runtime_and_capability(
+    let tool = CronRunTool::new_with_runtime_and_capability(
         config,
         security,
         agent_alias.to_string(),
         runtime,
         caller_ceiling,
         execution_capability,
-    ))
+    );
+    if let Some(binding) = binding {
+        let _ = tool.capabilities_slot().set(binding.clone());
+    }
+    Arc::new(tool)
 }
 
 /// Rebuilds `cron_runs` bound to `agent_alias` - unconditional in production.
@@ -1966,22 +1977,31 @@ pub(crate) fn schedule_tool(
 /// a fresh registry assembled from the
 /// recipient's own full risk profile unless bound — a bounded sender must not
 /// be able to hand a peer's turn more than its own sealed ceiling.
+///
+/// `binding` is the capabilities and principal the registry being built runs
+/// on; the recipient's turn resolves through them, as it does from a registry
+/// `RuntimeCapabilities::prepare_registry` bound. The slot is read before the
+/// turn is detached, so the binding outlives the sender's turn. `None` leaves
+/// the slot empty, which is the config-backed behavior of an unbound registry.
 pub(crate) fn send_message_to_peer_tool(
     config: Arc<zeroclaw_config::schema::Config>,
     agent_alias: &str,
     live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
     execution_capability: Option<AgentExecutionCapability>,
     caller_ceiling: Option<caller_ceiling::CallerCeiling>,
+    binding: Option<&crate::composition::BoundCapabilities>,
 ) -> Arc<dyn Tool> {
-    Arc::new(
-        SendMessageToPeerTool::new_with_live_config_and_capability(
-            config,
-            agent_alias.to_string(),
-            live_config,
-            execution_capability,
-        )
-        .with_caller_ceiling(caller_ceiling),
+    let tool = SendMessageToPeerTool::new_with_live_config_and_capability(
+        config,
+        agent_alias.to_string(),
+        live_config,
+        execution_capability,
     )
+    .with_caller_ceiling(caller_ceiling);
+    if let Some(binding) = binding {
+        let _ = tool.capabilities_slot().set(binding.clone());
+    }
+    Arc::new(tool)
 }
 
 /// Rebuilds `spawn_subagent` bound to `agent_alias`/`security` -
@@ -1999,6 +2019,16 @@ pub(crate) fn send_message_to_peer_tool(
 /// delegation already passes when building a target's own registry
 /// (`delegate.rs`'s `independent` branch) - `Bounded` delegation is not
 /// itself a "subagent" in the depth-1-cap sense this flag guards.
+///
+/// `binding` is the capabilities and principal the registry being built runs
+/// on; the child run resolves through them, as it does from a registry
+/// `RuntimeCapabilities::prepare_registry` bound. `None` leaves the slot
+/// empty, which is the config-backed behavior of an unbound registry.
+///
+/// `session_memory` is the route of the registry the tool is built for, and
+/// it must be that registry's own: once pinned to an owner's plane for
+/// `agent_alias`, the child runs on that plane; while empty, the child opens
+/// `agent_alias`'s memory itself, as in an unowned session.
 pub(crate) fn spawn_subagent_tool(
     config: Arc<zeroclaw_config::schema::Config>,
     agent_alias: &str,
@@ -2006,13 +2036,18 @@ pub(crate) fn spawn_subagent_tool(
     is_subagent_caller: bool,
     caller_ceiling: Option<Arc<std::sync::OnceLock<Vec<String>>>>,
     execution_capability: Option<AgentExecutionCapability>,
+    binding: Option<&crate::composition::BoundCapabilities>,
+    session_memory: Arc<zeroclaw_tools::session_memory::SessionMemoryRoute>,
 ) -> Arc<dyn Tool> {
-    Arc::new(
-        SpawnSubagentTool::new(config, agent_alias.to_string(), security)
-            .with_caller_ceiling(caller_ceiling)
-            .with_execution_capability(execution_capability)
-            .with_subagent_caller(is_subagent_caller),
-    )
+    let tool = SpawnSubagentTool::new(config, agent_alias.to_string(), security)
+        .with_caller_ceiling(caller_ceiling)
+        .with_execution_capability(execution_capability)
+        .with_subagent_caller(is_subagent_caller)
+        .with_session_memory(session_memory);
+    if let Some(binding) = binding {
+        let _ = tool.capabilities_slot().set(binding.clone());
+    }
+    Arc::new(tool)
 }
 
 /// Rebuilds `claude_code_runner` bound to `security`, gated like

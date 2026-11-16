@@ -5768,6 +5768,13 @@ impl DelegateTool {
                     HashMap::new();
                 let mut target_identity_bound_tools: HashMap<String, Box<dyn Tool>> =
                     HashMap::new();
+                // The session memory route of the target's registry, shared by
+                // the `spawn_subagent` rebuilt below, and the owner's plane for
+                // the target it is pinned to in an owned session.
+                let mut target_session_memory: Option<
+                    Arc<zeroclaw_tools::session_memory::SessionMemoryRoute>,
+                > = None;
+                let mut target_owner_plane: Option<Arc<dyn Memory>> = None;
                 if (needs_workspace_bound_tools || needs_identity_bound_tools)
                     && let Some(root_config) = rebuild_config.as_ref()
                 {
@@ -5922,8 +5929,47 @@ impl DelegateTool {
                             // the bound by escaping to the peer's own full
                             // profile.
                             Some(Arc::clone(&bounded_ceiling)),
+                            // The bounded assembly collects no capability
+                            // slots, so the rebuilt child-starting tools are
+                            // bound here to the binding this hop runs on.
+                            self.capabilities.get(),
                         ))),
                     );
+                    // In an owned session the child of the rebuilt
+                    // `spawn_subagent` runs on the owner's plane for the
+                    // target, as the child of the normal registry's runs on
+                    // the owner's plane for its agent. The route is the
+                    // target's own and is pinned now: nothing pins this
+                    // registry later, and an empty route reads as an unowned
+                    // session. Without an owner it stays empty, as there.
+                    let route =
+                        Arc::new(zeroclaw_tools::session_memory::SessionMemoryRoute::default());
+                    let owned = self.principal_scope.read().is_some();
+                    if owned
+                        && bounded_base_tools
+                            .iter()
+                            .any(|tool| tool.name() == crate::tools::SpawnSubagentTool::NAME)
+                    {
+                        let plane = match target_memory.as_ref() {
+                            Some(memory) => Arc::clone(memory),
+                            None => match self
+                                .memory_for_target_agent(target_config, agent_name)
+                                .await
+                            {
+                                Ok(Some(memory)) => memory,
+                                Ok(None) | Err(_) => {
+                                    return Ok(Self::bounded_tools_refusal(agent_name));
+                                }
+                            },
+                        };
+                        if route
+                            .pin(Arc::clone(&plane), Arc::clone(&target_policy))
+                            .is_err()
+                        {
+                            return Ok(Self::bounded_tools_refusal(agent_name));
+                        }
+                        target_owner_plane = Some(plane);
+                    }
                     target_identity_bound_tools.insert(
                         "spawn_subagent".to_string(),
                         Box::new(ToolArcRef::new(crate::tools::spawn_subagent_tool(
@@ -5933,8 +5979,11 @@ impl DelegateTool {
                             false,
                             Some(Arc::clone(&bounded_ceiling)),
                             self.execution_capability.clone(),
+                            self.capabilities.get(),
+                            Arc::clone(&route),
                         ))),
                     );
+                    target_session_memory = Some(route);
 
                     if let Some(runtime) = self.runtime.as_ref() {
                         let persistent_writes = runtime.has_filesystem_access();
@@ -5983,6 +6032,7 @@ impl DelegateTool {
                                 // cannot be intersected at launch.
                                 Some(Arc::clone(&bounded_ceiling)),
                                 self.execution_capability.clone(),
+                                self.capabilities.get(),
                             ))),
                         );
                         target_identity_bound_tools.insert(
@@ -6625,6 +6675,10 @@ impl DelegateTool {
                         .unwrap_or_default(),
                 );
                 bounded_built.delegate_handle = Some(Arc::clone(&target_parent_tools));
+                // The sealed registry carries the route its rebuilt
+                // `spawn_subagent` shares, as a registry the native factory
+                // built does.
+                bounded_built.session_memory = target_session_memory;
                 // Seal the already-filtered set through the one assembly seam.
                 // The policy is `SecurityPolicy::default()` (no allow/deny
                 // lists), so `assemble`'s built-in filter is a provable identity
@@ -6660,6 +6714,18 @@ impl DelegateTool {
                         0..0,
                     )
                     .await;
+                // In an owned session the sealed registry must hold the
+                // owner's plane for the target: a registry with a
+                // memory-starting tool and no route to that plane would leave
+                // its child work on the shared plane.
+                if let Some(plane) = target_owner_plane.as_ref()
+                    && assembled_bounded
+                        .registry
+                        .check_session_memory_pin(plane)
+                        .is_err()
+                {
+                    return Ok(Self::bounded_tools_refusal(agent_name));
+                }
                 // The sealed set IS the ceiling for everything below this hop:
                 // bounding each level by what the level above actually received
                 // makes the bound narrow monotonically, instead of restating the
@@ -21052,6 +21118,8 @@ target = "memory_recall"
             false,
             None,
             None,
+            None,
+            Arc::new(zeroclaw_tools::session_memory::SessionMemoryRoute::default()),
         );
 
         let result = tool
