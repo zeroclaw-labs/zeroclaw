@@ -533,7 +533,8 @@ impl GoalOperationAccountant {
         };
         let price = price.unwrap_or_else(|| {
             // Keep the observed token lower bound, but do not report a dollar
-            // figure based on an invalid cache-token partition or failed pricing.
+            // figure based on an unknown model, invalid cache-token partition,
+            // or failed pricing.
             GoalUsagePrice {
                 cost_usd: 0.0,
                 unpriced_tokens: input + output,

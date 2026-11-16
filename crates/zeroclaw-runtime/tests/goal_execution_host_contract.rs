@@ -1621,6 +1621,7 @@ enum ScriptedFault {
     SettleIncomplete,
     ParentOutcomeUnknown,
     ParentFallbackOutcomeUnknown,
+    ParentAnthropic(AnthropicCase),
     PauseAfterParentOutcomeUnknown,
     VerifierOutcomeUnknown,
     CorruptLedgerAfterParent,
@@ -1630,6 +1631,17 @@ enum ScriptedFault {
     CorruptTaskAfterContinue,
     AbandonWithBlockedLedger,
     DropSettlement,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum AnthropicCase {
+    Handoff,
+    HandoffRefusal,
+    NoHandoff,
+    MissingTerminalModel,
+    CompleteRefusal,
+    CompleteHandoff,
+    UnattributedTerminal,
 }
 
 struct ExecutionScript {
@@ -1659,6 +1671,97 @@ struct ScriptedLease {
 }
 
 impl ScriptedLease {
+    async fn run_anthropic(case: AnthropicCase) -> anyhow::Result<String> {
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method, matchers::path};
+        use zeroclaw_runtime::tools::scoped::{ScopedAssembly, ScopedToolRegistry};
+
+        let server = MockServer::start().await;
+        let content = if matches!(case, AnthropicCase::NoHandoff) {
+            serde_json::json!([{"type": "text", "text": "done"}])
+        } else {
+            serde_json::json!([{"type": "fallback"}, {"type": "text", "text": "done"}])
+        };
+        let refusal = matches!(
+            case,
+            AnthropicCase::HandoffRefusal | AnthropicCase::CompleteRefusal
+        );
+        let mut usage = serde_json::json!({"input_tokens": 50, "output_tokens": 5});
+        if matches!(
+            case,
+            AnthropicCase::MissingTerminalModel
+                | AnthropicCase::CompleteRefusal
+                | AnthropicCase::CompleteHandoff
+                | AnthropicCase::UnattributedTerminal
+        ) {
+            let terminal = if matches!(
+                case,
+                AnthropicCase::CompleteRefusal | AnthropicCase::CompleteHandoff
+            ) {
+                serde_json::json!({"type": "fallback_message", "model": "model-b", "input_tokens": 50, "output_tokens": 5})
+            } else {
+                serde_json::json!({"type": "fallback_message"})
+            };
+            usage["iterations"] = serde_json::json!([
+                {"type": "message", "model": "model-a", "input_tokens": 100, "output_tokens": 10},
+                terminal
+            ]);
+        }
+        let mut response_body = serde_json::json!({
+            "model": "model-b",
+            "content": content,
+            "stop_reason": if refusal { "refusal" } else { "end_turn" },
+            "usage": usage
+        });
+        if matches!(case, AnthropicCase::UnattributedTerminal) {
+            response_body.as_object_mut().unwrap().remove("model");
+        }
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(response_body))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let provider = zeroclaw_providers::anthropic::AnthropicModelProvider::builder("test")
+            .credential(Some("test-key"))
+            .base_url(&server.uri())
+            .server_fallback_models(vec!["model-b".to_owned()])
+            .build();
+        let config = Config::default();
+        let security = Arc::new(zeroclaw_runtime::security::SecurityPolicy::default());
+        let tools = ScopedToolRegistry::assemble(ScopedAssembly {
+            config: &config,
+            agent_alias: "main",
+            security: &security,
+            built: zeroclaw_runtime::tools::AllToolsResult::from_prebuilt_tools(Vec::new()),
+            skills: &[],
+            runtime: Arc::new(zeroclaw_runtime::platform::NativeRuntime::new()),
+            caller_allowed: None,
+            connect_mcp: false,
+            connect_peripherals: false,
+            exclude_memory: true,
+            acp_delivery: false,
+            list_deferred_mcp_specs: false,
+            emit_assembly_logs: false,
+            mcp_registry: None,
+        })
+        .await
+        .registry;
+        let directory = tempfile::tempdir()?;
+        let mut agent = zeroclaw_runtime::agent::Agent::builder()
+            .model_provider(Box::new(provider))
+            .tools(tools)
+            .exclude_memory(true)
+            .observer(Arc::new(zeroclaw_runtime::observability::NoopObserver {}))
+            .tool_dispatcher(Box::new(
+                zeroclaw_runtime::agent::dispatcher::NativeToolDispatcher,
+            ))
+            .workspace_dir(directory.path().to_path_buf())
+            .model_name("model-a".to_owned())
+            .model_provider_name("primary".to_owned())
+            .build()?;
+        agent.turn("work on the goal").await
+    }
+
     async fn pause(&self, scope: &GoalExecutionScope) {
         assert_eq!(
             self.store
@@ -1877,6 +1980,9 @@ impl GoalSessionExecutionLease for ScriptedLease {
                         events: vec![event("primary", 10, 2), event("fallback", 15, 3)],
                     })
                     .await?;
+            }
+            Some(ScriptedFault::ParentAnthropic(case)) => {
+                return Self::run_anthropic(case).await;
             }
             Some(ScriptedFault::CorruptLedgerAfterParent) => {
                 use std::io::Write as _;
@@ -3199,6 +3305,210 @@ async fn engine_parent_operation_error_keeps_its_classification() {
         fixture.reason().await.as_deref(),
         Some("parent_operation_failed")
     );
+}
+
+#[tokio::test]
+async fn engine_classifies_real_anthropic_fallback_accounting() {
+    use std::collections::HashMap;
+
+    const CHILD_ENV: &str = "ZEROCLAW_GOAL_ANTHROPIC_FALLBACK_TEST_CHILD";
+    if std::env::var_os(CHILD_ENV).is_none() {
+        // The provider's HTTP-client cache is process-wide and must not reuse
+        // connections owned by another test's Tokio runtime.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "engine_classifies_real_anthropic_fallback_accounting",
+                "--test-threads=1",
+                "--nocapture",
+            ])
+            .env(CHILD_ENV, "1")
+            .output()
+            .expect("run isolated Anthropic Goal test");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "isolated test failed: {}\n{stdout}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+
+    for case in [
+        AnthropicCase::Handoff,
+        AnthropicCase::HandoffRefusal,
+        AnthropicCase::NoHandoff,
+        AnthropicCase::MissingTerminalModel,
+        AnthropicCase::CompleteRefusal,
+        AnthropicCase::CompleteHandoff,
+        AnthropicCase::UnattributedTerminal,
+    ] {
+        let mut fixture = EngineFixture::new(
+            &[],
+            &[SCRIPTED_COMPLETE],
+            Some(ScriptedFault::ParentAnthropic(case)),
+        )
+        .await;
+        assert_eq!(
+            fixture
+                .store
+                .update_session_goal_limits(
+                    fixture.scope.task_id(),
+                    fixture.scope.session_id(),
+                    fixture.scope.execution_epoch(),
+                    Some(1_000),
+                    None,
+                )
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+        let (tracker, _) = real_goal_accounting(&fixture);
+        let pricing = Arc::new(HashMap::from([(
+            "primary".to_owned(),
+            HashMap::from([
+                ("model-a.input".to_owned(), 1.0),
+                ("model-a.output".to_owned(), 2.0),
+                ("model-b.input".to_owned(), 3.0),
+                ("model-b.output".to_owned(), 4.0),
+                ("(unattributed).input".to_owned(), 99.0),
+                ("(unattributed).output".to_owned(), 99.0),
+            ]),
+        )]));
+        let factory = Arc::new(
+            zeroclaw_runtime::goal_accounting::RuntimeGoalOperationAccountingFactory::new(
+                fixture.store.clone() as Arc<dyn GoalTaskRegistry>,
+                Arc::clone(&tracker),
+                "main",
+                Arc::new(
+                    zeroclaw_runtime::goal_accounting::ModelProviderGoalUsagePricer::new(pricing),
+                ),
+            )
+            .unwrap(),
+        );
+        let result = fixture
+            .runtime
+            .execution_engine(factory)
+            .run(
+                &host_settings(&fixture.config),
+                fixture.request.take().unwrap(),
+            )
+            .await;
+        let steps = fixture.steps();
+        assert_eq!(
+            steps
+                .iter()
+                .filter(|step| matches!(step, ScriptedStep::Parent(_)))
+                .count(),
+            1
+        );
+        let complete_refusal = matches!(case, AnthropicCase::CompleteRefusal);
+        let no_handoff = matches!(case, AnthropicCase::NoHandoff);
+        let complete_handoff = matches!(case, AnthropicCase::CompleteHandoff);
+        let unattributed = matches!(case, AnthropicCase::UnattributedTerminal);
+        let chain = matches!(
+            case,
+            AnthropicCase::MissingTerminalModel
+                | AnthropicCase::CompleteRefusal
+                | AnthropicCase::CompleteHandoff
+                | AnthropicCase::UnattributedTerminal
+        );
+        if !no_handoff && !complete_handoff {
+            assert!(result.is_err(), "{case:?}");
+            if complete_refusal {
+                assert!(
+                    result
+                        .as_ref()
+                        .unwrap_err()
+                        .downcast_ref::<zeroclaw_api::model_provider::ModelRefusalError>()
+                        .is_some()
+                );
+            }
+            assert_eq!(fixture.task().await.status, TaskStatus::Failed);
+            assert_eq!(
+                fixture.reason().await.as_deref(),
+                Some(if complete_refusal {
+                    "parent_operation_failed"
+                } else {
+                    "accounting_missing_or_invalid"
+                }),
+                "{case:?}"
+            );
+            assert!(
+                !steps
+                    .iter()
+                    .any(|step| matches!(step, ScriptedStep::Verifier(_)))
+            );
+        } else {
+            assert!(result.is_ok(), "{case:?}: {result:?}");
+            assert_eq!(fixture.task().await.status, TaskStatus::Completed);
+            assert!(
+                steps
+                    .iter()
+                    .any(|step| matches!(step, ScriptedStep::Verifier(_)))
+            );
+        }
+        let goal = fixture
+            .store
+            .get_goal_task(fixture.scope.task_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            goal.accounting_state,
+            if no_handoff || complete_handoff || complete_refusal {
+                GoalAccountingState::Complete
+            } else {
+                GoalAccountingState::OutcomeUnknown
+            }
+        );
+        assert_eq!(
+            tracker
+                .get_strict_usage_totals_for_task_with_pricing(fixture.scope.task_id())
+                .unwrap()
+                .0,
+            if chain { 165 } else { 55 }
+        );
+        let ledger = std::fs::read_to_string(&fixture.driver.ledger_file).unwrap();
+        let rows: Vec<zeroclaw_config::cost::types::CostRecord> = ledger
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(rows.len(), if chain { 2 } else { 1 }, "{case:?}");
+        assert!(
+            rows[..rows.len() - 1]
+                .iter()
+                .all(|row| row.usage.pricing_available)
+        );
+        if chain {
+            assert_eq!(rows[0].usage.model, "model-a");
+            assert_eq!(rows[0].usage.total_tokens, 110);
+        }
+        let terminal = rows.last().unwrap();
+        assert_eq!(terminal.usage.total_tokens, 55);
+        assert_eq!(
+            terminal.usage.model,
+            if no_handoff {
+                "model-a"
+            } else if unattributed {
+                "(unattributed)"
+            } else {
+                "model-b"
+            }
+        );
+        if unattributed {
+            assert!(!terminal.usage.pricing_available);
+            assert_eq!(terminal.usage.unpriced_tokens, 55);
+            assert_eq!(terminal.usage.cost_usd, 0.0);
+        } else {
+            assert!(terminal.usage.pricing_available);
+        }
+        if complete_handoff {
+            assert!((rows[0].usage.cost_usd - 0.00012).abs() < 1e-12);
+            assert!((terminal.usage.cost_usd - 0.00017).abs() < 1e-12);
+        }
+    }
 }
 
 #[tokio::test]

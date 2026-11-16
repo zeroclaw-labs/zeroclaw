@@ -7,10 +7,13 @@ use std::sync::{Arc, Mutex};
 /// Returns Some((model_provider, model)) if a switch was requested, None otherwise.
 pub type ModelSwitchCallback = Arc<Mutex<Option<(String, String)>>>;
 
-/// The provider/model and resolved limits that actually served the most recent
-/// LLM call in a tool loop. Written every dispatching iteration so the last
-/// value is the FINAL serving route — including a per-call vision switch that
-/// differs from the turn's selected text route.
+/// The provider/model label and resolved route limits for the most recent LLM
+/// call in a tool loop. Written every dispatching iteration so the last value
+/// reflects the final route, including a per-call vision switch.
+///
+/// After server-side fallback, `model` can name the reported serving model
+/// while `context_limits` remain those of the dispatched route. If the serving
+/// model is not established, `model` retains the route's selected model.
 #[derive(Clone, Debug)]
 pub struct ServedRoute {
     pub provider_name: String,

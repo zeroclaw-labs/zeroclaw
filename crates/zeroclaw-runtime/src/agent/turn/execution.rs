@@ -68,9 +68,8 @@ fn extend_rejected_summaries(out: &mut Vec<SettledAttemptSummary>, attempts: &[A
             input_tokens: billable.usage.input_tokens,
             cached_input_tokens: billable.usage.cached_input_tokens,
             output_tokens: billable.usage.output_tokens,
-            cost_usd: crate::agent::cost::compute_cost_usd(
-                billable.attempt.provider_ref(),
-                billable.attempt.model(),
+            cost_usd: crate::agent::cost::compute_attempt_cost_usd(
+                billable.attempt,
                 billable.usage,
             ),
             accepted: false,
@@ -306,10 +305,14 @@ impl ResolvedModelAccess<'_> {
         let goal_scoped = crate::agent::cost::goal_operation_accounting_is_scoped();
 
         let accepted_route = accounting.accepted_route().cloned();
+        let accepted_attempt = accepted_route.as_ref().and_then(|_| attempts.last());
         let (served_provider, served_model) = accepted_route
             .as_ref()
             .map(|route| (route.provider_ref().to_string(), route.model().to_string()))
             .unwrap_or_else(|| (self.provider_name.to_string(), self.model.to_string()));
+        let (accounted_provider, accounted_model) = accepted_attempt
+            .map(|attempt| (attempt.provider_ref(), attempt.model()))
+            .unwrap_or((&served_provider, &served_model));
         match result {
             Ok(response) => {
                 // A terminal response without final text or tools was billed
@@ -354,14 +357,24 @@ impl ResolvedModelAccess<'_> {
                 // usage and successful response telemetry.
                 let accepted_cost_usd = if goal_scoped {
                     response.usage.as_ref().and_then(|usage| {
-                        crate::agent::cost::compute_cost_usd(&served_provider, &served_model, usage)
+                        accepted_attempt.map_or_else(
+                            || {
+                                crate::agent::cost::compute_cost_usd(
+                                    &served_provider,
+                                    &served_model,
+                                    usage,
+                                )
+                            },
+                            |attempt| crate::agent::cost::compute_attempt_cost_usd(attempt, usage),
+                        )
                     })
                 } else {
                     response.usage.as_ref().and_then(|usage| {
-                        crate::agent::cost::record_tool_loop_cost_usage(
-                            &served_provider,
-                            &served_model,
+                        crate::agent::cost::record_accepted_attempt_cost_usage(
+                            accounted_provider,
+                            accounted_model,
                             usage,
+                            accepted_attempt,
                         )
                         .map(|(_, cost_usd)| cost_usd)
                     })
@@ -370,8 +383,8 @@ impl ResolvedModelAccess<'_> {
                 // terminal identity stays coherent); the caller emits it with
                 // `accepted: true`.
                 settled_out.push(SettledAttemptSummary {
-                    provider_ref: served_provider,
-                    model: served_model,
+                    provider_ref: accounted_provider.to_string(),
+                    model: accounted_model.to_string(),
                     input_tokens: response.usage.as_ref().and_then(|usage| usage.input_tokens),
                     cached_input_tokens: response
                         .usage
@@ -1336,6 +1349,603 @@ mod run_model_query_tests {
         }
         assert!(ordinary_root.path().join("state/costs.jsonl").exists());
         assert!(!goal_root.path().join("state/costs.jsonl").exists());
+    }
+
+    #[tokio::test]
+    async fn run_model_query_prices_anthropic_fallback_attempts_by_attribution() {
+        if super::super::run_anthropic_test_in_fresh_process(
+            "agent::turn::execution::run_model_query_tests::run_model_query_prices_anthropic_fallback_attempts_by_attribution",
+            "ZEROCLAW_ANTHROPIC_FALLBACK_QUERY_TEST_CHILD",
+        ) {
+            return;
+        }
+
+        use std::collections::HashMap;
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method, matchers::path};
+        use zeroclaw_providers::anthropic::AnthropicModelProvider;
+
+        for attributed in [true, false] {
+            let server = MockServer::start().await;
+            let terminal = if attributed {
+                serde_json::json!({"type": "fallback_message", "model": "model-b", "input_tokens": 50, "output_tokens": 5})
+            } else {
+                serde_json::json!({"type": "fallback_message"})
+            };
+            let mut body = serde_json::json!({
+                "content": [{"type": "text", "text": "done"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 50, "output_tokens": 5, "iterations": [
+                    {"type": "message", "model": "model-a", "input_tokens": 100, "output_tokens": 10},
+                    terminal
+                ]}
+            });
+            if attributed {
+                body["model"] = serde_json::json!("model-b");
+            }
+            Mock::given(method("POST"))
+                .and(path("/v1/messages"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(body))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let provider = AnthropicModelProvider::builder("test")
+                .credential(Some("test-key"))
+                .base_url(&server.uri())
+                .server_fallback_models(vec!["model-b".to_string()])
+                .build();
+            let workspace = tempfile::TempDir::new().unwrap();
+            let tracker = Arc::new(
+                crate::cost::CostTracker::new(
+                    zeroclaw_config::schema::CostConfig::default(),
+                    workspace.path(),
+                )
+                .unwrap(),
+            );
+            let ctx = ToolLoopCostTrackingContext::new(
+                tracker,
+                Arc::new(HashMap::from([(
+                    "anthropic.test".to_string(),
+                    HashMap::from([
+                        ("model-a.input".to_string(), 1.0),
+                        ("model-a.output".to_string(), 2.0),
+                        ("model-b.input".to_string(), 3.0),
+                        ("model-b.output".to_string(), 4.0),
+                        ("(unattributed).input".to_string(), 99.0),
+                        ("(unattributed).output".to_string(), 99.0),
+                    ]),
+                )])),
+            );
+            let turn_usage = Arc::clone(&ctx.turn_usage);
+            let messages = [ChatMessage::user("hello")];
+            let mut summaries = Vec::new();
+            TOOL_LOOP_COST_TRACKING_CONTEXT
+                .scope(Some(ctx), async {
+                    ResolvedModelAccess {
+                        model_provider: &provider,
+                        provider_name: "anthropic.test",
+                        model: "model-a",
+                        dispatch_model: "model-a",
+                        temperature: None,
+                    }
+                    .run_model_query(
+                        ChatRequest {
+                            messages: &messages,
+                            tools: None,
+                            thinking: None,
+                        },
+                        &mut summaries,
+                    )
+                    .await
+                })
+                .await
+                .expect("fallback response");
+            assert_eq!(summaries.len(), 2);
+            assert_eq!(summaries[0].model, "model-a");
+            assert!(!summaries[0].accepted);
+            assert!((summaries[0].cost_usd.unwrap() - 120.0 / 1_000_000.0).abs() < 1e-12);
+            assert_eq!(
+                summaries[1].model,
+                if attributed {
+                    "model-b"
+                } else {
+                    "(unattributed)"
+                }
+            );
+            assert!(summaries[1].accepted);
+            let expected = if attributed { 170.0 / 1_000_000.0 } else { 0.0 };
+            assert!((summaries[1].cost_usd.unwrap() - expected).abs() < 1e-12);
+            let usage = *turn_usage.lock();
+            assert_eq!(
+                (
+                    usage.input_tokens,
+                    usage.output_tokens,
+                    usage.last_input_tokens
+                ),
+                (150, 15, 50)
+            );
+            assert!((usage.cost_usd - (120.0 / 1_000_000.0 + expected)).abs() < 1e-12);
+            let ledger =
+                std::fs::read_to_string(workspace.path().join("state").join("costs.jsonl"))
+                    .expect("persisted cost ledger");
+            let rows: Vec<zeroclaw_config::cost::types::CostRecord> = ledger
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0].usage.model, "model-a");
+            assert_eq!(rows[0].usage.total_tokens, 110);
+            assert_eq!(
+                rows[1].usage.model,
+                if attributed {
+                    "model-b"
+                } else {
+                    "(unattributed)"
+                }
+            );
+            assert_eq!(rows[1].usage.total_tokens, 55);
+            assert_eq!(rows[1].usage.pricing_available, attributed);
+            assert_eq!(
+                rows[1].usage.unpriced_tokens,
+                if attributed { 0 } else { 55 }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn goal_anthropic_fallback_settles_per_model_and_fences_uncertainty() {
+        if super::super::run_anthropic_test_in_fresh_process(
+            "agent::turn::execution::run_model_query_tests::goal_anthropic_fallback_settles_per_model_and_fences_uncertainty",
+            "ZEROCLAW_GOAL_ANTHROPIC_SETTLEMENT_TEST_CHILD",
+        ) {
+            return;
+        }
+
+        use std::collections::HashMap;
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method, matchers::path};
+        use zeroclaw_goal::accounting::{GoalOperationAccountingFactory, GoalOperationRequest};
+        use zeroclaw_goal::{GoalAccountingState, GoalTaskRegistry, GoalTransitionResult};
+        use zeroclaw_providers::anthropic::AnthropicModelProvider;
+
+        // A top-level model without a matching iteration model is priced as B
+        // while remaining unsettled; complete but unpriced usage also fences
+        // the next operation when the Goal has a cost limit.
+        for (
+            terminal_model,
+            top_model,
+            expected_state,
+            refusal,
+            invalid_first,
+            unpriced_terminal,
+        ) in [
+            (
+                Some("model-b"),
+                Some("model-b"),
+                GoalAccountingState::Complete,
+                false,
+                false,
+                false,
+            ),
+            (
+                None,
+                None,
+                GoalAccountingState::OutcomeUnknown,
+                false,
+                false,
+                false,
+            ),
+            (
+                None,
+                Some("model-b"),
+                GoalAccountingState::OutcomeUnknown,
+                false,
+                false,
+                false,
+            ),
+            (
+                Some("model-b"),
+                Some("model-b"),
+                GoalAccountingState::Complete,
+                true,
+                false,
+                false,
+            ),
+            (
+                None,
+                None,
+                GoalAccountingState::OutcomeUnknown,
+                true,
+                false,
+                false,
+            ),
+            (
+                Some("model-b"),
+                Some("model-b"),
+                GoalAccountingState::Invalid,
+                false,
+                true,
+                false,
+            ),
+            (
+                Some("model-b"),
+                Some("model-b"),
+                GoalAccountingState::Complete,
+                false,
+                false,
+                true,
+            ),
+        ] {
+            let server = MockServer::start().await;
+            let mut terminal = serde_json::json!({"type": "fallback_message"});
+            if let Some(model) = terminal_model {
+                terminal["model"] = serde_json::json!(model);
+                terminal["input_tokens"] = serde_json::json!(50);
+                terminal["output_tokens"] = serde_json::json!(5);
+            }
+            let mut first =
+                serde_json::json!({"type": "message", "model": "model-a", "input_tokens": 100});
+            if !invalid_first {
+                first["output_tokens"] = serde_json::json!(10);
+            }
+            let mut body = serde_json::json!({
+                "content": [{"type": "text", "text": "done"}],
+                "stop_reason": if refusal { "refusal" } else { "end_turn" },
+                "usage": {"input_tokens": 50, "output_tokens": 5, "iterations": [
+                    first,
+                    terminal
+                ]}
+            });
+            if let Some(model) = top_model {
+                body["model"] = serde_json::json!(model);
+            }
+            Mock::given(method("POST"))
+                .and(path("/v1/messages"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(body))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let provider = AnthropicModelProvider::builder("test")
+                .credential(Some("test-key"))
+                .base_url(&server.uri())
+                .server_fallback_models(vec!["model-b".to_string()])
+                .build();
+            let (store, _fixture_factory, tracker, scope, directory) =
+                crate::goal_accounting::tests::fixture().await;
+            let mut rates = HashMap::from([
+                ("model-a.input".to_string(), 1.0),
+                ("model-a.output".to_string(), 2.0),
+                ("model-b.input".to_string(), 3.0),
+                ("model-b.output".to_string(), 4.0),
+                ("(unattributed).input".to_string(), 99.0),
+                ("(unattributed).output".to_string(), 99.0),
+            ]);
+            if unpriced_terminal {
+                rates.remove("model-b.input");
+                rates.remove("model-b.output");
+                assert_eq!(
+                    store
+                        .update_session_goal_limits(
+                            scope.task_id(),
+                            scope.session_id(),
+                            scope.execution_epoch(),
+                            None,
+                            Some(10.0),
+                        )
+                        .await
+                        .unwrap(),
+                    GoalTransitionResult::Applied
+                );
+            }
+            let pricing = Arc::new(HashMap::from([("anthropic.test".to_string(), rates)]));
+            let factory = crate::goal_accounting::RuntimeGoalOperationAccountingFactory::new(
+                store.clone() as Arc<dyn GoalTaskRegistry>,
+                Arc::clone(&tracker),
+                "main",
+                Arc::new(crate::goal_accounting::ModelProviderGoalUsagePricer::new(
+                    Arc::clone(&pricing),
+                )),
+            )
+            .unwrap();
+            let accountant = factory.for_scope(scope.clone());
+            let context = ToolLoopCostTrackingContext::new(tracker, pricing);
+            let turn_usage = Arc::clone(&context.turn_usage);
+            let messages = [ChatMessage::user("hello")];
+            let mut summaries = Vec::new();
+            let result = zeroclaw_goal::accounting::GOAL_OPERATION_ACCOUNTING
+                .scope(Some(accountant), async {
+                    TOOL_LOOP_COST_TRACKING_CONTEXT
+                        .scope(Some(context), async {
+                            ResolvedModelAccess {
+                                model_provider: &provider,
+                                provider_name: "anthropic.test",
+                                model: "model-a",
+                                dispatch_model: "model-a",
+                                temperature: None,
+                            }
+                            .run_model_query(
+                                ChatRequest {
+                                    messages: &messages,
+                                    tools: None,
+                                    thinking: None,
+                                },
+                                &mut summaries,
+                            )
+                            .await
+                        })
+                        .await
+                })
+                .await;
+            if refusal {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .downcast_ref::<zeroclaw_api::model_provider::ModelRefusalError>()
+                        .is_some()
+                );
+            } else {
+                assert!(result.is_ok(), "{result:?}");
+            }
+
+            let goal = store.get_goal_task(scope.task_id()).await.unwrap().unwrap();
+            assert_eq!(goal.accounting_state, expected_state);
+            assert!(goal.pending_call_id.is_none());
+            let ledger = std::fs::read_to_string(directory.path().join("state/costs.jsonl"))
+                .expect("Goal ledger");
+            let rows: Vec<zeroclaw_config::cost::types::CostRecord> = ledger
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            assert_eq!(rows.len(), 2, "each attempt must be recorded exactly once");
+            assert!(
+                rows.iter()
+                    .all(|row| row.task_id.as_deref() == Some(scope.task_id()))
+            );
+            assert!(
+                rows.iter()
+                    .all(|row| row.provider_ref.as_deref() == Some("anthropic.test"))
+            );
+            assert_eq!(
+                (rows[0].usage.model.as_str(), rows[0].usage.total_tokens),
+                ("model-a", if invalid_first { 100 } else { 110 })
+            );
+            let terminal_attributed = top_model.is_some();
+            assert_eq!(
+                (rows[1].usage.model.as_str(), rows[1].usage.total_tokens),
+                (
+                    if terminal_attributed {
+                        "model-b"
+                    } else {
+                        "(unattributed)"
+                    },
+                    55
+                )
+            );
+            let terminal_priced = terminal_attributed && !unpriced_terminal;
+            assert_eq!(rows[1].usage.pricing_available, terminal_priced);
+            assert_eq!(
+                rows[1].usage.unpriced_tokens,
+                if terminal_priced { 0 } else { 55 }
+            );
+            let expected_terminal_cost = if terminal_priced { 170.0 / 1e6 } else { 0.0 };
+            let first_ledger_cost = if invalid_first {
+                100.0 / 1e6
+            } else {
+                120.0 / 1e6
+            };
+            assert!((rows[0].usage.cost_usd - first_ledger_cost).abs() < 1e-12);
+            assert!((rows[1].usage.cost_usd - expected_terminal_cost).abs() < 1e-12);
+            assert_eq!(summaries.len(), if invalid_first { 1 } else { 2 });
+            let terminal_summary = summaries.last().unwrap();
+            assert_eq!(terminal_summary.model, rows[1].usage.model);
+            assert!((terminal_summary.cost_usd.unwrap() - expected_terminal_cost).abs() < 1e-12);
+            assert_eq!(terminal_summary.accepted, !refusal);
+            let usage = *turn_usage.lock();
+            assert_eq!(
+                (
+                    usage.input_tokens,
+                    usage.output_tokens,
+                    usage.last_input_tokens
+                ),
+                (
+                    if invalid_first { 50 } else { 150 },
+                    if invalid_first { 5 } else { 15 },
+                    if refusal { 0 } else { 50 }
+                )
+            );
+            let first_projected_cost = if invalid_first { 0.0 } else { 120.0 / 1e6 };
+            assert!(
+                (usage.cost_usd - (first_projected_cost + expected_terminal_cost)).abs() < 1e-12
+            );
+
+            let next = factory.for_scope(scope);
+            let admission = next
+                .admit(GoalOperationRequest::new("anthropic.test", "model-a"))
+                .await;
+            if expected_state == GoalAccountingState::Complete && !unpriced_terminal {
+                admission.expect("complete accounting permits the next operation");
+                next.release_unstarted().await.unwrap();
+            } else {
+                assert!(
+                    admission.is_err(),
+                    "incomplete accounting or pricing must fence the next operation"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn goal_anthropic_handoff_without_iterations_retains_lower_bound_and_fences() {
+        if super::super::run_anthropic_test_in_fresh_process(
+            "agent::turn::execution::run_model_query_tests::goal_anthropic_handoff_without_iterations_retains_lower_bound_and_fences",
+            "ZEROCLAW_GOAL_ANTHROPIC_HANDOFF_TEST_CHILD",
+        ) {
+            return;
+        }
+
+        use std::collections::HashMap;
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method, matchers::path};
+        use zeroclaw_goal::accounting::{GoalOperationAccountingFactory, GoalOperationRequest};
+        use zeroclaw_goal::{GoalAccountingState, GoalTaskRegistry};
+        use zeroclaw_providers::anthropic::AnthropicModelProvider;
+
+        // A handoff proves that an earlier attempt is missing even when the
+        // returned attempt has usage. A response without a handoff is a control.
+        for (handoff, refusal, has_model, foreign) in [
+            (true, false, true, false),
+            (true, true, true, false),
+            (true, false, false, false),
+            (false, false, true, false),
+            (false, false, true, true),
+        ] {
+            let server = MockServer::start().await;
+            let content = if handoff {
+                serde_json::json!([{"type": "fallback"}, {"type": "text", "text": "done"}])
+            } else {
+                serde_json::json!([{"type": "text", "text": "done"}])
+            };
+            let mut body = serde_json::json!({
+                "content": content,
+                "stop_reason": if refusal { "refusal" } else { "end_turn" },
+                "usage": {"input_tokens": 50, "output_tokens": 5}
+            });
+            if has_model {
+                body["model"] = serde_json::json!("model-b");
+            }
+            if foreign {
+                body["usage"]["iterations"] = serde_json::json!([
+                    {"type": "message", "model": "model-a", "input_tokens": 100, "output_tokens": 10},
+                    {"type": "compaction"}
+                ]);
+            }
+            Mock::given(method("POST"))
+                .and(path("/v1/messages"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(body))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let provider = AnthropicModelProvider::builder("test")
+                .credential(Some("test-key"))
+                .base_url(&server.uri())
+                .server_fallback_models(vec!["model-b".to_string()])
+                .build();
+            let (store, _fixture_factory, tracker, scope, directory) =
+                crate::goal_accounting::tests::fixture().await;
+            let pricing = Arc::new(HashMap::from([(
+                "anthropic.test".to_string(),
+                HashMap::from([
+                    ("model-a.input".to_string(), 1.0),
+                    ("model-a.output".to_string(), 2.0),
+                    ("model-b.input".to_string(), 3.0),
+                    ("model-b.output".to_string(), 4.0),
+                    ("(unattributed).input".to_string(), 99.0),
+                    ("(unattributed).output".to_string(), 99.0),
+                ]),
+            )]));
+            let factory = crate::goal_accounting::RuntimeGoalOperationAccountingFactory::new(
+                store.clone() as Arc<dyn GoalTaskRegistry>,
+                Arc::clone(&tracker),
+                "main",
+                Arc::new(crate::goal_accounting::ModelProviderGoalUsagePricer::new(
+                    Arc::clone(&pricing),
+                )),
+            )
+            .unwrap();
+            let accountant = factory.for_scope(scope.clone());
+            let context = ToolLoopCostTrackingContext::new(tracker, pricing);
+            let messages = [ChatMessage::user("hello")];
+            let mut summaries = Vec::new();
+            let result = zeroclaw_goal::accounting::GOAL_OPERATION_ACCOUNTING
+                .scope(Some(accountant), async {
+                    TOOL_LOOP_COST_TRACKING_CONTEXT
+                        .scope(Some(context), async {
+                            ResolvedModelAccess {
+                                model_provider: &provider,
+                                provider_name: "anthropic.test",
+                                model: "model-a",
+                                dispatch_model: "model-a",
+                                temperature: None,
+                            }
+                            .run_model_query(
+                                ChatRequest {
+                                    messages: &messages,
+                                    tools: None,
+                                    thinking: None,
+                                },
+                                &mut summaries,
+                            )
+                            .await
+                        })
+                        .await
+                })
+                .await;
+            if refusal {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .downcast_ref::<zeroclaw_api::model_provider::ModelRefusalError>()
+                        .is_some()
+                );
+            } else {
+                assert!(result.is_ok(), "{result:?}");
+            }
+            let goal = store.get_goal_task(scope.task_id()).await.unwrap().unwrap();
+            assert_eq!(
+                goal.accounting_state,
+                if handoff || foreign {
+                    GoalAccountingState::OutcomeUnknown
+                } else {
+                    GoalAccountingState::Complete
+                }
+            );
+            assert!(goal.pending_call_id.is_none());
+            let ledger =
+                std::fs::read_to_string(directory.path().join("state/costs.jsonl")).unwrap();
+            let rows: Vec<zeroclaw_config::cost::types::CostRecord> = ledger
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            assert_eq!(rows.len(), 1, "the unobserved attempt must not be invented");
+            assert_eq!(rows[0].task_id.as_deref(), Some(scope.task_id()));
+            assert_eq!(rows[0].usage.total_tokens, 55);
+            let expected_model = if foreign {
+                "(unattributed)"
+            } else if !handoff {
+                "model-a"
+            } else if has_model {
+                "model-b"
+            } else {
+                "(unattributed)"
+            };
+            assert_eq!(rows[0].usage.model, expected_model);
+            let attributed = !foreign && (!handoff || has_model);
+            assert_eq!(rows[0].usage.pricing_available, attributed);
+            assert_eq!(
+                rows[0].usage.unpriced_tokens,
+                if attributed { 0 } else { 55 }
+            );
+            let expected_cost = if foreign {
+                0.0
+            } else if !handoff {
+                60.0 / 1e6
+            } else if has_model {
+                170.0 / 1e6
+            } else {
+                0.0
+            };
+            assert!((rows[0].usage.cost_usd - expected_cost).abs() < 1e-12);
+            let next = factory.for_scope(scope);
+            let admission = next
+                .admit(GoalOperationRequest::new("anthropic.test", "model-a"))
+                .await;
+            if handoff || foreign {
+                assert!(
+                    admission.is_err(),
+                    "unsettled handoff must fence the next operation"
+                );
+            } else {
+                admission.expect("single-attempt control must continue");
+                next.release_unstarted().await.unwrap();
+            }
+        }
     }
 
     #[tokio::test]

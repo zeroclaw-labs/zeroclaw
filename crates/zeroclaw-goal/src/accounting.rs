@@ -214,8 +214,8 @@ pub struct GoalUsageEvent {
     pub provider_ref: String,
     pub model: String,
     pub usage: TokenUsage,
-    /// False when token dimensions are retained but malformed cache metadata
-    /// prevents a trustworthy dollar projection.
+    /// False when retained token dimensions cannot be priced reliably because
+    /// cache metadata is malformed or the model identity is unattributed.
     pub priceable: bool,
 }
 
@@ -229,7 +229,7 @@ pub struct GoalOperationSettlement {
 
 impl GoalOperationSettlement {
     /// Reject an apparently complete operation when any event cannot support
-    /// a structurally valid durable usage record or safely priced cache split.
+    /// a structurally valid durable usage record or trustworthy price.
     pub fn normalize(&mut self) {
         use crate::task::GoalAccountingState;
 
