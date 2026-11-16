@@ -3,6 +3,8 @@
 
 #![forbid(unsafe_code)]
 
+use std::future::Future;
+
 /// Private re-export root for macro expansion. External crates must not
 /// reach through here — it exists solely so `spawn!` can expand without
 /// callers needing `tokio`, `tracing`, or `zeroclaw_log` as direct
@@ -13,6 +15,36 @@ pub mod __private {
     pub use ::tokio;
     pub use ::tracing;
     pub use ::zeroclaw_log;
+}
+
+tokio::task_local! {
+    static ACTIVE_PLUGIN_WAKE_DEPTH: u32;
+}
+
+/// Plugin wake-dispatch hops already taken by the current execution lineage.
+///
+/// Returns `0` for root turns and unrelated tasks. Because [`spawn!`] captures
+/// and restores this task-local across every detached Tokio task it creates,
+/// child work launched from inside a woken turn (such as `send_message_to_peer`
+/// recipient turns or background delegations) inherits the parent's hop depth
+/// rather than resetting to a root wake.
+#[must_use]
+pub fn current_plugin_wake_depth() -> u32 {
+    ACTIVE_PLUGIN_WAKE_DEPTH
+        .try_with(|depth| *depth)
+        .unwrap_or(0)
+}
+
+/// Run `future` with `depth` installed as the active plugin wake-dispatch depth.
+///
+/// Passing `0` installs an explicit zero scope, masking any enclosing depth.
+/// Returns the `TaskLocalFuture` directly rather than an `async fn` so large
+/// turn futures are not copied onto an extra coroutine frame in debug builds.
+pub fn scope_plugin_wake_depth<F: Future>(
+    depth: u32,
+    future: F,
+) -> tokio::task::futures::TaskLocalFuture<u32, F> {
+    ACTIVE_PLUGIN_WAKE_DEPTH.scope(depth, future)
 }
 
 /// Stable event name for spawn-lifecycle records emitted by [`spawn!`].
@@ -50,9 +82,12 @@ macro_rules! spawn {
         );
 
         // Wrap the user's future so we can stamp a Complete record when
-        // it resolves. The wrapper is itself `.in_current_span()`d, so
-        // the completion record inherits the same attribution context
-        // the caller had at spawn time.
+        // it resolves, and carry any active plugin wake-dispatch hop depth
+        // into the detached task so spawned child turns cannot reset it.
+        // The wrapper is itself `.in_current_span()`d, so the completion
+        // record inherits the same attribution context the caller had at
+        // spawn time.
+        let __zc_inherited_wake_depth = $crate::current_plugin_wake_depth();
         let __zc_task_started_at = $crate::__private::tokio::time::Instant::now();
         let __zc_task_future = async move {
             let __zc_task_output = { $body }.await;
@@ -75,8 +110,14 @@ macro_rules! spawn {
         };
 
         #[allow(clippy::disallowed_methods)]
-        let __zc_spawn_handle =
-            $crate::__private::tokio::spawn(__zc_task_future.in_current_span());
+        let __zc_spawn_handle = if __zc_inherited_wake_depth == 0 {
+            $crate::__private::tokio::spawn(__zc_task_future.in_current_span())
+        } else {
+            $crate::__private::tokio::spawn(
+                $crate::scope_plugin_wake_depth(__zc_inherited_wake_depth, __zc_task_future)
+                    .in_current_span(),
+            )
+        };
         __zc_spawn_handle
     }};
 }
@@ -163,5 +204,33 @@ mod tests {
             "spawned task lost caller's span; captured stacks: {:?}",
             *events
         );
+    }
+
+    #[tokio::test]
+    async fn spawn_propagates_plugin_wake_depth_and_explicit_zero_masks_parent() {
+        assert_eq!(crate::current_plugin_wake_depth(), 0);
+
+        crate::scope_plugin_wake_depth(2, async {
+            assert_eq!(crate::current_plugin_wake_depth(), 2);
+
+            let inherited = crate::spawn!(async {
+                tokio::task::yield_now().await;
+                crate::current_plugin_wake_depth()
+            })
+            .await
+            .unwrap();
+            assert_eq!(inherited, 2);
+
+            let masked = crate::scope_plugin_wake_depth(0, async {
+                crate::spawn!(async { crate::current_plugin_wake_depth() })
+                    .await
+                    .unwrap()
+            })
+            .await;
+            assert_eq!(masked, 0);
+        })
+        .await;
+
+        assert_eq!(crate::current_plugin_wake_depth(), 0);
     }
 }

@@ -484,9 +484,10 @@ Every call passes five host-owned checks before spawning a turn:
    unpadded 1–64 byte ASCII `[A-Za-z0-9_-]` alias; `prompt` must be non-empty,
    at most 1024 UTF-8 bytes, and free of ASCII control characters other than
    `\n` and `\t`. Violations return `invalid-request`.
-3. **Hop-depth ceiling:** woken turns carry a task-local hop depth capped at
-   `MAX_PLUGIN_WAKE_DEPTH` (`2`), refusing deeper wake chains with
-   `access-denied`.
+3. **Hop-depth ceiling:** woken turns (and detached child tasks they spawn,
+   such as peer-agent messages or background delegations) carry a task-local hop
+   depth capped at `MAX_PLUGIN_WAKE_DEPTH` (`2`), refusing deeper wake chains
+   with `access-denied`.
 4. **Live operator grant:** the runtime reads `plugins.entries.<key>.dispatch_agents`
    and `dispatch_rate_per_min` from live config on every call (default empty
    target list and `30` wakes/min; `"*"` allows any enabled agent). Targets
@@ -494,10 +495,12 @@ Every call passes five host-owned checks before spawning a turn:
    `unknown-agent`.
 5. **Coalescing and rate limit:** wakes for an `(instance, target)` pair already
    running a plugin wake turn coalesce into at most one pending follow-up turn
-   (retaining the latest prompt and caller attribution) without consuming a
-   second budget token. Idle pairs spend from the per-instance continuous token
-   bucket (`rate-limited` when exhausted), admit against `AgentExecutionCapability`,
-   record a durable `TaskRecord`, and run under `InternalPrincipal::PluginTool`.
+   (retaining the latest prompt and caller attribution) without charging an
+   extra token on overwrite; the follow-up re-checks live grants and spends one
+   budget token when drained. Idle pairs spend from the per-instance continuous
+   token bucket (`rate-limited` when exhausted), admit against
+   `AgentExecutionCapability`, record a durable `TaskRecord`, and run under
+   `InternalPrincipal::PluginTool`.
 
 ### `inbound`
 

@@ -12,9 +12,11 @@
 //! - **Budget.** Each instance spends a continuous-refill token bucket at
 //!   `dispatch_rate_per_min`, so a plugin cannot turn one tool call into an
 //!   unbounded stream of agent turns.
-//! - **Depth.** A woken agent's turn can itself run plugin tools that dispatch.
-//!   [`MAX_PLUGIN_WAKE_DEPTH`] caps that recursion, carried in a task-local so a
-//!   detached turn inherits it and an unrelated turn does not.
+//! - **Depth.** A woken agent's turn (and any detached child work it spawns,
+//!   such as `send_message_to_peer` or background delegation) can itself run
+//!   plugin tools that dispatch. [`MAX_PLUGIN_WAKE_DEPTH`] caps that recursion,
+//!   carried in `zeroclaw_spawn`'s task-local so detached child tasks inherit
+//!   it automatically while unrelated turns stay at zero.
 //! - **Coalescing.** A wake targeting an agent already running a plugin turn
 //!   does not start a second turn. It replaces that agent's pending wake, so
 //!   five plugin notifications in a burst cost one extra turn rather than five,
@@ -68,15 +70,6 @@ const MAX_PLUGIN_WAKE_DEPTH: u32 = 2;
 
 const WAKE_SETTLEMENT_RETRY_DELAY: Duration = Duration::from_millis(25);
 const WAKE_SETTLEMENT_MAX_RETRY_DELAY: Duration = Duration::from_secs(5);
-
-tokio::task_local! {
-    /// Plugin dispatch hops already taken by the current turn chain.
-    ///
-    /// A detached turn is a fresh tokio task and therefore does not inherit the
-    /// caller's task-locals, so the wake path installs this explicitly around
-    /// each turn it starts.
-    pub(crate) static PLUGIN_WAKE_DEPTH: u32;
-}
 
 /// One coalesced wake that has not started yet.
 ///
@@ -324,7 +317,7 @@ impl AgentWakeBackend for RuntimeAgentWakeBackend {
             return Err(AgentWakeError::AccessDenied);
         }
 
-        let depth = PLUGIN_WAKE_DEPTH.try_with(|depth| *depth).unwrap_or(0);
+        let depth = zeroclaw_spawn::current_plugin_wake_depth();
         if depth >= MAX_PLUGIN_WAKE_DEPTH {
             return Err(AgentWakeError::AccessDenied);
         }
@@ -563,12 +556,11 @@ impl AgentWakeBackend for RuntimeAgentWakeBackend {
                             ),
                         ),
                     };
-                let result = PLUGIN_WAKE_DEPTH
-                    .scope(
-                        plan.depth,
-                        run_wake_turn_with_panic_recovery(cost_ctx.clone(), turn_usage, turn),
-                    )
-                    .await;
+                let result = zeroclaw_spawn::scope_plugin_wake_depth(
+                    plan.depth,
+                    run_wake_turn_with_panic_recovery(cost_ctx.clone(), turn_usage, turn),
+                )
+                .await;
                 settle_wake_task(&task_store, &plan.task, &result).await;
 
                 // Drain a wake that coalesced while this turn ran. `None` means
@@ -1387,21 +1379,20 @@ mod tests {
             Arc::new(SharedWakeCoordinator::new()),
         );
 
-        let at_ceiling = PLUGIN_WAKE_DEPTH
-            .scope(MAX_PLUGIN_WAKE_DEPTH, async {
-                backend
-                    .wake(&scope(), Some("sender"), "ghost", "recurse")
-                    .await
-            })
-            .await;
+        let at_ceiling = zeroclaw_spawn::scope_plugin_wake_depth(MAX_PLUGIN_WAKE_DEPTH, async {
+            backend
+                .wake(&scope(), Some("sender"), "ghost", "recurse")
+                .await
+        })
+        .await;
         assert_eq!(
             at_ceiling,
             Err(AgentWakeError::AccessDenied),
             "a wake at the hop ceiling is refused"
         );
 
-        let beyond_ceiling = PLUGIN_WAKE_DEPTH
-            .scope(MAX_PLUGIN_WAKE_DEPTH + 7, async {
+        let beyond_ceiling =
+            zeroclaw_spawn::scope_plugin_wake_depth(MAX_PLUGIN_WAKE_DEPTH + 7, async {
                 backend
                     .wake(&scope(), Some("sender"), "ghost", "recurse")
                     .await
@@ -1416,8 +1407,8 @@ mod tests {
         // One hop below the ceiling the depth gate passes, so the same call
         // reaches target resolution: proof the two refusals above came from
         // depth and not from an unrelated check.
-        let below_ceiling = PLUGIN_WAKE_DEPTH
-            .scope(MAX_PLUGIN_WAKE_DEPTH - 1, async {
+        let below_ceiling =
+            zeroclaw_spawn::scope_plugin_wake_depth(MAX_PLUGIN_WAKE_DEPTH - 1, async {
                 backend
                     .wake(&scope(), Some("sender"), "ghost", "recurse")
                     .await
@@ -2321,5 +2312,604 @@ mod tests {
             recipient_summary.session_cost_usd
         );
         server.abort();
+    }
+
+    /// Regression: an authorized cycle of `plugin wake -> peer message ->
+    /// plugin wake` must preserve `PLUGIN_WAKE_DEPTH` across the detached
+    /// `send_message_to_peer` recipient turn rather than resetting to `0` on
+    /// the fresh Tokio task.
+    #[cfg(feature = "plugins-wasm-cranelift")]
+    #[tokio::test]
+    async fn peer_message_turn_preserves_wake_depth_and_stops_cycle_at_ceiling() {
+        use axum::{Json, Router, extract::State, routing::post};
+        use std::path::PathBuf;
+        use std::process::Command;
+        use zeroclaw_config::multi_agent::{AgentAlias, PeerGroupConfig};
+        use zeroclaw_config::policy::AutonomyLevel;
+        use zeroclaw_config::schema::{OpenAIModelProviderConfig, WireApi};
+
+        let fixture_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../zeroclaw-plugins/tests/fixtures/tool-dispatch-fixture");
+        let target_dir =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/tmp/plugin-wake-fixture");
+        let status = Command::new(env!("CARGO"))
+            .current_dir(&fixture_dir)
+            .args([
+                "build",
+                "--locked",
+                "--quiet",
+                "--package",
+                "zeroclaw-tool-dispatch-plugin-fixture",
+                "--target",
+                "wasm32-wasip2",
+                "--target-dir",
+            ])
+            .arg(&target_dir)
+            .status()
+            .expect("run Cargo for the tool dispatch component fixture");
+        assert!(
+            status.success(),
+            "the tool dispatch fixture must build; install the wasm32-wasip2 target"
+        );
+        let wasm =
+            target_dir.join("wasm32-wasip2/debug/zeroclaw_tool_dispatch_plugin_fixture.wasm");
+        assert!(wasm.is_file(), "the fixture WASM was not produced");
+
+        let plugin_root = tempfile::TempDir::new().expect("fixture package root");
+        let plugin_manifest = PluginManifest {
+            name: "tool-dispatch-fixture".to_string(),
+            wasm_path: Some("tool-dispatch-fixture.wasm".to_string()),
+            ..manifest()
+        };
+        let package_dir = plugin_root.path().join(&plugin_manifest.name);
+        std::fs::create_dir_all(&package_dir).expect("fixture package directory");
+        std::fs::copy(&wasm, package_dir.join("tool-dispatch-fixture.wasm"))
+            .expect("copy fixture payload");
+        std::fs::write(
+            package_dir.join("manifest.toml"),
+            toml::to_string(&plugin_manifest).expect("serialize fixture manifest"),
+        )
+        .expect("write fixture manifest");
+
+        #[derive(Clone)]
+        struct CycleState {
+            alpha_calls: Arc<Mutex<u32>>,
+            beta_calls: Arc<Mutex<u32>>,
+            tool_results: Arc<Mutex<Vec<String>>>,
+        }
+
+        async fn scripted_alpha(
+            State(state): State<CycleState>,
+            Json(body): Json<serde_json::Value>,
+        ) -> Json<serde_json::Value> {
+            let messages = body["messages"].as_array().cloned().unwrap_or_default();
+            let has_tool_reply = messages.iter().any(|m| m["role"] == "tool");
+            if has_tool_reply {
+                return Json(serde_json::json!({
+                    "choices": [{"message": {"content": "alpha done"}}]
+                }));
+            }
+            let turn_num = {
+                let mut count = state.alpha_calls.lock();
+                *count += 1;
+                *count
+            };
+            // Bound runaway loops in RED before the fix so the test finishes fast.
+            if turn_num > 4 {
+                return Json(serde_json::json!({
+                    "choices": [{"message": {"content": "alpha safety stop"}}]
+                }));
+            }
+            Json(serde_json::json!({
+                "choices": [{"message": {
+                    "content": "",
+                    "tool_calls": [{
+                        "id": format!("alpha-peer-{turn_num}"),
+                        "type": "function",
+                        "function": {
+                            "name": "send_message_to_peer",
+                            "arguments": serde_json::json!({
+                                "channel": "telegram.prod",
+                                "target": "beta",
+                                "message": format!("hop-{turn_num}")
+                            }).to_string()
+                        }
+                    }]
+                }}]
+            }))
+        }
+
+        async fn scripted_beta(
+            State(state): State<CycleState>,
+            Json(body): Json<serde_json::Value>,
+        ) -> Json<serde_json::Value> {
+            let messages = body["messages"].as_array().cloned().unwrap_or_default();
+            if let Some(tool_msg) = messages.iter().rev().find(|m| m["role"] == "tool") {
+                if let Some(content) = tool_msg["content"].as_str() {
+                    state.tool_results.lock().push(content.to_string());
+                }
+                return Json(serde_json::json!({
+                    "choices": [{"message": {"content": "beta done"}}]
+                }));
+            }
+            let turn_num = {
+                let mut count = state.beta_calls.lock();
+                *count += 1;
+                *count
+            };
+            if turn_num > 4 {
+                return Json(serde_json::json!({
+                    "choices": [{"message": {"content": "beta safety stop"}}]
+                }));
+            }
+            Json(serde_json::json!({
+                "choices": [{"message": {
+                    "content": "",
+                    "tool_calls": [{
+                        "id": format!("beta-wake-{turn_num}"),
+                        "type": "function",
+                        "function": {
+                            "name": "dispatch_fixture",
+                            "arguments": serde_json::json!({
+                                "target": "alpha",
+                                "prompt": format!("wake-alpha-{turn_num}")
+                            }).to_string()
+                        }
+                    }]
+                }}]
+            }))
+        }
+
+        let alpha_calls = Arc::new(Mutex::new(0));
+        let beta_calls = Arc::new(Mutex::new(0));
+        let tool_results = Arc::new(Mutex::new(Vec::new()));
+        let cycle_state = CycleState {
+            alpha_calls: Arc::clone(&alpha_calls),
+            beta_calls: Arc::clone(&beta_calls),
+            tool_results: Arc::clone(&tool_results),
+        };
+
+        let alpha_state = cycle_state.clone();
+        let alpha_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("alpha listener");
+        let alpha_addr = alpha_listener.local_addr().expect("alpha addr");
+        let alpha_server = zeroclaw_spawn::spawn!(async move {
+            let app = Router::new()
+                .route("/chat/completions", post(scripted_alpha))
+                .with_state(alpha_state);
+            axum::serve(alpha_listener, app)
+                .await
+                .expect("alpha mock server");
+        });
+
+        let beta_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("beta listener");
+        let beta_addr = beta_listener.local_addr().expect("beta addr");
+        let beta_server = zeroclaw_spawn::spawn!(async move {
+            let app = Router::new()
+                .route("/chat/completions", post(scripted_beta))
+                .with_state(cycle_state);
+            axum::serve(beta_listener, app)
+                .await
+                .expect("beta mock server");
+        });
+
+        let workspace = tempfile::TempDir::new().expect("temp data dir");
+        let mut config = Config {
+            data_dir: workspace.path().to_path_buf(),
+            config_path: workspace.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.reliability.provider_retries = 0;
+        config.plugins.enabled = true;
+        config.plugins.auto_discover = true;
+        config.plugins.plugins_dir = plugin_root.path().to_string_lossy().into_owned();
+        config.tools.optional = vec!["send_message_to_peer".to_string()];
+
+        let fixture_scope = PluginInstanceScope::for_package_binding(
+            &plugin_manifest,
+            PluginCapability::Tool,
+            [PluginPermission::AgentDispatch],
+        )
+        .expect("fixture scope");
+        let fixture_key = fixture_scope
+            .id()
+            .config_entry_key()
+            .expect("fixture entry key");
+        config.plugins.entries = vec![
+            entry(&instance_key(), &["alpha"], Some(600)),
+            entry(&fixture_key, &["alpha"], Some(600)),
+        ];
+
+        config.risk_profiles.insert(
+            "full".to_string(),
+            RiskProfileConfig {
+                level: AutonomyLevel::Full,
+                ..RiskProfileConfig::default()
+            },
+        );
+        for (alias, addr) in [("alpha", alpha_addr), ("beta", beta_addr)] {
+            config.providers.models.openai.insert(
+                alias.to_string(),
+                OpenAIModelProviderConfig {
+                    base: ModelProviderConfig {
+                        model: Some("mock-model".to_string()),
+                        uri: Some(format!("http://{addr}")),
+                        api_key: Some("fixture-key".to_string()),
+                        wire_api: Some(WireApi::ChatCompletions),
+                        timeout_secs: Some(10),
+                        ..ModelProviderConfig::default()
+                    },
+                },
+            );
+            config.agents.insert(
+                alias.to_string(),
+                AliasedAgentConfig {
+                    enabled: true,
+                    channels: vec!["telegram.prod".into()],
+                    model_provider: format!("openai.{alias}").into(),
+                    risk_profile: "full".into(),
+                    ..AliasedAgentConfig::default()
+                },
+            );
+        }
+        config.peer_groups.insert(
+            "mesh".to_string(),
+            PeerGroupConfig {
+                channel: "telegram".into(),
+                agents: vec![AgentAlias::new("alpha"), AgentAlias::new("beta")],
+                ..PeerGroupConfig::default()
+            },
+        );
+
+        let control_plane =
+            ControlPlaneHandle::open(workspace.path()).expect("isolated control plane");
+        let store = Arc::clone(&control_plane.store);
+        let coordinator = Arc::new(SharedWakeCoordinator::new());
+        let backend = RuntimeAgentWakeBackend::for_tests(
+            Arc::new(config),
+            None,
+            None,
+            Some(control_plane),
+            Arc::clone(&coordinator),
+        );
+
+        // Kick off the cycle:
+        //   wake(alpha) -> alpha runs at depth 1 -> send_message_to_peer(beta)
+        //   -> beta runs at inherited depth 1 -> dispatch_fixture(alpha)
+        //   -> alpha runs at depth 2 -> send_message_to_peer(beta)
+        //   -> beta runs at inherited depth 2 -> dispatch_fixture(alpha)
+        //   -> MUST be refused with access-denied (depth == MAX_PLUGIN_WAKE_DEPTH == 2).
+        assert_eq!(
+            backend
+                .wake(&scope(), Some("seed"), "alpha", "kickoff")
+                .await,
+            Ok(())
+        );
+
+        // Wait until beta has completed its second turn (recording two tool
+        // results from `dispatch_fixture`: first `ok`, second `access-denied`)
+        // and all tasks in `workspace` have settled.
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let results_len = tool_results.lock().len();
+                let alpha_tasks = tasks_for(store.as_ref(), "alpha").await;
+                let beta_tasks = tasks_for(store.as_ref(), "beta").await;
+                let all_settled = !alpha_tasks.is_empty()
+                    && alpha_tasks.iter().all(|t| t.status.is_terminal())
+                    && beta_tasks.len() >= 2
+                    && beta_tasks.iter().all(|t| t.status.is_terminal());
+                if results_len >= 2 && all_settled {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("cycle should reach beta's second turn and settle");
+        await_slots_released(&coordinator).await;
+
+        let alpha_tasks = tasks_for(store.as_ref(), "alpha").await;
+        let results = tool_results.lock().clone();
+
+        alpha_server.abort();
+        beta_server.abort();
+
+        assert_eq!(
+            alpha_tasks.len(),
+            2,
+            "alpha must run at depth 1 and depth 2 only, never beyond MAX_PLUGIN_WAKE_DEPTH: {alpha_tasks:?}"
+        );
+        assert_eq!(
+            alpha_tasks.iter().map(|t| t.depth).collect::<Vec<_>>(),
+            vec![1, 2],
+            "second wake through peer turn must advance depth from 1 to 2 rather than resetting to 1"
+        );
+        assert_eq!(
+            results.len(),
+            2,
+            "beta must invoke dispatch_fixture twice (accepted at depth 1, denied at depth 2): {results:?}"
+        );
+        assert!(
+            results[1].contains("access-denied"),
+            "wake from peer turn at MAX_PLUGIN_WAKE_DEPTH must fail with access-denied, got: {:?}",
+            results
+        );
+    }
+
+    /// Regression: background delegation (`delegate` with `background: true`)
+    /// spawns a detached Tokio task; it must also inherit `PLUGIN_WAKE_DEPTH`
+    /// rather than resetting to `0`.
+    #[cfg(feature = "plugins-wasm-cranelift")]
+    #[tokio::test]
+    async fn background_delegate_turn_preserves_wake_depth_ceiling() {
+        use axum::{Json, Router, extract::State, routing::post};
+        use std::path::PathBuf;
+        use std::process::Command;
+        use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
+        use zeroclaw_config::policy::AutonomyLevel;
+        use zeroclaw_config::schema::{
+            DelegateExecutionMode, DelegateTargetConfig, OpenAIModelProviderConfig,
+            RuntimeProfileConfig, WireApi,
+        };
+
+        let fixture_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../zeroclaw-plugins/tests/fixtures/tool-dispatch-fixture");
+        let target_dir =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/tmp/plugin-wake-fixture");
+        let status = Command::new(env!("CARGO"))
+            .current_dir(&fixture_dir)
+            .args([
+                "build",
+                "--locked",
+                "--quiet",
+                "--package",
+                "zeroclaw-tool-dispatch-plugin-fixture",
+                "--target",
+                "wasm32-wasip2",
+                "--target-dir",
+            ])
+            .arg(&target_dir)
+            .status()
+            .expect("run Cargo for the tool dispatch component fixture");
+        assert!(status.success());
+        let wasm =
+            target_dir.join("wasm32-wasip2/debug/zeroclaw_tool_dispatch_plugin_fixture.wasm");
+
+        let plugin_root = tempfile::TempDir::new().expect("fixture package root");
+        let plugin_manifest = PluginManifest {
+            name: "tool-dispatch-fixture".to_string(),
+            wasm_path: Some("tool-dispatch-fixture.wasm".to_string()),
+            ..manifest()
+        };
+        let package_dir = plugin_root.path().join(&plugin_manifest.name);
+        std::fs::create_dir_all(&package_dir).expect("fixture package directory");
+        std::fs::copy(&wasm, package_dir.join("tool-dispatch-fixture.wasm"))
+            .expect("copy fixture payload");
+        std::fs::write(
+            package_dir.join("manifest.toml"),
+            toml::to_string(&plugin_manifest).expect("serialize fixture manifest"),
+        )
+        .expect("write fixture manifest");
+
+        #[derive(Clone)]
+        struct BgState {
+            worker_tool_results: Arc<Mutex<Vec<String>>>,
+        }
+
+        async fn scripted_leader(Json(body): Json<serde_json::Value>) -> Json<serde_json::Value> {
+            let messages = body["messages"].as_array().cloned().unwrap_or_default();
+            if messages.iter().any(|m| m["role"] == "tool") {
+                return Json(serde_json::json!({
+                    "choices": [{"message": {"content": "leader done"}}]
+                }));
+            }
+            Json(serde_json::json!({
+                "choices": [{"message": {
+                    "content": "",
+                    "tool_calls": [{
+                        "id": "bg-del-1",
+                        "type": "function",
+                        "function": {
+                            "name": "delegate",
+                            "arguments": serde_json::json!({
+                                "agent": "worker",
+                                "prompt": "try waking sink",
+                                "background": true
+                            }).to_string()
+                        }
+                    }]
+                }}]
+            }))
+        }
+
+        async fn scripted_worker(
+            State(state): State<BgState>,
+            Json(body): Json<serde_json::Value>,
+        ) -> Json<serde_json::Value> {
+            let messages = body["messages"].as_array().cloned().unwrap_or_default();
+            if let Some(tool_msg) = messages.iter().rev().find(|m| m["role"] == "tool") {
+                if let Some(content) = tool_msg["content"].as_str() {
+                    state.worker_tool_results.lock().push(content.to_string());
+                }
+                return Json(serde_json::json!({
+                    "choices": [{"message": {"content": "worker done"}}]
+                }));
+            }
+            Json(serde_json::json!({
+                "choices": [{"message": {
+                    "content": "",
+                    "tool_calls": [{
+                        "id": "worker-wake-1",
+                        "type": "function",
+                        "function": {
+                            "name": "dispatch_fixture",
+                            "arguments": serde_json::json!({
+                                "target": "sink",
+                                "prompt": "should be denied at depth 2"
+                            }).to_string()
+                        }
+                    }]
+                }}]
+            }))
+        }
+
+        let worker_tool_results = Arc::new(Mutex::new(Vec::new()));
+        let leader_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let leader_addr = leader_listener.local_addr().unwrap();
+        let leader_server = zeroclaw_spawn::spawn!(async move {
+            let app = Router::new().route("/chat/completions", post(scripted_leader));
+            axum::serve(leader_listener, app).await.unwrap();
+        });
+
+        let worker_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let worker_addr = worker_listener.local_addr().unwrap();
+        let bg_state = BgState {
+            worker_tool_results: Arc::clone(&worker_tool_results),
+        };
+        let worker_server = zeroclaw_spawn::spawn!(async move {
+            let app = Router::new()
+                .route("/chat/completions", post(scripted_worker))
+                .with_state(bg_state);
+            axum::serve(worker_listener, app).await.unwrap();
+        });
+
+        let workspace = tempfile::TempDir::new().expect("temp data dir");
+        let mut config = Config {
+            data_dir: workspace.path().to_path_buf(),
+            config_path: workspace.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.reliability.provider_retries = 0;
+        config.plugins.enabled = true;
+        config.plugins.auto_discover = true;
+        config.plugins.plugins_dir = plugin_root.path().to_string_lossy().into_owned();
+        config.tools.optional = vec!["delegate".to_string()];
+
+        let fixture_scope = PluginInstanceScope::for_package_binding(
+            &plugin_manifest,
+            PluginCapability::Tool,
+            [PluginPermission::AgentDispatch],
+        )
+        .expect("fixture scope");
+        let fixture_key = fixture_scope
+            .id()
+            .config_entry_key()
+            .expect("fixture entry key");
+        config.plugins.entries = vec![
+            entry(&instance_key(), &["leader"], Some(600)),
+            entry(&fixture_key, &["sink"], Some(600)),
+        ];
+
+        config.risk_profiles.insert(
+            "full".to_string(),
+            RiskProfileConfig {
+                level: AutonomyLevel::Full,
+                delegation_policy: DelegationPolicy {
+                    mode: DelegationMode::Allow,
+                },
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.runtime_profiles.insert(
+            "agentic".to_string(),
+            RuntimeProfileConfig {
+                agentic: true,
+                ..RuntimeProfileConfig::default()
+            },
+        );
+
+        for (alias, uri) in [
+            ("leader", format!("http://{leader_addr}")),
+            ("worker", format!("http://{worker_addr}")),
+            ("sink", "http://127.0.0.1:1".to_string()),
+        ] {
+            config.providers.models.openai.insert(
+                alias.to_string(),
+                OpenAIModelProviderConfig {
+                    base: ModelProviderConfig {
+                        model: Some("mock-model".to_string()),
+                        uri: Some(uri),
+                        api_key: Some("fixture-key".to_string()),
+                        wire_api: Some(WireApi::ChatCompletions),
+                        timeout_secs: Some(10),
+                        ..ModelProviderConfig::default()
+                    },
+                },
+            );
+            let delegates = if alias == "leader" {
+                vec![DelegateTargetConfig {
+                    agent: "worker".into(),
+                    mode: DelegateExecutionMode::Independent,
+                }]
+            } else {
+                Vec::new()
+            };
+            config.agents.insert(
+                alias.to_string(),
+                AliasedAgentConfig {
+                    enabled: true,
+                    model_provider: format!("openai.{alias}").into(),
+                    risk_profile: "full".into(),
+                    runtime_profile: "agentic".into(),
+                    delegates,
+                    ..AliasedAgentConfig::default()
+                },
+            );
+        }
+
+        let control_plane =
+            ControlPlaneHandle::open(workspace.path()).expect("isolated control plane");
+        let store = Arc::clone(&control_plane.store);
+        let coordinator = Arc::new(SharedWakeCoordinator::new());
+        let backend = RuntimeAgentWakeBackend::for_tests(
+            Arc::new(config),
+            None,
+            None,
+            Some(control_plane),
+            Arc::clone(&coordinator),
+        );
+
+        // Start `leader` at depth 2 by issuing wake from depth 1:
+        // leader runs at depth 2 -> spawns background delegate `worker`
+        // -> `worker` must inherit depth 2 and be denied when waking `sink`.
+        zeroclaw_spawn::scope_plugin_wake_depth(MAX_PLUGIN_WAKE_DEPTH - 1, async {
+            assert_eq!(
+                backend
+                    .wake(&scope(), Some("seed"), "leader", "run background worker")
+                    .await,
+                Ok(())
+            );
+        })
+        .await;
+
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                if !worker_tool_results.lock().is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("background worker should invoke dispatch_fixture");
+        await_slots_released(&coordinator).await;
+
+        let sink_tasks = tasks_for(store.as_ref(), "sink").await;
+        let results = worker_tool_results.lock().clone();
+
+        leader_server.abort();
+        worker_server.abort();
+
+        assert!(
+            sink_tasks.is_empty(),
+            "background delegate spawned from depth-2 wake turn must not wake sink: {sink_tasks:?}"
+        );
+        assert!(
+            results[0].contains("access-denied"),
+            "background delegate at MAX_PLUGIN_WAKE_DEPTH must observe access-denied, got: {results:?}"
+        );
     }
 }
