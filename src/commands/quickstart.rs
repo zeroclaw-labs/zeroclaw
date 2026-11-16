@@ -605,14 +605,14 @@ pub async fn run_quickstart_cli(
                 }
             }
             Action::Memory => {
-                let kinds: [MemoryChoice; 4] = [
-                    MemoryChoice::Sqlite,
-                    MemoryChoice::Markdown,
-                    MemoryChoice::Lucid,
-                    MemoryChoice::None,
-                ];
-                // The retired postgres/qdrant variants only parse for old
-                // configs and are never offered.
+                let mut kinds: Vec<MemoryChoice> = Vec::new();
+                if zeroclaw_memory::TACHI_COMPILED {
+                    kinds.push(MemoryChoice::Tachi);
+                }
+                kinds.push(MemoryChoice::Markdown);
+                kinds.push(MemoryChoice::None);
+                // The retired postgres/qdrant/sqlite/lucid variants only parse
+                // for old configs and are never offered.
                 #[allow(clippy::no_effect_underscore_binding)]
                 let _exhaustive = |k: MemoryChoice| match k {
                     MemoryChoice::Sqlite

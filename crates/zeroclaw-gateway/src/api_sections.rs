@@ -683,23 +683,15 @@ fn storage_picker(cfg: &zeroclaw_config::schema::Config) -> Vec<PickerItem> {
 
 fn storage_rank(key: &str) -> usize {
     match key {
-        "sqlite" => 0,
-        "markdown" => 1,
-        "lucid" => 2,
+        "markdown" => 0,
         _ => 99,
     }
 }
 
 fn storage_description(key: &str) -> Option<&'static str> {
     match key {
-        "sqlite" => Some(
-            "Safe default for single-node installs: file-based, zero-config, no external service.",
-        ),
         "markdown" => {
             Some("Human-readable files with simple local storage and no database service.")
-        }
-        "lucid" => {
-            Some("Bridge to local lucid-memory CLI while keeping SQLite-style local operation.")
         }
         _ => None,
     }
@@ -1579,7 +1571,10 @@ mod tests {
         let items = memory_picker(&cfg);
         // Mirrors zeroclaw_memory::selectable_memory_backends() exactly.
         let keys: Vec<&str> = items.iter().map(|i| i.key.as_str()).collect();
-        assert!(keys.contains(&"sqlite"));
+        if zeroclaw_memory::TACHI_COMPILED {
+            assert!(keys.contains(&"tachi"));
+        }
+        assert!(keys.contains(&"markdown"));
         assert!(keys.contains(&"none"));
         // Fresh onboarding should not imply the user selected the default.
         let active = items.iter().find(|i| i.badge.as_deref() == Some("active"));
@@ -1916,31 +1911,29 @@ mod tests {
         let cfg = empty_cfg();
         let items = storage_picker(&cfg);
         let keys: Vec<&str> = items.iter().map(|i| i.key.as_str()).collect();
-        for expected in ["sqlite", "markdown", "lucid"] {
-            assert!(
-                keys.contains(&expected),
-                "storage picker must list `{expected}`, got: {keys:?}",
-            );
-        }
+        assert!(
+            keys.contains(&"markdown"),
+            "storage picker must list `markdown`, got: {keys:?}",
+        );
         // Fresh config — no kind should be badged.
         assert!(
             items.iter().all(|i| i.badge.is_none()),
             "fresh config: no storage kind should be marked configured",
         );
 
-        // Create a sqlite instance; the sqlite row should flip to configured.
+        // Create a markdown instance; the markdown row should flip to configured.
         let mut cfg2 = empty_cfg();
-        cfg2.create_map_key("storage.sqlite", "primary")
-            .expect("create_map_key(storage.sqlite, primary) must succeed");
+        cfg2.create_map_key("storage.markdown", "primary")
+            .expect("create_map_key(storage.markdown, primary) must succeed");
         let items = storage_picker(&cfg2);
-        let sqlite = items.iter().find(|i| i.key == "sqlite").unwrap();
+        let markdown = items.iter().find(|i| i.key == "markdown").unwrap();
         assert_eq!(
-            sqlite.badge.as_deref(),
+            markdown.badge.as_deref(),
             Some("created"),
-            "storage.sqlite should be marked created after adding an alias",
+            "storage.markdown should be marked created after adding an alias",
         );
         assert!(
-            sqlite.description.is_some(),
+            markdown.description.is_some(),
             "storage picker should explain each backend tradeoff",
         );
     }

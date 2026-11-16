@@ -22,7 +22,7 @@ enabled = false
 tool_result_retrim_chars = 2000
 
 [memory]
-backend = "sqlite"
+backend = "tachi"
 auto_save = true
 hygiene_enabled = true
 archive_after_days = 7

@@ -1,6 +1,6 @@
 //! System-level tests — full agent orchestration with real components.
 
-use crate::support::helpers::{build_agent_with_sqlite_memory, text_response, tool_response};
+use crate::support::helpers::{build_agent_with_memory, text_response, tool_response};
 use crate::support::{CountingTool, EchoTool, MockModelProvider, RecordingTool};
 use zeroclaw::providers::ToolCall;
 
@@ -16,7 +16,7 @@ async fn system_simple_text_response() {
 
     let temp_dir = tempfile::tempdir().unwrap();
     let mut agent =
-        build_agent_with_sqlite_memory(model_provider, vec![Box::new(EchoTool)], temp_dir.path());
+        build_agent_with_memory(model_provider, vec![Box::new(EchoTool)], temp_dir.path());
 
     let response = agent.turn("hello system").await.unwrap();
     assert_eq!(response, "System test response");
@@ -36,7 +36,7 @@ async fn system_tool_execution_flow() {
 
     let temp_dir = tempfile::tempdir().unwrap();
     let mut agent =
-        build_agent_with_sqlite_memory(model_provider, vec![Box::new(EchoTool)], temp_dir.path());
+        build_agent_with_memory(model_provider, vec![Box::new(EchoTool)], temp_dir.path());
 
     let response = agent.turn("run echo").await.unwrap();
     assert!(
@@ -55,7 +55,7 @@ async fn system_multi_turn_conversation() {
 
     let temp_dir = tempfile::tempdir().unwrap();
     let mut agent =
-        build_agent_with_sqlite_memory(model_provider, vec![Box::new(EchoTool)], temp_dir.path());
+        build_agent_with_memory(model_provider, vec![Box::new(EchoTool)], temp_dir.path());
 
     let r1 = agent.turn("turn 1").await.unwrap();
     assert_eq!(r1, "First system response");
@@ -87,7 +87,7 @@ async fn system_tool_arguments_passed_correctly() {
     ]));
 
     let temp_dir = tempfile::tempdir().unwrap();
-    let mut agent = build_agent_with_sqlite_memory(
+    let mut agent = build_agent_with_memory(
         model_provider,
         vec![Box::new(recording_tool)],
         temp_dir.path(),
@@ -132,7 +132,7 @@ async fn system_parallel_tool_execution() {
     ]));
 
     let temp_dir = tempfile::tempdir().unwrap();
-    let mut agent = build_agent_with_sqlite_memory(
+    let mut agent = build_agent_with_memory(
         model_provider,
         vec![Box::new(EchoTool), Box::new(counting_tool)],
         temp_dir.path(),

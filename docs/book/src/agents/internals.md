@@ -52,9 +52,9 @@ SubAgent spawns enforce the rule that a child cannot escalate beyond its parent.
 
 Each agent has its own `Arc<dyn Memory>` instance. The factory (`zeroclaw_memory::create_memory_for_agent`) dispatches by backend kind:
 
-- **SQLite / Lucid**: shared install-wide store. The `agents` table maps alias → UUID, and the `memories` table carries `agent_id` referencing that UUID. The factory wraps the inner backend in `AgentScopedMemory`, which stamps the bound agent's UUID on every store via `store_with_agent` and filters every recall via `recall_for_agents` with the resolved allowlist.
+- **Tachi**: default shared install-wide store (`<data_dir>/memory/tachi.db`). Each agent alias resolves to a UUID via `ensure_agent_uuid`. The factory wraps the inner backend in `AgentScopedMemory`, which stamps the bound agent's UUID on every store via `store_with_agent` and filters every recall via `recall_for_agents` with the resolved allowlist.
 - **Markdown**: per-agent dir. Each agent's `MarkdownMemory` writes to `<install>/agents/<alias>/workspace/MEMORY.md` and `memory/YYYY-MM-DD.md`. Cross-agent recall is composed by `AgentScopedMarkdownMemory`, which holds the bound agent's `MarkdownMemory` plus a peer set of `(alias, MarkdownMemory)` pairs and unions their results with `[<alias>]` attribution prefixes on each row.
-- **Postgres / Qdrant**: removed. Selecting either (install-wide `memory.backend` or per-agent `memory.backend`) fails memory construction with an explicit error; the config still loads and reports the `memory_backend_removed` warning.
+- **SQLite / Lucid / Postgres / Qdrant**: removed. Selecting any of them (install-wide `memory.backend` or per-agent `memory.backend`) fails memory construction with an explicit error steering operators to `zeroclaw memory migrate-native`; the config still loads and reports the `memory_backend_removed` warning.
 - **None**: no-op stub. The wrapper still exists so the runtime path is uniform.
 
 Cross-backend cross-agent memory is not supported: the schema validator at config load rejects `read_memory_from` entries that point at a sibling on a different backend.
@@ -71,7 +71,6 @@ See [Multi-agent setup walkthrough](../contributing/multi-agent-setup.md#rename-
 
 ## Not supported today
 
-1. Cross-backend cross-agent memory access (e.g. SQLite agent reading a Markdown agent's rows).
+1. Cross-backend cross-agent memory access (e.g. Tachi agent reading a Markdown agent's rows).
 2. Automated restore from an agent deletion archive.
 3. Per-agent secret namespacing: there is a single workspace-wide `SecretStore`.
-4. Lucid wire-format extensions for cross-agent scoping.

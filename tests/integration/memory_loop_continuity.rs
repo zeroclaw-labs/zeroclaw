@@ -3,12 +3,24 @@
 use std::sync::Arc;
 
 use zeroclaw::config::MemoryConfig;
-use zeroclaw::memory::sqlite::SqliteMemory;
 use zeroclaw::memory::traits::{Memory, MemoryCategory};
 use zeroclaw::providers::ToolCall;
 
-use crate::support::helpers::{build_agent_with_sqlite_memory, text_response, tool_response};
+use crate::support::helpers::{build_agent_with_memory, text_response, tool_response};
 use crate::support::{CountingTool, EchoTool, MockModelProvider};
+
+fn make_persistent_memory(dir: &std::path::Path) -> Arc<dyn Memory> {
+    let backend = if zeroclaw::memory::TACHI_COMPILED {
+        "tachi"
+    } else {
+        "markdown"
+    };
+    let cfg = MemoryConfig {
+        backend: backend.into(),
+        ..MemoryConfig::default()
+    };
+    Arc::from(zeroclaw::memory::create_memory(&cfg, dir, None).unwrap())
+}
 
 // ═════════════════════════════════════════════════════════════════════════════
 // 1. Memory Store + Recall Persistence
@@ -20,7 +32,7 @@ async fn memory_persists_across_instances() {
 
     // Instance 1: store
     {
-        let mem = SqliteMemory::new("test", tmp.path()).unwrap();
+        let mem = make_persistent_memory(tmp.path());
         mem.store(
             "project_deadline",
             "The deadline is March 30th 2026",
@@ -33,7 +45,7 @@ async fn memory_persists_across_instances() {
 
     // Instance 2: recall (simulates restart)
     {
-        let mem = SqliteMemory::new("test", tmp.path()).unwrap();
+        let mem = make_persistent_memory(tmp.path());
         let results = mem.recall("deadline", 5, None, None, None).await.unwrap();
         assert!(
             !results.is_empty(),
@@ -50,7 +62,7 @@ async fn memory_persists_across_instances() {
 #[tokio::test]
 async fn memory_recall_returns_relevant_entries() {
     let tmp = tempfile::TempDir::new().unwrap();
-    let mem = SqliteMemory::new("test", tmp.path()).unwrap();
+    let mem = make_persistent_memory(tmp.path());
 
     mem.store(
         "user_name",
@@ -129,7 +141,7 @@ async fn agent_completes_five_step_tool_chain() {
 
     let tmp = tempfile::TempDir::new().unwrap();
     let mut agent =
-        build_agent_with_sqlite_memory(model_provider, vec![Box::new(counting_tool)], tmp.path());
+        build_agent_with_memory(model_provider, vec![Box::new(counting_tool)], tmp.path());
 
     let response = agent.turn("Execute 5 sequential operations").await.unwrap();
     assert!(!response.is_empty());
@@ -149,7 +161,7 @@ async fn agent_maintains_history_across_turns() {
     ]));
 
     let tmp = tempfile::TempDir::new().unwrap();
-    let mut agent = build_agent_with_sqlite_memory(model_provider, vec![], tmp.path());
+    let mut agent = build_agent_with_memory(model_provider, vec![], tmp.path());
 
     let r1 = agent.turn("My name is Argenis").await.unwrap();
     assert!(!r1.is_empty());
@@ -171,7 +183,7 @@ async fn agent_auto_saves_and_recalls_memory() {
 
     // Pre-seed memory with a fact
     {
-        let mem = SqliteMemory::new("test", tmp.path()).unwrap();
+        let mem = make_persistent_memory(tmp.path());
         mem.store(
             "project_tech",
             "The project uses Rust and Tokio for async runtime",
@@ -187,7 +199,7 @@ async fn agent_auto_saves_and_recalls_memory() {
         "Based on memory, the project uses Rust and Tokio.",
     )]));
 
-    let mut agent = build_agent_with_sqlite_memory(model_provider, vec![], tmp.path());
+    let mut agent = build_agent_with_memory(model_provider, vec![], tmp.path());
     let response = agent
         .turn("What tech does this project use?")
         .await
@@ -221,8 +233,7 @@ async fn agent_handles_interleaved_tools_and_text() {
     ]));
 
     let tmp = tempfile::TempDir::new().unwrap();
-    let mut agent =
-        build_agent_with_sqlite_memory(model_provider, vec![Box::new(EchoTool)], tmp.path());
+    let mut agent = build_agent_with_memory(model_provider, vec![Box::new(EchoTool)], tmp.path());
 
     let response = agent.turn("Create a file then read it").await.unwrap();
     assert!(
@@ -281,7 +292,7 @@ async fn agent_survives_large_tool_output() {
 
     let tmp = tempfile::TempDir::new().unwrap();
     let mut agent =
-        build_agent_with_sqlite_memory(model_provider, vec![Box::new(LargeOutputTool)], tmp.path());
+        build_agent_with_memory(model_provider, vec![Box::new(LargeOutputTool)], tmp.path());
 
     let response = agent.turn("Generate a large output").await.unwrap();
     assert!(
@@ -320,7 +331,7 @@ async fn agent_handles_parallel_tool_calls() {
 
     let tmp = tempfile::TempDir::new().unwrap();
     let mut agent =
-        build_agent_with_sqlite_memory(model_provider, vec![Box::new(counting_tool)], tmp.path());
+        build_agent_with_memory(model_provider, vec![Box::new(counting_tool)], tmp.path());
 
     let response = agent.turn("Run 3 tools in parallel").await.unwrap();
     assert!(!response.is_empty());
@@ -358,7 +369,7 @@ async fn agent_multi_turn_with_tools_builds_context() {
 
     let tmp = tempfile::TempDir::new().unwrap();
     let mut agent =
-        build_agent_with_sqlite_memory(model_provider, vec![Box::new(counting_tool)], tmp.path());
+        build_agent_with_memory(model_provider, vec![Box::new(counting_tool)], tmp.path());
 
     let r1 = agent.turn("Start task: increment counter").await.unwrap();
     assert!(!r1.is_empty());
@@ -383,7 +394,7 @@ async fn agent_multi_turn_with_tools_builds_context() {
 #[tokio::test]
 async fn consolidation_extracts_facts_to_memory() {
     let tmp = tempfile::TempDir::new().unwrap();
-    let mem: Arc<dyn Memory> = Arc::new(SqliteMemory::new("test", tmp.path()).unwrap());
+    let mem = make_persistent_memory(tmp.path());
 
     let model_provider = MockModelProvider::new(vec![text_response(
         r#"{"history_entry": "User shared project deadline info", "memory_update": "Project deadline is April 15th 2026"}"#,
@@ -413,7 +424,7 @@ async fn consolidation_extracts_facts_to_memory() {
 #[tokio::test]
 async fn memory_survives_rapid_consolidation() {
     let tmp = tempfile::TempDir::new().unwrap();
-    let mem: Arc<dyn Memory> = Arc::new(SqliteMemory::new("test", tmp.path()).unwrap());
+    let mem = make_persistent_memory(tmp.path());
 
     // Simulate 10 rapid consolidation rounds
     for i in 0..10 {

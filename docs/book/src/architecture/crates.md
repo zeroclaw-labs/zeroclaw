@@ -116,7 +116,7 @@ accounting behavior; this crate does not schedule external harness work.
 
 ### `zeroclaw-memory`
 
-Conversation memory and retrieval. SQLite is the default backend; Lucid and Markdown are the alternatives (the PostgreSQL and Qdrant backends were removed). Optional:
+Conversation memory and retrieval. Embedded Tachi (`portable-kernel`, enabled by default in `zeroclawlabs` via `memory-tachi` and `zeroclaw-memory/tachi`) is the default durable backend; workspace `Markdown` and `none` are the alternatives (`SQLite`, `Lucid`, `PostgreSQL`, and `Qdrant` were retired). `zeroclaw-memory` defaults keep `tachi` off so `--no-default-features` and `slim-control` builds remain AGPL-free. Optional:
 
 - Embedding backends (OpenAI, Ollama, local)
 - Vector retrieval over stored conversations

@@ -1308,19 +1308,16 @@ fn v1_child_capability_set_is_disjoint_from_a_real_parent_registry() {
     use std::collections::HashMap;
     let tmp = tempfile::TempDir::new().unwrap();
     let mut config = zeroclaw_config::schema::Config::default();
+    if !zeroclaw_memory::TACHI_COMPILED {
+        config.memory.backend = "markdown".into();
+    }
     config.risk_profiles.insert(
         "default".to_string(),
         zeroclaw_config::schema::RiskProfileConfig::default(),
     );
     let security = Arc::new(zeroclaw_policy::SecurityPolicy::default());
-    let mem: Arc<dyn zeroclaw_memory::Memory> = Arc::from(
-        zeroclaw_memory::create_memory(
-            &zeroclaw_config::schema::MemoryConfig::default(),
-            tmp.path(),
-            None,
-        )
-        .unwrap(),
-    );
+    let mem: Arc<dyn zeroclaw_memory::Memory> =
+        Arc::from(zeroclaw_memory::create_memory(&config.memory, tmp.path(), None).unwrap());
     let built = crate::tools::all_tools_with_runtime(
         Arc::new(config),
         &security,

@@ -4906,6 +4906,7 @@ dependencies = [
  "parking_lot",
  "regex",
  "reqwest",
+ "rusqlite",
  "rustix",
  "rustls",
  "rustls-pki-types",

@@ -71,12 +71,156 @@ impl Tool for BoundarySteeringTool {
     }
 }
 
+#[cfg(not(feature = "memory-tachi"))]
+#[derive(Default)]
+struct SteeringMemoryStub {
+    entries: Mutex<HashMap<String, zeroclaw_memory::MemoryEntry>>,
+}
+
+#[cfg(not(feature = "memory-tachi"))]
+impl SteeringMemoryStub {
+    fn write_entry(
+        &self,
+        key: &str,
+        content: &str,
+        category: MemoryCategory,
+        session_id: Option<&str>,
+        namespace: Option<&str>,
+        importance: Option<f64>,
+        agent_id: Option<&str>,
+    ) {
+        self.entries.lock().insert(
+            key.to_string(),
+            zeroclaw_memory::MemoryEntry {
+                id: key.to_string(),
+                key: key.to_string(),
+                content: content.to_string(),
+                category,
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                session_id: session_id.map(str::to_string),
+                score: None,
+                namespace: namespace.unwrap_or("default").to_string(),
+                importance,
+                superseded_by: None,
+                kind: None,
+                pinned: false,
+                tenant_id: None,
+                agent_alias: None,
+                agent_id: agent_id.map(str::to_string),
+            },
+        );
+    }
+}
+
+#[cfg(not(feature = "memory-tachi"))]
+#[async_trait]
+impl Memory for SteeringMemoryStub {
+    fn name(&self) -> &str {
+        "stub"
+    }
+    async fn store(
+        &self,
+        key: &str,
+        content: &str,
+        category: MemoryCategory,
+        session_id: Option<&str>,
+    ) -> Result<()> {
+        self.write_entry(key, content, category, session_id, None, None, None);
+        Ok(())
+    }
+    async fn store_with_metadata(
+        &self,
+        key: &str,
+        content: &str,
+        category: MemoryCategory,
+        session_id: Option<&str>,
+        namespace: Option<&str>,
+        importance: Option<f64>,
+    ) -> Result<()> {
+        self.write_entry(
+            key, content, category, session_id, namespace, importance, None,
+        );
+        Ok(())
+    }
+    async fn recall(
+        &self,
+        _: &str,
+        _: usize,
+        _: Option<&str>,
+        _: Option<&str>,
+        _: Option<&str>,
+    ) -> Result<Vec<zeroclaw_memory::MemoryEntry>> {
+        Ok(vec![])
+    }
+    async fn get(&self, key: &str) -> Result<Option<zeroclaw_memory::MemoryEntry>> {
+        Ok(self.entries.lock().get(key).cloned())
+    }
+    async fn list(
+        &self,
+        _: Option<&MemoryCategory>,
+        _: Option<&str>,
+    ) -> Result<Vec<zeroclaw_memory::MemoryEntry>> {
+        Ok(vec![])
+    }
+    async fn forget(&self, _: &str) -> Result<bool> {
+        Ok(false)
+    }
+    async fn forget_for_agent(&self, _: &str, _: &str) -> Result<bool> {
+        Ok(false)
+    }
+    async fn count(&self) -> Result<usize> {
+        Ok(self.entries.lock().len())
+    }
+    async fn health_check(&self) -> bool {
+        true
+    }
+    async fn store_with_agent(
+        &self,
+        key: &str,
+        content: &str,
+        category: MemoryCategory,
+        session_id: Option<&str>,
+        namespace: Option<&str>,
+        importance: Option<f64>,
+        agent_id: Option<&str>,
+    ) -> Result<()> {
+        self.write_entry(
+            key, content, category, session_id, namespace, importance, agent_id,
+        );
+        Ok(())
+    }
+    async fn recall_for_agents(
+        &self,
+        _: &[&str],
+        _: &str,
+        _: usize,
+        _: Option<&str>,
+        _: Option<&str>,
+        _: Option<&str>,
+    ) -> Result<Vec<zeroclaw_memory::MemoryEntry>> {
+        Ok(vec![])
+    }
+}
+
+#[cfg(not(feature = "memory-tachi"))]
+impl ::zeroclaw_api::attribution::Attributable for SteeringMemoryStub {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Memory(::zeroclaw_api::attribution::MemoryKind::InMemory)
+    }
+    fn alias(&self) -> &str {
+        "SteeringMemoryStub"
+    }
+}
+
 #[tokio::test]
 async fn steering_at_tool_boundary_keeps_enrichment_and_cancellation_precedence() {
     for cancel_at_boundary in [false, true] {
         let tmp = tempfile::tempdir().unwrap();
+        #[cfg(feature = "memory-tachi")]
         let memory: Arc<dyn Memory> =
-            Arc::new(zeroclaw_memory::SqliteMemory::new("sqlite", tmp.path()).unwrap());
+            Arc::new(zeroclaw_memory::TachiMemory::new("tachi", tmp.path()).unwrap());
+        #[cfg(not(feature = "memory-tachi"))]
+        let memory: Arc<dyn Memory> = Arc::new(SteeringMemoryStub::default());
         let seen = Arc::new(Mutex::new(Vec::new()));
         let observer = Arc::new(CapturingObserver::default());
         let (steering_tx, mut steering_rx) = tokio::sync::mpsc::channel(4);

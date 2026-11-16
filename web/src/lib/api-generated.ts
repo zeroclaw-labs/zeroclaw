@@ -818,9 +818,9 @@ export interface components {
         /** @description Per-agent memory backend selection and its persistence contract. */
         AgentMemoryConfig: {
             /**
-             * @description The backend kind this agent uses. Defaults to `Sqlite` for new
+             * @description The backend kind this agent uses. Defaults to `Tachi` for new
              *     agents; once an agent has on-disk data the value is locked.
-             * @default sqlite
+             * @default tachi
              */
             backend: components["schemas"]["MemoryBackendKind"];
         };
@@ -1300,10 +1300,10 @@ export interface components {
             /**
              * @description Per-agent memory backend selection (`[agents.<alias>.memory]`).
              *     The `backend` field is locked at agent creation and immutable on
-             *     subsequent loads. Defaults to `Sqlite`. See
+             *     subsequent loads. Defaults to `Tachi`. See
              *     `crate::multi_agent::AgentMemoryConfig`.
              * @default {
-             *       "backend": "sqlite"
+             *       "backend": "tachi"
              *     }
              */
             memory: components["schemas"]["AgentMemoryConfig"];
@@ -4573,15 +4573,14 @@ export interface components {
              */
             media_pipeline: components["schemas"]["MediaPipelineConfig"];
             /**
-             * @description Memory backend configuration: sqlite, markdown, embeddings (`[memory]`).
+             * @description Memory backend configuration: tachi, markdown, embeddings (`[memory]`).
              * @default {
              *       "archive_after_days": 7,
              *       "audit_enabled": false,
              *       "audit_retention_days": 30,
-             *       "auto_hydrate": true,
              *       "auto_reindex_on_identity_change": false,
              *       "auto_save": true,
-             *       "backend": "sqlite",
+             *       "backend": "tachi",
              *       "candidate_multiplier": 4,
              *       "chunk_max_tokens": 512,
              *       "conflict_supersede_enabled": true,
@@ -4641,8 +4640,6 @@ export interface components {
              *         "vector"
              *       ],
              *       "search_mode": "hybrid",
-             *       "snapshot_enabled": false,
-             *       "snapshot_on_hygiene": false,
              *       "types": {
              *         "enabled": false
              *       },
@@ -11653,38 +11650,6 @@ export interface components {
          * @enum {string}
          */
         LogToolIo: "off" | "redacted" | "full";
-        /** @description Lucid CLI sync backend (`[storage.lucid.<alias>]`). */
-        LucidStorageConfig: {
-            /**
-             * @description Optional path to the lucid-memory binary. When unset, the bare `lucid`
-             *     executable is resolved on `PATH`. A blank or whitespace-only value is
-             *     rejected at config validation and remains invalid if startup continues,
-             *     so an invalid explicit selector never falls through to `PATH`.
-             * @default null
-             */
-            binary_path: string | null;
-            /**
-             * Format: uint64
-             * @description Recall (context) timeout override, in milliseconds. Lucid CLI cold
-             *     starts (loading the local embedding model) can exceed 1.5s on ARM
-             *     hosts; raise this if recalls still time out on your hardware.
-             *     Unset falls back to the built-in default (3000ms). `0` is rejected
-             *     at config validation; because startup warns and continues after
-             *     validation errors, a `0` that reaches the runtime is treated as
-             *     unset and falls back to the default.
-             * @default null
-             */
-            recall_timeout_ms: number | null;
-            /**
-             * Format: uint64
-             * @description Store timeout override, in milliseconds. Same cold-start
-             *     consideration as `recall_timeout_ms`. Unset falls back to the
-             *     built-in default (3000ms); `0` is rejected at validation and, if
-             *     startup continues after the warning, is likewise treated as unset.
-             * @default null
-             */
-            store_timeout_ms: number | null;
-        };
         /** @description Named model_provider profile definition. */
         ManifestModelProviderConfig: {
             /** @description Secret API token for this model_provider. Grab it from the model_provider's dashboard (OpenAI platform, Anthropic console, OpenRouter keys page, etc.). Stored via the OS keyring when possible; never commit it to config.toml directly. */
@@ -12054,14 +12019,14 @@ export interface components {
             transcribe_audio: boolean;
         };
         /** @description Selects the memory backend used by an agent. */
-        MemoryBackendKind: "none" | "sqlite" | "postgres" | "qdrant" | "markdown" | "lucid";
+        MemoryBackendKind: "none" | "sqlite" | "postgres" | "qdrant" | "markdown" | "lucid" | "tachi";
         /**
          * @description Memory backend configuration (`[memory]` section).
          *
-         *     Controls conversation memory storage, embeddings, hybrid search, response
-         *     caching, and memory snapshot/hydration. Backend-specific connection settings
-         *     live under `[storage.<backend>.<alias>]`; this section selects which storage
-         *     instance to use via the `backend` dotted reference.
+         *     Controls conversation memory storage, embeddings, hybrid search, and
+         *     response caching. Backend-specific settings live under
+         *     `[storage.<backend>.<alias>]` when applicable; this section selects
+         *     which backend or storage instance to use via `backend`.
          */
         MemoryConfig: {
             /**
@@ -12082,11 +12047,6 @@ export interface components {
              */
             audit_retention_days: number;
             /**
-             * @description Auto-hydrate from MEMORY_SNAPSHOT.md when brain.db is missing
-             * @default true
-             */
-            auto_hydrate: boolean;
-            /**
              * @description Automatically re-embed all memories in the background when a change of embedding provider/model/dimensions is detected at startup (after the stale vectors have been cleared). Costs one embedding API call per memory, so it's off by default — leave it off for large stores and run `zeroclaw memory reindex` explicitly instead.
              * @default false
              */
@@ -12097,12 +12057,11 @@ export interface components {
              */
             auto_save: boolean;
             /**
-             * @description Dotted reference to the active storage instance: `<backend>.<alias>`
-             *     (e.g. `"sqlite.default"`, `"postgres.work"`). Resolves through
-             *     `Config.storage.<backend>.<alias>` at runtime. Bare backend names
-             *     (`"sqlite"`) are treated as `"<backend>.default"`. Set to `"none"` to
-             *     disable persistence entirely.
-             * @default sqlite
+             * @description Active memory backend or dotted storage reference: `<backend>[.<alias>]`
+             *     (e.g. `"tachi"`, `"markdown.notes"`). Resolves through
+             *     `Config.storage.<backend>.<alias>` for configured storage backends, or
+             *     selects a built-in backend (`"tachi"`, `"markdown"`, `"none"`).
+             * @default tachi
              */
             backend: string;
             /**
@@ -12132,14 +12091,14 @@ export interface components {
             /**
              * @description Also extract atomic durable facts from each consolidated turn and store
              *     them as individual Core memories. Default off; the flip is sequenced in
-             *     a later phase. SQLite-only: enabling this requires the sqlite memory
+             *     a later phase. Tachi-only: enabling this requires the tachi memory
              *     backend globally and on every agent (validated at config load).
              * @default false
              */
             consolidation_extract_facts: boolean;
             /**
              * Format: uint32
-             * @description Delete conversation rows older than this many days from the DB (sqlite backend only). Age is measured by `updated_at` (last write time). 0 = keep forever.
+             * @description Delete conversation rows older than this many days (when enforced by the active backend). Age is measured by `updated_at` (last write time). 0 = keep forever.
              * @default 30
              */
             conversation_retention_days: number;
@@ -12157,7 +12116,7 @@ export interface components {
             core_max_rows: number;
             /**
              * Format: uint32
-             * @description Delete core memory rows older than this many days from the DB. Age is measured by `created_at` (first-write time). Neither recall nor ordinary rewrites refresh `created_at` under the current SQLite upsert, so core retention is an absolute age limit from first write. Set this to a generously large window for durable core memories, or keep 0 = keep forever.
+             * @description Delete core memory rows older than this many days from the store. Age is measured by `created_at` (first-write time). Neither recall nor ordinary rewrites refresh `created_at` on upsert, so core retention is an absolute age limit from first write. Set this to a generously large window for durable core memories, or keep 0 = keep forever.
              * @default 0
              */
             core_retention_days: number;
@@ -12169,7 +12128,7 @@ export interface components {
             daily_max_rows: number;
             /**
              * Format: uint32
-             * @description Delete daily memory rows older than this many days from the DB. Age is measured by `updated_at` (last write time). 0 = keep forever.
+             * @description Delete daily memory rows older than this many days from the store. Age is measured by `updated_at` (last write time). 0 = keep forever.
              * @default 0
              */
             daily_retention_days: number;
@@ -12367,16 +12326,6 @@ export interface components {
              */
             search_mode: components["schemas"]["SearchMode"];
             /**
-             * @description Enable periodic export of core memories to MEMORY_SNAPSHOT.md
-             * @default false
-             */
-            snapshot_enabled: boolean;
-            /**
-             * @description Run snapshot during hygiene passes (heartbeat-driven)
-             * @default false
-             */
-            snapshot_on_hygiene: boolean;
-            /**
              * @description Typed memory configuration (`[memory.types]` section).
              * @default {
              *       "enabled": false
@@ -12458,7 +12407,7 @@ export interface components {
          *
          *     Behaviour-neutral by default: `enabled` gates MemoryKind assignment on new
          *     consolidation writes and defaults off; the flip is sequenced in a later
-         *     phase. SQLite-only: enabling requires the sqlite memory backend globally
+         *     phase. Tachi-only: enabling requires the tachi memory backend globally
          *     and on every agent (validated at config load).
          */
         MemoryTypesConfig: {
@@ -16879,47 +16828,6 @@ export interface components {
              */
             security: components["schemas"]["PluginSecurityConfig"];
         };
-        /**
-         * @description PostgreSQL storage backend (`[storage.postgres.<alias>]`).
-         *
-         *     Holds connection parameters AND pgvector settings on one alias-keyed
-         *     entry; previously these lived in two separate sections.
-         */
-        PostgresStorageConfig: {
-            /**
-             * Format: uint64
-             * @description Optional connection timeout in seconds.
-             * @default null
-             */
-            connect_timeout_secs: number | null;
-            /**
-             * @description Connection URL (e.g. `"postgres://user:pass@host/db"`).
-             *     Accepts legacy aliases: dbURL, database_url, databaseUrl.
-             * @default null
-             */
-            db_url: string | null;
-            /**
-             * @description Database schema for the memory table.
-             * @default public
-             */
-            schema: string;
-            /**
-             * @description Table name for memory entries.
-             * @default memories
-             */
-            table: string;
-            /**
-             * Format: uint
-             * @description Vector dimensions for pgvector embeddings.
-             * @default 1536
-             */
-            vector_dimensions: number;
-            /**
-             * @description Enable pgvector extension for hybrid vector+keyword recall.
-             * @default false
-             */
-            vector_enabled: boolean;
-        };
         /** @description Project delivery intelligence configuration (`[project_intel]` section). */
         ProjectIntelConfig: {
             /**
@@ -17074,33 +16982,6 @@ export interface components {
         };
         /** @description Proxy application scope — determines which outbound traffic uses the proxy. */
         ProxyScope: "environment" | "zeroclaw" | "services";
-        /**
-         * @description Qdrant vector database backend (`[storage.qdrant.<alias>]`).
-         *
-         *     URL, collection, and API key are typed config values. Use schema-mirror env
-         *     overrides such as `ZEROCLAW_storage__qdrant__<alias>__url=...` for runtime
-         *     env injection.
-         */
-        QdrantStorageConfig: {
-            /**
-             * @description API key for Qdrant Cloud or secured instances.
-             *     Use `ZEROCLAW_storage__qdrant__<alias>__api_key=...` for env injection.
-             * @default null
-             */
-            api_key: string | null;
-            /**
-             * @description Collection name for storing memories.
-             *     Use `ZEROCLAW_storage__qdrant__<alias>__collection=...` for env injection.
-             * @default zeroclaw_memories
-             */
-            collection: string;
-            /**
-             * @description Qdrant server URL (e.g. `"http://localhost:6333"`).
-             *     Use `ZEROCLAW_storage__qdrant__<alias>__url=...` for env injection.
-             * @default null
-             */
-            url: string | null;
-        };
         /** @description Named model_provider profile definition. */
         QianfanModelProviderConfig: {
             /** @description Secret API token for this model_provider. Grab it from the model_provider's dashboard (OpenAI platform, Anthropic console, OpenRouter keys page, etc.). Stored via the OS keyring when possible; never commit it to config.toml directly. */
@@ -19280,22 +19161,6 @@ export interface components {
         /** @description A single step in an SOP procedure, parsed from SOP.md. */
         /** @description The kind of a workflow step. */
         /** @description What event can activate an SOP. */
-        /** @description SQLite storage backend (`[storage.sqlite.<alias>]`). */
-        SqliteStorageConfig: {
-            /**
-             * Format: uint64
-             * @description Maximum seconds to wait when opening the DB if it's locked.
-             *     `None` waits indefinitely. Recommended max: 300.
-             * @default null
-             */
-            open_timeout_secs: number | null;
-            /**
-             * @description Optional override for the SQLite database path.
-             *     When unset, defaults to `<workspace_dir>/brain.db`.
-             * @default null
-             */
-            path: string | null;
-        };
         /** @description Failure handling policy for a single SOP step. */
         /**
          * @description Persisted canvas coordinate for a step node. Written by the Blueprint
@@ -19474,30 +19339,14 @@ export interface components {
          *
          *     Storage is a two-tier alias-keyed map: `[storage.<backend>.<alias>]`,
          *     parallel to `[providers.models.<type>.<alias>]`. Each backend has its own typed
-         *     config struct. `MemoryConfig.backend` carries a dotted reference (`"sqlite.default"`,
-         *     `"postgres.work"`) that resolves to one of these entries via
-         *     [`Config::resolve_active_storage`].
+         *     config struct. `MemoryConfig.backend` carries a dotted reference (`"markdown.notes"`)
+         *     that resolves to one of these entries via [`Config::resolve_active_storage`], or
+         *     selects `"tachi"` (the embedded kernel) / `"none"`.
          */
         StorageConfig: {
-            /** @description Lucid CLI sync instances (`[storage.lucid.<alias>]`). */
-            lucid?: {
-                [key: string]: components["schemas"]["LucidStorageConfig"];
-            };
             /** @description Markdown storage instances (`[storage.markdown.<alias>]`). */
             markdown?: {
                 [key: string]: components["schemas"]["MarkdownStorageConfig"];
-            };
-            /** @description PostgreSQL storage instances (`[storage.postgres.<alias>]`). */
-            postgres?: {
-                [key: string]: components["schemas"]["PostgresStorageConfig"];
-            };
-            /** @description Qdrant storage instances (`[storage.qdrant.<alias>]`). */
-            qdrant?: {
-                [key: string]: components["schemas"]["QdrantStorageConfig"];
-            };
-            /** @description SQLite storage instances (`[storage.sqlite.<alias>]`). */
-            sqlite?: {
-                [key: string]: components["schemas"]["SqliteStorageConfig"];
             };
         };
         /** @description Streaming mode for channels that support progressive message updates. */
@@ -20728,7 +20577,7 @@ export interface components {
          *
          *     Stable codes (extend as new warnings are added):
          *     - `memory_semantic_search_without_embedder`: `memory.search_mode` requests
-         *       vector search on sqlite memory, but no effective embedder is configured.
+         *       vector search on tachi memory, but no effective embedder is configured.
          *     - `memory_config_knob_inert`: a `[memory]` knob is set to a non-default
          *       value but has no runtime consumer yet, so it currently has no effect
          *       (see `validate_memory_semantics` in `schema.rs` for the current list).

@@ -14,16 +14,15 @@ each get their own top-level directory.
 │   │   └── costs.jsonl, runtime-trace.jsonl
 │   ├── devices.db                — paired-device metadata
 │   └── memory/                   — shared instance memory
-│       └── brain.db, audit.db, response_cache.db,
-│           MEMORY_SNAPSHOT.md, archive/
+│       └── tachi.db, audit.db, response_cache.db,
+│           archive/
 ├── shared/                       — resources agents draw on in common
 │   └── skills/<bundle>/          — skill bundles
 │       └── SKILL.md, scripts/, references/, assets/
 └── agents/                       — per-agent private data
     └── <alias>/
         └── workspace/            — the agent's jailed filesystem sandbox
-            └── memory/
-                └── brain.db
+            └── memory/           — per-agent Markdown files (when backend = "markdown")
 ```
 
 The three roots map to three scopes:
@@ -59,13 +58,11 @@ Two things worth calling out:
 
 ## Memory
 
-Each agent keeps its own memory store under its workspace
-(`agents/<alias>/workspace/memory/`), separate from the shared instance memory
-in `data/memory/`. The backend is selected per agent:
+Shared install-wide Tachi storage lives in `data/memory/tachi.db` with per-agent scoping, while Markdown storage lives under each agent's workspace (`agents/<alias>/workspace/memory/`). The backend is selected per agent:
 
 {{#config-fields agents.memory}}
 
-The backend defaults to SQLite for a new agent, and once the agent has written
+The backend defaults to `tachi` for a new agent, and once the agent has written
 on-disk data the value is locked, so you cannot silently swap a backend out from
 under existing memory. Cross-agent memory sharing is opt-in through the
 workspace `read_memory_from` allowlist. For the memory model itself, see

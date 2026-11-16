@@ -71,12 +71,12 @@ done
 LEG_RUNNER=test
 run bash scripts/dev/leg.sh runtime
 check 0 \
-  'test --locked -p zeroclaw-runtime --features zeroclaw-runtime/heavy-tests' \
-  'test --locked -p zeroclaw-runtime --features zeroclaw-runtime/heavy-tests\,zeroclaw-runtime/sandbox-landlock -- landlock'
+  'test --locked -p zeroclaw-runtime --features zeroclaw-runtime/heavy-tests\,zeroclaw-runtime/memory-tachi' \
+  'test --locked -p zeroclaw-runtime --features zeroclaw-runtime/heavy-tests\,zeroclaw-runtime/memory-tachi\,zeroclaw-runtime/sandbox-landlock -- landlock'
 run bash scripts/dev/leg.sh channels
 check 0 \
-  'test --locked -p zeroclaw-gateway --features zeroclaw-gateway/nodes' \
-  'test --locked -p zeroclaw-gateway --features zeroclaw-gateway/nodes\,zeroclaw-gateway/voice-surface -- surface_tests'
+  'test --locked -p zeroclaw-gateway --features zeroclaw-gateway/nodes\,zeroclaw-gateway/memory-tachi' \
+  'test --locked -p zeroclaw-gateway --features zeroclaw-gateway/nodes\,zeroclaw-gateway/memory-tachi\,zeroclaw-gateway/voice-surface -- surface_tests'
 
 # Run the actual CI step's shell (its env is set as in the workflow), not a copy
 # of its command construction. No YAML dependency is needed for this block.

@@ -13,7 +13,6 @@ pub mod agent_scoped;
 pub mod agent_scoped_markdown;
 pub mod audit;
 pub mod backend;
-pub mod budget;
 pub mod chunker;
 pub mod classify;
 pub mod companion;
@@ -26,14 +25,13 @@ pub mod hygiene;
 pub mod importance;
 #[cfg(feature = "tachi")]
 pub mod kernel_store;
-pub mod lucid;
 pub mod markdown;
 pub mod merge;
-pub mod migration;
 #[cfg(feature = "tachi")]
 pub mod native_migration;
 pub mod none;
 pub mod normalize;
+#[cfg(feature = "tachi")]
 mod point_scope;
 pub mod policy;
 pub mod policy_gate;
@@ -44,8 +42,6 @@ pub mod rerank;
 pub mod response_cache;
 pub mod retrieval;
 pub mod scanned;
-pub mod snapshot;
-pub mod sqlite;
 #[cfg(feature = "tachi")]
 pub mod tachi;
 #[cfg(feature = "tachi")]
@@ -73,7 +69,6 @@ pub use companion::{
 };
 #[allow(unused_imports)]
 pub use embeddings::EmbeddingIdentity;
-pub use lucid::LucidMemory;
 pub use markdown::MarkdownMemory;
 pub use none::NoneMemory;
 #[allow(unused_imports)]
@@ -83,7 +78,6 @@ pub use response_cache::ResponseCache;
 #[allow(unused_imports)]
 pub use retrieval::{RetrievalConfig, RetrievalPipeline};
 pub use scanned::ScannedMemory;
-pub use sqlite::SqliteMemory;
 #[cfg(feature = "tachi")]
 pub use tachi::TachiMemory;
 #[cfg(feature = "tachi")]
@@ -147,10 +141,18 @@ fn retired_backend_error(backend: &str, selector: &str) -> anyhow::Error {
             .with_attrs(::serde_json::json!({ "backend": backend, "selector": selector })),
         "memory backend was removed"
     );
-    anyhow::Error::msg(format!(
-        "{selector} selects the '{backend}' memory backend, which was removed; set it to \
-         sqlite, lucid, markdown or none (existing data is not migrated automatically)"
-    ))
+    if matches!(backend, "sqlite" | "lucid") {
+        anyhow::Error::msg(format!(
+            "{selector} selects the '{backend}' memory backend, which was removed; run \
+             `zeroclaw memory migrate-native` to migrate existing brain.db data to tachi, \
+             or set {selector} to tachi, markdown, or none"
+        ))
+    } else {
+        anyhow::Error::msg(format!(
+            "{selector} selects the '{backend}' memory backend, which was removed; set it to \
+             tachi, markdown or none (existing data is not migrated automatically)"
+        ))
+    }
 }
 
 /// Wrap the backend in the `AuditedMemory` decorator when
@@ -185,30 +187,14 @@ fn wrap_scanned_and_audit<M: Memory + 'static>(
     )
 }
 
-fn create_memory_with_builders<F>(
+fn create_memory_with_policy(
     backend_name: &str,
     workspace_dir: &Path,
-    mut sqlite_builder: F,
     unknown_context: &str,
     policy: &MemoryPolicyConfig,
     audit_enabled: bool,
-) -> anyhow::Result<Box<dyn Memory>>
-where
-    F: FnMut() -> anyhow::Result<SqliteMemory>,
-{
+) -> anyhow::Result<Box<dyn Memory>> {
     match classify_memory_backend(backend_name) {
-        MemoryBackendKind::Sqlite => {
-            wrap_scanned_and_audit(sqlite_builder()?, policy, workspace_dir, audit_enabled)
-        }
-        MemoryBackendKind::Lucid => {
-            let local = sqlite_builder()?;
-            wrap_scanned_and_audit(
-                LucidMemory::new("lucid", workspace_dir, local),
-                policy,
-                workspace_dir,
-                audit_enabled,
-            )
-        }
         MemoryBackendKind::Retired(backend) => {
             Err(retired_backend_error(backend, "memory.backend"))
         }
@@ -222,7 +208,7 @@ where
         MemoryBackendKind::Tachi => {
             anyhow::bail!(
                 "tachi backend requires embedding config; \
-                 call create_memory_with_storage_and_routes instead of create_memory_with_builders"
+                 call create_memory_with_storage_and_routes instead of create_memory_with_policy"
             )
         }
         MemoryBackendKind::None => wrap_scanned_and_audit(
@@ -244,7 +230,7 @@ where
 }
 
 /// Extract the backend kind from a V3 dotted reference (`<kind>.<alias>`).
-/// Bare names (`"sqlite"`) are returned as-is. Returned lowercase.
+/// Bare names (`"tachi"`) are returned as-is. Returned lowercase.
 pub fn backend_kind_from_dotted(memory_backend: &str) -> String {
     memory_backend
         .trim()
@@ -539,44 +525,18 @@ pub fn create_memory_from_config(
     )
 }
 
-fn build_lucid_memory(
-    workspace_dir: &Path,
-    local: SqliteMemory,
-    active_storage: ActiveStorage<'_>,
-) -> LucidMemory {
-    // Lucid predates typed storage aliases and still supports the bare
-    // `memory.backend = "lucid"` form. A resolved alias overrides the
-    // executable and deadlines; otherwise the constructor uses defaults.
-    let (binary_path, recall_timeout_ms, store_timeout_ms) = match active_storage {
-        ActiveStorage::Lucid(lucid) => (
-            lucid.binary_path.clone(),
-            lucid.recall_timeout_ms,
-            lucid.store_timeout_ms,
-        ),
-        _ => (None, None, None),
-    };
-
-    LucidMemory::with_overrides(
-        "lucid",
-        workspace_dir,
-        local,
-        binary_path,
-        recall_timeout_ms,
-        store_timeout_ms,
-    )
-}
-
 pub fn create_memory_with_storage_and_routes(
     config: &MemoryConfig,
     embedding_routes: &[EmbeddingRouteConfig],
-    active_storage: ActiveStorage<'_>,
+    _active_storage: ActiveStorage<'_>,
     workspace_dir: &Path,
     api_key: Option<&str>,
     providers: Option<&ModelProviders>,
 ) -> anyhow::Result<Box<dyn Memory>> {
     let backend_name = backend_kind_from_dotted(&config.backend);
     let backend_kind = classify_memory_backend(&backend_name);
-    let resolved_embedding = resolve_embedding_config(config, embedding_routes, api_key, providers);
+    let _resolved_embedding =
+        resolve_embedding_config(config, embedding_routes, api_key, providers);
 
     // Same 12h cadence as hygiene — capture before `run_if_due` writes state so
     // tachi light-sleep can share the window without a second due-check race.
@@ -594,136 +554,18 @@ pub fn create_memory_with_storage_and_routes(
         );
     }
 
-    // If snapshot_on_hygiene is enabled, export core memories during hygiene.
-    if config.snapshot_enabled
-        && config.snapshot_on_hygiene
-        && matches!(
-            backend_kind,
-            MemoryBackendKind::Sqlite | MemoryBackendKind::Lucid
-        )
-        && let Err(e) = snapshot::export_snapshot(workspace_dir)
-    {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-            "memory snapshot skipped"
-        );
-    }
-
-    // Auto-hydration: if brain.db is missing but MEMORY_SNAPSHOT.md exists,
-    // restore the "soul" from the snapshot before creating the backend.
-    if config.auto_hydrate
-        && matches!(
-            backend_kind,
-            MemoryBackendKind::Sqlite | MemoryBackendKind::Lucid
-        )
-        && snapshot::should_hydrate(workspace_dir)
-    {
-        ::zeroclaw_log::record!(
-            INFO,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-            "cold boot detected; hydrating from MEMORY_SNAPSHOT.md"
-        );
-        match snapshot::hydrate_from_snapshot(workspace_dir) {
-            Ok(count) => {
-                if count > 0 {
-                    ::zeroclaw_log::record!(
-                        INFO,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_attrs(::serde_json::json!({"count": count})),
-                        "hydrated core memories from snapshot"
-                    );
-                }
-            }
-            Err(e) => {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                    "memory hydration failed"
-                );
-            }
-        }
-    }
-
-    fn build_sqlite_memory(
-        config: &MemoryConfig,
-        sqlite_open_timeout_secs: Option<u64>,
-        workspace_dir: &Path,
-        resolved_embedding: &ResolvedEmbeddingConfig,
-    ) -> anyhow::Result<SqliteMemory> {
-        let embedder: Arc<dyn embeddings::EmbeddingProvider> =
-            Arc::from(embeddings::create_embedding_provider(
-                &resolved_embedding.model_provider,
-                resolved_embedding.api_key.as_deref(),
-                &resolved_embedding.model,
-                resolved_embedding.dimensions,
-            ));
-        let has_embedder = embedder.dimensions() > 0;
-
-        #[allow(clippy::cast_possible_truncation)]
-        let mem = SqliteMemory::with_embedder(
-            "sqlite",
-            workspace_dir,
-            embedder,
-            config.vector_weight as f32,
-            config.keyword_weight as f32,
-            config.embedding_cache_size,
-            sqlite_open_timeout_secs,
-            config.search_mode.clone(),
-        )?;
-
-        if has_embedder {
-            reconcile_embedding_identity(
-                &mem,
-                &embeddings::EmbeddingIdentity {
-                    provider: resolved_embedding.model_provider.clone(),
-                    model: resolved_embedding.model.clone(),
-                    dimensions: resolved_embedding.dimensions,
-                },
-                config.auto_reindex_on_identity_change,
-            );
-        }
-        Ok(mem)
-    }
-
-    // Per-backend SQLite open-timeout override comes from the active storage
-    // alias (V3); when no typed entry resolves, sqlite waits indefinitely.
-    let sqlite_open_timeout_secs = match active_storage {
-        ActiveStorage::Sqlite(sq) => sq.open_timeout_secs,
-        _ => None,
-    };
-
     if let MemoryBackendKind::Retired(backend) = backend_kind {
         return Err(retired_backend_error(backend, "memory.backend"));
-    }
-
-    if matches!(backend_kind, MemoryBackendKind::Lucid) {
-        let local = build_sqlite_memory(
-            config,
-            sqlite_open_timeout_secs,
-            workspace_dir,
-            &resolved_embedding,
-        )?;
-        return wrap_scanned_and_audit(
-            build_lucid_memory(workspace_dir, local, active_storage),
-            &config.policy,
-            workspace_dir,
-            config.audit_enabled,
-        );
     }
 
     #[cfg(feature = "tachi")]
     if matches!(backend_kind, MemoryBackendKind::Tachi) {
         let embedder: Arc<dyn embeddings::EmbeddingProvider> =
             Arc::from(embeddings::create_embedding_provider(
-                &resolved_embedding.model_provider,
-                resolved_embedding.api_key.as_deref(),
-                &resolved_embedding.model,
-                resolved_embedding.dimensions,
+                &_resolved_embedding.model_provider,
+                _resolved_embedding.api_key.as_deref(),
+                &_resolved_embedding.model,
+                _resolved_embedding.dimensions,
             ));
         let mem = TachiMemory::with_embedder(
             "tachi",
@@ -754,156 +596,20 @@ pub fn create_memory_with_storage_and_routes(
         );
     }
 
-    create_memory_with_builders(
+    create_memory_with_policy(
         &backend_name,
         workspace_dir,
-        || {
-            build_sqlite_memory(
-                config,
-                sqlite_open_timeout_secs,
-                workspace_dir,
-                &resolved_embedding,
-            )
-        },
         "",
         &config.policy,
         config.audit_enabled,
     )
 }
 
-/// Outcome of a startup embedding-identity reconciliation.
-#[derive(Debug, PartialEq, Eq)]
-enum EmbeddingIdentityOutcome {
-    /// No identity was recorded (fresh store, or one predating identity
-    /// tracking): the current identity was adopted without touching vectors.
-    Adopted,
-    /// Stored identity matches the current config — nothing to do.
-    Match,
-    /// Stored identity differed: vectors were invalidated (set to NULL),
-    /// the embedding cache cleared, and the new identity stamped.
-    Invalidated(usize),
-    /// Reconciliation failed; the store is untouched and the error was
-    /// logged. Startup proceeds — recall degrades no further than it
-    /// already would, and the next boot retries.
-    Failed,
-}
-
-fn reconcile_embedding_identity(
-    mem: &SqliteMemory,
-    current: &embeddings::EmbeddingIdentity,
-    auto_reindex: bool,
-) -> EmbeddingIdentityOutcome {
-    let stored = match mem.stored_embedding_identity() {
-        Ok(stored) => stored,
-        Err(e) => {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({"error": format!("{e}")})),
-                "memory: failed to read stored embedding identity; skipping reconciliation"
-            );
-            return EmbeddingIdentityOutcome::Failed;
-        }
-    };
-
-    match stored {
-        None => match mem.record_embedding_identity(current) {
-            Ok(()) => EmbeddingIdentityOutcome::Adopted,
-            Err(e) => {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({"error": format!("{e}")})),
-                    "memory: failed to record embedding identity; will retry next startup"
-                );
-                EmbeddingIdentityOutcome::Failed
-            }
-        },
-        Some(stored) if stored == *current => EmbeddingIdentityOutcome::Match,
-        Some(stored) => match mem.invalidate_embeddings_for_identity_change(current) {
-            Ok(invalidated) => {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_attrs(::serde_json::json!({
-                            "stored_identity": stored.to_string(),
-                            "current_identity": current.to_string(),
-                            "vectors_invalidated": invalidated,
-                        })),
-                    "memory: embedding identity changed; stored vectors invalidated and \
-                     embedding cache cleared (content retained). Semantic recall is \
-                     keyword-only until re-embedded — run `zeroclaw memory reindex`"
-                );
-                if auto_reindex && invalidated > 0 {
-                    spawn_auto_reindex(mem);
-                }
-                EmbeddingIdentityOutcome::Invalidated(invalidated)
-            }
-            Err(e) => {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({
-                            "stored_identity": stored.to_string(),
-                            "current_identity": current.to_string(),
-                            "error": format!("{e}"),
-                        })),
-                    "memory: embedding identity changed but invalidation failed; \
-                     store untouched, will retry next startup"
-                );
-                EmbeddingIdentityOutcome::Failed
-            }
-        },
-    }
-}
-
-/// Kick off the gated re-embed in the background after an identity
-/// migration, when `[memory] auto_reindex_on_identity_change` opts in.
-/// Outside an async runtime (no tokio context) the spawn is skipped and the
-/// operator is pointed at `zeroclaw memory reindex` instead.
-fn spawn_auto_reindex(mem: &SqliteMemory) {
-    let Ok(handle) = tokio::runtime::Handle::try_current() else {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-            "memory: auto_reindex_on_identity_change is set but no async runtime is \
-             available here; run `zeroclaw memory reindex` to re-embed"
-        );
-        return;
-    };
-    let mem = mem.clone();
-    handle.spawn(async move {
-        match mem.reindex().await {
-            Ok(count) => {
-                ::zeroclaw_log::record!(
-                    INFO,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_attrs(::serde_json::json!({"reembedded": count})),
-                    "memory: background re-embed after embedding identity change complete"
-                );
-            }
-            Err(e) => {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({"error": format!("{e}")})),
-                    "memory: background re-embed after embedding identity change failed; \
-                     run `zeroclaw memory reindex` to retry"
-                );
-            }
-        }
-    });
-}
-
 pub fn create_memory_for_migration(config: &Config) -> anyhow::Result<Box<dyn Memory>> {
     let backend = backend_kind_from_dotted(&config.memory.backend);
     if matches!(classify_memory_backend(&backend), MemoryBackendKind::None) {
         anyhow::bail!(
-            "memory backend 'none' disables persistence; choose sqlite, lucid, or markdown before migration"
+            "memory backend 'none' disables persistence; choose tachi or markdown before migration"
         );
     }
 
@@ -921,18 +627,6 @@ pub fn create_memory_for_migration(config: &Config) -> anyhow::Result<Box<dyn Me
         ..MemoryPolicyConfig::default()
     };
 
-    // Migration writes bypass the audit trail: the imported rows are bulk
-    // history, not live memory operations.
-    if matches!(classify_memory_backend(&backend), MemoryBackendKind::Lucid) {
-        let local = SqliteMemory::new("sqlite", &config.data_dir)?;
-        return wrap_scanned_and_audit(
-            build_lucid_memory(&config.data_dir, local, config.resolve_active_storage()),
-            &policy,
-            &config.data_dir,
-            false,
-        );
-    }
-
     #[cfg(feature = "tachi")]
     if matches!(classify_memory_backend(&backend), MemoryBackendKind::Tachi) {
         let mem = TachiMemory::new("tachi", &config.data_dir)?;
@@ -947,10 +641,9 @@ pub fn create_memory_for_migration(config: &Config) -> anyhow::Result<Box<dyn Me
         );
     }
 
-    create_memory_with_builders(
+    create_memory_with_policy(
         &backend,
         &config.data_dir,
-        || SqliteMemory::new("sqlite", &config.data_dir),
         " during migration",
         &policy,
         false,
@@ -1006,11 +699,16 @@ pub async fn create_memory_for_agent(
     let backend_kind = agent_cfg.memory.backend;
     if matches!(
         backend_kind,
-        ConfigBackend::Postgres | ConfigBackend::Qdrant
+        ConfigBackend::Postgres
+            | ConfigBackend::Qdrant
+            | ConfigBackend::Sqlite
+            | ConfigBackend::Lucid
     ) {
         let backend = match backend_kind {
             ConfigBackend::Postgres => "postgres",
-            _ => "qdrant",
+            ConfigBackend::Qdrant => "qdrant",
+            ConfigBackend::Sqlite => "sqlite",
+            _ => "lucid",
         };
         return Err(retired_backend_error(
             backend,
@@ -1018,7 +716,7 @@ pub async fn create_memory_for_agent(
         ));
     }
 
-    // Typed-memory producers are SQLite-only. Config::validate already
+    // Typed-memory producers are Tachi-only. Config::validate already
     // rejects this combination on every save path, but boot is
     // deliberately validation-resilient (a hand-edited config still
     // starts the daemon so the operator can repair it via /config), so
@@ -1033,15 +731,15 @@ pub async fn create_memory_for_agent(
             "memory.consolidation_extract_facts"
         };
         let global_kind = backend_kind_from_dotted(&config.memory.backend);
-        if !matches!(global_kind.as_str(), "sqlite" | "tachi") {
+        if global_kind != "tachi" {
             anyhow::bail!(
-                "{flag} = true requires memory.backend = \"sqlite\" or \"tachi\" (typed memory storage is SQLite-only/Tachi-only), but memory.backend = {:?}",
+                "{flag} = true requires memory.backend = \"tachi\" (typed memory storage is Tachi-only), but memory.backend = {:?}",
                 config.memory.backend
             );
         }
-        if !matches!(backend_kind, ConfigBackend::Sqlite | ConfigBackend::Tachi) {
+        if !matches!(backend_kind, ConfigBackend::Tachi) {
             anyhow::bail!(
-                "{flag} = true requires every agent on the sqlite or tachi memory backend (typed memory storage is SQLite-only/Tachi-only), but agents.{agent_alias}.memory.backend = {backend_kind:?}"
+                "{flag} = true requires every agent on the tachi memory backend (typed memory storage is Tachi-only), but agents.{agent_alias}.memory.backend = {backend_kind:?}"
             );
         }
     }
@@ -1114,23 +812,10 @@ pub async fn create_memory_for_agent(
     } else {
         let mut agent_memory = config.memory.clone();
         agent_memory.backend = agent_backend_name.to_string();
-        let active_storage = match backend_kind {
-            ConfigBackend::Lucid => config
-                .storage
-                .lucid
-                .get("default")
-                .map_or(ActiveStorage::None, ActiveStorage::Lucid),
-            ConfigBackend::Sqlite => config
-                .storage
-                .sqlite
-                .get("default")
-                .map_or(ActiveStorage::None, ActiveStorage::Sqlite),
-            _ => ActiveStorage::None,
-        };
         create_memory_with_storage_and_routes(
             &agent_memory,
             &config.embedding_routes,
-            active_storage,
+            ActiveStorage::None,
             &config.data_dir,
             api_key,
             Some(&config.providers.models),

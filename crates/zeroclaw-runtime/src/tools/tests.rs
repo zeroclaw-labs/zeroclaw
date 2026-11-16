@@ -954,7 +954,15 @@ async fn registry_rebuild_carries_spawn_lineage_and_cannot_reset_depth() {
     build_cfg.config_path = tmp.path().join("config.toml");
     let security = Arc::new(SecurityPolicy::for_agent(&build_cfg, "parent-agent").unwrap());
     let mem: Arc<dyn Memory> = Arc::from(
-        zeroclaw_memory::create_memory(&MemoryConfig::default(), tmp.path(), None).unwrap(),
+        zeroclaw_memory::create_memory(
+            &MemoryConfig {
+                backend: "markdown".into(),
+                ..MemoryConfig::default()
+            },
+            tmp.path(),
+            None,
+        )
+        .unwrap(),
     );
 
     let at_cap = zeroclaw_api::subagent_v1::LineageRef::new_root(

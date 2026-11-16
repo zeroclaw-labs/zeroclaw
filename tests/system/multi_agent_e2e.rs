@@ -93,7 +93,7 @@ fn legacy_install_upgrades_cleanly_with_backup() {
 }
 
 #[tokio::test]
-async fn two_sqlite_agents_on_one_install_have_isolated_memory() {
+async fn two_agents_on_one_install_have_isolated_memory() {
     use zeroclaw_config::schema::{AliasedAgentConfig, Config, RiskProfileConfig};
 
     let tmp = TempDir::new().unwrap();

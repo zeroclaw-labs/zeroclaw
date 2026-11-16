@@ -483,6 +483,42 @@ fn build_memories_select_sql(cols: &HashSet<String>) -> String {
     )
 }
 
+fn legacy_key_prefix(key: &str) -> String {
+    use std::fmt::Write as _;
+    let mut prefix = String::from("zc-key-v1:");
+    for byte in key.as_bytes() {
+        let _ = write!(prefix, "{byte:02x}");
+    }
+    prefix.push(':');
+    prefix
+}
+
+fn decode_legacy_physical_key(id: &str, physical: String) -> String {
+    const TAG: &str = "zc-key-v1:";
+    let Some(uuid) = id.strip_prefix(TAG) else {
+        return physical;
+    };
+    let Some(rest) = physical.strip_prefix(TAG) else {
+        return physical;
+    };
+    let Some((_, payload)) = rest.split_once(':') else {
+        return physical;
+    };
+    let Ok((key, _session, nonce)) =
+        serde_json::from_str::<(String, Option<String>, String)>(payload)
+    else {
+        return physical;
+    };
+    if nonce == uuid
+        && uuid::Uuid::parse_str(uuid).is_ok()
+        && physical.starts_with(&legacy_key_prefix(&key))
+    {
+        key
+    } else {
+        physical
+    }
+}
+
 fn build_planned_row(
     row: &rusqlite::Row<'_>,
     agents_by_id: &HashMap<String, String>,
@@ -496,7 +532,7 @@ fn build_planned_row(
         "native 'memories' table contains a blank row id"
     );
     let raw_key: String = row.get(1)?;
-    let key = crate::sqlite::key_scope::decode(&id, raw_key);
+    let key = decode_legacy_physical_key(&id, raw_key);
     ensure!(
         !key.trim().is_empty(),
         "native memory row '{id}' has a blank key"
@@ -887,7 +923,6 @@ fn verify_decoded_row(
 mod tests {
     use super::*;
     use crate::embeddings::EmbeddingProvider;
-    use crate::sqlite::SqliteMemory;
     use crate::traits::{ExportFilter, Memory, SemanticSubtype};
     use async_trait::async_trait;
     use std::os::unix::fs::PermissionsExt;
@@ -917,94 +952,178 @@ mod tests {
         }
     }
 
-    async fn build_rich_native_brain(dir: &Path) -> PathBuf {
-        let embedder: Arc<dyn EmbeddingProvider> = Arc::new(Fixed1024Embedder);
-        let mem = SqliteMemory::with_embedder(
-            "sqlite",
-            dir,
-            embedder,
-            0.7,
-            0.3,
-            16,
-            None,
-            zeroclaw_config::schema::SearchMode::default(),
-        )
-        .expect("create sqlite memory");
-        let alpha_id = mem.ensure_agent_uuid("alpha").await.unwrap();
-        let beta_id = mem.ensure_agent_uuid("beta").await.unwrap();
+    fn fixed_vector_blob(seed_offset: usize, content: &str) -> Vec<u8> {
+        let seed = (content.len() + seed_offset) as f32 * 0.001 + 0.1;
+        std::iter::repeat_n(seed, MEMCORE_VECTOR_DIM)
+            .flat_map(f32::to_le_bytes)
+            .collect()
+    }
 
-        mem.store_with_options_and_agent(
-            "pref_theme",
-            "User prefers dark mode",
-            MemoryCategory::Core,
-            None,
-            StoreOptions {
-                namespace: Some("prefs".into()),
+    fn build_rich_native_brain(dir: &Path) -> PathBuf {
+        let memory_dir = dir.join("memory");
+        std::fs::create_dir_all(&memory_dir).unwrap();
+        let db_path = memory_dir.join("brain.db");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE agents (
+                 id TEXT PRIMARY KEY,
+                 alias TEXT NOT NULL UNIQUE,
+                 created_at TEXT NOT NULL
+             );
+             CREATE TABLE memories (
+                 id TEXT PRIMARY KEY,
+                 key TEXT NOT NULL,
+                 content TEXT NOT NULL,
+                 category TEXT NOT NULL,
+                 embedding BLOB,
+                 created_at TEXT NOT NULL,
+                 updated_at TEXT NOT NULL,
+                 session_id TEXT,
+                 namespace TEXT,
+                 importance REAL,
+                 superseded_by TEXT,
+                 agent_id TEXT,
+                 kind TEXT,
+                 pinned INTEGER NOT NULL DEFAULT 0,
+                 tenant_id TEXT
+             );
+             INSERT INTO agents (id, alias, created_at) VALUES
+                 ('agent-alpha', 'alpha', '2026-01-01T00:00:00Z'),
+                 ('agent-beta', 'beta', '2026-01-01T00:00:00Z');",
+        )
+        .unwrap();
+
+        struct FixtureRow<'a> {
+            id: &'a str,
+            key: &'a str,
+            content: &'a str,
+            category: &'a str,
+            ts: &'a str,
+            session_id: Option<&'a str>,
+            namespace: Option<&'a str>,
+            importance: Option<f64>,
+            superseded_by: Option<&'a str>,
+            agent_id: Option<&'a str>,
+            kind: Option<&'a str>,
+            pinned: i64,
+            tenant_id: Option<&'a str>,
+        }
+
+        let pref_kind =
+            serde_json::to_string(&MemoryKind::Semantic(SemanticSubtype::Preference)).unwrap();
+        let rows = [
+            FixtureRow {
+                id: "row-pref-theme",
+                key: "pref_theme",
+                content: "User prefers dark mode",
+                category: "core",
+                ts: "2026-01-01T00:00:01Z",
+                session_id: None,
+                namespace: Some("prefs"),
                 importance: Some(0.9),
-                kind: Some(MemoryKind::Semantic(SemanticSubtype::Preference)),
-                pinned: true,
-                tenant_id: Some("tenant-a".into()),
+                superseded_by: None,
+                agent_id: Some("agent-alpha"),
+                kind: Some(pref_kind.as_str()),
+                pinned: 1,
+                tenant_id: Some("tenant-a"),
             },
-            Some(&alpha_id),
-        )
-        .await
-        .unwrap();
+            FixtureRow {
+                id: "row-turn-1",
+                key: "turn_note",
+                content: "Session one summary",
+                category: "conversation",
+                ts: "2026-01-01T00:00:02Z",
+                session_id: Some("sess-1"),
+                namespace: None,
+                importance: None,
+                superseded_by: None,
+                agent_id: Some("agent-beta"),
+                kind: None,
+                pinned: 0,
+                tenant_id: None,
+            },
+            FixtureRow {
+                id: "row-turn-2",
+                key: "turn_note",
+                content: "Session two summary",
+                category: "conversation",
+                ts: "2026-01-01T00:00:03Z",
+                session_id: Some("sess-2"),
+                namespace: None,
+                importance: None,
+                superseded_by: None,
+                agent_id: Some("agent-beta"),
+                kind: None,
+                pinned: 0,
+                tenant_id: None,
+            },
+            FixtureRow {
+                id: "row-office-v1",
+                key: "office_city",
+                content: "The office is in Denver",
+                category: "core",
+                ts: "2026-01-01T00:00:04Z",
+                session_id: None,
+                namespace: None,
+                importance: None,
+                superseded_by: Some("row-office-v2"),
+                agent_id: None,
+                kind: None,
+                pinned: 0,
+                tenant_id: None,
+            },
+            FixtureRow {
+                id: "row-office-v2",
+                key: "office_city_v2",
+                content: "The office moved to Austin",
+                category: "core",
+                ts: "2026-01-01T00:00:05Z",
+                session_id: None,
+                namespace: None,
+                importance: None,
+                superseded_by: None,
+                agent_id: None,
+                kind: None,
+                pinned: 0,
+                tenant_id: None,
+            },
+        ];
 
-        mem.store_with_options_and_agent(
-            "turn_note",
-            "Session one summary",
-            MemoryCategory::Conversation,
-            Some("sess-1"),
-            StoreOptions::default(),
-            Some(&beta_id),
-        )
-        .await
-        .unwrap();
-
-        mem.store_with_options_and_agent(
-            "turn_note",
-            "Session two summary",
-            MemoryCategory::Conversation,
-            Some("sess-2"),
-            StoreOptions::default(),
-            Some(&beta_id),
-        )
-        .await
-        .unwrap();
-
-        mem.store_with_options(
-            "office_city",
-            "The office is in Denver",
-            MemoryCategory::Core,
-            None,
-            StoreOptions::default(),
-        )
-        .await
-        .unwrap();
-        mem.store_with_options(
-            "office_city_v2",
-            "The office moved to Austin",
-            MemoryCategory::Core,
-            None,
-            StoreOptions::default(),
-        )
-        .await
-        .unwrap();
-
-        let loser = mem.get("office_city").await.unwrap().unwrap();
-        let winner = mem.get("office_city_v2").await.unwrap().unwrap();
-        mem.supersede(std::slice::from_ref(&loser.id), &winner.id)
-            .await
+        for (idx, row) in rows.iter().enumerate() {
+            let embedding = fixed_vector_blob(idx, row.content);
+            conn.execute(
+                "INSERT INTO memories (
+                     id, key, content, category, embedding, created_at, updated_at,
+                     session_id, namespace, importance, superseded_by, agent_id, kind, pinned, tenant_id
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                rusqlite::params![
+                    row.id,
+                    row.key,
+                    row.content,
+                    row.category,
+                    embedding,
+                    row.ts,
+                    row.session_id,
+                    row.namespace,
+                    row.importance,
+                    row.superseded_by,
+                    row.agent_id,
+                    row.kind,
+                    row.pinned,
+                    row.tenant_id,
+                ],
+            )
             .unwrap();
+        }
 
-        dir.join("memory").join("brain.db")
+        db_path
     }
 
     #[tokio::test]
     async fn migrate_native_preserves_multi_agent_typed_superseded_and_vectors_and_is_reversible() {
         let src_dir = tempfile::tempdir().unwrap();
         let dst_dir = tempfile::tempdir().unwrap();
-        let source = build_rich_native_brain(src_dir.path()).await;
+        let source = build_rich_native_brain(src_dir.path());
         let destination = dst_dir.path().join("tachi.db");
 
         let source_before = source::census(&source).unwrap();

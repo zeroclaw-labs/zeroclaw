@@ -43,7 +43,7 @@
         # >>> generated:flake-packages by `cargo generate installers` - do not edit <<<
         # Default feature set: canonical lean Dist.
         # Override with `packages.zeroclaw.override { features = [ ... ]; }`.
-        zeroclawDefaultFeatures = [ "agent-runtime" "channel-acp-server" "channel-discord" "channel-email" "channel-telegram" "channel-webhook" "gateway" "observability-prometheus" "schema-export" ];
+        zeroclawDefaultFeatures = [ "agent-runtime" "channel-acp-server" "channel-discord" "channel-email" "channel-telegram" "channel-webhook" "gateway" "memory-tachi" "observability-prometheus" "schema-export" ];
         rootFeatureGraph = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).features;
         rootFeatureClosure = features: builtins.map (node: node.key) (builtins.genericClosure {
           startSet = builtins.map (feature: { key = feature; }) features;

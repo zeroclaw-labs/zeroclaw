@@ -170,6 +170,7 @@ default = [
     "agent-runtime",
     "default-channels",
     "gateway",
+    "memory-tachi",
     "observability-prometheus",
     "schema-export",
 ]
@@ -231,7 +232,7 @@ channel-acp-server = []
 # package needs this forward so targets that construct `gateway::AppState`
 # (e.g. the `component` test) can cfg-gate the node-only fields.
 nodes = ["zeroclaw-gateway?/nodes"]
-memory-tachi = ["zeroclaw-memory/tachi"]
+memory-tachi = ["zeroclaw-memory/tachi", "zeroclaw-runtime?/memory-tachi", "zeroclaw-gateway?/memory-tachi"]
 
 # Backends and platform flags — each forwards to ONE crate
 observability-prometheus = [
@@ -254,6 +255,7 @@ ci-all = [
     "voice-surface",
     "agent-runtime",
     "channels-full",
+    "memory-tachi",
     "observability-prometheus",
     "sandbox-landlock", "sandbox-bubblewrap",
     "zeroclaw-runtime/heavy-tests",

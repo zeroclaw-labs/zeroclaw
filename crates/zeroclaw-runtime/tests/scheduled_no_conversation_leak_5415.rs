@@ -6,7 +6,7 @@ use axum::{Router, extract::State, routing::post};
 use tempfile::TempDir;
 use tokio::sync::Mutex as AsyncMutex;
 use zeroclaw_config::schema::{AliasedAgentConfig, Config, RiskProfileConfig};
-use zeroclaw_memory::{Memory, MemoryCategory, SqliteMemory};
+use zeroclaw_memory::{MemoryCategory, TACHI_COMPILED, create_memory};
 
 // Unique sentinel that exists ONLY in the planted Conversation entry: it must
 // not appear in the cron prompt or any system prompt. If it surfaces in the
@@ -38,6 +38,9 @@ async fn spawn_mock_provider() -> (SocketAddr, CapturedBodies) {
 
 #[tokio::test]
 async fn scheduled_run_does_not_leak_conversation_memory_into_provider_request() {
+    if !TACHI_COMPILED {
+        return;
+    }
     let tmp = TempDir::new().unwrap();
     let workspace_dir = tmp.path().join("workspace");
     tokio::fs::create_dir_all(&workspace_dir).await.unwrap();
@@ -50,7 +53,9 @@ async fn scheduled_run_does_not_leak_conversation_memory_into_provider_request()
     let provider_type = "custom";
 
     {
-        let mem = SqliteMemory::new("sqlite", &workspace_dir).unwrap();
+        let mut mem_cfg = Config::default().memory;
+        mem_cfg.hygiene_enabled = false;
+        let mem = create_memory(&mem_cfg, &workspace_dir, None).unwrap();
         mem.store(
             "discord:guild:chan:msg-42",
             // Includes overlap words ("reminder", "today") so the keyword

@@ -59,7 +59,7 @@ See [runtime internals](../agents/internals.md#repeated-tool-failure-recovery).
 | Cron `allowed_tools = []` means deny-all | asserts the opposite in a test | deliberate |
 | `ModelProvider::set_credential` with real 429 rotation | logs "cannot apply … Retrying with original key" | deliberate |
 | WeChat state persistence is atomic and non-blocking | blocking, non-atomic write | deliberate |
-| Portable memory kernel behind `memory-tachi` (`zeroclaw-memory/tachi`) | absent | deliberate; distinct ZeroClaw memory and companion roles |
+| Portable memory kernel behind `memory-tachi` (`zeroclaw-memory/tachi`), default backend `tachi` | absent (defaults to SQLite) | deliberate; `tachi` is default in `zeroclawlabs`, while `--no-default-features`, `--features slim-control`, and default `zeroclaw-memory` stay AGPL-free |
 | `vault:<NAME>` secret references resolved from Tachi Vault and preserved on disk | `op://` only at `87461d1ac5` | deliberate; Tachi Vault owns credentials |
 | HyperMemory custom CRUD backend | absent | retired; never re-add |
 | Builtin `calculator` / `weather` tools (`crates/zeroclaw-tools/src/{calculator,weather_tool}.rs`) | present | retired; implementations deleted, names reserved in `RETIRED_OPERATOR_TOOL_NAMES`. Weather, if ever needed again, is an HTTP skill / MCP wrapper, not a builtin |
@@ -269,3 +269,31 @@ only activates exact MCP names already admitted by its own policy. See
 [MCP loading and argument recovery](../tools/mcp.md#deferred-loading) for behavior
 and validation limits. Reverting this leaf restores search-first loading; no
 persistent data migration is required.
+
+## Default Tachi memory and retired SQLite / Lucid backends (#382 / #647)
+
+Relative to immutable upstream decisions
+[ADR-005](../architecture/decisions/ADR-005-pluggable-memory-backends.md) and
+[ADR-010](../architecture/decisions/ADR-010-memory-authority-boundaries.md),
+this fork converges default conversation memory on the embedded Tachi
+(`portable-kernel`) store:
+
+- `zeroclawlabs` enables `memory-tachi` by default and defaults
+  `[memory].backend` and `[agents.<alias>.memory].backend` to `tachi` (`Tachi`).
+  `zeroclaw-memory` keeps default features off, and both
+  `--no-default-features` and `--features slim-control` remain 100% AGPL-free.
+- `SqliteMemory`, `LucidMemory`, `MEMORY_SNAPSHOT.md` export/hydration, SQLite
+  v3 memory migration, and `[storage.sqlite]` / `[storage.lucid]` configuration
+  sections are retired.
+- Parse-only config tombstones stay in `zeroclaw-config` (`sqlite`, `lucid`,
+  `postgres`, `qdrant`, `[storage.*]`, `memory.snapshot_enabled`,
+  `memory.snapshot_on_hygiene`, `memory.auto_hydrate`), emitting structured
+  warnings and failing memory construction explicitly with guidance to run
+  offline `zeroclaw memory migrate-native` (`--source`, `--destination`,
+  `--approved-by`) rather than silently falling back.
+- Non-memory SQLite stores remain untouched (`zeroclaw-infra` sessions, ACP
+  sessions, approvals, Soul, User Model, audit, cron, devices, and knowledge
+  graph).
+- Upstream `zeroclaw-labs/zeroclaw` retains `SqliteMemory` and `LucidMemory`
+  as built-in backends; do not port SQLite or Lucid memory re-introductions back
+  into this fork without an explicit architectural reversal.

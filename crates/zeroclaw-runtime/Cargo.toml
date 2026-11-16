@@ -97,6 +97,7 @@ schema-export = ["dep:schemars", "zeroclaw-config/schema-export"]
 # consumes this crate with default-features = false and forwards these from
 # its own default so the slim companion selection can omit them.
 email-tools = ["zeroclaw-tools/email-tools"]
+memory-tachi = ["zeroclaw-memory/tachi"]
 sandbox-bubblewrap = []
 # Heavy agent behavioral suites. Gated so lib-test
 # iteration does not compile them; CI runtime leg enables this feature.

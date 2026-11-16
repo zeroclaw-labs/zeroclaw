@@ -167,13 +167,22 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
-    use zeroclaw_config::schema::MemoryPolicyConfig;
-    use zeroclaw_memory::{MemoryEntry, ScannedMemory, SqliteMemory};
+    use zeroclaw_config::schema::{MemoryConfig, MemoryPolicyConfig};
+    use zeroclaw_memory::{MemoryEntry, NoneMemory, TACHI_COMPILED, create_memory};
 
-    fn test_mem() -> (TempDir, Arc<dyn Memory>) {
+    fn try_test_mem() -> Option<(TempDir, Arc<dyn Memory>)> {
+        if !TACHI_COMPILED {
+            return None;
+        }
         let tmp = TempDir::new().unwrap();
-        let mem = SqliteMemory::new("test", tmp.path()).unwrap();
-        (tmp, Arc::new(mem))
+        let cfg = MemoryConfig {
+            backend: "tachi".into(),
+            hygiene_enabled: false,
+            embedding_provider: "none".into(),
+            ..MemoryConfig::default()
+        };
+        let mem = create_memory(&cfg, tmp.path(), None).unwrap();
+        Some((tmp, Arc::from(mem)))
     }
 
     struct UnfilteredListMemory {
@@ -452,7 +461,7 @@ mod tests {
 
     #[test]
     fn name_and_schema() {
-        let (_tmp, mem) = test_mem();
+        let mem: Arc<dyn Memory> = Arc::new(NoneMemory::new("none"));
         let tool = MemoryExportTool::new(mem);
         assert_eq!(tool.name(), "memory_export");
         let schema = tool.parameters_schema();
@@ -465,7 +474,9 @@ mod tests {
 
     #[tokio::test]
     async fn export_produces_valid_json_output() {
-        let (_tmp, mem) = test_mem();
+        let Some((_tmp, mem)) = try_test_mem() else {
+            return;
+        };
         mem.store("k1", "test data", MemoryCategory::Core, None)
             .await
             .unwrap();
@@ -480,7 +491,9 @@ mod tests {
 
     #[tokio::test]
     async fn export_empty_database_returns_empty_array() {
-        let (_tmp, mem) = test_mem();
+        let Some((_tmp, mem)) = try_test_mem() else {
+            return;
+        };
         let tool = MemoryExportTool::new(mem);
         let result = tool.execute(json!({})).await.unwrap();
         assert!(result.success);
@@ -491,7 +504,9 @@ mod tests {
 
     #[tokio::test]
     async fn export_with_category_filter() {
-        let (_tmp, mem) = test_mem();
+        let Some((_tmp, mem)) = try_test_mem() else {
+            return;
+        };
         mem.store("k1", "core data", MemoryCategory::Core, None)
             .await
             .unwrap();
@@ -510,7 +525,9 @@ mod tests {
 
     #[tokio::test]
     async fn export_with_session_filter() {
-        let (_tmp, mem) = test_mem();
+        let Some((_tmp, mem)) = try_test_mem() else {
+            return;
+        };
         mem.store("k1", "sess-a data", MemoryCategory::Core, Some("sess-a"))
             .await
             .unwrap();
@@ -538,15 +555,22 @@ mod tests {
 
     #[tokio::test]
     async fn export_tool_omits_rows_withheld_by_read_policy() {
+        if !TACHI_COMPILED {
+            return;
+        }
         let tmp = TempDir::new().unwrap();
         let policy = MemoryPolicyConfig {
             threat_scan_on_hit: "block-on-read".into(),
             ..MemoryPolicyConfig::default()
         };
-        let mem = Arc::new(ScannedMemory::new(
-            SqliteMemory::new("test", tmp.path()).unwrap(),
-            &policy,
-        ));
+        let cfg = MemoryConfig {
+            backend: "tachi".into(),
+            hygiene_enabled: false,
+            embedding_provider: "none".into(),
+            policy,
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(create_memory(&cfg, tmp.path(), None).unwrap());
 
         mem.store(
             "held",

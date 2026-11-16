@@ -2150,7 +2150,7 @@ function MemoriesTab() {
   const sortBy: MemorySort = isMemorySort(sortRaw) ? sortRaw : "newest";
   // Debounced query so each keystroke doesn't fire a recall request to the
   // backend (which then hits the configured memory store — markdown read,
-  // sqlite scan, qdrant vector search, etc.).
+  // tachi search, etc.).
   const [debouncedQuery, setDebouncedQuery] = useState(searchQuery);
   useEffect(() => {
     const id = window.setTimeout(() => setDebouncedQuery(searchQuery), 250);

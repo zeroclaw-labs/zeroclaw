@@ -137,7 +137,8 @@ export const enumValues: EnumValues = {
     "postgres",
     "qdrant",
     "markdown",
-    "lucid"
+    "lucid",
+    "tachi"
   ],
   "MemoryDedupAction": [
     "reject",

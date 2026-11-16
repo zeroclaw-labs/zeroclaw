@@ -32,10 +32,9 @@ pub enum AccessMode {
 pub enum MemoryBackendKind {
     /// No memory backend. Recall returns empty; stores are no-ops.
     None,
-    /// Embedded SQLite (`crates/zeroclaw-memory/src/sqlite.rs`). Default for
-    /// new installs because every supported platform can run it without
-    /// extra services.
-    #[default]
+    /// Embedded SQLite (`crates/zeroclaw-memory/src/sqlite.rs`). Retired —
+    /// retained only for deserializing legacy config files so startup can
+    /// report the tombstone warning and steer to `zeroclaw memory migrate-native`.
     Sqlite,
     /// Retired PostgreSQL backend. Still parses so an old config loads (with
     /// the `memory_backend_removed` warning); selecting it fails memory
@@ -47,9 +46,12 @@ pub enum MemoryBackendKind {
     /// (`crates/zeroclaw-memory/src/markdown.rs`).
     Markdown,
     /// Hybrid local SQLite + external Lucid CLI
-    /// (`crates/zeroclaw-memory/src/lucid.rs`).
+    /// (`crates/zeroclaw-memory/src/lucid.rs`). Retired — same contract as
+    /// [`Self::Postgres`].
     Lucid,
     /// Embedded Tachi portable kernel (`crates/zeroclaw-memory/src/tachi.rs`).
+    /// Default for new agents.
+    #[default]
     Tachi,
 }
 
@@ -79,7 +81,7 @@ pub struct AgentWorkspaceConfig {
 #[prefix = "agent_memory"]
 #[serde(default)]
 pub struct AgentMemoryConfig {
-    /// The backend kind this agent uses. Defaults to `Sqlite` for new
+    /// The backend kind this agent uses. Defaults to `Tachi` for new
     /// agents; once an agent has on-disk data the value is locked.
     pub backend: MemoryBackendKind,
 }
@@ -342,10 +344,10 @@ gamma = "read_write"
     }
 
     #[test]
-    fn agent_memory_config_default_is_sqlite() {
+    fn agent_memory_config_default_is_tachi() {
         assert_eq!(
             AgentMemoryConfig::default().backend,
-            MemoryBackendKind::Sqlite
+            MemoryBackendKind::Tachi
         );
     }
 

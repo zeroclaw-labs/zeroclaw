@@ -185,6 +185,66 @@ impl TachiMemory {
         }
     }
 
+    /// Project memcore's multi-channel retrieval signals onto ZeroClaw's
+    /// calibrated `[0.0, 1.0]` relevance axis (`hit.score.final_score` uses
+    /// RRF scale `~1/(k+rank)` when `use_rrf` is enabled, which would
+    /// systematically fall below downstream `min_relevance_score` floors).
+    fn calibrated_relevance_score(
+        vector: f64,
+        fts: f64,
+        symbolic: f64,
+        final_score: f64,
+        weights: &HybridWeights,
+        vector_active: bool,
+    ) -> f64 {
+        let vec_score = if vector_active && vector.is_finite() {
+            vector.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let fts_score = if fts.is_finite() {
+            fts.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let sym_score = if symbolic.is_finite() {
+            symbolic.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+
+        let mut weighted = 0.0;
+        let mut present_weight = 0.0;
+        if vector_active && weights.semantic > 0.0 && vec_score > 0.0 {
+            weighted += weights.semantic * vec_score;
+            present_weight += weights.semantic;
+        }
+        if weights.fts > 0.0 && fts_score > 0.0 {
+            weighted += weights.fts * fts_score;
+            present_weight += weights.fts;
+        }
+        if weights.symbolic > 0.0 && sym_score > 0.0 {
+            weighted += weights.symbolic * sym_score;
+            present_weight += weights.symbolic;
+        }
+        if present_weight > f64::EPSILON {
+            return (weighted / present_weight).clamp(0.0, 1.0);
+        }
+        if sym_score > 0.0 {
+            return sym_score;
+        }
+        if vec_score > 0.0 {
+            return vec_score;
+        }
+        if fts_score > 0.0 {
+            return fts_score;
+        }
+        if final_score.is_finite() && final_score > 0.0 {
+            return final_score.clamp(0.0, 1.0);
+        }
+        0.0
+    }
+
     fn category_to_segment(category: &MemoryCategory) -> String {
         match category {
             MemoryCategory::Core => "core".into(),
@@ -486,6 +546,10 @@ impl TachiMemory {
         true
     }
 
+    fn is_durable_global_row(category: &MemoryCategory, session_id: Option<&str>) -> bool {
+        session_id.is_none() && matches!(category, MemoryCategory::Core | MemoryCategory::Daily)
+    }
+
     fn entry_matches_filters(
         entry: &MemoryEntry,
         session_id: Option<&str>,
@@ -499,6 +563,7 @@ impl TachiMemory {
         }
         if let Some(sid) = session_id
             && entry.session_id.as_deref() != Some(sid)
+            && !Self::is_durable_global_row(&entry.category, entry.session_id.as_deref())
         {
             return false;
         }
@@ -980,6 +1045,7 @@ impl TachiMemory {
             }
 
             let vec_available = store.vec_available;
+            let vector_active = vec_available && query_vec.is_some();
             let allowed_refs: Option<Vec<&str>> = allowed_c
                 .as_ref()
                 .map(|agents| agents.iter().map(String::as_str).collect());
@@ -1006,7 +1072,15 @@ impl TachiMemory {
 
                 for hit in hits {
                     let fts_matched = hit.score.fts.is_finite() && hit.score.fts > 0.0;
-                    let entry = Self::memcore_to_zeroclaw(hit.entry, Some(hit.score.final_score));
+                    let calibrated_score = Self::calibrated_relevance_score(
+                        hit.score.vector,
+                        hit.score.fts,
+                        hit.score.symbolic,
+                        hit.score.final_score,
+                        &weights,
+                        vector_active,
+                    );
+                    let entry = Self::memcore_to_zeroclaw(hit.entry, Some(calibrated_score));
                     if Self::entry_matches_filters(
                         &entry,
                         session_c.as_deref(),
@@ -1214,6 +1288,11 @@ impl TachiMemory {
 
     fn swap_embedder(&self, embedder: Arc<dyn EmbeddingProvider>) {
         *self.embedder.write() = embedder;
+    }
+
+    #[doc(hidden)]
+    pub fn embedder_dimensions(&self) -> usize {
+        self.embedder.read().dimensions()
     }
 
     async fn delete_ids(&self, ids: Vec<String>) -> anyhow::Result<usize> {
@@ -3264,5 +3343,30 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["recent_tail"]
         );
+    }
+
+    #[test]
+    fn calibrated_relevance_score_keeps_bm25_and_hybrid_on_unit_scale() {
+        let weights = HybridWeights {
+            semantic: 0.7,
+            fts: 0.3,
+            symbolic: 0.0,
+            decay: 0.0,
+            use_rrf: true,
+        };
+        let bm25_best =
+            TachiMemory::calibrated_relevance_score(0.0, 1.0, 0.0, 0.016, &weights, false);
+        let bm25_weaker =
+            TachiMemory::calibrated_relevance_score(0.0, 0.72, 0.0, 0.015, &weights, false);
+        assert!((bm25_best - 1.0).abs() < f64::EPSILON);
+        assert!((bm25_weaker - 0.72).abs() < f64::EPSILON);
+        assert!(bm25_best > bm25_weaker);
+
+        let hybrid = TachiMemory::calibrated_relevance_score(0.8, 1.0, 0.0, 0.018, &weights, true);
+        assert!((hybrid - 0.86).abs() < 1e-12);
+
+        let sym_fallback =
+            TachiMemory::calibrated_relevance_score(0.0, 0.0, 0.65, 0.01, &weights, false);
+        assert!((sym_fallback - 0.65).abs() < f64::EPSILON);
     }
 }

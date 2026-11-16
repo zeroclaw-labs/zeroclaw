@@ -3190,7 +3190,7 @@ mod tests {
             ..Config::default()
         };
         std::fs::create_dir_all(&config.data_dir).unwrap();
-        config.memory.backend = "sqlite.default".to_string();
+        config.memory.backend = "tachi".to_string();
 
         let mut agent = AliasedAgentConfig::default();
         agent.memory.backend = MemoryBackendKind::None;

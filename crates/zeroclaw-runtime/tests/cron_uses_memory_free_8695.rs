@@ -9,7 +9,7 @@ use axum::{Router, extract::State, routing::post};
 use tempfile::TempDir;
 use tokio::sync::Mutex as AsyncMutex;
 use zeroclaw_config::schema::{AliasedAgentConfig, Config, RiskProfileConfig};
-use zeroclaw_memory::{Memory, MemoryCategory, SqliteMemory};
+use zeroclaw_memory::{MemoryCategory, TACHI_COMPILED, create_memory};
 use zeroclaw_runtime::agent::loop_::AgentRunOverrides;
 
 // Present ONLY in the planted memory entry: if it surfaces in a provider
@@ -41,7 +41,9 @@ async fn spawn_mock_provider() -> (SocketAddr, CapturedBodies) {
 async fn config_with_planted_memory(provider_uri: &str, workspace_dir: &std::path::Path) -> Config {
     let provider_type = "custom";
     {
-        let mem = SqliteMemory::new("sqlite", workspace_dir).unwrap();
+        let mut mem_cfg = Config::default().memory;
+        mem_cfg.hygiene_enabled = false;
+        let mem = create_memory(&mem_cfg, workspace_dir, None).unwrap();
         mem.store(
             "core:reminder:8695",
             &format!(
@@ -135,6 +137,9 @@ fn body_advertises_memory_tool(body: &str) -> bool {
 
 #[tokio::test]
 async fn uses_memory_false_cron_run_has_no_memory_backend_or_tools() {
+    if !TACHI_COMPILED {
+        return;
+    }
     let tmp = TempDir::new().unwrap();
     let workspace_dir = tmp.path().join("workspace");
     tokio::fs::create_dir_all(&workspace_dir).await.unwrap();
@@ -168,6 +173,9 @@ async fn uses_memory_false_cron_run_has_no_memory_backend_or_tools() {
 
 #[tokio::test]
 async fn uses_memory_true_cron_run_keeps_memory_tools() {
+    if !TACHI_COMPILED {
+        return;
+    }
     // Control: the identical setup with a live backend (`uses_memory = true`)
     // MUST advertise the memory tools. This proves the exclusion above is
     // meaningful and that `memory_free` — not some unrelated gating — is what

@@ -6,23 +6,12 @@ async fn list_keeps_retention_controls_visible_across_backend_changes() {
     let mut config = temp_config(&tmp);
     config
         .storage
-        .sqlite
-        .insert("fixture".into(), Default::default());
-    config
-        .storage
         .markdown
         .insert("fixture".into(), Default::default());
     let state = test_state(config);
 
-    // Hygiene can prune the existing SQLite database for any selected backend.
-    // Keep its retention control available while reflecting the current selector.
-    for backend in [
-        "sqlite",
-        "sqlite.fixture",
-        "markdown",
-        "markdown.fixture",
-        "",
-    ] {
+    // Keep the retention control available while reflecting the current selector.
+    for backend in ["tachi", "markdown", "markdown.fixture", ""] {
         state.config.write().memory.backend = backend.into();
         let (status, listed) = response_json(
             handle_list(

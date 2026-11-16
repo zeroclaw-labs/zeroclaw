@@ -57,16 +57,19 @@ class GraphViolation(RuntimeError):
         self.rng = set(rng)
 
 
-def check_graph(cargo, repo, manifest=None, *, workspace=False):
+def check_graph(cargo, repo, manifest=None, *, workspace=False,
+                selection=("-p", "zeroclawlabs"), extra_args=(),
+                expected_package="zeroclawlabs", allow_reviewed_agpl=False,
+                scope_label=None):
     manifest = manifest or repo / "Cargo.toml"
-    scope = "workspace/all-features" if workspace else "default production"
-    selection = ["--workspace", "--all-features"] if workspace else ["-p", "zeroclawlabs"]
+    scope = scope_label or ("workspace/all-features" if workspace else "default production")
+    effective_selection = ["--workspace", "--all-features"] if workspace else list(selection)
     edges = "normal,build,dev" if workspace else "normal,build"
     lock = manifest.with_name("Cargo.lock")
     before = lock.read_bytes()
     command, result = run(cargo, [
         "tree", "--locked", "--offline", "--manifest-path", str(manifest),
-        *selection, "--target", "all", "--edges", edges,
+        *effective_selection, *extra_args, "--target", "all", "--edges", edges,
         "--prefix", "none", "--format", "{p}",
     ], repo)
     if result.returncode != 0:
@@ -82,22 +85,24 @@ def check_graph(cargo, repo, manifest=None, *, workspace=False):
             fail(f"Unrecognized {scope} dependency entry: {line!r}", command, result)
         packages.add((fields[0], fields[1][1:]))
     names = {name for name, _ in packages}
-    if "zeroclawlabs" not in names:
+    if expected_package not in names:
         fail(f"{scope} graph did not contain the selected root package", command, result)
     violations = []
-    forbidden_agpl = sorted((name, version) for name, version in packages
-                            if not workspace and name in AGPL_PACKAGES)
+    forbidden_agpl = sorted(
+        (name, version) for name, version in packages
+        if not workspace and not allow_reviewed_agpl and name in AGPL_PACKAGES
+    )
     forbidden_rng = sorted((name, version) for name, version in packages
                            if name in RETIRED_RNG_PACKAGES
                            or version.startswith(RETIRED_RNG_SERIES.get(name, ())))
     if forbidden_agpl:
-        violations.append(f"Optional AGPL packages entered the default graph: {forbidden_agpl}")
+        violations.append(f"Optional AGPL packages entered the {scope} graph: {forbidden_agpl}")
     if forbidden_rng:
         violations.append(f"Retired RNG packages entered the {scope} graph: {forbidden_rng}")
     if violations:
         raise GraphViolation("; ".join(violations), command, result,
                              forbidden_agpl, forbidden_rng)
-    boundary = "retired RNG" if workspace else "optional AGPL and retired RNG"
+    boundary = "retired RNG" if (workspace or allow_reviewed_agpl) else "optional AGPL and retired RNG"
     print(f"PASS {scope} graph excludes {boundary} packages on all targets")
 
 
@@ -229,7 +234,17 @@ def main():
     args = parser.parse_args()
     config = args.config.resolve(strict=True)
     cargo = str(Path(args.cargo).resolve()) if os.sep in args.cargo else args.cargo
-    check_graph(cargo, repo)
+    # Route B enables memory-tachi by default on zeroclawlabs; keep the lean
+    # core profiles (--no-default-features, slim-control, and zeroclaw-memory
+    # without `tachi`) strictly AGPL-free.
+    check_graph(cargo, repo, allow_reviewed_agpl=True)
+    check_graph(cargo, repo, extra_args=("--no-default-features",),
+                scope_label="minimal (--no-default-features)")
+    check_graph(cargo, repo, extra_args=("--no-default-features", "--features", "slim-control"),
+                scope_label="slim-control")
+    check_graph(cargo, repo, selection=("-p", "zeroclaw-memory"),
+                expected_package="zeroclaw-memory",
+                scope_label="zeroclaw-memory default")
     check_graph(cargo, repo, workspace=True)
     retired_rng = (
         ("rand", "0.8.6", "MIT"), ("rand", "0.9.4", "MIT"),

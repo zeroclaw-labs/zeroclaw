@@ -473,7 +473,7 @@ enum Commands {
         #[arg(long, hide = true)]
         model: Option<String>,
 
-        /// Memory backend (sqlite, lucid, markdown, none).
+        /// Memory backend (tachi, markdown, none).
         #[arg(long, hide = true)]
         memory: Option<String>,
 

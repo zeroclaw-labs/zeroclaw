@@ -89,14 +89,19 @@ pub fn build_recording_agent(
         .unwrap()
 }
 
-/// Build an agent with real `SqliteMemory` in a temporary directory.
-pub fn build_agent_with_sqlite_memory(
+/// Build an agent with the default persistent memory backend in a temporary directory.
+pub fn build_agent_with_memory(
     model_provider: Box<dyn ModelProvider>,
     tools: Vec<Box<dyn Tool>>,
     temp_dir: &std::path::Path,
 ) -> Agent {
+    let backend = if zeroclaw::memory::TACHI_COMPILED {
+        "tachi"
+    } else {
+        "markdown"
+    };
     let cfg = MemoryConfig {
-        backend: "sqlite".into(),
+        backend: backend.into(),
         ..MemoryConfig::default()
     };
     let mem = Arc::from(memory::create_memory(&cfg, temp_dir, None).unwrap());

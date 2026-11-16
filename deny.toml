@@ -32,10 +32,12 @@ allow = [
 ]
 unused-allowed-license = "allow"
 
-# ADR-017 section 6 accepts the optional memory-tachi build and its AGPL
-# distribution boundary. The three AGPL packages share the Tachi source pinned
-# in zeroclaw-memory/Cargo.toml; no license is added to the global allowlist.
-# dependency_policy_smoke.py rejects these AGPL packages in the default graph.
+# ADR-017 section 6 accepts the `memory-tachi` feature (enabled by default in
+# this fork) and its AGPL distribution boundary. The three AGPL packages share
+# the Tachi source pinned in zeroclaw-memory/Cargo.toml; no license is added
+# to the global allowlist. dependency_policy_smoke.py verifies that lean/core
+# selections (--no-default-features, --features slim-control, and zeroclaw-memory
+# default) remain free of AGPL packages, and rejects unreviewed AGPL crates.
 # Re-review the exception when a package version or the Tachi pin changes.
 # borrow-or-share is the reviewed MIT No Attribution dependency reached through
 # memcore -> jsonschema -> referencing -> fluent-uri (tracking #432/#647).

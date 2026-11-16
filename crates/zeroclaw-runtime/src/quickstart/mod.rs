@@ -529,18 +529,18 @@ pub fn snapshot_state(cfg: &Config) -> QuickstartState {
 /// the wire key so there's no parallel mapping.
 fn memory_kind_keys() -> Vec<String> {
     use zeroclaw_config::multi_agent::MemoryBackendKind as M;
-    [M::Sqlite, M::Tachi, M::Markdown, M::Lucid, M::None]
+    [M::Tachi, M::Markdown, M::None]
         .into_iter()
         .filter_map(|k| {
             // Exhaustiveness guard: adding a new variant forces this match to fail
             // to compile until the contributor decides whether the new backend
-            // belongs in the quickstart picker. The retired postgres/qdrant
-            // variants only parse for old configs and are never offered; tachi is
-            // offered only when this build includes `memory-tachi`.
+            // belongs in the quickstart picker. Retired variants only parse for
+            // legacy configs and are never offered; tachi is offered only when
+            // this build includes `memory-tachi`.
             match k {
-                M::Sqlite | M::Markdown | M::Lucid | M::None => (),
+                M::Markdown | M::None => (),
                 M::Tachi if zeroclaw_memory::TACHI_COMPILED => (),
-                M::Tachi | M::Postgres | M::Qdrant => return None,
+                M::Tachi | M::Sqlite | M::Lucid | M::Postgres | M::Qdrant => return None,
             }
             serde_json::to_value(k)
                 .ok()

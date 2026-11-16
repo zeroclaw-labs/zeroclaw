@@ -89,22 +89,32 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
     use zeroclaw_config::autonomy::AutonomyLevel;
-    use zeroclaw_memory::{MemoryCategory, SqliteMemory};
+    use zeroclaw_config::schema::MemoryConfig;
+    use zeroclaw_memory::{MemoryCategory, NoneMemory, TACHI_COMPILED, create_memory};
     use zeroclaw_policy::SecurityPolicy;
 
     fn test_security() -> Arc<SecurityPolicy> {
         Arc::new(SecurityPolicy::default())
     }
 
-    fn test_mem() -> (TempDir, Arc<dyn Memory>) {
+    fn try_test_mem() -> Option<(TempDir, Arc<dyn Memory>)> {
+        if !TACHI_COMPILED {
+            return None;
+        }
         let tmp = TempDir::new().unwrap();
-        let mem = SqliteMemory::new("test", tmp.path()).unwrap();
-        (tmp, Arc::new(mem))
+        let cfg = MemoryConfig {
+            backend: "tachi".into(),
+            hygiene_enabled: false,
+            embedding_provider: "none".into(),
+            ..MemoryConfig::default()
+        };
+        let mem = create_memory(&cfg, tmp.path(), None).unwrap();
+        Some((tmp, Arc::from(mem)))
     }
 
     #[test]
     fn name_and_schema() {
-        let (_tmp, mem) = test_mem();
+        let mem: Arc<dyn Memory> = Arc::new(NoneMemory::new("none"));
         let tool = MemoryForgetTool::new(mem, test_security());
         assert_eq!(tool.name(), "memory_forget");
         assert!(tool.parameters_schema()["properties"]["key"].is_object());
@@ -112,7 +122,9 @@ mod tests {
 
     #[tokio::test]
     async fn forget_existing() {
-        let (_tmp, mem) = test_mem();
+        let Some((_tmp, mem)) = try_test_mem() else {
+            return;
+        };
         mem.store("temp", "temporary", MemoryCategory::Conversation, None)
             .await
             .unwrap();
@@ -127,7 +139,7 @@ mod tests {
 
     #[tokio::test]
     async fn forget_nonexistent() {
-        let (_tmp, mem) = test_mem();
+        let mem: Arc<dyn Memory> = Arc::new(NoneMemory::new("none"));
         let tool = MemoryForgetTool::new(mem, test_security());
         let result = tool.execute(json!({"key": "nope"})).await.unwrap();
         assert!(result.success);
@@ -136,7 +148,7 @@ mod tests {
 
     #[tokio::test]
     async fn forget_missing_key() {
-        let (_tmp, mem) = test_mem();
+        let mem: Arc<dyn Memory> = Arc::new(NoneMemory::new("none"));
         let tool = MemoryForgetTool::new(mem, test_security());
         let result = tool.execute(json!({})).await;
         assert!(result.is_err());
@@ -144,7 +156,9 @@ mod tests {
 
     #[tokio::test]
     async fn forget_blocked_in_readonly_mode() {
-        let (_tmp, mem) = test_mem();
+        let Some((_tmp, mem)) = try_test_mem() else {
+            return;
+        };
         mem.store("temp", "temporary", MemoryCategory::Conversation, None)
             .await
             .unwrap();
@@ -167,7 +181,9 @@ mod tests {
 
     #[tokio::test]
     async fn forget_blocked_when_rate_limited() {
-        let (_tmp, mem) = test_mem();
+        let Some((_tmp, mem)) = try_test_mem() else {
+            return;
+        };
         mem.store("temp", "temporary", MemoryCategory::Conversation, None)
             .await
             .unwrap();

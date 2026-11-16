@@ -35,10 +35,12 @@
   },
   "features": {
     "runtime": [
-      "zeroclaw-runtime/heavy-tests"
+      "zeroclaw-runtime/heavy-tests",
+      "zeroclaw-runtime/memory-tachi"
     ],
     "channels": [
-      "zeroclaw-gateway/nodes"
+      "zeroclaw-gateway/nodes",
+      "zeroclaw-gateway/memory-tachi"
     ],
     "app": [
       "zeroclawlabs/nodes"

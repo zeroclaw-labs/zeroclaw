@@ -805,6 +805,9 @@ mod tests {
             config_path: workspace.path().join("config.toml"),
             ..Config::default()
         };
+        if !zeroclaw_memory::TACHI_COMPILED {
+            config.memory.backend = "markdown".into();
+        }
         config.memory.backend = "none".into();
         config.memory.auto_save = false;
         config.providers.models.ollama.insert(
@@ -1226,6 +1229,9 @@ mod tests {
             config_path: workspace.path().join("config.toml"),
             ..Config::default()
         };
+        if !zeroclaw_memory::TACHI_COMPILED {
+            config.memory.backend = "markdown".into();
+        }
         config.cost = CostConfig {
             enabled: true,
             track_per_agent: true,

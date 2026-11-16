@@ -1,8 +1,10 @@
 # Portable memory kernel
 
-The optional `memory-tachi` feature uses the shared Portable Kernel for two
-ZeroClaw-owned databases. The feature stays off in default builds. The backend
-name `tachi`, the crate feature `zeroclaw-memory/tachi`, configuration keys and
+The `memory-tachi` feature uses the shared Portable Kernel for two
+ZeroClaw-owned databases. It is enabled by default on the root `zeroclawlabs`
+crate (and stays optional on `zeroclaw-memory`, so `--no-default-features` and
+`slim-control` builds remain free of AGPL dependencies). The backend name
+`tachi`, the crate feature `zeroclaw-memory/tachi`, configuration keys and
 existing database locations are unchanged.
 
 | Store | Owner role | Location |
@@ -24,12 +26,23 @@ Runtime and status checks refuse older, unowned, wrong-role or wrong-profile
 stores instead of upgrading them. A refusal points to the explicit migration
 command below.
 
-The ordinary SQLite backend also tolerates kernel extension initialization in
-the same process. Its `[storage.sqlite.<alias>] open_timeout_secs` bounds the
-caller's open wait. SQLite `BUSY` and `LOCKED` errors receive bounded retries, at
-most five seconds and never beyond the caller's deadline. Other errors return
-immediately. A native SQLite open already in progress cannot be cancelled by
-that deadline. This setting applies to the SQLite backend.
+## Migrating retired native SQLite memory (`brain.db`)
+
+Operators with an existing native SQLite memory store (`<data_dir>/memory/brain.db`)
+must convert it offline into `<data_dir>/memory/tachi.db` with all writers
+stopped:
+
+```sh
+zeroclaw memory migrate-native \
+  --source /private/backup/brain.db \
+  --destination /private/upgrade/tachi.db \
+  --approved-by local-operator
+```
+
+Keep a restorable backup of `brain.db` and its WAL/SHM sidecars before migrating,
+verify the output, move the verified `tachi.db` into `<data_dir>/memory/tachi.db`,
+and update `[memory].backend` (or per-agent `memory.backend`) to `"tachi"` if
+it was pinned to `"sqlite"` or `"lucid"`.
 
 ## Supported offline input
 

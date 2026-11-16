@@ -4,8 +4,7 @@ use zeroclaw_config::schema::Config;
 
 fn memory_backend_excludes(backend: &str) -> Vec<&'static str> {
     let mut out = Vec::new();
-    if backend != "sqlite" {
-        out.push("sqlite-open-timeout-secs");
+    if backend != "tachi" {
         out.push("conversation-retention-days");
     }
     out
@@ -14,7 +13,7 @@ fn memory_backend_excludes(backend: &str) -> Vec<&'static str> {
 pub(super) fn excluded_paths(cfg: &Config, prefix: &str) -> Vec<String> {
     if prefix == "memory" || prefix.is_empty() {
         let backend = if cfg.memory.backend.is_empty() {
-            "sqlite"
+            "tachi"
         } else {
             cfg.memory.backend.as_str()
         };
@@ -53,13 +52,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn memory_excludes_hide_sqlite_knobs_for_other_backends() {
-        let ex = memory_backend_excludes("sqlite");
-        assert!(!ex.contains(&"sqlite-open-timeout-secs"));
+    fn memory_excludes_hide_non_tachi_retention_knobs() {
+        let ex = memory_backend_excludes("tachi");
         assert!(!ex.contains(&"conversation-retention-days"));
 
         let ex = memory_backend_excludes("markdown");
-        assert!(ex.contains(&"sqlite-open-timeout-secs"));
         assert!(ex.contains(&"conversation-retention-days"));
     }
 
@@ -68,7 +65,11 @@ mod tests {
         let mut cfg = Config::default();
         cfg.memory.backend = "markdown".into();
         let paths = excluded_paths(&cfg, "memory");
-        assert!(paths.iter().any(|p| p == "memory.sqlite-open-timeout-secs"));
+        assert!(
+            paths
+                .iter()
+                .any(|p| p == "memory.conversation-retention-days")
+        );
     }
 
     #[test]

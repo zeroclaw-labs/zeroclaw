@@ -1816,14 +1816,15 @@ mod tests {
         assert!(context.contains("- fact_e: epsilon elderberry"));
     }
 
-    /// Composed score-domain regression: current SQLite recall owns BM25
+    /// Composed score-domain regression: current Tachi recall owns BM25
     /// calibration, while this module owns the blend and relevance floor.
     /// Exercise the stock no-embedding backend through the real renderer so
     /// those two layers cannot silently drift back onto incompatible scales.
+    #[cfg(feature = "memory-tachi")]
     #[tokio::test]
-    async fn noop_sqlite_bm25_recall_stays_ranked_through_rerank_injection() {
+    async fn noop_tachi_bm25_recall_stays_ranked_through_rerank_injection() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let memory = zeroclaw_memory::SqliteMemory::new("rerank-bm25", tmp.path()).unwrap();
+        let memory = zeroclaw_memory::TachiMemory::new("rerank-bm25", tmp.path()).unwrap();
         assert_eq!(
             memory.embedder_dimensions(),
             0,

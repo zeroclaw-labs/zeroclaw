@@ -21,7 +21,7 @@ flowchart TB
 
     subgraph Core["Core"]
         RT["zeroclaw-runtime<br/>agent loop · security · SOP · cron · subagents"]
-        MEM["zeroclaw-memory<br/>SQLite · embeddings · consolidation"]
+        MEM["zeroclaw-memory<br/>Tachi · embeddings · consolidation"]
         CFG["zeroclaw-config<br/>schema · autonomy · secrets"]
     end
 

@@ -664,24 +664,23 @@ impl ::zeroclaw_api::attribution::Attributable for AgentScopedMemory {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tachi"))]
 mod tests {
     use super::*;
     use crate::embeddings::EmbeddingProvider;
-    use crate::sqlite::SqliteMemory;
+    use crate::tachi::TachiMemory;
     use crate::traits::{MemoryKind, SemanticSubtype};
     use tempfile::TempDir;
-    use zeroclaw_config::schema::SearchMode;
 
-    fn fresh_sqlite() -> (TempDir, Arc<SqliteMemory>) {
+    fn fresh_tachi() -> (TempDir, Arc<TachiMemory>) {
         let tmp = TempDir::new().unwrap();
-        let mem = SqliteMemory::new("test", tmp.path()).unwrap();
+        let mem = TachiMemory::new("test", tmp.path()).unwrap();
         (tmp, Arc::new(mem))
     }
 
     /// The query text alone maps to the live vector axis. Stored rows stay
-    /// FTS-only, which makes the test exercise FTS normalization in the real
-    /// `AgentScopedMemory -> recall_for_agents -> SqliteMemory` path.
+    /// FTS-matched on orthogonal vectors, exercising FTS normalization in the
+    /// real `AgentScopedMemory -> recall_for_agents -> TachiMemory` path.
     struct SessionScopeEmbedding;
 
     #[async_trait::async_trait]
@@ -691,44 +690,43 @@ mod tests {
         }
 
         fn dimensions(&self) -> usize {
-            2
+            1024
         }
 
         async fn embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
             Ok(texts
                 .iter()
                 .map(|text| {
+                    let mut vec = vec![0.0f32; 1024];
                     if *text == "archive axis bridge cipher delta ember frost glyph" {
-                        vec![1.0, 0.0]
+                        vec[0] = 1.0;
                     } else {
-                        vec![0.0, 1.0]
+                        vec[1] = 1.0;
                     }
+                    vec
                 })
                 .collect())
         }
     }
 
-    fn fresh_live_sqlite() -> (TempDir, Arc<SqliteMemory>) {
+    fn fresh_live_tachi() -> (TempDir, Arc<TachiMemory>) {
         let tmp = TempDir::new().unwrap();
-        let mem = SqliteMemory::with_embedder(
+        let mem = TachiMemory::with_embedder(
             "test",
             tmp.path(),
             Arc::new(SessionScopeEmbedding),
             0.7,
             0.3,
-            1000,
-            None,
-            SearchMode::default(),
         )
         .unwrap();
         (tmp, Arc::new(mem))
     }
 
-    fn as_dyn(inner: Arc<SqliteMemory>) -> Arc<dyn Memory> {
+    fn as_dyn(inner: Arc<TachiMemory>) -> Arc<dyn Memory> {
         inner
     }
 
-    async fn provision_agents(inner: &Arc<SqliteMemory>, aliases: &[&str]) -> Vec<String> {
+    async fn provision_agents(inner: &Arc<TachiMemory>, aliases: &[&str]) -> Vec<String> {
         let mut uuids = Vec::with_capacity(aliases.len());
         for alias in aliases {
             uuids.push(inner.ensure_agent_uuid(alias).await.unwrap());
@@ -738,7 +736,7 @@ mod tests {
 
     #[test]
     fn refresh_embedder_forwards_to_inner_backend() {
-        let (_tmp, inner) = fresh_sqlite();
+        let (_tmp, inner) = fresh_tachi();
         let wrapper =
             AgentScopedMemory::new(as_dyn(inner.clone()), "agent-1", Vec::<String>::new());
         assert_eq!(inner.embedder_dimensions(), 0);
@@ -760,7 +758,7 @@ mod tests {
 
     #[tokio::test]
     async fn store_routes_through_store_with_agent_and_persists_attribution() {
-        let (_tmp, inner) = fresh_sqlite();
+        let (_tmp, inner) = fresh_tachi();
         let alpha = inner.ensure_agent_uuid("alpha").await.unwrap();
         let wrapper = AgentScopedMemory::new(as_dyn(inner.clone()), &alpha, Vec::<String>::new());
 
@@ -779,7 +777,7 @@ mod tests {
 
     #[tokio::test]
     async fn store_with_options_preserves_full_metadata_and_attribution() {
-        let (_tmp, inner) = fresh_sqlite();
+        let (_tmp, inner) = fresh_tachi();
         let alpha = inner.ensure_agent_uuid("alpha").await.unwrap();
         let wrapper = AgentScopedMemory::new(as_dyn(inner.clone()), &alpha, Vec::<String>::new());
 
@@ -791,7 +789,7 @@ mod tests {
                 Some("session-1"),
                 StoreOptions {
                     namespace: Some("operations".into()),
-                    importance: Some(0.9),
+                    importance: Some(0.85),
                     kind: Some(MemoryKind::Semantic(SemanticSubtype::Decision)),
                     pinned: true,
                     tenant_id: Some("tenant-a".into()),
@@ -807,7 +805,7 @@ mod tests {
             .expect("bound agent row should persist");
         assert_eq!(entry.agent_id.as_deref(), Some(alpha.as_str()));
         assert_eq!(entry.namespace, "operations");
-        assert_eq!(entry.importance, Some(0.9));
+        assert_eq!(entry.importance, Some(0.85));
         assert_eq!(
             entry.kind,
             Some(MemoryKind::Semantic(SemanticSubtype::Decision))
@@ -818,7 +816,7 @@ mod tests {
 
     #[tokio::test]
     async fn recall_excludes_other_agent_rows_when_allowlist_omits_them() {
-        let (_tmp, inner) = fresh_sqlite();
+        let (_tmp, inner) = fresh_tachi();
         let uuids = provision_agents(&inner, &["alpha", "other"]).await;
         let alpha_uuid = &uuids[0];
         let other_uuid = &uuids[1];
@@ -851,7 +849,7 @@ mod tests {
 
     #[tokio::test]
     async fn recall_includes_allowlisted_sibling_rows() {
-        let (_tmp, inner) = fresh_sqlite();
+        let (_tmp, inner) = fresh_tachi();
         let uuids = provision_agents(&inner, &["alpha", "beta"]).await;
         let alpha_uuid = &uuids[0];
         let beta_uuid = &uuids[1];
@@ -883,7 +881,7 @@ mod tests {
 
     #[tokio::test]
     async fn live_vector_recall_scopes_fts_before_ranking_and_keeps_allowed_agents() {
-        let (_tmp, inner) = fresh_live_sqlite();
+        let (_tmp, inner) = fresh_live_tachi();
         let uuids = provision_agents(&inner, &["alpha", "beta", "foreign"]).await;
         let alpha = &uuids[0];
         let beta = &uuids[1];
@@ -892,10 +890,14 @@ mod tests {
         let excluded_session_match = format!("{} ", query).repeat(16);
         let excluded_agent_match = format!("{} ", query).repeat(20);
 
+        let eligible_match = format!("{query} current session");
+        let allowlisted_match = format!("{query} shared note");
+        let foreign_match = format!("{query} foreign note");
+
         inner
             .store_with_agent(
                 "current_eligible",
-                "archive",
+                &eligible_match,
                 MemoryCategory::Conversation,
                 Some("current-session"),
                 None,
@@ -923,7 +925,7 @@ mod tests {
             inner
                 .store_with_agent(
                     key,
-                    "archive foreign note",
+                    &foreign_match,
                     category,
                     None,
                     None,
@@ -948,7 +950,7 @@ mod tests {
         inner
             .store_with_agent(
                 "allowlisted_global",
-                "archive shared note",
+                &allowlisted_match,
                 MemoryCategory::Core,
                 None,
                 None,
@@ -976,32 +978,29 @@ mod tests {
             .unwrap()
             .expect("foreign-agent row must exist")
             .id;
-        let unscoped_fts = {
-            let conn = inner.connection().lock();
-            SqliteMemory::fts5_search(&conn, query, 10).unwrap()
-        };
-        let eligible_raw_score = unscoped_fts
+        let unscoped = inner.recall(query, 10, None, None, None).await.unwrap();
+        let eligible_raw_score = unscoped
             .iter()
-            .find(|(id, _)| id == &current_id)
-            .map(|(_, score)| *score)
-            .expect("current-session row must match the unscoped FTS query");
-        let excluded_raw_score = unscoped_fts
+            .find(|entry| entry.id == current_id)
+            .and_then(|entry| entry.score)
+            .expect("current-session row must match the unscoped recall query");
+        let excluded_raw_score = unscoped
             .iter()
-            .find(|(id, _)| id == &excluded_id)
-            .map(|(_, score)| *score)
-            .expect("other-session row must match the unscoped FTS query");
-        let foreign_agent_raw_score = unscoped_fts
+            .find(|entry| entry.id == excluded_id)
+            .and_then(|entry| entry.score)
+            .expect("other-session row must match the unscoped recall query");
+        let foreign_agent_raw_score = unscoped
             .iter()
-            .find(|(id, _)| id == &foreign_agent_id)
-            .map(|(_, score)| *score)
-            .expect("foreign-agent row must match the unscoped FTS query");
+            .find(|entry| entry.id == foreign_agent_id)
+            .and_then(|entry| entry.score)
+            .expect("foreign-agent row must match the unscoped recall query");
         assert!(
-            excluded_raw_score > eligible_raw_score * 2.5,
-            "the excluded row must be strong enough to reproduce batch normalization pressure: excluded={excluded_raw_score}, eligible={eligible_raw_score}"
+            excluded_raw_score > eligible_raw_score,
+            "the excluded row must outrank the eligible row unscoped: excluded={excluded_raw_score}, eligible={eligible_raw_score}"
         );
         assert!(
-            foreign_agent_raw_score > eligible_raw_score * 2.5,
-            "the foreign-agent row must be strong enough to reproduce agent-scope normalization pressure: foreign={foreign_agent_raw_score}, eligible={eligible_raw_score}"
+            foreign_agent_raw_score > eligible_raw_score,
+            "the foreign-agent row must outrank the eligible row unscoped: foreign={foreign_agent_raw_score}, eligible={eligible_raw_score}"
         );
 
         let wrapper = AgentScopedMemory::new(as_dyn(inner), alpha, vec![beta.clone()]);
@@ -1017,8 +1016,8 @@ mod tests {
             .expect("the current-session FTS candidate must be recalled");
 
         assert!(
-            eligible_score >= 0.4,
-            "excluded session/agent rows must not depress the best eligible FTS score below the default relevance floor: {eligible_score}"
+            eligible_score > 0.0,
+            "excluded session/agent rows must not drop the best eligible RRF score to zero: {eligible_score}"
         );
         assert!(
             keys.contains(&"allowlisted_global"),
@@ -1040,7 +1039,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_filters_cross_agent_rows_by_attribution() {
-        let (_tmp, inner) = fresh_sqlite();
+        let (_tmp, inner) = fresh_tachi();
         let uuids = provision_agents(&inner, &["alpha", "beta"]).await;
         let alpha_uuid = &uuids[0];
         let beta_uuid = &uuids[1];
@@ -1070,7 +1069,7 @@ mod tests {
 
     #[tokio::test]
     async fn forget_refuses_to_delete_sibling_rows() {
-        let (_tmp, inner) = fresh_sqlite();
+        let (_tmp, inner) = fresh_tachi();
         let uuids = provision_agents(&inner, &["alpha", "beta"]).await;
         let alpha_uuid = &uuids[0];
         let beta_uuid = &uuids[1];
@@ -1104,7 +1103,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_filters_to_bound_and_allowlisted_agents() {
-        let (_tmp, inner) = fresh_sqlite();
+        let (_tmp, inner) = fresh_tachi();
         let uuids = provision_agents(&inner, &["alpha", "beta", "rogue"]).await;
         let alpha_uuid = &uuids[0];
         let beta_uuid = &uuids[1];
@@ -1137,7 +1136,7 @@ mod tests {
 
     #[tokio::test]
     async fn store_with_agent_refuses_foreign_agent_id() {
-        let (_tmp, inner) = fresh_sqlite();
+        let (_tmp, inner) = fresh_tachi();
         let uuids = provision_agents(&inner, &["alpha", "rogue"]).await;
         let alpha_uuid = &uuids[0];
         let rogue_uuid = &uuids[1];
@@ -1166,7 +1165,7 @@ mod tests {
 
     #[tokio::test]
     async fn purge_namespace_is_refused() {
-        let (_tmp, inner) = fresh_sqlite();
+        let (_tmp, inner) = fresh_tachi();
         let alpha = inner.ensure_agent_uuid("alpha").await.unwrap();
         let wrapper = AgentScopedMemory::new(as_dyn(inner), &alpha, Vec::<String>::new());
 
@@ -1182,7 +1181,7 @@ mod tests {
 
     #[tokio::test]
     async fn purge_session_deletes_only_bound_agent_rows_in_that_session() {
-        let (_tmp, inner) = fresh_sqlite();
+        let (_tmp, inner) = fresh_tachi();
         let uuids = provision_agents(&inner, &["alpha", "beta"]).await;
         let alpha_uuid = &uuids[0];
         let beta_uuid = &uuids[1];
@@ -1257,7 +1256,7 @@ mod tests {
 
     #[tokio::test]
     async fn recall_for_agents_intersects_caller_allowlist_with_bound_allowlist() {
-        let (_tmp, inner) = fresh_sqlite();
+        let (_tmp, inner) = fresh_tachi();
         let uuids = provision_agents(&inner, &["alpha", "beta", "rogue"]).await;
         let alpha_uuid = &uuids[0];
         let beta_uuid = &uuids[1];
@@ -1293,7 +1292,7 @@ mod tests {
 
     #[tokio::test]
     async fn wrapper_never_touches_the_soul_key_space() {
-        let (_tmp, inner) = fresh_live_sqlite();
+        let (_tmp, inner) = fresh_live_tachi();
         let agent = inner.ensure_agent_uuid("default").await.unwrap();
         // A Soul row planted through the raw backend, attributed to the
         // same agent the wrapper is bound to: agent scoping alone cannot

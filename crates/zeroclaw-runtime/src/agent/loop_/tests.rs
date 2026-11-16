@@ -483,7 +483,7 @@ async fn execute_one_tool_keeps_data_path_raw_and_scrubs_only_observer() {
 use crate::observability::NoopObserver;
 use tempfile::TempDir;
 use zeroclaw_api::model_provider::{ProviderCapabilities, StreamChunk, StreamEvent, StreamOptions};
-use zeroclaw_memory::{Memory, MemoryCategory, SqliteMemory};
+use zeroclaw_memory::MemoryCategory;
 use zeroclaw_providers::ChatResponse;
 use zeroclaw_providers::router::{Route, RouterModelProvider};
 
@@ -8466,8 +8466,17 @@ fn autosave_memory_key_has_prefix_and_uniqueness() {
 
 #[tokio::test]
 async fn autosave_memory_keys_preserve_multiple_turns() {
+    if !zeroclaw_memory::TACHI_COMPILED {
+        return;
+    }
     let tmp = TempDir::new().unwrap();
-    let mem = SqliteMemory::new("test", tmp.path()).unwrap();
+    let cfg = zeroclaw_config::schema::MemoryConfig {
+        backend: "tachi".into(),
+        hygiene_enabled: false,
+        embedding_provider: "none".into(),
+        ..Default::default()
+    };
+    let mem = zeroclaw_memory::create_memory(&cfg, tmp.path(), None).unwrap();
 
     let key1 = autosave_memory_key("user_msg");
     let key2 = autosave_memory_key("user_msg");
@@ -11847,21 +11856,24 @@ fn lifecycle_events_for_alias(events: &[ObserverEvent], alias: &str) -> (usize, 
 
 /// A `Config::default()` rooted under a fresh temp dir instead of the
 /// real `$HOME/.zeroclaw`. `Config::default()` points `data_dir` (the
-/// sqlite memory db, `{data_dir}/memory/brain.db`) and `config_path`
+/// tachi memory db, `{data_dir}/memory/tachi.db`) and `config_path`
 /// (whose parent `install_root_dir()` backs `agent_workspace_dir`, i.e.
 /// `{install_root}/agents/<alias>/workspace`) at the real home
 /// directory, so a `run()`-driving test that doesn't override them
 /// creates/writes real files on every dev and CI machine and, under the
 /// crate's parallel test gate, has every such test contend on the same
-/// `brain.db`. The returned `TempDir` must be kept alive for the
+/// `tachi.db`. The returned `TempDir` must be kept alive for the
 /// duration of the test — it deletes the directory on drop.
 fn isolated_run_test_config() -> (tempfile::TempDir, Config) {
     let tmp = tempdir().expect("temp dir for isolated run() test config should create");
-    let config = Config {
+    let mut config = Config {
         data_dir: tmp.path().join("data"),
         config_path: tmp.path().join("config.toml"),
         ..Config::default()
     };
+    if !zeroclaw_memory::TACHI_COMPILED {
+        config.memory.backend = "markdown".into();
+    }
     (tmp, config)
 }
 
@@ -12226,9 +12238,18 @@ async fn run_rejects_model_switch_tool_call_and_keeps_original_route() {
 
 #[tokio::test]
 async fn recall_uses_canonical_memory_scopes_in_sequential_and_parallel_turns() {
+    if !zeroclaw_memory::TACHI_COMPILED {
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
+    let cfg = zeroclaw_config::schema::MemoryConfig {
+        backend: "tachi".into(),
+        hygiene_enabled: false,
+        embedding_provider: "none".into(),
+        ..Default::default()
+    };
     let mem: Arc<dyn zeroclaw_memory::Memory> =
-        Arc::new(zeroclaw_memory::SqliteMemory::new("test", dir.path()).unwrap());
+        Arc::from(zeroclaw_memory::create_memory(&cfg, dir.path(), None).unwrap());
     for session in ["A", "C", "gw_A", "B", "sender", "history"] {
         mem.store(
             session,
@@ -12350,11 +12371,20 @@ async fn recall_uses_canonical_memory_scopes_in_sequential_and_parallel_turns() 
 // Additive scenario regression: the canonical-scope test above remains unchanged.
 #[tokio::test]
 async fn scheduled_and_delegated_tools_obey_host_memory_policy() {
+    if !zeroclaw_memory::TACHI_COMPILED {
+        return;
+    }
     use zeroclaw_api::ingress::TurnOrigin;
     use zeroclaw_api::memory_traits::MemoryReadPolicy;
     let dir = tempfile::tempdir().unwrap();
+    let cfg = zeroclaw_config::schema::MemoryConfig {
+        backend: "tachi".into(),
+        hygiene_enabled: false,
+        embedding_provider: "none".into(),
+        ..Default::default()
+    };
     let mem: Arc<dyn zeroclaw_memory::Memory> =
-        Arc::new(zeroclaw_memory::SqliteMemory::new("test", dir.path()).unwrap());
+        Arc::from(zeroclaw_memory::create_memory(&cfg, dir.path(), None).unwrap());
     mem.store(
         "chat",
         "PRIVATE_CHAT_CANARY",

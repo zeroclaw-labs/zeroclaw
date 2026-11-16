@@ -268,7 +268,7 @@ Only load these when you need precise details beyond what's in this file — for
 
 **Agent not using tools / acting limited** — Check autonomy settings in config.toml under `[autonomy]`. `level = "read_only"` disables most tools. Try `level = "supervised"` or `level = "full"`.
 
-**Memory not persisting** — Check `[memory]` config. If `backend = "none"`, nothing is stored. Switch to `"sqlite"` or `"markdown"`. Also verify `auto_save = true`.
+**Memory not persisting** — Check `[memory]` config. If `backend = "none"`, nothing is stored. Switch to `"tachi"` or `"markdown"`. Also verify `auto_save = true`.
 
 **Channel not responding** — Run `zeroclaw channels doctor` for the specific channel. Common issues: expired bot token, wrong allowed_users list, channel not enabled in `[channels]`.
 

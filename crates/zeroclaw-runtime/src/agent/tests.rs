@@ -315,14 +315,19 @@ fn make_memory() -> Arc<dyn Memory> {
     Arc::from(zeroclaw_memory::create_memory(&cfg, &std::env::temp_dir(), None).unwrap())
 }
 
-fn make_sqlite_memory() -> (Arc<dyn Memory>, tempfile::TempDir) {
+fn try_tachi_memory() -> Option<(Arc<dyn Memory>, tempfile::TempDir)> {
+    if !zeroclaw_memory::TACHI_COMPILED {
+        return None;
+    }
     let tmp = tempfile::TempDir::new().unwrap();
     let cfg = MemoryConfig {
-        backend: "sqlite".into(),
+        backend: "tachi".into(),
+        hygiene_enabled: false,
+        embedding_provider: "none".into(),
         ..MemoryConfig::default()
     };
     let mem = Arc::from(zeroclaw_memory::create_memory(&cfg, tmp.path(), None).unwrap());
-    (mem, tmp)
+    Some((mem, tmp))
 }
 
 fn make_observer() -> Arc<dyn Observer> {
@@ -775,7 +780,9 @@ async fn history_trims_after_max_messages() {
 
 #[tokio::test]
 async fn auto_save_stores_only_user_messages_in_memory() {
-    let (mem, _tmp) = make_sqlite_memory();
+    let Some((mem, _tmp)) = try_tachi_memory() else {
+        return;
+    };
     let model_provider = Box::new(ScriptedModelProvider::new(vec![text_response(
         "I remember everything",
     )]));
@@ -813,7 +820,9 @@ async fn auto_save_stores_only_user_messages_in_memory() {
 
 #[tokio::test]
 async fn auto_save_disabled_does_not_store() {
-    let (mem, _tmp) = make_sqlite_memory();
+    let Some((mem, _tmp)) = try_tachi_memory() else {
+        return;
+    };
     let model_provider = Box::new(ScriptedModelProvider::new(vec![text_response("hello")]));
 
     let mut agent = build_agent_with_memory(

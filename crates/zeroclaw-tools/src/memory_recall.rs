@@ -178,12 +178,25 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
     use tempfile::TempDir;
-    use zeroclaw_memory::{MemoryCategory, MemoryEntry, SqliteMemory, is_recent_recall_query};
+    use zeroclaw_config::schema::MemoryConfig;
+    use zeroclaw_memory::{
+        MemoryCategory, MemoryEntry, NoneMemory, TACHI_COMPILED, create_memory,
+        is_recent_recall_query,
+    };
 
-    fn seeded_mem() -> (TempDir, Arc<dyn Memory>) {
+    fn try_seeded_mem() -> Option<(TempDir, Arc<dyn Memory>)> {
+        if !TACHI_COMPILED {
+            return None;
+        }
         let tmp = TempDir::new().unwrap();
-        let mem = SqliteMemory::new("test", tmp.path()).unwrap();
-        (tmp, Arc::new(mem))
+        let cfg = MemoryConfig {
+            backend: "tachi".into(),
+            hygiene_enabled: false,
+            embedding_provider: "none".into(),
+            ..MemoryConfig::default()
+        };
+        let mem = create_memory(&cfg, tmp.path(), None).unwrap();
+        Some((tmp, Arc::from(mem)))
     }
 
     async fn execute_scoped(
@@ -322,8 +335,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sqlite_session_recall_keeps_unscoped_long_term_facts() {
-        let (_dir, store) = seeded_mem();
+    async fn tachi_session_recall_keeps_unscoped_long_term_facts() {
+        let Some((_dir, store)) = try_seeded_mem() else {
+            return;
+        };
         for (key, category, session) in [
             ("durable", MemoryCategory::Core, None),
             ("current", MemoryCategory::Conversation, Some("A")),
@@ -370,7 +385,9 @@ mod tests {
 
     #[tokio::test]
     async fn recall_enforces_session_and_protected_memory_even_if_backend_does_not() {
-        let (_dir, store) = seeded_mem();
+        let Some((_dir, store)) = try_seeded_mem() else {
+            return;
+        };
         for (key, session, category) in [
             ("shared_fact", None, MemoryCategory::Core),
             ("session_a", Some("A"), MemoryCategory::Conversation),
@@ -448,7 +465,9 @@ mod tests {
 
     #[tokio::test]
     async fn recall_read_policy_excludes_scheduled_conversations_and_ignores_model_authority() {
-        let (_dir, memory) = seeded_mem();
+        let Some((_dir, memory)) = try_seeded_mem() else {
+            return;
+        };
         for (key, category, session) in [
             ("global", MemoryCategory::Core, None),
             ("current", MemoryCategory::Conversation, Some("A")),
@@ -529,7 +548,9 @@ mod tests {
 
     #[tokio::test]
     async fn recall_empty() {
-        let (_tmp, mem) = seeded_mem();
+        let Some((_tmp, mem)) = try_seeded_mem() else {
+            return;
+        };
         let tool = MemoryRecallTool::new(mem);
         let result = tool.execute(json!({"query": "anything"})).await.unwrap();
         assert!(result.success);
@@ -538,7 +559,9 @@ mod tests {
 
     #[tokio::test]
     async fn recall_finds_match() {
-        let (_tmp, mem) = seeded_mem();
+        let Some((_tmp, mem)) = try_seeded_mem() else {
+            return;
+        };
         mem.store("lang", "User prefers Rust", MemoryCategory::Core, None)
             .await
             .unwrap();
@@ -555,7 +578,9 @@ mod tests {
 
     #[tokio::test]
     async fn recall_respects_limit() {
-        let (_tmp, mem) = seeded_mem();
+        let Some((_tmp, mem)) = try_seeded_mem() else {
+            return;
+        };
         for i in 0..10 {
             mem.store(
                 &format!("k{i}"),
@@ -578,7 +603,9 @@ mod tests {
 
     #[tokio::test]
     async fn bare_recall_returns_recent_entries() {
-        let (_tmp, mem) = seeded_mem();
+        let Some((_tmp, mem)) = try_seeded_mem() else {
+            return;
+        };
         mem.store("lang", "User prefers Rust", MemoryCategory::Core, None)
             .await
             .unwrap();
@@ -591,7 +618,9 @@ mod tests {
 
     #[tokio::test]
     async fn recall_star_query_returns_recent_entries() {
-        let (_tmp, mem) = seeded_mem();
+        let Some((_tmp, mem)) = try_seeded_mem() else {
+            return;
+        };
         mem.store("lang", "User prefers Rust", MemoryCategory::Core, None)
             .await
             .unwrap();
@@ -625,7 +654,9 @@ mod tests {
 
     #[tokio::test]
     async fn recall_time_only_returns_entries() {
-        let (_tmp, mem) = seeded_mem();
+        let Some((_tmp, mem)) = try_seeded_mem() else {
+            return;
+        };
         mem.store("lang", "User prefers Rust", MemoryCategory::Core, None)
             .await
             .unwrap();
@@ -642,7 +673,7 @@ mod tests {
 
     #[test]
     fn name_and_schema() {
-        let (_tmp, mem) = seeded_mem();
+        let mem: Arc<dyn Memory> = Arc::new(NoneMemory::new("none"));
         let tool = MemoryRecallTool::new(mem);
         assert_eq!(tool.name(), "memory_recall");
         assert!(tool.parameters_schema()["properties"]["query"].is_object());
@@ -673,7 +704,7 @@ mod tests {
 
     #[test]
     fn schema_includes_search_mode_parameter() {
-        let (_tmp, mem) = seeded_mem();
+        let mem: Arc<dyn Memory> = Arc::new(NoneMemory::new("none"));
         let tool = MemoryRecallTool::new(mem);
         let schema = tool.parameters_schema();
         let search_mode = &schema["properties"]["search_mode"];

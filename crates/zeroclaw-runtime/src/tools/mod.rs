@@ -805,23 +805,10 @@ pub fn all_tools_with_runtime(
 
     // Register discord_search if any configured Discord alias has
     // archive enabled. Multiple Discord aliases are supported (one per
-    // bot/server set); the search tool reads from a shared archive DB
-    // so it's enabled when at least one alias archives.
+    // bot/server set); the search tool reads from the shared read-only
+    // archive DB under `data_dir` without creating files on startup.
     if root_config.channels.discord.values().any(|d| d.archive) {
-        match zeroclaw_memory::SqliteMemory::new_named("sqlite", &config.data_dir, "discord") {
-            Ok(discord_mem) => {
-                tool_arcs.push(Arc::new(DiscordSearchTool::new(Arc::new(discord_mem))));
-            }
-            Err(e) => {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                    "discord_search: failed to open discord.db"
-                );
-            }
-        }
+        tool_arcs.push(Arc::new(DiscordSearchTool::from_data_dir(&config.data_dir)));
     }
 
     // email_search — registered when at least one email channel is enabled

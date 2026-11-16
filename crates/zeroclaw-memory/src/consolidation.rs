@@ -527,12 +527,14 @@ mod tests {
         assert!(result.history_entry.len() <= 203);
     }
 
+    #[cfg(feature = "tachi")]
     use crate::agent_scoped::AgentScopedMemory;
+    #[cfg(feature = "tachi")]
     use crate::audit::AuditedMemory;
-    use crate::sqlite::SqliteMemory;
     use crate::traits::MemoryEntry;
     use async_trait::async_trait;
     use parking_lot::Mutex;
+    #[cfg(feature = "tachi")]
     use std::sync::Arc;
     use zeroclaw_api::model_provider::ChatMessage;
     use zeroclaw_config::schema::{MemoryDedupAction, MemoryPolicyConfig, MemoryTypesConfig};
@@ -851,10 +853,11 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "tachi")]
     #[tokio::test]
-    async fn typed_consolidation_preserves_kind_and_agent_through_scoped_sqlite() {
+    async fn typed_consolidation_preserves_kind_and_agent_through_scoped_tachi() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let inner = Arc::new(SqliteMemory::new("test", tmp.path()).unwrap());
+        let inner = Arc::new(crate::tachi::TachiMemory::new("tachi", tmp.path()).unwrap());
         let alpha = inner.ensure_agent_uuid("alpha").await.unwrap();
         let scoped = AgentScopedMemory::new(inner.clone(), &alpha, Vec::<String>::new());
         let provider = ScriptedProvider::new(TYPED_RESPONSE);
@@ -885,16 +888,17 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "tachi")]
     #[tokio::test]
     async fn typed_consolidation_survives_audit_decorator_in_the_stack() {
         // Composed-stack regression: scope wrapper over the audit decorator
-        // over real SQLite. The scoped store forwards through
+        // over real Tachi. The scoped store forwards through
         // `store_with_options_and_agent`, so the decorator must forward the
         // full typed surface (not inherit the failing trait default) while
         // still recording the writes in its audit trail.
         let tmp = tempfile::TempDir::new().unwrap();
-        let sqlite = SqliteMemory::new("test", tmp.path()).unwrap();
-        let audited = Arc::new(AuditedMemory::new(sqlite, tmp.path()).unwrap());
+        let tachi = crate::tachi::TachiMemory::new("tachi", tmp.path()).unwrap();
+        let audited = Arc::new(AuditedMemory::new(tachi, tmp.path()).unwrap());
         let alpha = audited.ensure_agent_uuid("alpha").await.unwrap();
         let scoped = AgentScopedMemory::new(audited.clone(), &alpha, Vec::<String>::new());
         let provider = ScriptedProvider::new(TYPED_RESPONSE);
@@ -1232,18 +1236,17 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "tachi")]
     #[tokio::test]
-    async fn flags_off_sqlite_kind_column_stays_null() {
+    async fn flags_off_tachi_kind_column_stays_null() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let sqlite = crate::sqlite::SqliteMemory::new("test", tmp.path()).unwrap();
+        let tachi = crate::tachi::TachiMemory::new("tachi", tmp.path()).unwrap();
         let provider = ScriptedProvider::new(TYPED_RESPONSE);
         let config = MemoryConfig::default();
 
-        run_consolidation(&provider, &sqlite, &config)
-            .await
-            .unwrap();
+        run_consolidation(&provider, &tachi, &config).await.unwrap();
 
-        let entries = sqlite.list(None, None).await.unwrap();
+        let entries = tachi.list(None, None).await.unwrap();
         assert!(!entries.is_empty());
         for entry in &entries {
             assert_eq!(
@@ -1288,13 +1291,12 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tachi"))]
 mod consolidate_turn_tests {
     use super::*;
-    use crate::sqlite::SqliteMemory;
+    use crate::tachi::TachiMemory;
     use crate::traits::MemoryEntry;
     use async_trait::async_trait;
-    use std::path::Path;
     use std::sync::Mutex;
     use tempfile::TempDir;
     use zeroclaw_api::attribution::{Attributable, ModelProviderKind, ProviderKind, Role};
@@ -1367,7 +1369,7 @@ mod consolidate_turn_tests {
 
     async fn run(
         provider: &ScriptedProvider,
-        memory: &SqliteMemory,
+        memory: &TachiMemory,
         cfg: &MemoryConfig,
     ) -> anyhow::Result<()> {
         consolidate_turn(
@@ -1382,24 +1384,19 @@ mod consolidate_turn_tests {
         .await
     }
 
-    async fn count(memory: &SqliteMemory, category: MemoryCategory) -> u64 {
+    async fn count(memory: &TachiMemory, category: MemoryCategory) -> u64 {
         memory.count_in_scope(None, Some(&category)).await.unwrap()
     }
 
-    fn open_db(workspace: &Path) -> rusqlite::Connection {
-        rusqlite::Connection::open(workspace.join("memory").join("brain.db")).unwrap()
+    async fn superseded_by(memory: &TachiMemory, key: &str) -> Option<String> {
+        memory
+            .get(key)
+            .await
+            .unwrap()
+            .and_then(|entry| entry.superseded_by)
     }
 
-    fn superseded_by(conn: &rusqlite::Connection, key: &str) -> Option<String> {
-        conn.query_row(
-            "SELECT superseded_by FROM memories WHERE key = ?1",
-            rusqlite::params![key],
-            |row| row.get(0),
-        )
-        .unwrap()
-    }
-
-    async fn store_core_fact(memory: &SqliteMemory, key: &str, content: &str) {
+    async fn store_core_fact(memory: &TachiMemory, key: &str, content: &str) {
         memory
             .store_with_options(
                 key,
@@ -1415,7 +1412,7 @@ mod consolidate_turn_tests {
     #[tokio::test]
     async fn persists_history_and_core_update() {
         let tmp = TempDir::new().unwrap();
-        let memory = SqliteMemory::new("sqlite", tmp.path()).unwrap();
+        let memory = TachiMemory::new("tachi", tmp.path()).unwrap();
         let provider = ScriptedProvider::update_reply("User tracks budgets in TOML files.");
 
         run(&provider, &memory, &MemoryConfig::default())
@@ -1425,18 +1422,17 @@ mod consolidate_turn_tests {
         assert_eq!(count(&memory, MemoryCategory::Daily).await, 1);
         assert_eq!(count(&memory, MemoryCategory::Core).await, 1);
 
-        let conn = open_db(tmp.path());
-        let (content, importance): (String, Option<f64>) = conn
-            .query_row(
-                "SELECT content, importance FROM memories \
-                 WHERE category = 'core' AND key LIKE 'core_%'",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
+        let entries = memory
+            .list(Some(&MemoryCategory::Core), None)
+            .await
             .unwrap();
-        assert_eq!(content, "User tracks budgets in TOML files.");
+        let entry = entries
+            .iter()
+            .find(|e| e.key.starts_with("core_"))
+            .expect("core consolidation row present");
+        assert_eq!(entry.content, "User tracks budgets in TOML files.");
         assert!(
-            importance.is_some(),
+            entry.importance.is_some(),
             "core writes carry a computed importance"
         );
     }
@@ -1444,7 +1440,7 @@ mod consolidate_turn_tests {
     #[tokio::test]
     async fn null_memory_update_writes_history_only() {
         let tmp = TempDir::new().unwrap();
-        let memory = SqliteMemory::new("sqlite", tmp.path()).unwrap();
+        let memory = TachiMemory::new("tachi", tmp.path()).unwrap();
         let provider = ScriptedProvider::replying(
             r#"{"history_entry": "Routine greeting.", "memory_update": null}"#,
         );
@@ -1460,7 +1456,7 @@ mod consolidate_turn_tests {
     #[tokio::test]
     async fn media_markers_are_stripped_from_the_outbound_prompt() {
         let tmp = TempDir::new().unwrap();
-        let memory = SqliteMemory::new("sqlite", tmp.path()).unwrap();
+        let memory = TachiMemory::new("tachi", tmp.path()).unwrap();
         let provider = ScriptedProvider::replying(
             r#"{"history_entry": "Reviewed an image.", "memory_update": null}"#,
         );
@@ -1491,7 +1487,7 @@ mod consolidate_turn_tests {
     #[tokio::test]
     async fn dedup_reject_skips_duplicate_core_update() {
         let tmp = TempDir::new().unwrap();
-        let memory = SqliteMemory::new("sqlite", tmp.path()).unwrap();
+        let memory = TachiMemory::new("tachi", tmp.path()).unwrap();
         let fact = "User prefers Rust for systems work";
         store_core_fact(&memory, "existing_fact", fact).await;
 
@@ -1508,21 +1504,20 @@ mod consolidate_turn_tests {
             1,
             "exact duplicate is rejected, only the pre-existing row remains"
         );
-        let conn = open_db(tmp.path());
-        let new_rows: u64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM memories WHERE key LIKE 'core_%'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
+        let new_rows = memory
+            .list(Some(&MemoryCategory::Core), None)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.key.starts_with("core_"))
+            .count();
         assert_eq!(new_rows, 0, "no consolidation-keyed row was written");
     }
 
     #[tokio::test]
     async fn dedup_merge_folds_update_into_the_survivor() {
         let tmp = TempDir::new().unwrap();
-        let memory = SqliteMemory::new("sqlite", tmp.path()).unwrap();
+        let memory = TachiMemory::new("tachi", tmp.path()).unwrap();
         let survivor = "User prefers Rust for systems work";
         let update = "User prefers Rust for systems programming work";
         store_core_fact(&memory, "fact_rust", survivor).await;
@@ -1550,26 +1545,27 @@ mod consolidate_turn_tests {
     /// contrast: in a corpus where every document contains the query terms
     /// the IDF collapses to ~0 and conflict scores become meaningless.
     /// Seed unrelated facts so the conflicting row scores above threshold.
-    async fn seed_filler_facts(memory: &SqliteMemory) {
+    async fn seed_filler_facts(memory: &TachiMemory) {
         store_core_fact(memory, "filler_editor", "Preferred editor is Helix").await;
         store_core_fact(memory, "filler_tz", "Timezone offset UTC plus ten").await;
         store_core_fact(memory, "filler_lang", "Speaks French and Japanese").await;
         store_core_fact(memory, "filler_ci", "CI provider is Buildkite").await;
     }
 
-    fn live_rows_with_content(conn: &rusqlite::Connection, content: &str) -> u64 {
-        conn.query_row(
-            "SELECT COUNT(*) FROM memories WHERE content = ?1 AND superseded_by IS NULL",
-            rusqlite::params![content],
-            |row| row.get(0),
-        )
-        .unwrap()
+    async fn live_rows_with_content(memory: &TachiMemory, content: &str) -> usize {
+        memory
+            .list(Some(&MemoryCategory::Core), None)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.content == content && e.superseded_by.is_none())
+            .count()
     }
 
     #[tokio::test]
     async fn conflict_supersede_marks_the_loser_reversibly() {
         let tmp = TempDir::new().unwrap();
-        let memory = SqliteMemory::new("sqlite", tmp.path()).unwrap();
+        let memory = TachiMemory::new("tachi", tmp.path()).unwrap();
         seed_filler_facts(&memory).await;
         store_core_fact(
             &memory,
@@ -1593,15 +1589,15 @@ mod consolidate_turn_tests {
 
         run(&provider, &memory, &cfg).await.unwrap();
 
-        let conn = open_db(tmp.path());
-        let marker = superseded_by(&conn, "stale_fact")
+        let marker = superseded_by(&memory, "stale_fact")
+            .await
             .expect("conflicting row is reversibly soft-hidden, not deleted");
         assert!(
             marker.starts_with("core_"),
             "superseded_by points at the winning consolidation write"
         );
         assert_eq!(
-            live_rows_with_content(&conn, update),
+            live_rows_with_content(&memory, update).await,
             1,
             "the winning update is stored live"
         );
@@ -1610,7 +1606,7 @@ mod consolidate_turn_tests {
     #[tokio::test]
     async fn supersede_disabled_leaves_conflicting_rows_live() {
         let tmp = TempDir::new().unwrap();
-        let memory = SqliteMemory::new("sqlite", tmp.path()).unwrap();
+        let memory = TachiMemory::new("tachi", tmp.path()).unwrap();
         seed_filler_facts(&memory).await;
         store_core_fact(
             &memory,
@@ -1629,18 +1625,17 @@ mod consolidate_turn_tests {
 
         run(&provider, &memory, &cfg).await.unwrap();
 
-        let conn = open_db(tmp.path());
         assert!(
-            superseded_by(&conn, "stale_fact").is_none(),
+            superseded_by(&memory, "stale_fact").await.is_none(),
             "flag off: the conflicting row stays visible"
         );
-        assert_eq!(live_rows_with_content(&conn, update), 1);
+        assert_eq!(live_rows_with_content(&memory, update).await, 1);
     }
 
     #[tokio::test]
     async fn policy_gate_rejection_bails_the_core_write() {
         let tmp = TempDir::new().unwrap();
-        let memory = SqliteMemory::new("sqlite", tmp.path()).unwrap();
+        let memory = TachiMemory::new("tachi", tmp.path()).unwrap();
 
         let mut cfg = MemoryConfig::default();
         cfg.policy.read_only_namespaces = vec!["default".into()];
@@ -1666,7 +1661,7 @@ mod consolidate_turn_tests {
     #[tokio::test]
     async fn provider_failure_aborts_before_any_write() {
         let tmp = TempDir::new().unwrap();
-        let memory = SqliteMemory::new("sqlite", tmp.path()).unwrap();
+        let memory = TachiMemory::new("tachi", tmp.path()).unwrap();
         let provider = ScriptedProvider::failing();
 
         let result = run(&provider, &memory, &MemoryConfig::default()).await;

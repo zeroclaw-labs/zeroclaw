@@ -585,7 +585,7 @@ pub struct Config {
     #[nested]
     pub channels: ChannelsConfig,
 
-    /// Memory backend configuration: sqlite, markdown, embeddings (`[memory]`).
+    /// Memory backend configuration: tachi, markdown, embeddings (`[memory]`).
     #[serde(default)]
     #[nested]
     pub memory: MemoryConfig,
@@ -4379,23 +4379,11 @@ impl Config {
         }
         let (kind, alias) = backend.split_once('.').unwrap_or((backend, "default"));
         match kind {
-            "sqlite" => self
-                .storage
-                .sqlite
-                .get(alias)
-                .map(ActiveStorage::Sqlite)
-                .unwrap_or(ActiveStorage::None),
             "markdown" => self
                 .storage
                 .markdown
                 .get(alias)
                 .map(ActiveStorage::Markdown)
-                .unwrap_or(ActiveStorage::None),
-            "lucid" => self
-                .storage
-                .lucid
-                .get(alias)
-                .map(ActiveStorage::Lucid)
                 .unwrap_or(ActiveStorage::None),
             _ => ActiveStorage::None,
         }
@@ -4408,25 +4396,19 @@ impl Config {
 /// borrow of the typed config from the corresponding `Config.storage` map.
 #[derive(Debug, Clone, Copy)]
 pub enum ActiveStorage<'a> {
-    /// No storage configured (`memory.backend = "none"` or unresolved alias).
+    /// No storage configured (`memory.backend = "none"`, `"tachi"`, or unresolved alias).
     None,
-    /// SQLite storage instance.
-    Sqlite(&'a SqliteStorageConfig),
     /// Markdown directory storage instance.
     Markdown(&'a MarkdownStorageConfig),
-    /// Lucid CLI sync instance.
-    Lucid(&'a LucidStorageConfig),
 }
 
 impl ActiveStorage<'_> {
-    /// Backend type name (`"sqlite"`, `"markdown"`, etc.); `"none"` for unconfigured.
+    /// Backend type name (`"markdown"`, etc.); `"none"` for unconfigured.
     #[must_use]
     pub fn kind(&self) -> &'static str {
         match self {
             ActiveStorage::None => "none",
-            ActiveStorage::Sqlite(_) => "sqlite",
             ActiveStorage::Markdown(_) => "markdown",
-            ActiveStorage::Lucid(_) => "lucid",
         }
     }
 }
@@ -6792,7 +6774,7 @@ fn default_false() -> bool {
 }
 
 fn default_memory_backend() -> String {
-    "sqlite".into()
+    "tachi".into()
 }
 
 fn default_tunnel_provider() -> String {
@@ -8309,40 +8291,17 @@ pub async fn read_persisted_proxy_for_boot() -> Option<ProxyConfig> {
 ///
 /// Storage is a two-tier alias-keyed map: `[storage.<backend>.<alias>]`,
 /// parallel to `[providers.models.<type>.<alias>]`. Each backend has its own typed
-/// config struct. `MemoryConfig.backend` carries a dotted reference (`"sqlite.default"`,
-/// `"markdown.notes"`) that resolves to one of these entries via
-/// [`Config::resolve_active_storage`].
+/// config struct. `MemoryConfig.backend` carries a dotted reference (`"markdown.notes"`)
+/// that resolves to one of these entries via [`Config::resolve_active_storage`], or
+/// selects `"tachi"` (the embedded kernel) / `"none"`.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "storage"]
 pub struct StorageConfig {
-    /// SQLite storage instances (`[storage.sqlite.<alias>]`).
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    #[nested]
-    pub sqlite: HashMap<String, SqliteStorageConfig>,
     /// Markdown storage instances (`[storage.markdown.<alias>]`).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
     pub markdown: HashMap<String, MarkdownStorageConfig>,
-    /// Lucid CLI sync instances (`[storage.lucid.<alias>]`).
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    #[nested]
-    pub lucid: HashMap<String, LucidStorageConfig>,
-}
-
-/// SQLite storage backend (`[storage.sqlite.<alias>]`).
-#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "storage_sqlite"]
-#[serde(default)]
-pub struct SqliteStorageConfig {
-    /// Optional override for the SQLite database path.
-    /// When unset, defaults to `<workspace_dir>/brain.db`.
-    pub path: Option<String>,
-    /// Maximum seconds the caller waits for a connection to open (capped at 300).
-    /// `None` disables that timeout. Transient open-lock retries stop after 5 seconds.
-    /// A native open already in progress cannot be cancelled by this timeout.
-    pub open_timeout_secs: Option<u64>,
 }
 
 /// Markdown directory storage (`[storage.markdown.<alias>]`).
@@ -8354,32 +8313,6 @@ pub struct MarkdownStorageConfig {
     /// Optional override for the markdown root directory.
     /// When unset, defaults to `<workspace_dir>/memory/`.
     pub directory: Option<String>,
-}
-
-/// Lucid CLI sync backend (`[storage.lucid.<alias>]`).
-#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "storage_lucid"]
-#[serde(default)]
-pub struct LucidStorageConfig {
-    /// Optional path to the lucid-memory binary. When unset, the bare `lucid`
-    /// executable is resolved on `PATH`. A blank or whitespace-only value is
-    /// rejected at config validation and remains invalid if startup continues,
-    /// so an invalid explicit selector never falls through to `PATH`.
-    pub binary_path: Option<String>,
-    /// Recall (context) timeout override, in milliseconds. Lucid CLI cold
-    /// starts (loading the local embedding model) can exceed 1.5s on ARM
-    /// hosts; raise this if recalls still time out on your hardware.
-    /// Unset falls back to the built-in default (3000ms). `0` is rejected
-    /// at config validation; because startup warns and continues after
-    /// validation errors, a `0` that reaches the runtime is treated as
-    /// unset and falls back to the default.
-    pub recall_timeout_ms: Option<u64>,
-    /// Store timeout override, in milliseconds. Same cold-start
-    /// consideration as `recall_timeout_ms`. Unset falls back to the
-    /// built-in default (3000ms); `0` is rejected at validation and, if
-    /// startup continues after the warning, is likewise treated as unset.
-    pub store_timeout_ms: Option<u64>,
 }
 
 /// Search strategy for memory recall.
@@ -8398,20 +8331,19 @@ pub enum SearchMode {
 
 /// Memory backend configuration (`[memory]` section).
 ///
-/// Controls conversation memory storage, embeddings, hybrid search, response
-/// caching, and memory snapshot/hydration. Backend-specific connection settings
-/// live under `[storage.<backend>.<alias>]`; this section selects which storage
-/// instance to use via the `backend` dotted reference.
+/// Controls conversation memory storage, embeddings, hybrid search, and response
+/// caching. Backend-specific settings live under `[storage.<backend>.<alias>]`
+/// when applicable; this section selects which backend or storage instance to use
+/// via `backend`.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "memory"]
 #[allow(clippy::struct_excessive_bools)]
 pub struct MemoryConfig {
-    /// Dotted reference to the active storage instance: `<backend>.<alias>`
-    /// (e.g. `"sqlite.default"`, `"markdown.notes"`). Resolves through
-    /// `Config.storage.<backend>.<alias>` at runtime. Bare backend names
-    /// (`"sqlite"`) are treated as `"<backend>.default"`. Set to `"none"` to
-    /// disable persistence entirely.
+    /// Active memory backend or dotted storage reference: `<backend>[.<alias>]`
+    /// (e.g. `"tachi"`, `"markdown.notes"`). Resolves through
+    /// `Config.storage.<backend>.<alias>` for configured storage backends, or
+    /// selects a built-in backend (`"tachi"`, `"markdown"`, `"none"`).
     #[serde(default = "default_memory_backend")]
     pub backend: String,
     /// Auto-save what *you* tell ZeroClaw into memory as conversation history — the agent's own replies are not saved. Turn off if you want memory to only hold things you explicitly record via the memory tool.
@@ -8422,7 +8354,7 @@ pub struct MemoryConfig {
     pub hygiene_enabled: bool,
     /// Also extract atomic durable facts from each consolidated turn and store
     /// them as individual Core memories. Default off; the flip is sequenced in
-    /// a later phase. SQLite-only: enabling this requires the sqlite memory
+    /// a later phase. Tachi-only: enabling this requires the tachi memory
     /// backend globally and on every agent (validated at config load).
     #[serde(default)]
     pub consolidation_extract_facts: bool,
@@ -8432,13 +8364,13 @@ pub struct MemoryConfig {
     /// Delete archived files permanently after this many days. Set high if you need long-term history; set low for privacy / disk-space reasons.
     #[serde(default = "default_purge_after_days")]
     pub purge_after_days: u32,
-    /// Delete conversation rows older than this many days from the DB (sqlite backend only). Age is measured by `updated_at` (last write time). 0 = keep forever.
+    /// Delete conversation rows older than this many days (when enforced by the active backend). Age is measured by `updated_at` (last write time). 0 = keep forever.
     #[serde(default = "default_conversation_retention_days")]
     pub conversation_retention_days: u32,
-    /// Delete daily memory rows older than this many days from the DB. Age is measured by `updated_at` (last write time). 0 = keep forever.
+    /// Delete daily memory rows older than this many days from the store. Age is measured by `updated_at` (last write time). 0 = keep forever.
     #[serde(default = "default_zero_retention")]
     pub daily_retention_days: u32,
-    /// Delete core memory rows older than this many days from the DB. Age is measured by `created_at` (first-write time). Neither recall nor ordinary rewrites refresh `created_at` under the current SQLite upsert, so core retention is an absolute age limit from first write. Set this to a generously large window for durable core memories, or keep 0 = keep forever.
+    /// Delete core memory rows older than this many days from the store. Age is measured by `created_at` (first-write time). Neither recall nor ordinary rewrites refresh `created_at` on upsert, so core retention is an absolute age limit from first write. Set this to a generously large window for durable core memories, or keep 0 = keep forever.
     #[serde(default = "default_zero_retention")]
     pub core_retention_days: u32,
     /// Source of embedding vectors for semantic search. `none` = keyword-only retrieval (no API calls, no vector cost); `openai` = OpenAI's embedding API; `custom:URL` = any OpenAI-compatible embedding endpoint (LiteLLM, local gateway, etc.).
@@ -8493,17 +8425,6 @@ pub struct MemoryConfig {
     /// Max in-memory hot cache entries for the two-tier response cache (default: 256)
     #[serde(default = "default_response_cache_hot_entries")]
     pub response_cache_hot_entries: usize,
-
-    // ── Memory Snapshot (soul backup to Markdown) ─────────────
-    /// Enable periodic export of core memories to MEMORY_SNAPSHOT.md
-    #[serde(default)]
-    pub snapshot_enabled: bool,
-    /// Run snapshot during hygiene passes (heartbeat-driven)
-    #[serde(default)]
-    pub snapshot_on_hygiene: bool,
-    /// Auto-hydrate from MEMORY_SNAPSHOT.md when brain.db is missing
-    #[serde(default = "default_true")]
-    pub auto_hydrate: bool,
 
     // ── Retrieval Pipeline ─────────────────────────────────────
     /// Retrieval stages for per-agent recall. Only `"cache"` is active: it
@@ -8605,17 +8526,16 @@ pub struct MemoryConfig {
     #[serde(default)]
     #[nested]
     pub types: MemoryTypesConfig,
-    // Backend-specific config fields (sqlite_open_timeout_secs, lucid.*)
-    // live on `[storage.<backend>.<alias>]`. The `backend` field
-    // carries a dotted alias reference and the runtime looks up the typed
-    // config via `Config::resolve_active_storage`.
+    // Backend-specific config fields (e.g. markdown directory) live on
+    // `[storage.<backend>.<alias>]`. When a storage alias is configured,
+    // runtime looks up the typed config via `Config::resolve_active_storage`.
 }
 
 /// Typed memory configuration (`[memory.types]` section).
 ///
 /// Behaviour-neutral by default: `enabled` gates MemoryKind assignment on new
 /// consolidation writes and defaults off; the flip is sequenced in a later
-/// phase. SQLite-only: enabling requires the sqlite memory backend globally
+/// phase. Tachi-only: enabling requires the tachi memory backend globally
 /// and on every agent (validated at config load).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
@@ -8908,7 +8828,7 @@ fn default_response_cache_hot_entries() -> usize {
 impl Default for MemoryConfig {
     fn default() -> Self {
         Self {
-            backend: "sqlite".into(),
+            backend: "tachi".into(),
             auto_save: true,
             hygiene_enabled: default_hygiene_enabled(),
             consolidation_extract_facts: false,
@@ -8932,9 +8852,7 @@ impl Default for MemoryConfig {
             response_cache_ttl_minutes: default_response_cache_ttl(),
             response_cache_max_entries: default_response_cache_max(),
             response_cache_hot_entries: default_response_cache_hot_entries(),
-            snapshot_enabled: false,
-            snapshot_on_hygiene: false,
-            auto_hydrate: true,
+
             retrieval_stages: default_retrieval_stages(),
             candidate_multiplier: default_candidate_multiplier(),
             rerank_enabled: false,
@@ -13411,7 +13329,7 @@ impl Config {
         warnings
     }
 
-    /// Surface sqlite semantic/hybrid search with no effective embedder. The
+    /// Surface tachi semantic/hybrid search with no effective embedder. The
     /// runtime treats `NoopEmbedding` as dimensions 0 and silently skips the
     /// vector path, so derive this from the canonical memory settings instead
     /// of storing another effective-mode field.
@@ -13419,7 +13337,7 @@ impl Config {
         &self,
         warnings: &mut Vec<crate::validation_warnings::ValidationWarning>,
     ) {
-        if !Self::memory_backend_is_sqlite(&self.memory.backend) {
+        if !Self::memory_backend_is_tachi(&self.memory.backend) {
             return;
         }
         if !matches!(
@@ -13440,7 +13358,7 @@ impl Config {
         warnings.push(crate::validation_warnings::ValidationWarning::new(
             "memory_semantic_search_without_embedder",
             format!(
-                "memory.search_mode is {search_mode:?} on sqlite memory, but no effective \
+                "memory.search_mode is {search_mode:?} on tachi memory, but no effective \
                  embedding provider is configured; vector search is skipped and \
                  recall falls back to keyword-only behavior. Configure \
                  memory.embedding_provider or a valid memory.embedding_model \
@@ -13450,13 +13368,13 @@ impl Config {
         ));
     }
 
-    fn memory_backend_is_sqlite(backend: &str) -> bool {
+    fn memory_backend_is_tachi(backend: &str) -> bool {
         let trimmed = backend.trim();
         let family = trimmed
             .split_once('.')
             .map_or(trimmed, |(family, _)| family)
             .trim();
-        family.eq_ignore_ascii_case("sqlite")
+        family.eq_ignore_ascii_case("tachi")
     }
 
     fn memory_has_effective_embedder(&self) -> bool {
@@ -13993,37 +13911,6 @@ impl Config {
             }
         }
 
-        let mut lucid_aliases: Vec<&String> = self.storage.lucid.keys().collect();
-        lucid_aliases.sort();
-        for alias in lucid_aliases {
-            let lucid = &self.storage.lucid[alias];
-            if lucid
-                .binary_path
-                .as_ref()
-                .is_some_and(|path| path.trim().is_empty())
-            {
-                validation_bail!(
-                    RequiredFieldEmpty,
-                    format!("storage.lucid.{alias}.binary_path"),
-                    "storage.lucid.{alias}.binary_path must not be empty"
-                );
-            }
-            if matches!(lucid.recall_timeout_ms, Some(0)) {
-                validation_bail!(
-                    InvalidNumericRange,
-                    format!("storage.lucid.{alias}.recall_timeout_ms"),
-                    "storage.lucid.{alias}.recall_timeout_ms must be greater than 0"
-                );
-            }
-            if matches!(lucid.store_timeout_ms, Some(0)) {
-                validation_bail!(
-                    InvalidNumericRange,
-                    format!("storage.lucid.{alias}.store_timeout_ms"),
-                    "storage.lucid.{alias}.store_timeout_ms must be greater than 0"
-                );
-            }
-        }
-
         // Reply-pacing bounds — both `reply_min_interval_secs` and
         // `reply_queue_depth_max` walk through one entry list so adding
         // a new paced channel only requires extending `reply_pacing_entries`.
@@ -14125,9 +14012,9 @@ impl Config {
                 "channels.max_concurrent_per_channel must be greater than 0"
             );
         }
-        // Typed-memory producers are a SQLite-only slice: the enabled write
+        // Typed-memory producers are a Tachi-only slice: the enabled write
         // path stores through `store_with_options_and_agent`, and only the
-        // SQLite backend persists the full typed StoreOptions surface. Any
+        // Tachi backend persists the full typed StoreOptions surface. Any
         // other backend would hit the trait default's explicit failure deep
         // inside spawned background consolidation, so reject the
         // configuration at load instead.
@@ -14148,25 +14035,24 @@ impl Config {
                 .next()
                 .unwrap_or_default()
                 .to_ascii_lowercase();
-            if !matches!(backend_kind.as_str(), "sqlite" | "tachi") {
+            if backend_kind != "tachi" {
                 validation_bail!(
                     InvalidFormat,
                     flag_path,
-                    "{flag_path} = true requires memory.backend = \"sqlite\" or \"tachi\" (typed memory storage is SQLite-only/Tachi-only), but memory.backend = {:?}",
+                    "{flag_path} = true requires memory.backend = \"tachi\" (typed memory storage is Tachi-only), but memory.backend = {:?}",
                     self.memory.backend
                 );
             }
             for (alias, agent) in &self.agents {
                 if !matches!(
                     agent.memory.backend,
-                    crate::multi_agent::MemoryBackendKind::Sqlite
-                        | crate::multi_agent::MemoryBackendKind::Tachi
+                    crate::multi_agent::MemoryBackendKind::Tachi
                 ) {
                     let agent_backend = agent.memory.backend;
                     validation_bail!(
                         InvalidFormat,
                         format!("agents.{alias}.memory.backend"),
-                        "{flag_path} = true requires every agent on the sqlite or tachi memory backend (typed memory storage is SQLite-only/Tachi-only), but agents.{alias}.memory.backend = {agent_backend:?}",
+                        "{flag_path} = true requires every agent on the tachi memory backend (typed memory storage is Tachi-only), but agents.{alias}.memory.backend = {agent_backend:?}",
                     );
                 }
             }

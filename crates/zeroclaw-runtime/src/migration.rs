@@ -403,6 +403,7 @@ fn backup_target_memory(workspace_dir: &Path) -> Result<Option<PathBuf>> {
     fs::create_dir_all(&backup_root)?;
 
     let files_to_copy = [
+        workspace_dir.join("memory").join("tachi.db"),
         workspace_dir.join("memory").join("brain.db"),
         workspace_dir.join("MEMORY.md"),
     ];
@@ -449,14 +450,13 @@ mod tests {
     use rusqlite::params;
     use tempfile::TempDir;
     use zeroclaw_config::schema::{Config, MemoryConfig};
-    use zeroclaw_memory::SqliteMemory;
 
     fn test_config(workspace: &Path) -> Config {
         Config {
             data_dir: workspace.to_path_buf(),
             config_path: workspace.join("config.toml"),
             memory: MemoryConfig {
-                backend: "sqlite".to_string(),
+                backend: "tachi".to_string(),
                 ..MemoryConfig::default()
             },
             ..Config::default()
@@ -507,15 +507,21 @@ mod tests {
 
     #[tokio::test]
     async fn migration_renames_conflicting_key() {
+        if !zeroclaw_memory::TACHI_COMPILED {
+            return;
+        }
         let source = TempDir::new().unwrap();
         let target = TempDir::new().unwrap();
+        let config = test_config(target.path());
 
         // Existing target memory
-        let target_mem = SqliteMemory::new("test", target.path()).unwrap();
-        target_mem
-            .store("k", "new value", MemoryCategory::Core, None)
-            .await
-            .unwrap();
+        {
+            let target_mem = target_memory_backend(&config).unwrap();
+            target_mem
+                .store("k", "new value", MemoryCategory::Core, None)
+                .await
+                .unwrap();
+        }
 
         // Source sqlite with conflicting key + different content
         let source_db_dir = source.path().join("memory");
@@ -530,11 +536,11 @@ mod tests {
         )
         .unwrap();
 
-        let config = test_config(target.path());
         migrate_openclaw_memory(&config, Some(source.path().to_path_buf()), false, false)
             .await
             .unwrap();
 
+        let target_mem = target_memory_backend(&config).unwrap();
         let all = target_mem.list(None, None).await.unwrap();
         assert!(all.iter().any(|e| e.key == "k" && e.content == "new value"));
         assert!(
@@ -545,6 +551,9 @@ mod tests {
 
     #[tokio::test]
     async fn dry_run_does_not_write() {
+        if !zeroclaw_memory::TACHI_COMPILED {
+            return;
+        }
         let source = TempDir::new().unwrap();
         let target = TempDir::new().unwrap();
         let source_db_dir = source.path().join("memory");
@@ -565,12 +574,15 @@ mod tests {
             .await
             .unwrap();
 
-        let target_mem = SqliteMemory::new("test", target.path()).unwrap();
+        let target_mem = target_memory_backend(&config).unwrap();
         assert_eq!(target_mem.count().await.unwrap(), 0);
     }
 
     #[tokio::test]
-    async fn migration_reindex_uses_same_dotted_sqlite_backend_as_import() {
+    async fn migration_reindex_uses_same_dotted_tachi_backend_as_import() {
+        if !zeroclaw_memory::TACHI_COMPILED {
+            return;
+        }
         let source = TempDir::new().unwrap();
         let target = TempDir::new().unwrap();
         let source_db_dir = source.path().join("memory");
@@ -587,12 +599,12 @@ mod tests {
         .unwrap();
 
         let mut config = test_config(target.path());
-        config.memory.backend = "sqlite.default".to_string();
+        config.memory.backend = "tachi.default".to_string();
         migrate_openclaw_memory(&config, Some(source.path().to_path_buf()), false, true)
             .await
             .unwrap();
 
-        let target_mem = SqliteMemory::new("test", target.path()).unwrap();
+        let target_mem = target_memory_backend(&config).unwrap();
         let results = target_mem
             .recall("searchable", 10, None, None, None)
             .await

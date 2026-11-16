@@ -1,5 +1,3 @@
-use crate::budget;
-use crate::policy::PolicyEnforcer;
 use anyhow::Result;
 use chrono::{DateTime, Duration, Local, NaiveDate, Utc};
 use rusqlite::{Connection, params};
@@ -23,9 +21,6 @@ struct HygieneReport {
     archived_session_files: u64,
     purged_memory_archives: u64,
     purged_session_archives: u64,
-    pruned_conversation_rows: u64,
-    pruned_daily_rows: u64,
-    pruned_core_rows: u64,
 }
 
 impl HygieneReport {
@@ -34,9 +29,6 @@ impl HygieneReport {
             + self.archived_session_files
             + self.purged_memory_archives
             + self.purged_session_archives
-            + self.pruned_conversation_rows
-            + self.pruned_daily_rows
-            + self.pruned_core_rows
     }
 }
 
@@ -112,22 +104,7 @@ pub fn run_if_due(config: &MemoryConfig, workspace_dir: &Path) -> Result<()> {
         return Ok(());
     }
 
-    // Use policy engine for per-category retention overrides.
-    let enforcer = PolicyEnforcer::new(&config.policy);
-    let conversation_retention = enforcer.retention_days_for_category(
-        &crate::traits::MemoryCategory::Conversation,
-        config.conversation_retention_days,
-    );
-    let daily_retention = enforcer.retention_days_for_category(
-        &crate::traits::MemoryCategory::Daily,
-        config.daily_retention_days,
-    );
-    let core_retention = enforcer.retention_days_for_category(
-        &crate::traits::MemoryCategory::Core,
-        config.core_retention_days,
-    );
-
-    let mut report = HygieneReport {
+    let report = HygieneReport {
         archived_memory_files: archive_daily_memory_files(
             workspace_dir,
             config.archive_after_days,
@@ -135,18 +112,7 @@ pub fn run_if_due(config: &MemoryConfig, workspace_dir: &Path) -> Result<()> {
         archived_session_files: archive_session_files(workspace_dir, config.archive_after_days)?,
         purged_memory_archives: purge_memory_archives(workspace_dir, config.purge_after_days)?,
         purged_session_archives: purge_session_archives(workspace_dir, config.purge_after_days)?,
-        pruned_conversation_rows: prune_category_rows(
-            workspace_dir,
-            conversation_retention,
-            "conversation",
-            false,
-        )?,
-        pruned_daily_rows: prune_category_rows(workspace_dir, daily_retention, "daily", false)?,
-        pruned_core_rows: prune_category_rows(workspace_dir, core_retention, "core", true)?,
     };
-    let budget_report = compact_budget_rows(workspace_dir, config)?;
-    report.pruned_daily_rows += budget_report.daily_rows;
-    report.pruned_core_rows += budget_report.core_rows;
 
     // Retention cleanup is independent from new audit collection: disabling
     // audit stops new rows, but existing sensitive rows still honor retention.
@@ -166,14 +132,11 @@ pub fn run_if_due(config: &MemoryConfig, workspace_dir: &Path) -> Result<()> {
             INFO,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
             &format!(
-                "memory hygiene complete: archived_memory={} archived_sessions={} purged_memory={} purged_sessions={} pruned_conversation={} pruned_daily={} pruned_core={}",
+                "memory hygiene complete: archived_memory={} archived_sessions={} purged_memory={} purged_sessions={}",
                 report.archived_memory_files,
                 report.archived_session_files,
                 report.purged_memory_archives,
                 report.purged_session_archives,
-                report.pruned_conversation_rows,
-                report.pruned_daily_rows,
-                report.pruned_core_rows,
             )
         );
     }
@@ -413,65 +376,6 @@ fn purge_session_archives(workspace_dir: &Path, purge_after_days: u32) -> Result
     Ok(removed)
 }
 
-fn prune_category_rows(
-    workspace_dir: &Path,
-    retention_days: u32,
-    category: &str,
-    use_created_at: bool,
-) -> Result<u64> {
-    if retention_days == 0 {
-        return Ok(0);
-    }
-
-    let db_path = workspace_dir.join("memory").join("brain.db");
-    if !db_path.exists() {
-        return Ok(0);
-    }
-
-    let conn = Connection::open(db_path)?;
-    // Use WAL so hygiene pruning doesn't block agent reads
-    conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")?;
-    let cutoff = (Local::now() - Duration::days(i64::from(retention_days))).to_rfc3339();
-
-    let timestamp_col = if use_created_at {
-        "created_at"
-    } else {
-        "updated_at"
-    };
-    let sql = format!(
-        "DELETE FROM memories WHERE category = ?1 AND {timestamp_col} < ?2 AND pinned = 0",
-    );
-    let affected = conn.execute(&sql, params![category, cutoff])?;
-
-    Ok(u64::try_from(affected).unwrap_or(0))
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-struct BudgetRows {
-    core_rows: u64,
-    daily_rows: u64,
-}
-
-fn compact_budget_rows(workspace_dir: &Path, config: &MemoryConfig) -> Result<BudgetRows> {
-    if config.core_max_rows == 0 && config.core_max_bytes == 0 && config.daily_max_rows == 0 {
-        return Ok(BudgetRows::default());
-    }
-
-    let db_path = workspace_dir.join("memory").join("brain.db");
-    if !db_path.exists() {
-        return Ok(BudgetRows::default());
-    }
-
-    let conn = Connection::open(db_path)?;
-    conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")?;
-    let core = budget::compact_category_to_budget(&conn, "core", config)?;
-    let daily = budget::compact_category_to_budget(&conn, "daily", config)?;
-    Ok(BudgetRows {
-        core_rows: core.evicted_by_count + core.evicted_by_bytes,
-        daily_rows: daily.evicted_by_count + daily.evicted_by_bytes,
-    })
-}
-
 fn prune_audit_entries(workspace_dir: &Path, retention_days: u32) -> Result<()> {
     if retention_days == 0 {
         return Ok(());
@@ -580,8 +484,6 @@ fn split_name(filename: &str) -> (&str, &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sqlite::SqliteMemory;
-    use crate::traits::{Memory, MemoryCategory, StoreOptions};
     use filetime::{FileTime, set_file_mtime};
     use tempfile::TempDir;
 
@@ -803,240 +705,6 @@ mod tests {
 
         assert!(!old_file.exists(), "old archived file should be purged");
         assert!(keep_file.exists(), "recent archived file should remain");
-    }
-
-    #[tokio::test]
-    async fn prunes_old_conversation_rows_in_sqlite_backend() {
-        let tmp = TempDir::new().unwrap();
-        let workspace = tmp.path();
-
-        let mem = SqliteMemory::new("sqlite", workspace).unwrap();
-        mem.store("conv_old", "outdated", MemoryCategory::Conversation, None)
-            .await
-            .unwrap();
-        mem.store("core_keep", "durable", MemoryCategory::Core, None)
-            .await
-            .unwrap();
-        drop(mem);
-
-        let db_path = workspace.join("memory").join("brain.db");
-        let conn = Connection::open(&db_path).unwrap();
-        let old_cutoff = (Local::now() - Duration::days(60)).to_rfc3339();
-        conn.execute(
-            "UPDATE memories SET created_at = ?1, updated_at = ?1 WHERE key = 'conv_old'",
-            params![old_cutoff],
-        )
-        .unwrap();
-        drop(conn);
-
-        let mut cfg = default_cfg();
-        cfg.archive_after_days = 0;
-        cfg.purge_after_days = 0;
-        cfg.conversation_retention_days = 30;
-
-        run_if_due(&cfg, workspace).unwrap();
-
-        let mem2 = SqliteMemory::new("sqlite", workspace).unwrap();
-        assert!(
-            mem2.get("conv_old").await.unwrap().is_none(),
-            "old conversation rows should be pruned"
-        );
-        assert!(
-            mem2.get("core_keep").await.unwrap().is_some(),
-            "core memory should remain"
-        );
-    }
-
-    #[tokio::test]
-    async fn prunes_old_daily_rows_in_sqlite_backend() {
-        let tmp = TempDir::new().unwrap();
-        let workspace = tmp.path();
-
-        let mem = SqliteMemory::new("sqlite", workspace).unwrap();
-        mem.store("daily_old", "stale", MemoryCategory::Daily, None)
-            .await
-            .unwrap();
-        mem.store("daily_recent", "fresh", MemoryCategory::Daily, None)
-            .await
-            .unwrap();
-        drop(mem);
-
-        let db_path = workspace.join("memory").join("brain.db");
-        let conn = Connection::open(&db_path).unwrap();
-        let old_cutoff = (Local::now() - Duration::days(60)).to_rfc3339();
-        conn.execute(
-            "UPDATE memories SET created_at = ?1, updated_at = ?1 WHERE key = 'daily_old'",
-            params![old_cutoff],
-        )
-        .unwrap();
-        drop(conn);
-
-        let mut cfg = default_cfg();
-        cfg.archive_after_days = 0;
-        cfg.purge_after_days = 0;
-        cfg.daily_retention_days = 30;
-
-        run_if_due(&cfg, workspace).unwrap();
-
-        let mem2 = SqliteMemory::new("sqlite", workspace).unwrap();
-        assert!(
-            mem2.get("daily_old").await.unwrap().is_none(),
-            "old daily rows should be pruned"
-        );
-        assert!(
-            mem2.get("daily_recent").await.unwrap().is_some(),
-            "recent daily rows should remain"
-        );
-    }
-
-    #[tokio::test]
-    async fn zero_retention_disables_daily_pruning() {
-        let tmp = TempDir::new().unwrap();
-        let workspace = tmp.path();
-
-        let mem = SqliteMemory::new("sqlite", workspace).unwrap();
-        mem.store("daily_old", "stale", MemoryCategory::Daily, None)
-            .await
-            .unwrap();
-        drop(mem);
-
-        let db_path = workspace.join("memory").join("brain.db");
-        let conn = Connection::open(&db_path).unwrap();
-        let old_cutoff = (Local::now() - Duration::days(60)).to_rfc3339();
-        conn.execute(
-            "UPDATE memories SET created_at = ?1, updated_at = ?1 WHERE key = 'daily_old'",
-            params![old_cutoff],
-        )
-        .unwrap();
-        drop(conn);
-
-        let mut cfg = default_cfg();
-        cfg.daily_retention_days = 0; // default: keep forever
-
-        run_if_due(&cfg, workspace).unwrap();
-
-        let mem2 = SqliteMemory::new("sqlite", workspace).unwrap();
-        assert!(
-            mem2.get("daily_old").await.unwrap().is_some(),
-            "daily rows should be kept when retention_days = 0"
-        );
-    }
-
-    #[tokio::test]
-    async fn prunes_old_core_rows_when_configured() {
-        let tmp = TempDir::new().unwrap();
-        let workspace = tmp.path();
-
-        let mem = SqliteMemory::new("sqlite", workspace).unwrap();
-        mem.store("core_old", "obsolete", MemoryCategory::Core, None)
-            .await
-            .unwrap();
-        mem.store(
-            "core_updated",
-            "touched recently",
-            MemoryCategory::Core,
-            None,
-        )
-        .await
-        .unwrap();
-        drop(mem);
-
-        let db_path = workspace.join("memory").join("brain.db");
-        let conn = Connection::open(&db_path).unwrap();
-        let old_cutoff = (Local::now() - Duration::days(120)).to_rfc3339();
-        let recent = (Local::now() - Duration::days(1)).to_rfc3339();
-        // core_old: both timestamps are old → should be pruned
-        conn.execute(
-            "UPDATE memories SET created_at = ?1, updated_at = ?1 WHERE key = 'core_old'",
-            params![old_cutoff],
-        )
-        .unwrap();
-        // core_updated: created_at is old but updated_at is recent → still pruned
-        // because core pruning keys on created_at, not updated_at
-        conn.execute(
-            "UPDATE memories SET created_at = ?1, updated_at = ?2 WHERE key = 'core_updated'",
-            params![old_cutoff, recent],
-        )
-        .unwrap();
-        drop(conn);
-
-        let mut cfg = default_cfg();
-        cfg.archive_after_days = 0;
-        cfg.purge_after_days = 0;
-        cfg.core_retention_days = 90;
-
-        run_if_due(&cfg, workspace).unwrap();
-
-        let mem2 = SqliteMemory::new("sqlite", workspace).unwrap();
-        assert!(
-            mem2.get("core_old").await.unwrap().is_none(),
-            "old core rows should be pruned when retention is configured"
-        );
-        assert!(
-            mem2.get("core_updated").await.unwrap().is_none(),
-            "core rows with old created_at should be pruned even if updated_at is recent"
-        );
-    }
-
-    #[tokio::test]
-    async fn run_if_due_enforces_the_core_row_budget() {
-        let tmp = TempDir::new().unwrap();
-        let workspace = tmp.path();
-
-        let mem = SqliteMemory::new("sqlite", workspace).unwrap();
-        mem.store_with_options(
-            "core_low",
-            "low value fact",
-            MemoryCategory::Core,
-            None,
-            StoreOptions::default().with_importance(0.1),
-        )
-        .await
-        .unwrap();
-        mem.store_with_options(
-            "core_high",
-            "high value fact",
-            MemoryCategory::Core,
-            None,
-            StoreOptions::default().with_importance(0.9),
-        )
-        .await
-        .unwrap();
-        mem.store_with_options(
-            "core_pinned",
-            "pinned but low value",
-            MemoryCategory::Core,
-            None,
-            StoreOptions {
-                importance: Some(0.05),
-                pinned: true,
-                ..StoreOptions::default()
-            },
-        )
-        .await
-        .unwrap();
-        drop(mem);
-
-        let mut cfg = default_cfg();
-        cfg.archive_after_days = 0;
-        cfg.purge_after_days = 0;
-        cfg.core_max_rows = 2;
-
-        run_if_due(&cfg, workspace).unwrap();
-
-        let mem2 = SqliteMemory::new("sqlite", workspace).unwrap();
-        assert!(
-            mem2.get("core_low").await.unwrap().is_none(),
-            "lowest-value non-pinned row is evicted to meet the budget"
-        );
-        assert!(
-            mem2.get("core_high").await.unwrap().is_some(),
-            "higher-value row survives compaction"
-        );
-        assert!(
-            mem2.get("core_pinned").await.unwrap().is_some(),
-            "pinned row survives despite the lowest importance"
-        );
     }
 
     #[test]

@@ -169,7 +169,7 @@ mod tests {
             }),
             risk_profile: SelectorChoice::Fresh("balanced".into()),
             runtime_profile: SelectorChoice::Fresh("balanced".into()),
-            memory: SelectorChoice::Fresh(MemoryChoice::Sqlite),
+            memory: SelectorChoice::Fresh(MemoryChoice::Tachi),
             channels: vec![SelectorChoice::Fresh(ChannelQuickStart {
                 channel_type: "cli".into(),
                 alias: "cli".into(),

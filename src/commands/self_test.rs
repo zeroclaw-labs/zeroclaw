@@ -38,8 +38,8 @@ pub async fn run_quick(config: &crate::config::Config) -> Result<Vec<CheckResult
     // 2. Workspace directory is writable
     results.push(check_workspace(&config.data_dir).await);
 
-    // 3. SQLite memory backend opens
-    results.push(check_sqlite(&config.data_dir));
+    // 3. Configured memory backend opens and passes health check
+    results.push(check_memory_store(config).await);
 
     // 4. ModelProvider registry has entries
     results.push(check_model_provider_registry());
@@ -159,14 +159,21 @@ async fn check_workspace(workspace_dir: &Path) -> CheckResult {
     }
 }
 
-fn check_sqlite(workspace_dir: &Path) -> CheckResult {
-    let db_path = workspace_dir.join("memory.db");
-    match rusqlite::Connection::open(&db_path) {
-        Ok(conn) => match conn.execute_batch("SELECT 1") {
-            Ok(()) => CheckResult::pass("sqlite", "memory.db opens and responds"),
-            Err(e) => CheckResult::fail("sqlite", format!("query failed: {e}")),
-        },
-        Err(e) => CheckResult::fail("sqlite", format!("cannot open memory.db: {e}")),
+async fn check_memory_store(config: &crate::config::Config) -> CheckResult {
+    let mem = match crate::memory::create_memory_from_config(config, None) {
+        Ok(m) => m,
+        Err(e) => return CheckResult::fail("memory_store", format!("cannot open backend: {e}")),
+    };
+    if mem.health_check().await {
+        CheckResult::pass(
+            "memory_store",
+            format!("{} backend opens and responds", mem.name()),
+        )
+    } else {
+        CheckResult::fail(
+            "memory_store",
+            format!("{} backend health check failed", mem.name()),
+        )
     }
 }
 
@@ -562,56 +569,38 @@ mod tests {
     #[cfg(feature = "gateway")]
     use super::{build_websocket_probe_url, resolve_gateway_bearer_token};
     use super::{format_probe_url, resolve_probe_host, web_dist_dir_expansion_reason_key};
-    #[cfg(unix)]
-    use std::fs;
-    #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt;
-    #[cfg(unix)]
     use tempfile::TempDir;
-    #[cfg(any(feature = "gateway", unix))]
     use zeroclaw_config::schema::Config;
-    #[cfg(unix)]
-    use zeroclaw_config::schema::LucidStorageConfig;
 
-    #[cfg(unix)]
     #[tokio::test]
-    async fn memory_roundtrip_uses_selected_lucid_alias() {
+    async fn memory_roundtrip_uses_configured_backend() {
         let tmp = TempDir::new().unwrap();
-        let calls_path = tmp.path().join("self-test-lucid.log");
-        let script_path = tmp.path().join("selected-lucid.sh");
-        let script = format!(
-            r#"#!/bin/sh
-set -eu
-printf '%s\n' "$*" >> "{}"
-if [ "${{1:-}}" = "context" ]; then
-  printf '<lucid-context>\n</lucid-context>\n'
-fi
-"#,
-            calls_path.display()
-        );
-        fs::write(&script_path, script).unwrap();
-        let mut permissions = fs::metadata(&script_path).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&script_path, permissions).unwrap();
-
         let mut config = Config::default();
         config.data_dir = tmp.path().to_path_buf();
-        config.memory.backend = "lucid.selected".into();
-        config.storage.lucid.insert(
-            "selected".into(),
-            LucidStorageConfig {
-                binary_path: Some(script_path.display().to_string()),
-                recall_timeout_ms: Some(10_000),
-                store_timeout_ms: Some(10_000),
-            },
-        );
+        config.memory.backend = "markdown".into();
 
         let result = super::check_memory_roundtrip(&config).await;
+        assert!(
+            result.passed,
+            "markdown memory self-test failed: {}",
+            result.detail
+        );
 
-        assert!(result.passed, "memory self-test failed: {}", result.detail);
-        let calls = fs::read_to_string(&calls_path)
-            .expect("the selected Lucid executable must be invoked by self-test");
-        assert!(calls.contains("store __selftest_probe__: selftest_ok"));
+        #[cfg(feature = "memory-tachi")]
+        {
+            let tachi_tmp = TempDir::new().unwrap();
+            let mut tachi_config = Config::default();
+            tachi_config.data_dir = tachi_tmp.path().to_path_buf();
+            tachi_config.memory.backend = "tachi".into();
+
+            let tachi_result = super::check_memory_roundtrip(&tachi_config).await;
+            assert!(
+                tachi_result.passed,
+                "tachi memory self-test failed: {}",
+                tachi_result.detail
+            );
+            assert!(tachi_tmp.path().join("memory").join("tachi.db").exists());
+        }
     }
 
     #[test]

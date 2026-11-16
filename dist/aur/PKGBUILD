@@ -33,7 +33,7 @@ build() {
   cargo web build
 
   # >>> generated:pkgbuild-build by `cargo generate installers` - do not edit <<<
-  cargo build --frozen --profile dist --features agent-runtime,channel-acp-server,channel-discord,channel-email,channel-telegram,channel-webhook,gateway,observability-prometheus,schema-export
+  cargo build --frozen --profile dist --features agent-runtime,channel-acp-server,channel-discord,channel-email,channel-telegram,channel-webhook,gateway,memory-tachi,observability-prometheus,schema-export
 # >>> end generated:pkgbuild-build <<<
 }
 

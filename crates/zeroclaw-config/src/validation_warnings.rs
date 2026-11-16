@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// Stable codes (extend as new warnings are added):
 /// - `memory_semantic_search_without_embedder`: `memory.search_mode` requests
-///   vector search on sqlite memory, but no effective embedder is configured.
+///   vector search on tachi memory, but no effective embedder is configured.
 /// - `memory_config_knob_inert`: a `[memory]` knob is set to a non-default
 ///   value but has no runtime consumer yet, so it currently has no effect
 ///   (see `validate_memory_semantics` in `schema.rs` for the current list).
@@ -85,12 +85,18 @@ use serde::{Deserialize, Serialize};
 ///   as `none` and the fields are ignored (see `RETIRED_CONFIG_VALUES` and
 ///   `RETIRED_CONFIG_FIELDS`).
 /// - `memory_backend_removed`: `memory.backend` or `agents.<a>.memory.backend`
-///   still selects the removed `postgres` or `qdrant` backend, or a
-///   `[storage.postgres]` / `[storage.qdrant]` section is still present. The
-///   config keeps loading, but selecting a removed backend fails memory
-///   construction with an explicit error; it never falls back to another
-///   store (see `RETIRED_CONFIG_VALUES`, `RETIRED_CONFIG_SURFACES` and
-///   [`RETIRED_MEMORY_BACKENDS`]).
+///   still selects the removed `postgres`, `qdrant`, `sqlite`, or `lucid` backend,
+///   or a `[storage.postgres]` / `[storage.qdrant]` / `[storage.sqlite]` /
+///   `[storage.lucid]` section (or `memory.sqlite_open_timeout_secs`) is still
+///   present. The config keeps loading, but selecting a removed backend fails
+///   memory construction with an explicit error steering to
+///   `zeroclaw memory migrate-native`; it never falls back to another store
+///   (see `RETIRED_CONFIG_VALUES`, `RETIRED_CONFIG_SURFACES`,
+///   `RETIRED_CONFIG_FIELDS`, and [`RETIRED_MEMORY_BACKENDS`]).
+/// - `memory_snapshot_removed`: `memory.snapshot_enabled`,
+///   `memory.snapshot_on_hygiene`, or `memory.auto_hydrate` is still set.
+///   `MEMORY_SNAPSHOT.md` export and hydration were removed alongside the
+///   SQLite memory backend and have no runtime consumer.
 /// - `browser_native_backend_removed`: `browser.backend` still selects the
 ///   removed WebDriver backend (`rust_native` / `native`) or a
 ///   `browser.native_*` key is still set. Selecting it fails the browser tool
@@ -289,12 +295,14 @@ pub const RETIRED_CONFIG_SURFACES: &[(&str, &str)] = &[
     ("notion", "saas_integration_removed"),
     ("storage.postgres", "memory_backend_removed"),
     ("storage.qdrant", "memory_backend_removed"),
+    ("storage.sqlite", "memory_backend_removed"),
+    ("storage.lucid", "memory_backend_removed"),
 ];
 
 /// Memory backend names that were removed. The memory factory classifies
 /// them as retired and fails construction explicitly; the config value
 /// tombstones below report them at load.
-pub const RETIRED_MEMORY_BACKENDS: &[&str] = &["postgres", "qdrant"];
+pub const RETIRED_MEMORY_BACKENDS: &[&str] = &["postgres", "qdrant", "sqlite", "lucid"];
 
 /// True when `channel_type` names a channel whose `[channels.<type>]`
 /// section is registered in [`RETIRED_CONFIG_SURFACES`]. Load-time
@@ -388,6 +396,10 @@ pub const RETIRED_CONFIG_FIELDS: &[(&str, &str)] = &[
         "browser.native_chrome_path",
         "browser_native_backend_removed",
     ),
+    ("memory.sqlite_open_timeout_secs", "memory_backend_removed"),
+    ("memory.snapshot_enabled", "memory_snapshot_removed"),
+    ("memory.snapshot_on_hygiene", "memory_snapshot_removed"),
+    ("memory.auto_hydrate", "memory_snapshot_removed"),
 ];
 
 /// Retired config VALUES: dotted path (one `*` wildcard segment allowed, as
@@ -437,9 +449,13 @@ fn retired_field_reason(code: &str) -> &'static str {
              options explicitly"
         }
         "memory_backend_removed" => {
-            "the postgres and qdrant memory backends were removed; selecting one \
+            "the postgres, qdrant, sqlite, and lucid memory backends were removed; selecting one \
              fails memory construction instead of falling back to another store. \
-             Choose sqlite, lucid, markdown or none"
+             Choose tachi, markdown or none (migrate existing brain.db offline via `zeroclaw memory migrate-native`)"
+        }
+        "memory_snapshot_removed" => {
+            "MEMORY_SNAPSHOT.md export and auto-hydration were removed alongside the \
+             SQLite memory backend and have no runtime consumer. Remove the field from config"
         }
         "browser_native_backend_removed" => {
             "the rust_native (WebDriver) browser backend was removed; selecting it \

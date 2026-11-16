@@ -381,9 +381,9 @@ mod tests {
         use zeroclaw_config::multi_agent::MemoryBackendKind;
         let dir = tempfile::tempdir().unwrap();
         // The agent's OWN backend is `none`, even though the install-wide
-        // default (config.memory.backend) is memory-enabled (sqlite).
+        // default (config.memory.backend) is memory-enabled (tachi).
         let config = config_with_agent_memory_backend("clawdia", MemoryBackendKind::None);
-        assert_eq!(config.memory.backend.as_str(), "sqlite");
+        assert_eq!(config.memory.backend.as_str(), "tachi");
 
         let written = seed_default_personality(&config, "clawdia", dir.path())
             .await
@@ -410,7 +410,7 @@ mod tests {
     async fn seed_default_personality_memory_agent_gets_memory_variant() {
         use zeroclaw_config::multi_agent::MemoryBackendKind;
         let dir = tempfile::tempdir().unwrap();
-        let config = config_with_agent_memory_backend("clawdia", MemoryBackendKind::Sqlite);
+        let config = config_with_agent_memory_backend("clawdia", MemoryBackendKind::Tachi);
 
         let written = seed_default_personality(&config, "clawdia", dir.path())
             .await

@@ -91,6 +91,7 @@ default = ["schema-export"]
 # The `[nodes]` / `[nodes.mdns]` config types stay unconditional in
 # zeroclaw-config (schema.rs is a hot upstream file — not worth the churn).
 nodes = ["dep:ring"]
+memory-tachi = ["zeroclaw-memory/tachi"]
 observability-prometheus = ["zeroclaw-runtime/observability-prometheus"]
 gateway-voice-duplex = []
 # Explicit opt-in to spoken-text presentation; no audio transport.

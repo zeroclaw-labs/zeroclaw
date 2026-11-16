@@ -32,7 +32,7 @@ POSIX device files (`/dev/null`, `/dev/zero`, `/dev/random`, `/dev/urandom`) are
 
 ## Cross-agent memory access
 
-Same-backend only. To let `researcher` recall memories that `primary` wrote, both agents must use the same memory backend (e.g. both `sqlite`). The schema validator rejects entries that point at a sibling on a different backend; the runtime never sees a cross-backend allowlist by the time it builds the per-agent memory wrapper.
+Same-backend only. To let `researcher` recall memories that `primary` wrote, both agents must use the same memory backend (e.g. both `tachi`). The schema validator rejects entries that point at a sibling on a different backend; the runtime never sees a cross-backend allowlist by the time it builds the per-agent memory wrapper.
 
 The bound agent always sees its own rows; the allowlist is purely additive. There is no way to *hide* an agent's own rows from itself.
 
@@ -91,7 +91,7 @@ The owned-state cascade attempts to:
 - clear agent attribution from retained conversation sessions; and
 - write `manifest.json` with counts and surfaced warnings.
 
-Each database cleanup requires its own complete, durable archive and successful byte-for-byte readback. SQLite memory, cron jobs and run history, and terminal ACP sessions use a write transaction across export, archive publication and deletion. A failed export, write or readback retains that store's records. A newly live ACP session or in-flight cron job also blocks that store's cleanup. Other stores can still finish, so inspect the counts and warnings for each one.
+Each database cleanup requires its own complete, durable archive and successful byte-for-byte readback. Cron jobs and run history, and terminal ACP sessions use a write transaction across export, archive publication and deletion. A failed export, write or readback retains that store's records. A newly live ACP session or in-flight cron job also blocks that store's cleanup. Other stores can still finish, so inspect the counts and warnings for each one.
 
 The versioned `cascade/*.json` files contain the raw persisted columns and record IDs, including memory embeddings, ACP messages, tool arguments/results, events and the stored plan. SQLite binary values use a `sqlite_blob` byte array. Archive files are never overwritten: an identical snapshot can be retried, while a different or damaged existing file blocks cleanup. On Unix the archive directories and files are restricted to `0700` and `0600`.
 

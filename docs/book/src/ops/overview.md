@@ -131,7 +131,7 @@ For multi-tenant hosting, see the proposal in #2765 (closed, historical, the arc
 
 What to back up:
 
-- `~/.zeroclaw/data/memory/*.db`: SQLite conversation memory (`brain.db`, plus `audit.db`)
+- `~/.zeroclaw/data/memory/*.db`: conversation memory (`tachi.db`, plus `audit.db`)
 - `~/.zeroclaw/data/sessions/`: persisted session state
 - `~/.zeroclaw/.secret_key`: master key for the encrypted secrets store (if used). **Without it, the config's encrypted secrets are unrecoverable.**
 

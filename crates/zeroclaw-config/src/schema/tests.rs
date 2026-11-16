@@ -1503,7 +1503,7 @@ default_temperature = 0.7
 #[test]
 async fn memory_config_default_hygiene_settings() {
     let m = MemoryConfig::default();
-    assert_eq!(m.backend, "sqlite");
+    assert_eq!(m.backend, "tachi");
     assert!(m.auto_save);
     assert!(m.hygiene_enabled);
     assert_eq!(m.archive_after_days, 7);
@@ -2190,71 +2190,6 @@ default_temperature = 0.7
             .next()
             .map(|(_, _, e)| e.extra_headers.is_empty())
             .unwrap_or(true)
-    );
-}
-
-#[test]
-async fn storage_lucid_timeout_overrides_deserialize() {
-    let raw = r#"
-default_temperature = 0.7
-
-[storage.lucid.default]
-binary_path = "/opt/lucid/bin/lucid"
-recall_timeout_ms = 5000
-store_timeout_ms = 4000
-"#;
-
-    let parsed = parse_test_config(raw);
-    let lucid = parsed
-        .storage
-        .lucid
-        .get("default")
-        .expect("lucid.default present");
-    assert_eq!(lucid.binary_path.as_deref(), Some("/opt/lucid/bin/lucid"));
-    assert_eq!(lucid.recall_timeout_ms, Some(5000));
-    assert_eq!(lucid.store_timeout_ms, Some(4000));
-}
-
-#[test]
-async fn validate_rejects_zero_lucid_timeouts_with_alias_qualified_paths() {
-    for field in ["recall_timeout_ms", "store_timeout_ms"] {
-        let raw = format!(
-            r#"
-default_temperature = 0.7
-
-[storage.lucid.edge_arm]
-{field} = 0
-"#
-        );
-        let parsed = parse_test_config(&raw);
-        let error = parsed
-            .validate()
-            .expect_err("zero Lucid timeout must fail validation");
-        let expected_path = format!("storage.lucid.edge_arm.{field}");
-        assert!(
-            error.to_string().contains(&expected_path),
-            "validation error must name {expected_path}: {error:#}"
-        );
-    }
-}
-
-#[test]
-async fn validate_rejects_blank_lucid_binary_with_alias_qualified_path() {
-    let raw = r#"
-default_temperature = 0.7
-
-[storage.lucid.edge_arm]
-binary_path = "   "
-"#;
-    let parsed = parse_test_config(raw);
-    let error = parsed
-        .validate()
-        .expect_err("blank Lucid binary path must fail validation");
-    assert!(
-        error
-            .to_string()
-            .contains("storage.lucid.edge_arm.binary_path"),
-        "validation error must name the alias-qualified binary path: {error:#}"
     );
 }
 
@@ -12544,7 +12479,7 @@ async fn validate_rejects_read_memory_from_cross_backend() {
 }
 
 #[test]
-async fn validate_rejects_typed_memory_flags_on_non_sqlite_global_backend() {
+async fn validate_rejects_typed_memory_flags_on_non_tachi_global_backend() {
     let mut config = multi_agent_test_config();
     config.memory.types.enabled = true;
     config.memory.backend = "markdown.work".to_string();
@@ -12554,13 +12489,13 @@ async fn validate_rejects_typed_memory_flags_on_non_sqlite_global_backend() {
         .expect_err("typed memory on a non-sqlite global backend must fail validation");
     let msg = err.to_string();
     assert!(
-        msg.contains("memory.types.enabled") && msg.contains("SQLite-only"),
-        "expected SQLite-only explanation naming the flag, got: {msg}"
+        msg.contains("memory.types.enabled") && msg.contains("Tachi-only"),
+        "expected Tachi-only explanation naming the flag, got: {msg}"
     );
 }
 
 #[test]
-async fn validate_rejects_typed_memory_flags_on_non_sqlite_agent_backend() {
+async fn validate_rejects_typed_memory_flags_on_non_tachi_agent_backend() {
     let mut config = multi_agent_test_config();
     config.memory.consolidation_extract_facts = true;
 
@@ -12577,40 +12512,44 @@ async fn validate_rejects_typed_memory_flags_on_non_sqlite_agent_backend() {
 
     let err = config
         .validate()
-        .expect_err("typed memory with a non-sqlite agent backend must fail validation");
+        .expect_err("typed memory with a non-tachi agent backend must fail validation");
     let msg = err.to_string();
     assert!(
         msg.contains("memory.consolidation_extract_facts")
             && msg.contains("agents.beta.memory.backend")
             && msg.contains("Markdown"),
-        "expected SQLite-only explanation naming the agent, got: {msg}"
+        "expected Tachi-only explanation naming the agent, got: {msg}"
     );
 }
 
 #[test]
-async fn validate_accepts_typed_memory_flags_on_sqlite() {
+async fn validate_rejects_typed_memory_flags_on_retired_sqlite_backend() {
     let mut config = multi_agent_test_config();
     config.memory.types.enabled = true;
     config.memory.consolidation_extract_facts = true;
     config.memory.backend = "sqlite".to_string();
 
-    config
+    let err = config
         .validate()
-        .expect("typed memory on sqlite everywhere must pass validation");
+        .expect_err("typed memory on retired sqlite backend must fail validation");
+    assert!(
+        err.to_string().contains("memory.types.enabled"),
+        "unexpected error: {err}"
+    );
 }
 
 #[test]
-async fn validate_accepts_typed_memory_flags_on_mixed_case_sqlite() {
+async fn validate_accepts_typed_memory_flags_on_mixed_case_tachi() {
     // The runtime classifies backends case-insensitively
-    // (`backend_kind_from_dotted` lowercases), so the SQLite-only gate
-    // must accept every spelling the runtime resolves to sqlite.
+    // (`backend_kind_from_dotted` lowercases), so the Tachi-only gate
+    // must accept every spelling the runtime resolves to tachi.
     let mut config = multi_agent_test_config();
     config.memory.types.enabled = true;
-    config.memory.backend = " SQLite.default ".to_string();
+    config.memory.backend = " TaChI.default ".to_string();
 
     config
         .validate()
-        .expect("mixed-case sqlite spellings the runtime accepts must pass the typed gate");
+        .expect("mixed-case tachi spellings the runtime accepts must pass the typed gate");
 }
 
 #[test]
@@ -12628,7 +12567,7 @@ async fn validate_accepts_typed_memory_flags_on_tachi() {
 }
 
 #[test]
-async fn validate_allows_non_sqlite_backend_when_typed_memory_flags_off() {
+async fn validate_allows_non_tachi_backend_when_typed_memory_flags_off() {
     let mut config = multi_agent_test_config();
     config.memory.backend = "markdown.work".to_string();
     let alpha = config.agents.get_mut("alpha").unwrap();
@@ -13924,7 +13863,7 @@ fn suppress_semantic_memory_warning(config: &mut Config) {
 }
 
 #[test]
-async fn collect_warnings_flags_sqlite_hybrid_without_embedder() {
+async fn collect_warnings_flags_tachi_hybrid_without_embedder() {
     let config = Config::default();
 
     let warnings = warnings_with_code(&config, SEMANTIC_MEMORY_WARNING);
@@ -13932,8 +13871,8 @@ async fn collect_warnings_flags_sqlite_hybrid_without_embedder() {
     let warning = &warnings[0];
     assert_eq!(warning.path, "memory.search_mode");
     assert!(
-        warning.message.contains("sqlite"),
-        "warning should name sqlite memory: {}",
+        warning.message.contains("tachi"),
+        "warning should name tachi memory: {}",
         warning.message
     );
     assert!(
@@ -13944,7 +13883,7 @@ async fn collect_warnings_flags_sqlite_hybrid_without_embedder() {
 }
 
 #[test]
-async fn collect_warnings_flags_sqlite_embedding_without_embedder() {
+async fn collect_warnings_flags_tachi_embedding_without_embedder() {
     let mut config = Config::default();
     config.memory.search_mode = SearchMode::Embedding;
 
@@ -14020,7 +13959,7 @@ async fn collect_warnings_silent_for_bm25_without_embedder() {
 }
 
 #[test]
-async fn collect_warnings_silent_for_non_sqlite_without_embedder() {
+async fn collect_warnings_silent_for_non_tachi_without_embedder() {
     let mut config = Config::default();
     config.memory.backend = "markdown.default".to_string();
 

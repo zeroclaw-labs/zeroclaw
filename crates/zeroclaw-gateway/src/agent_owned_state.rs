@@ -239,16 +239,26 @@ pub async fn cascade_rename_agent(
 mod archive_tests {
     use super::*;
     use zeroclaw_api::memory_traits::MemoryCategory;
-    use zeroclaw_memory::sqlite::SqliteMemory;
+    use zeroclaw_config::schema::MemoryConfig;
+    use zeroclaw_memory::{TACHI_COMPILED, create_memory};
 
     #[tokio::test]
     async fn failed_archive_keeps_memory_and_reports_independent_store_results() {
+        if !TACHI_COMPILED {
+            return;
+        }
         let directory = tempfile::tempdir().unwrap();
         let config = Config {
             data_dir: directory.path().join("data"),
             ..Config::default()
         };
-        let memory = Arc::new(SqliteMemory::new("archive-test", &config.data_dir).unwrap());
+        let mem_cfg = MemoryConfig {
+            backend: "tachi".into(),
+            hygiene_enabled: false,
+            ..MemoryConfig::default()
+        };
+        let memory: Arc<dyn Memory> =
+            Arc::from(create_memory(&mem_cfg, &config.data_dir, None).unwrap());
         let agent_id = memory.ensure_agent_uuid("alpha").await.unwrap();
         memory
             .store_with_agent(
@@ -265,8 +275,7 @@ mod archive_tests {
         let archive = directory.path().join("archive");
         std::fs::create_dir_all(archive.join("cascade")).unwrap();
         std::fs::create_dir(archive.join("cascade/memory.json")).unwrap();
-        let shared: Arc<dyn Memory> = memory.clone();
-        let report = cascade_owned_state(&config, &shared, None, "alpha", &archive).await;
+        let report = cascade_owned_state(&config, &memory, None, "alpha", &archive).await;
         assert_eq!(report.memory_purged, 0);
         assert_eq!(
             memory.export_agent("alpha").await.unwrap()[0].content,

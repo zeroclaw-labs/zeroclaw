@@ -697,10 +697,10 @@ impl<M: Memory> Memory for ScannedMemory<M> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tachi"))]
 mod tests {
     use super::*;
-    use crate::SqliteMemory;
+    use crate::tachi::TachiMemory;
     use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
 
@@ -715,8 +715,8 @@ mod tests {
         }
     }
 
-    fn scanned(tmp: &TempDir, policy: &MemoryPolicyConfig) -> ScannedMemory<SqliteMemory> {
-        ScannedMemory::new(SqliteMemory::new("sqlite", tmp.path()).unwrap(), policy)
+    fn scanned(tmp: &TempDir, policy: &MemoryPolicyConfig) -> ScannedMemory<TachiMemory> {
+        ScannedMemory::new(TachiMemory::new("tachi", tmp.path()).unwrap(), policy)
     }
 
     #[tokio::test]

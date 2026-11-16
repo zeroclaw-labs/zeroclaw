@@ -298,17 +298,18 @@ sections! {
         key:   "storage",
         shape: TypedFamilyMap,
         group: Storage,
-        help:  "SQLite is the safe default for single-node installs (file-based, \
-                zero-config, no extra services). Pick Markdown or Lucid for \
-                human-readable files. Each backend supports multiple \
-                aliased instances; agents reference them via `memory.storage_ref`.",
+        help:  "Tachi is the default embedded memory engine for single-node \
+                installs (file-based, zero-config, no extra services). Pick \
+                Markdown for human-readable files. Aliased markdown instances \
+                under `[storage.markdown.<alias>]` are referenced via \
+                `memory.backend`.",
     },
     Memory => {
         key:   "memory",
         shape: BackendPicker,
         group: Foundation,
-        help:  "Persistent memory backend. SQLite is the default; pick `none` to \
-                disable long-term recall entirely.",
+        help:  "Persistent memory backend. Tachi is the default; pick `markdown` \
+                or `none` to change or disable memory without editing `[storage.*]`.",
     },
 
     // Tier 4 — Capabilities. Bundles that agents reference via
@@ -844,27 +845,26 @@ mod tests {
     }
 
     #[test]
-    fn storage_help_steers_to_sqlite_default() {
+    fn storage_help_steers_to_tachi_default() {
         let help = section_help("storage").to_lowercase();
-        let sqlite_pos = help
-            .find("sqlite")
-            .expect("storage help must mention SQLite by name");
+        let tachi_pos = help
+            .find("tachi")
+            .expect("storage help must mention Tachi by name");
         assert!(
             help.contains("default") || help.contains("safe") || help.contains("recommend"),
-            "storage help must signal SQLite is the default/safe/recommended choice; got: {help}",
+            "storage help must signal Tachi is the default/safe/recommended choice; got: {help}",
         );
-        for other in ["markdown", "lucid"] {
-            let other_pos = help.find(other).unwrap_or_else(|| {
-                panic!(
-                    "storage help must still name `{other}` so operators know the alternatives \
-                     exist; got: {help}",
-                )
-            });
-            assert!(
-                sqlite_pos < other_pos,
-                "SQLite (at {sqlite_pos}) must be mentioned before `{other}` (at {other_pos}) so \
-                 the default recommendation lands first",
-            );
-        }
+        let other = "markdown";
+        let other_pos = help.find(other).unwrap_or_else(|| {
+            panic!(
+                "storage help must still name `{other}` so operators know the alternatives \
+                 exist; got: {help}",
+            )
+        });
+        assert!(
+            tachi_pos < other_pos,
+            "Tachi (at {tachi_pos}) must be mentioned before `{other}` (at {other_pos}) so \
+             the default recommendation lands first",
+        );
     }
 }

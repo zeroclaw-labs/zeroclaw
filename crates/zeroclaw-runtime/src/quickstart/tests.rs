@@ -109,7 +109,11 @@ fn fresh_submission(agent_name: &str) -> BuilderSubmission {
         }),
         risk_profile: SelectorChoice::Fresh("balanced".into()),
         runtime_profile: SelectorChoice::Fresh("balanced".into()),
-        memory: SelectorChoice::Fresh(MemoryChoice::Sqlite),
+        memory: SelectorChoice::Fresh(if zeroclaw_memory::TACHI_COMPILED {
+            MemoryChoice::Tachi
+        } else {
+            MemoryChoice::Markdown
+        }),
         channels: vec![],
         peer_groups: vec![],
         agent: AgentIdentity {

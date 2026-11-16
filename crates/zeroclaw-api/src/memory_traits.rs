@@ -363,7 +363,7 @@ pub trait Memory: Send + Sync + crate::attribution::Attributable {
     /// removed from `[agents.<alias>]` so the database doesn't accumulate
     /// rows for retired aliases.
     /// Default: returns unsupported error. Backends with per-agent storage
-    /// (sqlite, postgres) override this; backends without (markdown, none)
+    /// (such as Tachi) override this; backends without (markdown, none)
     /// keep the default and the caller logs a warning.
     async fn purge_agent(&self, _agent_alias: &str) -> anyhow::Result<usize> {
         anyhow::bail!("purge_agent not supported by this memory backend")
@@ -393,12 +393,8 @@ pub trait Memory: Send + Sync + crate::attribution::Attributable {
 
     /// Re-point every memory row from the `from` alias to the `to` alias,
     /// returning the number of rows re-pointed. Called when an alias is renamed.
-    /// For the SQL backends (sqlite/postgres) memory rows ride the
-    /// agent's UUID, so this is a single `UPDATE agents SET alias` and the count
-    /// is the agents-row count (0 or 1); payload-keyed backends (qdrant) rewrite
-    /// the alias on every matching memory point and return that count.
-    /// Default: unsupported error; backends with per-agent storage override.
-    /// Markdown/none keep the default and the caller logs a warning.
+    /// Backends with unified multi-agent storage rewrite agent attribution in place;
+    /// Markdown/none keep the default unsupported error and the caller logs a warning.
     async fn rename_agent(&self, _from: &str, _to: &str) -> anyhow::Result<usize> {
         anyhow::bail!("rename_agent not supported by this memory backend")
     }
@@ -409,10 +405,8 @@ pub trait Memory: Send + Sync + crate::attribution::Attributable {
     /// partial failure (state still lagging at the old alias) apart from an
     /// unrelated request, so a resume only fires on real residue.
     ///
-    /// MUST mirror exactly what `rename_agent` moves: for the SQL backends that
-    /// is the `agents` row (alias presence), NOT the memory-row count - an agent
-    /// with an `agents` row but zero memory rows still gets re-pointed, so a
-    /// memory-row probe would be a false negative. Default 0 (markdown/none have
+    /// MUST mirror exactly what `rename_agent` moves (e.g., agent registry or
+    /// attributed store entries). Default 0 (markdown/none have
     /// no DB rows and their `rename_agent` is a no-op).
     async fn count_agent(&self, _agent_alias: &str) -> anyhow::Result<usize> {
         Ok(0)
@@ -497,7 +491,7 @@ pub trait Memory: Send + Sync + crate::attribution::Attributable {
     /// without a vector index or with nothing to fill in return 0.
     ///
     /// Default: no-op. Overridden by backends that maintain separate
-    /// derived indexes (e.g. `SqliteMemory`).
+    /// derived indexes (e.g. `TachiMemory`).
     async fn reindex(&self) -> anyhow::Result<usize> {
         Ok(0)
     }
@@ -664,12 +658,12 @@ pub trait Memory: Send + Sync + crate::attribution::Attributable {
         .await
     }
 
-    /// Store a memory entry attributed to an explicit agent UUID.
-    /// Every backend must implement this explicitly so the agent_id
-    /// is never silently dropped at storage time. Backends with
-    /// native agent_id columns (SqliteMemory, LucidMemory) persist the
-    /// attribution in SQL; MarkdownMemory attributes via the per-agent
-    /// directory path; NoneMemory is a no-op stub.
+    /// Store a memory entry attributed to an explicit agent UUID or alias.
+    /// Every backend must implement this explicitly so attribution
+    /// is never silently dropped at storage time. Persistent multi-agent
+    /// backends (`TachiMemory`) persist agent attribution alongside each entry;
+    /// `MarkdownMemory` attributes via the per-agent directory path;
+    /// `NoneMemory` is a no-op stub.
     /// `AgentScopedMemory` is the canonical caller.
     async fn store_with_agent(
         &self,
@@ -682,14 +676,13 @@ pub trait Memory: Send + Sync + crate::attribution::Attributable {
         agent_id: Option<&str>,
     ) -> anyhow::Result<()>;
 
-    /// Recall memory entries scoped to a specific set of agent UUIDs.
+    /// Recall memory entries scoped to a specific set of agent identifiers.
     /// When `allowed_agent_ids` is non-empty, the backend filters its
-    /// result set to rows whose `agent_id` matches one of the listed
-    /// UUIDs (or is NULL, for legacy rows written before the agent_id
-    /// column existed). Every backend must implement this explicitly
-    /// so the allowlist is never silently dropped at read time.
+    /// result set to rows attributed to one of the listed identifiers
+    /// (or legacy unattributed rows). Every backend must implement this
+    /// explicitly so the allowlist is never silently dropped at read time.
     ///
-    /// For SQL-backed stores the filter is `WHERE agent_id IN (...)`.
+    /// Persistent multi-agent stores filter directly at query time.
     /// For Markdown the implementation walks the allowed agents'
     /// per-agent directories. For None it returns an empty list.
     /// `AgentScopedMemory` is the canonical caller; direct invocation
@@ -713,13 +706,8 @@ pub trait Memory: Send + Sync + crate::attribution::Attributable {
     /// Look up (or create) the identifier the backend uses to refer
     /// to the agent named by `alias`.
     ///
-    /// Backends with an `agents` table (SqliteMemory, LucidMemory)
-    /// return the row's UUID, inserting if absent.
-    /// Backends without (MarkdownMemory, NoneMemory)
-    /// return the alias verbatim — there is no UUID indirection at
-    /// the storage layer, so the alias serves as the agent_id.
-    /// Default impl returns the alias unchanged; SQL backends
-    /// override to do the real lookup.
+    /// Backends without separate UUID indirection (`TachiMemory`,
+    /// `MarkdownMemory`, `NoneMemory`) return the alias verbatim.
     async fn ensure_agent_uuid(&self, alias: &str) -> anyhow::Result<String> {
         Ok(alias.to_string())
     }

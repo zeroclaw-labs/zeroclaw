@@ -598,10 +598,10 @@ impl Memory for RetrievalPipeline {
 mod tests {
     use super::*;
     use crate::none::NoneMemory;
-    use crate::sqlite::SqliteMemory;
+    #[cfg(feature = "tachi")]
+    use crate::tachi::TachiMemory;
     use crate::traits::MemoryCategory;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use zeroclaw_config::schema::SearchMode;
 
     /// Cache config with the opt-in hot cache enabled (the production default
     /// keeps it off).
@@ -802,10 +802,12 @@ mod tests {
         serde_json::to_string(entries).expect("MemoryEntry serializes")
     }
 
-    /// Deterministic embedder so the sqlite hybrid (FTS + vector) path is
+    /// Deterministic embedder so the tachi hybrid (FTS + vector) path is
     /// reproducible without a network.
+    #[cfg(feature = "tachi")]
     struct DetEmbedding;
 
+    #[cfg(feature = "tachi")]
     #[async_trait]
     impl crate::embeddings::EmbeddingProvider for DetEmbedding {
         fn name(&self) -> &str {
@@ -813,7 +815,7 @@ mod tests {
         }
 
         fn dimensions(&self) -> usize {
-            8
+            1024
         }
 
         async fn embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
@@ -823,28 +825,22 @@ mod tests {
                     let seed = text.bytes().fold(0u32, |acc, b| {
                         acc.wrapping_mul(31).wrapping_add(u32::from(b))
                     });
-                    (0..8u32)
+                    let mut v: Vec<f32> = (0..8u32)
                         .map(|i| ((seed.wrapping_add(i.wrapping_mul(7919)) % 1000) as f32) / 1000.0)
-                        .collect()
+                        .collect();
+                    v.resize(1024, 0.0);
+                    v
                 })
                 .collect())
         }
     }
 
-    /// A sqlite backend with several entries across sessions and namespaces,
+    /// A Tachi backend with several entries across sessions and namespaces,
     /// exercising the real FTS + vector hybrid merge.
-    async fn seeded_sqlite(dir: &std::path::Path) -> Arc<SqliteMemory> {
-        let mem = SqliteMemory::with_embedder(
-            "sqlite",
-            dir,
-            Arc::new(DetEmbedding),
-            0.7,
-            0.3,
-            1000,
-            None,
-            SearchMode::default(),
-        )
-        .unwrap();
+    #[cfg(feature = "tachi")]
+    async fn seeded_tachi(dir: &std::path::Path) -> Arc<TachiMemory> {
+        let mem =
+            TachiMemory::with_embedder("tachi", dir, Arc::new(DetEmbedding), 0.7, 0.3).unwrap();
         mem.store(
             "deploy-target",
             "alpha cluster serves production deploys",
@@ -1084,10 +1080,11 @@ mod tests {
 
     // -- Neutrality: pipeline-at-defaults == direct backend recall --------
 
+    #[cfg(feature = "tachi")]
     #[tokio::test]
-    async fn defaults_identity_on_sqlite_hybrid_recall() {
+    async fn defaults_identity_on_tachi_hybrid_recall() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let backend = seeded_sqlite(tmp.path()).await;
+        let backend = seeded_tachi(tmp.path()).await;
 
         // (query, session, since, until) combinations covering keyword,
         // session-scoped, recent-wildcard, and time-window recalls.
@@ -1156,10 +1153,11 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "tachi")]
     #[tokio::test]
     async fn defaults_identity_on_namespaced_recall() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let backend = seeded_sqlite(tmp.path()).await;
+        let backend = seeded_tachi(tmp.path()).await;
         let pipeline = RetrievalPipeline::new(
             backend.clone() as Arc<dyn Memory>,
             RetrievalConfig::default(),

@@ -20,11 +20,19 @@ pub(super) fn queries(
 ) -> Vec<RecentMemoryQuery> {
     let mut query = RecentMemoryQuery::new(prefix, limit);
     if let Some(session) = session_id {
+        // Admit both exact session matches and unscoped metadata rows pre-LIMIT
+        // so durable global Core/Daily facts reach post-query filtering instead
+        // of being starved by session-scoped rows.
+        let values = if session.is_empty() {
+            vec![String::new()]
+        } else {
+            vec![session.into(), String::new()]
+        };
         query.filters.push(MetadataTextFilter {
             field: METADATA_SESSION_ID.into(),
-            values: vec![session.into()],
+            values,
             membership: TextMembership::AnyOf,
-            missing_value: None,
+            missing_value: Some(String::new()),
         });
     }
     // Exclude soft-superseded rows before applying the SQL LIMIT so

@@ -8,14 +8,16 @@ mod tests {
     use crate::memory::importance;
     use crate::memory::policy::{PolicyEnforcer, PolicyViolation};
     use crate::memory::retrieval::{RetrievalConfig, RetrievalPipeline};
-    use crate::memory::sqlite::SqliteMemory;
+    #[cfg(feature = "memory-tachi")]
+    use crate::memory::tachi::TachiMemory;
     use crate::memory::traits::{Memory, MemoryCategory, MemoryEntry};
     use std::sync::Arc;
     use tempfile::TempDir;
 
-    fn temp_sqlite() -> (TempDir, SqliteMemory) {
+    #[cfg(feature = "memory-tachi")]
+    fn temp_tachi() -> (TempDir, TachiMemory) {
         let tmp = TempDir::new().unwrap();
-        let mem = SqliteMemory::new("test", tmp.path()).unwrap();
+        let mem = TachiMemory::new("test", tmp.path()).unwrap();
         (tmp, mem)
     }
 
@@ -23,9 +25,10 @@ mod tests {
     // Phase 1: Multi-stage retrieval pipeline
     // ═══════════════════════════════════════════════════════════════
 
+    #[cfg(feature = "memory-tachi")]
     #[tokio::test]
-    async fn retrieval_pipeline_caches_sqlite_results() {
-        let (_tmp, mem) = temp_sqlite();
+    async fn retrieval_pipeline_caches_tachi_results() {
+        let (_tmp, mem) = temp_tachi();
         mem.store(
             "fact1",
             "Rust is a systems language",
@@ -61,9 +64,10 @@ mod tests {
         assert_eq!(r2[0].content, r1[0].content);
     }
 
+    #[cfg(feature = "memory-tachi")]
     #[tokio::test]
     async fn retrieval_pipeline_invalidation_forces_fresh_results() {
-        let (_tmp, mem) = temp_sqlite();
+        let (_tmp, mem) = temp_tachi();
         mem.store(
             "k1",
             "original content searchable",
@@ -93,9 +97,10 @@ mod tests {
         assert_eq!(pipeline.cache_size(), 0);
     }
 
+    #[cfg(feature = "memory-tachi")]
     #[tokio::test]
     async fn retrieval_pipeline_respects_limit() {
-        let (_tmp, mem) = temp_sqlite();
+        let (_tmp, mem) = temp_tachi();
         for i in 0..20 {
             mem.store(
                 &format!("k{i}"),
@@ -116,9 +121,10 @@ mod tests {
         assert!(results.len() <= 3);
     }
 
+    #[cfg(feature = "memory-tachi")]
     #[tokio::test]
     async fn retrieval_pipeline_empty_query_works() {
-        let (_tmp, mem) = temp_sqlite();
+        let (_tmp, mem) = temp_tachi();
         mem.store("k1", "some data", MemoryCategory::Core, None)
             .await
             .unwrap();
@@ -132,9 +138,10 @@ mod tests {
         assert_eq!(results.len(), 1);
     }
 
+    #[cfg(feature = "memory-tachi")]
     #[tokio::test]
     async fn retrieval_pipeline_with_namespace_filter() {
-        let (_tmp, mem) = temp_sqlite();
+        let (_tmp, mem) = temp_tachi();
         mem.store_with_metadata(
             "k1",
             "data in ns1",
@@ -170,9 +177,10 @@ mod tests {
     // Phase 2: Namespace isolation
     // ═══════════════════════════════════════════════════════════════
 
+    #[cfg(feature = "memory-tachi")]
     #[tokio::test]
     async fn namespace_isolation_between_agents() {
-        let (_tmp, mem) = temp_sqlite();
+        let (_tmp, mem) = temp_tachi();
 
         mem.store_with_metadata(
             "agent_a_pref",
@@ -231,9 +239,10 @@ mod tests {
         assert!(results.is_empty(), "agent-a should not see agent-b data");
     }
 
+    #[cfg(feature = "memory-tachi")]
     #[tokio::test]
     async fn namespace_default_assignment() {
-        let (_tmp, mem) = temp_sqlite();
+        let (_tmp, mem) = temp_tachi();
         mem.store("basic_key", "basic value", MemoryCategory::Core, None)
             .await
             .unwrap();
@@ -245,9 +254,10 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "memory-tachi")]
     #[tokio::test]
     async fn namespace_with_special_characters() {
-        let (_tmp, mem) = temp_sqlite();
+        let (_tmp, mem) = temp_tachi();
         let ns = "org/team-alpha/v2";
         mem.store_with_metadata("k1", "data", MemoryCategory::Core, None, Some(ns), None)
             .await
@@ -261,9 +271,10 @@ mod tests {
         assert_eq!(results[0].namespace, ns);
     }
 
+    #[cfg(feature = "memory-tachi")]
     #[tokio::test]
     async fn namespace_empty_string_works() {
-        let (_tmp, mem) = temp_sqlite();
+        let (_tmp, mem) = temp_tachi();
         mem.store_with_metadata(
             "k1",
             "empty ns data",
@@ -325,11 +336,27 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "memory-tachi")]
     #[tokio::test]
-    async fn importance_persists_in_sqlite() {
-        let (_tmp, mem) = temp_sqlite();
+    async fn importance_persists_in_tachi() {
+        let (_tmp, mem) = temp_tachi();
         mem.store_with_metadata(
             "high_importance",
+            "critical fact",
+            MemoryCategory::Core,
+            None,
+            None,
+            Some(0.85),
+        )
+        .await
+        .unwrap();
+
+        let entry = mem.get("high_importance").await.unwrap().unwrap();
+        assert!((entry.importance.unwrap() - 0.85).abs() < 0.01);
+
+        // memcore normalizes non-decision/guide categories (`fact`) to <= 0.85.
+        mem.store_with_metadata(
+            "capped_importance",
             "critical decision",
             MemoryCategory::Core,
             None,
@@ -339,8 +366,8 @@ mod tests {
         .await
         .unwrap();
 
-        let entry = mem.get("high_importance").await.unwrap().unwrap();
-        assert!((entry.importance.unwrap() - 0.95).abs() < 0.01);
+        let capped = mem.get("capped_importance").await.unwrap().unwrap();
+        assert!((capped.importance.unwrap() - 0.85).abs() < 0.01);
     }
 
     #[test]
@@ -468,11 +495,12 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "memory-tachi")]
     #[tokio::test]
     async fn superseded_entries_hidden_from_recall() {
-        let (_tmp, mem) = temp_sqlite();
+        let (_tmp, mem) = temp_tachi();
 
-        // Store an entry
+        // Store the initial entry
         mem.store(
             "old_pref",
             "User prefers Python",
@@ -482,20 +510,13 @@ mod tests {
         .await
         .unwrap();
 
-        // Mark it as superseded via raw SQL
-        {
-            let conn = mem.connection().lock();
-            conn.execute(
-                "UPDATE memories SET superseded_by = 'new_id' WHERE key = 'old_pref'",
-                [],
-            )
-            .unwrap();
-        }
-
-        // Store the new entry
+        // Store the replacement entry and supersede the old one
         mem.store("new_pref", "User prefers Rust", MemoryCategory::Core, None)
             .await
             .unwrap();
+        let old_id = mem.get("old_pref").await.unwrap().unwrap().id;
+        let new_id = mem.get("new_pref").await.unwrap().unwrap().id;
+        mem.supersede(&[old_id], &new_id).await.unwrap();
 
         // Recall should only return the non-superseded entry
         let results = mem.recall("prefers", 10, None, None, None).await.unwrap();
@@ -509,22 +530,17 @@ mod tests {
         assert_eq!(all[0].key, "new_pref");
     }
 
+    #[cfg(feature = "memory-tachi")]
     #[tokio::test]
     async fn superseded_entry_still_accessible_via_get() {
-        let (_tmp, mem) = temp_sqlite();
+        let (_tmp, mem) = temp_tachi();
 
         mem.store("versioned", "version 1", MemoryCategory::Core, None)
             .await
             .unwrap();
 
-        {
-            let conn = mem.connection().lock();
-            conn.execute(
-                "UPDATE memories SET superseded_by = 'v2_id' WHERE key = 'versioned'",
-                [],
-            )
-            .unwrap();
-        }
+        let id = mem.get("versioned").await.unwrap().unwrap().id;
+        mem.supersede(&[id], "v2_id").await.unwrap();
 
         // Direct get still works (for audit purposes)
         let entry = mem.get("versioned").await.unwrap().unwrap();
@@ -583,13 +599,14 @@ mod tests {
         assert_eq!(audited.audit_count().unwrap(), 2);
     }
 
+    #[cfg(feature = "memory-tachi")]
     #[tokio::test]
-    async fn audit_wrapping_sqlite_backend() {
+    async fn audit_wrapping_tachi_backend() {
         let tmp = TempDir::new().unwrap();
-        let inner = SqliteMemory::new("test", tmp.path()).unwrap();
+        let inner = TachiMemory::new("test", tmp.path()).unwrap();
         let audited = AuditedMemory::new(inner, tmp.path()).unwrap();
 
-        // Full round-trip through audited sqlite
+        // Full round-trip through audited tachi
         audited
             .store("audit_test", "audit value", MemoryCategory::Core, None)
             .await
@@ -737,9 +754,10 @@ mod tests {
     // Cross-phase integration tests
     // ═══════════════════════════════════════════════════════════════
 
+    #[cfg(feature = "memory-tachi")]
     #[tokio::test]
     async fn full_lifecycle_store_recall_supersede() {
-        let (_tmp, mem) = temp_sqlite();
+        let (_tmp, mem) = temp_tachi();
 
         // Store initial fact
         mem.store_with_metadata(
@@ -764,23 +782,16 @@ mod tests {
 
         // Supersede it
         let old_id = results[0].id.clone();
-        {
-            let conn = mem.connection().lock();
-            conn.execute(
-                "UPDATE memories SET superseded_by = 'new_entry_id' WHERE id = ?1",
-                rusqlite::params![old_id],
-            )
-            .unwrap();
-        }
+        mem.supersede(&[old_id], "new_entry_id").await.unwrap();
 
-        // Store updated fact
+        // Store updated fact (Core maps to memcore `fact`, capped at 0.85)
         mem.store_with_metadata(
             "user_lang_v2",
             "User now prefers Rust for systems programming",
             MemoryCategory::Core,
             None,
             Some("agent-1"),
-            Some(0.9),
+            Some(0.85),
         )
         .await
         .unwrap();
@@ -792,14 +803,15 @@ mod tests {
             .unwrap();
         assert_eq!(results.len(), 1);
         assert!(results[0].content.contains("Rust"));
-        assert!((results[0].importance.unwrap() - 0.9).abs() < 0.01);
+        assert!((results[0].importance.unwrap() - 0.85).abs() < 0.01);
     }
 
+    #[cfg(feature = "memory-tachi")]
     #[tokio::test]
-    async fn pipeline_with_audited_sqlite() {
+    async fn pipeline_with_audited_tachi() {
         let tmp = TempDir::new().unwrap();
-        let sqlite = SqliteMemory::new("test", tmp.path()).unwrap();
-        let audited = AuditedMemory::new(sqlite, tmp.path()).unwrap();
+        let tachi = TachiMemory::new("test", tmp.path()).unwrap();
+        let audited = AuditedMemory::new(tachi, tmp.path()).unwrap();
         let audited = Arc::new(audited);
 
         // Store through audited backend
@@ -825,9 +837,10 @@ mod tests {
         assert!(audited.audit_count().unwrap() >= 2);
     }
 
+    #[cfg(feature = "memory-tachi")]
     #[tokio::test]
     async fn namespace_isolation_with_session_id_cross_filter() {
-        let (_tmp, mem) = temp_sqlite();
+        let (_tmp, mem) = temp_tachi();
 
         // Store in ns1/sess-a
         mem.store_with_metadata(
@@ -874,12 +887,12 @@ mod tests {
         assert_eq!(results[0].key, "k1");
     }
 
+    #[cfg(feature = "memory-tachi")]
     #[tokio::test]
     async fn many_namespaces_sequential_writes() {
-        let (_tmp, mem) = temp_sqlite();
+        let (_tmp, mem) = temp_tachi();
 
         // Write entries across multiple namespaces sequentially
-        // (SQLite is single-writer; concurrent spawns cause locking issues)
         for ns_idx in 0..5 {
             let ns = format!("ns-{ns_idx}");
             for entry_idx in 0..5 {
@@ -932,13 +945,14 @@ mod tests {
         assert_eq!(merged[1].id, "b");
     }
 
+    #[cfg(feature = "memory-tachi")]
     #[tokio::test]
-    async fn schema_migration_idempotent_with_new_columns() {
+    async fn tachi_persistence_and_reopen_idempotent() {
         let tmp = TempDir::new().unwrap();
 
-        // First open: creates schema with all columns
+        // First open: creates store and writes metadata
         {
-            let mem = SqliteMemory::new("test", tmp.path()).unwrap();
+            let mem = TachiMemory::new("test", tmp.path()).unwrap();
             mem.store_with_metadata(
                 "persist_key",
                 "persisted data",
@@ -951,9 +965,9 @@ mod tests {
             .unwrap();
         }
 
-        // Second open: migrations run again but are idempotent
+        // Second open: reopens existing store cleanly
         {
-            let mem = SqliteMemory::new("test", tmp.path()).unwrap();
+            let mem = TachiMemory::new("test", tmp.path()).unwrap();
             let entry = mem.get("persist_key").await.unwrap().unwrap();
             assert_eq!(entry.content, "persisted data");
             assert_eq!(entry.namespace, "test-ns");
@@ -962,7 +976,7 @@ mod tests {
 
         // Third open: still fine
         {
-            let mem = SqliteMemory::new("test", tmp.path()).unwrap();
+            let mem = TachiMemory::new("test", tmp.path()).unwrap();
             assert!(mem.health_check().await);
             assert_eq!(mem.count().await.unwrap(), 1);
         }
@@ -972,9 +986,10 @@ mod tests {
     // Edge cases and stress tests
     // ═══════════════════════════════════════════════════════════════
 
+    #[cfg(feature = "memory-tachi")]
     #[tokio::test]
     async fn importance_survives_upsert() {
-        let (_tmp, mem) = temp_sqlite();
+        let (_tmp, mem) = temp_tachi();
 
         mem.store_with_metadata(
             "k1",
@@ -998,9 +1013,10 @@ mod tests {
         assert_eq!(mem.count().await.unwrap(), 1);
     }
 
+    #[cfg(feature = "memory-tachi")]
     #[tokio::test]
     async fn namespace_survives_upsert() {
-        let (_tmp, mem) = temp_sqlite();
+        let (_tmp, mem) = temp_tachi();
 
         mem.store_with_metadata("k1", "v1", MemoryCategory::Core, None, Some("ns-old"), None)
             .await
@@ -1015,9 +1031,10 @@ mod tests {
         assert_eq!(entry.content, "v2");
     }
 
+    #[cfg(feature = "memory-tachi")]
     #[tokio::test]
     async fn forget_cleans_up_namespaced_entry() {
-        let (_tmp, mem) = temp_sqlite();
+        let (_tmp, mem) = temp_tachi();
 
         mem.store_with_metadata(
             "k1",
@@ -1036,9 +1053,10 @@ mod tests {
         assert_eq!(mem.count().await.unwrap(), 0);
     }
 
+    #[cfg(feature = "memory-tachi")]
     #[tokio::test]
     async fn empty_namespace_recall_returns_nothing() {
-        let (_tmp, mem) = temp_sqlite();
+        let (_tmp, mem) = temp_tachi();
 
         mem.store_with_metadata("k1", "data", MemoryCategory::Core, None, Some("ns1"), None)
             .await

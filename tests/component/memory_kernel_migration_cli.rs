@@ -120,46 +120,70 @@ fn native_migration_bypasses_malformed_agent_config() {
     assert!(!destination.exists());
 }
 
-#[cfg(all(feature = "memory-tachi", unix))]
+#[cfg(all(feature = "memory-tachi", feature = "agent-runtime", unix))]
 #[test]
 fn native_migration_converts_real_source_without_config() {
-    use zeroclaw_memory::sqlite::SqliteMemory;
-    use zeroclaw_memory::traits::{
-        Memory, MemoryCategory, MemoryKind, SemanticSubtype, StoreOptions,
-    };
+    use zeroclaw_memory::traits::{Memory, MemoryKind, SemanticSubtype};
 
     let root = tempfile::tempdir().unwrap();
     let config_dir = root.path().join("not-configured");
     let src_ws = root.path().join("src-workspace");
     let dst_ws = root.path().join("dst-workspace");
-    std::fs::create_dir_all(&src_ws).unwrap();
+    std::fs::create_dir_all(src_ws.join("memory")).unwrap();
     std::fs::create_dir_all(dst_ws.join("memory")).unwrap();
-
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    rt.block_on(async {
-        let mem = SqliteMemory::new("sqlite", &src_ws).unwrap();
-        mem.store_with_options(
-            "pref_editor",
-            "Uses Neovim",
-            MemoryCategory::Core,
-            None,
-            StoreOptions {
-                namespace: Some("prefs".into()),
-                kind: Some(MemoryKind::Semantic(SemanticSubtype::Preference)),
-                pinned: true,
-                tenant_id: Some("acme".into()),
-                ..StoreOptions::default()
-            },
-        )
-        .await
-        .unwrap();
-    });
 
     let source = src_ws.join("memory").join("brain.db");
     let destination = dst_ws.join("memory").join("tachi.db");
+
+    {
+        let conn = rusqlite::Connection::open(&source).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE agents (
+                 id TEXT PRIMARY KEY,
+                 alias TEXT NOT NULL UNIQUE,
+                 created_at TEXT NOT NULL
+             );
+             CREATE TABLE memories (
+                 id TEXT PRIMARY KEY,
+                 key TEXT NOT NULL,
+                 content TEXT NOT NULL,
+                 category TEXT NOT NULL,
+                 embedding BLOB,
+                 created_at TEXT NOT NULL,
+                 updated_at TEXT NOT NULL,
+                 session_id TEXT,
+                 namespace TEXT,
+                 importance REAL,
+                 superseded_by TEXT,
+                 agent_id TEXT,
+                 kind TEXT,
+                 pinned INTEGER NOT NULL DEFAULT 0,
+                 tenant_id TEXT
+             );",
+        )
+        .unwrap();
+        let pref_kind =
+            serde_json::to_string(&MemoryKind::Semantic(SemanticSubtype::Preference)).unwrap();
+        conn.execute(
+            "INSERT INTO memories
+                 (id, key, content, category, embedding, created_at, updated_at, session_id, namespace, importance, superseded_by, agent_id, kind, pinned, tenant_id)
+             VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, NULL, ?7, NULL, NULL, NULL, ?8, ?9, ?10)",
+            rusqlite::params![
+                "row-pref-editor",
+                "pref_editor",
+                "Uses Neovim",
+                "core",
+                "2026-01-01T00:00:01Z",
+                "2026-01-01T00:00:01Z",
+                "prefs",
+                pref_kind,
+                1i64,
+                "acme",
+            ],
+        )
+        .unwrap();
+    }
+
     let output = migrate_native(&config_dir, &source, &destination);
     assert!(
         output.status.success(),
@@ -174,6 +198,10 @@ fn native_migration_converts_real_source_without_config() {
     assert_eq!(receipt["imported_rows"], 1);
     assert!(destination.exists());
 
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
     rt.block_on(async {
         let tachi = zeroclaw_memory::tachi::TachiMemory::new("tachi", &dst_ws).unwrap();
         let entry = tachi

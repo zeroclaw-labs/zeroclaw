@@ -137,9 +137,14 @@ fn make_memory() -> Arc<dyn Memory> {
     Arc::from(memory::create_memory(&cfg, std::path::Path::new("/tmp"), None).unwrap())
 }
 
-fn make_sqlite_memory(dir: &std::path::Path) -> Arc<dyn Memory> {
+fn make_bench_memory(dir: &std::path::Path) -> Arc<dyn Memory> {
+    let backend = if memory::TACHI_COMPILED {
+        "tachi"
+    } else {
+        "markdown"
+    };
     let cfg = MemoryConfig {
-        backend: "sqlite".into(),
+        backend: backend.into(),
         ..MemoryConfig::default()
     };
     Arc::from(memory::create_memory(&cfg, dir, None).unwrap())
@@ -230,13 +235,13 @@ fn bench_native_parsing(c: &mut Criterion) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Benchmark: Memory store + recall (SQLite)
+// Benchmark: Memory store + recall
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn bench_memory_operations(c: &mut Criterion) {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let tmp = tempfile::TempDir::new().unwrap();
-    let mem = make_sqlite_memory(tmp.path());
+    let mem = make_bench_memory(tmp.path());
 
     // Seed with entries for recall benchmarks
     rt.block_on(async {

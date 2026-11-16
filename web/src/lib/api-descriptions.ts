@@ -29,7 +29,7 @@ export const fieldDescriptions: FieldDescriptions = {
     "risk_profile": "Which `[risk_profiles.<alias>]` supplies the settings that are not tool\ngrants: autonomy level, sandbox, shell command allow-list, and the\n`always_ask` backstop. The card owns tools; the profile owns the rest —\nwith one exception: the named profile's own `excluded_tools` still\nsubtracts from the card's grants (`SecurityPolicy::for_agent` replaces\nonly `allowed_tools`; `is_tool_allowed` is `allowed && !excluded`\nregardless of where `allowed` came from). That is deliberate, not a\nleak: this profile is the card author's own choice, so its exclusions\nare part of the authored posture, and deny-wins fails safe."
   },
   "AgentMemoryConfig": {
-    "backend": "The backend kind this agent uses. Defaults to `Sqlite` for new\nagents; once an agent has on-disk data the value is locked."
+    "backend": "The backend kind this agent uses. Defaults to `Tachi` for new\nagents; once an agent has on-disk data the value is locked."
   },
   "AgentWorkspaceConfig": {
     "access": "Cross-agent workspace allowlist. An empty map grants no sibling access.",
@@ -99,7 +99,7 @@ export const fieldDescriptions: FieldDescriptions = {
     "enabled": "Whether this agent is active. Set false to disable without removing the definition.",
     "identity": "Per-agent identity format (`[agents.<alias>.identity]`). Each\nagent renders its own IDENTITY.md / SOUL.md inside its\nper-agent workspace; this block selects the format (OpenClaw or\nAIEOS) and optional inline/file source for the agent's identity\ndocument.",
     "mcp_bundles": "MCP bundle aliases. Each entry references `mcp_bundles[key]`, a named\ngroup of MCP servers. Secure by default: an agent is granted only the\nservers named by its bundles. An agent with no `mcp_bundles` receives\nno MCP servers (omission is not a grant). See\n`Config::mcp_servers_for_agent`.",
-    "memory": "Per-agent memory backend selection (`[agents.<alias>.memory]`).\nThe `backend` field is locked at agent creation and immutable on\nsubsequent loads. Defaults to `Sqlite`. See\n`crate::multi_agent::AgentMemoryConfig`.",
+    "memory": "Per-agent memory backend selection (`[agents.<alias>.memory]`).\nThe `backend` field is locked at agent creation and immutable on\nsubsequent loads. Defaults to `Tachi`. See\n`crate::multi_agent::AgentMemoryConfig`.",
     "model_provider": "Dotted model-provider alias (e.g. `\"anthropic.<alias>\"`).\nResolves through `model_providers.<type>.<alias>` at runtime;\n`Config::validate()` fails loud on dangling references.",
     "persona": "Which `[personas.<alias>]` dial set shapes this agent's voice. Absent\nleaves every dial at `medium`, which renders no persona text at all.",
     "precheck": "Per-agent reply-intent precheck controls. The classifier call reads\nthis block at message time; model/provider selection stays on\n`classifier_provider` so there is only one routing source of truth.",
@@ -596,7 +596,7 @@ export const fieldDescriptions: FieldDescriptions = {
     "mcp": "External MCP server connections (`[mcp]`).",
     "mcp_bundles": "Named MCP server bundles (`[mcp_bundles.<alias>]`).",
     "media_pipeline": "Automatic media understanding pipeline (`[media_pipeline]`).",
-    "memory": "Memory backend configuration: sqlite, markdown, embeddings (`[memory]`).",
+    "memory": "Memory backend configuration: tachi, markdown, embeddings (`[memory]`).",
     "microsoft365": "Microsoft 365 Graph API integration (`[microsoft365]`).",
     "model_routes": "Model-routing rules — route `hint:<name>` to specific\nmodel_provider + model combos.",
     "multimodal": "Multimodal (image) handling configuration (`[multimodal]`).",
@@ -1665,11 +1665,6 @@ export const fieldDescriptions: FieldDescriptions = {
     "timeout_secs": "Request timeout in seconds.",
     "uri": "Endpoint URL, e.g. `\"http://10.10.0.1:8001/v1/transcribe\"`."
   },
-  "LucidStorageConfig": {
-    "binary_path": "Optional path to the lucid-memory binary. When unset, the bare `lucid`\nexecutable is resolved on `PATH`. A blank or whitespace-only value is\nrejected at config validation and remains invalid if startup continues,\nso an invalid explicit selector never falls through to `PATH`.",
-    "recall_timeout_ms": "Recall (context) timeout override, in milliseconds. Lucid CLI cold\nstarts (loading the local embedding model) can exceed 1.5s on ARM\nhosts; raise this if recalls still time out on your hardware.\nUnset falls back to the built-in default (3000ms). `0` is rejected\nat config validation; because startup warns and continues after\nvalidation errors, a `0` that reaches the runtime is treated as\nunset and falls back to the default.",
-    "store_timeout_ms": "Store timeout override, in milliseconds. Same cold-start\nconsideration as `recall_timeout_ms`. Unset falls back to the\nbuilt-in default (3000ms); `0` is rejected at validation and, if\nstartup continues after the warning, is likewise treated as unset."
-  },
   "ManifestModelProviderConfig": {
     "api_key": "Secret API token for this model_provider. Grab it from the model_provider's dashboard (OpenAI platform, Anthropic console, OpenRouter keys page, etc.). Stored via the OS keyring when possible; never commit it to config.toml directly.",
     "chat_template_kwargs": "Arbitrary key/value pairs forwarded verbatim as a top-level\n`chat_template_kwargs` object in the request body of OpenAI-compatible\nproviders. Consumed by chat-template-aware backends such as vLLM,\nSGLang, and llama.cpp to pass model-family template variables that\ncontrol behaviour not exposed by other fields. Must be a JSON object\n(TOML inline table); non-object values are ignored with a warning.\nExample (Qwen3 thinking suppression):\n  `chat_template_kwargs = { enable_thinking = false }`",
@@ -1735,21 +1730,20 @@ export const fieldDescriptions: FieldDescriptions = {
     "archive_after_days": "Move daily/session files to the archive directory after this many days. Keeps the hot working set small without deleting history.",
     "audit_enabled": "Enable audit logging of memory operations.",
     "audit_retention_days": "Retention period for audit entries in days (default: 30).",
-    "auto_hydrate": "Auto-hydrate from MEMORY_SNAPSHOT.md when brain.db is missing",
     "auto_reindex_on_identity_change": "Automatically re-embed all memories in the background when a change of embedding provider/model/dimensions is detected at startup (after the stale vectors have been cleared). Costs one embedding API call per memory, so it's off by default — leave it off for large stores and run `zeroclaw memory reindex` explicitly instead.",
     "auto_save": "Auto-save what *you* tell ZeroClaw into memory as conversation history — the agent's own replies are not saved. Turn off if you want memory to only hold things you explicitly record via the memory tool.",
-    "backend": "Dotted reference to the active storage instance: `<backend>.<alias>`\n(e.g. `\"sqlite.default\"`, `\"postgres.work\"`). Resolves through\n`Config.storage.<backend>.<alias>` at runtime. Bare backend names\n(`\"sqlite\"`) are treated as `\"<backend>.default\"`. Set to `\"none\"` to\ndisable persistence entirely.",
+    "backend": "Active memory backend or dotted storage reference: `<backend>[.<alias>]`\n(e.g. `\"tachi\"`, `\"markdown.notes\"`). Resolves through\n`Config.storage.<backend>.<alias>` for configured storage backends, or\nselects a built-in backend (`\"tachi\"`, `\"markdown\"`, `\"none\"`).",
     "candidate_multiplier": "Candidate pool multiplier over the final recall limit before blend/rerank trimming.\nValues must be in 1..=20; runtime also enforces a bounded candidate pool.",
     "chunk_max_tokens": "Max tokens per chunk for document splitting",
     "conflict_supersede_enabled": "Enable reversible supersede soft-hide machinery when wired.",
     "conflict_threshold": "Cosine similarity threshold for conflict detection (0.0–1.0).",
-    "consolidation_extract_facts": "Also extract atomic durable facts from each consolidated turn and store\nthem as individual Core memories. Default off; the flip is sequenced in\na later phase. SQLite-only: enabling this requires the sqlite memory\nbackend globally and on every agent (validated at config load).",
-    "conversation_retention_days": "Delete conversation rows older than this many days from the DB (sqlite backend only). Age is measured by `updated_at` (last write time). 0 = keep forever.",
+    "consolidation_extract_facts": "Also extract atomic durable facts from each consolidated turn and store\nthem as individual Core memories. Default off; the flip is sequenced in\na later phase. Tachi-only: enabling this requires the tachi memory\nbackend globally and on every agent (validated at config load).",
+    "conversation_retention_days": "Delete conversation rows older than this many days (when enforced by the active backend). Age is measured by `updated_at` (last write time). 0 = keep forever.",
     "core_max_bytes": "Maximum Core bytes before budget compaction. 0 = unbounded.",
     "core_max_rows": "Maximum Core rows before budget compaction. 0 = unbounded.",
-    "core_retention_days": "Delete core memory rows older than this many days from the DB. Age is measured by `created_at` (first-write time). Neither recall nor ordinary rewrites refresh `created_at` under the current SQLite upsert, so core retention is an absolute age limit from first write. Set this to a generously large window for durable core memories, or keep 0 = keep forever.",
+    "core_retention_days": "Delete core memory rows older than this many days from the store. Age is measured by `created_at` (first-write time). Neither recall nor ordinary rewrites refresh `created_at` on upsert, so core retention is an absolute age limit from first write. Set this to a generously large window for durable core memories, or keep 0 = keep forever.",
     "daily_max_rows": "Maximum Daily rows before budget compaction. 0 = unbounded.",
-    "daily_retention_days": "Delete daily memory rows older than this many days from the DB. Age is measured by `updated_at` (last write time). 0 = keep forever.",
+    "daily_retention_days": "Delete daily memory rows older than this many days from the store. Age is measured by `updated_at` (last write time). 0 = keep forever.",
     "dedup_action": "Action to take when a duplicate is detected.",
     "dedup_jaccard_threshold": "Jaccard threshold for text-only duplicate detection.",
     "dedup_on_write": "Enable write-time near-duplicate detection.",
@@ -1780,8 +1774,6 @@ export const fieldDescriptions: FieldDescriptions = {
     "response_cache_ttl_minutes": "TTL in minutes for cached responses (default: 60)",
     "retrieval_stages": "Retrieval stages for per-agent recall. Only `\"cache\"` is active: it\nenables an in-process, per-handle hot cache over recall results and is\nomitted from the default so recall stays coherent across handles.\n`\"fts\"` and `\"vector\"` are reserved for when the backend exposes\ndistinct FTS and vector operations; recall is a single hybrid backend\ncall today, so those names have no effect (kept for forward compat).",
     "search_mode": "How memories are retrieved: `bm25` = keyword-only (no embeddings, cheapest); `embedding` = vector similarity only (needs an embedding model_provider); `hybrid` = blended keyword + vector score using the weights above (most robust).",
-    "snapshot_enabled": "Enable periodic export of core memories to MEMORY_SNAPSHOT.md",
-    "snapshot_on_hygiene": "Run snapshot during hygiene passes (heartbeat-driven)",
     "types": "Typed memory configuration (`[memory.types]` section).",
     "vector_weight": "How heavily vector (semantic) similarity counts when `search_mode = hybrid`. Raise toward 1.0 to favor meaning-based matches; lower it to lean on keyword overlap instead."
   },
@@ -2434,14 +2426,6 @@ export const fieldDescriptions: FieldDescriptions = {
     "plugins_dir": "Directory where plugins are stored",
     "security": "Plugin signature verification security settings"
   },
-  "PostgresStorageConfig": {
-    "connect_timeout_secs": "Optional connection timeout in seconds.",
-    "db_url": "Connection URL (e.g. `\"postgres://user:pass@host/db\"`).\nAccepts legacy aliases: dbURL, database_url, databaseUrl.",
-    "schema": "Database schema for the memory table.",
-    "table": "Table name for memory entries.",
-    "vector_dimensions": "Vector dimensions for pgvector embeddings.",
-    "vector_enabled": "Enable pgvector extension for hybrid vector+keyword recall."
-  },
   "ProjectIntelConfig": {
     "default_language": "Default report language (en, de, fr, it). Default: \"en\".",
     "enabled": "Enable the project_intel tool. Default: false.",
@@ -2473,11 +2457,6 @@ export const fieldDescriptions: FieldDescriptions = {
     "no_proxy": "No-proxy bypass list. Same format as NO_PROXY.",
     "scope": "Proxy application scope.",
     "services": "Service selectors used when scope = \"services\"."
-  },
-  "QdrantStorageConfig": {
-    "api_key": "API key for Qdrant Cloud or secured instances.\nUse `ZEROCLAW_storage__qdrant__<alias>__api_key=...` for env injection.",
-    "collection": "Collection name for storing memories.\nUse `ZEROCLAW_storage__qdrant__<alias>__collection=...` for env injection.",
-    "url": "Qdrant server URL (e.g. `\"http://localhost:6333\"`).\nUse `ZEROCLAW_storage__qdrant__<alias>__url=...` for env injection."
   },
   "QianfanModelProviderConfig": {
     "api_key": "Secret API token for this model_provider. Grab it from the model_provider's dashboard (OpenAI platform, Anthropic console, OpenRouter keys page, etc.). Stored via the OS keyring when possible; never commit it to config.toml directly.",
@@ -2790,10 +2769,6 @@ export const fieldDescriptions: FieldDescriptions = {
     "untrusted_outbound_redact": "Redact outbound SOP content before persistence/audit consumers write it.\nIntended to converge with the shared B/F redaction switch once those consumers land.",
     "untrusted_payload_max_bytes": "Maximum bytes accepted from untrusted SOP trigger payload/topic content\nbefore char-boundary truncation. 0 disables the cap."
   },
-  "SqliteStorageConfig": {
-    "open_timeout_secs": "Maximum seconds to wait when opening the DB if it's locked.\n`None` waits indefinitely. Recommended max: 300.",
-    "path": "Optional override for the SQLite database path.\nWhen unset, defaults to `<workspace_dir>/brain.db`."
-  },
   "StepfunModelProviderConfig": {
     "api_key": "Secret API token for this model_provider. Grab it from the model_provider's dashboard (OpenAI platform, Anthropic console, OpenRouter keys page, etc.). Stored via the OS keyring when possible; never commit it to config.toml directly.",
     "chat_template_kwargs": "Arbitrary key/value pairs forwarded verbatim as a top-level\n`chat_template_kwargs` object in the request body of OpenAI-compatible\nproviders. Consumed by chat-template-aware backends such as vLLM,\nSGLang, and llama.cpp to pass model-family template variables that\ncontrol behaviour not exposed by other fields. Must be a JSON object\n(TOML inline table); non-object values are ignored with a warning.\nExample (Qwen3 thinking suppression):\n  `chat_template_kwargs = { enable_thinking = false }`",
@@ -2820,11 +2795,7 @@ export const fieldDescriptions: FieldDescriptions = {
     "wire_api": "Wire protocol flavor: `responses` for OpenAI's Responses API (`POST /v1/responses`), `chat_completions` for the legacy chat wire and most OpenAI-compatible gateways. New OpenAI provider slots default to `responses`; other families default to chat-completions (or ignore the field). Only override if you're forcing an unusual combination."
   },
   "StorageConfig": {
-    "lucid": "Lucid CLI sync instances (`[storage.lucid.<alias>]`).",
-    "markdown": "Markdown storage instances (`[storage.markdown.<alias>]`).",
-    "postgres": "PostgreSQL storage instances (`[storage.postgres.<alias>]`).",
-    "qdrant": "Qdrant storage instances (`[storage.qdrant.<alias>]`).",
-    "sqlite": "SQLite storage instances (`[storage.sqlite.<alias>]`)."
+    "markdown": "Markdown storage instances (`[storage.markdown.<alias>]`)."
   },
   "SubagentsConfig": {
     "max_concurrent_children": "How many subagent children may be pending or active at the same time,\nacross the whole daemon.\n\nEach one is a full agent turn: its own model calls, its own shell and\ntool access, its own token spend. Six is a working ceiling for one\nmachine — high enough that ordinary fan-out never notices it, low\nenough that a runaway spawner is stopped while a person can still read\nthe log.\n\n**Why not 128.** The coordinator's compiled-in default used to be 128,\ninherited verbatim from a retired `DelegateTool` runaway backstop.\nThat constant meant \"if we got here, something is broken\" and was\ncopied into the slot where an operating limit belongs. 128 concurrent\nagent turns on one machine is not a limit; it is the absence of one.\n\n**`0` disables the limit entirely**, matching\n`zeroclaw_coordinator::at_child_capacity`. It is spelled `0` rather\nthan omitting the key because an absent key means \"use the default\",\nand \"no limit\" must be something an operator has to type."

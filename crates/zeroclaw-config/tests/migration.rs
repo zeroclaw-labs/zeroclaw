@@ -445,7 +445,7 @@ vector_dimensions = 1536
 }
 
 #[test]
-fn t9_memory_sqlite_open_timeout_promoted() {
+fn t9_memory_sqlite_open_timeout_loads_retired_config() {
     let raw = r#"
 default_provider = "openai"
 default_model = "gpt-4o-mini"
@@ -456,17 +456,7 @@ auto_save = true
 sqlite_open_timeout_secs = 60
 "#;
     let cfg = migrate_to_current(raw).expect("V1 memory.sqlite migrates");
-    let sqlite = cfg
-        .storage
-        .sqlite
-        .get("default")
-        .expect("storage.sqlite.default exists after sqlite_open_timeout_secs fold");
-    assert_eq!(
-        sqlite.open_timeout_secs,
-        Some(60),
-        "V2 memory.sqlite_open_timeout_secs must land at \
-         storage.sqlite.default.open_timeout_secs"
-    );
+    assert_eq!(cfg.memory.backend, "sqlite");
 }
 
 #[test]
@@ -1701,10 +1691,11 @@ Authorization = "Bearer x"
 
 #[test]
 fn v3_retired_memory_and_browser_backends_load_with_tombstone_warnings() {
-    // postgres/qdrant memory and the rust_native browser backend were
-    // removed. A config that still selects them must keep loading and
-    // report every retired selector; selecting them then fails explicitly
-    // at construction (memory factory / browser tool), never silently.
+    // postgres/qdrant/sqlite/lucid memory (plus snapshot_* / sqlite timeout)
+    // and the rust_native browser backend were removed. A config that still
+    // selects them must keep loading and report every retired selector;
+    // selecting them then fails explicitly at construction (memory factory /
+    // browser tool), never silently.
     let mut value: toml::Value = toml::from_str(
         &generate(CURRENT_SCHEMA_VERSION, &GenerateOptions::default())
             .expect("generate current succeeds"),
@@ -1715,6 +1706,10 @@ fn v3_retired_memory_and_browser_backends_load_with_tombstone_warnings() {
         r#"
 [memory]
 backend = "postgres.work"
+sqlite_open_timeout_secs = 30
+snapshot_enabled = true
+snapshot_on_hygiene = true
+auto_hydrate = false
 
 [storage.postgres.work]
 db_url = "postgres://user:pw@host/db"
@@ -1722,6 +1717,12 @@ vector_enabled = true
 
 [storage.qdrant.default]
 url = "http://localhost:6333"
+
+[storage.sqlite.default]
+open_timeout_secs = 30
+
+[storage.lucid.default]
+binary_path = "/opt/lucid/bin/lucid"
 
 [browser]
 backend = "rust_native"
@@ -1771,12 +1772,34 @@ native_chrome_path = "/usr/bin/chromium"
                 "browser.native_webdriver_url",
                 "browser_native_backend_removed"
             ),
+            ("memory.auto_hydrate", "memory_snapshot_removed"),
             ("memory.backend", "memory_backend_removed"),
+            ("memory.snapshot_enabled", "memory_snapshot_removed"),
+            ("memory.snapshot_on_hygiene", "memory_snapshot_removed"),
+            ("memory.sqlite_open_timeout_secs", "memory_backend_removed"),
+            ("storage.lucid", "memory_backend_removed"),
             ("storage.postgres", "memory_backend_removed"),
             ("storage.qdrant", "memory_backend_removed"),
+            ("storage.sqlite", "memory_backend_removed"),
         ],
         "{warnings:?}"
     );
+
+    for legacy_backend in ["sqlite", "lucid"] {
+        let mut backend_value = value.clone();
+        backend_value["memory"]["backend"] = toml::Value::String(legacy_backend.to_string());
+        let raw_legacy = toml::to_string(&backend_value).unwrap();
+        let legacy_cfg = migrate_to_current(&raw_legacy).expect("legacy backend still loads");
+        assert_eq!(legacy_cfg.memory.backend, legacy_backend);
+        let field_warnings =
+            zeroclaw_config::validation_warnings::retired_field_tombstones(&raw_legacy);
+        assert!(
+            field_warnings
+                .iter()
+                .any(|w| w.path == "memory.backend" && w.code == "memory_backend_removed"),
+            "expected memory_backend_removed for {legacy_backend}, got {field_warnings:?}"
+        );
+    }
 }
 
 #[test]

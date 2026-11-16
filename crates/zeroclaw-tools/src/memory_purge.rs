@@ -125,22 +125,32 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
     use zeroclaw_config::autonomy::AutonomyLevel;
-    use zeroclaw_memory::{MemoryCategory, MemoryEntry, SqliteMemory};
+    use zeroclaw_config::schema::MemoryConfig;
+    use zeroclaw_memory::{MemoryCategory, MemoryEntry, NoneMemory, TACHI_COMPILED, create_memory};
     use zeroclaw_policy::SecurityPolicy;
 
     fn test_security() -> Arc<SecurityPolicy> {
         Arc::new(SecurityPolicy::default())
     }
 
-    fn test_mem() -> (TempDir, Arc<dyn Memory>) {
+    fn try_test_mem() -> Option<(TempDir, Arc<dyn Memory>)> {
+        if !TACHI_COMPILED {
+            return None;
+        }
         let tmp = TempDir::new().unwrap();
-        let mem = SqliteMemory::new("test", tmp.path()).unwrap();
-        (tmp, Arc::new(mem))
+        let cfg = MemoryConfig {
+            backend: "tachi".into(),
+            hygiene_enabled: false,
+            embedding_provider: "none".into(),
+            ..MemoryConfig::default()
+        };
+        let mem = create_memory(&cfg, tmp.path(), None).unwrap();
+        Some((tmp, Arc::from(mem)))
     }
 
     #[test]
     fn name_and_schema() {
-        let (_tmp, mem) = test_mem();
+        let mem: Arc<dyn Memory> = Arc::new(NoneMemory::new("none"));
         let tool = MemoryPurgeTool::new(mem, test_security());
         assert_eq!(tool.name(), "memory_purge");
         assert!(tool.parameters_schema()["properties"]["namespace"].is_object());
@@ -149,7 +159,9 @@ mod tests {
 
     #[tokio::test]
     async fn purge_namespace_removes_only_all_matching_memories() {
-        let (_tmp, mem) = test_mem();
+        let Some((_tmp, mem)) = try_test_mem() else {
+            return;
+        };
 
         mem.store_with_metadata("a", "data", MemoryCategory::Core, None, Some("ns1"), None)
             .await
@@ -173,7 +185,9 @@ mod tests {
 
     #[tokio::test]
     async fn purge_session_removes_all_memories() {
-        let (_tmp, mem) = test_mem();
+        let Some((_tmp, mem)) = try_test_mem() else {
+            return;
+        };
         mem.store("a1", "data1", MemoryCategory::Core, Some("sess-x"))
             .await
             .unwrap();
@@ -194,7 +208,9 @@ mod tests {
 
     #[tokio::test]
     async fn purge_namespace_nonexistent_is_noop() {
-        let (_tmp, mem) = test_mem();
+        let Some((_tmp, mem)) = try_test_mem() else {
+            return;
+        };
         mem.store("a", "data", MemoryCategory::Core, None)
             .await
             .unwrap();
@@ -212,7 +228,9 @@ mod tests {
 
     #[tokio::test]
     async fn purge_session_nonexistent_is_noop() {
-        let (_tmp, mem) = test_mem();
+        let Some((_tmp, mem)) = try_test_mem() else {
+            return;
+        };
         mem.store("a", "data", MemoryCategory::Core, Some("sess"))
             .await
             .unwrap();
@@ -230,7 +248,7 @@ mod tests {
 
     #[tokio::test]
     async fn purge_missing_parameter() {
-        let (_tmp, mem) = test_mem();
+        let mem: Arc<dyn Memory> = Arc::new(NoneMemory::new("none"));
         let tool = MemoryPurgeTool::new(mem, test_security());
         let result = tool.execute(json!({})).await;
         assert!(result.is_err());
@@ -238,7 +256,9 @@ mod tests {
 
     #[tokio::test]
     async fn purge_blocked_in_readonly_mode() {
-        let (_tmp, mem) = test_mem();
+        let Some((_tmp, mem)) = try_test_mem() else {
+            return;
+        };
         mem.store_with_metadata(
             "a",
             "data",
@@ -268,7 +288,9 @@ mod tests {
 
     #[tokio::test]
     async fn purge_blocked_when_rate_limited() {
-        let (_tmp, mem) = test_mem();
+        let Some((_tmp, mem)) = try_test_mem() else {
+            return;
+        };
         mem.store_with_metadata(
             "a",
             "data",

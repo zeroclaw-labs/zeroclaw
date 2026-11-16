@@ -12,7 +12,7 @@ but "which surface owns this data, and how long does it live?"
 
 | Surface | Owner | Durability | What reviewers should check |
 | --- | --- | --- | --- |
-| Long-term memory | `zeroclaw-memory` behind `Arc<dyn Memory>` | Backend-specific: SQLite/Lucid shared stores, or per-agent Markdown files | Stores and recalls must stay agent-scoped. A tool result, log line, or session row is not long-term memory unless a memory write happened. |
+| Long-term memory | `zeroclaw-memory` behind `Arc<dyn Memory>` | Backend-specific: shared Tachi store (`data/memory/tachi.db`), or per-agent Markdown files | Stores and recalls must stay agent-scoped. A tool result, log line, or session row is not long-term memory unless a memory write happened. |
 | Relationship memory | `knowledge` tool and knowledge graph | Graph backend, when enabled | Capture is explicit. Enabling the graph does not automatically ingest conversations, files, or channel data. |
 | Session history | `zeroclaw-infra` session backends and ACP store | Chat/ACP history can persist; live session handles are process-local | History preserves conversation continuity. It is not the canonical store for user preferences, config, or files. |
 | Current prompt context | Agent loop prompt assembly | Ephemeral provider request | Recalled memory, hardware RAG, current input, system prompt, skills, and tool results may be sent to the provider. This does not make them durable. |

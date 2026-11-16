@@ -27,10 +27,10 @@ pub use schema::{
     QueryClassificationConfig, ReliabilityConfig, RiskProfileConfig, RuntimeConfig, SandboxBackend,
     SandboxConfig, SchedulerConfig, SearchMode, SecretsConfig, SecurityConfig, SecurityOpsConfig,
     ShellToolConfig, SkillCreationConfig, SkillImprovementConfig, SkillsConfig,
-    SkillsPromptInjectionMode, SopConfig, SqliteStorageConfig, StorageConfig, StreamMode,
-    TelegramConfig, TextBrowserConfig, ToolFilterGroup, ToolFilterGroupMode, TranscriptionConfig,
-    TtsConfig, TtsProviderConfig, TunnelConfig, VerifiableIntentConfig, WebFetchConfig,
-    WebSearchConfig, WebhookConfig, read_persisted_proxy_for_boot,
+    SkillsPromptInjectionMode, SopConfig, StorageConfig, StreamMode, TelegramConfig,
+    TextBrowserConfig, ToolFilterGroup, ToolFilterGroupMode, TranscriptionConfig, TtsConfig,
+    TtsProviderConfig, TunnelConfig, VerifiableIntentConfig, WebFetchConfig, WebSearchConfig,
+    WebhookConfig, read_persisted_proxy_for_boot,
 };
 
 pub use schema::ModelProviderConfig;

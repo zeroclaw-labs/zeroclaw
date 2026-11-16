@@ -70,6 +70,9 @@ async fn test_config(tmp: &TempDir) -> Config {
         config_path: tmp.path().join("config.toml"),
         ..Config::default()
     };
+    if !zeroclaw_memory::TACHI_COMPILED {
+        config.memory.backend = "markdown".into();
+    }
     config.risk_profiles.insert(
         TEST_AGENT.to_string(),
         zeroclaw_config::schema::RiskProfileConfig::default(),

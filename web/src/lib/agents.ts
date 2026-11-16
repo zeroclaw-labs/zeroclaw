@@ -8,7 +8,7 @@ export interface AgentSummary {
   riskProfile: string;
   runtimeProfile: string;
   /** Memory backend kind from `[agents.<alias>.memory].backend`. Empty
-   * string when unset (the agent inherits the default — sqlite). */
+   * string when unset (the agent inherits the default — tachi). */
   memoryBackend: string;
   skillBundles: string[];
   mcpBundles: string[];
