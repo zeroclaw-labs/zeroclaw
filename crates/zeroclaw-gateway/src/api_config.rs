@@ -1009,7 +1009,7 @@ struct PluginTlsCredential {
     profiles: std::collections::BTreeMap<String, Vec<String>>,
 }
 
-type PluginTlsSlots = std::collections::HashSet<(String, String)>;
+type PluginTlsSlots = std::collections::HashMap<(String, String), serde_json::Value>;
 
 #[cfg_attr(not(feature = "plugins-wasm"), allow(clippy::unused_async))]
 async fn admitted_plugin_tls_slots(
@@ -1073,7 +1073,10 @@ async fn admitted_plugin_tls_slots(
                     for (name, schema) in properties {
                         if schema.get("x-secret").and_then(serde_json::Value::as_bool) == Some(true)
                         {
-                            slots.insert((key.clone(), name.clone()));
+                            slots.insert(
+                                (key.clone(), name.clone()),
+                                manifest.config_schema.clone()?,
+                            );
                         }
                     }
                 }
@@ -1101,7 +1104,7 @@ fn plugin_tls_credentials(
             .into_iter()
             .flatten()
             {
-                if !slots.contains(&(entry.name.clone(), property.clone())) {
+                if !slots.contains_key(&(entry.name.clone(), property.clone())) {
                     continue;
                 }
                 let credential = credentials
@@ -1225,9 +1228,9 @@ async fn mutate_plugin_tls_credential_inner(
     if guard.published_revision() != revision {
         return StatusCode::CONFLICT.into_response();
     }
-    if !slots.contains(&(mutation.instance.clone(), mutation.property.clone())) {
+    let Some(_schema) = slots.get(&(mutation.instance.clone(), mutation.property.clone())) else {
         return StatusCode::NOT_FOUND.into_response();
-    }
+    };
     let Some(entry) = config
         .plugins
         .entries
@@ -1280,6 +1283,11 @@ async fn mutate_plugin_tls_credential_inner(
             || value.len() > 32 * 1024
             || reject_masked_secret_value("", true, &value).is_err()
             || zeroclaw_config::secrets::SecretStore::is_encrypted(&value)
+        {
+            return StatusCode::BAD_REQUEST.into_response();
+        }
+        #[cfg(feature = "plugins-wasm")]
+        if !zeroclaw_plugins::config::validate_secret_property(_schema, &mutation.property, &value)
         {
             return StatusCode::BAD_REQUEST.into_response();
         }
