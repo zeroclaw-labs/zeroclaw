@@ -69,9 +69,9 @@ This bounded non-streaming entry point disables hidden HTTP retries and
 automatic redirects and preserves the selected native or prompt tool protocol.
 Unsupported adapters decline before generation, allowing
 Reliable to try another eligible configured candidate. Exhaustion is terminal
-for the operation. The CLI adapters and directly constructed native Ollama
-implementation currently decline this entry point. Configured Ollama uses the
-supported Compatible adapter. Ordinary chat and streaming keep their existing
+for the operation. The CLI adapters and directly constructed native Ollama or
+`GlmModelProvider` implementations currently decline this entry point. Configured
+Ollama and GLM use the supported Compatible adapter. Ordinary chat and streaming keep their existing
 recovery policies. No runtime consumer is switched to bounded execution by
 the provider API addition itself.
 
