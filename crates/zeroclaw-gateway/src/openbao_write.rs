@@ -197,8 +197,7 @@ fn writer_token_path() -> Option<std::ffi::OsString> {
 }
 
 pub(crate) fn managed_writer() -> bool {
-    writer_token_path()
-        .is_some_and(|path| std::path::Path::new(&path).is_absolute())
+    writer_token_path().is_some_and(|path| std::path::Path::new(&path).is_absolute())
 }
 
 fn valid_token(token: &str) -> bool {
