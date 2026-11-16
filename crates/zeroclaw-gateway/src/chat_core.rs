@@ -39,8 +39,8 @@ use crate::dashboard_session::{
     DashboardAuth, SessionWatch, WS_CLOSE_SESSION_ENDED, session_known_lost, session_lost,
 };
 use crate::ws::{
-    ConnectParams, WS_PROTOCOL, WsQuery, close_for_reconnect, close_with, gateway_stop_signal,
-    history_trimmed_ws_frame, tick_websocket_ping, websocket_ping_interval,
+    ConnectParams, ContextDisplay, WS_PROTOCOL, WsQuery, close_for_reconnect, close_with,
+    gateway_stop_signal, history_trimmed_ws_frame, tick_websocket_ping, websocket_ping_interval,
 };
 
 /// The longest the gateway waits for a turn's answer. The core's own limits
@@ -998,18 +998,22 @@ impl TurnRelay {
                 tokens_after_source,
                 unsatisfiable_floor,
                 ..
-            } => history_trimmed_ws_frame(
-                dropped_messages,
-                dropped_turns,
-                kept_turns,
-                &reason,
-                token_budget,
-                tokens_before,
-                tokens_after,
-                tokens_before_source.map(|s| s.as_str()),
-                tokens_after_source.map(|s| s.as_str()),
-                unsatisfiable_floor,
-            ),
+            } => {
+                self.meter
+                    .trimmed(dropped_messages, tokens_after, tokens_after_source);
+                history_trimmed_ws_frame(
+                    dropped_messages,
+                    dropped_turns,
+                    kept_turns,
+                    &reason,
+                    token_budget,
+                    tokens_before,
+                    tokens_after,
+                    tokens_before_source.map(|s| s.as_str()),
+                    tokens_after_source.map(|s| s.as_str()),
+                    unsatisfiable_floor,
+                )
+            }
         };
         if !self.client_gone && send(sender, &frame).await.is_err() {
             self.disconnect().await;
@@ -1050,6 +1054,9 @@ struct ContextMeter {
     last_input_tokens: Option<u64>,
     max_context_tokens: Option<u64>,
     model_context_window: Option<u64>,
+    /// The count a later trim left, shown in place of `last_input_tokens`
+    /// without replacing it, as the in-process chat does.
+    display: ContextDisplay,
 }
 
 impl ContextMeter {
@@ -1062,6 +1069,19 @@ impl ContextMeter {
         self.last_input_tokens = input_tokens.or(self.last_input_tokens);
         self.max_context_tokens = max_context_tokens.or(self.max_context_tokens);
         self.model_context_window = model_context_window.or(self.model_context_window);
+        // The core sends `context_usage` for each accepted call, with or
+        // without usage, so it supersedes an earlier trim's count.
+        self.display.accepted_call();
+    }
+
+    fn trimmed(
+        &mut self,
+        dropped_messages: usize,
+        tokens_after: Option<u64>,
+        tokens_after_source: Option<zeroclaw_api::agent::TokenCountSource>,
+    ) {
+        self.display
+            .trimmed(dropped_messages, tokens_after, tokens_after_source);
     }
 
     /// The in-process chat's `done` frame, from the turn's usage as the
@@ -1113,6 +1133,7 @@ impl ContextMeter {
         {
             done["model_context_window"] = Value::from(window);
         }
+        self.display.add_to_done(&mut done);
         done
     }
 }
