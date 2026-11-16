@@ -289,3 +289,5 @@ tool-http-credential-argument = 'credential' must be a string
 tool-http-credential-exclusive = Choose credential or auth_secret, not both
 tool-http-credential-host = A custom Host header is forbidden when using a scoped credential.
 tool-http-credential-alias = Credential alias must contain 1 to 64 ASCII letters, numbers, underscores, or hyphens.
+
+tool-http-request-authenticated-response-truncated = [Truncated authenticated response omitted]

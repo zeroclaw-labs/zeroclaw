@@ -944,7 +944,9 @@ impl Tool for HttpRequestTool {
                 let response_text = if !sensitive.is_empty()
                     && response_text.ends_with("... [Response truncated due to size limit] ...")
                 {
-                    "[Truncated authenticated response omitted]".into()
+                    crate::i18n::get_required_tool_string(
+                        "tool-http-request-authenticated-response-truncated",
+                    )
                 } else {
                     redact(response_text)
                 };
