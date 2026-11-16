@@ -856,7 +856,7 @@ mode = "scrape"
 [web_search]
 enabled = true
 max_results = 5
-search_provider = "parallel"
+search_provider = "duckduckgo"
 timeout_secs = 15
 
 [workspace]
