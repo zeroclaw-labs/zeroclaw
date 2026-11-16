@@ -939,7 +939,16 @@ impl Tool for HttpRequestTool {
                     };
 
                 let headers_text = redact(headers_text);
-                let response_text = redact(response_text);
+                // An exact-value scrub cannot match the partial credential
+                // left when a decoded body is cut across the secret.
+                let response_text = if !sensitive.is_empty()
+                    && response_text.ends_with("... [Response truncated due to size limit] ...")
+                {
+                    "[Truncated authenticated response omitted]".into()
+                } else {
+                    redact(response_text)
+                };
+                let body_error = body_error.map(redact);
                 let output = format!(
                     "Status: {} {}\nResponse Headers: {}\n\nResponse Body:\n{}",
                     status_code,
@@ -982,7 +991,7 @@ impl Tool for HttpRequestTool {
                 Ok(ToolResult {
                     success: false,
                     output: ToolOutput::default(),
-                    error: Some(error),
+                    error: Some(redact(error)),
                 })
             }
         }
