@@ -305,17 +305,17 @@ pub fn validate_secret_property(schema: &Value, name: &str, value: &str) -> bool
         return false;
     }
     let pointer = name.replace('~', "~0").replace('/', "~1");
-    let mut projected = schema.clone();
-    let Some(root) = projected.as_object_mut() else {
+    const MANIFEST_URI: &str = "urn:zeroclaw:plugin-config";
+    let Ok(registry) = jsonschema::Registry::new()
+        .add(MANIFEST_URI, schema.clone())
+        .and_then(|builder| builder.prepare())
+    else {
         return false;
     };
-    root.retain(|key, _| matches!(key.as_str(), "properties" | "$defs" | "definitions"));
-    root.insert(
-        "$ref".into(),
-        Value::String(format!("#/properties/{pointer}")),
-    );
+    let property = serde_json::json!({ "$ref": format!("{MANIFEST_URI}#/properties/{pointer}") });
     manifest_schema_options()
-        .build(&projected)
+        .with_registry(&registry)
+        .build(&property)
         .is_ok_and(|validator| validator.is_valid(&Value::String(value.to_owned())))
 }
 
@@ -326,10 +326,10 @@ fn write_only_provisioning_checks_secret_refs_and_allows_partial_setup() {
         "type": "object",
         "required": ["secret", "other"],
         "properties": {
-            "secret": { "x-secret": true, "$ref": "#/$defs/pem" },
+            "secret": { "x-secret": true, "$ref": "#/allOf/0/properties/pem" },
             "other": { "type": "string" }
         },
-        "$defs": { "pem": { "type": "string", "pattern": "^-----BEGIN ", "minLength": 16 } }
+        "allOf": [{ "properties": { "pem": { "type": "string", "pattern": "^-----BEGIN ", "minLength": 16 } } }]
     });
 
     assert!(validate_secret_property(
