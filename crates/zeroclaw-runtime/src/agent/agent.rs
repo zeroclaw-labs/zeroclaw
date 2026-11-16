@@ -4383,6 +4383,19 @@ impl Agent {
     }
 
     pub async fn turn(&mut self, user_message: &str) -> Result<String> {
+        let session_agent = self
+            .forwarded_environment
+            .as_ref()
+            .and_then(|environment| environment.get("SSH_AUTH_SOCK"))
+            .map(std::ffi::OsString::from);
+        zeroclaw_tools::task_ssh::scope_with_agent(
+            session_agent,
+            Box::pin(self.turn_body(user_message)),
+        )
+        .await
+    }
+
+    async fn turn_body(&mut self, user_message: &str) -> Result<String> {
         if user_message.trim().is_empty() {
             ::zeroclaw_log::record!(
                 WARN,
