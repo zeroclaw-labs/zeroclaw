@@ -3389,12 +3389,15 @@ impl DelegateTool {
             }
         };
 
-        // Build the message
-        let full_prompt = if context.is_empty() {
+        // Build the message. The sub-agent starts a fresh transcript, so the
+        // timestamp line is its only source for the time of day.
+        let task = if context.is_empty() {
             prompt.to_string()
         } else {
             format!("[Context]\n{context}\n\n[Task]\n{prompt}")
         };
+        let full_prompt =
+            crate::agent::prompt::timestamp_user_message(&chrono::Local::now(), &task);
 
         // Agentic mode: run full tool-call loop with allowlisted tools.
         if agentic {
@@ -22139,6 +22142,83 @@ command = "rm independent-delegate-marker"
             0,
             "strict mixed validation must precede fallback dispatch"
         );
+    }
+
+    #[tokio::test]
+    async fn delegated_task_reaches_the_model_stamped_with_the_current_time() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let with_context = (
+            json!({
+                "agent": "target",
+                "prompt": "What time is it?",
+                "context": "The caller is in a meeting."
+            }),
+            "[Context]\nThe caller is in a meeting.\n\n[Task]\nWhat time is it?",
+        );
+        let cases = [
+            (
+                false,
+                json!({"agent": "target", "prompt": "What time is it?"}),
+                "What time is it?",
+            ),
+            (
+                true,
+                json!({"agent": "target", "prompt": "What time is it?"}),
+                "What time is it?",
+            ),
+            (true, with_context.0, with_context.1),
+            (
+                true,
+                json!({"parallel": ["target"], "prompt": "What time is it?"}),
+                "What time is it?",
+            ),
+        ];
+        for (agentic, args, expected_task) in cases {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "choices": [{"message": {"content": "done"}}]
+                })))
+                .mount(&server)
+                .await;
+            let (config, _fixture_dir) =
+                fallback_delegate_config(server.uri(), server.uri(), agentic);
+            let tool = fallback_delegate_tool(config, None);
+
+            let before = chrono::Local::now().timestamp();
+            let result = tool.execute(args).await.expect("delegate call completes");
+            let after = chrono::Local::now().timestamp();
+            assert!(result.success, "agentic={agentic}: {result:?}");
+
+            let requests = server.received_requests().await.unwrap();
+            assert_eq!(requests.len(), 1, "agentic={agentic}: one model request");
+            let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+            let user_messages: Vec<&str> = body["messages"]
+                .as_array()
+                .expect("chat request carries messages")
+                .iter()
+                .filter(|message| message["role"] == "user")
+                .filter_map(|message| message["content"].as_str())
+                .collect();
+            assert_eq!(user_messages.len(), 1, "agentic={agentic}: {body}");
+
+            let (stamp_line, task) = user_messages[0]
+                .split_once("\n\n")
+                .expect("timestamp line precedes the task");
+            assert_eq!(task, expected_task, "agentic={agentic}");
+            let stamp = stamp_line
+                .strip_prefix("[CURRENT DATE & TIME: ")
+                .and_then(|rest| rest.strip_suffix(']'))
+                .unwrap_or_else(|| panic!("agentic={agentic}: unlabeled stamp {stamp_line:?}"));
+            let stamped = chrono::DateTime::parse_from_str(stamp, "%Y-%m-%d %H:%M:%S %:z")
+                .unwrap_or_else(|error| panic!("agentic={agentic}: {stamp:?}: {error}"));
+            assert!(
+                (before..=after).contains(&stamped.timestamp()),
+                "agentic={agentic}: {stamp} is not the time of the call"
+            );
+        }
     }
 
     #[tokio::test]

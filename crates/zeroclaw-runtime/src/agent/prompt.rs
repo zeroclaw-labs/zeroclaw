@@ -211,9 +211,9 @@ impl SystemPromptBuilder {
     /// content (and with it every provider prompt-cache entry hashed behind
     /// it) would change once a day per session. The per-turn
     /// `[CURRENT DATE & TIME]` user-message prefix is the authoritative
-    /// clock, so the cached system prefix stays byte-stable. Builders for
-    /// paths without that prefix (e.g. the delegate sub-agent prompt) opt in
-    /// by adding the section explicitly.
+    /// clock, so the cached system prefix stays byte-stable. Builders that
+    /// also want the date in the system prompt opt in by adding the section
+    /// explicitly.
     pub fn with_defaults() -> Self {
         Self {
             sections: vec![
