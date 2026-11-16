@@ -454,6 +454,11 @@ pub(crate) async fn prepare_tool_calls(
                 model_switch_callback: None,
             },
         );
+        // Discovery can admit a later call that splits an apparent repeat run.
+        // Preserve the remaining calls for the sequential dispatch detector.
+        if detector_tool_name.as_deref() == Some("tool_search") {
+            detector_preview = None;
+        }
         if let Some(detector_tool_name) = detector_tool_name
             && let Some(preview) = &mut detector_preview
             && !ctx
