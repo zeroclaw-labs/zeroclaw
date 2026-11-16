@@ -1755,34 +1755,15 @@ mod tests {
         );
     }
 
-    /// The real component boundary: a compiled `tool` guest calls
-    /// `dispatch.wake`, and the host answers through
-    /// [`RuntimeAgentWakeBackend`] rather than a recording stub.
-    ///
-    /// This is the only test that pins the *seam* instead of the backend: the
-    /// grant, the frame, the shape validation and the caller attribution all
-    /// live in `zeroclaw-plugins`, and what crosses into this module is exactly
-    /// what an installed plugin would send.
+    /// Build (or reuse) the compiled `tool-dispatch-fixture` WASM component
+    /// and stage a ready-to-load plugin root directory for tests.
     #[cfg(feature = "plugins-wasm-cranelift")]
-    #[tokio::test]
-    async fn wasm_tool_dispatch_reaches_the_runtime_backend_end_to_end() {
+    fn stage_dispatch_fixture_plugin() -> (tempfile::TempDir, PluginManifest) {
         use std::path::PathBuf;
         use std::process::Command;
-        use zeroclaw_api::tool::Tool as _;
-        use zeroclaw_plugins::component::PluginLimits;
-        use zeroclaw_plugins::config::{PluginConfigResolver, resolve_plugin_config};
-        use zeroclaw_plugins::host::{AdmittedComponent, PluginHost};
-        use zeroclaw_plugins::services::{AgentWakeService, PluginHostServices};
-        use zeroclaw_plugins::wasm_tool::WasmTool;
 
-        // Build (or reuse) the fixture component. Cargo's cached wasm32 build
-        // makes the repeat runs cheap; the first is the only slow one.
         let fixture_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../zeroclaw-plugins/tests/fixtures/tool-dispatch-fixture");
-        // `CARGO_TARGET_TMPDIR` is set only for integration-test targets, and
-        // this is a unit test, so land the fixture build under the workspace
-        // target dir by the same convention: one path per workspace, reused by
-        // every run so Cargo's wasm32 cache does the work.
         let target_dir =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/tmp/plugin-wake-fixture");
         let status = Command::new(env!("CARGO"))
@@ -1813,9 +1794,6 @@ mod tests {
             wasm_path: Some("tool-dispatch-fixture.wasm".to_string()),
             ..manifest()
         };
-
-        // Admit the fixture the way `plugin install` admits a source: a real
-        // package directory, a real manifest, a real component.
         let root = tempfile::TempDir::new().expect("fixture package root");
         let package_dir = root.path().join(&plugin_manifest.name);
         std::fs::create_dir_all(&package_dir).expect("fixture package directory");
@@ -1826,6 +1804,28 @@ mod tests {
             toml::to_string(&plugin_manifest).expect("serialize fixture manifest"),
         )
         .expect("write fixture manifest");
+        (root, plugin_manifest)
+    }
+
+    /// The real component boundary: a compiled `tool` guest calls
+    /// `dispatch.wake`, and the host answers through
+    /// [`RuntimeAgentWakeBackend`] rather than a recording stub.
+    ///
+    /// This is the only test that pins the *seam* instead of the backend: the
+    /// grant, the frame, the shape validation and the caller attribution all
+    /// live in `zeroclaw-plugins`, and what crosses into this module is exactly
+    /// what an installed plugin would send.
+    #[cfg(feature = "plugins-wasm-cranelift")]
+    #[tokio::test]
+    async fn wasm_tool_dispatch_reaches_the_runtime_backend_end_to_end() {
+        use zeroclaw_api::tool::Tool as _;
+        use zeroclaw_plugins::component::PluginLimits;
+        use zeroclaw_plugins::config::{PluginConfigResolver, resolve_plugin_config};
+        use zeroclaw_plugins::host::{AdmittedComponent, PluginHost};
+        use zeroclaw_plugins::services::{AgentWakeService, PluginHostServices};
+        use zeroclaw_plugins::wasm_tool::WasmTool;
+
+        let (root, plugin_manifest) = stage_dispatch_fixture_plugin();
         let host = Arc::new(PluginHost::from_plugins_dir(root.path()).expect("admit fixture"));
         let details = host.tool_plugin_details();
         assert_eq!(
@@ -2322,54 +2322,11 @@ mod tests {
     #[tokio::test]
     async fn peer_message_turn_preserves_wake_depth_and_stops_cycle_at_ceiling() {
         use axum::{Json, Router, extract::State, routing::post};
-        use std::path::PathBuf;
-        use std::process::Command;
         use zeroclaw_config::multi_agent::{AgentAlias, PeerGroupConfig};
         use zeroclaw_config::policy::AutonomyLevel;
         use zeroclaw_config::schema::{OpenAIModelProviderConfig, WireApi};
 
-        let fixture_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../zeroclaw-plugins/tests/fixtures/tool-dispatch-fixture");
-        let target_dir =
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/tmp/plugin-wake-fixture");
-        let status = Command::new(env!("CARGO"))
-            .current_dir(&fixture_dir)
-            .args([
-                "build",
-                "--locked",
-                "--quiet",
-                "--package",
-                "zeroclaw-tool-dispatch-plugin-fixture",
-                "--target",
-                "wasm32-wasip2",
-                "--target-dir",
-            ])
-            .arg(&target_dir)
-            .status()
-            .expect("run Cargo for the tool dispatch component fixture");
-        assert!(
-            status.success(),
-            "the tool dispatch fixture must build; install the wasm32-wasip2 target"
-        );
-        let wasm =
-            target_dir.join("wasm32-wasip2/debug/zeroclaw_tool_dispatch_plugin_fixture.wasm");
-        assert!(wasm.is_file(), "the fixture WASM was not produced");
-
-        let plugin_root = tempfile::TempDir::new().expect("fixture package root");
-        let plugin_manifest = PluginManifest {
-            name: "tool-dispatch-fixture".to_string(),
-            wasm_path: Some("tool-dispatch-fixture.wasm".to_string()),
-            ..manifest()
-        };
-        let package_dir = plugin_root.path().join(&plugin_manifest.name);
-        std::fs::create_dir_all(&package_dir).expect("fixture package directory");
-        std::fs::copy(&wasm, package_dir.join("tool-dispatch-fixture.wasm"))
-            .expect("copy fixture payload");
-        std::fs::write(
-            package_dir.join("manifest.toml"),
-            toml::to_string(&plugin_manifest).expect("serialize fixture manifest"),
-        )
-        .expect("write fixture manifest");
+        let (plugin_root, plugin_manifest) = stage_dispatch_fixture_plugin();
 
         #[derive(Clone)]
         struct CycleState {
@@ -2646,8 +2603,6 @@ mod tests {
     #[tokio::test]
     async fn background_delegate_turn_preserves_wake_depth_ceiling() {
         use axum::{Json, Router, extract::State, routing::post};
-        use std::path::PathBuf;
-        use std::process::Command;
         use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
         use zeroclaw_config::policy::AutonomyLevel;
         use zeroclaw_config::schema::{
@@ -2655,44 +2610,7 @@ mod tests {
             RuntimeProfileConfig, WireApi,
         };
 
-        let fixture_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../zeroclaw-plugins/tests/fixtures/tool-dispatch-fixture");
-        let target_dir =
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/tmp/plugin-wake-fixture");
-        let status = Command::new(env!("CARGO"))
-            .current_dir(&fixture_dir)
-            .args([
-                "build",
-                "--locked",
-                "--quiet",
-                "--package",
-                "zeroclaw-tool-dispatch-plugin-fixture",
-                "--target",
-                "wasm32-wasip2",
-                "--target-dir",
-            ])
-            .arg(&target_dir)
-            .status()
-            .expect("run Cargo for the tool dispatch component fixture");
-        assert!(status.success());
-        let wasm =
-            target_dir.join("wasm32-wasip2/debug/zeroclaw_tool_dispatch_plugin_fixture.wasm");
-
-        let plugin_root = tempfile::TempDir::new().expect("fixture package root");
-        let plugin_manifest = PluginManifest {
-            name: "tool-dispatch-fixture".to_string(),
-            wasm_path: Some("tool-dispatch-fixture.wasm".to_string()),
-            ..manifest()
-        };
-        let package_dir = plugin_root.path().join(&plugin_manifest.name);
-        std::fs::create_dir_all(&package_dir).expect("fixture package directory");
-        std::fs::copy(&wasm, package_dir.join("tool-dispatch-fixture.wasm"))
-            .expect("copy fixture payload");
-        std::fs::write(
-            package_dir.join("manifest.toml"),
-            toml::to_string(&plugin_manifest).expect("serialize fixture manifest"),
-        )
-        .expect("write fixture manifest");
+        let (plugin_root, plugin_manifest) = stage_dispatch_fixture_plugin();
 
         #[derive(Clone)]
         struct BgState {

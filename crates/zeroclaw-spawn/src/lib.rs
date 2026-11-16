@@ -52,6 +52,46 @@ pub fn scope_plugin_wake_depth<F: Future>(
 /// of recomputing it.
 pub const TASK_EVENT_NAME: &str = "runtime.task.spawn";
 
+/// Record the `Spawn` lifecycle event for [`spawn!`] in a single non-generic
+/// function so macro call sites do not duplicate `serde_json::json!` and
+/// `tracing::event!` expansion code across hundreds of spawns.
+#[doc(hidden)]
+pub fn record_task_spawn(module: &'static str, file: &'static str, line: u32) {
+    ::zeroclaw_log::record!(
+        INFO,
+        ::zeroclaw_log::Event::new(TASK_EVENT_NAME, ::zeroclaw_log::Action::Spawn).with_attrs(
+            ::serde_json::json!({
+                "task_site": format!("{file}:{line}"),
+                "task_module": module,
+            })
+        ),
+        "task spawned"
+    );
+}
+
+/// Record the `Complete` lifecycle event for [`spawn!`] in a single
+/// non-generic function.
+#[doc(hidden)]
+pub fn record_task_complete(
+    module: &'static str,
+    file: &'static str,
+    line: u32,
+    started_at: tokio::time::Instant,
+) {
+    let elapsed_ms = started_at.elapsed().as_millis() as u64;
+    ::zeroclaw_log::record!(
+        INFO,
+        ::zeroclaw_log::Event::new(TASK_EVENT_NAME, ::zeroclaw_log::Action::Complete)
+            .with_outcome(::zeroclaw_log::EventOutcome::Success)
+            .with_duration(elapsed_ms)
+            .with_attrs(::serde_json::json!({
+                "task_site": format!("{file}:{line}"),
+                "task_module": module,
+            })),
+        "task complete"
+    );
+}
+
 #[macro_export]
 macro_rules! spawn {
     ($body:expr) => {{
@@ -68,18 +108,7 @@ macro_rules! spawn {
         // Spawn-time record — fires synchronously on the caller's
         // thread, attributed to whatever span the caller currently has
         // entered.
-        $crate::__private::zeroclaw_log::record!(
-            INFO,
-            $crate::__private::zeroclaw_log::Event::new(
-                $crate::TASK_EVENT_NAME,
-                $crate::__private::zeroclaw_log::Action::Spawn,
-            )
-            .with_attrs($crate::__private::serde_json::json!({
-                "task_site": format!("{}:{}", __ZC_TASK_FILE, __ZC_TASK_LINE),
-                "task_module": __ZC_TASK_MODULE,
-            })),
-            "task spawned"
-        );
+        $crate::record_task_spawn(__ZC_TASK_MODULE, __ZC_TASK_FILE, __ZC_TASK_LINE);
 
         // Wrap the user's future so we can stamp a Complete record when
         // it resolves, and carry any active plugin wake-dispatch hop depth
@@ -89,35 +118,20 @@ macro_rules! spawn {
         // spawn time.
         let __zc_inherited_wake_depth = $crate::current_plugin_wake_depth();
         let __zc_task_started_at = $crate::__private::tokio::time::Instant::now();
-        let __zc_task_future = async move {
-            let __zc_task_output = { $body }.await;
-            let __zc_task_elapsed_ms = __zc_task_started_at.elapsed().as_millis() as u64;
-            $crate::__private::zeroclaw_log::record!(
-                INFO,
-                $crate::__private::zeroclaw_log::Event::new(
-                    $crate::TASK_EVENT_NAME,
-                    $crate::__private::zeroclaw_log::Action::Complete,
-                )
-                .with_outcome($crate::__private::zeroclaw_log::EventOutcome::Success)
-                .with_duration(__zc_task_elapsed_ms)
-                .with_attrs($crate::__private::serde_json::json!({
-                    "task_site": format!("{}:{}", __ZC_TASK_FILE, __ZC_TASK_LINE),
-                    "task_module": __ZC_TASK_MODULE,
-                })),
-                "task complete"
-            );
-            __zc_task_output
-        };
+        let __zc_task_future =
+            $crate::scope_plugin_wake_depth(__zc_inherited_wake_depth, async move {
+                let __zc_task_output = { $body }.await;
+                $crate::record_task_complete(
+                    __ZC_TASK_MODULE,
+                    __ZC_TASK_FILE,
+                    __ZC_TASK_LINE,
+                    __zc_task_started_at,
+                );
+                __zc_task_output
+            });
 
         #[allow(clippy::disallowed_methods)]
-        let __zc_spawn_handle = if __zc_inherited_wake_depth == 0 {
-            $crate::__private::tokio::spawn(__zc_task_future.in_current_span())
-        } else {
-            $crate::__private::tokio::spawn(
-                $crate::scope_plugin_wake_depth(__zc_inherited_wake_depth, __zc_task_future)
-                    .in_current_span(),
-            )
-        };
+        let __zc_spawn_handle = $crate::__private::tokio::spawn(__zc_task_future.in_current_span());
         __zc_spawn_handle
     }};
 }
