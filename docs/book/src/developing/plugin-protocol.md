@@ -495,12 +495,13 @@ Every call passes five host-owned checks before spawning a turn:
    `unknown-agent`.
 5. **Coalescing and rate limit:** wakes for an `(instance, target)` pair already
    running a plugin wake turn coalesce into at most one pending follow-up turn
-   (retaining the latest prompt and caller attribution) without charging an
-   extra token on overwrite; the follow-up re-checks live grants and spends one
-   budget token when drained. Idle pairs spend from the per-instance continuous
-   token bucket (`rate-limited` when exhausted), admit against
-   `AgentExecutionCapability`, record a durable `TaskRecord`, and run under
-   `InternalPrincipal::PluginTool`.
+   (retaining the latest prompt and caller attribution). The first pending
+   wake reserves one token before returning success; later overwrites share
+   that reservation. An exhausted bucket returns `rate-limited` immediately.
+   The follow-up re-checks live grants and target availability before running.
+   Idle pairs also spend from the per-instance continuous token bucket, admit
+   against `AgentExecutionCapability`, record a durable `TaskRecord`, and run
+   under `InternalPrincipal::PluginTool`.
 
 ### `inbound`
 

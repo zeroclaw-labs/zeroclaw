@@ -365,12 +365,22 @@ impl AgentWakeBackend for RuntimeAgentWakeBackend {
             execution_capability: self.execution_capability.clone(),
         };
 
-        // Claim the slot, charge the budget and coalesce under one lock, so two
-        // simultaneous callers can never both spawn a turn for the same pair and
-        // a coalesced wake is never charged twice.
+        // Claim the slot and reserve each turn's budget under one lock. The
+        // first pending wake pays for its follow-up before we return success;
+        // later overwrites share that reservation.
+        let rate_limit = entry
+            .dispatch_rate_per_min
+            .unwrap_or(DEFAULT_DISPATCH_RATE_PER_MIN);
         {
             let mut slots = self.coordinator.slots.lock();
             if let Some(WakeSlotState::Running { pending: existing }) = slots.get_mut(&slot_key) {
+                if existing.is_none()
+                    && !self
+                        .coordinator
+                        .try_consume_token(&instance_key, rate_limit)
+                {
+                    return Err(AgentWakeError::RateLimited);
+                }
                 *existing = Some(pending);
                 ::zeroclaw_log::record!(
                     INFO,
@@ -386,9 +396,6 @@ impl AgentWakeBackend for RuntimeAgentWakeBackend {
                 return Ok(());
             }
 
-            let rate_limit = entry
-                .dispatch_rate_per_min
-                .unwrap_or(DEFAULT_DISPATCH_RATE_PER_MIN);
             if !self
                 .coordinator
                 .try_consume_token(&instance_key, rate_limit)
@@ -565,11 +572,6 @@ impl AgentWakeBackend for RuntimeAgentWakeBackend {
 
                 // Drain a wake that coalesced while this turn ran. `None` means
                 // nothing is pending, so release the slot and stop.
-                //
-                // Charge one budget token for the follow-up turn using the
-                // current live rate limit before starting it: overwriting the
-                // same pending wake never charges extra, and an exhausted
-                // bucket drops the follow-up rather than bypassing the cap.
                 let next = {
                     let mut slots = coordinator.slots.lock();
                     let next = match slots.get_mut(&spawn_key) {
@@ -642,24 +644,6 @@ impl AgentWakeBackend for RuntimeAgentWakeBackend {
                     );
                     return;
                 }
-                let rate_limit = entry
-                    .dispatch_rate_per_min
-                    .unwrap_or(DEFAULT_DISPATCH_RATE_PER_MIN);
-                if !coordinator.try_consume_token(&spawn_key.0, rate_limit) {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                            .with_attrs(::serde_json::json!({
-                                "plugin": package,
-                                "agent": spawn_canonical,
-                                "rate_per_min": rate_limit,
-                            })),
-                        "coalesced plugin wake cancelled: wake rate limit exhausted"
-                    );
-                    return;
-                }
-
                 let admission = match next
                     .execution_capability
                     .as_ref()
@@ -1715,7 +1699,7 @@ mod tests {
     async fn coalesced_wake_carries_the_latest_callers_identity() {
         let workspace = tempfile::TempDir::new().expect("temp data dir");
         let mut config = base_config(workspace.path());
-        config.plugins.entries = vec![entry(&instance_key(), &["recipient"], None)];
+        config.plugins.entries = vec![entry(&instance_key(), &["recipient"], Some(1))];
         let coordinator = Arc::new(SharedWakeCoordinator::new());
         let backend = RuntimeAgentWakeBackend::for_tests(
             Arc::new(config),
@@ -1752,6 +1736,11 @@ mod tests {
         assert!(
             pending.capabilities.is_none(),
             "an unbound registry inherits no capabilities"
+        );
+        drop(slots);
+        assert!(
+            !coordinator.try_consume_token(&instance_key(), 1),
+            "the first pending wake reserves one token and overwrites share it"
         );
     }
 
@@ -1989,8 +1978,8 @@ mod tests {
                 ..OllamaModelProviderConfig::default()
             },
         );
-        // Budget = 1 token/min: the initial turn spends it, so a coalesced
-        // follow-up queued during that turn must be dropped when drained.
+        // Budget = 1 token/min: the initial turn spends it, so a later wake
+        // must report rate-limited rather than claim a follow-up it will drop.
         config.plugins.entries = vec![entry(&instance_key(), &["recipient"], Some(1))];
 
         let control_plane =
@@ -2016,13 +2005,14 @@ mod tests {
             .await
             .expect("first turn reaches mock provider");
 
-        // Repeated wakes overwrite the single pending slot without charging.
+        // No token remains for a pending follow-up. Every call must receive
+        // rate-limited while the first turn remains in progress.
         for caller in ["sender-2", "sender-3", "sender-4"] {
             assert_eq!(
                 backend
                     .wake(&scope(), Some(caller), "recipient", caller)
                     .await,
-                Ok(())
+                Err(AgentWakeError::RateLimited)
             );
         }
         release.notify_one();
@@ -2032,7 +2022,7 @@ mod tests {
         assert_eq!(
             tasks.len(),
             1,
-            "rate=1 must drop the coalesced follow-up after the initial turn: {tasks:?}"
+            "rate=1 admits only the initial turn: {tasks:?}"
         );
         assert_eq!(*request_count.lock(), 1);
         server.abort();
