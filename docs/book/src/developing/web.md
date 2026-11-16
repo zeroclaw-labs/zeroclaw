@@ -101,6 +101,14 @@ and `structuredClone()`.
 
 ## Provisioning OpenBao secrets from the dashboard
 
+With a server-side OpenBao identity configured, the operator selects **OpenBao**,
+enters the secret value, and selects **Add credential**. The editable reference
+is suggested from the mount, prefix, alias and field. The gateway handles vault
+authentication, so the operator can complete the task without issuing or
+copying a vault token. **Link existing secret** saves the reference without
+writing a value to OpenBao.
+
+
 Set `BAO_ADDR` to the operator-configured HTTPS origin of an OpenBao server
 and `ZEROCLAW_OPENBAO_WRITE_PREFIX` to an allowed KV v2 mount and prefix,
 for example `secret/agents`. OpenBao then offers **Add** to create a
