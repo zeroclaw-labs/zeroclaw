@@ -40,8 +40,8 @@ export default function HttpCredentials({ kind }: { kind: HttpCredentialKind }) 
   const [nameDraft, setNameDraft] = useState("");
   const [referenceOverride, setReferenceOverride] = useState<string>();
   const prefix = source === "open_bao" ? catalog?.openbao_write_prefix : catalog?.vault_write_prefixes?.[source];
-  const canWrite = source !== "local" && !!prefix;
-  const managedWriter = source === "open_bao" && !!catalog?.openbao_managed_writer;
+  const canWrite = source !== "local" && !!prefix && (source !== "open_bao" || !!catalog?.openbao_managed_writer);
+  const managedWriter = source === "open_bao";
   const field = { totp: "seed", ssh_key: "private_key", api_key: "token", user_password: "password" }[kind];
   const defaultReference = (() => {
     if (editing && editing !== "new") return editing.source === source ? editing.reference ?? "" : "";
