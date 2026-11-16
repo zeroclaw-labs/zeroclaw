@@ -38,6 +38,59 @@ pub const SUBPROTOCOL: &str = "zeroclaw.relay.v1";
 /// `Open.peer_hint` value for the narrow daemon enrollment route.
 pub const PEER_HINT_ENROLL: &str = "enroll";
 
+/// `Open.peer_hint` value for a browser connection to the daemon's own
+/// dashboard, which the relay serves at a per-node host and terminates.
+///
+/// Unlike every other route this one is NOT blind: the relay ends the
+/// browser's TLS and forwards plaintext HTTP, so it is sent only to a daemon
+/// that opted in with `Hello.dashboard`, and the daemon routes it to its
+/// gateway in process - never to a local port.
+pub const PEER_HINT_GATEWAY: &str = "gateway";
+
+/// Length of a dashboard host label, in characters.
+pub const DASHBOARD_LABEL_LEN: usize = 26;
+
+/// Domain-separation prefix hashed before the registration public key to
+/// derive a daemon's dashboard host label (see [`dashboard_label_from_digest`]).
+pub const DASHBOARD_LABEL_CONTEXT: &[u8] = b"zeroclaw.relay.dashboard-label.v1\0";
+
+const BASE32_LOWER: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
+
+/// The DNS label a relay serves a daemon's dashboard under, from
+/// `SHA-256(DASHBOARD_LABEL_CONTEXT || registration public key)`.
+///
+/// The first [`DASHBOARD_LABEL_LEN`] characters of the digest's lowercase
+/// RFC 4648 base32 encoding: 130 bits, lower case because DNS is
+/// case-insensitive, and short enough for one DNS label. It is bound to the
+/// registration key, which the relay already verifies at `Register`, so only
+/// the holder of that key can be served under it, and it does not change when
+/// the node-id rotates. It is an address, not a secret: anyone who sees the
+/// TLS server name learns it, and it reveals nothing about the node-id.
+///
+/// This crate has no crypto dependency, so callers hash and pass the digest.
+pub fn dashboard_label_from_digest(digest: &[u8; 32]) -> String {
+    let mut label = String::with_capacity(DASHBOARD_LABEL_LEN);
+    let mut buffer: u32 = 0;
+    let mut bits = 0;
+    for byte in digest {
+        buffer = (buffer << 8) | u32::from(*byte);
+        bits += 8;
+        while bits >= 5 {
+            bits -= 5;
+            label.push(char::from(BASE32_LOWER[((buffer >> bits) & 31) as usize]));
+            if label.len() == DASHBOARD_LABEL_LEN {
+                return label;
+            }
+        }
+    }
+    label
+}
+
+/// Whether `label` has the shape [`dashboard_label_from_digest`] produces.
+pub fn is_dashboard_label(label: &str) -> bool {
+    label.len() == DASHBOARD_LABEL_LEN && label.bytes().all(|b| BASE32_LOWER.contains(&b))
+}
+
 /// Maximum control-frame size (JSON text) a peer should accept. Control frames
 /// are tiny; anything larger is hostile or a bug.
 pub const MAX_CONTROL_FRAME: usize = 64 * 1024;
@@ -87,6 +140,12 @@ pub enum Control {
         node_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         relay_token: Option<String>,
+        /// The daemon serves its dashboard through this relay
+        /// (`[relay.dashboard]`) and accepts [`PEER_HINT_GATEWAY`] routes.
+        /// Absent (false) from daemons that predate it, so a relay never
+        /// sends them one.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        dashboard: bool,
     },
     /// Relay -> daemon: a fresh anti-replay challenge (base64 of random bytes).
     Challenge { nonce: String },
@@ -121,6 +180,11 @@ pub enum Control {
         conn_id: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         peer_hint: Option<String>,
+        /// For a [`PEER_HINT_GATEWAY`] route, the browser's address as the
+        /// relay saw it (`ip:port`). The daemon serves the connection under
+        /// it - never as a loopback peer - and refuses the route without it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_addr: Option<String>,
     },
     /// Daemon -> relay (accept an `Open`) and relay -> client (route is ready).
     Opened { conn_id: u64 },
@@ -361,11 +425,13 @@ mod tests {
                 daemon_pubkey: "cHVic2V5".into(),
                 node_id: "n1".into(),
                 relay_token: Some("tok".into()),
+                dashboard: false,
             },
             Control::Hello {
                 daemon_pubkey: "cHVic2V5".into(),
                 node_id: "n1".into(),
                 relay_token: None,
+                dashboard: true,
             },
             Control::Challenge {
                 nonce: "bm9uY2U=".into(),
@@ -387,10 +453,17 @@ mod tests {
             Control::Open {
                 conn_id: 7,
                 peer_hint: Some("eu".into()),
+                client_addr: None,
             },
             Control::Open {
                 conn_id: 7,
                 peer_hint: None,
+                client_addr: None,
+            },
+            Control::Open {
+                conn_id: 7,
+                peer_hint: Some(PEER_HINT_GATEWAY.into()),
+                client_addr: Some("203.0.113.7:51000".into()),
             },
             Control::Opened { conn_id: 7 },
             Control::Close {
@@ -415,16 +488,85 @@ mod tests {
     }
 
     #[test]
+    fn frames_from_peers_that_predate_the_dashboard_fields_still_parse() {
+        assert_eq!(
+            Control::from_json(r#"{"t":"hello","daemon_pubkey":"k","node_id":"n"}"#).unwrap(),
+            Control::Hello {
+                daemon_pubkey: "k".into(),
+                node_id: "n".into(),
+                relay_token: None,
+                dashboard: false,
+            }
+        );
+        assert_eq!(
+            Control::from_json(r#"{"t":"open","conn_id":3,"peer_hint":"enroll"}"#).unwrap(),
+            Control::Open {
+                conn_id: 3,
+                peer_hint: Some(PEER_HINT_ENROLL.into()),
+                client_addr: None,
+            }
+        );
+        // And a daemon that never opts in sends exactly what it sent before.
+        let line = Control::Hello {
+            daemon_pubkey: "k".into(),
+            node_id: "n".into(),
+            relay_token: None,
+            dashboard: false,
+        }
+        .to_json();
+        assert!(!line.contains("dashboard"), "{line}");
+    }
+
+    #[test]
+    fn a_dashboard_label_is_a_fixed_short_lower_case_dns_label() {
+        // Known answer: 0x00.. encodes to 'a's, 0xff.. to '7's, and a mixed
+        // digest to the RFC 4648 base32 of its first 17 bytes, cut to 26.
+        assert_eq!(dashboard_label_from_digest(&[0u8; 32]), "a".repeat(26));
+        assert_eq!(dashboard_label_from_digest(&[0xff; 32]), "7".repeat(26));
+        let mut digest = [0u8; 32];
+        digest[..5].copy_from_slice(b"hello");
+        // base32("hello") = "NBSWY3DP"; the zero bytes after it continue as 'a'.
+        assert_eq!(
+            dashboard_label_from_digest(&digest),
+            format!("nbswy3dp{}", "a".repeat(18))
+        );
+        for digest in [[0u8; 32], [0xff; 32], [0x5a; 32]] {
+            let label = dashboard_label_from_digest(&digest);
+            assert!(is_dashboard_label(&label), "{label}");
+            assert!(label.len() <= 63);
+        }
+        for refused in [
+            "",
+            "short",
+            &"A".repeat(26),
+            &"a".repeat(27),
+            &"1".repeat(26),
+        ] {
+            assert!(!is_dashboard_label(refused), "{refused}");
+        }
+    }
+
+    #[test]
     fn hello_omits_none_token() {
         let line = Control::Hello {
             daemon_pubkey: "k".into(),
             node_id: "n".into(),
             relay_token: None,
+            dashboard: false,
         }
         .to_json();
         assert!(
             !line.contains("relay_token"),
             "None token must be omitted: {line}"
+        );
+    }
+
+    #[test]
+    fn from_json_accepts_line_terminated_control_frames() {
+        let frame = Control::Opened { conn_id: 9 }.to_json();
+        assert_eq!(
+            Control::from_json(&format!("{frame}\r\n")).unwrap(),
+            Control::Opened { conn_id: 9 }
         );
     }
 
@@ -478,6 +620,7 @@ mod tests {
             daemon_pubkey: "a".repeat(MAX_CONTROL_FRAME),
             node_id: "node".into(),
             relay_token: None,
+            dashboard: false,
         }
         .to_json();
         assert!(oversized.len() > MAX_CONTROL_FRAME);

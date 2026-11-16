@@ -61,9 +61,9 @@ fn gateway_steering_input(content: String) -> SteeringInput {
 }
 
 #[derive(Debug, Deserialize)]
-struct ConnectParams {
+pub(crate) struct ConnectParams {
     #[serde(rename = "type")]
-    msg_type: String,
+    pub(crate) msg_type: String,
     /// Client-chosen session ID for memory persistence
     #[serde(default)]
     session_id: Option<String>,
@@ -75,11 +75,11 @@ struct ConnectParams {
     capabilities: Vec<String>,
     /// Project root / working directory for this session.
     #[serde(default, alias = "workspaceDir", alias = "workspace_dir")]
-    cwd: Option<String>,
+    pub(crate) cwd: Option<String>,
 }
 
 /// The sub-protocol we support for the chat WebSocket.
-const WS_PROTOCOL: &str = "zeroclaw.v1";
+pub(crate) const WS_PROTOCOL: &str = "zeroclaw.v1";
 
 /// Prefix used in `Sec-WebSocket-Protocol` to carry a bearer token.
 const BEARER_SUBPROTO_PREFIX: &str = "bearer.";
@@ -141,10 +141,32 @@ fn extract_ws_token<'a>(headers: &'a HeaderMap, query_token: Option<&'a str>) ->
 pub async fn handle_ws_chat(
     State(state): State<AppState>,
     dashboard: Option<Extension<Arc<crate::dashboard_session::DashboardAuth>>>,
+    core: Option<Extension<crate::core_rpc::CoreRpc>>,
     Query(params): Query<WsQuery>,
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
+    // A scoped dashboard session chats through the core, as its own
+    // principal, whenever this gateway runs inside the daemon: the core
+    // applies the account's grants and keeps the conversation as its own.
+    // The socket closes when the session ends or no longer admits it. An
+    // administrator session keeps the in-process chat below.
+    if state.pairing.require_pairing()
+        && extract_ws_token(&headers, params.token.as_deref()).is_none()
+        && let Some(caller) = crate::dashboard_core::core_caller(
+            &state,
+            &headers,
+            core,
+            dashboard.clone(),
+            crate::dashboard_core::Reach::ScopedOnly,
+        )
+    {
+        let dashboard = dashboard.map(|Extension(auth)| auth);
+        return crate::chat_core::ws_chat_through_core(
+            caller, state, params, &headers, ws, dashboard,
+        )
+        .await;
+    }
     // A signed-in dashboard session presents no token; the session layer
     // classified it for this upgrade, the dashboard's own origin included.
     // The in-process chat runs as the operator, so only an administrator
@@ -253,7 +275,7 @@ pub async fn handle_ws_chat(
     .into_response()
 }
 
-fn websocket_ping_interval(
+pub(crate) fn websocket_ping_interval(
     config: &zeroclaw_config::schema::Config,
 ) -> Option<tokio::time::Interval> {
     let seconds = config.gateway.websocket_ping_interval_secs;
@@ -281,8 +303,11 @@ const WS_CLOSE_HANDSHAKE_GRACE: Duration = Duration::from_secs(2);
 /// message with a refusal, and clients reconnect on a close, not on an error
 /// frame. The peer's close is awaited briefly: dropping the socket straight
 /// after sending can reset the connection and lose the frame.
-async fn close_for_reconnect<S, R>(sender: &mut S, receiver: &mut R, reason: &'static str)
-where
+pub(crate) async fn close_for_reconnect<S, R>(
+    sender: &mut S,
+    receiver: &mut R,
+    reason: &'static str,
+) where
     S: futures_util::Sink<Message> + Unpin,
     R: futures_util::Stream<Item = Result<Message, axum::Error>> + Unpin,
 {
@@ -388,13 +413,13 @@ where
 /// waits for a new signal rather than reading the current value: the channel
 /// outlives one gateway instance, so a value left by an earlier stop says
 /// nothing about this one. Never resolves if the signal can no longer arrive.
-async fn gateway_stop_signal(stopping: &mut tokio::sync::watch::Receiver<bool>) {
+pub(crate) async fn gateway_stop_signal(stopping: &mut tokio::sync::watch::Receiver<bool>) {
     if stopping.changed().await.is_err() {
         std::future::pending::<()>().await;
     }
 }
 
-async fn tick_websocket_ping(interval: &mut Option<tokio::time::Interval>) {
+pub(crate) async fn tick_websocket_ping(interval: &mut Option<tokio::time::Interval>) {
     if let Some(interval) = interval.as_mut() {
         interval.tick().await;
     } else {
@@ -1649,7 +1674,7 @@ fn has_assistant_chat_message(messages: &[zeroclaw_providers::ConversationMessag
     })
 }
 
-fn history_trimmed_ws_frame(
+pub(crate) fn history_trimmed_ws_frame(
     dropped_messages: usize,
     dropped_turns: usize,
     kept_turns: usize,
@@ -1738,7 +1763,7 @@ fn needs_onboarding_ws_error(
     }))
 }
 
-fn first_chat_message_content(text: &str) -> Option<String> {
+pub(crate) fn first_chat_message_content(text: &str) -> Option<String> {
     let parsed = serde_json::from_str::<serde_json::Value>(text).ok()?;
     (parsed["type"].as_str() == Some("message"))
         .then(|| parsed["content"].as_str().unwrap_or("").to_string())
@@ -1942,6 +1967,67 @@ impl UsageFold {
     fn total_cost_usd(entries: &[ProviderUsageEntry]) -> Option<f64> {
         let sum: f64 = entries.iter().map(|e| e.cost_usd).sum();
         if sum > 0.0 { Some(sum) } else { None }
+    }
+}
+
+/// A per-turn display projection of the latest real history trim. The trim
+/// event is authoritative for this retained-context estimate; `UsageFold`
+/// remains the provider-measured ledger. Any later accepted call (even one
+/// without usage) supersedes the estimate. Rejected billable attempts do not.
+///
+/// Both chat relays keep one: the in-process relay observes `TurnEvent`s, and
+/// the scoped relay in `chat_core` observes the core's `session/update`
+/// notifications, where `context_usage` is sent for exactly the accepted
+/// calls. Both go through [`Self::accepted_call`] and [`Self::trimmed`].
+#[derive(Debug, Default)]
+pub(crate) struct ContextDisplay {
+    trimmed_input: Option<(u64, Option<&'static str>)>,
+}
+
+impl ContextDisplay {
+    fn observe(&mut self, event: &zeroclaw_api::agent::TurnEvent) {
+        use zeroclaw_api::agent::TurnEvent;
+        match event {
+            TurnEvent::Usage { accepted: true, .. } => self.accepted_call(),
+            TurnEvent::HistoryTrimmed {
+                dropped_messages,
+                tokens_after,
+                tokens_after_source,
+                ..
+            } => self.trimmed(*dropped_messages, *tokens_after, *tokens_after_source),
+            _ => {}
+        }
+    }
+
+    /// A later accepted call measured the context again.
+    pub(crate) fn accepted_call(&mut self) {
+        self.trimmed_input = None;
+    }
+
+    /// A trim notice. Only one that dropped history and reports what was
+    /// kept moves the displayed count: a zero-drop floor notice describes a
+    /// rejected request, and a message-limit trim has no token count.
+    pub(crate) fn trimmed(
+        &mut self,
+        dropped_messages: usize,
+        tokens_after: Option<u64>,
+        tokens_after_source: Option<zeroclaw_api::agent::TokenCountSource>,
+    ) {
+        if dropped_messages == 0 {
+            return;
+        }
+        if let Some(after) = tokens_after {
+            self.trimmed_input = Some((after, tokens_after_source.map(|source| source.as_str())));
+        }
+    }
+
+    pub(crate) fn add_to_done(&self, done: &mut serde_json::Value) {
+        if let Some((input, source)) = self.trimmed_input {
+            done["context_input_tokens"] = input.into();
+            if let Some(source) = source {
+                done["context_input_tokens_source"] = source.into();
+            }
+        }
     }
 }
 
@@ -2160,6 +2246,7 @@ async fn process_chat_message(
     // including rejected ones) and the accepted-serving snapshot (accepted
     // events only) that the done/cancel frames render.
     let mut usage_fold = UsageFold::default();
+    let mut context_display = ContextDisplay::default();
 
     // The socket is a viewer of the turn, not its owner. Once the client is
     // gone (close frame, transport error, end of stream, or a failed write)
@@ -2353,6 +2440,7 @@ async fn process_chat_message(
                             }
                                 event_opt = event_rx.recv() => {
                                 let Some(event) = event_opt else { break };
+                                context_display.observe(&event);
                                 let ws_msg = match event {
             usage_event @ TurnEvent::Usage { .. } => {
                                         // The fold below is the production event path under
@@ -2673,7 +2761,8 @@ async fn process_chat_message(
             // transcript. Privacy: only the model names cross the wire — the
             // classifier `category` (and any refusal explanation) never do.
             let safeguard_notice = outcome.safeguard_fallback.as_ref();
-            let done = build_done_frame_json(&meta, &usage_by_provider_vec);
+            let mut done = build_done_frame_json(&meta, &usage_by_provider_vec);
+            context_display.add_to_done(&mut done);
             for frame in success_terminal_ws_frames(safeguard_notice, done) {
                 let _ = sender.send(Message::Text(frame.to_string().into())).await;
             }
@@ -2919,6 +3008,108 @@ mod tests {
             done_frame_context_limits(None, Some(7_200), Some(8_000), Some(fallback)),
             (7_200, Some(8_000)),
         );
+    }
+
+    fn context_trim(dropped_messages: usize, after: Option<u64>) -> zeroclaw_api::agent::TurnEvent {
+        zeroclaw_api::agent::TurnEvent::HistoryTrimmed {
+            dropped_messages,
+            dropped_turns: usize::from(dropped_messages > 0),
+            kept_turns: 1,
+            reason: "context token budget exceeded".into(),
+            token_budget: Some(128_000),
+            tokens_before: Some(180_000),
+            tokens_after: after,
+            tokens_before_source: Some(zeroclaw_api::agent::TokenCountSource::Provider),
+            tokens_after_source: Some(zeroclaw_api::agent::TokenCountSource::Calibrated),
+            unsatisfiable_floor: Some(true),
+            retained_context: None,
+        }
+    }
+
+    #[test]
+    fn history_trim_updates_display_without_rewriting_measured_usage() {
+        let mut fold = UsageFold::default();
+        let mut display = ContextDisplay::default();
+        let usage = usage_event(
+            "openai.default",
+            "model-a",
+            Some(180_000),
+            None,
+            Some(64),
+            Some(0.5),
+            true,
+        );
+        display.observe(&usage);
+        fold.apply(usage);
+        let trim = context_trim(4, Some(90_000));
+        display.observe(&trim);
+        fold.apply(trim);
+
+        // A real trim may remain at a floor: its count is useful even though
+        // the notice must not claim the request fits the configured budget.
+        assert_eq!(display.trimmed_input, Some((90_000, Some("calibrated"))));
+        assert_eq!(fold.last_input_tokens, Some(180_000));
+        assert_eq!(fold.last_context_token_budget, None);
+        assert_eq!(fold.total_input_tokens, Some(180_000));
+        assert_eq!(fold.total_output_tokens, Some(64));
+        let entries = fold.take_sorted_entries();
+        assert_eq!(entries[0].input_tokens, 180_000);
+        assert_eq!(UsageFold::total_cost_usd(&entries), Some(0.5));
+    }
+
+    #[test]
+    fn context_display_ignores_zero_drop_and_message_only_trims() {
+        let mut display = ContextDisplay::default();
+        display.observe(&context_trim(0, Some(80_000)));
+        display.observe(&context_trim(2, None));
+        assert_eq!(display.trimmed_input, None);
+        let mut done = serde_json::json!({"type": "done", "last_input_tokens": null});
+        display.add_to_done(&mut done);
+        assert!(done.get("context_input_tokens").is_none());
+        assert!(done.get("context_input_tokens_source").is_none());
+
+        display.observe(&context_trim(4, Some(90_000)));
+        display.observe(&context_trim(0, Some(10_000)));
+        display.observe(&context_trim(2, None));
+        assert_eq!(display.trimmed_input, Some((90_000, Some("calibrated"))));
+        display.observe(&context_trim(2, Some(70_000)));
+        display.add_to_done(&mut done);
+        assert_eq!(done["context_input_tokens"], 70_000);
+        assert_eq!(done["context_input_tokens_source"], "calibrated");
+        assert!(done["last_input_tokens"].is_null());
+    }
+
+    #[test]
+    fn context_display_is_cleared_by_every_accepted_usage_but_not_rejected_usage() {
+        for input in [Some(70_000), None] {
+            let mut display = ContextDisplay::default();
+            display.observe(&context_trim(4, Some(90_000)));
+            display.observe(&usage_event(
+                "rejected.route",
+                "rejected",
+                Some(500),
+                None,
+                Some(20),
+                Some(0.1),
+                false,
+            ));
+            assert_eq!(display.trimmed_input, Some((90_000, Some("calibrated"))));
+            // Includes an accepted cached-only response with no input count.
+            display.observe(&usage_event(
+                "accepted.route",
+                "next",
+                input,
+                Some(100),
+                None,
+                None,
+                true,
+            ));
+            assert_eq!(display.trimmed_input, None);
+            let mut done = serde_json::json!({"type": "done"});
+            display.add_to_done(&mut done);
+            assert!(done.get("context_input_tokens").is_none());
+            assert!(done.get("context_input_tokens_source").is_none());
+        }
     }
 
     #[test]
@@ -3424,13 +3615,17 @@ data: {{\"type\":\"message_stop\"}}\n\n"
 
     impl ParkedTurnFixture {
         async fn spawn() -> Self {
-            Self::spawn_with(None, |_| {}).await
+            Self::spawn_with(None, None, |_| {}).await
+        }
+
+        async fn spawn_with_context(context: Option<(u64, usize, usize)>) -> Self {
+            Self::spawn_with(None, context, |_| {}).await
         }
 
         /// The same gateway with dashboard sign-in offering `corp` at
         /// `issuer`, under the session layer, with `/auth/sign-out` served.
         async fn spawn_signed_in(issuer: &str) -> Self {
-            Self::spawn_with(Some(issuer), |_| {}).await
+            Self::spawn_with(Some(issuer), None, |_| {}).await
         }
 
         /// A signed-in fixture whose config `adjust` changes before the
@@ -3439,11 +3634,12 @@ data: {{\"type\":\"message_stop\"}}\n\n"
             issuer: &str,
             adjust: impl FnOnce(&mut zeroclaw_config::schema::Config),
         ) -> Self {
-            Self::spawn_with(Some(issuer), adjust).await
+            Self::spawn_with(Some(issuer), None, adjust).await
         }
 
         async fn spawn_with(
             sign_in: Option<&str>,
+            context: Option<(u64, usize, usize)>,
             adjust: impl FnOnce(&mut zeroclaw_config::schema::Config),
         ) -> Self {
             let (request_seen_tx, request_seen) =
@@ -3470,9 +3666,14 @@ data: {{\"type\":\"message_stop\"}}\n\n"
                         );
                         let head = futures_util::stream::once(async move {
                             let _ = request_seen_tx.send(request);
-                            Ok::<_, std::io::Error>(axum::body::Bytes::from_static(
-                                PARKED_STREAM_HEAD.as_bytes(),
-                            ))
+                            let head = match context {
+                                Some((reported, _, _)) if index == 1 => PARKED_STREAM_HEAD.replace(
+                                    "\"input_tokens\":1",
+                                    &format!("\"input_tokens\":{reported}"),
+                                ),
+                                _ => PARKED_STREAM_HEAD.to_string(),
+                            };
+                            Ok::<_, std::io::Error>(axum::body::Bytes::from(head))
                         });
                         let tail = futures_util::stream::once(async move {
                             let _ = released_rx.wait_for(|released| *released >= index).await;
@@ -3539,6 +3740,21 @@ data: {{\"type\":\"message_stop\"}}\n\n"
                 },
             );
 
+            if let Some((_, budget, window)) = context {
+                config
+                    .runtime_profiles
+                    .get_mut("fixture")
+                    .expect("fixture runtime")
+                    .max_context_tokens = Some(budget);
+                config
+                    .providers
+                    .models
+                    .anthropic
+                    .get_mut("fixture")
+                    .expect("fixture provider")
+                    .base
+                    .context_window = Some(window);
+            }
             if let Some(issuer) = sign_in {
                 crate::dashboard_session::test_support::add_sign_in(&mut config, issuer);
             }
@@ -4503,6 +4719,93 @@ data: {\"type\":\"message_stop\"}\n\n",
         );
         drop(client);
         fixture.shutdown();
+    }
+
+    #[test]
+    fn websocket_terminal_trim_survives_done_without_changing_usage_or_next_turn() {
+        run_ws_regression("ws-terminal-context-trim", || async {
+            // The initial estimate fits. A deliberately larger measured usage
+            // calibrates the terminal retained-history trim after the reply.
+            let mut fixture =
+                ParkedTurnFixture::spawn_with_context(Some((180_000, 100_000, 200_000))).await;
+            let session_id = "terminal-context-trim";
+            let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
+            fixture
+                .backend
+                .replace_conversation_state(
+                    &session_key,
+                    &[
+                        zeroclaw_providers::ChatMessage::user("old request ".repeat(2_000)),
+                        zeroclaw_providers::ChatMessage::assistant("old reply ".repeat(2_000)),
+                    ],
+                    false,
+                )
+                .expect("seed prior turn");
+            let (mut client, _) = fixture.connect(session_id).await;
+            let request = fixture
+                .start_parked_turn(&mut client, "give a short final answer")
+                .await;
+            assert!(
+                provider_messages(&request)
+                    .iter()
+                    .any(|(_, text)| text.contains("old request")),
+                "old turn must reach the provider before the terminal trim"
+            );
+            fixture.release_next();
+            let mut trims = Vec::new();
+            let done = loop {
+                let frame = next_text_frame(&mut client).await;
+                match frame["type"].as_str() {
+                    Some("history_trimmed") => trims.push(frame),
+                    Some("done") => break frame,
+                    Some("error") => panic!("unexpected turn error: {frame}"),
+                    _ => {}
+                }
+            };
+            let trim = trims.last().expect("real terminal trim reaches socket");
+            assert!(trim["dropped_messages"].as_u64().expect("dropped count") > 0);
+            assert_eq!(trim["tokens_after_source"], "calibrated");
+            assert_eq!(done["context_input_tokens"], trim["tokens_after"]);
+            assert_eq!(done["context_input_tokens_source"], "calibrated");
+            assert_eq!(done["last_input_tokens"], 180_000);
+            assert_eq!(done["input_tokens"], 180_000);
+            assert_eq!(done["usage_by_provider"][0]["input_tokens"], 180_000);
+            assert_eq!(done["max_context_tokens"], 100_000);
+            assert_eq!(done["model_context_window"], 200_000);
+            assert_ne!(done["context_input_tokens"], done["last_input_tokens"]);
+            // Optional validation artifact for replay through the actual web
+            // page. No production setting or default test-side file write.
+            if let Some(path) = std::env::var_os("ZEROCLAW_CONTEXT_METER_TEST_FRAMES_PATH") {
+                trims.push(done.clone());
+                std::fs::write(
+                    path,
+                    serde_json::to_vec_pretty(&trims).expect("serialize WS capture"),
+                )
+                .expect("write WS capture");
+            }
+            fixture.wait_for_turn_to_settle(&session_key).await;
+
+            // A fresh turn on the same socket must not inherit the override.
+            fixture
+                .start_parked_turn(&mut client, "one more short answer")
+                .await;
+            fixture.release_next();
+            let next_done = loop {
+                let frame = next_text_frame(&mut client).await;
+                match frame["type"].as_str() {
+                    Some("done") => break frame,
+                    Some("history_trimmed" | "error") => {
+                        panic!("unexpected next-turn frame: {frame}")
+                    }
+                    _ => {}
+                }
+            };
+            assert_eq!(next_done["last_input_tokens"], 1);
+            assert!(next_done.get("context_input_tokens").is_none());
+            assert!(next_done.get("context_input_tokens_source").is_none());
+            fixture.wait_for_turn_to_settle(&session_key).await;
+            fixture.shutdown();
+        });
     }
 
     #[test]

@@ -791,7 +791,8 @@ impl ScopedToolRegistry {
             channel_room_handle,
             mut unfiltered_tool_arcs,
             capability_slots: _,
-            // The Agent captures this before assembly for owner binding.
+            // The Agent captures the concrete delegate before assembly, for owner
+            // binding and to bind descendant registries to live RPC authority.
             delegate_tool: _,
         } = built;
 

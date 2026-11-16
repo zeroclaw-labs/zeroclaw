@@ -1497,13 +1497,16 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
                 prefix={prefix}
                 enabled={entryValue(enabledEntry) === "true"}
                 onChange={(next) => {
+                  const nextStr = next ? "true" : "false";
                   setEntries((prev) =>
                     prev.map((e) =>
                       e.path === enabledEntry.path
-                        ? { ...e, value: next, populated: true }
+                        ? { ...e, populated: true, value: nextStr }
                         : e,
                     ),
                   );
+                  setDraft((d) => ({ ...d, [enabledEntry.path]: nextStr }));
+                  configDraft.clearDraft(enabledEntry.path);
                 }}
               />
             )}
