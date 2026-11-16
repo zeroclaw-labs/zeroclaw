@@ -291,6 +291,61 @@ fn manifest_schema_options<'a>() -> jsonschema::ValidationOptions<'a> {
     )
 }
 
+/// Check one secret during write-only provisioning. Other required fields
+/// may still be unconfigured, so the complete object is checked at use time.
+pub fn validate_secret_property(schema: &Value, name: &str, value: &str) -> bool {
+    let Some(properties) = schema.get("properties") else {
+        return false;
+    };
+    if !properties
+        .get(name)
+        .and_then(|property| property.get("x-secret"))
+        .is_some_and(|secret| secret == &Value::Bool(true))
+    {
+        return false;
+    }
+    let pointer = name.replace('~', "~0").replace('/', "~1");
+    let mut projected = schema.clone();
+    let Some(root) = projected.as_object_mut() else {
+        return false;
+    };
+    root.retain(|key, _| matches!(key.as_str(), "properties" | "$defs" | "definitions"));
+    root.insert(
+        "$ref".into(),
+        Value::String(format!("#/properties/{pointer}")),
+    );
+    manifest_schema_options()
+        .build(&projected)
+        .is_ok_and(|validator| validator.is_valid(&Value::String(value.to_owned())))
+}
+
+#[cfg(test)]
+#[test]
+fn write_only_provisioning_checks_secret_refs_and_allows_partial_setup() {
+    let schema = serde_json::json!({
+        "type": "object",
+        "required": ["secret", "other"],
+        "properties": {
+            "secret": { "x-secret": true, "$ref": "#/$defs/pem" },
+            "other": { "type": "string" }
+        },
+        "$defs": { "pem": { "type": "string", "pattern": "^-----BEGIN ", "minLength": 16 } }
+    });
+
+    assert!(validate_secret_property(
+        &schema,
+        "secret",
+        "-----BEGIN TEST KEY"
+    ));
+    assert!(!validate_secret_property(&schema, "secret", "-----BEGIN "));
+    assert!(!validate_secret_property(
+        &schema,
+        "secret",
+        "plaintext is invalid"
+    ));
+    assert!(!validate_secret_property(&schema, "other", "not a secret"));
+}
+
 fn compile_manifest_config(
     manifest: &PluginManifest,
 ) -> Result<Option<jsonschema::Validator>, PluginError> {
