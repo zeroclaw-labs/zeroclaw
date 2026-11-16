@@ -63,6 +63,8 @@ pub fn record_task_spawn(module: &'static str, file: &'static str, line: u32) {
             ::serde_json::json!({
                 "task_site": format!("{file}:{line}"),
                 "task_module": module,
+                "_file": file,
+                "_line": line,
             })
         ),
         "task spawned"
@@ -87,6 +89,8 @@ pub fn record_task_complete(
             .with_attrs(::serde_json::json!({
                 "task_site": format!("{file}:{line}"),
                 "task_module": module,
+                "_file": file,
+                "_line": line,
             })),
         "task complete"
     );
@@ -246,5 +250,39 @@ mod tests {
         .await;
 
         assert_eq!(crate::current_plugin_wake_depth(), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn spawn_lifecycle_events_preserve_caller_file_and_line() {
+        let _hook_lock = zeroclaw_log::__private_test_hook_lock();
+        let mut rx = zeroclaw_log::subscribe_or_install();
+        let subscriber = Registry::default().with(zeroclaw_log::LogCaptureLayer);
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let expected_file = file!();
+        let (expected_line, handle) = (line!(), crate::spawn!(async { 7_u8 }));
+        assert_eq!(handle.await.unwrap(), 7);
+
+        let mut matched = Vec::new();
+        while let Ok(parsed) = rx.try_recv() {
+            if parsed["attributes"]["task_site"] == format!("{expected_file}:{expected_line}") {
+                matched.push(parsed);
+            }
+        }
+        assert_eq!(
+            matched.len(),
+            2,
+            "expected Spawn and Complete events for call site"
+        );
+        for event in &matched {
+            assert_eq!(
+                event["attributes"]["_file"], expected_file,
+                "_file must point to the spawn! call site, not the helper: {event}"
+            );
+            assert_eq!(
+                event["attributes"]["_line"], expected_line,
+                "_line must point to the spawn! call site, not the helper: {event}"
+            );
+        }
     }
 }
