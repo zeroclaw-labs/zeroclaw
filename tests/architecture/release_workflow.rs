@@ -613,7 +613,7 @@ fn immutable_stable_release_recipe_has_real_command_and_failure_baselines() {
     let outside = format!("{}{}", &release[..start], &release[end..]);
     assert_eq!(
         format!("{:x}", Sha256::digest(outside.as_bytes())),
-        "ae02127aa7e71625aeee69152e08a31bf2d75aaceb6a770e6865fc47264c4c70"
+        "cab305f9253d8efa94a63e4807cace4106c92cc53c71ef0c9a54c73e1fc12815"
     );
     let matrix = yaml_block(build, "      matrix:\n");
     for context in RELEASE_RECIPE_CONTEXTS {
@@ -1125,7 +1125,7 @@ fn assert_manual_qualification_wiring(manual: &str) {
         assert!(job.contains("needs: [release-tool-smoke"));
         assert!(job.contains("if: ${{ inputs.qualification_profile == 'stable-gnu-ubuntu22' }}"));
         assert!(job.contains("dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537"));
-        assert!(job.contains("toolchain: 1.99.1"));
+        assert!(job.contains("toolchain: 1.100.0"));
         assert!(!job.contains("CARGO_INCREMENTAL:"));
         let receipt_header = match role {
             "web" => "      - name: Record same-run web inputs\n",
