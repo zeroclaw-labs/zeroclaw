@@ -101,7 +101,7 @@ impl SecretWrite {
         };
         let managed;
         let token = if self.token.is_empty() {
-            let path = std::env::var_os(WRITER_TOKEN_PATH)
+            let path = writer_token_path()
                 .filter(|path| std::path::Path::new(path).is_absolute())
                 .ok_or(disabled)?;
             // OpenBao Agent may replace its sink when the lease changes.
@@ -192,8 +192,12 @@ impl SecretWrite {
 
 const WRITER_TOKEN_PATH: &str = "ZEROCLAW_OPENBAO_WRITE_TOKEN_FILE";
 
+fn writer_token_path() -> Option<std::ffi::OsString> {
+    std::env::var_os(WRITER_TOKEN_PATH).or_else(|| std::env::var_os("BAO_TOKEN_PATH"))
+}
+
 pub(crate) fn managed_writer() -> bool {
-    std::env::var_os(WRITER_TOKEN_PATH)
+    writer_token_path()
         .is_some_and(|path| std::path::Path::new(&path).is_absolute())
 }
 

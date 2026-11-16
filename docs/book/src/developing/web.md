@@ -111,14 +111,12 @@ Set `BAO_CACERT` to a PEM CA bundle if the vault uses a private CA.
 
 For managed writes, set `ZEROCLAW_OPENBAO_WRITE_TOKEN_FILE` to the absolute
 path of a dedicated, short-lived write token managed by OpenBao Agent or an
-equivalent deployment service. The dashboard then asks the authenticated
+equivalent deployment service. If omitted, the gateway can use the configured
+OpenBao Agent token file from BAO_TOKEN_PATH. The dashboard asks the authenticated
 operator for the value only. The gateway reads the token file on each
 write, so lease renewal and replacement do not require a gateway restart.
 Protect the file and the writer identity from agent tools and untrusted
-processes. Use a separate gateway execution boundary if agent tools can
-otherwise read the file. Keep the read-side identity separate. With no
-managed writer configured, the operator supplies a short-lived token per
-write. Give that token `create` for new records or `patch` plus `read`
+processes. An explicitly shared OpenBao identity needs scoped permissions for both reads and writes. Use a separate writer identity where the gateway has its own execution boundary. Without a server-side writer, the WebUI can still link an existing secret without issuing an OpenBao write. Give the writer token `create` for new records or `patch` plus `read`
 on the metadata endpoint for rotations, restricted to the configured
 prefix. The gateway sends the value and token over verified HTTPS and
 persists only the encrypted reference. New records use KV v2 CAS zero.

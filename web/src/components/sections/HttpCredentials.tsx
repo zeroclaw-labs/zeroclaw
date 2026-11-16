@@ -39,10 +39,10 @@ export default function HttpCredentials({ kind }: { kind: HttpCredentialKind }) 
   const [linkExisting, setLinkExisting] = useState(false);
   const [nameDraft, setNameDraft] = useState("");
   const [referenceOverride, setReferenceOverride] = useState<string>();
-  const canWriteOpenBao = source === "open_bao" && !!catalog?.openbao_write_prefix;
-  const managedWriter = source === "open_bao" && !!catalog?.openbao_managed_writer;
+  const hasOpenBaoPrefix = source === "open_bao" && !!catalog?.openbao_write_prefix;
+  const canWriteOpenBao = hasOpenBaoPrefix && !!catalog?.openbao_managed_writer;
   const field = { totp: "seed", ssh_key: "private_key", api_key: "token", user_password: "password" }[kind];
-  const defaultReference = canWriteOpenBao && editing === "new" && /^[A-Za-z0-9_-]+$/.test(nameDraft)
+  const defaultReference = hasOpenBaoPrefix && editing === "new" && /^[A-Za-z0-9_-]+$/.test(nameDraft)
     ? `${catalog?.openbao_write_prefix}/${nameDraft}/${field}` : "";
 
   const [busy, setBusy] = useState(false);
@@ -83,12 +83,11 @@ export default function HttpCredentials({ kind }: { kind: HttpCredentialKind }) 
     const raw = String(data.get("external_value") ?? "");
     const value = kind === "totp" ? raw.replace(/[\s-]+/g, "").replace(/=+$/, "").toUpperCase()
       : kind === "ssh_key" ? raw.trim() : raw;
-    const token = String(data.get("writer_token") ?? "").trim();
-    if (canWriteOpenBao && !linkExisting && ((editing === "new" && !value.trim()) || (value && !managedWriter && !token))) {
-      setMessage(t(managedWriter ? "http_credentials.managed_value_required" : "http_credentials.write_required"));
+    if (canWriteOpenBao && !linkExisting && editing === "new" && !value.trim()) {
+      setMessage(t("http_credentials.managed_value_required"));
       return;
     }
-    const write = canWriteOpenBao && !linkExisting && value !== "" ? { value, ...(managedWriter ? {} : { token }) } : undefined;
+    const write = canWriteOpenBao && !linkExisting && value !== "" ? { value } : undefined;
     const destinations = parseSshDestinations(String(data.get("destinations") ?? ""));
     const auth = kind === "totp"
       ? { kind, seed: source === "local" ? secret.replace(/[\s-]+/g, "").replace(/=+$/, "").toUpperCase() : secret.trim() } as const
@@ -213,10 +212,6 @@ export default function HttpCredentials({ kind }: { kind: HttpCredentialKind }) 
                 : <input className={inputClass} name="external_value" type="password" autoComplete="new-password" required={editing === "new"} />}
             </label>
             {editing !== "new" && <p className="text-sm">{t("http_credentials.preserve_external")}</p>}
-            {!managedWriter && <label className="block space-y-1">
-              <span>{t("http_credentials.writer_token")}</span>
-              <input className={inputClass} name="writer_token" type="password" autoComplete="off" required={editing === "new"} />
-            </label>}
           </>}
           {source !== "local" && !canWriteOpenBao && <p className="text-sm">{t("http_credentials.reference_only")}</p>}
           <div className="flex flex-wrap gap-2">
