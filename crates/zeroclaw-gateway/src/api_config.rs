@@ -1556,8 +1556,10 @@ pub async fn mutate_http_credential(
                     {
                         return StatusCode::BAD_REQUEST.into_response();
                     }
-                    credential.http_allowed =
-                        previous.http_allowed && previous.origin == credential.origin;
+                    credential.http_allowed = previous.http_allowed
+                        && (previous.origin == credential.origin
+                            || ScopedHttpCredential::https_origin(&credential.origin)
+                                .is_some_and(|origin| origin == previous.origin));
                     if let (
                         ScopedHttpAuth::SshKey {
                             destinations: current,
