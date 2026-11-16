@@ -15,7 +15,7 @@ Common failure mode this guide targets:
 If Matrix appears connected but there's no reply, validate these first:
 
 1. Sender is in the agent's peer set (for testing: `external_peers = ["*"]`).
-2. Bot account has joined the exact target room.
+2. Bot account has joined the exact target room: invite it from your client, see [Adding the bot to a room](#adding-the-bot-to-a-room).
 3. Credentials belong to the bot account (`whoami` check on the token path, see [§5C](#c-token-and-identity)).
 4. Encrypted room can be decrypted: `recovery_key` set (recommended) or keys shared to the bot device.
 5. Daemon was restarted after config changes.
@@ -24,11 +24,36 @@ If Matrix appears connected but there's no reply, validate these first:
 
 Before testing message flow:
 
-1. The bot account is joined to the target room.
+1. The bot account is joined to the target room (see [Adding the bot to a room](#adding-the-bot-to-a-room)).
 2. Credentials authenticate the bot account: either `user_id` + `password` (recommended, see [§2](#2-configuration)) or an `access_token` (token path, [§3](#3-token-path-alternative-obtaining-access_token-and-device_id)).
 3. `allowed_rooms` includes the target room (or is empty to allow all rooms the bot has joined). Entries are matched literally against the canonical room ID (`!room:server`) of each incoming message, so list canonical room IDs here: ZeroClaw does **not** resolve a `#alias:server` entry for this allowlist. (Aliases are resolved only for outbound delivery targets such as cron `delivery.to`.) Find a room's canonical ID in its client (in Element: Room settings → Advanced → Internal room ID).
 4. A peer group authorizes the sender (`external_peers = ["*"]` for open testing, see [§6](#b-sender-allowlist-peer-groups)).
 5. For E2EE rooms, the bot can decrypt: a `recovery_key` (recommended) restores keys automatically, or keys are shared to the bot device manually.
+
+### Adding the bot to a room
+
+Invite the bot's user ID (for example `@zeroclaw:example.org`) to the room
+from any Matrix client, the same way you would invite a person (in Element:
+room info → People → Invite). A direct message works the same way: start a
+DM with the bot's user ID. While the daemon is running, ZeroClaw accepts the
+invite and joins the room on its own.
+
+ZeroClaw accepts an invite only when both of these hold, which are the same
+checks it applies to every inbound message:
+
+- The **inviter** is in the agent's peer set ([Who can talk to the agent](#who-can-talk-to-the-agent)).
+- The room is listed in `allowed_rooms`, or `allowed_rooms` is empty.
+
+Any other invite is declined silently: it stays pending in the room, and the
+inviter gets no rejection. ZeroClaw does not retry it later, so after fixing
+the peer set or `allowed_rooms`, cancel the pending invite and send a new one
+(see [§5A](#a-room-and-membership)).
+
+> **Open peer sets admit anyone.** With `external_peers = ["*"]` and an empty
+> `allowed_rooms`, any Matrix user on any federated homeserver can invite the
+> bot into a room of their choosing and talk to it there. Keep `*` for
+> testing. For a long-running bot, list explicit user IDs in the peer group,
+> restrict `allowed_rooms`, or both.
 
 ## 2. Configuration
 
@@ -153,7 +178,7 @@ Work through in order.
 
 ### A. Room and membership
 
-- Confirm the bot account has joined the room.
+- Confirm the bot account has joined the room. If the bot's invite is still pending, ZeroClaw declined it: the inviter is not in the peer set, or the room is not in a non-empty `allowed_rooms`. Declined invites are not retried. Fix the config, restart the daemon, then cancel the pending invite and invite the bot again. With debug logging on ([§6](#6-debug-logging)), each declined invite logs `matrix: decline invite from non-allowed sender or room` with the inviter and room ID.
 - If you put a room in `allowed_rooms`, it must be the **canonical** room ID (`!room:server`), not a `#alias:server`. Aliases are not resolved for the allowlist, so an alias entry silently matches nothing. Find the canonical ID in Element via Room settings → Advanced → Internal room ID.
 
 ### B. Sender allowlist (peer groups)

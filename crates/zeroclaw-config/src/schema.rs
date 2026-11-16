@@ -18114,6 +18114,8 @@ pub struct MatrixConfig {
     #[serde(default)]
     pub device_id: Option<String>,
     /// Allowed Matrix room IDs. Empty = allow all rooms the bot has joined.
+    /// Also gates room invites: an invite from an allowed peer is accepted
+    /// only for a listed room (or any room when empty).
     /// Entries are matched literally against the canonical room ID
     /// (`!abc:server`) of each incoming message; `#room:server` aliases are
     /// not resolved for this allowlist (they are resolved only for outbound

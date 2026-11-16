@@ -2107,6 +2107,7 @@ mod inbound {
                 relation::Annotation,
                 room::{
                     encrypted::OriginalSyncRoomEncryptedEvent,
+                    member::{MembershipState, StrippedRoomMemberEvent},
                     message::{MessageType, OriginalSyncRoomMessageEvent},
                 },
             },
@@ -2153,6 +2154,7 @@ mod inbound {
     ) -> (
         matrix_sdk::event_handler::EventHandlerDropGuard,
         matrix_sdk::event_handler::EventHandlerDropGuard,
+        matrix_sdk::event_handler::EventHandlerDropGuard,
     ) {
         let handler_ctx = ctx.clone();
         let message_handler = client.add_event_handler(
@@ -2190,11 +2192,26 @@ mod inbound {
             });
         let encrypted_guard = client.event_handler_drop_guard(encrypted_handler);
 
-        (message_guard, encrypted_guard)
+        // matrix-sdk delivers an invite as the invited room's stripped
+        // `m.room.member` state event ("invites are special" in the
+        // add_event_handler docs). Without an acceptor here the bot stayed in
+        // `invited` state forever and silently missed every message in rooms
+        // it was invited to — the SDK never joins on the user's behalf.
+        let invite_ctx = ctx.clone();
+        let invite_handler =
+            client.add_event_handler(move |ev: StrippedRoomMemberEvent, room: Room| {
+                let ctx = invite_ctx.clone();
+                async move {
+                    handle_room_invite(&ctx, &ev, room);
+                }
+            });
+        let invite_guard = client.event_handler_drop_guard(invite_handler);
+
+        (message_guard, encrypted_guard, invite_guard)
     }
 
     pub(super) async fn run_sync_loop(client: Client, ctx: HandlerCtx) -> anyhow::Result<()> {
-        let (_message_handler_guard, _encrypted_handler_guard) =
+        let (_message_handler_guard, _encrypted_handler_guard, _invite_handler_guard) =
             register_event_handlers(&client, &ctx);
 
         ::zeroclaw_log::record!(
@@ -2274,6 +2291,82 @@ mod inbound {
                 "matrix: failed to react ❓ on undecryptable event"
             );
         }
+    }
+
+    /// True when an invite of the bot into `room_id` by `inviter` should be
+    /// auto-accepted. Mirrors the message-path gate: the inviter must be an
+    /// allowed peer and, when `allowed_rooms` is non-empty, the room must be
+    /// listed. An empty peer set denies everyone, `["*"]` accepts anyone —
+    /// identical semantics to inbound messages, so a sender who could not talk
+    /// to the bot in a joined room cannot pull the bot into a new one either.
+    /// Pure so the gate is unit-testable without a homeserver double.
+    pub(super) fn invite_admission(
+        allowed_peers: &[String],
+        allowed_rooms: &[String],
+        room_id: &str,
+        inviter: &str,
+    ) -> bool {
+        allowlist::user_allowed(allowed_peers, inviter)
+            && allowlist::room_allowed_static(allowed_rooms, room_id)
+    }
+
+    /// Accept room invites addressed at the bot.
+    ///
+    /// Invites arrive as stripped `m.room.member` state on the invited room
+    /// (`StrippedRoomMemberEvent`). Events for other users' memberships and
+    /// non-invite transitions (including the bot's own join echo after a
+    /// successful accept) are filtered by the guards below, so the accept loop
+    /// terminates in one round-trip.
+    ///
+    /// Admission is decided inline, but the `/join` request is spawned:
+    /// matrix-sdk awaits event handlers while it processes a sync response, so
+    /// awaiting the join here would stall every other event in that sync for a
+    /// homeserver round-trip (longer for a DM, which also writes account data).
+    fn handle_room_invite(ctx: &HandlerCtx, ev: &StrippedRoomMemberEvent, room: Room) {
+        // Only invites that name the bot as their target concern us.
+        if ev.content.membership != MembershipState::Invite || ev.state_key != ctx.bot_user_id {
+            return;
+        }
+        // `join()` is only meaningful from Invited state; stale member events
+        // replayed in joined/left rooms must not re-join.
+        if room.state() != RoomState::Invited {
+            return;
+        }
+        let inviter = ev.sender.as_str();
+        let room_id = room.room_id().as_str();
+        let allowed_peers = (ctx.peer_resolver)();
+        if !invite_admission(&allowed_peers, &ctx.config.allowed_rooms, room_id, inviter) {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"inviter": inviter, "room": room_id})),
+                "matrix: decline invite from non-allowed sender or room"
+            );
+            return;
+        }
+        let inviter = inviter.to_owned();
+        let room_id = room_id.to_owned();
+        zeroclaw_spawn::spawn!(async move {
+            match room.join().await {
+                Ok(()) => ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({"inviter": inviter, "room": room_id})),
+                    "matrix: accepted room invite"
+                ),
+                Err(e) => ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "inviter": inviter,
+                            "room": room_id,
+                            "error": format!("{e}"),
+                        })),
+                    "matrix: failed to accept room invite"
+                ),
+            }
+        });
     }
 
     async fn handle_message(
@@ -6873,18 +6966,19 @@ mod tests {
         use std::sync::atomic::AtomicBool;
         use std::time::Duration;
 
-        use matrix_sdk::ruma::events::AnySyncTimelineEvent;
+        use matrix_sdk::RoomState;
+        use matrix_sdk::ruma::events::{AnyStrippedStateEvent, AnySyncTimelineEvent};
         use matrix_sdk::ruma::serde::Raw;
         use matrix_sdk::ruma::{RoomId, room_id, user_id};
         use matrix_sdk::test_utils::mocks::MatrixMockServer;
-        use matrix_sdk_test::JoinedRoomBuilder;
+        use matrix_sdk_test::{InvitedRoomBuilder, JoinedRoomBuilder};
         use tokio::sync::{Mutex as TokioMutex, RwLock as TokioRwLock, mpsc, oneshot};
         use wiremock::matchers::{method, path, path_regex};
         use wiremock::{Mock, ResponseTemplate};
         use zeroclaw_api::channel::ChannelApprovalResponse;
         use zeroclaw_config::schema::{MatrixConfig, TranscriptionConfig};
 
-        use super::super::inbound::{HandlerCtx, register_event_handlers};
+        use super::super::inbound::{HandlerCtx, invite_admission, register_event_handlers};
 
         const TRANSCRIPT: &str = "route level transcript of the voice note";
 
@@ -7799,6 +7893,190 @@ mod tests {
             let approvals = ctx.pending_approvals.lock().await;
             assert!(approvals.contains_key("WRONG001"));
             assert!(approvals.contains_key("OTHER001"));
+        }
+
+        // ── invite auto-accept (StrippedRoomMemberEvent) ──────────────────
+
+        fn invite_room() -> &'static RoomId {
+            room_id!("!invite-room:localhost")
+        }
+
+        /// The gate must mirror message-path admission: peer allowlist AND
+        /// (when configured) the room allowlist decide, with `*` as the open
+        /// peer set and an empty allowlist meaning "allow all".
+        #[test]
+        fn invite_admission_mirrors_message_gating() {
+            let open = vec!["*".to_string()];
+            let listed = vec!["@alice:localhost".to_string()];
+            assert!(invite_admission(
+                &open,
+                &[],
+                "!r:localhost",
+                "@anyone:localhost"
+            ));
+            assert!(invite_admission(
+                &listed,
+                &["!r:localhost".to_string()],
+                "!r:localhost",
+                "@alice:localhost"
+            ));
+            assert!(
+                !invite_admission(&listed, &[], "!r:localhost", "@mallory:localhost"),
+                "a sender outside the peer set must not be able to pull the bot into a room"
+            );
+            assert!(
+                !invite_admission(
+                    &open,
+                    &["!other:localhost".to_string()],
+                    "!r:localhost",
+                    "@alice:localhost"
+                ),
+                "rooms outside a configured allowlist must stay unjoined"
+            );
+        }
+
+        /// A stripped `m.room.member` event as matrix-sdk delivers it in an
+        /// invited room's `invite_state`. Built by hand rather than with
+        /// matrix-sdk-test's `stripped_state_event!`, which expands to
+        /// `::ruma::…` and so only compiles in crates depending on ruma
+        /// directly; this crate reaches ruma through `matrix_sdk::ruma`.
+        fn member_event(
+            sender: &str,
+            target: &str,
+            membership: &str,
+        ) -> Raw<AnyStrippedStateEvent> {
+            Raw::new(&::serde_json::json!({
+                "type": "m.room.member",
+                "sender": sender,
+                "state_key": target,
+                "content": { "membership": membership }
+            }))
+            .expect("a static member event serializes")
+            .cast_unchecked()
+        }
+
+        fn invite_ctx(peers: Vec<String>, allowed_rooms: Vec<String>) -> HandlerCtx {
+            let (tx, _rx) = mpsc::channel(1);
+            HandlerCtx {
+                config: Arc::new(MatrixConfig {
+                    allowed_rooms,
+                    ..MatrixConfig::default()
+                }),
+                alias: "test".to_string(),
+                peer_resolver: Arc::new(move || peers.clone()),
+                transcription: None,
+                workspace_dir: None,
+                tx,
+                pending_approvals: Arc::new(TokioMutex::new(HashMap::new())),
+                threads_seen: Arc::new(TokioRwLock::new(HashSet::new())),
+                bot_user_id: user_id!("@bot:localhost").to_owned(),
+                bot_display_name: Arc::new(TokioRwLock::new(None)),
+                initial_sync_done: Arc::new(AtomicBool::new(true)),
+                undecryptable_seen: Arc::new(TokioMutex::new(HashSet::new())),
+            }
+        }
+
+        /// Sync `invite_room()` as an invited room carrying `event`, with a
+        /// succeeding `/join` mock mounted, and report how many `/join`
+        /// requests reached the homeserver plus the room's resulting state.
+        ///
+        /// The join is spawned off the sync path, so an admitted invite is
+        /// awaited until the room turns `Joined`; a denied one gets a grace
+        /// period in which a wrongly spawned join would land on the mock. The
+        /// mock answers 200 on purpose: a missing mock would 404 a wrong join
+        /// and leave the room `Invited`, so state alone cannot prove denial.
+        async fn deliver_invite(
+            ctx: &HandlerCtx,
+            event: Raw<AnyStrippedStateEvent>,
+            expect_join: bool,
+        ) -> (usize, RoomState) {
+            let matrix = MatrixMockServer::new().await;
+            let client = matrix.client_builder().build().await;
+            let join_mock = matrix
+                .mock_room_join(invite_room())
+                .ok()
+                .named("room join")
+                .mount_as_scoped()
+                .await;
+            let _guards = register_event_handlers(&client, ctx);
+            let room = matrix
+                .sync_room(
+                    &client,
+                    InvitedRoomBuilder::new(invite_room()).add_state_event(event),
+                )
+                .await;
+            if expect_join {
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while room.state() != RoomState::Joined {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .expect("an admitted invite must join within 5s");
+            } else {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            (join_mock.received_requests().await.len(), room.state())
+        }
+
+        #[tokio::test]
+        async fn sync_ingress_accepts_invite_from_allowed_peer() {
+            let ctx = invite_ctx(vec!["@friend:localhost".to_string()], vec![]);
+            let event = member_event("@friend:localhost", "@bot:localhost", "invite");
+            assert_eq!(
+                deliver_invite(&ctx, event, true).await,
+                (1, RoomState::Joined),
+                "an invite from an allowed peer must join the room exactly once"
+            );
+        }
+
+        #[tokio::test]
+        async fn sync_ingress_declines_invite_from_non_allowed_peer() {
+            let ctx = invite_ctx(vec!["@friend:localhost".to_string()], vec![]);
+            let event = member_event("@evil:localhost", "@bot:localhost", "invite");
+            assert_eq!(
+                deliver_invite(&ctx, event, false).await,
+                (0, RoomState::Invited),
+                "an invite from a non-allowed peer must not join the bot"
+            );
+        }
+
+        #[tokio::test]
+        async fn sync_ingress_declines_invite_into_room_outside_allowlist() {
+            let ctx = invite_ctx(
+                vec!["*".to_string()],
+                vec!["!other-room:localhost".to_string()],
+            );
+            let event = member_event("@friend:localhost", "@bot:localhost", "invite");
+            assert_eq!(
+                deliver_invite(&ctx, event, false).await,
+                (0, RoomState::Invited),
+                "an allowed peer must not pull the bot into a room outside allowed_rooms"
+            );
+        }
+
+        #[tokio::test]
+        async fn sync_ingress_ignores_invites_targeting_other_users() {
+            // Even with an open peer set, a stripped member event naming
+            // someone else is not OUR invite and must not join anything.
+            let ctx = invite_ctx(vec!["*".to_string()], vec![]);
+            let event = member_event("@alice:localhost", "@carol:localhost", "invite");
+            assert_eq!(
+                deliver_invite(&ctx, event, false).await,
+                (0, RoomState::Invited),
+                "an invite for another user must not join the bot"
+            );
+        }
+
+        #[tokio::test]
+        async fn sync_ingress_ignores_non_invite_membership_for_bot() {
+            let ctx = invite_ctx(vec!["*".to_string()], vec![]);
+            let event = member_event("@alice:localhost", "@bot:localhost", "leave");
+            assert_eq!(
+                deliver_invite(&ctx, event, false).await,
+                (0, RoomState::Invited),
+                "only an `invite` membership for the bot may trigger a join"
+            );
         }
     }
 
