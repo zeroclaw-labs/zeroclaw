@@ -109,10 +109,10 @@ pub struct AnthropicModelProvider {
     /// paths that rebuild the provider per call (e.g. the per-iteration
     /// vision route) start it empty each time.
     schema_cache: zeroclaw_api::schema::SchemaCleanCache,
-    /// Send `thinking.block_binding = drop_block` with adaptive thinking.
-    /// On for Anthropic's own API; off for a custom `uri`, since an
-    /// Anthropic-compatible proxy may not accept the beta.
-    thinking_block_binding: bool,
+    /// Test-only override of [`AnthropicModelProvider::sends_block_binding`],
+    /// so tests can exercise the field against a local mock endpoint.
+    #[cfg(test)]
+    block_binding_override: Option<bool>,
 }
 
 #[cfg(test)]
@@ -758,6 +758,7 @@ pub struct AnthropicBuilder {
     timeout_secs: Option<u64>,
     server_fallback_models: Vec<String>,
     cache_ttl: Option<CacheTtl>,
+    #[cfg(test)]
     thinking_block_binding: Option<bool>,
 }
 
@@ -823,14 +824,10 @@ impl AnthropicBuilder {
     }
 
     pub fn build(self) -> AnthropicModelProvider {
-        let base_url = self.base_url.unwrap_or_else(|| BASE_URL.to_string());
-        let thinking_block_binding = self
-            .thinking_block_binding
-            .unwrap_or(base_url.trim_end_matches('/') == BASE_URL);
         AnthropicModelProvider {
             alias: self.alias,
             credential: self.credential,
-            base_url,
+            base_url: self.base_url.unwrap_or_else(|| BASE_URL.to_string()),
             single_tool_rounds_supported: self.single_tool_rounds_supported,
             max_tokens: self
                 .max_tokens
@@ -841,7 +838,8 @@ impl AnthropicBuilder {
             server_fallback_models: self.server_fallback_models,
             cache_ttl: self.cache_ttl.unwrap_or_default(),
             schema_cache: zeroclaw_api::schema::SchemaCleanCache::new(),
-            thinking_block_binding,
+            #[cfg(test)]
+            block_binding_override: self.thinking_block_binding,
         }
     }
 }
@@ -859,6 +857,7 @@ impl AnthropicModelProvider {
             timeout_secs: None,
             server_fallback_models: Vec::new(),
             cache_ttl: None,
+            #[cfg(test)]
             thinking_block_binding: None,
         }
     }
@@ -2260,11 +2259,17 @@ impl AnthropicModelProvider {
         })
     }
 
-    fn parse_native_response(response: NativeChatResponse) -> ProviderChatResponse {
+    /// Record the response's `input_transformations`. Called where each
+    /// response is read, before the refusal check, so a refused request still
+    /// reports the blocks the API dropped.
+    fn record_response_transformations(response: &NativeChatResponse) {
         record_input_transformations(
             response.model.as_deref().unwrap_or("unknown"),
             &response.input_transformations,
         );
+    }
+
+    fn parse_native_response(response: NativeChatResponse) -> ProviderChatResponse {
         let stop_reason = response.stop_reason.as_deref().unwrap_or("unknown");
         let content_block_count = response.content.len();
         let mut content_block_types = Vec::with_capacity(content_block_count);
@@ -2570,9 +2575,19 @@ impl AnthropicModelProvider {
     /// The `thinking.block_binding` object for an adaptive-thinking request,
     /// or `None` where this provider leaves the field out.
     fn adaptive_block_binding(&self) -> Option<NativeBlockBinding> {
-        self.thinking_block_binding.then_some(NativeBlockBinding {
+        self.sends_block_binding().then_some(NativeBlockBinding {
             prefix_mismatch_behavior: "drop_block",
         })
+    }
+
+    /// Send `thinking.block_binding` only to Anthropic's own API: an
+    /// Anthropic-compatible proxy behind a custom `uri` may not accept the beta.
+    fn sends_block_binding(&self) -> bool {
+        #[cfg(test)]
+        if let Some(forced) = self.block_binding_override {
+            return forced;
+        }
+        self.base_url.trim_end_matches('/') == BASE_URL
     }
 
     fn http_client(&self) -> Client {
@@ -3123,6 +3138,7 @@ impl ModelProvider for AnthropicModelProvider {
 
         let chat_response: NativeChatResponse = response.json().await?;
         commit_safeguard_fallback(None);
+        Self::record_response_transformations(&chat_response);
         Self::check_refusal(&chat_response, model)?;
         let safeguard_notice = Self::server_fallback_notice(&chat_response, model);
         let parsed = Self::parse_native_response(chat_response);
@@ -3283,6 +3299,7 @@ impl ModelProvider for AnthropicModelProvider {
 
         let native_response: NativeChatResponse = response.json().await?;
         commit_safeguard_fallback(None);
+        Self::record_response_transformations(&native_response);
         Self::check_refusal(&native_response, model)?;
         let safeguard_notice = Self::server_fallback_notice(&native_response, model);
         let parsed = Self::parse_native_response(native_response);
@@ -3558,6 +3575,7 @@ impl ModelProvider for AnthropicModelProvider {
                     .await
                     .map_err(|e| StreamError::ModelProvider(format!("response decode: {e}")))?;
                 commit_safeguard_fallback(None);
+                Self::record_response_transformations(&parsed);
                 Self::check_refusal(&parsed, &requested_model)
                     .map_err(|refusal| StreamError::ModelRefusal(Box::new(refusal)))?;
                 let safeguard_notice = Self::server_fallback_notice(&parsed, &requested_model);
@@ -11933,5 +11951,32 @@ data: {\"type\":\"message_stop\"}\n\n";
             "fallback requests stay unbound: {body}"
         );
         assert_eq!(beta.as_deref(), Some(ANTHROPIC_SERVER_FALLBACK_BETA));
+    }
+
+    #[tokio::test]
+    async fn refusal_with_dropped_blocks_still_maps_to_the_refusal_error() {
+        let body = serde_json::json!({
+            "content": [],
+            "stop_reason": "refusal",
+            "stop_details": {"type": "refusal", "category": "cyber"},
+            "model": "claude-opus-5-5",
+            "usage": {"input_tokens": 412, "output_tokens": 0},
+            "input_transformations": [
+                {"type": "thinking_dropped", "path": "messages.1.content.0", "reason": "prefix_binding_mismatch"}
+            ]
+        });
+        let (addr, server, _captured) =
+            spawn_capturing_messages_server(body, SSE_REPLY_WITH_DROPS).await;
+        let provider = binding_test_provider(addr, true);
+        let messages = vec![ChatMessage::user("hello")];
+        let request = ProviderChatRequest {
+            messages: messages.as_slice(),
+            tools: None,
+            thinking: None,
+        };
+        let result = provider.chat(request, "claude-opus-5-5", None).await;
+        server.abort();
+        let err = result.expect_err("a refusal must surface as an error");
+        assert!(err.downcast_ref::<AnthropicRefusalError>().is_some());
     }
 }
