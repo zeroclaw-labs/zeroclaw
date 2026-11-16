@@ -21,6 +21,8 @@ The legacy Yonbo N3B1 crate has been retired from ZeroClaw source; its complete 
 
 Proposed on 2026-10-30. Not accepted until the owner approves it.
 
+Partly superseded on 2026-11-16 by the proposed [ADR-023](./ADR-023-realtime-voice-carrier-with-body-delegation.md): when ADR-023 is accepted, for its carrier mode it replaces the §1 restriction on end-to-end speech models, the §9 benchmark-only row for cloud realtime models, the §10 one-tool rule (for provider-side search only), the §10 "It must not" rules on answering, judging simplicity and persona, the §10 "Voice and words" export rule, the storage sentence of §10 "Everything it says is reported", the third item of §12, and Acceptance item 8. See ADR-023 for the exact scope. All other decisions here are unchanged.
+
 Merging this document records a proposal. It does not accept the architecture, activate a feature, change a protected contract, or claim device acceptance. Issue #374 remains the execution index; implementation requires its own bounded review and evidence.
 
 Amended on 2026-11-10 with the device audio facts reported in #626: the vendor recognition engine runs on the device and is open source, so reusing it is a candidate rather than a rejected cloud path (Context, §7, §9, §12), and the microphone array's channel layout must be checked for a playback reference before an echo-cancellation design is chosen (§3). The echo-cancellation, capture-while-frozen and light-ownership questions of slice 1 are still open.
