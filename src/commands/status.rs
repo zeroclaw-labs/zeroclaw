@@ -166,7 +166,7 @@ pub async fn handle(config: &Config, format: Option<String>) -> Result<()> {
             t("cli-status-service-stopped", "🔴 Service:       stopped")
         );
     }
-    let effective_memory_backend = config.resolve_active_storage().kind();
+    let effective_memory_backend = self::effective_memory_backend(config);
     let heartbeat_value = if config.heartbeat.enabled {
         let interval_minutes = config.heartbeat.interval_minutes.to_string();
         let heartbeat_every_fallback = format!("every {}min", interval_minutes);
@@ -445,4 +445,68 @@ pub async fn handle(config: &Config, format: Option<String>) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Resolve the memory backend label printed by `zeroclaw status`.
+///
+/// Runtime construction reads `config.memory.backend` directly (`tachi`,
+/// `markdown`, `none`); `Config::resolve_active_storage` returns
+/// `ActiveStorage::None` for `tachi` and alias-less `markdown` because only
+/// explicit `[storage.markdown.<alias>]` entries appear under `config.storage`.
+fn effective_memory_backend(config: &Config) -> &'static str {
+    let backend = crate::memory::backend_kind_from_dotted(&config.memory.backend);
+    if backend.is_empty() {
+        return "none";
+    }
+    match crate::memory::classify_memory_backend(&backend) {
+        #[cfg(feature = "memory-tachi")]
+        crate::memory::MemoryBackendKind::Tachi => "tachi",
+        crate::memory::MemoryBackendKind::Markdown => "markdown",
+        crate::memory::MemoryBackendKind::None => "none",
+        crate::memory::MemoryBackendKind::Retired(name) => name,
+        crate::memory::MemoryBackendKind::Unknown => {
+            if backend == "tachi" {
+                "tachi"
+            } else {
+                "markdown"
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::effective_memory_backend;
+    use crate::config::Config;
+
+    #[test]
+    fn default_config_reports_tachi_not_none() {
+        let config = Config::default();
+        assert_eq!(effective_memory_backend(&config), "tachi");
+    }
+
+    #[test]
+    fn markdown_and_dotted_markdown_report_markdown_without_storage_alias() {
+        for raw in ["markdown", "markdown.notes", " MARKDOWN "] {
+            let mut config = Config::default();
+            config.memory.backend = raw.to_string();
+            assert_eq!(effective_memory_backend(&config), "markdown");
+        }
+    }
+
+    #[test]
+    fn none_and_empty_report_none() {
+        for raw in ["none", "", "   "] {
+            let mut config = Config::default();
+            config.memory.backend = raw.to_string();
+            assert_eq!(effective_memory_backend(&config), "none");
+        }
+    }
+
+    #[test]
+    fn retired_backend_preserves_name_instead_of_masking_as_none() {
+        let mut config = Config::default();
+        config.memory.backend = "sqlite".to_string();
+        assert_eq!(effective_memory_backend(&config), "sqlite");
+    }
 }
