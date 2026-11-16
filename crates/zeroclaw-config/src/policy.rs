@@ -3743,6 +3743,16 @@ fn split_powershell_pipeline_syntax(command: &str) -> Option<Vec<String>> {
                     segments.push(segment.to_string());
                     current.clear();
                 }
+                // `@` starts splatting, an array subexpression, a hashtable, or
+                // a here-string only where PowerShell starts a token: at the
+                // start of an argument, after a `-Name:` parameter, or after a
+                // `,` array separator. Inside a bare argument it is literal
+                // text (`user@example.com`); a following `(`, `{`, or quote is
+                // still rejected by its own arm or the mixed-token check.
+                '@' if token_has_bare && !token_body.ends_with([',', ':']) => {
+                    token_body.push(ch);
+                    current.push(ch);
+                }
                 // These characters introduce expressions, statements,
                 // redirection, splatting, or alternate invocation forms.
                 ';' | '\r' | '\n' | '&' | '(' | ')' | '{' | '}' | '[' | ']' | '<' | '>' | '@' => {
@@ -6862,6 +6872,85 @@ mod tests {
         assert!(split_powershell_pipeline_syntax("cat \"env:path\"").is_some());
         assert!(split_powershell_pipeline_syntax("cat 'env:path'").is_some());
         assert!(split_powershell_pipeline_syntax("cat \"my file.txt\"").is_some());
+    }
+
+    #[test]
+    fn powershell_grammar_accepts_at_sign_inside_a_bare_argument() {
+        // PowerShell treats `@` as splatting, an array subexpression, a
+        // hashtable, or a here-string only where a token starts. Inside a bare
+        // argument it is ordinary text, so an email address or a `user@host`
+        // target reaches the native command unchanged.
+        for command in [
+            "himalaya message compose --to user@example.com --body test",
+            "git log --author=dev@example.com",
+            "ssh deploy@build-host uptime",
+            "echo a@b@c",
+            "echo -to=@literal",
+        ] {
+            assert!(
+                split_powershell_pipeline_syntax(command).is_some(),
+                "a mid-argument `@` is literal text: {command}"
+            );
+        }
+
+        // Where PowerShell starts a new token at `@`, the grammar still fails
+        // closed: at the start of an argument or command, after a `-Name:`
+        // parameter, and after the `,` array separator.
+        for command in [
+            "echo @args",
+            "@args",
+            "echo hi | @args",
+            "echo @'",
+            "echo -InputObject:@args",
+            "echo a,@args",
+            "echo @(Get-Item env:path)",
+            "echo @{a=1}",
+            "echo a@(Get-Item env:path)",
+            "echo a@{a=1}",
+            "echo a@\"x\"",
+        ] {
+            assert_eq!(
+                split_powershell_pipeline_syntax(command),
+                None,
+                "`@` that starts a PowerShell token must be rejected: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_treats_powershell_email_argument_like_any_other_argument() {
+        // An allowlisted command that takes an email address must reach the
+        // same gates as the command without it, not fail the allowlist.
+        let p = SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            allowed_commands: vec!["himalaya".into()],
+            require_approval_for_medium_risk: true,
+            block_high_risk_commands: true,
+            ..SecurityPolicy::default()
+        };
+        let plain = "himalaya message compose --body test";
+        let with_email = "himalaya message compose --to user@example.com --body test";
+
+        for approved in [false, true] {
+            let expected =
+                p.validate_command_execution_for_shell(plain, approved, ShellDialect::PowerShell);
+            let actual = p.validate_command_execution_for_shell(
+                with_email,
+                approved,
+                ShellDialect::PowerShell,
+            );
+            assert_eq!(actual, expected, "approved={approved}");
+            if let Err(error) = actual {
+                assert!(
+                    !error.contains("not allowed by security policy"),
+                    "an email address argument must not fail the allowlist: {error}"
+                );
+            }
+        }
+        assert!(
+            p.validate_command_execution_for_shell(with_email, true, ShellDialect::PowerShell)
+                .is_ok()
+        );
     }
 
     #[test]
