@@ -974,7 +974,7 @@ fn tools_to_openai_format(tools_registry: &[Box<dyn Tool>]) -> Vec<serde_json::V
         .collect()
 }
 
-fn autosave_memory_key(prefix: &str) -> String {
+pub(super) fn autosave_memory_key(prefix: &str) -> String {
     format!("{prefix}_{}", Uuid::new_v4())
 }
 

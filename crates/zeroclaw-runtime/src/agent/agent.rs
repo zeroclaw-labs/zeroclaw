@@ -1975,7 +1975,7 @@ impl Agent {
             let store_result = self
                 .memory
                 .store(
-                    "user_msg",
+                    &crate::agent::loop_::autosave_memory_key("user_msg"),
                     user_message,
                     MemoryCategory::Conversation,
                     self.memory_session_id.as_deref(),
@@ -2320,7 +2320,7 @@ impl Agent {
                     let store_result = self
                         .memory
                         .store(
-                            "user_msg",
+                            &crate::agent::loop_::autosave_memory_key("user_msg"),
                             input.text(),
                             MemoryCategory::Conversation,
                             self.memory_session_id.as_deref(),
@@ -4443,7 +4443,7 @@ impl Agent {
             let store_result = self
                 .memory
                 .store(
-                    "user_msg",
+                    &crate::agent::loop_::autosave_memory_key("user_msg"),
                     user_message,
                     MemoryCategory::Conversation,
                     self.memory_session_id.as_deref(),
