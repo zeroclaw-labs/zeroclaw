@@ -109,7 +109,15 @@ The editable reference defaults to `<prefix>/<alias>/<field>`.
 Existing read-side OpenBao identity and ACLs still govern later use.
 Set `BAO_CACERT` to a PEM CA bundle if the vault uses a private CA.
 
-The authenticated operator supplies a short-lived write token for each
+For managed writes, set `ZEROCLAW_OPENBAO_WRITE_TOKEN_FILE` to the absolute
+path of a dedicated, short-lived write token managed by OpenBao Agent or an
+equivalent deployment service. The dashboard then asks the authenticated
+operator for the value only. The gateway reads the token file on each
+write, so lease renewal and replacement do not require a gateway restart.
+Protect the file and the writer identity from agent tools and untrusted
+processes. Use a separate gateway execution boundary if agent tools can
+otherwise read the file. Keep the read-side identity separate. With no
+managed writer configured, the operator supplies a short-lived token per
 write. Give that token `create` for new records or `patch` plus `read`
 on the metadata endpoint for rotations, restricted to the configured
 prefix. The gateway sends the value and token over verified HTTPS and

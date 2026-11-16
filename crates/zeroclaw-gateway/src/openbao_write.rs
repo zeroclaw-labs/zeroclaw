@@ -8,6 +8,7 @@ use zeroclaw_config::schema::ScopedHttpAuth;
 #[serde(deny_unknown_fields)]
 pub(crate) struct SecretWrite {
     pub(crate) value: String,
+    #[serde(default)]
     pub(crate) token: String,
     pub(crate) aws_access_key_id: Option<String>,
     pub(crate) aws_secret_access_key: Option<String>,
@@ -23,11 +24,15 @@ impl SecretWrite {
         }
     }
 
-    pub(crate) fn valid_for(&self, auth: &ScopedHttpAuth, aws: bool) -> bool {
+    pub(crate) fn valid_for(
+        &self,
+        auth: &ScopedHttpAuth,
+        aws: bool,
+        managed_openbao: bool,
+    ) -> bool {
         let value = self.value.as_str();
-        if self.token.is_empty()
-            || self.token.len() > 16384
-            || !self.token.bytes().all(|b| b.is_ascii_graphic())
+        if !(valid_token(&self.token)
+            || self.token.is_empty() && managed_openbao && managed_writer())
         {
             return false;
         }
@@ -118,7 +123,42 @@ impl SecretWrite {
                 .extend(path.iter().copied());
             Ok(url)
         };
-        let mut token = reqwest::header::HeaderValue::from_str(&self.token).map_err(|_| bad)?;
+        let managed;
+        let token = if self.token.is_empty() {
+            let path = std::env::var_os(WRITER_TOKEN_PATH)
+                .filter(|path| std::path::Path::new(path).is_absolute())
+                .ok_or(disabled)?;
+            // OpenBao Agent may replace its sink when the lease changes.
+            // Read it per mutation and cap the bytes admitted as a header.
+            use tokio::io::AsyncReadExt as _;
+            if !tokio::fs::metadata(&path)
+                .await
+                .map_err(|_| disabled)?
+                .is_file()
+            {
+                return Err(disabled);
+            }
+            let file = tokio::fs::File::open(path).await.map_err(|_| disabled)?;
+            if !file.metadata().await.map_err(|_| disabled)?.is_file() {
+                return Err(disabled);
+            }
+            let mut raw = String::new();
+            file.take(16386)
+                .read_to_string(&mut raw)
+                .await
+                .map_err(|_| disabled)?;
+            if raw.len() >= 16386 {
+                return Err(disabled);
+            }
+            managed = raw;
+            managed.trim()
+        } else {
+            self.token.as_str()
+        };
+        if !valid_token(token) {
+            return Err(if self.token.is_empty() { disabled } else { bad });
+        }
+        let mut token = reqwest::header::HeaderValue::from_str(token).map_err(|_| bad)?;
         token.set_sensitive(true);
         let version = if replace {
             let mut response = client
@@ -174,6 +214,17 @@ impl SecretWrite {
     }
 }
 
+const WRITER_TOKEN_PATH: &str = "ZEROCLAW_OPENBAO_WRITE_TOKEN_FILE";
+
+pub(crate) fn managed_writer() -> bool {
+    std::env::var_os(WRITER_TOKEN_PATH)
+        .is_some_and(|path| std::path::Path::new(&path).is_absolute())
+}
+
+fn valid_token(token: &str) -> bool {
+    !token.is_empty() && token.len() <= 16384 && token.bytes().all(|b| b.is_ascii_graphic())
+}
+
 pub(crate) fn configured_prefix() -> Option<String> {
     let prefix = std::env::var("ZEROCLAW_OPENBAO_WRITE_PREFIX").ok()?;
     let address = std::env::var("BAO_ADDR").ok()?;
@@ -201,7 +252,16 @@ fn in_scope(prefix: &str, reference: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::in_scope;
+    use super::{SecretWrite, in_scope, valid_token};
+
+    #[test]
+    fn managed_request_omits_the_token_without_relaxing_header_validation() {
+        let write: SecretWrite = serde_json::from_str(r#"{"value":"synthetic-secret"}"#).unwrap();
+        assert!(write.token.is_empty());
+        assert!(valid_token("synthetic-token"));
+        assert!(!valid_token(""));
+        assert!(!valid_token("unsafe\r\nheader"));
+    }
 
     #[test]
     fn provisioning_scope_is_segment_bound_and_excludes_the_prefix_record() {

@@ -41,6 +41,7 @@ export default function HttpCredentials({ kind }: { kind: HttpCredentialKind }) 
   const [referenceOverride, setReferenceOverride] = useState<string>();
   const prefix = source === "open_bao" ? catalog?.openbao_write_prefix : catalog?.vault_write_prefixes?.[source];
   const canWrite = source !== "local" && !!prefix;
+  const managedWriter = source === "open_bao" && !!catalog?.openbao_managed_writer;
   const field = { totp: "seed", ssh_key: "private_key", api_key: "token", user_password: "password" }[kind];
   const defaultReference = (() => {
     if (editing && editing !== "new") return editing.source === source ? editing.reference ?? "" : "";
@@ -91,12 +92,12 @@ export default function HttpCredentials({ kind }: { kind: HttpCredentialKind }) 
     const value = kind === "totp" ? raw.replace(/[\s-]+/g, "").replace(/=+$/, "").toUpperCase()
       : kind === "ssh_key" ? raw.trim() : raw;
     const token = String(data.get("writer_token") ?? "").trim();
-    if (canWrite && !linkExisting && ((editing === "new" && !value.trim()) || (value && !token))) {
-      setMessage(t("http_credentials.write_required"));
+    if (canWrite && !linkExisting && ((editing === "new" && !value.trim()) || (value && !managedWriter && !token))) {
+      setMessage(t(managedWriter ? "http_credentials.managed_value_required" : "http_credentials.write_required"));
       return;
     }
     const write = canWrite && !linkExisting && value !== "" ? {
-      value, token,
+      value, ...(managedWriter ? {} : { token }),
       ...(source === "aws" ? {
         aws_access_key_id: String(data.get("aws_access_key_id") ?? "").trim(),
         aws_secret_access_key: String(data.get("aws_secret_access_key") ?? "").trim(),
@@ -226,10 +227,10 @@ export default function HttpCredentials({ kind }: { kind: HttpCredentialKind }) 
                 : <input className={inputClass} name="external_value" type="password" autoComplete="new-password" required={editing === "new"} />}
             </label>
             {editing !== "new" && <p className="text-sm">{t("http_credentials.preserve_external")}</p>}
-            <label className="block space-y-1">
+            {!managedWriter && <label className="block space-y-1">
               <span>{t(source === "aws" ? "http_credentials.aws_session_token" : "http_credentials.writer_token")}</span>
               <input className={inputClass} name="writer_token" type="password" autoComplete="off" required={editing === "new"} />
-            </label>
+            </label>}
             {source === "aws" && <>
               <label className="block space-y-1">
                 <span>{t("http_credentials.aws_access_key")}</span>

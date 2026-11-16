@@ -1395,13 +1395,13 @@ type HttpCredentialAuth =
 const httpCredentialsPath = "/api/config/http-credentials";
 
 export function listHttpCredentials() {
-  return apiFetch<{ encryption_enabled: boolean; credentials: HttpCredentialRow[]; openbao_write_prefix?: string; vault_write_prefixes?: Partial<Record<HttpCredentialSource, string | null>> }>(
+  return apiFetch<{ encryption_enabled: boolean; credentials: HttpCredentialRow[]; openbao_write_prefix?: string; openbao_managed_writer?: boolean; vault_write_prefixes?: Partial<Record<HttpCredentialSource, string | null>> }>(
     httpCredentialsPath,
   );
 }
 
 export function changeHttpCredential(mutation:
-  | { name: string; operation: "create" | "replace"; credential: { origin: string; source: HttpCredentialSource; auth: HttpCredentialAuth }; vault_write?: { value: string; token: string; aws_access_key_id?: string; aws_secret_access_key?: string } }
+  | { name: string; operation: "create" | "replace"; credential: { origin: string; source: HttpCredentialSource; auth: HttpCredentialAuth }; vault_write?: { value: string; token?: string; aws_access_key_id?: string; aws_secret_access_key?: string } }
   | { name: string; operation: "replace"; permissions: { http_allowed: boolean } | { destinations: SshDestination[] } }
   | { name: string; operation: "delete" }
 ) {

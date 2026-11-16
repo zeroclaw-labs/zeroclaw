@@ -1423,6 +1423,7 @@ pub async fn list_http_credentials(
             Json(serde_json::json!({
                 "encryption_enabled": config.secrets.encrypt,
                 "openbao_write_prefix": crate::openbao_write::configured_prefix(),
+                "openbao_managed_writer": crate::openbao_write::managed_writer(),
                 "vault_write_prefixes": crate::cloud_vault_write::prefixes(),
                 "credentials": rows.into_iter().map(|(_, row)| row).collect::<Vec<_>>()
             }))
@@ -1655,6 +1656,7 @@ pub async fn mutate_http_credential(
                         || !write.valid_for(
                             &credential.auth,
                             matches!(credential.source, ScopedCredentialSource::Aws),
+                            matches!(credential.source, ScopedCredentialSource::OpenBao),
                         )
                     {
                         return StatusCode::BAD_REQUEST.into_response();
