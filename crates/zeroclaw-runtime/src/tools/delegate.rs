@@ -1818,6 +1818,52 @@ impl DelegateTool {
         }
     }
 
+    /// Refuses a bounded hop in an owned session whose sealed registry cannot
+    /// hold the owner's plane for the target, recording why first. The model
+    /// sees the same refusal as for any other tool-initialization failure.
+    fn bounded_owner_plane_refusal(
+        agent_name: &str,
+        reason: &'static str,
+        error: Option<&anyhow::Error>,
+    ) -> ToolResult {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({
+                    "agent_alias": agent_name,
+                    "error_kind": "bounded_owner_plane_unavailable",
+                    "reason": reason,
+                    "error": error.map(|error| format!("{error:#}")),
+                })),
+            "bounded delegate cannot hold the session owner's memory plane for its target"
+        );
+        #[cfg(test)]
+        let _ = OWNER_PLANE_PROBE.try_with(|probe| {
+            probe.lock().unwrap().refusal = Some(reason);
+        });
+        Self::bounded_tools_refusal(agent_name)
+    }
+
+    /// Why `route`, the session memory route of a bounded target's sealed
+    /// registry, does not hold the owner's plane for that target
+    /// (`owner_scope`), or `None` when it does.
+    fn owner_plane_mismatch(
+        route: Option<&Arc<zeroclaw_tools::session_memory::SessionMemoryRoute>>,
+        owner_scope: &PrincipalScope,
+    ) -> Option<&'static str> {
+        let Some(route) = route else {
+            return Some("sealed_registry_has_no_route");
+        };
+        let Some(routed) = route.routed() else {
+            return Some("sealed_route_not_pinned");
+        };
+        if routed.memory.principal_scope().as_ref() != Some(owner_scope) {
+            return Some("sealed_route_plane_scope_mismatch");
+        }
+        None
+    }
+
     /// Rebuilds a `Bounded` delegate target's shell tool with the target's
     /// OWN OS sandbox and shell timeout, instead of the `NoopSandbox`
     /// `default_tools_with_runtime` always builds (that factory is also used
@@ -5769,12 +5815,12 @@ impl DelegateTool {
                 let mut target_identity_bound_tools: HashMap<String, Box<dyn Tool>> =
                     HashMap::new();
                 // The session memory route of the target's registry, shared by
-                // the `spawn_subagent` rebuilt below, and the owner's plane for
-                // the target it is pinned to in an owned session.
+                // the `spawn_subagent` rebuilt below, and, in an owned session,
+                // the scope of the owner's plane for the target it is pinned to.
                 let mut target_session_memory: Option<
                     Arc<zeroclaw_tools::session_memory::SessionMemoryRoute>,
                 > = None;
-                let mut target_owner_plane: Option<Arc<dyn Memory>> = None;
+                let mut target_owner_scope: Option<PrincipalScope> = None;
                 if (needs_workspace_bound_tools || needs_identity_bound_tools)
                     && let Some(root_config) = rebuild_config.as_ref()
                 {
@@ -5942,10 +5988,16 @@ impl DelegateTool {
                     // target's own and is pinned now: nothing pins this
                     // registry later, and an empty route reads as an unowned
                     // session. Without an owner it stays empty, as there.
+                    // One read of the owner decides both whether this hop is
+                    // owned and which plane the sealed registry must hold.
                     let route =
                         Arc::new(zeroclaw_tools::session_memory::SessionMemoryRoute::default());
-                    let owned = self.principal_scope.read().is_some();
-                    if owned
+                    let owner_scope = self
+                        .principal_scope
+                        .read()
+                        .clone()
+                        .map(|scope| scope.with_agent(Some(agent_name.to_string())));
+                    if let Some(owner_scope) = owner_scope
                         && bounded_base_tools
                             .iter()
                             .any(|tool| tool.name() == crate::tools::SpawnSubagentTool::NAME)
@@ -5957,18 +6009,36 @@ impl DelegateTool {
                                 .await
                             {
                                 Ok(Some(memory)) => memory,
-                                Ok(None) | Err(_) => {
-                                    return Ok(Self::bounded_tools_refusal(agent_name));
+                                // A config is in hand here, and with one the
+                                // target's memory is always opened or fails.
+                                Ok(None) => {
+                                    return Ok(Self::bounded_owner_plane_refusal(
+                                        agent_name,
+                                        "target_memory_absent",
+                                        None,
+                                    ));
+                                }
+                                Err(error) => {
+                                    return Ok(Self::bounded_owner_plane_refusal(
+                                        agent_name,
+                                        "target_memory_unavailable",
+                                        Some(&error),
+                                    ));
                                 }
                             },
                         };
-                        if route
-                            .pin(Arc::clone(&plane), Arc::clone(&target_policy))
-                            .is_err()
-                        {
-                            return Ok(Self::bounded_tools_refusal(agent_name));
+                        // The route was created empty just above, and an
+                        // empty route takes any plane.
+                        let pinned = route.pin(plane, Arc::clone(&target_policy));
+                        debug_assert!(pinned.is_ok(), "a fresh session memory route pins");
+                        if let Err(error) = pinned {
+                            return Ok(Self::bounded_owner_plane_refusal(
+                                agent_name,
+                                "route_pin_refused",
+                                Some(&error),
+                            ));
                         }
-                        target_owner_plane = Some(plane);
+                        target_owner_scope = Some(owner_scope);
                     }
                     target_identity_bound_tools.insert(
                         "spawn_subagent".to_string(),
@@ -6714,17 +6784,21 @@ impl DelegateTool {
                         0..0,
                     )
                     .await;
-                // In an owned session the sealed registry must hold the
-                // owner's plane for the target: a registry with a
-                // memory-starting tool and no route to that plane would leave
-                // its child work on the shared plane.
-                if let Some(plane) = target_owner_plane.as_ref()
-                    && assembled_bounded
-                        .registry
-                        .check_session_memory_pin(plane)
-                        .is_err()
+                // In an owned session the route the sealed registry carries,
+                // the one its rebuilt `spawn_subagent` shares, must be pinned
+                // to a plane scoped to the owner for the target, judged
+                // against the single read of the owner above. A plane opened
+                // under another reading (a shared handle, another agent's
+                // plane) refuses the hop instead of running its child there.
+                // SOP tools rebound into this registry keep the caller's own
+                // route and are not judged here.
+                let sealed_route = assembled_bounded.registry.session_memory_route();
+                #[cfg(test)]
+                record_sealed_route(sealed_route);
+                if let Some(owner_scope) = target_owner_scope.as_ref()
+                    && let Some(reason) = Self::owner_plane_mismatch(sealed_route, owner_scope)
                 {
-                    return Ok(Self::bounded_tools_refusal(agent_name));
+                    return Ok(Self::bounded_owner_plane_refusal(agent_name, reason, None));
                 }
                 // The sealed set IS the ceiling for everything below this hop:
                 // bounding each level by what the level above actually received
@@ -7198,6 +7272,44 @@ impl Observer for NoopObserver {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
+}
+
+/// Test-only: what a bounded hop's sealed registry carried as its session
+/// memory route.
+#[cfg(test)]
+pub(crate) enum SealedRoute {
+    Absent,
+    Unpinned,
+    Pinned(Arc<dyn Memory>),
+}
+
+/// Test-only: what a bounded hop decided about the owner's plane for its
+/// target, so a regression can observe the sealed registry and the reason a
+/// hop was refused without reading logs.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct OwnerPlaneProbe {
+    pub(crate) sealed: Option<SealedRoute>,
+    pub(crate) refusal: Option<&'static str>,
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    pub(crate) static OWNER_PLANE_PROBE: Arc<std::sync::Mutex<OwnerPlaneProbe>>;
+}
+
+#[cfg(test)]
+fn record_sealed_route(route: Option<&Arc<zeroclaw_tools::session_memory::SessionMemoryRoute>>) {
+    let sealed = match route {
+        None => SealedRoute::Absent,
+        Some(route) => match route.routed() {
+            None => SealedRoute::Unpinned,
+            Some(routed) => SealedRoute::Pinned(Arc::clone(&routed.memory)),
+        },
+    };
+    let _ = OWNER_PLANE_PROBE.try_with(|probe| {
+        probe.lock().unwrap().sealed = Some(sealed);
+    });
 }
 
 #[cfg(test)]
@@ -21197,6 +21309,30 @@ target = "memory_recall"
             }
         }
 
+        /// A memory source that cannot open any agent's memory.
+        struct FailingStore;
+
+        #[async_trait]
+        impl crate::composition::MemorySource for FailingStore {
+            async fn memory(
+                &self,
+                _request: &crate::composition::MemoryRequest<'_>,
+            ) -> anyhow::Result<Arc<dyn Memory>> {
+                anyhow::bail!("the caller's memory source cannot open this agent's memory")
+            }
+        }
+
+        /// Which memory source the binding of a bound hop serves.
+        #[derive(Clone, Copy)]
+        enum HopMemory {
+            /// Records which agents' memory was asked for.
+            Recording,
+            /// Serves the hop's one store for every agent.
+            OneStore,
+            /// Fails for every agent.
+            Failing,
+        }
+
         /// Keeps a nested agent turn off the host: no memory backend, plugins,
         /// MCP servers or skill creation from config, and no provider retry.
         fn offline_child_config(config: &mut Config) {
@@ -21242,12 +21378,12 @@ target = "memory_recall"
         /// The full bounded fixture for `tool_name`, with the target's route on
         /// a counting endpoint. `bind` binds the delegate to recording
         /// capabilities for [`caller_principal`] with the native recipe (no
-        /// recipe makes the hop supplied-only, which rebuilds nothing);
-        /// `serve_one_store` has the binding's memory source serve `store`.
+        /// recipe makes the hop supplied-only, which rebuilds nothing), whose
+        /// memory source is chosen by `memory_source`.
         async fn hop(
             tool_name: &str,
             bind: bool,
-            serve_one_store: bool,
+            memory_source: HopMemory,
             configure: impl FnOnce(&mut Config, &str),
         ) -> Hop {
             let endpoint = counting_endpoint().await;
@@ -21276,8 +21412,12 @@ target = "memory_recall"
                     Arc::clone(&memory),
                     Arc::new(crate::composition::defaults::NoSuppliedTools),
                 );
-                if serve_one_store {
-                    capabilities.memory = Arc::new(OneStore(Arc::clone(&store)));
+                match memory_source {
+                    HopMemory::Recording => {}
+                    HopMemory::OneStore => {
+                        capabilities.memory = Arc::new(OneStore(Arc::clone(&store)));
+                    }
+                    HopMemory::Failing => capabilities.memory = Arc::new(FailingStore),
                 }
                 tool.with_memory(Arc::clone(&store))
                     .with_capabilities(capabilities, Some(caller_principal()))
@@ -21321,6 +21461,37 @@ target = "memory_recall"
                 .expect("the bounded hop runs")
         }
 
+        /// What one run of the target's `spawn_subagent` call left behind.
+        struct SpawnRun {
+            result: ToolResult,
+            /// `Some` once the child run started, with the memory it was handed.
+            child: Option<Option<Arc<dyn Memory>>>,
+            probe: OwnerPlaneProbe,
+        }
+
+        /// Runs the target's bounded turn calling `spawn_subagent`, observing
+        /// both the sealed registry and the child it starts.
+        async fn run_spawn(hop: &Hop) -> SpawnRun {
+            let sink = Arc::new(std::sync::Mutex::new(None));
+            let probe = Arc::new(std::sync::Mutex::new(OwnerPlaneProbe::default()));
+            let result = OWNER_PLANE_PROBE
+                .scope(
+                    Arc::clone(&probe),
+                    CHILD_MEMORY_SINK.scope(
+                        Arc::clone(&sink),
+                        run_target(hop, "spawn_subagent", json!({"prompt": "say hello"})),
+                    ),
+                )
+                .await;
+            let child = sink.lock().unwrap().take();
+            let probe = std::mem::take(&mut *probe.lock().unwrap());
+            SpawnRun {
+                result,
+                child,
+                probe,
+            }
+        }
+
         /// A nested agent turn inside the delegated turn is deeper than the
         /// harness's default thread stack allows, so each test runs on workers
         /// with a larger stack and re-raises the body's own panic.
@@ -21352,7 +21523,7 @@ target = "memory_recall"
         #[test]
         fn bounded_rebuilt_spawn_subagent_runs_child_on_callers_binding() {
             on_deep_stack(async {
-                let hop = hop("spawn_subagent", true, false, |_, _| {}).await;
+                let hop = hop("spawn_subagent", true, HopMemory::Recording, |_, _| {}).await;
                 let sink = Arc::new(std::sync::Mutex::new(None));
                 let result = CHILD_MEMORY_SINK
                     .scope(
@@ -21409,7 +21580,7 @@ target = "memory_recall"
         #[test]
         fn bounded_rebuilt_cron_run_runs_job_on_callers_binding() {
             on_deep_stack(async {
-                let hop = hop("cron_run", true, false, |_, _| {}).await;
+                let hop = hop("cron_run", true, HopMemory::Recording, |_, _| {}).await;
                 let job = crate::cron::add_agent_job(
                     &hop.config,
                     TARGET,
@@ -21471,36 +21642,41 @@ target = "memory_recall"
         #[test]
         fn bounded_rebuilt_send_message_to_peer_relays_on_callers_binding() {
             on_deep_stack(async {
-                let hop = hop("send_message_to_peer", true, false, |config, url| {
-                    use zeroclaw_config::multi_agent::{AgentAlias, PeerGroupConfig};
-                    route_agent_to(config, PEER, url);
-                    config.risk_profiles.insert(
-                        "peer".to_string(),
-                        zeroclaw_config::schema::RiskProfileConfig::default(),
-                    );
-                    config.agents.insert(
-                        PEER.to_string(),
-                        AliasedAgentConfig {
-                            channels: vec![PEER_CHANNEL.into()],
-                            model_provider: "ollama.peer_recipient".into(),
-                            risk_profile: "peer".into(),
-                            ..AliasedAgentConfig::default()
-                        },
-                    );
-                    config
-                        .agents
-                        .get_mut(TARGET)
-                        .expect("the fixture configures the target")
-                        .channels = vec![PEER_CHANNEL.into()];
-                    config.peer_groups.insert(
-                        "rebuilt-relay".to_string(),
-                        PeerGroupConfig {
-                            channel: "telegram".into(),
-                            agents: vec![AgentAlias::new(TARGET), AgentAlias::new(PEER)],
-                            ..PeerGroupConfig::default()
-                        },
-                    );
-                })
+                let hop = hop(
+                    "send_message_to_peer",
+                    true,
+                    HopMemory::Recording,
+                    |config, url| {
+                        use zeroclaw_config::multi_agent::{AgentAlias, PeerGroupConfig};
+                        route_agent_to(config, PEER, url);
+                        config.risk_profiles.insert(
+                            "peer".to_string(),
+                            zeroclaw_config::schema::RiskProfileConfig::default(),
+                        );
+                        config.agents.insert(
+                            PEER.to_string(),
+                            AliasedAgentConfig {
+                                channels: vec![PEER_CHANNEL.into()],
+                                model_provider: "ollama.peer_recipient".into(),
+                                risk_profile: "peer".into(),
+                                ..AliasedAgentConfig::default()
+                            },
+                        );
+                        config
+                            .agents
+                            .get_mut(TARGET)
+                            .expect("the fixture configures the target")
+                            .channels = vec![PEER_CHANNEL.into()];
+                        config.peer_groups.insert(
+                            "rebuilt-relay".to_string(),
+                            PeerGroupConfig {
+                                channel: "telegram".into(),
+                                agents: vec![AgentAlias::new(TARGET), AgentAlias::new(PEER)],
+                                ..PeerGroupConfig::default()
+                            },
+                        );
+                    },
+                )
                 .await;
 
                 let result = run_target(
@@ -21520,22 +21696,43 @@ target = "memory_recall"
                     result.output
                 );
 
-                // The relayed turn is detached: wait until it has asked a
-                // provider source or reached the configured endpoint.
+                // The relayed turn is detached: wait until the relay settles
+                // its task, which happens only after the whole turn returned,
+                // so every request it made is counted below.
+                let task_id: String = result
+                    .output
+                    .split_once("task_id=")
+                    .map(|(_, rest)| {
+                        rest.chars()
+                            .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+                            .collect()
+                    })
+                    .filter(|id: &String| !id.is_empty())
+                    .expect("the accepted relay names its task");
+                let control_plane = match crate::control_plane::control_plane().cloned() {
+                    Some(handle) => handle,
+                    None => crate::control_plane::non_daemon_control_plane(&hop.config.data_dir)
+                        .await
+                        .expect("the relay's control plane opens"),
+                };
                 let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
                 loop {
-                    let asked = hop
-                        .providers
-                        .seen
-                        .lock()
-                        .iter()
-                        .any(|request| request.agent_alias == PEER);
-                    if asked
-                        || hop.endpoint.connections() > 0
-                        || tokio::time::Instant::now() >= deadline
-                    {
+                    let snapshot = control_plane
+                        .store
+                        .get_snapshot(&task_id)
+                        .await
+                        .expect("the relay's task is queryable")
+                        .expect("the relay's task is registered in the control plane");
+                    if snapshot.task.status.is_terminal() {
                         break;
                     }
+                    assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "the relayed turn did not settle its task within 60 s; seen: {:?}; \
+                         connections to the configured endpoint: {}",
+                        hop.providers.seen.lock().clone(),
+                        hop.endpoint.connections()
+                    );
                     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
                 }
 
@@ -21543,13 +21740,14 @@ target = "memory_recall"
                 let seen = hop.providers.seen.lock().clone();
                 let connections = hop.endpoint.connections();
                 assert!(
-                    seen.iter().any(|request| {
-                        request.agent_alias == PEER
-                            && request.principal.as_ref() == Some(&principal)
-                    }),
-                    "the relayed turn must ask the caller's provider source for {PEER} on \
-                     behalf of the caller's principal; seen: {seen:?}; connections to the \
-                     configured endpoint: {connections}"
+                    seen.iter().any(|request| request.agent_alias == PEER)
+                        && seen
+                            .iter()
+                            .filter(|request| request.agent_alias == PEER)
+                            .all(|request| request.principal.as_ref() == Some(&principal)),
+                    "every request of the relayed turn must ask the caller's provider source \
+                     for {PEER} on behalf of the caller's principal; seen: {seen:?}; \
+                     connections to the configured endpoint: {connections}"
                 );
                 assert_eq!(
                     connections, 0,
@@ -21565,19 +21763,42 @@ target = "memory_recall"
         #[test]
         fn bounded_rebuilt_spawn_subagent_child_stays_on_owner_plane() {
             on_deep_stack(async {
-                let hop = hop("spawn_subagent", true, true, |_, _| {}).await;
+                let hop = hop("spawn_subagent", true, HopMemory::OneStore, |_, _| {}).await;
                 hop.tool
                     .bind_principal_scope(owner_scope())
                     .expect("the session's owner binds");
-                let sink = Arc::new(std::sync::Mutex::new(None));
-                let result = CHILD_MEMORY_SINK
-                    .scope(
-                        Arc::clone(&sink),
-                        run_target(&hop, "spawn_subagent", json!({"prompt": "say hello"})),
-                    )
-                    .await;
-                let started = sink.lock().unwrap().take();
-                let Some(handed) = started else {
+                let SpawnRun {
+                    result,
+                    child,
+                    probe,
+                } = run_spawn(&hop).await;
+                // The sealed registry itself carries the owner's plane for the
+                // target, on the route its `spawn_subagent` shares.
+                let sealed = match probe.sealed {
+                    Some(SealedRoute::Pinned(memory)) => memory,
+                    Some(SealedRoute::Unpinned) => panic!(
+                        "the sealed registry of an owned hop must carry a route pinned to the \
+                         owner's plane for {TARGET}; its route is not pinned; refusal: {:?}",
+                        probe.refusal
+                    ),
+                    Some(SealedRoute::Absent) => panic!(
+                        "the sealed registry of an owned hop must carry a route pinned to the \
+                         owner's plane for {TARGET}; it carries no route; refusal: {:?}",
+                        probe.refusal
+                    ),
+                    None => panic!(
+                        "precondition: the bounded hop sealed its registry; refusal: {:?}; \
+                         delegate output: {}",
+                        probe.refusal, result.output
+                    ),
+                };
+                assert_eq!(
+                    sealed.principal_scope(),
+                    Some(owner_target_scope()),
+                    "the sealed registry's route is pinned to the owner's plane for the target"
+                );
+                assert_eq!(probe.refusal, None, "the owned hop is not refused");
+                let Some(handed) = child else {
                     panic!(
                         "precondition: the rebuilt spawn_subagent started its child run; \
                          delegate output: {}",
@@ -21596,6 +21817,10 @@ target = "memory_recall"
                     handed.principal_scope(),
                     Some(owner_target_scope()),
                     "the child runs on the owner's plane for the target, not the caller's"
+                );
+                assert!(
+                    Arc::ptr_eq(&handed, &sealed),
+                    "the child is handed the plane the sealed registry's route holds"
                 );
                 handed
                     .store(
@@ -21627,22 +21852,24 @@ target = "memory_recall"
         #[test]
         fn bounded_rebuilt_spawn_subagent_unowned_child_opens_its_own_memory() {
             on_deep_stack(async {
-                let hop = hop("spawn_subagent", true, true, |_, _| {}).await;
-                let sink = Arc::new(std::sync::Mutex::new(None));
-                let result = CHILD_MEMORY_SINK
-                    .scope(
-                        Arc::clone(&sink),
-                        run_target(&hop, "spawn_subagent", json!({"prompt": "say hello"})),
-                    )
-                    .await;
-                let started = sink.lock().unwrap().take();
-                let Some(handed) = started else {
+                let hop = hop("spawn_subagent", true, HopMemory::OneStore, |_, _| {}).await;
+                let SpawnRun {
+                    result,
+                    child,
+                    probe,
+                } = run_spawn(&hop).await;
+                let Some(handed) = child else {
                     panic!(
                         "precondition: the rebuilt spawn_subagent started its child run; \
                          delegate output: {}",
                         result.output
                     );
                 };
+                assert!(
+                    matches!(probe.sealed, Some(SealedRoute::Unpinned)),
+                    "an unowned hop's sealed registry carries its route, left empty"
+                );
+                assert_eq!(probe.refusal, None, "the unowned hop is not refused");
                 assert!(
                     handed.is_none(),
                     "an unowned session's child is handed no memory; it was handed one \
@@ -21658,7 +21885,7 @@ target = "memory_recall"
         #[test]
         fn bounded_rebuilt_spawn_subagent_unbound_delegate_keeps_config_backed_child() {
             on_deep_stack(async {
-                let hop = hop("spawn_subagent", false, false, |_, _| {}).await;
+                let hop = hop("spawn_subagent", false, HopMemory::Recording, |_, _| {}).await;
                 let sink = Arc::new(std::sync::Mutex::new(None));
                 let result = CHILD_MEMORY_SINK
                     .scope(
@@ -21684,6 +21911,149 @@ target = "memory_recall"
                     "nothing was bound, so no supplied source is asked"
                 );
             });
+        }
+
+        /// An owned session whose delegate no entry point bound still runs the
+        /// rebuilt `spawn_subagent`'s child on the owner's plane for the
+        /// target: the plane wraps the target's memory opened from config, and
+        /// the child keeps the config-backed provider.
+        #[test]
+        fn bounded_rebuilt_spawn_subagent_owned_unbound_delegate_child_stays_on_owner_plane() {
+            on_deep_stack(async {
+                let hop = hop("spawn_subagent", false, HopMemory::Recording, |_, _| {}).await;
+                hop.tool
+                    .bind_principal_scope(owner_scope())
+                    .expect("the session's owner binds");
+                let SpawnRun {
+                    result,
+                    child,
+                    probe,
+                } = run_spawn(&hop).await;
+                assert_eq!(
+                    probe.refusal, None,
+                    "the owned unbound hop is not refused; delegate output: {}",
+                    result.output
+                );
+                let Some(handed) = child else {
+                    panic!(
+                        "precondition: the rebuilt spawn_subagent started its child run; \
+                         delegate output: {}",
+                        result.output
+                    );
+                };
+                assert_eq!(
+                    handed.as_ref().and_then(|memory| memory.principal_scope()),
+                    Some(owner_target_scope()),
+                    "the child runs on the owner's plane for the target"
+                );
+                assert!(
+                    matches!(
+                        &probe.sealed,
+                        Some(SealedRoute::Pinned(memory))
+                            if handed.as_ref().is_some_and(|handed| Arc::ptr_eq(handed, memory))
+                    ),
+                    "the sealed registry's route holds the plane the child is handed"
+                );
+                assert!(
+                    hop.endpoint.connections() >= 1,
+                    "an unbound delegate's child builds {TARGET}'s configured provider; \
+                     delegate output: {}",
+                    result.output
+                );
+                assert!(
+                    hop.providers.seen.lock().is_empty(),
+                    "nothing was bound, so no supplied source is asked"
+                );
+            });
+        }
+
+        /// In an owned session, a target whose memory the caller's source
+        /// cannot open refuses the hop before its registry is sealed, with the
+        /// same refusal as any other tool-initialization failure, and records
+        /// that the owner's plane was unavailable.
+        #[test]
+        fn bounded_rebuilt_spawn_subagent_owned_refuses_when_target_memory_fails() {
+            on_deep_stack(async {
+                let hop = hop("spawn_subagent", true, HopMemory::Failing, |_, _| {}).await;
+                hop.tool
+                    .bind_principal_scope(owner_scope())
+                    .expect("the session's owner binds");
+                let SpawnRun {
+                    result,
+                    child,
+                    probe,
+                } = run_spawn(&hop).await;
+                assert_eq!(
+                    probe.refusal,
+                    Some("target_memory_unavailable"),
+                    "the hop is refused because the owner's plane for {TARGET} cannot be \
+                     opened; delegate output: {}; error: {:?}",
+                    result.output,
+                    result.error
+                );
+                assert!(!result.success, "a refused hop does not succeed");
+                assert_eq!(
+                    result.error,
+                    DelegateTool::bounded_tools_refusal(TARGET).error,
+                    "the refusal the model sees is the existing tool-initialization one"
+                );
+                assert!(
+                    probe.sealed.is_none(),
+                    "the hop is refused before its registry is sealed"
+                );
+                assert!(child.is_none(), "no child run starts");
+                assert_eq!(
+                    hop.endpoint.connections(),
+                    0,
+                    "nothing reaches the target's configured endpoint"
+                );
+            });
+        }
+
+        /// The check on a sealed registry's route names each way it can miss
+        /// the owner's plane for the target, and accepts only that plane.
+        #[test]
+        fn owner_plane_mismatch_accepts_only_the_owner_plane_for_the_target() {
+            use zeroclaw_tools::session_memory::SessionMemoryRoute;
+            let shared: Arc<dyn Memory> = Arc::new(zeroclaw_memory::NoneMemory::new("none"));
+            let plane = |scope: PrincipalScope| -> Arc<dyn Memory> {
+                Arc::new(zeroclaw_memory::PrincipalPlaneMemory::new(
+                    Arc::clone(&shared),
+                    scope,
+                ))
+            };
+            let pinned = |memory: Arc<dyn Memory>| {
+                let route = Arc::new(SessionMemoryRoute::default());
+                route
+                    .pin(memory, Arc::new(SecurityPolicy::default()))
+                    .unwrap();
+                route
+            };
+            let expected = owner_target_scope();
+            let check = |route: Option<&Arc<SessionMemoryRoute>>| {
+                DelegateTool::owner_plane_mismatch(route, &expected)
+            };
+
+            assert_eq!(check(None), Some("sealed_registry_has_no_route"));
+            assert_eq!(
+                check(Some(&Arc::new(SessionMemoryRoute::default()))),
+                Some("sealed_route_not_pinned")
+            );
+            for (wrong, what) in [
+                (Arc::clone(&shared), "the shared plane"),
+                (plane(owner_scope()), "the owner's plane for the caller"),
+                (
+                    plane(PrincipalScope::new("user:bob").with_agent(Some(TARGET.to_string()))),
+                    "another owner's plane for the target",
+                ),
+            ] {
+                assert_eq!(
+                    check(Some(&pinned(wrong))),
+                    Some("sealed_route_plane_scope_mismatch"),
+                    "a route pinned to {what} is refused"
+                );
+            }
+            assert_eq!(check(Some(&pinned(plane(owner_target_scope())))), None);
         }
     }
 

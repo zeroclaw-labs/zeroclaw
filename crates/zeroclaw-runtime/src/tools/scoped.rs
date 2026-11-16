@@ -491,6 +491,13 @@ impl ScopedToolRegistry {
         }
     }
 
+    /// The session memory route this registry carries, when it carries one.
+    pub(crate) fn session_memory_route(
+        &self,
+    ) -> Option<&Arc<zeroclaw_tools::session_memory::SessionMemoryRoute>> {
+        self.5.as_ref()
+    }
+
     /// Pin the session memory route this registry's memory-starting tools
     /// share to `memory`, the session owner's routed handle. The pipeline's
     /// memory steps, `spawn_subagent`'s child runs and the SOP tools' audit
