@@ -531,7 +531,9 @@ mod tests {
     use async_trait::async_trait;
     use parking_lot::Mutex;
     use std::sync::Arc;
-    use zeroclaw_api::model_provider::ChatMessage;
+    use zeroclaw_api::model_provider::{
+        ChatMessage, ChatRequest, ChatResponse, GenerationAttemptBudget, ToolRoundPolicy,
+    };
     use zeroclaw_config::schema::{MemoryDedupAction, MemoryPolicyConfig, MemoryTypesConfig};
 
     #[derive(Debug, Clone)]
@@ -699,6 +701,19 @@ mod tests {
 
     #[async_trait]
     impl ModelProvider for ScriptedProvider {
+        async fn chat_with_attempt_budget(
+            &self,
+            request: ChatRequest<'_>,
+            model: &str,
+            temperature: Option<f64>,
+            policy: ToolRoundPolicy,
+            budget: &GenerationAttemptBudget,
+        ) -> anyhow::Result<ChatResponse> {
+            budget.try_spend()?;
+            self.chat_with_tool_round_policy(request, model, temperature, policy)
+                .await
+        }
+
         async fn chat_with_system(
             &self,
             system_prompt: Option<&str>,
@@ -875,6 +890,19 @@ mod tests {
                     .pop_front()
                     .expect("unexpected extraction call")
                     .map_err(|_| anyhow::Error::msg("private-provider-error-sentinel"))
+            }
+
+            async fn chat_with_attempt_budget(
+                &self,
+                request: ChatRequest<'_>,
+                model: &str,
+                temperature: Option<f64>,
+                policy: ToolRoundPolicy,
+                budget: &GenerationAttemptBudget,
+            ) -> anyhow::Result<ChatResponse> {
+                budget.try_spend()?;
+                self.chat_with_tool_round_policy(request, model, temperature, policy)
+                    .await
             }
         }
 
@@ -1187,7 +1215,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn configured_transport_retry_does_not_add_an_extraction_repair_budget() {
+        async fn configured_transport_retry_shares_two_calls_with_schema_repair() {
             let invalid =
                 r#"{"history_entry":"h","memory_update":"invalid core","kind":"unknown"}"#;
             let leaf = Arc::new(SequenceProvider::new(
@@ -1202,23 +1230,162 @@ mod tests {
             );
             assert_fallback(&run(&reliable).await);
             let requests = leaf.requests.lock();
-            assert_eq!(
-                requests.len(),
-                3,
-                "one transport retry plus two extraction invocations"
-            );
+            assert_eq!(requests.len(), 2, "retry spent the final submission");
             assert_eq!(requests[0].messages.len(), 2);
             assert_eq!(requests[1].messages.len(), 2);
-            assert_eq!(requests[2].messages.len(), 2);
-            assert!(
-                requests[2].messages[1]
+            assert!(requests.iter().all(|request| {
+                !request.messages[1]
                     .content
                     .contains("Repair the extraction")
+            }));
+        }
+
+        #[tokio::test]
+        async fn configured_failover_shares_two_calls_with_schema_repair() {
+            for response in ["{broken}", TYPED_RESPONSE] {
+                let primary = Arc::new(SequenceProvider::new(vec![Err(())], false));
+                let fallback = Arc::new(SequenceProvider::new(
+                    vec![text(Some(response)), text(Some(TYPED_RESPONSE))],
+                    false,
+                ));
+                let unused = Arc::new(SequenceProvider::new(vec![], false));
+                let reliable = zeroclaw_providers::reliable::ReliableModelProvider::new(
+                    "reliable-fixture",
+                    vec![
+                        ("primary".into(), Box::new(Arc::clone(&primary))),
+                        ("fallback".into(), Box::new(Arc::clone(&fallback))),
+                        ("unused".into(), Box::new(Arc::clone(&unused))),
+                    ],
+                    0,
+                    50,
+                );
+                let memory = run(&reliable).await;
+                if response == TYPED_RESPONSE {
+                    assert!(memory.writes.lock().len() > 1);
+                } else {
+                    assert_fallback(&memory);
+                }
+                assert_eq!(primary.requests.lock().len(), 1);
+                let requests = fallback.requests.lock();
+                assert_eq!(requests.len(), 1);
+                assert!(
+                    !requests[0].messages[1]
+                        .content
+                        .contains("Repair the extraction")
+                );
+                assert!(unused.requests.lock().is_empty());
+            }
+        }
+
+        #[tokio::test]
+        async fn retry_can_use_the_final_call_for_a_valid_extraction() {
+            let leaf = Arc::new(SequenceProvider::new(
+                vec![Err(()), text(Some(TYPED_RESPONSE))],
+                false,
+            ));
+            let reliable = zeroclaw_providers::reliable::ReliableModelProvider::new(
+                "reliable-fixture",
+                vec![("scripted".into(), Box::new(Arc::clone(&leaf)))],
+                5,
+                50,
+            );
+            assert!(run(&reliable).await.writes.lock().len() > 1);
+            assert_eq!(leaf.requests.lock().len(), 2);
+        }
+
+        #[tokio::test]
+        async fn retry_exhaustion_keeps_provider_failure_after_history_fallback() {
+            let leaf = Arc::new(SequenceProvider::new(vec![Err(()), Err(())], false));
+            let unused = Arc::new(SequenceProvider::new(vec![], false));
+            let reliable = zeroclaw_providers::reliable::ReliableModelProvider::new(
+                "reliable-fixture",
+                vec![
+                    ("scripted".into(), Box::new(Arc::clone(&leaf))),
+                    ("unused".into(), Box::new(Arc::clone(&unused))),
+                ],
+                5,
+                50,
+            );
+            let (memory, outcome) = run_outcome(&reliable).await;
+            assert_fallback(&memory);
+            let error = outcome.unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "Memory consolidation provider call failed"
             );
             assert!(
-                requests[2].messages[1]
-                    .content
-                    .starts_with(&requests[0].messages[1].content)
+                error
+                    .downcast_ref::<zeroclaw_api::model_provider::GenerationAttemptBudgetExhausted>(
+                    )
+                    .is_some()
+            );
+            assert_eq!(
+                error.root_cause().to_string(),
+                "private-provider-error-sentinel"
+            );
+            assert_eq!(leaf.requests.lock().len(), 2);
+            assert!(unused.requests.lock().is_empty());
+        }
+
+        #[tokio::test]
+        async fn each_turn_gets_its_own_two_call_allowance() {
+            let provider = SequenceProvider::new(
+                vec![
+                    text(Some("{broken}")),
+                    text(Some(TYPED_RESPONSE)),
+                    text(Some("{broken}")),
+                    text(Some(TYPED_RESPONSE)),
+                ],
+                false,
+            );
+            for _ in 0..2 {
+                assert!(run(&provider).await.writes.lock().len() > 1);
+            }
+            assert_eq!(provider.requests.lock().len(), 4);
+        }
+
+        struct UnboundedOnlyProvider;
+
+        impl zeroclaw_api::attribution::Attributable for UnboundedOnlyProvider {
+            fn role(&self) -> zeroclaw_api::attribution::Role {
+                zeroclaw_api::attribution::Role::Provider(
+                    zeroclaw_api::attribution::ProviderKind::Model(
+                        zeroclaw_api::attribution::ModelProviderKind::Custom,
+                    ),
+                )
+            }
+
+            fn alias(&self) -> &str {
+                "unbounded-fixture"
+            }
+        }
+
+        #[async_trait]
+        impl ModelProvider for UnboundedOnlyProvider {
+            async fn chat_with_system(
+                &self,
+                _: Option<&str>,
+                _: &str,
+                _: &str,
+                _: Option<f64>,
+            ) -> anyhow::Result<String> {
+                panic!("consolidation must never use an unbounded provider entry point")
+            }
+        }
+
+        #[tokio::test]
+        async fn unsupported_bounded_provider_saves_fallback_without_unbounded_calls() {
+            let (memory, outcome) = run_outcome(&UnboundedOnlyProvider).await;
+            assert_fallback(&memory);
+            let error = outcome.unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "Memory consolidation provider call failed"
+            );
+            assert!(
+                error
+                    .downcast_ref::<zeroclaw_api::model_provider::BoundedChatUnsupported>()
+                    .is_some()
             );
         }
 
@@ -1768,6 +1935,9 @@ mod consolidate_turn_tests {
     use std::sync::Mutex;
     use tempfile::TempDir;
     use zeroclaw_api::attribution::{Attributable, ModelProviderKind, ProviderKind, Role};
+    use zeroclaw_api::model_provider::{
+        ChatRequest, ChatResponse, GenerationAttemptBudget, ToolRoundPolicy,
+    };
     use zeroclaw_config::schema::MemoryDedupAction;
 
     /// Scripted model: returns a canned consolidation reply (or fails) and
@@ -1810,6 +1980,19 @@ mod consolidate_turn_tests {
 
     #[async_trait]
     impl ModelProvider for ScriptedProvider {
+        async fn chat_with_attempt_budget(
+            &self,
+            request: ChatRequest<'_>,
+            model: &str,
+            temperature: Option<f64>,
+            policy: ToolRoundPolicy,
+            budget: &GenerationAttemptBudget,
+        ) -> anyhow::Result<ChatResponse> {
+            budget.try_spend()?;
+            self.chat_with_tool_round_policy(request, model, temperature, policy)
+                .await
+        }
+
         async fn chat_with_system(
             &self,
             _system_prompt: Option<&str>,

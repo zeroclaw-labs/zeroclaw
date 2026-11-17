@@ -68,9 +68,12 @@ these limits reject the complete extraction:
 | `kind` | 10 |
 
 Consolidation selects one [provider extraction mode](../providers/configuration.md#consolidation-tool-forcing)
-and makes at most two extraction invocations: the initial request and one
-repair. Existing provider transport retries and failover remain configured
-independently, so this is not a two-HTTP-request or physical-inference limit.
+and shares one allowance of two client generation submissions across initial
+extraction, one schema repair, adapter recovery, transport retries, and failover.
+Retries retain their configured order within that allowance. If recovery uses
+both submissions, invalid output falls back to history without another repair.
+The allowance caps client submissions, not work performed internally by a remote
+provider or gateway.
 Repair feedback contains at most eight schema keyword/path pairs within 256
 bytes. It includes neither candidate values nor unknown field names, and the
 failed response is not copied into the repair conversation.
@@ -91,6 +94,11 @@ retained. Channel and gateway callers handle these failures in background tasks
 outside response delivery. Missing or invalid output still returns success
 after fallback. Existing storage, policy, retention,
 deduplication, conflict resolution, and typed-memory controls still apply.
+
+Providers that cannot enforce the allowance decline extraction before submitting
+generation requests. CLI adapters and directly constructed native Ollama or GLM
+providers use the history-only fallback and return a fixed-context error.
+Configured Ollama and GLM routes use Compatible and support bounded extraction.
 
 There is no persisted migration. Reverting the extraction change restores the
 previous prompt-and-parse behavior without rewriting stored memories.

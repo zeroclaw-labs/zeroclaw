@@ -164,11 +164,19 @@ narrow. Applicable string bounds and enums remain. Every returned candidate
 must still pass the complete canonical schema, including nullability and the
 kind/update dependency, before Rust decoding.
 
-The two-invocation extraction budget covers initial extraction and one schema
-repair in the same mode. Provider transport retries and availability failover
-keep their existing policy beneath those invocations and can cause additional
-requests. A provider error ends extraction with the safe history fallback, then
-returns to the caller with a fixed error summary and the original cause retained.
+Initial extraction, one schema repair in the same mode, adapter recovery,
+transport retries, and availability failover share a total allowance of two
+client generation submissions. Recovery retains its configured order within
+that allowance. A retry or failover can use the final submission, leaving none
+for schema repair. Invalid output then uses the safe history fallback. A provider
+error saves fallback history before returning to the caller with a fixed error
+summary and the original cause retained. The allowance does not count work
+performed internally by remote providers or gateways.
+
+Providers that cannot enforce the allowance decline extraction without submitting
+generation requests. CLI adapters and directly constructed native Ollama or GLM
+providers use history fallback and return a fixed-context error. Configured
+Ollama and GLM routes use Compatible and support bounded extraction.
 
 ## Field resolution order
 

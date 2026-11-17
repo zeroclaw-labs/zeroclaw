@@ -7,8 +7,8 @@ use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 use serde_json::Value;
 use zeroclaw_api::model_provider::{
-    ChatMessage, ChatRequest, ChatResponse, ModelProvider, ToolRoundPolicy,
-    build_tool_instructions_text,
+    ChatMessage, ChatRequest, ChatResponse, GenerationAttemptBudget, ModelProvider,
+    ToolRoundPolicy, build_tool_instructions_text,
 };
 use zeroclaw_api::tool::ToolSpec;
 use zeroclaw_providers::ProviderDispatch;
@@ -270,13 +270,18 @@ pub(super) async fn extract(
         )
     };
     let mut messages = vec![ChatMessage::system(instructions), ChatMessage::user(turn)];
-    // This consumer owns semantic repair only. Existing provider transport
-    // retries/failover retain their configured policy beneath each invocation.
+    // Submission admission belongs to the provider. Keep the same allowance
+    // across semantic repair and every underlying retry or failover.
+    let budget = GenerationAttemptBudget::new(2);
     for attempt in 0..2 {
+        if budget.remaining() == 0 {
+            log_failure("budget_exhausted", attempt);
+            return Ok(None);
+        }
         let response = zeroclaw_api::TOOL_CHOICE_OVERRIDE
             .scope(
                 native.then(|| "any".to_string()),
-                ProviderDispatch::from_ref(provider).chat_with_tool_round_policy(
+                ProviderDispatch::from_ref(provider).chat_with_attempt_budget(
                     ChatRequest {
                         messages: &messages,
                         tools: native.then_some(tools.as_slice()),
@@ -289,6 +294,7 @@ pub(super) async fn extract(
                     } else {
                         ToolRoundPolicy::Batch
                     },
+                    &budget,
                 ),
             )
             .await

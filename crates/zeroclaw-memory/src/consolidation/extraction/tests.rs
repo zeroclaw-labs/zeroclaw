@@ -242,6 +242,19 @@ async fn repair_retains_source_through_the_default_history_adapter() {
     }
     #[async_trait::async_trait]
     impl ModelProvider for LastUserProvider {
+        async fn chat_with_attempt_budget(
+            &self,
+            request: ChatRequest<'_>,
+            model: &str,
+            temperature: Option<f64>,
+            policy: ToolRoundPolicy,
+            budget: &GenerationAttemptBudget,
+        ) -> anyhow::Result<ChatResponse> {
+            budget.try_spend()?;
+            self.chat_with_tool_round_policy(request, model, temperature, policy)
+                .await
+        }
+
         async fn chat_with_system(
             &self,
             _: Option<&str>,
@@ -303,15 +316,16 @@ impl ModelProvider for WireProvider {
     ) -> anyhow::Result<String> {
         anyhow::bail!("wire fixture requires structured dispatch")
     }
-    async fn chat_with_tool_round_policy(
+    async fn chat_with_attempt_budget(
         &self,
         request: ChatRequest<'_>,
         model: &str,
         temperature: Option<f64>,
         policy: ToolRoundPolicy,
+        budget: &GenerationAttemptBudget,
     ) -> anyhow::Result<ChatResponse> {
         self.0
-            .chat_with_tool_round_policy(request, model, temperature, policy)
+            .chat_with_attempt_budget(request, model, temperature, policy, budget)
             .await
     }
 }
