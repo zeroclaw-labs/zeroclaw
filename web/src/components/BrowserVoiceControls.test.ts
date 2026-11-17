@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import test from 'node:test';
 import { Window } from 'happy-dom';
 import React, { createElement } from 'react';
@@ -36,7 +37,8 @@ class FakeUtterance {
   constructor(public text: string) {}
 }
 const speech = Object.assign(new EventTarget(), {
-  getVoices: () => [{ voiceURI: 'synthetic-local-voice', name: 'Test local voice', lang: 'en-US', localService: true }],
+  getVoices: () => [{ voiceURI: 'synthetic-local-voice', name: 'Test local voice', lang: 'en-US', localService: true },
+    { voiceURI: 'synthetic-pt-voice', name: 'Test Portuguese voice', lang: 'pt-BR', localService: true }],
   cancel: () => {}, speak: (u: FakeUtterance) => { spokenUtterance = u; spoken.push(u.text); },
 });
 const fakeWindow = Object.assign(new EventTarget(), {
@@ -770,5 +772,84 @@ test('microphone waits for the initial global timeout before capture can start',
   } finally {
     if (renderer) await act(async () => { renderer.unmount(); });
     globalThis.fetch = originalFetch;
+  }
+});
+
+test('OIDC voice settings enable chat controls without pairing and isolate accounts', async () => {
+  const { setOidcSession } = await import('../lib/auth.ts');
+  const { default: Settings } = await import('./BrowserVoiceSettings.tsx');
+  const aliceKey = 'zeroclaw-oidc-voice:v2:' + createHash('sha256').update('alice').digest('hex');
+  const principal = (id: string, config = true) => ({
+    kind: 'oidc' as const, provider: 'oidc.test', principal_id: id,
+    display_name: id, admin: true, expires_at: 2_000_000_000,
+    csrf_token: 'test-csrf', features: { chat: true, config, operator_pages: true },
+  });
+  const pairedToken = values.get('zeroclaw_token')!;
+  values.delete('zeroclaw_token');
+  const before = requests.length;
+  let settings: ReactTestRenderer | undefined;
+  let chat: ReactTestRenderer | undefined;
+  try {
+    setOidcSession(principal('alice'));
+    await act(async () => { settings = create(createElement(Settings), options); });
+    await act(async () => { await crypto.subtle.digest('SHA-256', new TextEncoder().encode('alice')); });
+    const mic = settings!.root.findAllByType('input').find(input => input.props.type === 'checkbox')!;
+    await act(async () => { mic.props.onChange({ target: { checked: true } }); });
+    const spokenSettings = settings!.root.findAllByType('input').filter(input => input.props.type === 'checkbox');
+    await act(async () => { spokenSettings[1]!.props.onChange({ target: { checked: true } }); });
+    await act(async () => {
+      await saveVoicePreferences({ ...JSON.parse(values.get(aliceKey)!), voice: 'synthetic-local-voice' });
+    });
+    const transcripts: string[] = [];
+    await act(async () => {
+      await saveVoicePreferences({ ...JSON.parse(values.get(aliceKey)!), voice: 'synthetic-pt-voice', automatic: true });
+    });
+    const preview = settings!.root.findAllByType('button').find(button => button.props.children === 'Test voice')!;
+    await act(async () => { preview.props.onClick(); });
+    assert.equal(spokenUtterance?.text, 'Olá. Esta é uma amostra da voz selecionada.');
+    assert.equal((spokenUtterance as unknown as SpeechSynthesisUtterance).lang, 'pt-BR');
+    const sample = spokenUtterance;
+    await act(async () => { preview.props.onClick(); });
+    assert.equal(spokenUtterance, sample, 'repeated clicks do not queue previews');
+    await act(async () => {
+      await saveVoicePreferences({ ...JSON.parse(values.get(aliceKey)!), automatic: false });
+    });
+    chat = await mount(text => transcripts.push(text));
+    assert.equal(chat.root.findAllByType('button').length, 2);
+    const speaker = chat.root.findAllByType('button')[1]!;
+    await act(async () => { speaker.props.onClick(); });
+    assert.equal(chat.root.findByProps({ role: 'alert' }).props.children,
+      'Voice playback is already in progress. Try again after it ends.');
+    await act(async () => { sample?.onend?.(); });
+    await act(async () => { speaker.props.onClick(); });
+    assert.deepEqual(spoken, ['Historical reply']);
+    const micButton = chat.root.findAllByType('button')[0]!;
+    await act(async () => { await micButton.props.onClick(); });
+    const captured = capture.onresult!;
+    await act(async () => { captured({ resultIndex: 0, results: [{ isFinal: true, 0: { transcript: 'OIDC dictation' } }] }); });
+    assert.deepEqual(transcripts, ['OIDC dictation']);
+    await act(async () => {
+      localStorage.setItem(aliceKey, JSON.stringify({ ...JSON.parse(values.get(aliceKey)!), automatic: true }));
+      setOidcSession(principal('bob'));
+    });
+    assert.equal(aborted, 1);
+    captured({ resultIndex: 0, results: [{ isFinal: true, 0: { transcript: 'Stale account' } }] });
+    assert.deepEqual(transcripts, ['OIDC dictation']);
+    assert.equal(chat.root.findAllByType('button').length, 0);
+    await act(async () => { setOidcSession(principal('alice', false)); });
+    assert.equal(chat.root.findAllByType('button').length, 0);
+    await assert.rejects(saveVoicePreferences(preferences as Parameters<typeof saveVoicePreferences>[0]));
+    await act(async () => { setOidcSession(principal('alice')); });
+    await act(async () => { await crypto.subtle.digest('SHA-256', new TextEncoder().encode('alice')); });
+    assert.equal(chat.root.findAllByType('button').length, 2);
+    assert.ok(![...values.keys()].some(key => key.includes('alice')));
+    assert.equal(chat.root.findAllByType('button')[1]!.props['aria-pressed'], true);
+    assert.ok(requests.slice(before).every(r => !r.path.startsWith('/api/devices')));
+    assert.ok(!JSON.stringify([...values]).includes('test-csrf'));
+  } finally {
+    await act(async () => { settings?.unmount(); chat?.unmount(); });
+    setOidcSession(null);
+    values.set('zeroclaw_token', pairedToken);
+    values.delete(aliceKey);
   }
 });

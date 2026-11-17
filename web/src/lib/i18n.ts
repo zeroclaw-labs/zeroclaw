@@ -571,6 +571,8 @@ const translations: Record<Locale, Record<string, string>> = {
     "voice.help_identity": "Preferences are stored in ZeroClaw by paired-device ID, without browser preference storage. One browser may use one voice, another a different voice, and another may have voice disabled. Reloading preserves each device’s choices. A new pairing creates a new device identity with its own defaults.",
 
     "voice.settings": "Browser Voice and Audio",
+    "voice.oidc_setup": "Enable the microphone and speaker below, then choose and test an available voice.",
+    "voice.oidc_note": "Preferences are saved in this browser for the signed-in account.",
     "voice.device_note": "Preferences are saved in ZeroClaw for the selected device. Chat controls in this browser always use the record marked “this browser”.",
     "voice.dictation": "Show microphone / enable dictation",
     "voice.language": "Language",
@@ -2305,6 +2307,7 @@ const translations: Record<Locale, Record<string, string>> = {
   },
 
   tr: {
+    "voice.sample_text": "Merhaba. Bu, seçilen sesin bir örneğidir.",
     'sidebar.update_available': "Güncelleme mevcut",
     'upgrade.title': "Yükselt",
     'upgrade.current': "Geçerli",
@@ -3260,6 +3263,7 @@ const translations: Record<Locale, Record<string, string>> = {
   },
 
   bn: {
+    "voice.sample_text": "নমস্কার। এটি নির্বাচিত কণ্ঠের একটি নমুনা।",
     'sidebar.update_available': "আপডেট উপলব্ধ",
     'upgrade.title': "আপগ্রেড",
     'upgrade.current': "বর্তমান",
@@ -3704,6 +3708,7 @@ const translations: Record<Locale, Record<string, string>> = {
   },
 
   cs: {
+    "voice.sample_text": "Dobrý den. Toto je ukázka vybraného hlasu.",
     'sidebar.update_available': "Dostupná aktualizace",
     'upgrade.title': "Aktualizovat",
     'upgrade.current': "Aktuální",
@@ -4148,6 +4153,7 @@ const translations: Record<Locale, Record<string, string>> = {
   },
 
   da: {
+    "voice.sample_text": "Hej. Dette er en prøve på den valgte stemme.",
     'sidebar.update_available': "Opdatering tilgængelig",
     'upgrade.title': "Opgrader",
     'upgrade.current': "Nuværende",
@@ -5091,6 +5097,7 @@ const translations: Record<Locale, Record<string, string>> = {
   },
 
   el: {
+    "voice.sample_text": "Γεια σας. Αυτό είναι ένα δείγμα της επιλεγμένης φωνής.",
     'sidebar.update_available': "Διαθέσιμη ενημέρωση",
     'upgrade.title': "Αναβάθμιση",
     'upgrade.current': "Τρέχουσα",
@@ -6034,6 +6041,7 @@ const translations: Record<Locale, Record<string, string>> = {
   },
 
   fi: {
+    "voice.sample_text": "Hei. Tämä on näyte valitusta äänestä.",
     'sidebar.update_available': "Päivitys saatavilla",
     'upgrade.title': "Päivitä",
     'upgrade.current': "Nykyinen",
@@ -6991,6 +6999,7 @@ const translations: Record<Locale, Record<string, string>> = {
   },
 
   he: {
+    "voice.sample_text": "שלום. זוהי דוגמה לקול שנבחר.",
     'sidebar.update_available': "עדכון זמין",
     'upgrade.title': "שדרוג",
     'upgrade.current': "נוכחית",
@@ -7435,6 +7444,7 @@ const translations: Record<Locale, Record<string, string>> = {
   },
 
   hi: {
+    "voice.sample_text": "नमस्ते। यह चुनी गई आवाज़ का एक नमूना है।",
     'sidebar.update_available': "अपडेट उपलब्ध",
     'upgrade.title': "अपग्रेड",
     'upgrade.current': "वर्तमान",
@@ -7879,6 +7889,7 @@ const translations: Record<Locale, Record<string, string>> = {
   },
 
   hu: {
+    "voice.sample_text": "Üdvözlöm. Ez a kiválasztott hang mintája.",
     'sidebar.update_available': "Frissítés érhető el",
     'upgrade.title': "Frissítés",
     'upgrade.current': "Jelenlegi",
@@ -8323,6 +8334,7 @@ const translations: Record<Locale, Record<string, string>> = {
   },
 
   id: {
+    "voice.sample_text": "Halo. Ini adalah contoh suara yang dipilih.",
     'sidebar.update_available': "Pembaruan tersedia",
     'upgrade.title': "Tingkatkan",
     'upgrade.current': "Saat ini",
@@ -9779,6 +9791,7 @@ const translations: Record<Locale, Record<string, string>> = {
   },
 
   ko: {
+    "voice.sample_text": "안녕하세요. 선택한 음성의 예시입니다.",
     'sidebar.update_available': "업데이트 사용 가능",
     'upgrade.title': "업그레이드",
     'upgrade.current': "현재",
@@ -10223,6 +10236,7 @@ const translations: Record<Locale, Record<string, string>> = {
   },
 
   nb: {
+    "voice.sample_text": "Hei. Dette er en prøve på den valgte stemmen.",
     'sidebar.update_available': "Oppdatering tilgjengelig",
     'upgrade.title': "Oppgrader",
     'upgrade.current': "Nåværende",
@@ -10667,6 +10681,7 @@ const translations: Record<Locale, Record<string, string>> = {
   },
 
   nl: {
+    "voice.sample_text": "Hallo. Dit is een voorbeeld van de geselecteerde stem.",
     'sidebar.update_available': "Update beschikbaar",
     'upgrade.title': "Upgraden",
     'upgrade.current': "Huidige",
@@ -11111,6 +11126,7 @@ const translations: Record<Locale, Record<string, string>> = {
   },
 
   pl: {
+    "voice.sample_text": "Dzień dobry. To jest próbka wybranego głosu.",
     'sidebar.update_available': "Dostępna aktualizacja",
     'upgrade.title': "Aktualizuj",
     'upgrade.current': "Bieżąca",
@@ -11576,6 +11592,8 @@ const translations: Record<Locale, Record<string, string>> = {
     "voice.help_identity": "As preferências ficam no ZeroClaw por ID do dispositivo pareado, sem armazenamento de preferências no navegador. Um navegador pode usar uma voz, outro uma voz diferente e outro ficar com a voz desativada. Recarregar preserva as escolhas de cada dispositivo. Um novo pareamento cria outra identidade, com seus próprios padrões.",
 
     "voice.settings": "Voz e áudio do navegador",
+    "voice.oidc_setup": "Ative o microfone e o alto-falante abaixo. Depois escolha e teste uma voz disponível.",
+    "voice.oidc_note": "As preferências ficam neste navegador para a conta conectada.",
     "voice.device_note": "As preferências são salvas no ZeroClaw para o dispositivo selecionado. Os botões de fala deste navegador sempre usam o registro identificado como “este navegador”.",
     "voice.dictation": "Mostrar microfone / habilitar ditado",
     "voice.language": "Idioma",
@@ -12063,6 +12081,7 @@ const translations: Record<Locale, Record<string, string>> = {
   },
 
   ro: {
+    "voice.sample_text": "Bună ziua. Acesta este un exemplu al vocii selectate.",
     'sidebar.update_available': "Actualizare disponibilă",
     'upgrade.title': "Actualizează",
     'upgrade.current': "Curentă",
@@ -13020,6 +13039,7 @@ const translations: Record<Locale, Record<string, string>> = {
   },
 
   sv: {
+    "voice.sample_text": "Hej. Det här är ett prov på den valda rösten.",
     'sidebar.update_available': "Uppdatering tillgänglig",
     'upgrade.title': "Uppgradera",
     'upgrade.current': "Nuvarande",
@@ -13464,6 +13484,7 @@ const translations: Record<Locale, Record<string, string>> = {
   },
 
   th: {
+    "voice.sample_text": "สวัสดี นี่คือตัวอย่างเสียงที่เลือก",
     'sidebar.update_available': "มีอัปเดต",
     'upgrade.title': "อัปเกรด",
     'upgrade.current': "ปัจจุบัน",
@@ -13908,6 +13929,7 @@ const translations: Record<Locale, Record<string, string>> = {
   },
 
   tl: {
+    "voice.sample_text": "Kumusta. Ito ay halimbawa ng napiling boses.",
     'sidebar.update_available': "May available na update",
     'upgrade.title': "I-upgrade",
     'upgrade.current': "Kasalukuyan",
@@ -14352,6 +14374,7 @@ const translations: Record<Locale, Record<string, string>> = {
   },
 
   uk: {
+    "voice.sample_text": "Вітаю. Це зразок вибраного голосу.",
     'sidebar.update_available': "Доступне оновлення",
     'upgrade.title': "Оновити",
     'upgrade.current': "Поточна",
@@ -14796,6 +14819,7 @@ const translations: Record<Locale, Record<string, string>> = {
   },
 
   ur: {
+    "voice.sample_text": "سلام۔ یہ منتخب آواز کا ایک نمونہ ہے۔",
     'sidebar.update_available': "اپ ڈیٹ دستیاب ہے",
     'upgrade.title': "اپ گریڈ",
     'upgrade.current': "موجودہ",
@@ -15240,6 +15264,7 @@ const translations: Record<Locale, Record<string, string>> = {
   },
 
   vi: {
+    "voice.sample_text": "Xin chào. Đây là mẫu của giọng đã chọn.",
     'sidebar.update_available': "Có bản cập nhật",
     'upgrade.title': "Nâng cấp",
     'upgrade.current': "Hiện tại",

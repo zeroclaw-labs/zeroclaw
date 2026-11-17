@@ -1,13 +1,18 @@
 import { useEffect, useRef, useState } from 'react';
-import { t } from '@/lib/i18n';
+import { SUPPORTED_LOCALES, t, tLocale } from '@/lib/i18n';
 import { apiFetch } from '@/lib/api';
 import { Button, Select } from '@/components/ui';
-import { playVoice, releaseVoice, voicePlaybackBusy, useGlobalVoiceTimeout, saveGlobalVoiceTimeout, localRecognitionStatus, recognitionConstructor, saveVoicePreferences, useBrowserVoices, useVoicePreferences, type VoicePreferences } from '@/lib/browserVoice';
+import { playVoice, releaseVoice, voicePlaybackBusy, useGlobalVoiceTimeout, saveGlobalVoiceTimeout, localRecognitionStatus, recognitionConstructor, saveVoicePreferences, useBrowserVoices, useOidcVoiceSession, useVoicePreferences, type VoicePreferences } from '@/lib/browserVoice';
 
 interface PairedDevice { id: string; name: string | null; device_type: string | null }
 interface DeviceInventory { devices: PairedDevice[]; current_device_id: string | null }
 
 export default function BrowserVoiceSettings() {
+  const session = useOidcVoiceSession();
+  return <VoiceSettings key={session?.principal_id ?? 'paired'} oidc={!!session} />;
+}
+
+function VoiceSettings({ oidc }: { oidc: boolean }) {
   const globalTimeout = useGlobalVoiceTimeout();
   const [timeoutDraft, setTimeoutDraft] = useState('');
   const [globalSaving, setGlobalSaving] = useState(false);
@@ -26,8 +31,9 @@ export default function BrowserVoiceSettings() {
   const [inventoryLoading, setInventoryLoading] = useState(true);
   const [inventoryError, setInventoryError] = useState('');
   const { preferences: saved, ready, error: loadError, deviceId: loadedDeviceId } = useVoicePreferences(selectedDeviceId);
-  const currentDevice = !!selectedDeviceId && selectedDeviceId === loadedDeviceId && loadedDeviceId === inventory.current_device_id;
+  const currentDevice = oidc || !!selectedDeviceId && selectedDeviceId === loadedDeviceId && loadedDeviceId === inventory.current_device_id;
   useEffect(() => {
+    if (oidc) return;
     let active = true;
     let pending: AbortController | undefined;
     const load = async () => {
@@ -52,7 +58,7 @@ export default function BrowserVoiceSettings() {
     const focused = () => { void load(); };
     window.addEventListener('focus', focused);
     return () => { active = false; pending?.abort(); window.removeEventListener('focus', focused); };
-  }, []);
+  }, [oidc]);
   const [draft, setDraft] = useState<VoicePreferences | null>(null);
   const prefs = draft ?? saved;
   const [rateDraft, setRateDraft] = useState<number | null>(null);
@@ -108,7 +114,7 @@ export default function BrowserVoiceSettings() {
         </div>
       </fieldset>
       {(globalTimeout.error || globalError) && <p role="alert">{globalError || t('voice.global_load_error')}</p>}
-      <label className="grid gap-1 mt-3 max-w-2xl text-sm">{t('voice.device')}
+      {!oidc && <label className="grid gap-1 mt-3 max-w-2xl text-sm">{t('voice.device')}
         <select aria-label={t('voice.device')} size={Math.min(5, Math.max(2, inventory.devices.length))}
           className="border border-pc-border rounded p-2 bg-pc-base w-full"
           value={selectedDeviceId ?? ''} disabled={saving || inventoryLoading || !inventory.devices.length}
@@ -118,12 +124,12 @@ export default function BrowserVoiceSettings() {
             {device.name || device.device_type || t('voice.unnamed_device')} · {device.id.slice(0, 8)}{device.id === inventory.current_device_id ? ` · ${t('voice.current_device')}` : ''}
           </option>)}
         </select>
-      </label>
+      </label>}
       {inventoryError && <p role="alert">{inventoryError}</p>}
       <details className="mt-3 max-w-2xl rounded-lg border border-pc-border p-3 text-sm">
         <summary className="cursor-pointer font-medium">{t('voice.help_title')}</summary>
         <ol className="list-decimal pl-5 mt-3 space-y-3">
-          <li>{t('voice.help_setup')}</li>
+          <li>{t(oidc ? 'voice.oidc_setup' : 'voice.help_setup')}</li>
           <li>{t('voice.help_microphone')}</li>
           <li>{t('voice.help_once')}</li>
           <li>{t('voice.help_continuous')}</li>
@@ -131,10 +137,10 @@ export default function BrowserVoiceSettings() {
         </ol>
         <p className="mt-3">{t('voice.help_privacy')}</p>
         <p className="mt-3">{t('voice.help_limits')}</p>
-        <p className="mt-3 text-pc-text-muted">{t('voice.help_identity')}</p>
+        <p className="mt-3 text-pc-text-muted">{t(oidc ? 'voice.oidc_note' : 'voice.help_identity')}</p>
       </details>
-      <fieldset disabled={!ready || saving || inventoryLoading || !selectedDeviceId} className="grid gap-3 max-w-2xl mt-3 text-sm">
-        <p className="text-pc-text-muted">{t('voice.device_note')}</p>
+      <fieldset disabled={!ready || saving || (!oidc && (inventoryLoading || !selectedDeviceId))} className="grid gap-3 max-w-2xl mt-3 text-sm">
+        {!oidc && <p className="text-pc-text-muted">{t('voice.device_note')}</p>}
         <label><input type="checkbox" checked={prefs.dictation} onChange={e => update({ dictation: e.target.checked })} /> {t('voice.dictation')}</label>
         <div className="grid gap-1">
           <label htmlFor="browser-voice-language">{t('voice.language')}</label>
@@ -187,11 +193,19 @@ export default function BrowserVoiceSettings() {
             onBlur={e => commitRate(e.currentTarget.valueAsNumber)} />
         </label>
         {currentDevice && <Button size="sm" disabled={!prefs.voice || !voices.some(v => v.voiceURI === prefs.voice)} onClick={() => {
+          const voice = voices.find(v => v.voiceURI === prefs.voice);
+          if (!voice) return;
           if (voicePlaybackBusy()) { setError(t('voice.playback_busy')); return; }
           setError('');
-          const utterance = new SpeechSynthesisUtterance(t('voice.sample_text'));
-          utterance.voice = voices.find(v => v.voiceURI === prefs.voice) || null;
-          utterance.lang = prefs.language; utterance.rate = prefs.rate;
+          const language = voice.lang || prefs.language;
+          const primary = language.split('-')[0]?.toLowerCase();
+          const locale = SUPPORTED_LOCALES.find(entry => entry.code === primary)?.code;
+          // An unsupported narrator language can still announce its own name.
+          const utterance = new SpeechSynthesisUtterance(
+            locale ? tLocale('voice.sample_text', locale) : voice.name,
+          );
+          utterance.voice = voice;
+          utterance.lang = language; utterance.rate = prefs.rate;
           utterance.onend = () => { sample.current = null; releaseVoice(utterance); };
           utterance.onerror = () => { sample.current = null; releaseVoice(utterance); setError(t('voice.speech_error')); };
           if (playVoice(utterance)) sample.current = utterance;

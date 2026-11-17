@@ -4,15 +4,23 @@ import { Mic, MicOff, Volume2, VolumeX } from 'lucide-react';
 import type { ChatMessage } from '@/contexts/AgentContext';
 import { t } from '@/lib/i18n';
 import { speechText } from '@/lib/speechText';
-import { playVoice, releaseVoice, voicePlaybackBusy, voicePlaybackIdle, useGlobalVoiceTimeout, readGlobalVoiceTimeout, localRecognitionStatus, recognitionConstructor, shortPressAction, useBrowserVoices, useVoicePreferences, type Recognition } from '@/lib/browserVoice';
+import { playVoice, releaseVoice, voicePlaybackBusy, voicePlaybackIdle, useGlobalVoiceTimeout, readGlobalVoiceTimeout, localRecognitionStatus, recognitionConstructor, shortPressAction, useBrowserVoices, useOidcVoiceSession, useVoicePreferences, type Recognition } from '@/lib/browserVoice';
 
 const readableMessage = (message: ChatMessage) => speechText(displayMessageText(message));
 
-export default function BrowserVoiceControls({ messages, hydrated, typing, onTranscript, onSilence, captureRef }: {
+type BrowserVoiceControlsProps = {
   messages: ChatMessage[]; hydrated: boolean; typing: boolean; onTranscript: (text: string) => void;
   captureRef?: Ref<() => void>;
   onSilence?: () => void;
-}) {
+};
+
+export default function BrowserVoiceControls(props: BrowserVoiceControlsProps) {
+  const session = useOidcVoiceSession();
+  // A new principal must not inherit capture, playback or a continuous-reading override.
+  return <VoiceControls key={session ? `oidc:${session.principal_id}` : 'paired'} {...props} />;
+}
+
+function VoiceControls({ messages, hydrated, typing, onTranscript, onSilence, captureRef }: BrowserVoiceControlsProps) {
   const { preferences: prefs, ready } = useVoicePreferences();
   const voices = useBrowserVoices();
   const { seconds: silenceSeconds } = useGlobalVoiceTimeout(ready && prefs.dictation);

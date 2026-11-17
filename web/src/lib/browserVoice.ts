@@ -1,6 +1,6 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useSyncExternalStore } from 'react';
 import { apiFetch, getProp, putProp } from './api';
-import { getToken } from './auth';
+import { getOidcSession, getToken, subscribeOidcSession } from './auth';
 
 export const voicePlaybackIdle = 'zeroclaw-voice-playback-idle';
 let activeVoicePlayback: SpeechSynthesisUtterance | null = null;
@@ -39,7 +39,9 @@ const defaults: VoicePreferences = {
 };
 interface DevicePreferences { device_id: string; preferences: VoicePreferences }
 const preferenceEvent = 'zeroclaw-device-voice-updated';
+const oidcPreferenceEvent = 'zeroclaw-oidc-voice-updated';
 interface VoicePreferenceState {
+  pairedIdentity?: string | null;
   path: string;
   deviceId?: string;
   preferences: VoicePreferences;
@@ -56,7 +58,48 @@ function notificationChannel(): BroadcastChannel | undefined {
   catch { console.warn('Voice preference notifications unavailable; settings reload on tab return.'); }
 }
 
+// The verified principal is stable across sign-ins. Browser storage keeps
+// preferences local to this origin and profile, with a separate key per account.
+export function useOidcVoiceSession() {
+  return useSyncExternalStore(subscribeOidcSession, getOidcSession, () => null);
+}
+
+async function oidcPreferenceKey(principal: string): Promise<string> {
+  const bytes = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(principal));
+  const digest = Array.from(new Uint8Array(bytes), byte => byte.toString(16).padStart(2, '0')).join('');
+  return `zeroclaw-oidc-voice:v2:${digest}`;
+}
+
+function readOidcPreferences(key: string): string | null {
+  try { return localStorage.getItem(key); }
+  catch { return null; }
+}
+
+function parseOidcPreferences(raw: string | null): VoicePreferences {
+  try {
+    const value = JSON.parse(raw ?? 'null');
+    if (value && typeof value.dictation === 'boolean' && typeof value.reading === 'boolean'
+      && typeof value.automatic === 'boolean' && typeof value.language === 'string'
+      && (value.recognition === 'local' || value.recognition === 'browser')
+      && typeof value.voice === 'string' && Number.isFinite(value.rate)
+      && value.rate >= 0.5 && value.rate <= 2) return value;
+  } catch { /* Invalid local settings fall back to opt-in defaults. */ }
+  return { ...defaults };
+}
+
 export async function saveVoicePreferences(prefs: VoicePreferences, deviceId?: string): Promise<void> {
+  const session = getOidcSession();
+  if (session) {
+    if (!session.features.chat || !session.features.config || deviceId) throw new Error('Invalid OIDC voice preference target');
+    const key = await oidcPreferenceKey(session.principal_id);
+    const current = getOidcSession();
+    if (current?.principal_id !== session.principal_id || !current.features.chat || !current.features.config) {
+      throw new Error('OIDC voice session changed');
+    }
+    localStorage.setItem(key, JSON.stringify(prefs));
+    window.dispatchEvent(new Event(oidcPreferenceEvent));
+    return;
+  }
   const identity = getToken();
   const result = await apiFetch<DevicePreferences>(preferencePath(deviceId), {
     method: 'PUT', cache: 'no-store', body: JSON.stringify(prefs),
@@ -71,42 +114,85 @@ export async function saveVoicePreferences(prefs: VoicePreferences, deviceId?: s
     finally { channel.close(); }
   }
 }
+function subscribePairedToken(changed: () => void) {
+  window.addEventListener('storage', changed);
+  window.addEventListener('focus', changed);
+  return () => {
+    window.removeEventListener('storage', changed);
+    window.removeEventListener('focus', changed);
+  };
+}
+
 export function useVoicePreferences(targetDeviceId?: string): VoicePreferenceState {
-  const path = preferencePath(targetDeviceId);
-  const [state, setState] = useState<VoicePreferenceState>({ path, preferences: { ...defaults }, ready: false, error: '' });
+  const session = useOidcVoiceSession();
+  const identity = useSyncExternalStore(subscribePairedToken, getToken, () => null);
+  const principal = session?.features.chat && session.features.config ? session.principal_id : null;
+  const [keyState, setKeyState] = useState<{ principal: string; key: string } | null>(null);
+  const key = principal && keyState?.principal === principal ? keyState.key : null;
   useEffect(() => {
+    if (!principal) return;
+    let active = true;
+    void oidcPreferenceKey(principal).then(derivedKey => {
+      if (!active || getOidcSession()?.principal_id !== principal) return;
+      try {
+        const previous = `zeroclaw-oidc-voice:${encodeURIComponent(principal)}`;
+        const raw = readOidcPreferences(previous);
+        if (raw !== null && readOidcPreferences(derivedKey) === null) localStorage.setItem(derivedKey, raw);
+        localStorage.removeItem(previous);
+      } catch { /* Storage can be disabled in this browser profile. */ }
+      setKeyState({ principal, key: derivedKey });
+    }).catch(() => { /* Without Web Crypto, OIDC preferences stay disabled. */ });
+    return () => { active = false; };
+  }, [principal]);
+  const path = key ?? preferencePath(targetDeviceId);
+  const [, refreshLocal] = useState(0);
+  useEffect(() => {
+    if (!key) return;
+    const refresh = () => refreshLocal(revision => revision + 1);
+    const storageChanged = (event: StorageEvent) => {
+      if (event.key === key || event.key === null) refresh();
+    };
+    window.addEventListener(oidcPreferenceEvent, refresh);
+    window.addEventListener('storage', storageChanged);
+    return () => {
+      window.removeEventListener(oidcPreferenceEvent, refresh);
+      window.removeEventListener('storage', storageChanged);
+    };
+  }, [key]);
+  const [state, setState] = useState<VoicePreferenceState>({ path, pairedIdentity: identity, preferences: { ...defaults }, ready: false, error: '' });
+  useEffect(() => {
+    if (session) return;
     let active = true;
     let deviceId: string | undefined;
     let requestVersion = 0;
     let pending: AbortController | undefined;
-    const identity = getToken();
     const refresh = async () => {
       const version = ++requestVersion;
       pending?.abort();
       const controller = new AbortController();
       pending = controller;
       // A returning tab cannot use stale microphone/reading choices while loading.
-      setState(previous => previous.path === path
+      setState(previous => previous.path === path && previous.pairedIdentity === identity
         ? { ...previous, ready: false, error: '' }
-        : { path, preferences: { ...defaults }, ready: false, error: '' });
+        : { path, pairedIdentity: identity, preferences: { ...defaults }, ready: false, error: '' });
       try {
         const result = await apiFetch<DevicePreferences>(path, { cache: 'no-store', signal: controller.signal });
         if (!result?.device_id || !result.preferences || (targetDeviceId && result.device_id !== targetDeviceId)) throw new Error('Invalid device preferences response');
-        if (!active || controller.signal.aborted || version !== requestVersion || identity !== getToken()) return;
+        if (!active || controller.signal.aborted || version !== requestVersion || getOidcSession() || identity !== getToken()) return;
         deviceId = result.device_id;
-        setState({ path, deviceId: result.device_id, preferences: result.preferences, ready: true, error: '' });
+        setState({ path, pairedIdentity: identity, deviceId: result.device_id, preferences: result.preferences, ready: true, error: '' });
       } catch {
         if (active && !controller.signal.aborted && version === requestVersion) {
-          setState({ path, preferences: { ...defaults }, ready: false, error: 'unavailable' });
+          setState({ path, pairedIdentity: identity, preferences: { ...defaults }, ready: false, error: 'unavailable' });
         }
       }
     };
     const changed = (event: Event) => {
       const result = (event as CustomEvent<DevicePreferences>).detail;
-      if (active && identity === getToken() && result.device_id === deviceId) {
+      if (result && active && !getOidcSession() && identity === getToken() && result.device_id === deviceId) {
         requestVersion++;
         pending?.abort();
-        setState({ path, deviceId: result.device_id, preferences: result.preferences, ready: true, error: '' });
+        setState({ path, pairedIdentity: identity, deviceId: result.device_id, preferences: result.preferences, ready: true, error: '' });
       }
     };
     const channel = notificationChannel();
@@ -126,8 +212,12 @@ export function useVoicePreferences(targetDeviceId?: string): VoicePreferenceSta
       window.removeEventListener('focus', focused);
       document.removeEventListener('visibilitychange', visible);
     };
-  }, [path]);
-  return state.path === path ? state : { path, preferences: { ...defaults }, ready: false, error: '' };
+  }, [session, path, targetDeviceId, identity]);
+  if (session) {
+    const ready = key !== null && !targetDeviceId;
+    return { path, pairedIdentity: identity, preferences: ready && key ? parseOidcPreferences(readOidcPreferences(key)) : { ...defaults }, ready, error: '' };
+  }
+  return state.path === path && state.pairedIdentity === identity ? state : { path, preferences: { ...defaults }, ready: false, error: '' };
 }
 export interface Recognition {
   lang: string;

@@ -101,6 +101,12 @@ and `structuredClone()`.
 
 ## Browser voice controls
 
+Operators with both Chat and Config access can enable browser voice in an OIDC
+session under **Config → Other → Browser Voice and Audio**. Preferences remain
+in the browser profile under a SHA-256 digest of the verified account ID.
+The browser's microphone permission and the gateway's existing permissions for
+chat and global settings still apply.
+
 Paired browsers can open **Config → Other → Browser Voice and Audio** to enable microphone and
 speaker controls in chat. Preferences live in the gateway's `devices.db`, on the
 existing paired-device record, and survive page reloads and gateway restarts.
