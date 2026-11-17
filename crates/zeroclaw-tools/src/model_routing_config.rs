@@ -12,6 +12,7 @@ use zeroclaw_providers::ProviderDispatch;
 
 const DEFAULT_AGENT_MAX_DEPTH: u32 = 3;
 const DEFAULT_AGENT_MAX_ITERATIONS: usize = 10;
+const SCENARIO_REQUIRED_STRING_FIELDS: [&str; 3] = ["hint", "model_provider", "model"];
 
 /// Why a model probe failed.
 ///
@@ -269,6 +270,28 @@ impl ModelRoutingConfigTool {
         }
 
         anyhow::bail!("'{field}' must be a string, string[], or delegate target object[]")
+    }
+
+    fn validate_scenario_required_strings(args: &Value) -> anyhow::Result<()> {
+        let invalid: Vec<&str> = SCENARIO_REQUIRED_STRING_FIELDS
+            .iter()
+            .copied()
+            .filter(|field| {
+                args.get(*field)
+                    .and_then(Value::as_str)
+                    .is_none_or(|value| value.trim().is_empty())
+            })
+            .collect();
+        if !invalid.is_empty() {
+            anyhow::bail!(crate::i18n::get_required_tool_string_with_args(
+                "tool-model-routing-config-invalid-scenario",
+                &[
+                    ("required", &SCENARIO_REQUIRED_STRING_FIELDS.join(", ")),
+                    ("invalid", &invalid.join(", ")),
+                ],
+            ));
+        }
+        Ok(())
     }
 
     fn parse_non_empty_string(args: &Value, field: &str) -> anyhow::Result<String> {
@@ -913,15 +936,18 @@ impl ModelRoutingConfigTool {
         // alias (such an entry is only usable through routes that carry their
         // own model), so there is nothing to validate and the probe stops
         // before dispatch instead of failing the update.
-        let Some(probe_model_name) = effective
-            .providers
-            .models
-            .find(family, alias)
+        let probe_entry = effective.providers.models.find(family, alias);
+        let Some(probe_model_name) = probe_entry
             .and_then(|e| e.model.clone())
             .filter(|value| !value.trim().is_empty())
         else {
             return Ok(());
         };
+        // The temperature the served turns send for this alias: the configured
+        // one, or none, so the provider's own default applies. A fixed value
+        // here would fail the probe, and revert the change, for a model that
+        // rejects any temperature but serves the alias's turns fine.
+        let probe_temperature = probe_entry.and_then(|e| e.temperature);
 
         let model_provider =
             zeroclaw_providers::create_model_provider_from_ref(&effective, provider_name).map_err(
@@ -931,14 +957,12 @@ impl ModelRoutingConfigTool {
                 },
             )?;
 
-        // Greedy sampling: the ping is a liveness check, not a generation task.
-        const PING_TEMPERATURE: f64 = 0.0;
         ProviderDispatch::from_ref(&*model_provider)
             .chat_with_system(
                 Some("Respond with OK."),
                 "ping",
                 &probe_model_name,
-                Some(PING_TEMPERATURE),
+                probe_temperature,
             )
             .await
             .map_err(|error| ProbeFailure::Request {
@@ -950,6 +974,7 @@ impl ModelRoutingConfigTool {
     }
 
     async fn handle_upsert_scenario(&self, args: &Value) -> anyhow::Result<ToolResult> {
+        Self::validate_scenario_required_strings(args)?;
         let hint = Self::parse_non_empty_string(args, "hint")?;
         let model_provider = Self::parse_non_empty_string(args, "model_provider")?;
         let model = Self::parse_non_empty_string(args, "model")?;
@@ -1558,6 +1583,12 @@ impl ModelRoutingConfigTool {
 
 #[async_trait]
 impl Tool for ModelRoutingConfigTool {
+    fn requires_unrestricted_principal(&self) -> bool {
+        // Saving config changes every agent's later runs, which RPC gates
+        // behind `config:update`; the caller's principal does not reach them.
+        true
+    }
+
     fn name(&self) -> &str {
         "model_routing_config"
     }
@@ -1567,6 +1598,16 @@ impl Tool for ModelRoutingConfigTool {
     }
 
     fn parameters_schema(&self) -> Value {
+        let scenario_string_properties: serde_json::Map<String, Value> =
+            SCENARIO_REQUIRED_STRING_FIELDS
+                .iter()
+                .map(|field| {
+                    (
+                        (*field).to_string(),
+                        json!({"type": "string", "minLength": 1, "pattern": "\\S"}),
+                    )
+                })
+                .collect();
         let delegates_schema = json!({
             "description": "Explicit delegate roster. Accepts a comma-separated string, string array, or objects with {agent, mode}; mode is bounded or independent.",
             "oneOf": [
@@ -1612,15 +1653,15 @@ impl Tool for ModelRoutingConfigTool {
                 },
                 "hint": {
                     "type": "string",
-                    "description": "Scenario hint name (for example: conversation, coding, reasoning)"
+                    "description": "Scenario hint name (for example: conversation, coding, reasoning). Required and nonblank for upsert_scenario."
                 },
                 "model_provider": {
                     "type": "string",
-                    "description": "ModelProvider for set_default/upsert_scenario/upsert_agent"
+                    "description": "ModelProvider for set_default/upsert_scenario/upsert_agent. Required and nonblank for upsert_scenario."
                 },
                 "model": {
                     "type": "string",
-                    "description": "Model for set_default/upsert_scenario or bare-family upsert_agent; omitted when upsert_agent reuses an existing dotted provider ref"
+                    "description": "Model for set_default/upsert_scenario or bare-family upsert_agent; omitted when upsert_agent reuses an existing dotted provider ref. Required and nonblank for upsert_scenario."
                 },
                 "temperature": {
                     "type": ["number", "null"],
@@ -1702,7 +1743,16 @@ impl Tool for ModelRoutingConfigTool {
                 },
                 "delegates": delegates_schema
             },
-            "additionalProperties": false
+            "additionalProperties": false,
+            // The selector is required so omitted action keeps the read-only get default.
+            "if": {
+                "required": ["action"],
+                "properties": {"action": {"enum": ["upsert_scenario"]}}
+            },
+            "then": {
+                "required": SCENARIO_REQUIRED_STRING_FIELDS,
+                "properties": scenario_string_properties
+            }
         })
     }
 
@@ -1794,6 +1844,128 @@ mod tests {
         let contents = std::fs::read_to_string(cfg_path).ok()?;
         let cfg = zeroclaw_config::migration::migrate_to_current(&contents).ok()?;
         cfg.providers.models.find(family, alias).cloned()
+    }
+
+    #[tokio::test]
+    async fn model_routing_config_requires_an_unrestricted_principal() {
+        let tmp = TempDir::new().unwrap();
+        let tool = ModelRoutingConfigTool::new(test_config(&tmp).await, test_security());
+        assert!(tool.requires_unrestricted_principal());
+    }
+
+    #[test]
+    fn scenario_requirements_reach_cleaned_schema_and_tool_prompt() {
+        let tool = ModelRoutingConfigTool::new(Arc::new(Config::default()), test_security());
+        let spec = tool.spec();
+        let openai =
+            zeroclaw_api::schema::SchemaCleanr::clean_for_openai((*spec.parameters).clone());
+        let anthropic =
+            zeroclaw_api::schema::SchemaCleanr::clean_for_anthropic((*spec.parameters).clone());
+
+        for schema in [spec.parameters.as_ref(), &openai, &anthropic] {
+            assert_eq!(schema["type"], "object");
+            assert!(schema.get("required").is_none());
+            for composition in ["allOf", "anyOf", "oneOf"] {
+                assert!(schema.get(composition).is_none());
+            }
+            assert_eq!(schema["if"]["required"], json!(["action"]));
+            assert_eq!(
+                schema["if"]["properties"]["action"]["enum"],
+                json!(["upsert_scenario"])
+            );
+            assert_eq!(
+                schema["then"]["required"],
+                json!(["hint", "model_provider", "model"])
+            );
+            for field in ["hint", "model_provider", "model"] {
+                assert_eq!(
+                    schema["then"]["properties"][field],
+                    json!({"type": "string", "minLength": 1, "pattern": "\\S"})
+                );
+            }
+        }
+
+        let parameters = serde_json::to_string(&spec.parameters).unwrap();
+        let prompt = zeroclaw_api::model_provider::build_tool_instructions_text(&[spec]);
+        assert!(prompt.contains(&format!("Parameters: `{parameters}`")));
+    }
+
+    #[tokio::test]
+    async fn invalid_scenario_reports_all_required_strings_without_mutation() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let original = fs::read(&config.config_path).unwrap();
+        let tool = ModelRoutingConfigTool::new(config.clone(), test_security());
+
+        for (args, invalid) in [
+            (
+                json!({"action": "upsert_scenario"}),
+                "hint, model_provider, model",
+            ),
+            (
+                json!({"action": "upsert_scenario", "hint": null, "model_provider": 42, "model": " \t\n"}),
+                "hint, model_provider, model",
+            ),
+            (
+                json!({"action": "upsert_scenario", "hint": "coding"}),
+                "model_provider, model",
+            ),
+            (
+                json!({"action": "upsert_scenario", "hint": "coding", "model_provider": "openai", "model": "\u{2003}"}),
+                "model",
+            ),
+        ] {
+            let result = tool.execute(args).await.unwrap();
+            assert!(!result.success);
+            let error = result.error.unwrap();
+            assert!(error.contains("Supply nonempty strings for: hint, model_provider, model."));
+            assert!(error.contains(&format!(
+                "Fix missing, non-string, or blank fields: {invalid}."
+            )));
+            assert_eq!(fs::read(&config.config_path).unwrap(), original);
+        }
+
+        // No file exists at this path. Invalid arguments must win over a config-read error.
+        let missing_config = Config {
+            config_path: tmp.path().join("missing.toml"),
+            ..Config::default()
+        };
+        let tool = ModelRoutingConfigTool::new(Arc::new(missing_config), test_security());
+        let result = tool
+            .execute(json!({"action": "upsert_scenario"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .unwrap()
+                .contains("Invalid upsert_scenario arguments.")
+        );
+    }
+
+    #[tokio::test]
+    async fn scenario_requirements_do_not_change_read_or_partial_default_calls() {
+        let _env_guard = env_override_test_lock().await;
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let tool = ModelRoutingConfigTool::new(config.clone(), test_security());
+        let implicit_get = tool.execute(json!({})).await.unwrap();
+        let explicit_get = tool.execute(json!({"action": "get"})).await.unwrap();
+        assert!(implicit_get.success);
+        assert_eq!(implicit_get.output, explicit_get.output);
+        assert!(
+            tool.execute(json!({"action": "list_hints"}))
+                .await
+                .unwrap()
+                .success
+        );
+
+        let result = tool
+            .execute(json!({"action": "set_default", "temperature": 0.3}))
+            .await
+            .unwrap();
+        assert!(result.success, "{:?}", result.error);
     }
 
     /// Mount the OpenAI-shaped `404 model_not_found` rejection the composed
@@ -2443,7 +2615,14 @@ mod tests {
         config.save().await.unwrap();
 
         let current = std::fs::read_to_string(&cfg_path).unwrap();
-        let legacy = current.replacen("schema_version = 3", "schema_version = 2", 1);
+        let legacy = current.replacen(
+            &format!(
+                "schema_version = {}",
+                zeroclaw_config::migration::CURRENT_SCHEMA_VERSION
+            ),
+            "schema_version = 2",
+            1,
+        );
         assert_ne!(current, legacy, "fixture must downgrade the schema label");
         std::fs::write(&cfg_path, &legacy).unwrap();
 
@@ -2867,6 +3046,18 @@ mod tests {
 
         assert!(!result.success);
         assert!(result.error.unwrap_or_default().contains("read-only"));
+
+        let invalid_scenario = tool
+            .execute(json!({"action": "upsert_scenario"}))
+            .await
+            .unwrap();
+        assert!(!invalid_scenario.success);
+        assert!(
+            invalid_scenario
+                .error
+                .unwrap_or_default()
+                .contains("read-only")
+        );
     }
 
     #[tokio::test]
@@ -3276,6 +3467,65 @@ mod tests {
     /// alias `model` override decides what the post-reload runtime serves.
     /// Probing the saved disk value instead would validate — or roll back
     /// over — a model that is never dispatched.
+    /// The probe sends the alias's configured temperature, or none when it is
+    /// unset, never a fixed value: a model that rejects any temperature must
+    /// pass the same liveness check its own turns would.
+    #[tokio::test]
+    async fn probe_model_sends_only_the_configured_temperature() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let _env_guard = env_override_test_lock().await;
+        let tmp = TempDir::new().unwrap();
+        let base = test_config(&tmp).await;
+        const ALIAS: &str = "probe_temperature_case";
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "msg_probe", "type": "message", "role": "assistant",
+                "content": [{ "type": "text", "text": "OK" }],
+                "model": "claude-opus-5-5", "stop_reason": "end_turn",
+                "usage": { "input_tokens": 1, "output_tokens": 1 }
+            })))
+            .mount(&server)
+            .await;
+
+        let tool = ModelRoutingConfigTool::new(Arc::clone(&base), test_security());
+        for configured in [None, Some(0.4)] {
+            let mut saved = (*base).clone();
+            {
+                let entry = saved.providers.models.ensure("anthropic", ALIAS).unwrap();
+                entry.api_key = Some("sk-ant-fixture".to_string());
+                entry.model = Some("claude-opus-5-5".to_string());
+                entry.uri = Some(server.uri());
+                entry.temperature = configured;
+            }
+            let probe = tool
+                .probe_model(&saved, &format!("anthropic.{ALIAS}"))
+                .await;
+            assert!(probe.is_ok(), "the mock accepts the probe: {probe:?}");
+
+            let requests = server
+                .received_requests()
+                .await
+                .expect("the mock server records requests");
+            let body: serde_json::Value = requests
+                .last()
+                .expect("the probe dispatched a request")
+                .body_json()
+                .expect("the probe sends a JSON request");
+            assert_eq!(body["model"], "claude-opus-5-5");
+            assert_eq!(
+                body.get("temperature").cloned(),
+                configured.map(|t| serde_json::json!(t)),
+                "the probe must send the configured temperature ({configured:?}), and none \
+                 when unset: {body}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn probe_model_dispatches_the_env_effective_alias_model_not_the_saved_one() {
         use wiremock::matchers::method;
