@@ -71,9 +71,7 @@ pub(crate) use provider_call::{
     enforce_tool_loop_budget,
 };
 pub use redact::scrub_credentials;
-pub(crate) use results_collect::{
-    CollectedResults, check_identical_output_abort, collect_tool_results,
-};
+pub(crate) use results_collect::{check_identical_output_abort, collect_tool_results};
 pub use steering::{
     SteeringAdmission, SteeringAdmit, SteeringInput, SteeringPosture, drain_steering_messages,
 };
@@ -3603,11 +3601,7 @@ async fn run_tool_call_loop_impl<'a>(
             }
         }
 
-        let CollectedResults {
-            individual_results,
-            tool_results,
-            detection_relevant_output,
-        } = collect_tool_results(
+        let collected = collect_tool_results(
             &ordered_results,
             &tool_calls,
             turn_state.history,
@@ -3618,29 +3612,34 @@ async fn run_tool_call_loop_impl<'a>(
             active_model,
             iteration,
             turn_id,
-        )?;
+        )
+        .and_then(|collected| {
+            if !cancelled_mid_batch && repetition_guard.is_none() {
+                check_identical_output_abort(
+                    &collected.detection_relevant_output,
+                    loop_started_at,
+                    pacing,
+                    &mut consecutive_identical_outputs,
+                    &mut last_tool_output_hash,
+                    active_model,
+                    iteration,
+                    turn_id,
+                )?;
+            }
+            Ok(collected)
+        });
 
-        if !cancelled_mid_batch && repetition_guard.is_none() {
-            check_identical_output_abort(
-                &detection_relevant_output,
-                loop_started_at,
-                pacing,
-                &mut consecutive_identical_outputs,
-                &mut last_tool_output_hash,
-                active_model,
-                iteration,
-                turn_id,
-            )?;
+        if let Ok(collected) = &collected {
+            turn_state.append_tool_round(
+                assistant_history_content,
+                &native_tool_calls,
+                &collected.individual_results,
+                &collected.tool_results,
+                use_native_tools,
+            );
         }
 
-        turn_state.append_tool_round(
-            assistant_history_content,
-            &native_tool_calls,
-            &individual_results,
-            &tool_results,
-            use_native_tools,
-        );
-
+        // Record executed calls even when a detector stops the turn.
         record_executed_outcomes(
             &ctx,
             &executed_completed_indices,
@@ -3650,6 +3649,7 @@ async fn run_tool_call_loop_impl<'a>(
             iteration,
         )
         .await;
+        collected?;
         if cancelled_mid_batch {
             // Completed calls already received their after hook; every other
             // executable context of the batch was interrupted before
@@ -3691,6 +3691,7 @@ async fn run_tool_call_loop_impl<'a>(
             return Err(ToolLoopCancelled.into());
         }
 
+        let mut closeout_reply = None;
         if let Some(key) = repetition_disposition.message_key {
             if cancellation_token
                 .as_ref()
@@ -3711,7 +3712,7 @@ async fn run_tool_call_loop_impl<'a>(
             }
             accumulated_display_text.push_str(&visible_reason);
             if repetition_disposition.close {
-                turn_state.push_dual(ChatMessage::assistant(reason));
+                closeout_reply = Some(reason);
             } else {
                 turn_state.push_dual(ChatMessage::system(reason));
             }
@@ -3776,6 +3777,9 @@ async fn run_tool_call_loop_impl<'a>(
         }
 
         if repetition_disposition.close {
+            if let Some(reply) = closeout_reply {
+                turn_state.push_dual(ChatMessage::assistant(reply));
+            }
             *history_has_trim_breadcrumb = turn_state.crumb_present;
             return Ok(accumulated_display_text);
         }
