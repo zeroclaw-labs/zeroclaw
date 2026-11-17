@@ -804,11 +804,18 @@ async fn auto_save_stores_only_user_messages_in_memory() {
         "Expected exactly 1 user memory entry, got {count}"
     );
 
-    let stored = mem.get("user_msg").await.unwrap();
-    assert!(stored.is_some(), "Expected user_msg key to be present");
+    let entries = mem.list(None, None).await.unwrap();
+    let stored = entries
+        .iter()
+        .find(|entry| zeroclaw_memory::is_user_autosave_key(&entry.key))
+        .expect("Expected an autosaved user message");
+    assert!(
+        stored.key.starts_with("user_msg_"),
+        "autosave keys are unique per message, got {}",
+        stored.key
+    );
     assert_eq!(
-        stored.unwrap().content,
-        "Remember this fact",
+        stored.content, "Remember this fact",
         "Stored memory should match the original user message"
     );
 
@@ -817,6 +824,36 @@ async fn auto_save_stores_only_user_messages_in_memory() {
         assistant.is_none(),
         "assistant_resp should not be auto-saved anymore"
     );
+}
+
+#[tokio::test]
+async fn auto_save_keeps_one_row_per_user_message() {
+    // A fixed key upserted each message over the last, so only the newest
+    // user message survived.
+    let (mem, _tmp) = make_sqlite_memory();
+    let model_provider = Box::new(ScriptedModelProvider::new(vec![
+        text_response("ok"),
+        text_response("ok"),
+    ]));
+    let mut agent = build_agent_with_memory(model_provider, vec![], mem.clone(), true);
+
+    let _ = agent.turn("first").await.unwrap();
+    let _ = agent.turn("second").await.unwrap();
+
+    let entries = mem.list(None, None).await.unwrap();
+    let mut saved: Vec<_> = entries
+        .iter()
+        .filter(|entry| zeroclaw_memory::is_user_autosave_key(&entry.key))
+        .collect();
+    saved.sort_by(|a, b| a.content.cmp(&b.content));
+    assert_eq!(
+        saved
+            .iter()
+            .map(|entry| entry.content.as_str())
+            .collect::<Vec<_>>(),
+        ["first", "second"]
+    );
+    assert_ne!(saved[0].key, saved[1].key);
 }
 
 #[tokio::test]

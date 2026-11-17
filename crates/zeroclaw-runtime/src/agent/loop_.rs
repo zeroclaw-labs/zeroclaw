@@ -974,7 +974,10 @@ fn tools_to_openai_format(tools_registry: &[Box<dyn Tool>]) -> Vec<serde_json::V
         .collect()
 }
 
-fn autosave_memory_key(prefix: &str) -> String {
+/// A memory key unique to one autosaved message: `<prefix>_<uuid>`. Every
+/// path that autosaves user input uses it, so each message keeps its own row
+/// instead of replacing the last one under a fixed key.
+pub(crate) fn autosave_memory_key(prefix: &str) -> String {
     format!("{prefix}_{}", Uuid::new_v4())
 }
 
