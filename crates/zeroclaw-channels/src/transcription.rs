@@ -1702,9 +1702,11 @@ mod tests {
     async fn config_environment_bridge_requires_existing_openai_section() {
         const CHILD_ENV: &str = "ZEROCLAW_TEST_OPENAI_STT_BRIDGE_CHILD";
         if std::env::var_os(CHILD_ENV).is_some() {
-            let mut config = Config::default();
-            config.transcription = toml::from_str("enabled = true\n[openai]\n")
-                .expect("deserialize configured OpenAI section with its serde model default");
+            let mut config = Config {
+                transcription: toml::from_str("enabled = true\n[openai]\n")
+                    .expect("deserialize configured OpenAI section with its serde model default"),
+                ..Config::default()
+            };
             assert_eq!(
                 config
                     .transcription
