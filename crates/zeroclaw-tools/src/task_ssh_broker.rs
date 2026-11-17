@@ -763,6 +763,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn signer_rejects_prebound_socket_before_delivering_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = dir.path().join("fixture");
+        assert!(
+            std::process::Command::new("/usr/bin/ssh-keygen")
+                .args(["-q", "-t", "ed25519", "-N", "", "-f"])
+                .arg(&key)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let path = dir.path().join("fake-agent");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let result = super::signer(
+            &path, zeroclaw_config::schema::ScopedCredentialSource::Local,
+            std::fs::read_to_string(&key).unwrap(),
+            "hostname fixture.example\nport 22\nuser fixture\nuserknownhostsfile /tmp/fixture-known-hosts\nglobalknownhostsfile none\n"
+        ).await;
+        assert!(result.is_err());
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        assert!(path.exists());
+    }
+
+    #[tokio::test]
     async fn owned_master_stops_proxy_after_leader_exits() {
         let dir = tempfile::tempdir().unwrap();
         let pidfile = dir.path().join("proxy.pid");
