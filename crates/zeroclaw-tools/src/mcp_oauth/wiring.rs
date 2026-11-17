@@ -33,6 +33,40 @@ fn any_oauth_server(config: &Config) -> bool {
         })
 }
 
+/// Re-apply `security.nat64_prefixes` to the installed manager (greptile
+/// C9). A daemon reload changes this list without rebuilding the
+/// process-wide instance, and a stale list would keep classifying newly
+/// declared NAT64 translations as ordinary IPv6 (a guard the operator
+/// updated would not bite). The parse is idempotent; a malformed reload is
+/// skipped with a warn so the last-known-good rules stay in force -
+/// dropping the network guard because of a typo would be strictly worse
+/// than applying the previous list.
+fn refresh_network_rules(manager: &McpOAuthManager, config: &Config) {
+    let parsed = match zeroclaw_infra::net_guard::parse_nat64_prefixes(
+        &config.security.nat64_prefixes,
+        "security.nat64_prefixes",
+    ) {
+        Ok(parsed) => parsed,
+        Err(err) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_attrs(::serde_json::json!({
+                        "mcp_oauth": "nat64-reload",
+                    })),
+                &format!(
+                    "MCP OAuth kept the previous NAT64 prefix rules; the reloaded \
+                     security.nat64_prefixes are malformed: {err:#}"
+                )
+            );
+            return;
+        }
+    };
+    if parsed != manager.current_nat64_prefixes() {
+        manager.refresh_nat64_prefixes(parsed);
+    }
+}
+
 /// The shared manager, if MCP OAuth is configured. `None` means either no
 /// server needs OAuth (nothing to build) or construction failed closed —
 /// `secrets.encrypt` off — in which case the failure is logged once and
@@ -46,6 +80,7 @@ fn any_oauth_server(config: &Config) -> bool {
 /// single-flight remains effectively singular.
 pub fn shared_oauth_manager(config: &Config) -> Option<Arc<McpOAuthManager>> {
     if let Some(manager) = MANAGER.get() {
+        refresh_network_rules(manager, config);
         return Some(Arc::clone(manager));
     }
     if !any_oauth_server(config) {
@@ -153,5 +188,43 @@ mod tests {
             &shared_oauth_manager(&plain).expect("installed stays shared"),
             &first
         ));
+        assert!(
+            first.current_nat64_prefixes().is_empty(),
+            "default config declares no NAT64 translators"
+        );
+
+        // C9: a reload that edits security.nat64_prefixes must take effect
+        // on the cached instance (no restart), while a malformed reload
+        // keeps the last-known-good rules.
+        let mut reloaded = plain.clone();
+        reloaded
+            .security
+            .nat64_prefixes
+            .push("64:ff9b:1::/48".to_string());
+        shared_oauth_manager(&reloaded).expect("shared");
+        assert_eq!(
+            first.current_nat64_prefixes().len(),
+            1,
+            "the reloaded prefix list must be live without a restart"
+        );
+
+        let mut broken = plain.clone();
+        broken
+            .security
+            .nat64_prefixes
+            .push("not-a-prefix".to_string());
+        shared_oauth_manager(&broken).expect("shared");
+        assert_eq!(
+            first.current_nat64_prefixes().len(),
+            1,
+            "a malformed reload must not drop the working guard"
+        );
+
+        // Clearing the setting is a valid reload, not a malformed one.
+        shared_oauth_manager(&plain).expect("shared");
+        assert!(
+            first.current_nat64_prefixes().is_empty(),
+            "an explicit empty list must clear the rules"
+        );
     }
 }

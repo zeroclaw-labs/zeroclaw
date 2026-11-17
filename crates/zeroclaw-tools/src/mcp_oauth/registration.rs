@@ -60,17 +60,26 @@ fn client_id_is_usable(client_id: &str) -> bool {
 /// and the per-target client is what carries the URL policy + DNS pinning.
 /// `redirect_uri` is the
 /// loopback callback this exact flow bound, so it must be registered before
-/// the authorization request is built.
+/// the authorization request is built. `request_refresh_grant` comes from the
+/// validated AS metadata: an AS that does not implement the refresh grant
+/// rejects a registration asking for it (`invalid_client_metadata`, RFC 7591
+/// §2 / §3.2.1), which would end sign-in before the browser ever opened, so
+/// the grant is requested only when the AS advertised it.
 pub async fn register_client(
     client: &reqwest::Client,
     endpoint: &Url,
     redirect_uri: &str,
     scopes: Option<&[String]>,
+    request_refresh_grant: bool,
 ) -> Result<RegisteredClient> {
+    let mut grant_types = vec!["authorization_code".to_string()];
+    if request_refresh_grant {
+        grant_types.push("refresh_token".to_string());
+    }
     let mut document = serde_json::json!({
         "client_name": "ZeroClaw MCP client",
         "redirect_uris": [redirect_uri],
-        "grant_types": ["authorization_code", "refresh_token"],
+        "grant_types": grant_types,
         "response_types": ["code"],
         "token_endpoint_auth_method": "none",
     });
@@ -202,9 +211,15 @@ mod tests {
             .await;
         let client = client_for(&server, "/register").await;
         let endpoint = Url::parse(&format!("{}/register", server.uri())).expect("url");
-        let err = register_client(&client, &endpoint, "http://127.0.0.1:9/callback", None)
-            .await
-            .expect_err("echoed redirect_uris must be verified");
+        let err = register_client(
+            &client,
+            &endpoint,
+            "http://127.0.0.1:9/callback",
+            None,
+            true,
+        )
+        .await
+        .expect_err("echoed redirect_uris must be verified");
         assert!(err.to_string().contains("redirect_uris"), "got: {err}");
     }
 
@@ -221,9 +236,15 @@ mod tests {
             .await;
         let client = client_for(&server, "/register").await;
         let endpoint = Url::parse(&format!("{}/register", server.uri())).expect("url");
-        let err = register_client(&client, &endpoint, "http://127.0.0.1:9/callback", None)
-            .await
-            .expect_err("a secret-auth echo cannot be satisfied by a public client");
+        let err = register_client(
+            &client,
+            &endpoint,
+            "http://127.0.0.1:9/callback",
+            None,
+            true,
+        )
+        .await
+        .expect_err("a secret-auth echo cannot be satisfied by a public client");
         assert!(
             err.to_string().contains("token_endpoint_auth_method"),
             "got: {err}"
@@ -239,9 +260,15 @@ mod tests {
             .await;
         let client2 = client_for(&server2, "/register").await;
         let endpoint2 = Url::parse(&format!("{}/register", server2.uri())).expect("url");
-        let err = register_client(&client2, &endpoint2, "http://127.0.0.1:9/callback", None)
-            .await
-            .expect_err("an oversized AS-chosen id is a hostile body, not an identifier");
+        let err = register_client(
+            &client2,
+            &endpoint2,
+            "http://127.0.0.1:9/callback",
+            None,
+            true,
+        )
+        .await
+        .expect_err("an oversized AS-chosen id is a hostile body, not an identifier");
         assert!(err.to_string().contains("shape"), "got: {err}");
     }
 
@@ -267,6 +294,7 @@ mod tests {
             &Url::parse(&format!("{}/register", server.uri())).expect("url"),
             "http://127.0.0.1:9/callback",
             Some(&["openid".to_string(), "mcp".to_string()]),
+            true,
         )
         .await
         .expect("registered");
@@ -288,6 +316,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_registration_without_the_refresh_grant_asks_for_authorization_code_only() {
+        // An AS that does not implement the refresh grant rejects a
+        // registration that asks for it (`invalid_client_metadata`), ending
+        // sign-in before the browser opens, so the flag must keep
+        // `refresh_token` out of the document entirely.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/register"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "client_id": "issued-id-456",
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = client_for(&server, "/register").await;
+        let registered = register_client(
+            &client,
+            &Url::parse(&format!("{}/register", server.uri())).expect("url"),
+            "http://127.0.0.1:9/callback",
+            None,
+            false,
+        )
+        .await
+        .expect("registered");
+        assert_eq!(registered.client_id, "issued-id-456");
+        let requests = server.received_requests().await.expect("received");
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).expect("json body");
+        assert_eq!(
+            body["grant_types"],
+            serde_json::json!(["authorization_code"]),
+            "the unadvertised refresh grant must not be requested"
+        );
+        assert_eq!(body["response_types"], serde_json::json!(["code"]));
+    }
+
+    #[tokio::test]
     async fn registration_error_response_is_actionable_not_a_parse_report() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -304,6 +368,7 @@ mod tests {
             &Url::parse(&format!("{}/register", server.uri())).expect("url"),
             "http://127.0.0.1:9/callback",
             None,
+            true,
         )
         .await
         .expect_err("must fail");
@@ -330,6 +395,7 @@ mod tests {
             &Url::parse(&format!("{}/register", server.uri())).expect("url"),
             "http://127.0.0.1:9/callback",
             None,
+            true,
         )
         .await
         .expect_err("must fail");
@@ -358,6 +424,7 @@ mod tests {
                 &Url::parse(&format!("{}/register", server.uri())).expect("url"),
                 "http://127.0.0.1:9/callback",
                 None,
+                true,
             )
             .await
             .expect_err("body must fail closed");
@@ -382,6 +449,7 @@ mod tests {
             &Url::parse(&format!("{}/register", server.uri())).expect("url"),
             "http://127.0.0.1:9/callback",
             None,
+            true,
         )
         .await
         .expect_err("oversized body must fail");

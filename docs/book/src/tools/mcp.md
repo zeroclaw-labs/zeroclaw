@@ -271,11 +271,14 @@ a mutation cannot run twice. A refresh response that omits
 clears the stored grant and asks for a new sign-in. If the authorization
 server behind a stored grant changes (discovered issuer no longer matches the
 issuer that minted it), ZeroClaw drops the grant rather than sending its
-tokens to the new server. ZeroClaw does not call the authorization server's
-revocation endpoint (RFC 7009) when it drops or replaces a grant, so
-server-side sessions live out their own expiry; revoking at the provider
-always wins on the next call, and client-initiated revocation is a tracked
-follow-up.
+tokens to the new server. A stored profile written by a DIFFERENT sign-in (the
+interactive CLI signing the resource in while the daemon runs, for example) is
+not deleted by that verdict, and when it was minted by the new server it is
+adopted instead of asking you to sign in again. ZeroClaw does not call the
+authorization server's revocation endpoint (RFC 7009) when it drops or replaces
+a grant, so server-side sessions live out their own expiry; revoking at the
+provider always wins on the next call, and client-initiated revocation is a
+tracked follow-up.
 
 Storage: grants (access token, optional ID token, refresh token, client id,
 issuer, returned scope) live in the encrypted auth-profile store beside your
@@ -284,7 +287,13 @@ encrypted secret storage: with `secrets.encrypt = false` the manager fails
 closed with an actionable message instead of persisting plaintext refresh
 tokens. The requested `oauth_scopes` are sent verbatim; the scope string the
 AS returns is stored but not subset-checked, so the AS is the authority on
-what the token can do.
+what the token can do. A rotation the running daemon performs after you signed
+the same resource in at a DIFFERENT authorization server or with a different
+client (the CLI, for example) does not overwrite that sign-in: the stored
+profile is left exactly as the newer one wrote it, and the daemon keeps its own
+rotated token in memory. A newer sign-in at the SAME authorization server under
+the same client id is a newer token set for the same party, and a rotation of
+the older grant still replaces it.
 
 Security posture (all enforced before any token leaves): MCP OAuth URLs must
 use `https` except on loopback; discovery and metadata documents are fetched
