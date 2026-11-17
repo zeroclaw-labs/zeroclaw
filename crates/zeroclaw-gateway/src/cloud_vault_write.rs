@@ -335,7 +335,7 @@ async fn execute(
                     name,
                     &write,
                     replace,
-                    chrono::Utc::now(),
+                    time::OffsetDateTime::now_utc(),
                 )?)
                 .await
                 .map_err(|_| UPSTREAM)?;
@@ -366,7 +366,7 @@ fn aws_request(
     name: &str,
     write: &SecretWrite,
     replace: bool,
-    now: chrono::DateTime<chrono::Utc>,
+    now: time::OffsetDateTime,
 ) -> Result<Request, StatusCode> {
     use hmac::{Hmac, Mac};
     use sha2::{Digest, Sha256};
@@ -380,8 +380,15 @@ fn aws_request(
     };
     let key_field = if replace { "SecretId" } else { "Name" };
     let payload = json!({(key_field): name, "SecretString": write.value, "ClientRequestToken": uuid::Uuid::new_v4().to_string()}).to_string();
-    let timestamp = now.format("%Y%m%dT%H%M%SZ").to_string();
-    let day = &timestamp[..8];
+    let now = now.to_offset(time::UtcOffset::UTC);
+    let timestamp = now
+        .format(time::macros::format_description!(
+            "[year][month][day]T[hour][minute][second]Z"
+        ))
+        .map_err(|_| UPSTREAM)?;
+    let day = now
+        .format(time::macros::format_description!("[year][month][day]"))
+        .map_err(|_| UPSTREAM)?;
     let content_type = "application/x-amz-json-1.1";
     let host = base.host_str().ok_or(BAD)?;
     let signed = "content-type;host;x-amz-date;x-amz-security-token;x-amz-target";
@@ -401,7 +408,7 @@ fn aws_request(
         h.update(data.as_bytes());
         Ok(Zeroizing::new(h.finalize().into_bytes().to_vec()))
     };
-    let day_key = mac(Zeroizing::new(format!("AWS4{key}")).as_bytes(), day)?;
+    let day_key = mac(Zeroizing::new(format!("AWS4{key}")).as_bytes(), &day)?;
     let regional = mac(&day_key, region)?;
     let service = mac(&regional, "secretsmanager")?;
     let signing = mac(&service, "aws4_request")?;
@@ -466,6 +473,33 @@ mod tests {
             aws_access_key_id: None,
             aws_secret_access_key: None,
         }
+    }
+
+    #[test]
+    fn aws_signing_uses_utc_for_timestamp_and_scope_day() {
+        let mut write = write();
+        write.aws_access_key_id = Some("synthetic-access-key".into());
+        write.aws_secret_access_key = Some("synthetic-signing-key".into());
+        let request = aws_request(
+            &Client::new(),
+            &Url::parse("https://secretsmanager.us-east-1.amazonaws.com/").unwrap(),
+            "us-east-1",
+            "jarvis-test",
+            &write,
+            false,
+            time::macros::datetime!(2026-01-02 01:02:03 +02:00),
+        )
+        .unwrap();
+
+        assert_eq!(request.headers()["x-amz-date"], "20260101T230203Z");
+        assert!(
+            request.headers()["authorization"]
+                .to_str()
+                .unwrap()
+                .contains(
+                    "Credential=synthetic-access-key/20260101/us-east-1/secretsmanager/aws4_request"
+                )
+        );
     }
 
     #[test]

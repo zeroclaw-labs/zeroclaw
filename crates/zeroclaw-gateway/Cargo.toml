@@ -81,6 +81,7 @@ rusqlite = { version = "0.40", features = ["bundled", "fallible_uint"] }
 # Misc
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
 parking_lot = "0.12"
+time = { version = "0.3", default-features = false, features = ["std", "formatting", "macros"] }
 toml = "1.0"
 toml_edit = "0.25"
 uuid = { version = "1.22", default-features = false, features = ["v4", "std"] }
