@@ -341,21 +341,44 @@ async fn serve(id: &str) -> Result<()> {
 }
 
 async fn retire_idle(pool: &Pool, idle: Duration) {
-    let mut entries = pool.lock().await;
-    for (path, entry) in entries.iter_mut() {
-        if let Ok(mut state) = entry.try_lock()
-            && state.leases == 0
-            && state.idle_since.is_some_and(|time| time.elapsed() >= idle)
-        {
-            if let Some(mut master) = state.master.take() {
-                // Only a live master retired by this broker is eligible for reuse.
-                state.failed = !matches!(master.try_wait(), Ok(None));
+    let entries: Vec<_> = pool
+        .lock()
+        .await
+        .iter()
+        .map(|(path, entry)| (path.clone(), Arc::clone(entry)))
+        .collect();
+    let mut cleanup = JoinSet::new();
+    for (path, entry) in entries {
+        cleanup.spawn(async move {
+            if let Ok(mut state) = entry.try_lock()
+                && state.leases == 0
+                && state.idle_since.is_some_and(|time| time.elapsed() >= idle)
+            {
+                if let Some(mut master) = state.master.take() {
+                    state.failed = !matches!(master.try_wait(), Ok(None));
+                    let _ = master.kill().await;
+                }
+                // Hold this entry's lock through termination so an old master
+                // cannot unlink a replacement connection's control socket.
+                let _ = std::fs::remove_file(path);
+                state.idle_since = None;
+            }
+        });
+    }
+    while cleanup.join_next().await.is_some() {}
+}
+
+async fn stop_masters(pool: &Pool) {
+    let entries: Vec<_> = pool.lock().await.values().cloned().collect();
+    let mut cleanup = JoinSet::new();
+    for entry in entries {
+        cleanup.spawn(async move {
+            if let Some(mut master) = entry.lock().await.master.take() {
                 let _ = master.kill().await;
             }
-            let _ = std::fs::remove_file(path);
-            state.idle_since = None;
-        }
+        });
     }
+    while cleanup.join_next().await.is_some() {}
 }
 
 async fn serve_inner(
@@ -411,11 +434,7 @@ async fn serve_inner(
         }
     }
     jobs.shutdown().await;
-    for entry in pool.lock().await.values() {
-        if let Some(mut master) = entry.lock().await.master.take() {
-            let _ = master.kill().await;
-        }
-    }
+    stop_masters(&pool).await;
     Ok(())
 }
 
@@ -576,6 +595,31 @@ mod tests {
             assert_eq!(socket.exists(), leases != 0);
             drop(listener);
         }
+    }
+
+    #[tokio::test]
+    async fn many_connections_close_within_the_task_cleanup_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = Pool::default();
+        for index in 0..70 {
+            let master = OwnedMaster::spawn(Command::new("/usr/bin/sleep").arg("60")).unwrap();
+            pool.lock().await.insert(
+                dir.path().join(index.to_string()),
+                Arc::new(Mutex::new(Entry {
+                    master: Some(master),
+                    ..Entry::default()
+                })),
+            );
+        }
+        let (input, writer) = std::os::unix::net::UnixStream::pair().unwrap();
+        drop(writer);
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            serve_inner(dir.path(), dir.path(), Duration::from_secs(60), pool, input),
+        )
+        .await
+        .expect("seventy masters must stop before the task's ten-second deadline")
+        .unwrap();
     }
 
     #[tokio::test]
