@@ -221,11 +221,14 @@ fn signer_loader_args(effective: &str, home: Option<&Path>) -> Result<Vec<std::f
             if file == "none" {
                 continue;
             }
+            let home_relative = file.strip_prefix("~/").or_else(|| file.strip_prefix("%d/"));
             ensure!(
-                !file.contains(['%', '$', '"', '\'', '\\']),
+                !home_relative
+                    .unwrap_or(file)
+                    .contains(['%', '$', '"', '\'', '\\']),
                 "unsupported known-hosts path"
             );
-            let path = if let Some(relative) = file.strip_prefix("~/") {
+            let path = if let Some(relative) = home_relative {
                 home.context("missing home for known-hosts path")?
                     .join(relative)
             } else {
@@ -757,6 +760,14 @@ mod tests {
                 "-"
             ]
         );
+        let tokenized = base.replace("~/", "%d/");
+        assert_eq!(
+            signer_loader_args(&tokenized, Some(Path::new("/home/test"))).unwrap(),
+            args
+        );
+        assert!(signer_loader_args(&tokenized, None).is_err());
+        let unsupported = base.replace("~/", "%h/");
+        assert!(signer_loader_args(&unsupported, Some(Path::new("/home/test"))).is_err());
         let alias = format!("{base}hostkeyalias build-pin\n");
         let args = signer_loader_args(&alias, Some(Path::new("/home/test"))).unwrap();
         assert_eq!(args[5], "runner@build-pin");
