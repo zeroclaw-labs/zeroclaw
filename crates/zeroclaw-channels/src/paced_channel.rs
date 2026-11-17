@@ -506,6 +506,14 @@ impl Channel for PacedChannel {
             .await
     }
 
+    /// Forwarded: pacing wraps delivery, and a channel that posts its own
+    /// native acknowledgement must still report that through the wrapper or
+    /// cleanup would skip the clear for every paced instance (Telegram is
+    /// always wrapped).
+    fn posts_native_ack(&self) -> bool {
+        self.inner.posts_native_ack()
+    }
+
     async fn pin_message(&self, channel_id: &str, message_id: &str) -> Result<()> {
         self.inner.pin_message(channel_id, message_id).await
     }
@@ -1191,6 +1199,52 @@ mod tests {
                 .await,
             42,
             "paced wrapper must report the inner channel's confirmed offset, not the trait default of 0",
+        );
+    }
+
+    /// Without the forwarding override the wrapper would report that no
+    /// channel posts its own acknowledgement, so cleanup would skip the clear
+    /// for every paced instance - and Telegram is always paced.
+    #[tokio::test]
+    async fn posts_native_ack_forwards_to_inner_channel() {
+        struct NativeAckChannel;
+        impl Attributable for NativeAckChannel {
+            fn role(&self) -> Role {
+                Role::Channel(zeroclaw_api::attribution::ChannelKind::Telegram)
+            }
+            fn alias(&self) -> &str {
+                "native-ack"
+            }
+        }
+        #[async_trait]
+        impl Channel for NativeAckChannel {
+            fn name(&self) -> &str {
+                "native-ack"
+            }
+            async fn send(&self, _message: &SendMessage) -> Result<()> {
+                Ok(())
+            }
+            async fn listen(&self, _tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> Result<()> {
+                Ok(())
+            }
+            fn posts_native_ack(&self) -> bool {
+                true
+            }
+        }
+
+        let bare: Arc<dyn Channel> = Arc::new(NativeAckChannel);
+        let cfg = PacingFixture {
+            interval_secs: 3600,
+            depth: 4,
+        };
+        let paced = PacedChannel::wrap(Arc::clone(&bare), &cfg);
+        assert!(
+            !Arc::ptr_eq(&paced, &bare),
+            "non-zero pacing must actually produce the wrapper"
+        );
+        assert!(
+            paced.posts_native_ack(),
+            "the wrapper must report the inner channel's native acknowledgement"
         );
     }
 

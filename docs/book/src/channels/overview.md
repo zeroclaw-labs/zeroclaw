@@ -174,7 +174,7 @@ With that config the Slack `work` instance shows ⏳ while the turn runs and lea
 
 On Slack the value is either a Unicode emoji (`⏳`) or a Slack short name (`:hourglass_flowing_sand:`). Names outside the built-in Unicode-to-name map are passed to the Slack reactions API with their colons trimmed, so workspace emoji work too. Channels that translate acknowledgement emoji into their own vocabulary, such as the Git forge channels, skip a configured emoji they cannot express.
 
-Telegram is not covered by these emoji settings. It posts its own acknowledgement from the fixed set Telegram accepts (⚡️, 👌, 👀, 🔥, 👍) and honours `ack_reactions` only as an on/off switch, because a Telegram bot has one reaction slot per message and a narrower allowed emoji set than Slack or Matrix.
+Telegram is not covered by these emoji settings. It posts its own acknowledgement from the fixed set Telegram accepts (⚡️, 👌, 👀, 🔥, 👍) and honours `ack_reactions` only as an on/off switch, because a Telegram bot has one reaction slot per message and a narrower allowed emoji set than Slack or Matrix. Because that reaction is posted by the channel rather than the orchestrator, cleanup still clears it when `ack_reaction_in_progress` is empty: an empty value means the orchestrator adds nothing, not that Telegram has nothing to withdraw. `ack_reactions = false` is the only way to leave a Telegram message reaction-free.
 
 Lark's inbound fast-ack uses the same resolved in-progress emoji, so the reaction the channel adds is the one the orchestrator later withdraws.
 

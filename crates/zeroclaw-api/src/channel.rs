@@ -1333,6 +1333,19 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
         Ok(())
     }
 
+    /// Whether this channel posts its own acknowledgement reaction on inbound
+    /// messages instead of going through [`Channel::add_reaction`].
+    ///
+    /// Such a channel owns a reaction on the message that the orchestrator
+    /// never added, so cleanup must still call [`Channel::remove_reaction`]
+    /// when the configured in-progress emoji is empty: an empty value means
+    /// the orchestrator adds nothing, not that the channel has nothing to
+    /// clear. Channels that react only through `add_reaction` keep the
+    /// default `false`, so an empty in-progress emoji skips both calls.
+    fn posts_native_ack(&self) -> bool {
+        false
+    }
+
     /// The in-progress acknowledgement this channel already posted to
     /// `message_id` when the message arrived, if the channel fast-acks inbound
     /// messages.

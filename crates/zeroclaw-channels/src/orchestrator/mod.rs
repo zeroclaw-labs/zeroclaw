@@ -9170,10 +9170,12 @@ fn resolve_channel_ack_emojis(
     }
 }
 
-/// Withdraw an acknowledgement reaction. A configured empty emoji means no
-/// reaction was ever added, so there is nothing to remove.
+/// Withdraw an acknowledgement reaction. A configured empty emoji means the
+/// orchestrator added nothing, so it skips the remove - except on a channel
+/// that posted its own native acknowledgement (`posts_native_ack`, e.g.
+/// Telegram), where the clear is still the only thing that withdraws it.
 async fn withdraw_ack(channel: &dyn Channel, target: &str, message_id: &str, emoji: &str) {
-    if emoji.is_empty() {
+    if emoji.is_empty() && !channel.posts_native_ack() {
         return;
     }
     let _ = channel.remove_reaction(target, message_id, emoji).await;
@@ -25767,6 +25769,10 @@ api_key = "anthropic-key"
         /// Pending add task handed back with the recorded acknowledgement, so a
         /// test can prove the reply never waits for the channel's own add.
         inbound_ack_completion: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+        /// Stands in for a channel that posts its own native acknowledgement
+        /// (Telegram), so cleanup must clear it even with an empty configured
+        /// in-progress emoji.
+        posts_native_ack: bool,
     }
 
     /// Records every outbound `SendMessage` whole, so a test can assert on
@@ -26768,6 +26774,10 @@ api_key = "anthropic-key"
             let emoji = self.inbound_ack.clone()?;
             let completion = self.inbound_ack_completion.lock().await.take();
             Some(::zeroclaw_api::channel::InboundAck { emoji, completion })
+        }
+
+        fn posts_native_ack(&self) -> bool {
+            self.posts_native_ack
         }
 
         async fn add_reaction(
@@ -37930,6 +37940,103 @@ BTC is currently around $65,000 based on latest tool output."#
             removed.iter().map(|r| r.2.as_str()).collect::<Vec<_>>(),
             vec!["\u{23F3}"],
             "the acknowledgement should be withdrawn with nothing added in its place"
+        );
+    }
+
+    // An empty in-progress emoji on a channel that posts its own native
+    // acknowledgement (Telegram) must still reach `remove_reaction`: the
+    // orchestrator added nothing, but the channel's reaction is on the message
+    // and the clear is the only thing that withdraws it. #11739 landed that
+    // clear on master; before this fix `withdraw_ack` returned early and
+    // stranded it for anyone running `ack_reaction_in_progress = ""`.
+    #[tokio::test]
+    async fn process_channel_message_clears_native_ack_with_empty_in_progress() {
+        let channel_impl = Arc::new(RecordingChannel {
+            posts_native_ack: true,
+            ..Default::default()
+        });
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.channels.ack_reaction_in_progress = String::new();
+        config.channels.ack_reaction_done = String::new();
+        let runtime_ctx = ack_reaction_test_context(channel, config);
+
+        process_channel_message(
+            runtime_ctx,
+            zeroclaw_api::channel::ChannelMessage {
+                id: "react-msg-native-empty".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-react".to_string(),
+                content: "hello".to_string(),
+                channel: "test-channel".into(),
+                channel_alias: None,
+                timestamp: 1,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments: vec![],
+                subject: None,
+
+                ..Default::default()
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        assert!(
+            channel_impl.reactions_added.lock().await.is_empty(),
+            "an empty in-progress emoji must not add an orchestrator reaction"
+        );
+        let removed = channel_impl.reactions_removed.lock().await;
+        assert_eq!(
+            removed.len(),
+            1,
+            "the channel's native acknowledgement must still be cleared once, got {removed:?}"
+        );
+        assert_eq!(removed[0].2, "");
+    }
+
+    // The mirror case: a channel that reacts only through the orchestrator
+    // `add_reaction` has nothing on the message when the in-progress emoji is
+    // empty, so both the add and the remove stay skipped.
+    #[tokio::test]
+    async fn process_channel_message_skips_remove_with_empty_in_progress() {
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.channels.ack_reaction_in_progress = String::new();
+        config.channels.ack_reaction_done = String::new();
+        let runtime_ctx = ack_reaction_test_context(channel, config);
+
+        process_channel_message(
+            runtime_ctx,
+            zeroclaw_api::channel::ChannelMessage {
+                id: "react-msg-plain-empty".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-react".to_string(),
+                content: "hello".to_string(),
+                channel: "test-channel".into(),
+                channel_alias: None,
+                timestamp: 1,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments: vec![],
+                subject: None,
+
+                ..Default::default()
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        assert!(
+            channel_impl.reactions_added.lock().await.is_empty(),
+            "an empty in-progress emoji adds nothing"
+        );
+        assert!(
+            channel_impl.reactions_removed.lock().await.is_empty(),
+            "nothing was added, so the orchestrator must not call remove_reaction"
         );
     }
 
