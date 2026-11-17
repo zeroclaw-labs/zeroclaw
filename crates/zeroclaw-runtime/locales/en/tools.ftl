@@ -301,3 +301,8 @@ tool-http-credential-host = A custom Host header is forbidden when using a scope
 tool-http-credential-alias = Credential alias must contain 1 to 64 ASCII letters, numbers, underscores, or hyphens.
 
 tool-http-request-authenticated-response-truncated = [Truncated authenticated response omitted]
+
+# Native task SSH broker
+tool-native-ssh-arguments = Use a configured SSH destination and an explicit noninteractive command.
+tool-native-ssh-denied = Task SSH could not authorize or open the requested transport.
+tool-ssh-task-unsupported = The task SSH broker requires Linux.

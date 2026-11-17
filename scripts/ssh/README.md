@@ -89,3 +89,48 @@ owner live outside the transitional runtime crate. The small turn-entry and
 shell-environment wiring requires maintainer ownership review, including any
 bounded holding-crate exception required before merge. This proposal does not
 grant itself such an exception or introduce a second task scheduler.
+
+## Native broker preview
+
+Build the Linux binary with `cargo build --locked --release -p zeroclaw-tools
+--bin zeroclaw-ssh-task`. Configure the service helper path and the shell's
+managed SSH wrapper to point to the same binary. The existing task protocol,
+catalog, trust configuration, and idle timeout apply. Roll back by restoring
+both paths to the previous helper. Keep the Python adapter during review.
+
+To enable catalog-backed SSH credentials in the Rust broker:
+
+1. Register an SSH key or OpenBao KV field in **Storage → Secrets** and grant
+   the effective hostname, port and SSH login. Install the expected host key
+   in the service user's configured known-hosts file.
+2. Set `ZEROCLAW_SSH_CREDENTIAL_DIR` to the protected directory containing
+   `config.toml` and its encryption key.
+3. Invoke `ssh --credential ALIAS HOST COMMAND` through the managed wrapper,
+   or set `ZEROCLAW_SSH_DEFAULT_CREDENTIAL` for a default alias. Keep the alias
+   unset when rolling back to the agent-only Python helper.
+
+The Rust broker reads the existing encrypted catalog with ZeroClaw's own
+configuration and secret store. OpenSSH still owns transport and host-key
+validation. Scoped credentials require OpenSSH 8.9 or newer. The signer
+loads the key with a 20-second lifetime and a destination constraint derived
+from the authorized effective user, hostname, port and host-key alias. It
+uses the configured known-hosts files and refuses the scoped connection if
+those files cannot establish the constraint. Use distinct, pinned host keys
+for different servers. The SSH agent binds the constraint to host keys and
+the username, while the catalog separately checks the effective port. The
+broker terminates the signer before leasing the authenticated transport.
+
+For OpenBao, the broker invokes the operator-managed `bao` CLI with discrete
+arguments and a bounded lifetime and output. Its standard error is excluded
+from user-facing diagnostics. Keep the CLI on the trusted service PATH and
+configure service authentication and TLS through the CLI's normal settings.
+Upgrading the CLI alongside OpenBao can accommodate protocol changes without
+changing ZeroClaw, as long as the supported CLI commands and output contract
+remain stable.
+
+The same rule applies to Azure and other vault adapters. Prefer the official
+CLI when it can preserve service identity, TLS verification and scoped secret
+access without putting secret values in arguments or logs. Consider direct
+verified HTTPS when a specific CLI cannot meet those conditions and the API
+provides a safer path. The native SSH preview supports local keys and OpenBao,
+matching the existing broker's supported SSH sources.
