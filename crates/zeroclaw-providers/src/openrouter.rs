@@ -583,6 +583,99 @@ impl OpenRouterModelProvider {
     }
 }
 
+impl OpenRouterModelProvider {
+    async fn chat_inner(
+        &self,
+        request: ProviderChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        budget: Option<&zeroclaw_api::model_provider::GenerationAttemptBudget>,
+    ) -> anyhow::Result<ProviderChatResponse> {
+        if let Some(budget) = budget {
+            budget.ensure_available()?;
+        }
+        let credential = self.credential.as_ref().ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"missing": "credentials"})),
+                "openrouter: API key not configured"
+            );
+            anyhow::Error::msg(
+                "OpenRouter API key not set. Run `zeroclaw quickstart` or `zeroclaw config set` to configure.",
+            )
+        })?;
+
+        let tools = Self::convert_tools(request.tools);
+        let native_request = NativeChatRequest {
+            model: model.to_string(),
+            messages: Self::convert_messages(request.messages),
+            temperature,
+            tool_choice: tools
+                .as_ref()
+                .and_then(|t| (!t.is_empty()).then(|| "auto".to_string())),
+            tools,
+            max_tokens: self.max_tokens,
+            stream: None,
+        };
+
+        let body = self.merge_extra_body(&native_request)?;
+        let client = match budget {
+            Some(_) => {
+                crate::bounded::timeout_client("model_provider.openrouter", self.timeout_secs)?
+            }
+            None => self.http_client(),
+        };
+        let request = client
+            .post(endpoint_url("chat/completions"))
+            .header("Authorization", format!("Bearer {credential}"))
+            .header("HTTP-Referer", "https://github.com/zeroclaw-labs/zeroclaw")
+            .header("X-Title", "ZeroClaw")
+            .header("X-OpenRouter-Categories", "personal-agent,cli-agent")
+            .json(&body);
+        let response = crate::bounded::send(request, budget, None).await?;
+
+        if !response.status().is_success() {
+            return Err(super::api_error("OpenRouter", response).await);
+        }
+
+        let resp_body = Self::read_response_body("OpenRouter", response).await?;
+        let native_response = Self::parse_response_body::<NativeChatResponse>(
+            "OpenRouter",
+            &resp_body,
+            "native chat",
+        )?;
+        // OpenRouter surfaces cached-token accounting via
+        // `usage.prompt_tokens_details.cached_tokens` when the upstream
+        // provider supports prompt caching. For providers without caching
+        // the field is absent and we report `None`.
+        let usage = native_response.usage.map(|u| TokenUsage {
+            input_tokens: u.prompt_tokens,
+            output_tokens: u.completion_tokens,
+            cached_input_tokens: u.prompt_tokens_details.and_then(|d| d.cached_tokens),
+            cache_creation_input_tokens: None,
+        });
+        let message = native_response
+            .choices
+            .into_iter()
+            .next()
+            .map(|c| c.message)
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                    "openrouter: empty choices in response"
+                );
+                anyhow::Error::msg("No response from OpenRouter")
+            })?;
+        let mut result = Self::parse_native_response(message);
+        result.usage = usage;
+        Ok(result)
+    }
+}
+
 #[async_trait]
 impl ModelProvider for OpenRouterModelProvider {
     // ── ModelProvider-family defaults ──
@@ -788,81 +881,19 @@ impl ModelProvider for OpenRouterModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<ProviderChatResponse> {
-        let credential = self.credential.as_ref().ok_or_else(|| {
-            ::zeroclaw_log::record!(
-                ERROR,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({"missing": "credentials"})),
-                "openrouter: API key not configured"
-            );
-            anyhow::Error::msg(
-                "OpenRouter API key not set. Run `zeroclaw quickstart` or `zeroclaw config set` to configure.",
-            )
-        })?;
+        self.chat_inner(request, model, temperature, None).await
+    }
 
-        let tools = Self::convert_tools(request.tools);
-        let native_request = NativeChatRequest {
-            model: model.to_string(),
-            messages: Self::convert_messages(request.messages),
-            temperature,
-            tool_choice: tools
-                .as_ref()
-                .and_then(|t| (!t.is_empty()).then(|| "auto".to_string())),
-            tools,
-            max_tokens: self.max_tokens,
-            stream: None,
-        };
-
-        let body = self.merge_extra_body(&native_request)?;
-        let response = self
-            .http_client()
-            .post(endpoint_url("chat/completions"))
-            .header("Authorization", format!("Bearer {credential}"))
-            .header("HTTP-Referer", "https://github.com/zeroclaw-labs/zeroclaw")
-            .header("X-Title", "ZeroClaw")
-            .header("X-OpenRouter-Categories", "personal-agent,cli-agent")
-            .json(&body)
-            .send()
-            .await?;
-
-        if !response.status().is_success() {
-            return Err(super::api_error("OpenRouter", response).await);
-        }
-
-        let resp_body = Self::read_response_body("OpenRouter", response).await?;
-        let native_response = Self::parse_response_body::<NativeChatResponse>(
-            "OpenRouter",
-            &resp_body,
-            "native chat",
-        )?;
-        // OpenRouter surfaces cached-token accounting via
-        // `usage.prompt_tokens_details.cached_tokens` when the upstream
-        // provider supports prompt caching. For providers without caching
-        // the field is absent and we report `None`.
-        let usage = native_response.usage.map(|u| TokenUsage {
-            input_tokens: u.prompt_tokens,
-            output_tokens: u.completion_tokens,
-            cached_input_tokens: u.prompt_tokens_details.and_then(|d| d.cached_tokens),
-            cache_creation_input_tokens: None,
-        });
-        let message = native_response
-            .choices
-            .into_iter()
-            .next()
-            .map(|c| c.message)
-            .ok_or_else(|| {
-                ::zeroclaw_log::record!(
-                    ERROR,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
-                    "openrouter: empty choices in response"
-                );
-                anyhow::Error::msg("No response from OpenRouter")
-            })?;
-        let mut result = Self::parse_native_response(message);
-        result.usage = usage;
-        Ok(result)
+    async fn chat_with_attempt_budget(
+        &self,
+        request: crate::traits::ChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        _policy: zeroclaw_api::model_provider::ToolRoundPolicy,
+        budget: &zeroclaw_api::model_provider::GenerationAttemptBudget,
+    ) -> anyhow::Result<crate::traits::ChatResponse> {
+        self.chat_inner(request, model, temperature, Some(budget))
+            .await
     }
 
     fn supports_native_tools(&self) -> bool {
@@ -2544,5 +2575,24 @@ data: [DONE]
             !finished.load(Ordering::SeqCst),
             "cancelled task must not have run its completion side effect"
         );
+    }
+}
+
+#[cfg(test)]
+mod attempt_budget_tests {
+    use super::*;
+    use crate::bounded::tests as fixture;
+
+    #[tokio::test]
+    async fn openrouter_shares_budget_across_calls() {
+        let server = fixture::server(vec![
+            fixture::Reply::json(200, fixture::CHAT_OK),
+            fixture::Reply::json(200, fixture::CHAT_OK),
+        ])
+        .await;
+        let provider = OpenRouterModelProvider::builder("fixture")
+            .credential(Some("fixture-key"))
+            .build();
+        fixture::assert_two_requests(&provider, &server).await;
     }
 }

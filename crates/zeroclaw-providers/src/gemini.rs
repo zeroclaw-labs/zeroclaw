@@ -1000,14 +1000,19 @@ impl GeminiModelProvider {
     fn build_generate_content_request(
         &self,
         auth: &GeminiAuth,
-        url: &str,
         request: &GenerateContentRequest,
         model: &str,
         include_generation_config: bool,
         project: Option<&str>,
         oauth_token: Option<&str>,
+        budget: Option<&zeroclaw_api::model_provider::GenerationAttemptBudget>,
     ) -> anyhow::Result<reqwest::RequestBuilder> {
-        let req = self.http_client().post(url).json(request);
+        let url = Self::build_generate_content_url(model, auth);
+        let client = match budget {
+            Some(_) => crate::bounded::timeout_client("model_provider.gemini", 120)?,
+            None => self.http_client(),
+        };
+        let req = client.post(&url).json(request);
         Ok(match auth {
             GeminiAuth::ExplicitKey(key) => {
                 req.header(GOOGLE_API_KEY_HEADER, Self::sensitive_api_key_header(key)?)
@@ -1030,10 +1035,7 @@ impl GeminiModelProvider {
                         },
                     },
                 };
-                self.http_client()
-                    .post(url)
-                    .json(&internal_request)
-                    .bearer_auth(token)
+                client.post(url).json(&internal_request).bearer_auth(token)
             }
         })
     }
@@ -1154,7 +1156,7 @@ impl GeminiModelProvider {
         temperature: Option<f64>,
     ) -> anyhow::Result<(String, Option<TokenUsage>)> {
         let (contents, system_instruction) = Self::build_chat_contents(messages, None)?;
-        self.send_generate_content(contents, system_instruction, model, temperature)
+        self.send_generate_content(contents, system_instruction, model, temperature, None)
             .await
     }
 
@@ -1176,6 +1178,7 @@ impl GeminiModelProvider {
         system_instruction: Option<Content>,
         model: &str,
         temperature: Option<f64>,
+        budget: Option<&zeroclaw_api::model_provider::GenerationAttemptBudget>,
     ) -> anyhow::Result<(String, Option<TokenUsage>)> {
         let auth = self.auth.as_ref().ok_or_else(|| {
             ::zeroclaw_log::record!(
@@ -1252,20 +1255,16 @@ impl GeminiModelProvider {
             },
         };
 
-        let url = Self::build_generate_content_url(model, auth);
-
-        let mut response = self
-            .build_generate_content_request(
-                auth,
-                &url,
-                &request,
-                model,
-                true,
-                project.as_deref(),
-                oauth_token.as_deref(),
-            )?
-            .send()
-            .await?;
+        let http_request = self.build_generate_content_request(
+            auth,
+            &request,
+            model,
+            true,
+            project.as_deref(),
+            oauth_token.as_deref(),
+            budget,
+        )?;
+        let mut response = crate::bounded::send(http_request, budget, None).await?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -1333,18 +1332,23 @@ impl GeminiModelProvider {
                     };
                     oauth_token = Some(new_token);
                     project = Some(new_project);
-                    response = self
-                        .build_generate_content_request(
-                            auth,
-                            &url,
-                            &request,
-                            model,
-                            true,
-                            project.as_deref(),
-                            oauth_token.as_deref(),
-                        )?
-                        .send()
-                        .await?;
+                    let http_request = self.build_generate_content_request(
+                        auth,
+                        &request,
+                        model,
+                        true,
+                        project.as_deref(),
+                        oauth_token.as_deref(),
+                        budget,
+                    )?;
+                    response = crate::bounded::send(
+                        http_request,
+                        budget,
+                        Some(anyhow::Error::msg(format!(
+                            "Gemini API error ({status}): {error_text}"
+                        ))),
+                    )
+                    .await?;
                 } else {
                     anyhow::bail!("Gemini API error ({status}): {error_text}");
                 }
@@ -1357,18 +1361,23 @@ impl GeminiModelProvider {
                         .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
                     "Gemini OAuth internal endpoint rejected generationConfig; retrying without generationConfig"
                 );
-                response = self
-                    .build_generate_content_request(
-                        auth,
-                        &url,
-                        &request,
-                        model,
-                        false,
-                        project.as_deref(),
-                        oauth_token.as_deref(),
-                    )?
-                    .send()
-                    .await?;
+                let http_request = self.build_generate_content_request(
+                    auth,
+                    &request,
+                    model,
+                    false,
+                    project.as_deref(),
+                    oauth_token.as_deref(),
+                    budget,
+                )?;
+                response = crate::bounded::send(
+                    http_request,
+                    budget,
+                    Some(anyhow::Error::msg(format!(
+                        "Gemini API error ({status}): {error_text}"
+                    ))),
+                )
+                .await?;
             } else {
                 anyhow::bail!("Gemini API error ({status}): {error_text}");
             }
@@ -1386,18 +1395,23 @@ impl GeminiModelProvider {
                         .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
                     "Gemini OAuth internal endpoint rejected generationConfig; retrying without generationConfig"
                 );
-                response = self
-                    .build_generate_content_request(
-                        auth,
-                        &url,
-                        &request,
-                        model,
-                        false,
-                        project.as_deref(),
-                        oauth_token.as_deref(),
-                    )?
-                    .send()
-                    .await?;
+                let http_request = self.build_generate_content_request(
+                    auth,
+                    &request,
+                    model,
+                    false,
+                    project.as_deref(),
+                    oauth_token.as_deref(),
+                    budget,
+                )?;
+                response = crate::bounded::send(
+                    http_request,
+                    budget,
+                    Some(anyhow::Error::msg(format!(
+                        "Gemini API error ({status}): {error_text}"
+                    ))),
+                )
+                .await?;
             } else {
                 anyhow::bail!("Gemini API error ({status}): {error_text}");
             }
@@ -1441,6 +1455,46 @@ impl GeminiModelProvider {
     }
 }
 
+impl GeminiModelProvider {
+    async fn chat_inner(
+        &self,
+        request: ProviderChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        budget: Option<&zeroclaw_api::model_provider::GenerationAttemptBudget>,
+    ) -> anyhow::Result<ProviderChatResponse> {
+        if let Some(budget) = budget {
+            budget.ensure_available()?;
+        }
+        let tool_instructions = if let Some(tools) = request.tools
+            && !tools.is_empty()
+            && !self.supports_native_tools()
+        {
+            Some(match self.convert_tools(tools) {
+                ToolsPayload::PromptGuided { instructions } => instructions,
+                payload => {
+                    anyhow::bail!(
+                        "Provider returned non-prompt-guided tools payload ({payload:?}) while supports_native_tools() is false"
+                    )
+                }
+            })
+        } else {
+            None
+        };
+        let (contents, system_instruction) =
+            Self::build_chat_contents(request.messages, tool_instructions.as_deref())?;
+        let (text, usage) = self
+            .send_generate_content(contents, system_instruction, model, temperature, budget)
+            .await?;
+        Ok(ProviderChatResponse {
+            text: Some(text),
+            tool_calls: Vec::new(),
+            usage,
+            reasoning_content: None,
+        })
+    }
+}
+
 #[async_trait]
 impl ModelProvider for GeminiModelProvider {
     // ── ModelProvider-family defaults ──
@@ -1475,7 +1529,7 @@ impl ModelProvider for GeminiModelProvider {
         }];
 
         let (text, _usage) = self
-            .send_generate_content(contents, system_instruction, model, temperature)
+            .send_generate_content(contents, system_instruction, model, temperature, None)
             .await?;
         Ok(text)
     }
@@ -1498,32 +1552,19 @@ impl ModelProvider for GeminiModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<ProviderChatResponse> {
-        let tool_instructions = if let Some(tools) = request.tools
-            && !tools.is_empty()
-            && !self.supports_native_tools()
-        {
-            Some(match self.convert_tools(tools) {
-                ToolsPayload::PromptGuided { instructions } => instructions,
-                payload => {
-                    anyhow::bail!(
-                        "Provider returned non-prompt-guided tools payload ({payload:?}) while supports_native_tools() is false"
-                    )
-                }
-            })
-        } else {
-            None
-        };
-        let (contents, system_instruction) =
-            Self::build_chat_contents(request.messages, tool_instructions.as_deref())?;
-        let (text, usage) = self
-            .send_generate_content(contents, system_instruction, model, temperature)
-            .await?;
-        Ok(ProviderChatResponse {
-            text: Some(text),
-            tool_calls: Vec::new(),
-            usage,
-            reasoning_content: None,
-        })
+        self.chat_inner(request, model, temperature, None).await
+    }
+
+    async fn chat_with_attempt_budget(
+        &self,
+        request: crate::traits::ChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        _policy: zeroclaw_api::model_provider::ToolRoundPolicy,
+        budget: &zeroclaw_api::model_provider::GenerationAttemptBudget,
+    ) -> anyhow::Result<crate::traits::ChatResponse> {
+        self.chat_inner(request, model, temperature, Some(budget))
+            .await
     }
 
     async fn warmup(&self) -> anyhow::Result<()> {
@@ -1891,7 +1932,6 @@ mod tests {
     fn oauth_request_uses_bearer_auth_header() {
         let model_provider = test_model_provider(Some(test_oauth_auth("ya29.mock-token")));
         let auth = test_oauth_auth("ya29.mock-token");
-        let url = GeminiModelProvider::build_generate_content_url("gemini-2.0-flash", &auth);
         let body = GenerateContentRequest {
             contents: vec![Content {
                 role: Some("user".into()),
@@ -1907,12 +1947,12 @@ mod tests {
         let request = model_provider
             .build_generate_content_request(
                 &auth,
-                &url,
                 &body,
                 "gemini-2.0-flash",
                 true,
                 Some("test-project"),
                 Some("ya29.mock-token"),
+                None,
             )
             .unwrap()
             .build()
@@ -1931,7 +1971,6 @@ mod tests {
     fn oauth_request_wraps_payload_in_request_envelope() {
         let model_provider = test_model_provider(Some(test_oauth_auth("ya29.mock-token")));
         let auth = test_oauth_auth("ya29.mock-token");
-        let url = GeminiModelProvider::build_generate_content_url("gemini-2.0-flash", &auth);
         let body = GenerateContentRequest {
             contents: vec![Content {
                 role: Some("user".into()),
@@ -1947,12 +1986,12 @@ mod tests {
         let request = model_provider
             .build_generate_content_request(
                 &auth,
-                &url,
                 &body,
                 "models/gemini-2.0-flash",
                 true,
                 Some("test-project"),
                 Some("ya29.mock-token"),
+                None,
             )
             .unwrap()
             .build()
@@ -1975,7 +2014,6 @@ mod tests {
         let model_provider =
             test_model_provider(Some(GeminiAuth::ExplicitKey("api-key-123".into())));
         let auth = GeminiAuth::ExplicitKey("api-key-123".into());
-        let url = GeminiModelProvider::build_generate_content_url("gemini-2.0-flash", &auth);
         let body = GenerateContentRequest {
             contents: vec![Content {
                 role: Some("user".into()),
@@ -1991,10 +2029,10 @@ mod tests {
         let request = model_provider
             .build_generate_content_request(
                 &auth,
-                &url,
                 &body,
                 "gemini-2.0-flash",
                 true,
+                None,
                 None,
                 None,
             )
@@ -2838,5 +2876,61 @@ mod tests {
         assert!(
             matches!(&system_instruction.parts[0], Part::Text { text } if text == "Use tools carefully")
         );
+    }
+}
+
+#[cfg(test)]
+mod attempt_budget_tests {
+    use super::*;
+    use crate::bounded::tests as fixture;
+
+    #[tokio::test]
+    async fn gemini_shares_budget_across_calls() {
+        let server = fixture::server(vec![
+            fixture::Reply::json(200, fixture::GEMINI_OK),
+            fixture::Reply::json(200, fixture::GEMINI_OK),
+        ])
+        .await;
+        let provider = GeminiModelProvider::builder("fixture")
+            .api_key(Some("fixture-key"))
+            .build();
+        fixture::assert_two_requests(&provider, &server).await;
+    }
+
+    #[tokio::test]
+    async fn oauth_generation_config_replays_share_two_slots() {
+        let rejected = r#"{"error":{"message":"Unknown name 'generationConfig'"}}"#;
+        let server = fixture::server(vec![
+            fixture::Reply::json(400, rejected),
+            fixture::Reply::json(400, rejected),
+            fixture::Reply::json(200, fixture::GEMINI_OK),
+        ])
+        .await;
+        let mut provider = GeminiModelProvider::builder("fixture")
+            .api_key(Some("fixture-key"))
+            .build();
+        provider.auth = Some(GeminiAuth::OAuthToken(Arc::new(tokio::sync::Mutex::new(
+            OAuthTokenState {
+                access_token: "fixture-token".into(),
+                refresh_token: None,
+                client_id: None,
+                client_secret: None,
+                expiry_millis: Some(i64::MAX),
+            },
+        ))));
+        *provider.oauth_project.lock().await = Some("fixture-project".into());
+        let budget = crate::traits::GenerationAttemptBudget::new(2);
+        let error = fixture::at_endpoint(&server.url, fixture::call(&provider, &budget, None))
+            .await
+            .unwrap_err();
+        assert!(
+            error.is::<crate::traits::GenerationAttemptBudgetExhausted>(),
+            "{error:#}"
+        );
+        assert!(format!("{error:#}").contains("generationConfig"));
+        let requests = server.requests.lock();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].1["request"].get("generationConfig").is_some());
+        assert!(requests[1].1["request"].get("generationConfig").is_none());
     }
 }

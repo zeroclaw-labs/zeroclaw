@@ -323,16 +323,21 @@ impl AzureOpenAiModelProvider {
         &self,
         credential: &str,
         request: &mut NativeChatRequest,
+        budget: Option<&zeroclaw_api::model_provider::GenerationAttemptBudget>,
     ) -> anyhow::Result<reqwest::Response> {
         let tools_count = request.tools.as_ref().map_or(0, Vec::len);
+        let mut previous_error = None;
         loop {
-            let response = self
-                .http_client()
+            let client = match budget {
+                Some(_) => crate::bounded::timeout_client("model_provider.azure_openai", 120)?,
+                None => self.http_client(),
+            };
+            let request_builder = client
                 .post(self.chat_completions_url())
                 .header("api-key", credential)
-                .json(request)
-                .send()
-                .await?;
+                .json(request);
+            let response =
+                crate::bounded::send(request_builder, budget, previous_error.take()).await?;
             if response.status().is_success() {
                 return Ok(response);
             }
@@ -353,6 +358,7 @@ impl AzureOpenAiModelProvider {
                 && request.reasoning_effort.as_deref() != Some("none")
                 && super::rejects_tools_with_reasoning_effort(status, &body)
             {
+                previous_error = Some(super::api_error_from_parts("Azure OpenAI", status, &body));
                 request.reasoning_effort = Some("none".to_string());
                 ::zeroclaw_log::record!(
                     WARN,
@@ -496,6 +502,76 @@ impl AzureOpenAiModelProvider {
     }
 }
 
+impl AzureOpenAiModelProvider {
+    async fn chat_inner(
+        &self,
+        request: ProviderChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        budget: Option<&zeroclaw_api::model_provider::GenerationAttemptBudget>,
+    ) -> anyhow::Result<ProviderChatResponse> {
+        if let Some(budget) = budget {
+            budget.ensure_available()?;
+        }
+        let credential = self.credential.as_ref().ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"missing": "credentials"})),
+                "azure_openai: API key not configured"
+            );
+            anyhow::Error::msg(
+                "Azure OpenAI API key not set. Set AZURE_OPENAI_API_KEY or edit config.toml.",
+            )
+        })?;
+
+        let tools = Self::convert_tools(request.tools);
+        let mut native_request = NativeChatRequest {
+            messages: Self::convert_messages(request.messages),
+            temperature,
+            // Omit tool_choice when the tool list is empty — Azure (and
+            // spec-compliant validators) reject tool_choice without a
+            // non-empty tools field (HTTP 400).
+            tool_choice: tools
+                .as_ref()
+                .and_then(|t| (!t.is_empty()).then(|| "auto".to_string())),
+            tools,
+            reasoning_effort: self.reasoning_effort_for_model(model),
+            max_completion_tokens: None,
+        };
+
+        let response = self
+            .send_native_chat_request(credential, &mut native_request, budget)
+            .await?;
+
+        let native_response: NativeChatResponse = response.json().await?;
+        let usage = native_response.usage.map(|u| TokenUsage {
+            input_tokens: u.prompt_tokens,
+            output_tokens: u.completion_tokens,
+            cached_input_tokens: None,
+            cache_creation_input_tokens: None,
+        });
+        let message = native_response
+            .choices
+            .into_iter()
+            .next()
+            .map(|c| c.message)
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                    "azure_openai: empty choices in response"
+                );
+                anyhow::Error::msg("No response from Azure OpenAI")
+            })?;
+        let mut result = Self::parse_native_response(message);
+        result.usage = usage;
+        Ok(result)
+    }
+}
+
 #[async_trait]
 impl ModelProvider for AzureOpenAiModelProvider {
     fn capabilities(&self) -> ProviderCapabilities {
@@ -611,62 +687,19 @@ impl ModelProvider for AzureOpenAiModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<ProviderChatResponse> {
-        let credential = self.credential.as_ref().ok_or_else(|| {
-            ::zeroclaw_log::record!(
-                ERROR,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({"missing": "credentials"})),
-                "azure_openai: API key not configured"
-            );
-            anyhow::Error::msg(
-                "Azure OpenAI API key not set. Set AZURE_OPENAI_API_KEY or edit config.toml.",
-            )
-        })?;
+        self.chat_inner(request, model, temperature, None).await
+    }
 
-        let tools = Self::convert_tools(request.tools);
-        let mut native_request = NativeChatRequest {
-            messages: Self::convert_messages(request.messages),
-            temperature,
-            // Omit tool_choice when the tool list is empty — Azure (and
-            // spec-compliant validators) reject tool_choice without a
-            // non-empty tools field (HTTP 400).
-            tool_choice: tools
-                .as_ref()
-                .and_then(|t| (!t.is_empty()).then(|| "auto".to_string())),
-            tools,
-            reasoning_effort: self.reasoning_effort_for_model(model),
-            max_completion_tokens: None,
-        };
-
-        let response = self
-            .send_native_chat_request(credential, &mut native_request)
-            .await?;
-
-        let native_response: NativeChatResponse = response.json().await?;
-        let usage = native_response.usage.map(|u| TokenUsage {
-            input_tokens: u.prompt_tokens,
-            output_tokens: u.completion_tokens,
-            cached_input_tokens: None,
-            cache_creation_input_tokens: None,
-        });
-        let message = native_response
-            .choices
-            .into_iter()
-            .next()
-            .map(|c| c.message)
-            .ok_or_else(|| {
-                ::zeroclaw_log::record!(
-                    ERROR,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
-                    "azure_openai: empty choices in response"
-                );
-                anyhow::Error::msg("No response from Azure OpenAI")
-            })?;
-        let mut result = Self::parse_native_response(message);
-        result.usage = usage;
-        Ok(result)
+    async fn chat_with_attempt_budget(
+        &self,
+        request: crate::traits::ChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        _policy: zeroclaw_api::model_provider::ToolRoundPolicy,
+        budget: &zeroclaw_api::model_provider::GenerationAttemptBudget,
+    ) -> anyhow::Result<crate::traits::ChatResponse> {
+        self.chat_inner(request, model, temperature, Some(budget))
+            .await
     }
 
     async fn chat_with_tools(
@@ -714,7 +747,7 @@ impl ModelProvider for AzureOpenAiModelProvider {
         };
 
         let response = self
-            .send_native_chat_request(credential, &mut native_request)
+            .send_native_chat_request(credential, &mut native_request, None)
             .await?;
 
         let native_response: NativeChatResponse = response.json().await?;
@@ -1537,5 +1570,56 @@ mod tests {
         let native = AzureOpenAiModelProvider::convert_messages(&messages);
         let tool_calls = native[0].tool_calls.as_ref().unwrap();
         assert_eq!(tool_calls[0].function.arguments, r#"{"command":"pwd"}"#);
+    }
+}
+
+#[cfg(test)]
+mod attempt_budget_tests {
+    use super::*;
+    use crate::bounded::tests as fixture;
+
+    #[tokio::test]
+    async fn azure_shares_budget_across_calls() {
+        let server = fixture::server(vec![
+            fixture::Reply::json(200, fixture::CHAT_OK),
+            fixture::Reply::json(200, fixture::CHAT_OK),
+        ])
+        .await;
+        let provider = AzureOpenAiModelProvider::builder("fixture")
+            .resource_name("fixture")
+            .deployment_name("fixture")
+            .credential(Some("fixture-key"))
+            .build();
+        fixture::assert_two_requests(&provider, &server).await;
+    }
+
+    #[tokio::test]
+    async fn denied_internal_retry_preserves_the_provider_cause() {
+        let server = fixture::server(vec![fixture::Reply::json(
+            400,
+            r#"{"error":{"message":"Function tools with reasoning effort are not supported"}}"#,
+        )])
+        .await;
+        let provider = AzureOpenAiModelProvider::builder("fixture")
+            .resource_name("fixture")
+            .deployment_name("fixture")
+            .credential(Some("fixture-key"))
+            .build();
+        let budget = crate::traits::GenerationAttemptBudget::new(1);
+        let tools = [zeroclaw_api::tool::ToolSpec::new(
+            "fixture",
+            "fixture",
+            serde_json::json!({"type":"object"}),
+        )];
+        let error =
+            fixture::at_endpoint(&server.url, fixture::call(&provider, &budget, Some(&tools)))
+                .await
+                .unwrap_err();
+        assert!(
+            error.is::<crate::traits::GenerationAttemptBudgetExhausted>(),
+            "{error:#}"
+        );
+        assert!(format!("{error:#}").contains("reasoning effort"));
+        assert_eq!(server.requests.lock().len(), 1);
     }
 }

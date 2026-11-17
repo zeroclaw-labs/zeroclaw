@@ -1318,6 +1318,21 @@ impl OpenAiCodexModelProvider {
         })
     }
 
+    fn http_client_for_budget(
+        &self,
+        budget: Option<&zeroclaw_api::model_provider::GenerationAttemptBudget>,
+    ) -> anyhow::Result<Client> {
+        match budget {
+            Some(_) => crate::bounded::client(
+                Client::builder()
+                    .read_timeout(std::time::Duration::from_secs(300))
+                    .connect_timeout(std::time::Duration::from_secs(10)),
+                Some("model_provider.openai"),
+            ),
+            None => Ok(self.http_client()),
+        }
+    }
+
     fn responses_request_builder(
         &self,
         bearer_token: &str,
@@ -1326,8 +1341,26 @@ impl OpenAiCodexModelProvider {
         use_gateway_api_key_auth: bool,
         request: &ResponsesRequest,
     ) -> reqwest::RequestBuilder {
-        let mut request_builder = self
-            .http_client()
+        self.responses_request_builder_with_client(
+            bearer_token,
+            account_id,
+            access_token,
+            use_gateway_api_key_auth,
+            request,
+            self.http_client(),
+        )
+    }
+
+    fn responses_request_builder_with_client(
+        &self,
+        bearer_token: &str,
+        account_id: Option<&str>,
+        access_token: Option<&str>,
+        use_gateway_api_key_auth: bool,
+        request: &ResponsesRequest,
+        client: Client,
+    ) -> reqwest::RequestBuilder {
+        let mut request_builder = client
             .post(&self.responses_url)
             .header("Authorization", format!("Bearer {bearer_token}"))
             .header("OpenAI-Beta", "responses=experimental")
@@ -1360,6 +1393,7 @@ impl OpenAiCodexModelProvider {
         instructions: String,
         tools: Option<Vec<ResponsesToolSpec>>,
         model: &str,
+        budget: Option<&zeroclaw_api::model_provider::GenerationAttemptBudget>,
     ) -> anyhow::Result<ResponsesTurnResult> {
         let creds = self.resolve_credentials().await?;
         let normalized_model = normalize_model_id(model);
@@ -1405,15 +1439,16 @@ impl OpenAiCodexModelProvider {
             );
         }
 
-        let request_builder = self.responses_request_builder(
+        let request_builder = self.responses_request_builder_with_client(
             &creds.bearer_token,
             creds.account_id.as_deref(),
             creds.access_token.as_deref(),
             creds.use_gateway_api_key_auth,
             &request,
+            self.http_client_for_budget(budget)?,
         );
 
-        let response = request_builder.json(&request).send().await?;
+        let response = crate::bounded::send(request_builder.json(&request), budget, None).await?;
 
         if !response.status().is_success() {
             return Err(super::api_error("OpenAI Codex", response).await);
@@ -1437,18 +1472,20 @@ impl OpenAiCodexModelProvider {
                     "OpenAI Codex streaming response decode failed, retrying without streaming"
                 );
 
+                let stream_detail = stream_err.to_string();
                 request.stream = false;
-                let non_streaming_response = self
-                    .responses_request_builder(
+                let retry_request = self
+                    .responses_request_builder_with_client(
                         &creds.bearer_token,
                         creds.account_id.as_deref(),
                         creds.access_token.as_deref(),
                         creds.use_gateway_api_key_auth,
                         &request,
+                        self.http_client_for_budget(budget)?,
                     )
-                    .json(&request)
-                    .send()
-                    .await?;
+                    .json(&request);
+                let non_streaming_response =
+                    crate::bounded::send(retry_request, budget, Some(stream_err)).await?;
 
                 if !non_streaming_response.status().is_success() {
                     return Err(super::api_error("OpenAI Codex", non_streaming_response).await);
@@ -1462,17 +1499,51 @@ impl OpenAiCodexModelProvider {
                             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
                                 .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                                 .with_attrs(::serde_json::json!({
-                                    "stream_err": format!("{}", stream_err),
+                                    "stream_err": stream_detail,
                                     "fallback_err": format!("{}", fallback_err),
                                 })),
                             "openai_codex: stream + non-stream fallback both failed"
                         );
                         anyhow::Error::msg(format!(
-                            "OpenAI Codex streaming response decode failed ({stream_err}); non-streaming retry failed ({fallback_err})"
+                            "OpenAI Codex streaming response decode failed ({stream_detail}); non-streaming retry failed ({fallback_err})"
                         ))
                     })
             }
         }
+    }
+}
+
+impl OpenAiCodexModelProvider {
+    async fn chat_inner(
+        &self,
+        request: ProviderChatRequest<'_>,
+        model: &str,
+        _temperature: Option<f64>,
+        budget: Option<&zeroclaw_api::model_provider::GenerationAttemptBudget>,
+    ) -> anyhow::Result<ProviderChatResponse> {
+        if let Some(budget) = budget {
+            budget.ensure_available()?;
+        }
+        let prepared =
+            crate::multimodal::prepare_messages_for_provider(request.messages, &self.multimodal)
+                .await?;
+        let (instructions, input) = build_responses_input(&prepared.messages);
+        let response = self
+            .send_responses_request(
+                input,
+                instructions,
+                convert_tools(request.tools),
+                model,
+                budget,
+            )
+            .await?;
+
+        Ok(ProviderChatResponse {
+            text: response.text,
+            tool_calls: response.tool_calls,
+            usage: response.usage,
+            reasoning_content: response.reasoning_content,
+        })
     }
 }
 
@@ -1516,7 +1587,7 @@ impl ModelProvider for OpenAiCodexModelProvider {
             crate::multimodal::prepare_messages_for_provider(&messages, &self.multimodal).await?;
 
         let (instructions, input) = build_responses_input(&prepared.messages);
-        self.send_responses_request(input, instructions, None, model)
+        self.send_responses_request(input, instructions, None, model, None)
             .await
             .map(|response| response.text.unwrap_or_default())
     }
@@ -1533,7 +1604,7 @@ impl ModelProvider for OpenAiCodexModelProvider {
             crate::multimodal::prepare_messages_for_provider(messages, &self.multimodal).await?;
 
         let (instructions, input) = build_responses_input(&prepared.messages);
-        self.send_responses_request(input, instructions, None, model)
+        self.send_responses_request(input, instructions, None, model, None)
             .await
             .map(|response| response.text.unwrap_or_default())
     }
@@ -1544,20 +1615,19 @@ impl ModelProvider for OpenAiCodexModelProvider {
         model: &str,
         _temperature: Option<f64>,
     ) -> anyhow::Result<ProviderChatResponse> {
-        let prepared =
-            crate::multimodal::prepare_messages_for_provider(request.messages, &self.multimodal)
-                .await?;
-        let (instructions, input) = build_responses_input(&prepared.messages);
-        let response = self
-            .send_responses_request(input, instructions, convert_tools(request.tools), model)
-            .await?;
+        self.chat_inner(request, model, _temperature, None).await
+    }
 
-        Ok(ProviderChatResponse {
-            text: response.text,
-            tool_calls: response.tool_calls,
-            usage: response.usage,
-            reasoning_content: response.reasoning_content,
-        })
+    async fn chat_with_attempt_budget(
+        &self,
+        request: crate::traits::ChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        _policy: zeroclaw_api::model_provider::ToolRoundPolicy,
+        budget: &zeroclaw_api::model_provider::GenerationAttemptBudget,
+    ) -> anyhow::Result<crate::traits::ChatResponse> {
+        self.chat_inner(request, model, temperature, Some(budget))
+            .await
     }
 
     fn supports_streaming(&self) -> bool {
@@ -2884,5 +2954,83 @@ data: [DONE]
 
         let item = build_function_call_item(call);
         assert_eq!(item["arguments"], r#"{"command":"pwd"}"#);
+    }
+}
+
+#[cfg(test)]
+mod attempt_budget_tests {
+    use super::*;
+    use crate::bounded::tests as fixture;
+
+    #[tokio::test]
+    async fn codex_shares_budget_across_calls() {
+        let server = fixture::server(vec![
+            fixture::Reply::json(200, fixture::RESPONSES_OK),
+            fixture::Reply::json(200, fixture::RESPONSES_OK),
+        ])
+        .await;
+        let state = tempfile::tempdir().unwrap();
+        let options = ModelProviderRuntimeOptions {
+            provider_api_url: Some(server.url.clone()),
+            zeroclaw_dir: Some(state.path().to_owned()),
+            ..Default::default()
+        };
+        let provider =
+            OpenAiCodexModelProvider::new("fixture", &options, Some("fixture-key")).unwrap();
+        fixture::assert_two_requests(&provider, &server).await;
+    }
+
+    #[tokio::test]
+    async fn denied_stream_decode_recovery_preserves_the_cause() {
+        let server = fixture::server(vec![
+            fixture::Reply::stream("data: not-json\n\n"),
+            fixture::Reply::json(200, fixture::RESPONSES_OK),
+        ])
+        .await;
+        let state = tempfile::tempdir().unwrap();
+        let options = ModelProviderRuntimeOptions {
+            provider_api_url: Some(server.url.clone()),
+            zeroclaw_dir: Some(state.path().to_owned()),
+            ..Default::default()
+        };
+        let provider =
+            OpenAiCodexModelProvider::new("fixture", &options, Some("fixture-key")).unwrap();
+        let budget = crate::traits::GenerationAttemptBudget::new(1);
+        let error = fixture::at_endpoint(&server.url, fixture::call(&provider, &budget, None))
+            .await
+            .unwrap_err();
+        assert!(
+            error.is::<crate::traits::GenerationAttemptBudgetExhausted>(),
+            "{error:#}"
+        );
+        assert_ne!(
+            error.root_cause().to_string(),
+            crate::traits::GenerationAttemptBudgetExhausted::default().to_string()
+        );
+        assert_eq!(server.requests.lock().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn stream_decode_recovery_spends_the_second_slot() {
+        let server = fixture::server(vec![
+            fixture::Reply::stream("data: not-json\n\n"),
+            fixture::Reply::json(200, fixture::RESPONSES_OK),
+        ])
+        .await;
+        let state = tempfile::tempdir().unwrap();
+        let options = ModelProviderRuntimeOptions {
+            provider_api_url: Some(server.url.clone()),
+            zeroclaw_dir: Some(state.path().to_owned()),
+            ..Default::default()
+        };
+        let provider =
+            OpenAiCodexModelProvider::new("fixture", &options, Some("fixture-key")).unwrap();
+        let budget = crate::traits::GenerationAttemptBudget::new(2);
+        let response = fixture::at_endpoint(&server.url, fixture::call(&provider, &budget, None))
+            .await
+            .unwrap();
+        assert_eq!(response.text.as_deref(), Some("ok"));
+        assert_eq!(budget.remaining(), 0);
+        assert_eq!(server.requests.lock().len(), 2);
     }
 }
