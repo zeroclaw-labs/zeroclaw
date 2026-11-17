@@ -1193,11 +1193,6 @@ impl SessionBackend for SqliteSessionBackend {
         )
         .map_err(std::io::Error::other)?;
 
-        // NOTE: FTS index becomes stale here (no UPDATE trigger, only
-        // INSERT/DELETE triggers). This is acceptable — update_last is
-        // used for transient streaming snapshots. The final content will
-        // be correct in the sessions table for load().
-
         let now = chrono::Utc::now().to_rfc3339();
         conn.execute(
             "UPDATE session_metadata SET last_activity = ?1 WHERE session_key = ?2",
@@ -2126,6 +2121,19 @@ mod tests {
             keys.sort();
             keys
         };
+        // MATCH counts index rowids without loading the external content row.
+        // A stale entry can otherwise disappear from search when that row is gone.
+        let indexed = |backend: &SqliteSessionBackend, keyword: &str| -> i64 {
+            backend
+                .conn
+                .lock()
+                .query_row(
+                    "SELECT count(*) FROM sessions_fts WHERE sessions_fts MATCH ?1",
+                    [format!("\"{keyword}\"")],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
         backend
             .append("chat", &ChatMessage::user("originaltoken 中文🦀"))
             .unwrap();
@@ -2133,6 +2141,7 @@ mod tests {
             .append("control", &ChatMessage::user("originaltoken control"))
             .unwrap();
         assert_eq!(hits(&backend, "originaltoken"), ["chat", "control"]);
+        assert_eq!(indexed(&backend, "originaltoken"), 2);
 
         assert!(
             backend
@@ -2141,22 +2150,38 @@ mod tests {
         );
         assert_eq!(hits(&backend, "originaltoken"), ["control"]);
         assert_eq!(hits(&backend, "replacementtoken"), ["chat"]);
+        assert_eq!(indexed(&backend, "originaltoken"), 1);
+        assert_eq!(indexed(&backend, "replacementtoken"), 1);
         drop(backend);
 
         let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
         assert_eq!(hits(&backend, "originaltoken"), ["control"]);
         assert_eq!(hits(&backend, "replacementtoken"), ["chat"]);
+        assert_eq!(indexed(&backend, "replacementtoken"), 1);
         assert!(backend.remove_last("chat").unwrap());
         assert!(hits(&backend, "replacementtoken").is_empty());
+        assert_eq!(
+            indexed(&backend, "replacementtoken"),
+            0,
+            "remove_last must remove the indexed rowid"
+        );
         assert_eq!(hits(&backend, "originaltoken"), ["control"]);
+        assert_eq!(indexed(&backend, "originaltoken"), 1);
 
         backend
             .append("chat", &ChatMessage::user("cleartoken 中文"))
             .unwrap();
         assert_eq!(hits(&backend, "cleartoken"), ["chat"]);
+        assert_eq!(indexed(&backend, "cleartoken"), 1);
         assert_eq!(backend.clear_messages("chat").unwrap(), 1);
         assert!(hits(&backend, "cleartoken").is_empty());
+        assert_eq!(
+            indexed(&backend, "cleartoken"),
+            0,
+            "clear_messages must remove the indexed rowid"
+        );
         assert_eq!(hits(&backend, "originaltoken"), ["control"]);
+        assert_eq!(indexed(&backend, "originaltoken"), 1);
     }
 
     #[test]
