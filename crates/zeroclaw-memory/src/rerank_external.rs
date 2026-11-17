@@ -22,7 +22,7 @@ use crate::traits::MemoryEntry;
 use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
-use zeroclaw_infra::net_guard::{PrivateNetworkAccess, ResolvedDestination};
+use zeroclaw_infra::net_guard::{PrivateNetworkAccess, ResolvedDestination, normalize_host};
 
 /// Longest text sent for the query or for one candidate, in characters.
 pub const MAX_RERANK_TEXT_CHARS: usize = 1_500;
@@ -198,8 +198,9 @@ impl ExternalRerankSettings {
         }
 
         let deadline = Instant::now() + self.timeout;
-        let url = reqwest::Url::parse(&self.rerank_url()).map_err(|_| RerankFailure::Refused)?;
-        let client = self.pinned_client(&url, deadline).await?;
+        let mut url =
+            reqwest::Url::parse(&self.rerank_url()).map_err(|_| RerankFailure::Refused)?;
+        let client = self.pinned_client(&mut url, deadline).await?;
         let mut response = client
             .post(url)
             .timeout(deadline.saturating_duration_since(Instant::now()))
@@ -232,26 +233,32 @@ impl ExternalRerankSettings {
     /// A client that can reach only the endpoint's checked addresses: the
     /// host is resolved once, the answer goes through the network guard, and
     /// the client dials exactly those addresses, with no proxy (which would
-    /// resolve the host again) and no redirects.
+    /// resolve the host again) and no redirects. `url` is rewritten to the
+    /// host spelling the guard checked, so the pinned addresses apply to it.
     async fn pinned_client(
         &self,
-        url: &reqwest::Url,
+        url: &mut reqwest::Url,
         deadline: Instant,
     ) -> Result<reqwest::Client, RerankFailure> {
-        let host = url.host_str().ok_or(RerankFailure::Refused)?;
+        let host = url.host_str().ok_or(RerankFailure::Refused)?.to_string();
         let port = url.port_or_known_default().ok_or(RerankFailure::Refused)?;
         let bare_host = host.trim_start_matches('[').trim_end_matches(']');
         let literal = bare_host.parse::<IpAddr>().ok();
         let addresses: Vec<SocketAddr> = match literal {
             Some(ip) => vec![SocketAddr::new(ip, port)],
-            None => tokio::time::timeout(
-                deadline.saturating_duration_since(Instant::now()),
-                tokio::net::lookup_host((bare_host, port)),
-            )
-            .await
-            .map_err(|_| RerankFailure::Timeout)?
-            .map_err(|_| RerankFailure::Transport)?
-            .collect(),
+            None => {
+                // Resolve the spelling the guard checks below, so the lookup,
+                // the check and the request all name one host.
+                let checked = normalize_host(bare_host).map_err(|_| RerankFailure::Refused)?;
+                tokio::time::timeout(
+                    deadline.saturating_duration_since(Instant::now()),
+                    tokio::net::lookup_host((checked.as_str(), port)),
+                )
+                .await
+                .map_err(|_| RerankFailure::Timeout)?
+                .map_err(|_| RerankFailure::Transport)?
+                .collect()
+            }
         };
         let access = if self.allow_private_endpoint {
             PrivateNetworkAccess::Allow
@@ -260,12 +267,20 @@ impl ExternalRerankSettings {
         };
         // No network-specific NAT64 prefixes are passed: the well-known
         // `64:ff9b::/96` form is still decoded.
-        let destination = ResolvedDestination::new(host, port, addresses, access, &[])
+        let destination = ResolvedDestination::new(&host, port, addresses, access, &[])
             .map_err(|_| RerankFailure::Refused)?;
         let mut builder = reqwest::Client::builder()
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none());
         if literal.is_none() {
+            // The guard's spelling drops a trailing dot. A request that kept
+            // `rank.example.` would miss the `rank.example` override below and
+            // be resolved again, unchecked.
+            url.set_host(Some(destination.host()))
+                .map_err(|_| RerankFailure::Refused)?;
+            if url.host_str() != Some(destination.host()) {
+                return Err(RerankFailure::Refused);
+            }
             builder = builder.resolve_to_addrs(destination.host(), destination.addresses());
         }
         builder.build().map_err(|_| RerankFailure::Transport)
@@ -373,6 +388,44 @@ mod tests {
                 .rerank("query", &["one", "two"])
                 .await,
             Err(RerankFailure::Transport)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_trailing_dot_host_is_sent_as_the_checked_spelling() {
+        // The guard drops the dot; the request must name the same host, or
+        // the pinned addresses would not apply and the host would be
+        // resolved again unchecked.
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 8192];
+            let read = stream.read(&mut request).unwrap_or(0);
+            let head = String::from_utf8_lossy(&request[..read]).to_ascii_lowercase();
+            let host = head
+                .lines()
+                .find_map(|line| line.strip_prefix("host:"))
+                .map(|value| value.trim().to_string());
+            let body = br#"{"results":[{"index":1,"relevance_score":0.9},{"index":0,"relevance_score":0.1}]}"#;
+            let _ = stream.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
+                    body.len()
+                )
+                .as_bytes(),
+            );
+            let _ = stream.write_all(body);
+            host
+        });
+        let result = settings(&format!("http://localhost.:{port}"))
+            .rerank("query", &["one", "two"])
+            .await;
+        assert_eq!(result, Ok(vec![1, 0]));
+        assert_eq!(
+            server.join().unwrap().as_deref(),
+            Some(format!("localhost:{port}").as_str())
         );
     }
 
