@@ -12086,7 +12086,7 @@ Add pricing to the active provider profile or supply a catalog entry."
                 ta(
                     "cli-status-estop",
                     &[("v", &config.security.estop.enabled.to_string())],
-                    "E-stop enabled (not enforced)"
+                    "E-stop enabled: (not enforced)"
                 )
             );
             println!();
