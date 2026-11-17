@@ -3,6 +3,8 @@ import importlib.machinery
 import importlib.util
 import pathlib
 import io
+import os
+import signal
 import threading
 import time
 import tempfile
@@ -23,6 +25,7 @@ class FakeMaster:
     def __init__(self, command, **kwargs):
         self.command, self.returncode = command, (255 if self.fail else None)
         self.stderr = io.BytesIO()
+        self.pid = len(self.starts) + 1
         self.starts.append(self)
         if not self.fail:
             pathlib.Path(command[command.index('-S') + 1]).touch()
@@ -42,6 +45,13 @@ class TaskTransportTests(unittest.TestCase):
         FakeMaster.fail = False
         self.mock = patch.object(module.subprocess, 'Popen', FakeMaster)
         self.mock.start()
+        def signal_group(pid, sig):
+            master = FakeMaster.starts[pid - 1]
+            if master.poll() is None:
+                (master.terminate if sig == signal.SIGTERM else master.kill)()
+        group_patch = patch.object(module.os, 'killpg', side_effect=signal_group)
+        group_patch.start()
+        self.addCleanup(group_patch.stop)
 
     def tearDown(self):
         self.pool.close()
@@ -277,3 +287,57 @@ class TaskTransportTests(unittest.TestCase):
 
 
 if __name__ == '__main__': unittest.main()
+
+
+@unittest.skipUnless(pathlib.Path('/usr/bin/ssh').is_file() and pathlib.Path('/usr/bin/setpriv').is_file(),
+                     'requires Linux OpenSSH and setpriv')
+class ProxyLifecycleTests(unittest.TestCase):
+    def test_closing_task_stops_real_proxy_that_ignores_term(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            pid_file = root / 'proxy.pid'
+            config = root / 'ssh_config'
+            config.write_text(f'Host fixture\n  ProxyCommand {root}/proxy\n')
+            for name, body in [
+                ('ssh', f'exec /usr/bin/ssh -F {config} "$@"'),
+                ('proxy', f'trap "" TERM\necho $$ > {pid_file}\nexec /usr/bin/sleep 60'),
+            ]:
+                script = root / name
+                script.write_text('#!/bin/sh\n' + body + '\n')
+                script.chmod(0o700)
+            pool = module.Pool(root, ssh=str(root / 'ssh'))
+            pid = None
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                connection = executor.submit(pool.acquire, 'master', [], 'fixture')
+                try:
+                    deadline = time.monotonic() + 5
+                    while time.monotonic() < deadline:
+                        if pid_file.exists() and (value := pid_file.read_text().strip()):
+                            pid = int(value)
+                            break
+                        if connection.done():
+                            connection.result()
+                        time.sleep(0.02)
+                    self.assertIsNotNone(pid, 'OpenSSH did not start the proxy')
+                    pool.close()
+                    with self.assertRaises(RuntimeError):
+                        connection.result(timeout=5)
+                    status = pathlib.Path(f'/proc/{pid}/stat')
+                    deadline = time.monotonic() + 5
+                    while time.monotonic() < deadline:
+                        try:
+                            if status.read_text().rsplit(')', 1)[1].split()[0] == 'Z':
+                                break
+                        except FileNotFoundError:
+                            break
+                        time.sleep(0.02)
+                    else:
+                        self.fail('ProxyCommand remained running after task shutdown')
+                    self.assertFalse((root / 'master').exists())
+                finally:
+                    if pid is not None:
+                        try:
+                            os.kill(pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                    pool.close()
