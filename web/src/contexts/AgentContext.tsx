@@ -44,7 +44,10 @@ import { buildHistoryTrimmedNotice } from '@/contexts/historyTrimNotices.logic';
 import { uncommittedLocalTail } from '@/contexts/chatHydration.logic';
 import {
   EMPTY_CONTEXT_LIMITS,
+  EMPTY_CONTEXT_INPUT,
+  applyHistoryTrimToDisplayedBudget,
   contextLimitsFromDoneFrame,
+  contextInputFromDoneFrame,
 } from '@/contexts/contextLimits.logic';
 import {
   loadChatHistory,
@@ -153,6 +156,7 @@ export interface AgentContextValue {
   contextMaxTokens: number | null;
   contextModelWindow: number | null;
   contextInputTokens: number | null;
+  contextInputTokensSource: string | null;
 }
 
 const AgentContext = createContext<AgentContextValue | null>(null);
@@ -333,7 +337,8 @@ export function AgentProvider({
   const [pendingApproval, setPendingApproval] = useState<PendingApproval | null>(null);
   // Context window tracking (from "done" WS frames). See #7311.
   const [contextLimits, setContextLimits] = useState(EMPTY_CONTEXT_LIMITS);
-  const [contextInputTokens, setContextInputTokens] = useState<number | null>(null);
+  // Count and provenance move together, including batched socket frames.
+  const [contextInput, setContextInput] = useState(EMPTY_CONTEXT_INPUT);
 
   const wsRef = useRef<WebSocketClient | null>(null);
   // Canonical per-turn stream state. Every production transition that mutates
@@ -531,7 +536,7 @@ export function AgentProvider({
               notice: true,
             },
           ]);
-          setContextInputTokens(null);
+          setContextInput(EMPTY_CONTEXT_INPUT);
         }
         // A transcript that failed to load, typically because the
         // conversation didn't exist until this socket opened it, loads now.
@@ -607,18 +612,7 @@ export function AgentProvider({
         // Extract context window info from "done" frame (sent by gateway).
         if (msg.type === 'done') {
           setContextLimits(contextLimitsFromDoneFrame(msg));
-          // Prefer last_input_tokens (accurate per-turn prompt size) over
-          // accumulated input_tokens for context-bar rendering.
-          // When last_input_tokens is explicitly null, the accepted route has no
-          // usage data; clear the input state and do NOT fall back to the
-          // accumulated input_tokens (which would be stale from a previous route).
-          if (msg.last_input_tokens === null) {
-            setContextInputTokens(null);
-          } else if (typeof msg.last_input_tokens === 'number') {
-            setContextInputTokens(msg.last_input_tokens);
-          } else if (typeof msg.input_tokens === 'number') {
-            setContextInputTokens(msg.input_tokens);
-          }
+          setContextInput((current) => contextInputFromDoneFrame(current, msg));
         }
         setStreamingContent('');
         setStreamingThinking('');
@@ -728,6 +722,10 @@ export function AgentProvider({
 
       case 'history_trimmed': {
         const content = buildHistoryTrimmedNotice(msg, t);
+        // The trim lands after the usage sample the meter last rendered, and
+        // the next refresh is the terminal `done` frame. Adopt the post-trim
+        // count now so the bar does not keep the pre-trim snapshot.
+        setContextInput((current) => applyHistoryTrimToDisplayedBudget(current, msg));
         localMessageMutationVersionRef.current += 1;
         setMessages((prev) => [
           ...prev,
@@ -1307,7 +1305,7 @@ export function AgentProvider({
     // Context-window figures describe the transcript we just dropped; leaving
     // them would show the outgoing conversation's token usage against an empty
     // one until the next `done` frame refreshes them.
-    setContextInputTokens(null);
+    setContextInput(EMPTY_CONTEXT_INPUT);
   }, [foldTurnStream]);
 
   const clearAllMessages = useCallback(() => {
@@ -1579,7 +1577,8 @@ export function AgentProvider({
     // Context window tracking (from "done" WS frames). See #7311.
     contextMaxTokens: contextLimits.maxTokens,
     contextModelWindow: contextLimits.modelWindow,
-    contextInputTokens,
+    contextInputTokens: contextInput.inputTokens,
+    contextInputTokensSource: contextInput.source,
   };
 
   return <AgentContext.Provider value={value}>{children}</AgentContext.Provider>;
