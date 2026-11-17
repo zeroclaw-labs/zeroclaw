@@ -1547,7 +1547,7 @@ pub async fn mutate_http_credential(
             let kind =
                 record
                     .as_ref()
-                    .or_else(|| prior.as_ref())
+                    .or(prior.as_ref())
                     .map(|record| match &record.auth {
                         ScopedHttpAuth::ApiKey { .. } => "api_key",
                         ScopedHttpAuth::UserPassword { .. } => "user_password",
