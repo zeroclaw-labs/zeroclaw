@@ -51,6 +51,15 @@ a broker remain governed by the configured sandbox policy.
 
 ## Trust and credentials
 
+The Python helper uses the operator-configured SSH agent. Catalog aliases and
+the vault belong to the native broker. The Python helper needs only the
+standard library, OpenSSH and the existing process supervision tools.
+
+For localized helper diagnostics, install the optional compiled gettext
+catalog for the service locale. Set `LANG` and, when using a custom catalog
+directory, `ZEROCLAW_SSH_LOCALE_DIR`. OpenSSH and remote output follow their
+respective process locales.
+
 Use the existing SSH agent and configured public identity selection, including
 an operator's vault-backed agent if present. The adapter does not read a vault,
 copy a private key, change host-key trust, forward the agent or grant remote

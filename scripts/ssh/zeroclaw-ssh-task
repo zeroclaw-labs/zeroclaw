@@ -1,6 +1,7 @@
 #!/usr/bin/python3
 """Task-owned SSH multiplexing; credentials remain in the existing private agent."""
 import hashlib
+import gettext
 import concurrent.futures
 import json
 import os
@@ -19,6 +20,10 @@ ROOT = pathlib.Path(os.environ['ZEROCLAW_SSH_STATE_DIR']) if 'ZEROCLAW_SSH_STATE
 SSH = '/usr/bin/ssh'
 IDLE_SECONDS = 1800
 SAFE_OPTIONS = {'batchmode', 'connecttimeout', 'loglevel'}
+
+translate = gettext.translation(
+    'zeroclaw-ssh-task', localedir=os.environ.get('ZEROCLAW_SSH_LOCALE_DIR'), fallback=True,
+).gettext
 
 
 def parse_args(args):
@@ -226,7 +231,7 @@ def read_message(peer):
     while not data.endswith(b'\n'):
         part = peer.recv(4096)
         if not part:
-            raise EOFError('SSH client disconnected')
+            raise EOFError(translate('SSH client disconnected'))
         data.extend(part)
         if len(data) > 16384:
             raise ValueError('SSH request too large')
@@ -238,14 +243,14 @@ def serve(directory):
     ROOT.mkdir(mode=0o700, exist_ok=True)
     info = ROOT.lstat()
     if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
-        raise RuntimeError('SSH state directory must be private and owned by the service user')
+        raise RuntimeError(translate('SSH state directory must be private and owned by the service user'))
     directory.mkdir(mode=0o700)
     listener = socket.socket(socket.AF_UNIX)
     listener.bind(str(directory / 'broker'))
     listener.listen(32)
     idle = int(os.environ.get('ZEROCLAW_SSH_IDLE_TIMEOUT_SECS', str(IDLE_SECONDS)))
     if not 1 <= idle <= 86400:
-        raise ValueError('SSH idle timeout must be between 1 and 86400 seconds')
+        raise ValueError(translate('SSH idle timeout must be between 1 and 86400 seconds'))
     pool = Pool(directory, idle=idle)
     selector = selectors.DefaultSelector()
     selector.register(listener, selectors.EVENT_READ)

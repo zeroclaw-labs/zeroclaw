@@ -48,6 +48,16 @@ class TaskTransportTests(unittest.TestCase):
         self.mock.stop()
         self.temp.cleanup()
 
+    def test_agent_only_helper_rejects_a_catalog_alias(self):
+        with self.assertRaises(ValueError):
+            module.parse_args(['--credential', 'SYNTHETIC', 'example', 'true'])
+
+    def test_client_disconnect_uses_gettext(self):
+        with patch.object(module, 'translate', return_value='localized disconnect') as translate:
+            with self.assertRaisesRegex(EOFError, 'localized disconnect'):
+                module.read_message(type('DisconnectedPeer', (), {'recv': lambda self, size: b''})())
+            translate.assert_called_once_with('SSH client disconnected')
+
     def test_command_options_cannot_control_the_shared_transport(self):
         from unittest.mock import MagicMock
         for command in [['-O', 'exit'], ['-o', 'ControlMaster=yes']]:
