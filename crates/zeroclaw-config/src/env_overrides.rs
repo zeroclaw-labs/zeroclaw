@@ -154,6 +154,7 @@ pub fn apply_env_overrides(config: &mut Config) -> Result<AppliedOverrides> {
         .map(str::trim)
         .is_some_and(|value| !value.is_empty());
     if config.transcription.openai.is_some()
+        && !paths.contains(OPENAI_STT_API_KEY_PATH)
         && !has_openai_stt_key
         && let Some((env_name, value)) = ["TRANSCRIPTION_API_KEY", "OPENAI_API_KEY"]
             .into_iter()
@@ -919,5 +920,20 @@ mod tests {
             Some("zeroclaw-key"),
         );
         assert!(applied.paths.contains(OPENAI_STT_API_KEY_PATH));
+
+        env.set("ZEROCLAW_transcription__openai__api_key", "");
+        let mut explicitly_cleared = Config::default();
+        explicitly_cleared.transcription.openai = Some(crate::schema::OpenAiSttConfig::default());
+        let cleared = apply_env_overrides(&mut explicitly_cleared).expect("apply succeeds");
+        assert!(
+            explicitly_cleared
+                .transcription
+                .openai
+                .as_ref()
+                .and_then(|openai| openai.api_key.as_deref())
+                .is_none(),
+            "an explicit empty schema-mirror value must not be refilled by native aliases",
+        );
+        assert!(cleared.paths.contains(OPENAI_STT_API_KEY_PATH));
     }
 }
