@@ -11946,50 +11946,73 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                     &cost_tracking_fallback
                 )
             );
-            println!(
-                "{}",
-                ta(
+            // An unset limit is no limit: say so instead of printing a number.
+            let max_cost_day = match config.cost.daily_limit_usd {
+                Some(limit) => ta(
                     "cli-status-max-cost-day",
-                    &[("v", &format!("{:.2}", config.cost.daily_limit_usd))],
-                    "Max cost/day"
-                )
-            );
-            println!(
-                "{}",
-                ta(
+                    &[("v", &format!("{limit:.2}"))],
+                    "Max cost/day",
+                ),
+                None => t(
+                    "cli-status-max-cost-day-unlimited",
+                    "  Max cost/day:      no limit",
+                ),
+            };
+            println!("{max_cost_day}");
+            let max_cost_month = match config.cost.monthly_limit_usd {
+                Some(limit) => ta(
                     "cli-status-max-cost-month",
-                    &[("v", &format!("{:.2}", config.cost.monthly_limit_usd))],
-                    "Max cost/month"
-                )
-            );
+                    &[("v", &format!("{limit:.2}"))],
+                    "Max cost/month",
+                ),
+                None => t(
+                    "cli-status-max-cost-month-unlimited",
+                    "  Max cost/month:    no limit",
+                ),
+            };
+            println!("{max_cost_month}");
             if config.cost.enabled {
                 match cost::CostTracker::new(config.cost.clone(), &config.data_dir) {
                     Ok(tracker) => match tracker.get_summary() {
                         Ok(summary) => {
                             let spent_today = format!("{:.4}", summary.daily_cost_usd);
-                            let daily_limit = format!("{:.2}", config.cost.daily_limit_usd);
-                            let spent_today_fallback =
-                                format!("  Spent today:       ${spent_today} / ${daily_limit}");
-                            println!(
-                                "{}",
-                                ta(
-                                    "cli-status-spent-today",
-                                    &[("spent", &spent_today), ("limit", &daily_limit)],
-                                    &spent_today_fallback
-                                )
-                            );
+                            let spent_today_line = match config.cost.daily_limit_usd {
+                                Some(limit) => {
+                                    let daily_limit = format!("{limit:.2}");
+                                    ta(
+                                        "cli-status-spent-today",
+                                        &[("spent", &spent_today), ("limit", &daily_limit)],
+                                        format!(
+                                            "  Spent today:       ${spent_today} / ${daily_limit}"
+                                        ),
+                                    )
+                                }
+                                None => ta(
+                                    "cli-status-spent-today-unlimited",
+                                    &[("spent", &spent_today)],
+                                    format!("  Spent today:       ${spent_today} (no limit)"),
+                                ),
+                            };
+                            println!("{spent_today_line}");
                             let spent_month = format!("{:.4}", summary.monthly_cost_usd);
-                            let monthly_limit = format!("{:.2}", config.cost.monthly_limit_usd);
-                            let spent_month_fallback =
-                                format!("  Spent this month:  ${spent_month} / ${monthly_limit}");
-                            println!(
-                                "{}",
-                                ta(
-                                    "cli-status-spent-month",
-                                    &[("spent", &spent_month), ("limit", &monthly_limit)],
-                                    &spent_month_fallback
-                                )
-                            );
+                            let spent_month_line = match config.cost.monthly_limit_usd {
+                                Some(limit) => {
+                                    let monthly_limit = format!("{limit:.2}");
+                                    ta(
+                                        "cli-status-spent-month",
+                                        &[("spent", &spent_month), ("limit", &monthly_limit)],
+                                        format!(
+                                            "  Spent this month:  ${spent_month} / ${monthly_limit}"
+                                        ),
+                                    )
+                                }
+                                None => ta(
+                                    "cli-status-spent-month-unlimited",
+                                    &[("spent", &spent_month)],
+                                    format!("  Spent this month:  ${spent_month} (no limit)"),
+                                ),
+                            };
+                            println!("{spent_month_line}");
                             // Pricing provenance is recorded per usage row.
                             // The warning qualifies the monthly spend line,
                             // so it reads the current-UTC-month model rollup

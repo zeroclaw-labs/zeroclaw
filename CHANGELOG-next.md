@@ -162,6 +162,12 @@ Plus the dashboard through ZeroRelay, a CLI-only server build, and tighter isola
 
 ## Breaking Changes
 
+- **No dollar limit unless you set one** (closes #10635). An install that priced its models and never set `[cost] daily_limit_usd` or `monthly_limit_usd` was being stopped at $10 a day and $100 a month and no longer is; set the keys to keep a limit.
+  - A limit you set, `0.0` included, works exactly as before. An unset limit neither refuses nor warns.
+  - `max_cost_per_day_cents` now defaults to `0` on a runtime profile that leaves it out and on an agent with no runtime profile: runs delegated to that agent get no ceiling of their own, where they got 500 cents. It never limited the agent's own turns. The `balanced` preset still writes 500, and a value you wrote is unchanged.
+  - Earlier releases dropped a value equal to the old default from `config.toml` when they saved it, for example after `zeroclaw config set cost.daily_limit_usd 10`. Check the `[cost]` section after upgrading: a limit missing from the file no longer applies.
+  - `zeroclaw status` shows an unset limit as "no limit".
+  - ZeroCode's config editor can now clear an optional number: an empty value clears it back to its default, which for the two cost limits is no limit. It used to refuse the empty edit. The dashboard config form is unchanged: remove a limit there with the field's trash-can button (**Reset to default / unset**). Emptying a number box in the dashboard, or saving only a comment on an unset number there, still saves `0`, which for these limits refuses every call once any spend has been recorded.
 - **Configuration schema version 4** (#11218, closes #11579).
   - After upgrading, run `zeroclaw config migrate` once. Until then configs load, migrated in memory, but `config set`, `config init`, `config patch` and `models set` refuse.
   - `[security.nevis]`, the eight agent-inline tunables and `summary_model` are no longer config keys. Set tunables on the agent's `[runtime_profiles.<profile>]`, and use `[oidc.<alias>]` with `[users]` and `[permission_profiles]` in place of Nevis. Top-level `[twitter]` and `[reddit]` and `[channels.notion]` are dropped.

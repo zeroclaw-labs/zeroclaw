@@ -23369,8 +23369,8 @@ command = "rm independent-delegate-marker"
             CostConfig {
                 enabled: cost_tracking_enabled,
                 track_per_agent,
-                daily_limit_usd,
-                monthly_limit_usd: 10_000.0,
+                daily_limit_usd: Some(daily_limit_usd),
+                monthly_limit_usd: Some(10_000.0),
                 ..CostConfig::default()
             },
             RuntimeProfileConfig {
@@ -23889,18 +23889,18 @@ command = "rm independent-delegate-marker"
             .await
             .expect("delegate execute returns a result");
         assert!(
-            !result.success,
-            "the built-in 500-cent ceiling refuses the delegate: {result:?}"
-        );
-        let error = result.error.clone().unwrap_or_default();
-        assert!(
-            error.contains("Budget exceeded for agent `target`") && error.contains("$5.00"),
-            "the refusal names the built-in $5.00 ceiling: {error}"
+            result.success,
+            "no ceiling was written, so none refuses the delegate: {result:?}"
         );
         assert_eq!(
             requests.load(std::sync::atomic::Ordering::SeqCst),
-            0,
-            "the provider is not reached"
+            1,
+            "the delegated provider is reached"
+        );
+        let stats = poll_agent_cost(&fixture.data_dir, "target").await;
+        assert_eq!(
+            stats.request_count, 2,
+            "the delegate's own call lands on the ledger beside the seeded spend"
         );
     }
 
@@ -24012,8 +24012,8 @@ command = "rm independent-delegate-marker"
         root_config.cost = CostConfig {
             enabled: true,
             track_per_agent: true,
-            daily_limit_usd,
-            monthly_limit_usd: 10_000.0,
+            daily_limit_usd: Some(daily_limit_usd),
+            monthly_limit_usd: Some(10_000.0),
             ..CostConfig::default()
         };
         root_config.providers.models.ollama.insert(
@@ -24122,8 +24122,8 @@ command = "rm independent-delegate-marker"
         root_config.cost = CostConfig {
             enabled: true,
             track_per_agent: true,
-            daily_limit_usd,
-            monthly_limit_usd: 10_000.0,
+            daily_limit_usd: Some(daily_limit_usd),
+            monthly_limit_usd: Some(10_000.0),
             ..CostConfig::default()
         };
         root_config.providers.models.ollama.insert(
@@ -24565,8 +24565,8 @@ command = "rm independent-delegate-marker"
         root_config.cost = CostConfig {
             enabled: true,
             track_per_agent: true,
-            daily_limit_usd: 1000.0,
-            monthly_limit_usd: 10_000.0,
+            daily_limit_usd: Some(1000.0),
+            monthly_limit_usd: Some(10_000.0),
             ..CostConfig::default()
         };
         for (alias, uri) in [("default", hop_mock_uri), ("leaf", leaf_mock_uri)] {
@@ -25054,7 +25054,7 @@ command = "rm independent-delegate-marker"
 
         async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
             let mut reloaded = self.tracker.config();
-            reloaded.daily_limit_usd = self.lowered_daily_limit_usd;
+            reloaded.daily_limit_usd = Some(self.lowered_daily_limit_usd);
             self.tracker.update_config(reloaded);
             self.flipped
                 .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -25273,8 +25273,8 @@ command = "rm independent-delegate-marker"
                 CostConfig {
                     enabled: true,
                     track_per_agent: true,
-                    daily_limit_usd: 1000.0,
-                    monthly_limit_usd: 10_000.0,
+                    daily_limit_usd: Some(1000.0),
+                    monthly_limit_usd: Some(10_000.0),
                     ..CostConfig::default()
                 },
                 workspace.path(),
@@ -25378,8 +25378,8 @@ command = "rm independent-delegate-marker"
                 CostConfig {
                     enabled: true,
                     track_per_agent: true,
-                    daily_limit_usd: 1000.0,
-                    monthly_limit_usd: 10_000.0,
+                    daily_limit_usd: Some(1000.0),
+                    monthly_limit_usd: Some(10_000.0),
                     ..CostConfig::default()
                 },
                 workspace.path(),
@@ -25491,8 +25491,8 @@ command = "rm independent-delegate-marker"
                 CostConfig {
                     enabled: true,
                     track_per_agent: true,
-                    daily_limit_usd: 1000.0,
-                    monthly_limit_usd: 10_000.0,
+                    daily_limit_usd: Some(1000.0),
+                    monthly_limit_usd: Some(10_000.0),
                     ..CostConfig::default()
                 },
                 workspace.path(),

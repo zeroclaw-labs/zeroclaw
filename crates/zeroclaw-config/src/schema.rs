@@ -7465,17 +7465,29 @@ pub struct CostConfig {
     #[serde(default = "default_cost_enabled")]
     pub enabled: bool,
 
-    /// Daily spending limit in USD (default: 10.00)
+    /// Daily spending limit in USD for all agents together, counted per UTC
+    /// day. Unset (the default) means no daily limit. When set, each model
+    /// call is checked against the spend already recorded today: the call
+    /// that takes the total past the limit still runs, and later calls are
+    /// refused for the rest of the UTC day unless the limit is raised. `0`
+    /// refuses every call once any spend has been recorded. Only priced
+    /// usage counts toward it.
     #[tab(Limits)]
-    #[serde(default = "default_daily_limit")]
-    pub daily_limit_usd: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daily_limit_usd: Option<f64>,
 
-    /// Monthly spending limit in USD (default: 100.00)
+    /// Monthly spending limit in USD for all agents together, counted per
+    /// UTC month. Unset (the default) means no monthly limit. When set, it is
+    /// checked like the daily limit against the spend already recorded this
+    /// month: the call that crosses it still runs, later calls are refused,
+    /// and `0` refuses every call once any spend has been recorded. Only priced
+    /// usage counts toward it.
     #[tab(Limits)]
-    #[serde(default = "default_monthly_limit")]
-    pub monthly_limit_usd: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub monthly_limit_usd: Option<f64>,
 
-    /// Warn when spending reaches this percentage of limit (default: 80)
+    /// Warn when spending reaches this percentage of a daily or monthly
+    /// limit that is set (default: 80). An unset limit never warns.
     #[tab(Limits)]
     #[serde(default = "default_warn_percent")]
     pub warn_at_percent: u8,
@@ -7558,14 +7570,6 @@ impl Default for CostEnforcementConfig {
             reserve_percent: default_reserve_percent(),
         }
     }
-}
-
-fn default_daily_limit() -> f64 {
-    10.0
-}
-
-fn default_monthly_limit() -> f64 {
-    100.0
 }
 
 fn default_warn_percent() -> u8 {
@@ -7797,8 +7801,8 @@ impl Default for CostConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            daily_limit_usd: default_daily_limit(),
-            monthly_limit_usd: default_monthly_limit(),
+            daily_limit_usd: None,
+            monthly_limit_usd: None,
             warn_at_percent: default_warn_percent(),
             allow_override: false,
             enforcement: CostEnforcementConfig::default(),
@@ -15134,8 +15138,11 @@ pub struct RuntimeProfileConfig {
     /// `SecurityPolicy::ensure_no_escalation_beyond` rejects subagents
     /// that try to raise this above the parent's value.
     pub max_actions_per_hour: u32,
-    /// Maximum cost per day in cents. `0` inherits the global limit.
-    /// Parent-subset enforced for subagents.
+    /// Daily spending ceiling, in cents, for runs this agent is the target
+    /// of when another agent delegates to it. It is not a limit on this
+    /// agent's own turns. `0` (the default) sets no ceiling of its own; the
+    /// `[cost]` daily and monthly limits apply when set. A bounded delegation
+    /// carries the caller's ceiling down when the target has none.
     pub max_cost_per_day_cents: u32,
     /// Shell subprocess timeout in seconds. `0` inherits the global timeout.
     /// Parent-subset enforced for subagents.
@@ -15226,7 +15233,7 @@ impl Default for RuntimeProfileConfig {
             max_tool_iterations: 0,
             max_execution_tree_iterations: None,
             max_actions_per_hour: 20,
-            max_cost_per_day_cents: 500,
+            max_cost_per_day_cents: 0,
             shell_timeout_secs: 60,
             max_delegation_depth: 0,
             delegation_timeout_secs: None,
@@ -41997,6 +42004,139 @@ group_policy = "disabled"
 
         validate_config_with_cost_rates(rates)
             .expect("the canonical maximum cost rate must remain valid");
+    }
+
+    /// `[cost]` limits the operator wrote parse to `Some`, including `0.0`;
+    /// limits left out parse to `None`, which means no limit.
+    #[test]
+    async fn cost_limits_parse_to_some_when_written_and_none_when_absent() {
+        let current = crate::migration::CURRENT_SCHEMA_VERSION;
+        let written = crate::migration::migrate_to_current(&format!(
+            "schema_version = {current}\n\n[cost]\ndaily_limit_usd = 10.0\nmonthly_limit_usd = 0.0\n"
+        ))
+        .unwrap();
+        assert_eq!(written.cost.daily_limit_usd, Some(10.0));
+        assert_eq!(written.cost.monthly_limit_usd, Some(0.0));
+
+        let section_only = crate::migration::migrate_to_current(&format!(
+            "schema_version = {current}\n\n[cost]\nenabled = true\n"
+        ))
+        .unwrap();
+        assert_eq!(section_only.cost.daily_limit_usd, None);
+        assert_eq!(section_only.cost.monthly_limit_usd, None);
+
+        let no_section =
+            crate::migration::migrate_to_current(&format!("schema_version = {current}\n")).unwrap();
+        assert_eq!(no_section.cost.daily_limit_usd, None);
+        assert_eq!(no_section.cost.monthly_limit_usd, None);
+        assert_eq!(CostConfig::default().daily_limit_usd, None);
+        assert_eq!(CostConfig::default().monthly_limit_usd, None);
+    }
+
+    /// A full save writes a limit the operator set, even one equal to the
+    /// old built-in `10.0`, and never writes one that is unset.
+    #[test]
+    async fn cost_limits_round_trip_through_save_without_inventing_keys() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        let mut config = Config {
+            config_path: config_path.clone(),
+            ..Default::default()
+        };
+        config.cost.daily_limit_usd = Some(10.0);
+        config.save().await.unwrap();
+
+        let written = std::fs::read_to_string(&config_path).unwrap();
+        assert!(written.contains("daily_limit_usd = 10.0"), "{written}");
+        assert!(!written.contains("monthly_limit_usd"), "{written}");
+        let reloaded = crate::migration::migrate_to_current(&written).unwrap();
+        assert_eq!(reloaded.cost.daily_limit_usd, Some(10.0));
+        assert_eq!(reloaded.cost.monthly_limit_usd, None);
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        Config {
+            config_path: config_path.clone(),
+            ..Default::default()
+        }
+        .save()
+        .await
+        .unwrap();
+        let written = std::fs::read_to_string(&config_path).unwrap();
+        assert!(!written.contains("daily_limit_usd"), "{written}");
+        assert!(!written.contains("monthly_limit_usd"), "{written}");
+    }
+
+    /// `config set` writes a limit, an empty value unsets it, the incremental
+    /// save follows both, and `config get` shows an unset limit as unset.
+    #[test]
+    async fn cost_limits_set_and_unset_through_set_prop_and_save_dirty() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        let seed = format!(
+            "schema_version = {}\n\n[cost]\nmonthly_limit_usd = 100.0\n",
+            crate::migration::CURRENT_SCHEMA_VERSION
+        );
+        std::fs::write(&config_path, &seed).unwrap();
+        let mut config = crate::migration::migrate_to_current(&seed).unwrap();
+        config.config_path = config_path.clone();
+        assert_eq!(
+            config.get_prop("cost.daily_limit_usd").unwrap(),
+            crate::traits::UNSET_DISPLAY
+        );
+        assert_eq!(config.get_prop("cost.monthly_limit_usd").unwrap(), "100.0");
+
+        config
+            .set_prop_persistent("cost.daily_limit_usd", "10.0")
+            .unwrap();
+        config
+            .set_prop_persistent("cost.monthly_limit_usd", "")
+            .unwrap();
+        assert_eq!(config.cost.daily_limit_usd, Some(10.0));
+        assert_eq!(config.cost.monthly_limit_usd, None);
+        assert_eq!(config.get_prop("cost.daily_limit_usd").unwrap(), "10.0");
+        assert_eq!(
+            config.get_prop("cost.monthly_limit_usd").unwrap(),
+            crate::traits::UNSET_DISPLAY
+        );
+        config.save_dirty().await.unwrap();
+
+        let written = std::fs::read_to_string(&config_path).unwrap();
+        assert!(written.contains("daily_limit_usd = 10.0"), "{written}");
+        assert!(!written.contains("monthly_limit_usd"), "{written}");
+        let reloaded = crate::migration::migrate_to_current(&written).unwrap();
+        assert_eq!(reloaded.cost.daily_limit_usd, Some(10.0));
+        assert_eq!(reloaded.cost.monthly_limit_usd, None);
+    }
+
+    /// Clearing an optional field through `config set` (an empty value, which
+    /// is what a JSON `null` replace and ZeroCode's empty edit become)
+    /// removes its key and re-reads the section's serde defaults. For the
+    /// `[cost]` limits that default is no limit; a field whose default is a
+    /// number gets that number back.
+    #[test]
+    async fn clearing_an_optional_number_restores_its_default() {
+        let mut config = Config::default();
+        config
+            .set_prop_persistent("runtime.docker.memory_limit_mb", "2048")
+            .unwrap();
+        assert_eq!(config.runtime.docker.memory_limit_mb, Some(2048));
+        config
+            .set_prop_persistent("runtime.docker.memory_limit_mb", "")
+            .unwrap();
+        assert_eq!(
+            config.runtime.docker.memory_limit_mb,
+            Some(512),
+            "cleared back to its default, not to None"
+        );
+
+        config
+            .set_prop_persistent("cost.daily_limit_usd", "10.0")
+            .unwrap();
+        config
+            .set_prop_persistent("cost.daily_limit_usd", "")
+            .unwrap();
+        assert_eq!(config.cost.daily_limit_usd, None, "default: no limit");
     }
 
     /// `cost.rates.providers.models.<type>` is a

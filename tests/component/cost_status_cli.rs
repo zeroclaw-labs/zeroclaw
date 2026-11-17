@@ -1,21 +1,21 @@
 use chrono::{DateTime, Datelike, Duration, TimeZone, Utc};
 use serde_json::{Value, json};
-use std::path::Path;
 use std::process::{Command, Output};
 
-fn write_config(config_dir: &Path) {
-    std::fs::write(
-        config_dir.join("config.toml"),
-        r#"locale = "en"
+const EXPLICIT_LIMITS_CONFIG: &str = r#"locale = "en"
 
 [cost]
 enabled = true
 daily_limit_usd = 10.0
 monthly_limit_usd = 100.0
-"#,
-    )
-    .unwrap();
-}
+"#;
+
+/// `[cost]` with neither limit written: no daily or monthly limit.
+const NO_LIMITS_CONFIG: &str = r#"locale = "en"
+
+[cost]
+enabled = true
+"#;
 
 fn usage_record(
     model: &str,
@@ -73,8 +73,12 @@ fn usage_record_with_unpriced_tokens(
 }
 
 fn run_status(records: &[Value]) -> Output {
+    run_status_with(EXPLICIT_LIMITS_CONFIG, records)
+}
+
+fn run_status_with(config_toml: &str, records: &[Value]) -> Output {
     let config_dir = tempfile::tempdir().unwrap();
-    write_config(config_dir.path());
+    std::fs::write(config_dir.path().join("config.toml"), config_toml).unwrap();
     let state_dir = config_dir.path().join("data").join("state");
     std::fs::create_dir_all(&state_dir).unwrap();
     let mut ledger = records
@@ -200,4 +204,39 @@ fn earlier_month_unpriced_usage_still_warns_after_day_rollover() {
     assert!(stderr.contains("earlier-model"));
     assert!(!stderr.contains("stale-model"));
     assert!(!stderr.contains("450 tokens uncosted"));
+}
+
+#[test]
+fn status_prints_explicit_limits_as_dollars() {
+    let output = run_status(&[usage_record("priced-model", 100, 50, 0.1, Some(true))]);
+    let (stdout, _stderr) = output_text(&output);
+    assert!(stdout.contains("Max cost/day:      $10.00"), "{stdout}");
+    assert!(stdout.contains("Max cost/month:    $100.00"), "{stdout}");
+    assert!(
+        stdout.contains("Spent this month:  $0.1000 / $100.00"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn status_reads_no_limit_for_unset_limits() {
+    let output = run_status_with(
+        NO_LIMITS_CONFIG,
+        &[usage_record("priced-model", 100, 50, 0.1, Some(true))],
+    );
+    let (stdout, _stderr) = output_text(&output);
+    assert!(stdout.contains("Max cost/day:      no limit"), "{stdout}");
+    assert!(stdout.contains("Max cost/month:    no limit"), "{stdout}");
+    assert!(
+        stdout.contains("Spent today:       $0.1000 (no limit)"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("Spent this month:  $0.1000 (no limit)"),
+        "{stdout}"
+    );
+    assert!(
+        !stdout.contains("$0.00\n") && !stdout.contains("/ $"),
+        "an unset limit must not print as a dollar figure: {stdout}"
+    );
 }

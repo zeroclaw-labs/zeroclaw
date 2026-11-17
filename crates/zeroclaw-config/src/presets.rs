@@ -279,9 +279,14 @@ fn local_small_runtime() -> RuntimeProfileConfig {
 }
 
 fn balanced_runtime() -> RuntimeProfileConfig {
-    // Schema default is already the Balanced shape. Use it directly so
-    // the preset can't drift from the schema default.
-    RuntimeProfileConfig::default()
+    // The schema default is the Balanced shape except for the delegation
+    // cost ceiling: the schema default sets none (`0`), while Balanced is a
+    // posture the operator picks and keeps its 500-cent ceiling. Every other
+    // field comes from the schema default so the preset can't drift from it.
+    RuntimeProfileConfig {
+        max_cost_per_day_cents: 500,
+        ..RuntimeProfileConfig::default()
+    }
 }
 
 fn unbounded_runtime() -> RuntimeProfileConfig {
@@ -601,7 +606,28 @@ mod tests {
         let preset = runtime_preset("balanced").unwrap();
         let preset_values = (preset.values)();
         let schema_default = RuntimeProfileConfig::default();
-        assert_eq!(format!("{preset_values:?}"), format!("{schema_default:?}"),);
+        // The one field where Balanced and the schema default differ: the
+        // preset keeps its 500-cent delegation ceiling, the schema default
+        // sets none.
+        assert_eq!(preset_values.max_cost_per_day_cents, 500);
+        assert_eq!(schema_default.max_cost_per_day_cents, 0);
+        // Every other field is the schema default.
+        let preset_without_ceiling = RuntimeProfileConfig {
+            max_cost_per_day_cents: schema_default.max_cost_per_day_cents,
+            ..preset_values
+        };
+        assert_eq!(
+            format!("{preset_without_ceiling:?}"),
+            format!("{schema_default:?}"),
+        );
+    }
+
+    #[test]
+    fn non_balanced_runtime_presets_keep_their_cost_ceilings() {
+        let ceiling = |name: &str| (runtime_preset(name).unwrap().values)().max_cost_per_day_cents;
+        assert_eq!(ceiling("tight"), 100);
+        assert_eq!(ceiling(LOCAL_SMALL_RUNTIME_PRESET_NAME), 100);
+        assert_eq!(ceiling(DEFAULT_RUNTIME_PRESET_NAME), u32::MAX);
     }
 
     #[test]

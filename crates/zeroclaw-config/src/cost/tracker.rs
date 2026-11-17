@@ -116,9 +116,9 @@ enum BudgetScope {
     /// daily total (previous derived-tracker behavior).
     Shared,
     /// Compare the shared process-wide daily total against the global daily
-    /// limit tightened by this per-hop ceiling
-    /// (`config.daily_limit_usd.min(daily_ceiling_usd)`, read live each
-    /// check). This is the `track_per_agent = false` degrade: per-alias
+    /// limit tightened by this per-hop ceiling (the smaller of the two, read
+    /// live each check; the ceiling alone when the global daily limit is
+    /// unset). This is the `track_per_agent = false` degrade: per-alias
     /// daily totals cannot exist, so the per-hop ceiling can only tighten
     /// the shared check. No subtree chain rides on this scope: chains only
     /// apply to per-agent scopes, and the shared cap stays shared.
@@ -262,8 +262,8 @@ impl CostTracker {
     /// shared process-wide daily and monthly totals against the global
     /// limits (read live each check), with no per-agent ceiling and no
     /// subtree chain: the frozen-mode equivalent of the global tracker.
-    /// An independent nested delegation with no per-hop ceiling (`0` =
-    /// inherit the global limit) uses this so the target runs under the
+    /// An independent nested delegation with no per-hop ceiling (`0` = no
+    /// ceiling of its own) uses this so the target runs under the
     /// shared global limits instead of its delegating parent's
     /// agent-scoped tracker, while the enforcement mode stays frozen
     /// from the base exactly as for every other derived tracker.
@@ -272,9 +272,9 @@ impl CostTracker {
     }
 
     /// Derive an ephemeral tracker whose shared daily check uses the base
-    /// tracker's global daily limit tightened by `daily_ceiling_usd`
-    /// (`config.daily_limit_usd.min(daily_ceiling_usd)`, read live each
-    /// check). Delegated sub-loops use this when
+    /// tracker's global daily limit tightened by `daily_ceiling_usd` (the
+    /// smaller of the two, read live each check; `daily_ceiling_usd` alone
+    /// when the global daily limit is unset). Delegated sub-loops use this when
     /// `[cost].track_per_agent` is false: per-alias daily totals cannot
     /// exist, so the per-hop ceiling can only tighten the shared check, and
     /// their recorded spend lands on the same durable ledger as every other
@@ -457,15 +457,20 @@ impl CostTracker {
         // Check daily limit (shared). A shared-capped scope tightens the
         // global daily limit by its per-hop ceiling; the global limit is
         // read live from the shared config handle each call, so an operator
-        // reload applies to running delegates at their next check.
+        // reload applies to running delegates at their next check. An unset
+        // global daily limit is no limit, so the per-hop ceiling alone binds.
         let shared_daily_limit = match &self.budget_scope {
-            BudgetScope::SharedCapped { daily_ceiling_usd } => {
-                config.daily_limit_usd.min(*daily_ceiling_usd)
-            }
+            BudgetScope::SharedCapped { daily_ceiling_usd } => Some(
+                config
+                    .daily_limit_usd
+                    .map_or(*daily_ceiling_usd, |limit| limit.min(*daily_ceiling_usd)),
+            ),
             BudgetScope::Shared | BudgetScope::Agent { .. } => config.daily_limit_usd,
         };
         let projected_daily = daily_cost + estimated_cost_usd;
-        if projected_daily > shared_daily_limit {
+        if let Some(shared_daily_limit) = shared_daily_limit
+            && projected_daily > shared_daily_limit
+        {
             return Ok(BudgetCheck::Exceeded {
                 current_usd: daily_cost,
                 limit_usd: shared_daily_limit,
@@ -501,34 +506,38 @@ impl CostTracker {
             }
         }
 
-        // Check monthly limit
+        // Check monthly limit (an unset one is no limit)
         let projected_monthly = monthly_cost + estimated_cost_usd;
-        if projected_monthly > config.monthly_limit_usd {
+        if let Some(monthly_limit_usd) = config.monthly_limit_usd
+            && projected_monthly > monthly_limit_usd
+        {
             return Ok(BudgetCheck::Exceeded {
                 current_usd: monthly_cost,
-                limit_usd: config.monthly_limit_usd,
+                limit_usd: monthly_limit_usd,
                 period: UsagePeriod::Month,
                 agent_alias: None,
             });
         }
 
-        // Check warning thresholds
+        // Check warning thresholds (only for a limit that is set)
         let warn_threshold = f64::from(config.warn_at_percent.min(100)) / 100.0;
-        let daily_warn_threshold = config.daily_limit_usd * warn_threshold;
-        let monthly_warn_threshold = config.monthly_limit_usd * warn_threshold;
 
-        if projected_daily >= daily_warn_threshold {
+        if let Some(daily_limit_usd) = config.daily_limit_usd
+            && projected_daily >= daily_limit_usd * warn_threshold
+        {
             return Ok(BudgetCheck::Warning {
                 current_usd: daily_cost,
-                limit_usd: config.daily_limit_usd,
+                limit_usd: daily_limit_usd,
                 period: UsagePeriod::Day,
             });
         }
 
-        if projected_monthly >= monthly_warn_threshold {
+        if let Some(monthly_limit_usd) = config.monthly_limit_usd
+            && projected_monthly >= monthly_limit_usd * warn_threshold
+        {
             return Ok(BudgetCheck::Warning {
                 current_usd: monthly_cost,
-                limit_usd: config.monthly_limit_usd,
+                limit_usd: monthly_limit_usd,
                 period: UsagePeriod::Month,
             });
         }
@@ -1790,8 +1799,11 @@ mod tests {
     #[test]
     fn budget_check_when_disabled() {
         let tmp = TempDir::new().unwrap();
+        // Limits far below the estimate, so only `enabled: false` lets it by.
         let config = CostConfig {
             enabled: false,
+            daily_limit_usd: Some(10.0),
+            monthly_limit_usd: Some(100.0),
             ..Default::default()
         };
 
@@ -2019,7 +2031,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let config = CostConfig {
             enabled: true,
-            daily_limit_usd: 0.01, // Very low limit
+            daily_limit_usd: Some(0.01), // Very low limit
             ..Default::default()
         };
 
@@ -2033,6 +2045,30 @@ mod tests {
         assert!(matches!(check, BudgetCheck::Exceeded { .. }));
     }
 
+    /// Priced usage of `usd` recorded now, with no agent attribution.
+    fn record_priced(tracker: &CostTracker, usd: f64) {
+        tracker
+            .record_usage(TokenUsage::new(
+                "test/model",
+                1_000_000,
+                0,
+                0,
+                usd,
+                0.0,
+                0.0,
+            ))
+            .unwrap();
+    }
+
+    fn limits_config(daily: Option<f64>, monthly: Option<f64>) -> CostConfig {
+        CostConfig {
+            enabled: true,
+            daily_limit_usd: daily,
+            monthly_limit_usd: monthly,
+            ..Default::default()
+        }
+    }
+
     /// A `[cost]` section with no limit written, once a model is priced:
     /// what an operator who never chose a dollar limit gets.
     #[test]
@@ -2040,18 +2076,55 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let tracker = CostTracker::new(CostConfig::default(), tmp.path()).unwrap();
         // $10.50 of priced input recorded today.
-        tracker
-            .record_usage(TokenUsage::new(
-                "test/model",
-                1_000_000,
-                0,
-                0,
-                10.5,
-                0.0,
-                0.0,
-            ))
-            .unwrap();
+        record_priced(&tracker, 10.5);
 
+        let check = tracker.check_budget(0.0).unwrap();
+        assert!(
+            matches!(check, BudgetCheck::Allowed),
+            "no daily limit was written, so none refuses or warns: {check:?}"
+        );
+
+        // Past the old $100.00 monthly default as well.
+        record_priced(&tracker, 100.0);
+        let check = tracker.check_budget(0.0).unwrap();
+        assert!(
+            matches!(check, BudgetCheck::Allowed),
+            "no monthly limit was written, so none refuses or warns: {check:?}"
+        );
+    }
+
+    /// An explicit daily limit keeps today's behavior, including at the
+    /// value that used to be the built-in default. Checked as production
+    /// checks before a call (`check_budget(0.0)`: spend already recorded,
+    /// no estimate for the call itself), so the call that crosses the limit
+    /// is let through and the calls after it are refused.
+    #[test]
+    fn explicit_daily_limit_refuses_once_recorded_spend_passes_it() {
+        let tmp = TempDir::new().unwrap();
+        let tracker = CostTracker::new(limits_config(Some(10.0), None), tmp.path()).unwrap();
+        record_priced(&tracker, 9.0);
+        assert!(
+            matches!(
+                tracker.check_budget(0.0).unwrap(),
+                BudgetCheck::Warning {
+                    period: UsagePeriod::Day,
+                    ..
+                }
+            ),
+            "below the limit, past 80% of it: warn"
+        );
+        record_priced(&tracker, 1.0);
+        assert!(
+            matches!(
+                tracker.check_budget(0.0).unwrap(),
+                BudgetCheck::Warning {
+                    period: UsagePeriod::Day,
+                    ..
+                }
+            ),
+            "exactly at the limit is not past it"
+        );
+        record_priced(&tracker, 0.01);
         let check = tracker.check_budget(0.0).unwrap();
         assert!(
             matches!(
@@ -2063,7 +2136,231 @@ mod tests {
                     ..
                 } if limit_usd == 10.0
             ),
-            "the built-in $10.00 daily limit refuses the next call: {check:?}"
+            "once recorded spend is past the explicit $10.00, the next call is refused: {check:?}"
+        );
+    }
+
+    /// An explicit `0.0` daily limit, checked as production checks: with
+    /// nothing recorded the call is let through with a warning, and once
+    /// any priced spend is recorded the next call is refused. A negative
+    /// limit refuses from the start.
+    #[test]
+    fn explicit_zero_daily_limit_refuses_once_priced_spend_is_recorded() {
+        let tmp = TempDir::new().unwrap();
+        let tracker = CostTracker::new(limits_config(Some(0.0), None), tmp.path()).unwrap();
+        let check = tracker.check_budget(0.0).unwrap();
+        assert!(
+            matches!(
+                check,
+                BudgetCheck::Warning {
+                    period: UsagePeriod::Day,
+                    ..
+                }
+            ),
+            "nothing recorded: the first call is not refused: {check:?}"
+        );
+        record_priced(&tracker, 0.000_001);
+        assert!(matches!(
+            tracker.check_budget(0.0).unwrap(),
+            BudgetCheck::Exceeded {
+                period: UsagePeriod::Day,
+                ..
+            }
+        ));
+
+        let tmp = TempDir::new().unwrap();
+        let negative = CostTracker::new(limits_config(Some(-1.0), None), tmp.path()).unwrap();
+        assert!(matches!(
+            negative.check_budget(0.0).unwrap(),
+            BudgetCheck::Exceeded {
+                period: UsagePeriod::Day,
+                ..
+            }
+        ));
+    }
+
+    /// An explicit monthly limit keeps today's behavior, `0.0` included,
+    /// checked as production checks (`check_budget(0.0)`).
+    #[test]
+    fn explicit_monthly_limit_refuses_once_recorded_spend_passes_it() {
+        let tmp = TempDir::new().unwrap();
+        let tracker = CostTracker::new(limits_config(None, Some(100.0)), tmp.path()).unwrap();
+        record_priced(&tracker, 100.5);
+        let check = tracker.check_budget(0.0).unwrap();
+        assert!(
+            matches!(
+                check,
+                BudgetCheck::Exceeded {
+                    period: UsagePeriod::Month,
+                    limit_usd,
+                    agent_alias: None,
+                    ..
+                } if limit_usd == 100.0
+            ),
+            "spend past the explicit $100.00 monthly limit refuses the next call: {check:?}"
+        );
+
+        let tmp = TempDir::new().unwrap();
+        let zero = CostTracker::new(limits_config(None, Some(0.0)), tmp.path()).unwrap();
+        let check = zero.check_budget(0.0).unwrap();
+        assert!(
+            matches!(
+                check,
+                BudgetCheck::Warning {
+                    period: UsagePeriod::Month,
+                    ..
+                }
+            ),
+            "nothing recorded: the first call is not refused: {check:?}"
+        );
+        record_priced(&zero, 0.000_001);
+        assert!(matches!(
+            zero.check_budget(0.0).unwrap(),
+            BudgetCheck::Exceeded {
+                period: UsagePeriod::Month,
+                ..
+            }
+        ));
+    }
+
+    /// With only the daily limit set, the month never warns or blocks.
+    #[test]
+    fn only_daily_limit_set_month_never_warns_or_blocks() {
+        let tmp = TempDir::new().unwrap();
+        let tracker = CostTracker::new(limits_config(Some(10_000.0), None), tmp.path()).unwrap();
+        record_priced(&tracker, 500.0);
+        let check = tracker.check_budget(0.0).unwrap();
+        assert!(
+            matches!(check, BudgetCheck::Allowed),
+            "an unset monthly limit neither refuses nor warns at $500: {check:?}"
+        );
+    }
+
+    /// With only the monthly limit set, the day never warns or blocks.
+    #[test]
+    fn only_monthly_limit_set_day_never_warns_or_blocks() {
+        let tmp = TempDir::new().unwrap();
+        let tracker = CostTracker::new(limits_config(None, Some(10_000.0)), tmp.path()).unwrap();
+        record_priced(&tracker, 500.0);
+        let check = tracker.check_budget(0.0).unwrap();
+        assert!(
+            matches!(check, BudgetCheck::Allowed),
+            "an unset daily limit neither refuses nor warns at $500: {check:?}"
+        );
+    }
+
+    /// `warn_at_percent = 0` makes every set limit warn at once, which
+    /// isolates the warning path: an unset limit must not warn even then.
+    #[test]
+    fn warn_at_percent_never_warns_for_an_unset_limit() {
+        let warn_now = |daily: Option<f64>, monthly: Option<f64>| CostConfig {
+            warn_at_percent: 0,
+            ..limits_config(daily, monthly)
+        };
+
+        let tmp = TempDir::new().unwrap();
+        let unset = CostTracker::new(warn_now(None, None), tmp.path()).unwrap();
+        assert!(matches!(
+            unset.check_budget(0.0).unwrap(),
+            BudgetCheck::Allowed
+        ));
+        record_priced(&unset, 50.0);
+        let check = unset.check_budget(0.0).unwrap();
+        assert!(
+            matches!(check, BudgetCheck::Allowed),
+            "neither unset limit warns: {check:?}"
+        );
+
+        // Controls: the same threshold does warn for a limit that is set.
+        let tmp = TempDir::new().unwrap();
+        let daily = CostTracker::new(warn_now(Some(1_000.0), None), tmp.path()).unwrap();
+        assert!(matches!(
+            daily.check_budget(0.0).unwrap(),
+            BudgetCheck::Warning {
+                period: UsagePeriod::Day,
+                ..
+            }
+        ));
+        let tmp = TempDir::new().unwrap();
+        let monthly = CostTracker::new(warn_now(None, Some(1_000.0)), tmp.path()).unwrap();
+        assert!(matches!(
+            monthly.check_budget(0.0).unwrap(),
+            BudgetCheck::Warning {
+                period: UsagePeriod::Month,
+                ..
+            }
+        ));
+    }
+
+    /// A shared-capped delegation scope with no global daily limit is
+    /// bounded by its per-hop ceiling alone; with one, the smaller binds.
+    #[test]
+    fn shared_capped_without_daily_limit_is_bounded_by_ceiling_alone() {
+        let tmp = TempDir::new().unwrap();
+        let base = CostTracker::new(limits_config(None, None), tmp.path()).unwrap();
+        let capped = base.derived_shared_capped(1.0);
+        record_priced(&capped, 0.5);
+        assert!(matches!(
+            capped.check_budget(0.0).unwrap(),
+            BudgetCheck::Allowed
+        ));
+        record_priced(&capped, 0.6);
+        let check = capped.check_budget(0.0).unwrap();
+        assert!(
+            matches!(
+                check,
+                BudgetCheck::Exceeded {
+                    period: UsagePeriod::Day,
+                    limit_usd,
+                    agent_alias: None,
+                    ..
+                } if limit_usd == 1.0
+            ),
+            "the $1.00 ceiling binds with no global daily limit: {check:?}"
+        );
+        assert!(
+            matches!(base.check_budget(0.0).unwrap(), BudgetCheck::Allowed),
+            "the base tracker itself has no limit"
+        );
+
+        let tmp = TempDir::new().unwrap();
+        let base = CostTracker::new(limits_config(Some(0.5), None), tmp.path()).unwrap();
+        let capped = base.derived_shared_capped(1.0);
+        record_priced(&capped, 0.6);
+        let check = capped.check_budget(0.0).unwrap();
+        assert!(
+            matches!(
+                check,
+                BudgetCheck::Exceeded { limit_usd, .. } if limit_usd == 0.5
+            ),
+            "a set global daily limit below the ceiling still binds: {check:?}"
+        );
+    }
+
+    /// A per-agent delegation ceiling binds on its own with no shared limit.
+    #[test]
+    fn agent_ceiling_binds_without_shared_limits() {
+        let tmp = TempDir::new().unwrap();
+        let base = CostTracker::new(limits_config(None, None), tmp.path()).unwrap();
+        let scoped = base.derived_for_agent("worker", 1.0);
+        scoped
+            .record_usage_with_agent(
+                TokenUsage::new("test/model", 1_000_000, 0, 0, 1.5, 0.0, 0.0),
+                Some("worker"),
+            )
+            .unwrap();
+        let check = scoped.check_budget(0.0).unwrap();
+        assert!(
+            matches!(
+                check,
+                BudgetCheck::Exceeded {
+                    period: UsagePeriod::Day,
+                    limit_usd,
+                    agent_alias: Some(ref alias),
+                    ..
+                } if limit_usd == 1.0 && alias == "worker"
+            ),
+            "the agent's $1.00 ceiling binds with no shared limit: {check:?}"
         );
     }
 
@@ -2440,21 +2737,21 @@ mod tests {
 
         let boot = CostConfig {
             enabled: true,
-            daily_limit_usd: 10.0,
+            daily_limit_usd: Some(10.0),
             ..Default::default()
         };
         let tracker = CostTracker::new(boot, tmp.path()).expect("boot tracker");
-        assert_eq!(tracker.config().daily_limit_usd, 10.0);
+        assert_eq!(tracker.config().daily_limit_usd, Some(10.0));
 
         tracker.update_config(CostConfig {
             enabled: true,
-            daily_limit_usd: 14000.0,
+            daily_limit_usd: Some(14000.0),
             ..Default::default()
         });
 
         assert_eq!(
             tracker.config().daily_limit_usd,
-            14000.0,
+            Some(14000.0),
             "reload must apply the new daily limit through the RwLock"
         );
     }
@@ -2466,7 +2763,7 @@ mod tests {
 
         let boot = CostConfig {
             enabled: true,
-            daily_limit_usd: 10.0,
+            daily_limit_usd: Some(10.0),
             ..Default::default()
         };
         let first = CostTracker::resolve_global(&trackers, boot, tmp.path())
@@ -2474,7 +2771,7 @@ mod tests {
 
         let reloaded = CostConfig {
             enabled: true,
-            daily_limit_usd: 14000.0,
+            daily_limit_usd: Some(14000.0),
             ..Default::default()
         };
         let after = CostTracker::resolve_global(&trackers, reloaded, tmp.path())
@@ -2482,7 +2779,7 @@ mod tests {
 
         assert_eq!(
             after.config().daily_limit_usd,
-            14000.0,
+            Some(14000.0),
             "the process-global tracker must adopt the reloaded daily limit"
         );
         assert!(
@@ -2523,7 +2820,7 @@ mod tests {
 
         let disabled_boot = CostConfig {
             enabled: false,
-            daily_limit_usd: 10.0,
+            daily_limit_usd: Some(10.0),
             ..Default::default()
         };
         assert!(
@@ -2533,14 +2830,14 @@ mod tests {
 
         let enable = CostConfig {
             enabled: true,
-            daily_limit_usd: 14000.0,
+            daily_limit_usd: Some(14000.0),
             ..Default::default()
         };
         let constructed = CostTracker::resolve_global(&trackers, enable, tmp.path())
             .expect("reload enabling cost tracking must construct the tracker");
         assert_eq!(
             constructed.config().daily_limit_usd,
-            14000.0,
+            Some(14000.0),
             "the on-demand tracker must adopt the reloaded daily limit"
         );
 
@@ -2548,7 +2845,7 @@ mod tests {
             &trackers,
             CostConfig {
                 enabled: true,
-                daily_limit_usd: 14000.0,
+                daily_limit_usd: Some(14000.0),
                 ..Default::default()
             },
             tmp.path(),
@@ -2567,7 +2864,7 @@ mod tests {
 
         let enabled_boot = CostConfig {
             enabled: true,
-            daily_limit_usd: 14000.0,
+            daily_limit_usd: Some(14000.0),
             ..Default::default()
         };
         let tracker = CostTracker::resolve_global(&trackers, enabled_boot, tmp.path())
@@ -2575,7 +2872,7 @@ mod tests {
 
         let disable = CostConfig {
             enabled: false,
-            daily_limit_usd: 14000.0,
+            daily_limit_usd: Some(14000.0),
             ..Default::default()
         };
         let after = CostTracker::resolve_global(&trackers, disable, tmp.path())
@@ -2663,8 +2960,8 @@ mod tests {
             CostConfig {
                 enabled: true,
                 track_per_agent: true,
-                daily_limit_usd: 100.0,
-                monthly_limit_usd: 500.0,
+                daily_limit_usd: Some(100.0),
+                monthly_limit_usd: Some(500.0),
                 ..Default::default()
             },
             tmp.path(),
@@ -2738,8 +3035,8 @@ mod tests {
             CostConfig {
                 enabled: true,
                 track_per_agent: true,
-                daily_limit_usd: 10.0,
-                monthly_limit_usd: 500.0,
+                daily_limit_usd: Some(10.0),
+                monthly_limit_usd: Some(500.0),
                 ..Default::default()
             },
             tmp.path(),
@@ -2758,7 +3055,7 @@ mod tests {
         );
 
         let mut reloaded = base.config();
-        reloaded.daily_limit_usd = 0.5;
+        reloaded.daily_limit_usd = Some(0.5);
         base.update_config(reloaded);
         match derived.check_budget(0.1).unwrap() {
             BudgetCheck::Exceeded {
@@ -2791,8 +3088,8 @@ mod tests {
             CostConfig {
                 enabled: true,
                 track_per_agent: false,
-                daily_limit_usd: 10.0,
-                monthly_limit_usd: 500.0,
+                daily_limit_usd: Some(10.0),
+                monthly_limit_usd: Some(500.0),
                 ..Default::default()
             },
             tmp.path(),
@@ -2807,7 +3104,7 @@ mod tests {
         );
 
         let mut reloaded = base.config();
-        reloaded.daily_limit_usd = 1.0;
+        reloaded.daily_limit_usd = Some(1.0);
         base.update_config(reloaded);
         match derived.check_budget(0.5).unwrap() {
             BudgetCheck::Exceeded {
@@ -2839,8 +3136,8 @@ mod tests {
             CostConfig {
                 enabled: true,
                 track_per_agent: true,
-                daily_limit_usd: 100.0,
-                monthly_limit_usd: 500.0,
+                daily_limit_usd: Some(100.0),
+                monthly_limit_usd: Some(500.0),
                 ..Default::default()
             },
             tmp.path(),
@@ -2910,8 +3207,8 @@ mod tests {
             CostConfig {
                 enabled: true,
                 track_per_agent: true,
-                daily_limit_usd: 100.0,
-                monthly_limit_usd: 500.0,
+                daily_limit_usd: Some(100.0),
+                monthly_limit_usd: Some(500.0),
                 ..Default::default()
             },
             tmp.path(),
@@ -2955,8 +3252,8 @@ mod tests {
             CostConfig {
                 enabled: true,
                 track_per_agent: true,
-                daily_limit_usd: 100.0,
-                monthly_limit_usd: 500.0,
+                daily_limit_usd: Some(100.0),
+                monthly_limit_usd: Some(500.0),
                 ..Default::default()
             },
             tmp.path(),
@@ -3041,8 +3338,8 @@ mod tests {
             CostConfig {
                 enabled: true,
                 track_per_agent: false,
-                daily_limit_usd: 100.0,
-                monthly_limit_usd: 500.0,
+                daily_limit_usd: Some(100.0),
+                monthly_limit_usd: Some(500.0),
                 ..Default::default()
             },
             tmp.path(),
@@ -3186,8 +3483,8 @@ mod tests {
             CostConfig {
                 enabled: true,
                 track_per_agent: true,
-                daily_limit_usd: 100.0,
-                monthly_limit_usd: 500.0,
+                daily_limit_usd: Some(100.0),
+                monthly_limit_usd: Some(500.0),
                 ..Default::default()
             },
             tmp.path(),
@@ -3238,8 +3535,8 @@ mod tests {
             CostConfig {
                 enabled: true,
                 track_per_agent: true,
-                daily_limit_usd: 100.0,
-                monthly_limit_usd: 500.0,
+                daily_limit_usd: Some(100.0),
+                monthly_limit_usd: Some(500.0),
                 ..Default::default()
             },
             tmp.path(),
@@ -3323,8 +3620,8 @@ mod tests {
             CostConfig {
                 enabled: true,
                 track_per_agent: true,
-                daily_limit_usd: 100.0,
-                monthly_limit_usd: 500.0,
+                daily_limit_usd: Some(100.0),
+                monthly_limit_usd: Some(500.0),
                 ..Default::default()
             },
             tmp.path(),
@@ -3396,8 +3693,8 @@ mod tests {
             CostConfig {
                 enabled: true,
                 track_per_agent: true,
-                daily_limit_usd: 100.0,
-                monthly_limit_usd: 500.0,
+                daily_limit_usd: Some(100.0),
+                monthly_limit_usd: Some(500.0),
                 ..Default::default()
             },
             tmp2.path(),
@@ -3433,8 +3730,8 @@ mod tests {
             CostConfig {
                 enabled: true,
                 track_per_agent: true,
-                daily_limit_usd: 100.0,
-                monthly_limit_usd: 500.0,
+                daily_limit_usd: Some(100.0),
+                monthly_limit_usd: Some(500.0),
                 ..Default::default()
             },
             tmp.path(),
@@ -3534,8 +3831,8 @@ mod tests {
             CostConfig {
                 enabled: true,
                 track_per_agent: true,
-                daily_limit_usd: 100.0,
-                monthly_limit_usd: 500.0,
+                daily_limit_usd: Some(100.0),
+                monthly_limit_usd: Some(500.0),
                 ..Default::default()
             },
             tmp.path(),
@@ -3607,8 +3904,8 @@ mod tests {
             CostConfig {
                 enabled: true,
                 track_per_agent: true,
-                daily_limit_usd: 100.0,
-                monthly_limit_usd: 500.0,
+                daily_limit_usd: Some(100.0),
+                monthly_limit_usd: Some(500.0),
                 ..Default::default()
             },
             tmp.path(),
