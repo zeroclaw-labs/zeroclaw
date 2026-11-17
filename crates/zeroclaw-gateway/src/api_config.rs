@@ -464,11 +464,12 @@ pub(crate) async fn persist_and_swap(
         guard,
         Vec::new(),
         Vec::new(),
+        None,
     )
     .await
 }
 
-#[allow(clippy::result_large_err)]
+#[allow(clippy::result_large_err, clippy::too_many_arguments)]
 async fn persist_and_swap_retaining(
     state: &AppState,
     authorization: ConfigWriteAuthorization,
@@ -476,6 +477,7 @@ async fn persist_and_swap_retaining(
     guard: ConfigWriteGuard,
     agent_reservations: Vec<zeroclaw_runtime::live_config_authority::AgentAdmissionReservation>,
     annotations: Vec<(String, String)>,
+    credential_audit: Option<ScopedCredentialAudit>,
 ) -> Result<RetainedConfigWrite, Response> {
     let config_path = new_config.config_path.clone();
     let pending_reload = Arc::clone(&state.pending_reload);
@@ -489,8 +491,11 @@ async fn persist_and_swap_retaining(
                 new_config,
                 authorization,
             )
-            .await?;
-            finish_prepared_channel_generation(prepared, pending_reload).await;
+            .await;
+            if let Some(audit) = credential_audit {
+                audit.record(prepared.is_ok());
+            }
+            finish_prepared_channel_generation(prepared?, pending_reload).await;
             if let Err(e) =
                 zeroclaw_config::comment_writer::apply_comments(&config_path, &annotations).await
             {
@@ -1367,28 +1372,31 @@ fn scoped_credential_kind(auth: &zeroclaw_config::schema::ScopedHttpAuth) -> &'s
     }
 }
 
-fn audit_scoped_credential_mutation(
-    principal: &RequestPrincipal,
-    name: &str,
-    kind: Option<&str>,
-    operation: &str,
+struct ScopedCredentialAudit {
+    actor: Option<String>,
+    name: String,
+    kind: Option<&'static str>,
+    operation: &'static str,
     grant: Option<serde_json::Value>,
-    saved: bool,
-) {
-    ::zeroclaw_log::record!(
-        INFO,
-        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
-            serde_json::json!({
-                "actor": crate::principal_gate::request_principal_id(principal),
-                "credential": name,
-                "kind": kind,
-                "operation": operation,
-                "grant": grant,
-                "saved": saved
-            })
-        ),
-        "Scoped credential mutation"
-    );
+}
+
+impl ScopedCredentialAudit {
+    fn record(self, saved: bool) {
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+                serde_json::json!({
+                    "actor": self.actor,
+                    "credential": self.name,
+                    "kind": self.kind,
+                    "operation": self.operation,
+                    "grant": self.grant,
+                    "saved": saved
+                })
+            ),
+            "Scoped credential mutation"
+        );
+    }
 }
 
 pub async fn list_http_credentials(
@@ -1550,17 +1558,25 @@ pub async fn mutate_http_credential(
                     Ok(authorization) => authorization,
                     Err(denied) => return denied.into_response(),
                 };
-                let saved = persist_and_swap(&state, authorization, config, guard)
-                    .await
-                    .is_ok();
-                audit_scoped_credential_mutation(
-                    &principal,
-                    &mutation.name,
-                    Some(scoped_credential_kind(&record.auth)),
-                    "update_grant",
-                    Some(grant),
-                    saved,
-                );
+                let audit = ScopedCredentialAudit {
+                    actor: crate::principal_gate::request_principal_id(&principal)
+                        .map(str::to_owned),
+                    name: mutation.name,
+                    kind: Some(scoped_credential_kind(&record.auth)),
+                    operation: "update_grant",
+                    grant: Some(grant),
+                };
+                let saved = persist_and_swap_retaining(
+                    &state,
+                    authorization,
+                    config,
+                    guard,
+                    Vec::new(),
+                    Vec::new(),
+                    Some(audit),
+                )
+                .await
+                .is_ok();
                 return if saved {
                     StatusCode::NO_CONTENT.into_response()
                 } else {
@@ -1711,17 +1727,24 @@ pub async fn mutate_http_credential(
                 Ok(authorization) => authorization,
                 Err(denied) => return denied.into_response(),
             };
-            let saved = persist_and_swap(&state, authorization, config, guard)
-                .await
-                .is_ok();
-            audit_scoped_credential_mutation(
-                &principal,
-                &mutation.name,
+            let audit = ScopedCredentialAudit {
+                actor: crate::principal_gate::request_principal_id(&principal).map(str::to_owned),
+                name: mutation.name,
                 kind,
                 operation,
-                None,
-                saved,
-            );
+                grant: None,
+            };
+            let saved = persist_and_swap_retaining(
+                &state,
+                authorization,
+                config,
+                guard,
+                Vec::new(),
+                Vec::new(),
+                Some(audit),
+            )
+            .await
+            .is_ok();
             if saved {
                 StatusCode::NO_CONTENT.into_response()
             } else {
@@ -1857,6 +1880,7 @@ pub async fn handle_prop_put(
         _cfg_guard,
         agent_config_reservation.into_iter().collect(),
         annotations,
+        None,
     )
     .await
     {
@@ -1942,6 +1966,7 @@ pub async fn handle_prop_delete(
         _cfg_guard,
         agent_config_reservation.into_iter().collect(),
         Vec::new(),
+        None,
     )
     .await
     {
