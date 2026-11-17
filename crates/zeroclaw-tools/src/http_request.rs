@@ -60,9 +60,19 @@ fn redact_response_body(
         return redact(&body);
     }
 
-    // Scan JSON tokens without rebuilding numbers through Value. Exact scrubbing
-    // of the final text also catches quoted secrets spanning token boundaries in
-    // non-JSON replies, HTML, and malformed/truncated responses.
+    // Validate without materializing numbers, preserving integers larger than
+    // u64 and avoiding global serde_json numeric feature changes.
+    let mut decoder = serde_json::Deserializer::from_str(&body);
+    if <serde::de::IgnoredAny as serde::Deserialize>::deserialize(&mut decoder)
+        .and_then(|_| decoder.end())
+        .is_err()
+    {
+        // A literal credential may span quotation marks in text or HTML.
+        return redact(&body);
+    }
+
+    // Redact decoded JSON strings and scalar tokens without changing syntax
+    // or escape sequences. Preserve every unrelated numeric token verbatim.
     let bytes = body.as_bytes();
     let mut output = String::with_capacity(body.len());
     let mut cursor = 0;
@@ -94,12 +104,12 @@ fn redact_response_body(
                     output.push_str(token);
                 }
             }
-            b'-' | b'0'..=b'9' => {
+            b'-' | b'0'..=b'9' | b't' | b'f' | b'n' => {
                 cursor += 1;
                 while cursor < bytes.len()
                     && matches!(
                         bytes[cursor],
-                        b'0'..=b'9' | b'.' | b'e' | b'E' | b'+' | b'-'
+                        b'0'..=b'9' | b'a'..=b'z' | b'A'..=b'Z' | b'.' | b'+' | b'-'
                     )
                 {
                     cursor += 1;
@@ -121,7 +131,7 @@ fn redact_response_body(
             }
         }
     }
-    redact(&output)
+    output
 }
 
 impl HttpRequestTool {
@@ -2692,6 +2702,28 @@ api_token = "Bearer from-secret"
         assert_eq!(parsed["authorization"], "Bearer secret");
         assert_eq!(parsed["x-api-key"], "my-key");
         assert_eq!(parsed["content-type"], "application/json");
+    }
+
+    #[test]
+    fn authenticated_json_unicode_escapes_remain_structured() {
+        let output = redact_response_body(
+            r#"{"city":"\u6771\u4eac"}"#.into(),
+            &|text| text.replace("u", "[REDACTED]"),
+            true,
+        );
+        let structured: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(structured["city"], "東京");
+    }
+
+    #[test]
+    fn authenticated_scalar_credentials_preserve_valid_json() {
+        for scalar in ["true", "false", "null", "-123.45e+2"] {
+            let body = format!("{{\"value\":{scalar}}}");
+            let output =
+                redact_response_body(body, &|text| text.replace(scalar, "[REDACTED]"), true);
+            let structured: serde_json::Value = serde_json::from_str(&output).unwrap();
+            assert_eq!(structured["value"], "[REDACTED]");
+        }
     }
 
     #[test]
