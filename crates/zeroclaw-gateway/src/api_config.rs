@@ -2590,6 +2590,7 @@ pub async fn handle_map_key(
             _cfg_guard,
             agent_config_reservation.into_iter().collect(),
             Vec::new(),
+            None,
         )
         .await
         {
@@ -3630,6 +3631,7 @@ pub async fn handle_patch(
         _cfg_guard,
         agent_config_reservations,
         annotations,
+        None,
     )
     .await
     {
