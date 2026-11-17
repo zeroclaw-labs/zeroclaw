@@ -39,6 +39,8 @@ struct Request {
 #[derive(Serialize, Deserialize)]
 struct Reply {
     path: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
 }
 
 fn parse(args: &[String]) -> Result<(&[String], &str, &[String])> {
@@ -250,6 +252,58 @@ fn signer_loader_args(effective: &str, home: Option<&Path>) -> Result<Vec<std::f
     Ok(args)
 }
 
+struct OwnedMaster {
+    child: Child,
+    group: i32,
+}
+
+impl OwnedMaster {
+    fn spawn(command: &mut Command) -> Result<Self> {
+        command.process_group(0);
+        let child = command.spawn()?;
+        let group = child.id().context("missing SSH master pid")? as i32;
+        Ok(Self { child, group })
+    }
+
+    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        self.child.try_wait()
+    }
+
+    async fn kill(&mut self) -> std::io::Result<()> {
+        // Kill the group even if the leader has already exited: a proxy can
+        // ignore closed pipes and remain in the original process group.
+        unsafe {
+            libc::kill(-self.group, libc::SIGTERM);
+        }
+        sleep(Duration::from_millis(150)).await;
+        unsafe {
+            libc::kill(-self.group, libc::SIGKILL);
+        }
+        let result = self.child.wait().await.map(|_| ());
+        self.group = 0;
+        result
+    }
+}
+
+impl Drop for OwnedMaster {
+    fn drop(&mut self) {
+        if self.group > 0 {
+            unsafe {
+                libc::kill(-self.group, libc::SIGKILL);
+            }
+            let _ = self.child.start_kill();
+        }
+    }
+}
+
+fn require_unused_socket(path: &Path) -> Result<()> {
+    match path.symlink_metadata() {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+        Ok(_) => anyhow::bail!("SSH socket path already exists"),
+    }
+}
+
 async fn signer(
     path: &Path,
     source: ScopedCredentialSource,
@@ -277,6 +331,7 @@ async fn signer(
             && key.ends_with("-----END OPENSSH PRIVATE KEY-----"),
         "invalid SSH key"
     );
+    require_unused_socket(path)?;
     let mut signer = child()
         .args(["/usr/bin/ssh-agent", "-D", "-a"])
         .arg(path)
@@ -289,6 +344,7 @@ async fn signer(
         Result::<()>::Ok(())
     })
     .await??;
+    ensure!(signer.try_wait()?.is_none(), "signer exited");
     let mut loader = child()
         .arg("/usr/bin/ssh-add")
         .args(loader_args)
@@ -310,7 +366,7 @@ async fn signer(
 
 #[derive(Default)]
 struct Entry {
-    master: Option<Child>,
+    master: Option<OwnedMaster>,
     failed: bool,
     leases: usize,
     idle_since: Option<Instant>,
@@ -331,7 +387,9 @@ async fn open(
     host: &str,
     credential: Option<(ScopedCredentialSource, String)>,
     effective: &str,
-) -> Result<Child> {
+) -> Result<OwnedMaster> {
+    require_unused_socket(path)?;
+    require_unused_socket(&path.with_extension("agent"))?;
     let socket = SocketPath(path.with_extension("agent"));
     let mut agent = if let Some((source, value)) = credential {
         Some(signer(&socket.0, source, value, effective).await?)
@@ -374,7 +432,7 @@ async fn open(
             "PreferredAuthentications=publickey",
         ]);
     }
-    let mut master = command.args(options).args(["--", host]).spawn()?;
+    let mut master = OwnedMaster::spawn(command.args(options).args(["--", host]))?;
     timeout(Duration::from_secs(15), async {
         while !path.exists() {
             ensure!(master.try_wait()?.is_none(), "master exited");
@@ -436,7 +494,8 @@ async fn lease(
     let credential = alias
         .as_deref()
         .map(|alias| record(alias, effective))
-        .transpose()?;
+        .transpose()
+        .context("tool-native-ssh-credential")?;
     let fingerprint =
         serde_json::to_vec(&(host, effective, alias, credential.as_ref().map(|c| &c.0)))?;
     let key = format!("{:x}", Sha256::digest(fingerprint));
@@ -454,7 +513,8 @@ async fn lease(
                 credential.map(|(_, source, value)| (source, value)),
                 effective,
             )
-            .await?,
+            .await
+            .context("tool-native-ssh-connection")?,
         );
         state.failed = false;
     }
@@ -555,14 +615,20 @@ async fn serve_inner(
                 jobs.spawn(async move {
                     match lease(&mut stream, &dir, &pool).await {
                         Ok((path, entry)) => {
-                            if write(&mut stream, &Reply {path:Some(path)}).await.is_ok() {
+                            if write(&mut stream, &Reply {path:Some(path), error:None}).await.is_ok() {
                                 let _ = stream.read_u8().await;
                             }
                             let mut state = entry.lock().await;
                             state.leases -= 1;
                             state.idle_since = Some(Instant::now());
                         }
-                        Err(_) => { let _ = write(&mut stream, &Reply {path:None}).await; }
+                        Err(error) => {
+                            let key = error.chain()
+                                .map(|cause| cause.to_string())
+                                .find(|text| matches!(text.as_str(), "tool-native-ssh-credential" | "tool-native-ssh-connection"))
+                                .unwrap_or_else(|| "tool-native-ssh-denied".into());
+                            let _ = write(&mut stream, &Reply {path:None, error:Some(key)}).await;
+                        }
                     }
                 });
             }
@@ -598,7 +664,17 @@ async fn client(mut args: Vec<String>) -> Result<i32> {
     )
     .await?;
     let reply: Reply = timeout(Duration::from_secs(48), read(&mut stream)).await??;
-    let path = reply.path.context(message("tool-native-ssh-denied"))?;
+    let error_key = reply
+        .error
+        .as_deref()
+        .filter(|key| {
+            matches!(
+                *key,
+                "tool-native-ssh-credential" | "tool-native-ssh-connection"
+            )
+        })
+        .unwrap_or("tool-native-ssh-denied");
+    let path = reply.path.context(message(error_key))?;
     let status = Command::new(SSH)
         .arg("-S")
         .arg(path)
@@ -642,8 +718,20 @@ pub fn run(args: Vec<String>) -> i32 {
         });
     match result {
         Ok(code) => code,
-        Err(_) => {
-            eprintln!("{}", message("tool-native-ssh-denied"));
+        Err(error) => {
+            let display = error.to_string();
+            let allowed = [
+                "tool-native-ssh-credential",
+                "tool-native-ssh-connection",
+                "tool-native-ssh-arguments",
+            ]
+            .iter()
+            .map(|key| message(key))
+            .find(|text| *text == display);
+            eprintln!(
+                "{}",
+                allowed.unwrap_or_else(|| message("tool-native-ssh-denied"))
+            );
             255
         }
     }
@@ -651,16 +739,57 @@ pub fn run(args: Vec<String>) -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use super::signer_loader_args;
     use super::{
         Entry, Pool, SecretStore, SocketPath, parse, record_at, retire_idle, serve_inner,
         valid_task,
     };
+    use super::{OwnedMaster, require_unused_socket, signer_loader_args};
     use std::{
         sync::Arc,
         time::{Duration, Instant},
     };
     use tokio::{process::Command, sync::Mutex};
+
+    #[test]
+    fn prebound_fake_agent_and_master_sockets_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["agent", "master"] {
+            let path = dir.path().join(name);
+            let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+            assert!(require_unused_socket(&path).is_err());
+            assert!(path.exists());
+            drop(listener);
+        }
+    }
+
+    #[tokio::test]
+    async fn owned_master_stops_proxy_after_leader_exits() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("proxy.pid");
+        let mut master = OwnedMaster::spawn(
+            Command::new("/bin/sh")
+                .arg("-c")
+                .arg(r#"trap '' TERM; sleep 60 & echo $! > "$1"; exit 0"#)
+                .arg("fixture")
+                .arg(&pidfile),
+        )
+        .unwrap();
+        master.child.wait().await.unwrap();
+        let pid = std::fs::read_to_string(&pidfile)
+            .unwrap()
+            .trim()
+            .parse::<i32>()
+            .unwrap();
+        master.kill().await.unwrap();
+        for _ in 0..40 {
+            let status = std::fs::read_to_string(format!("/proc/{pid}/stat"));
+            if status.is_err() || status.unwrap().split_whitespace().nth(2) == Some("Z") {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("proxy remained alive after task shutdown");
+    }
 
     #[tokio::test]
     async fn idle_expiry_retires_live_master_and_marks_dead_master_failed() {
@@ -670,19 +799,12 @@ mod tests {
             let socket = dir.path().join(name);
             let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
             let mut master = if alive {
-                Command::new("/usr/bin/sleep")
-                    .arg("60")
-                    .kill_on_drop(true)
-                    .spawn()
-                    .unwrap()
+                OwnedMaster::spawn(Command::new("/usr/bin/sleep").arg("60")).unwrap()
             } else {
-                Command::new("/usr/bin/false")
-                    .kill_on_drop(true)
-                    .spawn()
-                    .unwrap()
+                OwnedMaster::spawn(&mut Command::new("/usr/bin/false")).unwrap()
             };
             if !alive {
-                assert!(!master.wait().await.unwrap().success());
+                assert!(!master.child.wait().await.unwrap().success());
             }
             let entry = Arc::new(Mutex::new(Entry {
                 master: Some(master),
@@ -708,12 +830,8 @@ mod tests {
     async fn input_eof_stops_task_master_and_unlinks_broker_socket() {
         let dir = tempfile::tempdir().unwrap();
         let pool = Pool::default();
-        let master = Command::new("/usr/bin/sleep")
-            .arg("60")
-            .kill_on_drop(true)
-            .spawn()
-            .unwrap();
-        let pid = master.id().unwrap();
+        let master = OwnedMaster::spawn(Command::new("/usr/bin/sleep").arg("60")).unwrap();
+        let pid = master.child.id().unwrap();
         let entry = Arc::new(Mutex::new(Entry {
             master: Some(master),
             leases: 1,

@@ -18,7 +18,7 @@ there is no automatic reconnect or unmanaged TCP fallback.
 
 ## Dependencies and setup
 
-Requires Linux, OpenSSH 8.7 or later, Python 3.10 or later, and util-linux `setpriv`
+The Python adapter requires Linux, OpenSSH 8.7 or later, Python 3.10 or later, and util-linux `setpriv`
 with `--pdeathsig`. Other platforms and existing installations are unchanged
 when the helper is not configured. This initial implementation is for
 noninteractive commands, not interactive logins, port forwarding or SCP.
@@ -41,8 +41,9 @@ The runtime supplies `ZEROCLAW_SSH_TASK` and `ZEROCLAW_SSH_STATE_DIR` after
 constructing the shell environment. Do not set them manually for agent tasks.
 The helper uses a user-owned 0700 directory under XDG_RUNTIME_DIR or the private
 temporary directory. No private keys are written there; it contains control
-sockets and readiness state. Connection stderr is drained continuously into an
-8 KiB in-memory tail, not an unbounded file. Connecting one key does not hold the
+sockets and readiness state. The Python adapter drains connection stderr into an 8 KiB in-memory tail.
+The native Rust broker currently discards OpenSSH stderr and reports localized
+connection-stage errors. Connecting one key does not hold the
 pool lock while waiting for the network; other keys and task shutdown proceed.
 
 When a turn owns a host SSH broker, the built-in shell refuses commands under
@@ -128,9 +129,19 @@ Upgrading the CLI alongside OpenBao can accommodate protocol changes without
 changing ZeroClaw, as long as the supported CLI commands and output contract
 remain stable.
 
-The same rule applies to Azure and other vault adapters. Prefer the official
-CLI when it can preserve service identity, TLS verification and scoped secret
-access without putting secret values in arguments or logs. Consider direct
-verified HTTPS when a specific CLI cannot meet those conditions and the API
-provides a safer path. The native SSH preview supports local keys and OpenBao,
-matching the existing broker's supported SSH sources.
+## Native broker security boundary
+
+The native scoped signer requires OpenSSH 8.9 or newer. Broker, shell tools and
+the private signer execute under the same operating-system user. Catalog keys
+and the signer are therefore accessible to arbitrary unsandboxed shell code
+running as that user. Destination-constrained signing is defense in depth.
+Confidentiality against those shell processes requires a separately privileged
+credential broker and is outside this adapter's current boundary.
+
+Agent and master socket paths must be absent before setup. The broker rechecks
+signer liveness after its socket appears and before loading a key. These checks
+reject pre-bound fake sockets. They cannot eliminate a same-user replacement
+race during authentication.
+
+Each master owns a process group. Setup failure, cancellation, idle retirement
+and task shutdown terminate the group's proxy descendants as well as the master.
