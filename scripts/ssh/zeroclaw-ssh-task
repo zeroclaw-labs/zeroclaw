@@ -8,6 +8,7 @@ import os
 import pathlib
 import re
 import selectors
+import signal
 import socket
 import subprocess
 import sys
@@ -123,7 +124,8 @@ class Pool:
                 log = BoundedLog()
                 def spawn():
                     process = subprocess.Popen(command, stdin=subprocess.DEVNULL,
-                                               stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                                               stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                                               start_new_session=True)
                     log.attach(process.stderr)
                     return process
                 entry = dict(key=key, process=None, future=self.spawner.submit(spawn), path=path,
@@ -185,13 +187,22 @@ class Pool:
                 process = entry['future'].result()
             except Exception:
                 process = None
-            if process is not None and process.poll() is None:
-                process.terminate()
+            if process is not None and not entry.get('group_stopped'):
+                def signal_group(sig):
+                    try:
+                        os.killpg(process.pid, sig)
+                    except ProcessLookupError:
+                        pass
+
+                signal_group(signal.SIGTERM)
                 try:
                     process.wait(timeout=3)
                 except subprocess.TimeoutExpired:
-                    process.kill()
-                    process.wait(timeout=3)
+                    pass
+                # The master can exit before its ProxyCommand or ProxyJump.
+                signal_group(signal.SIGKILL)
+                process.wait(timeout=3)
+                entry['group_stopped'] = True
             entry['log'].close()
             pathlib.Path(entry['path']).unlink(missing_ok=True)
 
