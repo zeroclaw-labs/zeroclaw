@@ -1335,7 +1335,6 @@ mod tests {
         forged.insert(HOST, HeaderValue::from_static("another.example.com"));
         assert!(
             tool.apply_scoped_credential(&mut forged, "TEST", &target)
-                .await
                 .is_err()
         );
         assert!(!forged.contains_key("x-api-key"));
