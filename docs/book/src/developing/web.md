@@ -101,7 +101,7 @@ and `structuredClone()`.
 
 ## Browser voice controls
 
-Paired browsers can open **Config → Voice and audio** to enable microphone and
+Paired browsers can open **Config → Other → Browser Voice and Audio** to enable microphone and
 speaker controls in chat. Preferences live in the gateway's `devices.db`, on the
 existing paired-device record, and survive page reloads and gateway restarts.
 `GET` and `PUT /api/devices/me/voice` resolve that record from the authenticated
