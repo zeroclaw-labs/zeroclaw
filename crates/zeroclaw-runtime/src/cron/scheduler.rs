@@ -13,7 +13,7 @@ use crate::live_config_authority::{
 use crate::security::SecurityPolicy;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use futures_util::{StreamExt, stream};
+use futures_util::stream::{self, FuturesUnordered, StreamExt};
 use std::process::Stdio;
 use std::sync::Arc;
 use tokio::time::{self, Duration};
@@ -578,7 +578,18 @@ pub async fn run_with_capability(
     .await
 }
 
-/// Poll for due jobs every `poll_every` until `cancel` fires.
+/// Poll for due jobs every `poll_every` until `cancel` fires, running at most
+/// `scheduler.max_concurrent` jobs at once across polls.
+///
+/// Polling goes on while jobs run, so a long job holds one slot and the other
+/// due jobs start in the free ones. When a job finishes, its slot goes at once
+/// to a job that was already due at the last poll; a job that falls due later,
+/// the finished one included, waits for the next poll. Jobs are claimed only
+/// for free slots, and each claimed job starts or is released right away, so
+/// no claim waits unstarted. The runs live in this future, not in spawned
+/// tasks: dropping the scheduler drops them, as the daemon does when its
+/// shutdown grace ends. On cancellation no new job starts, and the running
+/// jobs are driven to completion before the loop returns.
 async fn poll_due_jobs(
     config: &Config,
     event_tx: &EventBroadcast,
@@ -589,53 +600,69 @@ async fn poll_due_jobs(
 ) -> Result<()> {
     let mut interval = time::interval(poll_every);
     interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+    let mut running = FuturesUnordered::new();
+    let mut last_poll = Utc::now();
 
     loop {
-        tokio::select! {
-            _ = interval.tick() => {
-                // Keep scheduler liveness fresh even when there are no due jobs.
-                crate::health::mark_component_ok(component);
-
-                let execution_selection = execution_capability
-                    .map(AgentExecutionCapability::capture_selection);
-                let selection_config = execution_selection.as_ref()
-                    .map(|selection| selection.config_handle().read().clone());
-                let config = selection_config.as_ref().unwrap_or(config);
-                let jobs = match due_jobs(config, Utc::now()) {
-                    Ok(jobs) => jobs,
-                    Err(e) => {
-                        crate::health::mark_component_error(component, e.to_string());
-                        ::zeroclaw_log::record!(
-                            WARN,
-                            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                                .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                            "Scheduler query failed"
-                        );
-                        continue;
-                    }
-                };
-
-                let jobs = claim_due_jobs(config, jobs);
-                process_due_jobs(
-                    config,
-                    jobs,
-                    component,
-                    event_tx,
-                    execution_selection,
-                )
-                .await;
-            }
+        let due_by = tokio::select! {
+            biased;
             _ = cancel.cancelled() => {
                 crate::health::mark_component_ok(component);
                 ::zeroclaw_log::record!(
                     INFO,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({"running": running.len()})),
                     "Cron scheduler shutting down via cancellation token"
                 );
+                while let Some((result, _execution_admission)) = running.next().await {
+                    report_job_result(event_tx, result);
+                }
                 return Ok(());
             }
+            Some((result, _execution_admission)) = running.next(), if !running.is_empty() => {
+                report_job_result(event_tx, result);
+                last_poll
+            }
+            _ = interval.tick() => {
+                // Keep scheduler liveness fresh even when there are no due jobs.
+                crate::health::mark_component_ok(component);
+                last_poll = Utc::now();
+                last_poll
+            }
+        };
+
+        let execution_selection =
+            execution_capability.map(AgentExecutionCapability::capture_selection);
+        let selection_config = execution_selection
+            .as_ref()
+            .map(|selection| selection.config_handle().read().clone());
+        let config = selection_config.as_ref().unwrap_or(config);
+        let free_slots = config
+            .scheduler
+            .max_concurrent
+            .max(1)
+            .saturating_sub(running.len());
+        if free_slots == 0 {
+            continue;
         }
+        let jobs = match due_jobs(config, due_by) {
+            Ok(jobs) => jobs,
+            Err(e) => {
+                crate::health::mark_component_error(component, e.to_string());
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    "Scheduler query failed"
+                );
+                continue;
+            }
+        };
+        let jobs = claim_due_jobs(config, jobs.into_iter().take(free_slots).collect());
+        running.extend(jobs.into_iter().filter_map(|job| {
+            prepare_due_job(config, job, component, execution_selection.as_ref())
+        }));
     }
 }
 
@@ -1013,74 +1040,104 @@ async fn process_due_jobs(
     crate::health::mark_component_ok(component);
 
     let max_concurrent = config.scheduler.max_concurrent.max(1);
-    let mut in_flight = stream::iter(jobs.into_iter().filter_map(|job| {
-        // Selection already drops unowned jobs; this guards callers that
-        // hand in jobs from elsewhere.
-        if resolve_owning_agent(config, &job).is_none() {
-            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(super::store::ownership_refusal_attrs(config, &job)), NO_OWNER_MESSAGE);
-            let _ = release_job(config, &job.id);
-            return None;
-        }
-        let (agent_alias, execution_admission, execution_config) =
-            match resolve_execution_target(config, &job, execution_selection.as_ref()) {
-                Ok(target) => target,
-                Err(error) => {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                            .with_attrs(::serde_json::json!({"job_id": job.id, "error": error.to_string()})),
-                        "Cron job: target admission failed"
-                    );
-                    let _ = release_job(config, &job.id);
-                    return None;
-                }
-            };
-        let security = match SecurityPolicy::for_agent(&execution_config, &agent_alias) {
-            Ok(s) => Arc::new(s),
-            Err(e) => {
-                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"job_id": job.id, "agent": agent_alias, "error": format!("{}", e)})), "Cron job: failed to build SecurityPolicy for owning agent");
-                let _ = release_job(&execution_config, &job.id);
+    let mut in_flight =
+        stream::iter(jobs.into_iter().filter_map(|job| {
+            prepare_due_job(config, job, component, execution_selection.as_ref())
+        }))
+        .buffer_unordered(max_concurrent);
+
+    while let Some((result, _execution_admission)) = in_flight.next().await {
+        report_job_result(event_tx, result);
+    }
+}
+
+/// Resolve a claimed job's owner, admission and security policy, and return
+/// its run. A job that cannot be resolved is released and returns `None`.
+/// The run owns everything it uses, so it can outlive the poll that claimed it.
+fn prepare_due_job(
+    config: &Config,
+    job: CronJob,
+    component: &str,
+    execution_selection: Option<&AgentExecutionSelection>,
+) -> Option<
+    impl std::future::Future<Output = ((String, bool, String), Option<AgentExecutionAdmission>)>
+    + Send
+    + use<>,
+> {
+    // Selection already drops unowned jobs; this guards callers that
+    // hand in jobs from elsewhere.
+    if resolve_owning_agent(config, &job).is_none() {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(super::store::ownership_refusal_attrs(config, &job)),
+            NO_OWNER_MESSAGE
+        );
+        let _ = release_job(config, &job.id);
+        return None;
+    }
+    let (agent_alias, execution_admission, execution_config) =
+        match resolve_execution_target(config, &job, execution_selection) {
+            Ok(target) => target,
+            Err(error) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(
+                            ::serde_json::json!({"job_id": job.id, "error": error.to_string()})
+                        ),
+                    "Cron job: target admission failed"
+                );
+                let _ = release_job(config, &job.id);
                 return None;
             }
         };
-        let config = execution_config;
-        let component = component.to_owned();
-        Some(async move {
-            let result = Box::pin(execute_and_persist_job(
-                &config,
-                security.as_ref(),
-                &agent_alias,
-                &job,
-                &component,
-                execution_admission.clone(),
-            ))
-            .await;
-            (result, execution_admission)
-        })
-    }))
-    .buffer_unordered(max_concurrent);
+    let security = match SecurityPolicy::for_agent(&execution_config, &agent_alias) {
+        Ok(s) => Arc::new(s),
+        Err(e) => {
+            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"job_id": job.id, "agent": agent_alias, "error": format!("{}", e)})), "Cron job: failed to build SecurityPolicy for owning agent");
+            let _ = release_job(&execution_config, &job.id);
+            return None;
+        }
+    };
+    let config = execution_config;
+    let component = component.to_owned();
+    Some(async move {
+        let result = Box::pin(execute_and_persist_job(
+            &config,
+            security.as_ref(),
+            &agent_alias,
+            &job,
+            &component,
+            execution_admission.clone(),
+        ))
+        .await;
+        (result, execution_admission)
+    })
+}
 
-    while let Some(((job_id, success, output), _execution_admission)) = in_flight.next().await {
-        if !success {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"job_id": job_id, "output": output})),
-                "Scheduler job '' failed: "
-            );
-        }
-        // Broadcast cron result to dashboard/SSE clients.
-        if let Some(tx) = event_tx {
-            let _ = tx.send(serde_json::json!({
-                "type": "cron_result",
-                "job_id": job_id,
-                "success": success,
-                "output": output,
-                "timestamp": chrono::Utc::now().to_rfc3339(),
-            }));
-        }
+/// Log a failed run, and broadcast every run's result to dashboard/SSE clients.
+fn report_job_result(event_tx: &EventBroadcast, (job_id, success, output): (String, bool, String)) {
+    if !success {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({"job_id": job_id, "output": output})),
+            "Scheduler job '' failed: "
+        );
+    }
+    // Broadcast cron result to dashboard/SSE clients.
+    if let Some(tx) = event_tx {
+        let _ = tx.send(serde_json::json!({
+            "type": "cron_result",
+            "job_id": job_id,
+            "success": success,
+            "output": output,
+            "timestamp": chrono::Utc::now().to_rfc3339(),
+        }));
     }
 }
 
@@ -3271,6 +3328,305 @@ mod tests {
         let snapshot = crate::health::snapshot_json();
         let entry = &snapshot["components"][component.as_str()];
         assert_eq!(entry["status"], "ok");
+    }
+
+    /// The poll loop, driven with shell jobs that `sleep`, which the Windows
+    /// shells do not have.
+    #[cfg(not(target_os = "windows"))]
+    mod poll_loop {
+        use super::*;
+
+        /// A config whose test agent may run `sleep` and `echo` as often as the
+        /// poll-loop tests need, with `max_concurrent` scheduler slots.
+        async fn poll_test_config(tmp: &TempDir, max_concurrent: usize) -> Config {
+            let mut config = test_config(tmp).await;
+            config.scheduler.max_concurrent = max_concurrent;
+            config.scheduler.max_run_history = 1_000;
+            config
+                .risk_profiles
+                .entry(TEST_AGENT.into())
+                .or_default()
+                .allowed_commands = vec!["sleep".into(), "echo".into()];
+            config
+                .runtime_profiles
+                .entry(TEST_AGENT.into())
+                .or_default()
+                .max_actions_per_hour = u32::MAX;
+            config
+        }
+
+        /// A recurring shell job first due `every_ms` from now, and again
+        /// `every_ms` after each run.
+        fn add_every_job(config: &Config, every_ms: u64, command: &str) -> CronJob {
+            cron::add_shell_job(
+                config,
+                TEST_AGENT,
+                None,
+                Schedule::Every { every_ms },
+                command,
+            )
+            .unwrap()
+        }
+
+        /// The job's finished runs, oldest first.
+        fn runs_oldest_first(config: &Config, job: &CronJob) -> Vec<cron::CronRun> {
+            let mut runs = cron::list_runs(config, &job.id, 1_000).unwrap();
+            runs.reverse();
+            runs
+        }
+
+        const TEST_POLL_EVERY: Duration = Duration::from_millis(50);
+
+        /// Whether the job holds its in-flight claim: it is due within a second,
+        /// yet `due_jobs` does not offer it.
+        fn is_claimed(config: &Config, job: &CronJob) -> bool {
+            !due_jobs(config, Utc::now() + ChronoDuration::seconds(1))
+                .unwrap()
+                .iter()
+                .any(|due| due.id == job.id)
+        }
+
+        /// Drive `poll` until `done` holds or `within` passes, and return whether
+        /// `done` held. The poll loop must not return meanwhile.
+        async fn drive_until<F: std::future::Future<Output = Result<()>>>(
+            mut poll: std::pin::Pin<&mut F>,
+            within: Duration,
+            mut done: impl FnMut() -> bool,
+        ) -> bool {
+            let deadline = tokio::time::Instant::now() + within;
+            loop {
+                tokio::select! {
+                    result = poll.as_mut() => panic!("the poll loop returned early: {result:?}"),
+                    () = tokio::time::sleep(Duration::from_millis(25)) => {
+                        if done() {
+                            return true;
+                        }
+                        if tokio::time::Instant::now() >= deadline {
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
+
+        /// Run the poll loop until `done` holds or `within` passes, then drop it,
+        /// which drops any job still running. Returns whether `done` held.
+        async fn poll_until(
+            config: &Config,
+            poll_every: Duration,
+            within: Duration,
+            done: impl FnMut() -> bool,
+        ) -> bool {
+            let events = None;
+            let cancel = CancellationToken::new();
+            let component = unique_component("scheduler-poll");
+            let poll = poll_due_jobs(config, &events, &cancel, None, &component, poll_every);
+            tokio::pin!(poll);
+            drive_until(poll.as_mut(), within, done).await
+        }
+
+        #[tokio::test]
+        async fn a_long_job_does_not_hold_back_other_due_jobs() {
+            let tmp = TempDir::new().unwrap();
+            let config = poll_test_config(&tmp, 4).await;
+            let long = add_every_job(&config, 50, "sleep 30");
+            let short = add_every_job(&config, 50, "echo short");
+
+            let short_ran_three_times =
+                poll_until(&config, TEST_POLL_EVERY, Duration::from_secs(20), || {
+                    runs_oldest_first(&config, &short).len() >= 3
+                })
+                .await;
+
+            assert!(
+                short_ran_three_times,
+                "a due job must start while a long job from an earlier poll still runs"
+            );
+            assert!(
+                runs_oldest_first(&config, &long).is_empty(),
+                "the long job is still on its first run"
+            );
+        }
+
+        #[tokio::test]
+        async fn max_concurrent_caps_running_jobs_across_polls() {
+            let tmp = TempDir::new().unwrap();
+            let config = poll_test_config(&tmp, 2).await;
+            // `first` takes a slot; `second` falls due in a later poll and takes
+            // the other; `third` falls due while both run and has to wait.
+            let first = add_every_job(&config, 50, "sleep 3");
+            let second = add_every_job(&config, 400, "sleep 3");
+            let third = add_every_job(&config, 800, "echo third");
+
+            let all_ran = poll_until(&config, TEST_POLL_EVERY, Duration::from_secs(40), || {
+                [&first, &second, &third]
+                    .iter()
+                    .all(|job| !runs_oldest_first(&config, job).is_empty())
+            })
+            .await;
+            assert!(all_ran, "every job runs once");
+
+            let first = &runs_oldest_first(&config, &first)[0];
+            let second = &runs_oldest_first(&config, &second)[0];
+            let third = &runs_oldest_first(&config, &third)[0];
+            assert!(
+                second.started_at < first.finished_at,
+                "the second job starts in a later poll while the first one runs"
+            );
+            assert!(
+                third.started_at >= first.finished_at.min(second.finished_at),
+                "with both slots busy the third job waits for one to free up, \
+                 although it fell due in a poll of its own"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_freed_slot_goes_at_once_to_a_job_due_at_the_last_poll() {
+            let tmp = TempDir::new().unwrap();
+            let config = poll_test_config(&tmp, 1).await;
+            let first = add_every_job(&config, 100, "sleep 1");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            let waiting = add_every_job(&config, 100, "echo waiting");
+            // Both are due at the first poll; the second poll is a minute away.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+
+            let waiting_ran = poll_until(
+                &config,
+                Duration::from_secs(60),
+                Duration::from_secs(20),
+                || !runs_oldest_first(&config, &waiting).is_empty(),
+            )
+            .await;
+            assert!(
+                waiting_ran,
+                "the waiting job takes the slot when the first job ends, not at the next poll"
+            );
+            let first = &runs_oldest_first(&config, &first)[0];
+            let waiting = &runs_oldest_first(&config, &waiting)[0];
+            assert!(
+                waiting.started_at >= first.finished_at,
+                "with one slot the waiting job starts after the first one ends"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_finished_job_does_not_start_again_before_the_next_poll() {
+            let tmp = TempDir::new().unwrap();
+            let config = poll_test_config(&tmp, 4).await;
+            // Due again 1 ms after each run ends, so only the next poll may
+            // start it again; that poll is a minute away.
+            let job = add_every_job(&config, 1, "echo again");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+
+            let _ = poll_until(
+                &config,
+                Duration::from_secs(60),
+                Duration::from_secs(2),
+                || false,
+            )
+            .await;
+            assert_eq!(
+                runs_oldest_first(&config, &job).len(),
+                1,
+                "a freed slot goes only to jobs that were due at the last poll"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_running_job_is_not_started_again_by_later_polls() {
+            let tmp = TempDir::new().unwrap();
+            let config = poll_test_config(&tmp, 4).await;
+            // `long` is due again 50 ms after it starts, so every poll during its
+            // run would start it again if its claim did not hold.
+            let long = add_every_job(&config, 50, "sleep 2");
+            let short = add_every_job(&config, 200, "echo short");
+
+            let long_ran_twice =
+                poll_until(&config, TEST_POLL_EVERY, Duration::from_secs(40), || {
+                    runs_oldest_first(&config, &long).len() >= 2
+                })
+                .await;
+            assert!(long_ran_twice, "the long job runs twice in a row");
+
+            let long_runs = runs_oldest_first(&config, &long);
+            for pair in long_runs.windows(2) {
+                assert!(
+                    pair[1].started_at >= pair[0].finished_at,
+                    "a run of the long job started before its previous run ended: {long_runs:?}"
+                );
+            }
+            let short_runs_during_first_long_run = runs_oldest_first(&config, &short)
+                .iter()
+                .filter(|run| run.started_at < long_runs[0].finished_at)
+                .count();
+            assert!(
+                short_runs_during_first_long_run >= 3,
+                "polls kept starting the short job during the long run, \
+                 got {short_runs_during_first_long_run} runs"
+            );
+        }
+
+        #[tokio::test]
+        async fn cancellation_starts_nothing_new_and_lets_running_jobs_finish() {
+            let tmp = TempDir::new().unwrap();
+            let config = poll_test_config(&tmp, 4).await;
+            let running = add_every_job(&config, 50, "sleep 1");
+            let events = None;
+            let cancel = CancellationToken::new();
+            let component = unique_component("scheduler-cancel");
+            let poll = poll_due_jobs(&config, &events, &cancel, None, &component, TEST_POLL_EVERY);
+            tokio::pin!(poll);
+
+            let claimed = drive_until(poll.as_mut(), Duration::from_secs(20), || {
+                is_claimed(&config, &running)
+            })
+            .await;
+            assert!(claimed, "the first job is claimed and running");
+            // Due within two polls, while the first job still has most of its
+            // second to go.
+            let late = add_every_job(&config, 100, "echo late");
+            cancel.cancel();
+
+            tokio::time::timeout(Duration::from_secs(20), poll)
+                .await
+                .expect("the loop returns once the running job ends")
+                .unwrap();
+            assert_eq!(
+                runs_oldest_first(&config, &running).len(),
+                1,
+                "the running job finishes and is recorded"
+            );
+            assert!(
+                runs_oldest_first(&config, &late).is_empty(),
+                "no job starts after cancellation"
+            );
+        }
+
+        #[tokio::test]
+        async fn dropping_the_scheduler_leaves_a_running_job_for_startup_recovery() {
+            let tmp = TempDir::new().unwrap();
+            let config = poll_test_config(&tmp, 4).await;
+            let job = add_every_job(&config, 50, "sleep 30");
+
+            let claimed = poll_until(&config, TEST_POLL_EVERY, Duration::from_secs(20), || {
+                is_claimed(&config, &job)
+            })
+            .await;
+            assert!(
+                claimed,
+                "the job is claimed and running when the loop drops"
+            );
+
+            assert!(runs_oldest_first(&config, &job).is_empty());
+            assert_eq!(clear_stale_locks(&config).unwrap(), 1);
+            assert!(
+                due_jobs(&config, Utc::now())
+                    .unwrap()
+                    .iter()
+                    .any(|due| due.id == job.id),
+                "after startup recovery the dropped run is due again"
+            );
+        }
     }
 
     #[tokio::test]
