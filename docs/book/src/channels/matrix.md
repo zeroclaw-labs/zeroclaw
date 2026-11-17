@@ -15,7 +15,7 @@ Common failure mode this guide targets:
 If Matrix appears connected but there's no reply, validate these first:
 
 1. Sender is in the agent's peer set (for testing: `external_peers = ["*"]`).
-2. Bot account has joined the exact target room: invite it from your client, see [Adding the bot to a room](#adding-the-bot-to-a-room).
+2. Bot account has joined the exact target room: invite it from your client, see [Adding the bot to a room](#adding-the-bot-to-a-room). With only `*` in the peer set and an empty `allowed_rooms`, the invite is declined: add your own user ID next to `*` (`external_peers = ["*", "@you:example.org"]`).
 3. Credentials belong to the bot account (`whoami` check on the token path, see [§5C](#c-token-and-identity)).
 4. Encrypted room can be decrypted: `recovery_key` set (recommended) or keys shared to the bot device.
 5. Daemon was restarted after config changes.
@@ -44,16 +44,19 @@ checks it applies to every inbound message:
 - The **inviter** is in the agent's peer set ([Who can talk to the agent](#who-can-talk-to-the-agent)).
 - The room is listed in `allowed_rooms`, or `allowed_rooms` is empty.
 
+When `allowed_rooms` is empty, there is one more condition: the inviter must
+be **named** in the peer set. A `*` grant lets anyone talk to the bot in rooms
+it is already in, but it does not let anyone choose new rooms for it.
+Otherwise, with `external_peers = ["*"]` and no room allowlist, any Matrix user
+on any federated homeserver could pull the bot into a room of their choosing.
+To use invites with an open peer set, name the inviters alongside `*` (for
+example `external_peers = ["*", "@you:example.org"]`) or list the target rooms
+in `allowed_rooms`.
+
 Any other invite is declined silently: it stays pending in the room, and the
 inviter gets no rejection. ZeroClaw does not retry it later, so after fixing
 the peer set or `allowed_rooms`, cancel the pending invite and send a new one
 (see [§5A](#a-room-and-membership)).
-
-> **Open peer sets admit anyone.** With `external_peers = ["*"]` and an empty
-> `allowed_rooms`, any Matrix user on any federated homeserver can invite the
-> bot into a room of their choosing and talk to it there. Keep `*` for
-> testing. For a long-running bot, list explicit user IDs in the peer group,
-> restrict `allowed_rooms`, or both.
 
 ## 2. Configuration
 
@@ -178,7 +181,7 @@ Work through in order.
 
 ### A. Room and membership
 
-- Confirm the bot account has joined the room. If the bot's invite is still pending, ZeroClaw declined it: the inviter is not in the peer set, or the room is not in a non-empty `allowed_rooms`. Declined invites are not retried. Fix the config, restart the daemon, then cancel the pending invite and invite the bot again. With debug logging on ([§6](#6-debug-logging)), each declined invite logs `matrix: decline invite from non-allowed sender or room` with the inviter and room ID.
+- Confirm the bot account has joined the room. If the bot's invite is still pending, ZeroClaw declined it: the inviter is not in the peer set, the room is not in a non-empty `allowed_rooms`, or the inviter is admitted only by `*` while `allowed_rooms` is empty. Declined invites are not retried. Fix the config, restart the daemon, then cancel the pending invite and invite the bot again. With debug logging on ([§6](#6-debug-logging)), each declined invite logs `matrix: decline invite from non-allowed sender or room` with the inviter and room ID. An invite declined because only `*` admits the inviter logs `matrix: decline invite admitted only by wildcard peer grant` at the default (info) level.
 - If you put a room in `allowed_rooms`, it must be the **canonical** room ID (`!room:server`), not a `#alias:server`. Aliases are not resolved for the allowlist, so an alias entry silently matches nothing. Find the canonical ID in Element via Room settings → Advanced → Internal room ID.
 
 ### B. Sender allowlist (peer groups)
