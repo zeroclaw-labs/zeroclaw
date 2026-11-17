@@ -1385,7 +1385,7 @@ mod tests {
         use crate::agent::turn::provider_call::enforce_tool_loop_budget;
         use crate::cost::CostTracker;
         use std::collections::HashMap;
-        use zeroclaw_config::schema::CostConfig;
+        use zeroclaw_config::schema::{CostConfig, CostEnforcementConfig};
         use zeroclaw_providers::traits::TokenUsage;
 
         let workspace = tempfile::TempDir::new().expect("temp dir");
@@ -1487,6 +1487,10 @@ mod tests {
                     enabled: true,
                     track_per_agent: true,
                     daily_limit_usd: expected_cost / 2.0,
+                    enforcement: CostEnforcementConfig {
+                        mode: "block".into(),
+                        ..CostEnforcementConfig::default()
+                    },
                     ..CostConfig::default()
                 },
                 capped_workspace.path(),
@@ -1553,7 +1557,8 @@ mod tests {
         use axum::{Json, Router, extract::State, routing::post};
         use std::collections::HashMap;
         use zeroclaw_config::schema::{
-            CostConfig, ModelProviderConfig, OllamaModelProviderConfig, RiskProfileConfig,
+            CostConfig, CostEnforcementConfig, ModelProviderConfig, OllamaModelProviderConfig,
+            RiskProfileConfig,
         };
 
         // `[providers.models.ollama.*]` dispatches through the shared
@@ -1796,6 +1801,10 @@ mod tests {
             enabled: true,
             track_per_agent: true,
             daily_limit_usd: recipient_summary.session_cost_usd / 2.0,
+            enforcement: CostEnforcementConfig {
+                mode: "block".into(),
+                ..CostEnforcementConfig::default()
+            },
             ..CostConfig::default()
         });
         let unrelated_ctx =

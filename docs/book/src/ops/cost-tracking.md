@@ -203,6 +203,16 @@ assurance while the current month contains unpriced tokens. Configure the
 missing rate dimensions and generate a new request before relying on cap
 enforcement; existing ledger rows are never retroactively repriced.
 
+The mode applies to the shared `daily_limit_usd` and `monthly_limit_usd`
+limits. It is read together with the limits at each check, so it follows the
+same reload rules. A delegated agent's per-hop ceiling
+(`max_cost_per_day_cents` on its runtime profile) refuses that agent in every
+mode. Under `warn`, each model call past a shared limit logs a warn-level
+`cost limit exceeded` event and nothing stops the spend; set `mode = "block"`
+when the limit must hold. `route_down` does not substitute a model yet: it
+refuses the request as `block` does and logs that it did so. Any value other
+than `warn`, `block` or `route_down` is also enforced as `block`.
+
 ## Per-agent attribution
 
 When `cost.track_per_agent` is true (default) every recorded
