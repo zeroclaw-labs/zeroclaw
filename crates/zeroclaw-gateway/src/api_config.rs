@@ -1179,7 +1179,7 @@ struct PluginTlsCredentialMutation {
     value: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Copy, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum PluginTlsCredentialOperation {
     Create,
@@ -1357,6 +1357,40 @@ struct HttpCredentialPermissions {
     destinations: Option<Vec<zeroclaw_config::schema::SshCredentialDestination>>,
 }
 
+fn scoped_credential_kind(auth: &zeroclaw_config::schema::ScopedHttpAuth) -> &'static str {
+    use zeroclaw_config::schema::ScopedHttpAuth;
+    match auth {
+        ScopedHttpAuth::ApiKey { .. } => "api_key",
+        ScopedHttpAuth::UserPassword { .. } => "user_password",
+        ScopedHttpAuth::SshKey { .. } => "ssh_key",
+        ScopedHttpAuth::Totp { .. } => "totp",
+    }
+}
+
+fn audit_scoped_credential_mutation(
+    principal: &RequestPrincipal,
+    name: &str,
+    kind: Option<&str>,
+    operation: &str,
+    grant: Option<serde_json::Value>,
+    saved: bool,
+) {
+    ::zeroclaw_log::record!(
+        INFO,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+            serde_json::json!({
+                "actor": principal.as_ref().map(|auth| auth.0.principal.id.as_str()),
+                "credential": name,
+                "kind": kind,
+                "operation": operation,
+                "grant": grant,
+                "saved": saved
+            })
+        ),
+        "Scoped credential mutation"
+    );
+}
+
 pub async fn list_http_credentials(
     State(state): State<AppState>,
     principal: RequestPrincipal,
@@ -1392,12 +1426,7 @@ pub async fn list_http_credentials(
                 }) else {
                     return StatusCode::SERVICE_UNAVAILABLE.into_response();
                 };
-                let kind = match record.auth {
-                    ScopedHttpAuth::ApiKey { .. } => "api_key",
-                    ScopedHttpAuth::UserPassword { .. } => "user_password",
-                    ScopedHttpAuth::SshKey { .. } => "ssh_key",
-                    ScopedHttpAuth::Totp { .. } => "totp",
-                };
+                let kind = scoped_credential_kind(&record.auth);
                 let header = match &record.auth {
                     ScopedHttpAuth::ApiKey { header, .. } => Some(header),
                     _ => None,
@@ -1481,6 +1510,10 @@ pub async fn mutate_http_credential(
                 }) else {
                     return StatusCode::SERVICE_UNAVAILABLE.into_response();
                 };
+                let grant = serde_json::json!({
+                    "http_allowed": permissions.http_allowed,
+                    "ssh_destination_count": permissions.destinations.as_ref().map(Vec::len),
+                });
                 match (
                     &mut record.auth,
                     permissions.http_allowed,
@@ -1517,9 +1550,21 @@ pub async fn mutate_http_credential(
                     Ok(authorization) => authorization,
                     Err(denied) => return denied.into_response(),
                 };
-                return match persist_and_swap(&state, authorization, config, guard).await {
-                    Ok(_) => StatusCode::NO_CONTENT.into_response(),
-                    Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+                let saved = persist_and_swap(&state, authorization, config, guard)
+                    .await
+                    .is_ok();
+                audit_scoped_credential_mutation(
+                    &principal,
+                    &mutation.name,
+                    Some(scoped_credential_kind(&record.auth)),
+                    "update_grant",
+                    Some(grant),
+                    saved,
+                );
+                return if saved {
+                    StatusCode::NO_CONTENT.into_response()
+                } else {
+                    StatusCode::INTERNAL_SERVER_ERROR.into_response()
                 };
             }
             let verb = match (mutation.operation, &mutation.credential, present) {
@@ -1528,7 +1573,14 @@ pub async fn mutate_http_credential(
                 (PluginTlsCredentialOperation::Delete, None, true) => Verb::Delete,
                 _ => return StatusCode::CONFLICT.into_response(),
             };
+            let operation = match mutation.operation {
+                PluginTlsCredentialOperation::Create => "create",
+                PluginTlsCredentialOperation::Replace => "replace",
+                PluginTlsCredentialOperation::Delete => "delete",
+            };
+            let kind;
             if let Some(mut credential) = mutation.credential {
+                kind = Some(scoped_credential_kind(&credential.auth));
                 credential.http_allowed = false;
                 if let Some(previous) = credentials.get(&mutation.name) {
                     let store = SecretStore::new(dir, true);
@@ -1639,7 +1691,15 @@ pub async fn mutate_http_credential(
                 };
                 credentials.insert(mutation.name.clone(), ciphertext);
             } else {
-                credentials.remove(&mutation.name);
+                kind = credentials.remove(&mutation.name).and_then(|stored| {
+                    let value = if stored.starts_with("enc2:") {
+                        SecretStore::new(dir, true).decrypt(&stored).ok()?
+                    } else {
+                        stored
+                    };
+                    let record: ScopedHttpCredential = serde_json::from_str(&value).ok()?;
+                    Some(scoped_credential_kind(&record.auth))
+                });
             }
             let path = format!("http_request.scoped_credentials.{}", mutation.name);
             config.mark_dirty(&path);
@@ -1651,13 +1711,22 @@ pub async fn mutate_http_credential(
                 Ok(authorization) => authorization,
                 Err(denied) => return denied.into_response(),
             };
-            if persist_and_swap(&state, authorization, config, guard)
+            let saved = persist_and_swap(&state, authorization, config, guard)
                 .await
-                .is_err()
-            {
-                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                .is_ok();
+            audit_scoped_credential_mutation(
+                &principal,
+                &mutation.name,
+                kind,
+                operation,
+                None,
+                saved,
+            );
+            if saved {
+                StatusCode::NO_CONTENT.into_response()
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR.into_response()
             }
-            StatusCode::NO_CONTENT.into_response()
         }
         .await,
     )

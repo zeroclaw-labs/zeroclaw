@@ -230,7 +230,36 @@ pub fn build_spec() -> serde_json::Value {
             "tags": ["config"],
             "summary": "List scoped credential metadata",
             "responses": {
-                "200": {"description": "Credential aliases, origins, kinds, sources and grants. Secret values and references are omitted."},
+                "200": {
+                    "description": "Credential metadata. Secret values and references are omitted.",
+                    "content": {"application/json": {"schema": {
+                        "type": "object",
+                        "required": ["encryption_enabled", "credentials"],
+                        "properties": {
+                            "encryption_enabled": {"type": "boolean"},
+                            "credentials": {"type": "array", "items": {
+                                "type": "object",
+                                "required": ["name", "origin", "kind", "source"],
+                                "properties": {
+                                    "name": {"type": "string"},
+                                    "origin": {"type": "string"},
+                                    "kind": {"type": "string"},
+                                    "source": {"type": "string"},
+                                    "http_allowed": {"type": ["boolean", "null"]},
+                                    "header": {"type": ["string", "null"]},
+                                    "destinations": {"type": ["array", "null"], "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "host": {"type": "string"},
+                                            "port": {"type": "integer"},
+                                            "username": {"type": "string"}
+                                        }
+                                    }}
+                                }
+                            }}
+                        }
+                    }}}
+                },
                 "403": {"description": "Authenticated operator required"},
                 "503": {"description": "Credential catalog unavailable"}
             }
@@ -1111,6 +1140,20 @@ mod tests {
             csp.contains("https://cdn.jsdelivr.net"),
             "default layer must not clobber the handler-owned docs CSP: {csp}"
         );
+    }
+
+    #[test]
+    #[cfg(feature = "schema-export")]
+    fn scoped_credential_openapi_marks_secret_inputs_write_only() {
+        let spec = build_spec();
+        let path = &spec["paths"]["/api/config/http-credentials"];
+        assert!(path["get"]["responses"]["200"].is_object());
+        assert!(path["post"]["responses"]["204"].is_object());
+        let auth = &path["post"]["requestBody"]["content"]["application/json"]["schema"]["properties"]
+            ["credential"]["properties"]["auth"]["properties"];
+        for name in ["value", "password", "seed", "private_key"] {
+            assert_eq!(auth[name]["writeOnly"], true);
+        }
     }
 
     #[cfg(all(feature = "schema-export", feature = "a2a"))]

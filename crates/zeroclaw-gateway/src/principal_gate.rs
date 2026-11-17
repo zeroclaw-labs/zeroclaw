@@ -1293,9 +1293,16 @@ mod tests {
             StatusCode::FORBIDDEN
         );
         assert_eq!(
-            send(&router, "POST", url, SCOPED.0, SCOPED.1, Some(create.clone()))
-                .await
-                .0,
+            send(
+                &router,
+                "POST",
+                url,
+                SCOPED.0,
+                SCOPED.1,
+                Some(create.clone())
+            )
+            .await
+            .0,
             StatusCode::FORBIDDEN
         );
         assert_eq!(
