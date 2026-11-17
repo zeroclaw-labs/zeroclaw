@@ -10856,7 +10856,7 @@ async fn process_channel_message_body(
 
     match llm_result {
         LlmExecutionResult::Cancelled => {
-            if !history_resync_failed {
+            if !history_resync_failed && !completed_turn_messages.is_empty() {
                 append_sender_turn(
                     ctx.as_ref(),
                     &history_key,
