@@ -276,9 +276,6 @@ class TaskTransportTests(unittest.TestCase):
         self.assertEqual(self.pool.entries['same']['active'], 1)
 
 
-if __name__ == '__main__': unittest.main()
-
-
 @unittest.skipUnless(pathlib.Path('/usr/bin/ssh').is_file() and pathlib.Path('/usr/bin/setpriv').is_file(),
                      'requires Linux OpenSSH and setpriv')
 class ProxyLifecycleTests(unittest.TestCase):
@@ -331,3 +328,7 @@ class ProxyLifecycleTests(unittest.TestCase):
                         except ProcessLookupError:
                             pass
                     pool.close()
+
+
+if __name__ == '__main__':
+    unittest.main()
