@@ -571,6 +571,9 @@ impl HttpRequestTool {
                     ScopedApiKeyHeader::Bearer => {
                         (AUTHORIZATION, format!("Bearer {value}"), vec![value])
                     }
+                    ScopedApiKeyHeader::Token => {
+                        (AUTHORIZATION, format!("Token {value}"), vec![value])
+                    }
                     ScopedApiKeyHeader::XApiKey => (
                         HeaderName::from_static("x-api-key"),
                         value.clone(),

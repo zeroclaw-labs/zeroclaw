@@ -34,7 +34,7 @@ export default function HttpCredentials({ kind }: { kind: HttpCredentialKind }) 
   const [catalog, setCatalog] = useState<Catalog>();
   const [editing, setEditing] = useState<HttpCredentialRow | "new" | null>(null);
   const [removing, setRemoving] = useState<HttpCredentialRow | null>(null);
-  const [header, setHeader] = useState<"bearer" | "x_api_key">("bearer");
+  const [header, setHeader] = useState<"bearer" | "x_api_key" | "token">("bearer");
   const [source, setSource] = useState<HttpCredentialSource>("local");
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState("");
@@ -159,10 +159,11 @@ export default function HttpCredentials({ kind }: { kind: HttpCredentialKind }) 
               <label htmlFor="credential-header">{t("http_credentials.header")}</label>
               <Select id="credential-header" value={header}
                 aria-label={t("http_credentials.header")}
-                onChange={(value) => setHeader(value === "x_api_key" ? "x_api_key" : "bearer")}
+                onChange={(value) => setHeader(value === "x_api_key" || value === "token" ? value : "bearer")}
                 options={[
                   { value: "bearer", label: "Authorization: Bearer" },
                   { value: "x_api_key", label: "X-API-Key" },
+                  { value: "token", label: "Authorization: Token" },
                 ]}
               />
             </div>

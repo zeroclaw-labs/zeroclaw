@@ -1385,12 +1385,12 @@ export interface MapKeyResponse {
 export type HttpCredentialKind = "user_password" | "api_key" | "ssh_key" | "totp";
 export type HttpCredentialSource = "local" | "open_bao" | "one_password" | "azure" | "aws" | "google";
 export type SshDestination = { host: string; port: number; username: string };
-export type HttpCredentialRow = { name: string; origin: string; kind: HttpCredentialKind; source: HttpCredentialSource; destinations?: SshDestination[] | null; http_allowed?: boolean | null; header?: "bearer" | "x_api_key" | null };
+export type HttpCredentialRow = { name: string; origin: string; kind: HttpCredentialKind; source: HttpCredentialSource; destinations?: SshDestination[] | null; http_allowed?: boolean | null; header?: "bearer" | "x_api_key" | "token" | null };
 type HttpCredentialAuth =
   | { kind: "totp"; seed: string }
   | { kind: "user_password"; username: string; password: string }
   | { kind: "ssh_key"; private_key: string; destinations: SshDestination[] }
-  | { kind: "api_key"; value: string; header: "bearer" | "x_api_key" };
+  | { kind: "api_key"; value: string; header: "bearer" | "x_api_key" | "token" };
 
 const httpCredentialsPath = "/api/config/http-credentials";
 

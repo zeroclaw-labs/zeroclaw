@@ -9115,6 +9115,7 @@ pub enum ScopedApiKeyHeader {
     #[default]
     Bearer,
     XApiKey,
+    Token,
 }
 
 #[derive(Clone, Copy, Default, Serialize, Deserialize)]
