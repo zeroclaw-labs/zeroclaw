@@ -78,7 +78,7 @@ pub(crate) fn collect_tool_results(
                 .map(|c| &c.arguments)
                 .unwrap_or(&serde_json::Value::Null);
             let det_result = if outcome.success {
-                loop_detector.record(&tool_name, args, &outcome.output)
+                loop_detector.record(tool_name, args, &outcome.output)
             } else {
                 crate::agent::loop_detector::LoopDetectionResult::Ok
             };
