@@ -187,6 +187,9 @@ pub(crate) async fn finish_after_max_iterations(
     // final-summary billed work. Declared outside the call block so the
     // match arms below can read it after the future completes.
     let mut summary_attempts = Vec::new();
+    // Estimate of the request actually dispatched (the collapsed view plus the
+    // summary prompt), for the display-only fallback below.
+    let mut dispatched_estimate = 0u64;
     let summary_call = {
         // Preparation and hooks belong to the same timeout/cancellation scope
         // as dispatch; only a successful summary persists the prompt.
@@ -362,6 +365,7 @@ pub(crate) async fn finish_after_max_iterations(
                 }
                 break;
             }
+            dispatched_estimate = crate::agent::history::estimate_history_tokens(&messages) as u64;
             let summary_request = zeroclaw_providers::ChatRequest {
                 messages: &messages,
                 tools: None, // No tools — force a text response
@@ -465,7 +469,7 @@ pub(crate) async fn finish_after_max_iterations(
                 .as_ref()
                 .and_then(|u| u.input_tokens)
                 .is_none()
-                .then(|| crate::agent::history::estimate_history_tokens(history) as u64)
+                .then_some(dispatched_estimate)
                 .filter(|&est| est > 0);
             if let Some(est) = accepted_estimate {
                 for summary in &mut summary_attempts {
@@ -1346,7 +1350,8 @@ mod graceful_summary_metering_tests {
                 r#"{{"tool_calls":[{{"id":"call_{n}","name":"shell","arguments":"{{}}"}}]}}"#
             )));
             history.push(ChatMessage::tool(format!(
-                r#"{{"tool_call_id":"call_{n}","content":"output of turn {n}"}}"#
+                r#"{{"tool_call_id":"call_{n}","content":"output of turn {n} {}"}}"#,
+                "x".repeat(2_000)
             )));
             history.push(ChatMessage::assistant(format!("answer {n}")));
         }
@@ -1356,8 +1361,11 @@ mod graceful_summary_metering_tests {
         let knobs = LoopKnobs::default();
         let multimodal_config = MultimodalConfig::default();
 
-        finish_after_max_iterations(
-            &mut None,
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(8);
+        let mut memory_preamble = None;
+        let mut crumb_present = false;
+        let summary = finish_after_max_iterations(
+            &mut memory_preamble,
             &provider,
             &mut history,
             "custom",
@@ -1370,7 +1378,7 @@ mod graceful_summary_metering_tests {
             String::new(),
             "trace-collapsed-summary",
             &knobs,
-            None,
+            Some(&event_tx),
             None,
             None,
             None,
@@ -1380,7 +1388,7 @@ mod graceful_summary_metering_tests {
             None,
             None,
             |_, _| ResolvedContextLimits::legacy_fallback(0),
-            &mut false,
+            &mut crumb_present,
             None,
             &crate::observability::NoopObserver,
             None,
@@ -1388,9 +1396,33 @@ mod graceful_summary_metering_tests {
                 keep_prior_turns: 1,
                 known_tools: &known,
             },
-        )
-        .await
-        .expect("graceful summary should succeed");
+        );
+        TOOL_LOOP_COST_TRACKING_CONTEXT
+            .scope(Some(ToolLoopCostTrackingContext::usage_only()), summary)
+            .await
+            .expect("graceful summary should succeed");
+
+        // The provider reported no input tokens, so the accepted summary
+        // carries an estimate. It is of the collapsed request that was sent,
+        // not of the full working history.
+        let mut estimates = Vec::new();
+        while let Ok(event) = event_rx.try_recv() {
+            if let TurnEvent::Usage {
+                estimated_input_tokens: Some(estimate),
+                accepted: true,
+                ..
+            } = event
+            {
+                estimates.push(estimate);
+            }
+        }
+        let full = crate::agent::history::estimate_history_tokens(&working_history) as u64;
+        assert_eq!(estimates.len(), 1, "one accepted summary estimate");
+        assert!(
+            estimates[0] < full,
+            "estimate {} counts hidden tool output (full history {full})",
+            estimates[0]
+        );
 
         let captured = seen.lock().unwrap().join("\n");
         for n in [1, 2] {
