@@ -102,6 +102,8 @@ pub struct AnthropicModelProvider {
     /// One TTL per request by design. Defaults to the 5-minute API
     /// default.
     cache_ttl: CacheTtl,
+    /// Sent as `output_config.effort` on every request; `None` omits it.
+    effort: Option<String>,
     /// Memoized cleaned tool schemas: each registered schema is cleaned once
     /// per provider instance (not once per request) and the byte-stable
     /// result keeps the `cache_control` tools block identical across
@@ -166,6 +168,14 @@ struct NativeChatRequest {
     /// only; `None` (the default) keeps the request byte-identical to today.
     #[serde(skip_serializing_if = "Option::is_none")]
     fallbacks: Option<Vec<NativeFallbackEntry>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_config: Option<OutputConfig>,
+}
+
+/// The native `output_config` object: how deeply the model thinks.
+#[derive(Debug, Serialize)]
+struct OutputConfig {
+    effort: String,
 }
 
 /// One entry in the native `fallbacks` array: a model Anthropic may serve
@@ -184,8 +194,8 @@ struct NativeThinkingConfig {
     #[serde(rename = "type")]
     kind: &'static str,
     /// Fixed token budget for `enabled` thinking. Absent for `adaptive`
-    /// thinking, which lets the model pace itself — adaptive-only models
-    /// (Opus 4.7, Fable 5.1) reject `enabled` with HTTP 400.
+    /// thinking, which lets the model pace itself — models numbered 4.7 or
+    /// later reject `enabled` with HTTP 400.
     #[serde(skip_serializing_if = "Option::is_none")]
     budget_tokens: Option<u32>,
     /// Anthropic's `thinking.display` beta field. `None` leaves the key out
@@ -268,9 +278,9 @@ fn anthropic_beta_features(
     }
 }
 
-/// Anthropic thinking request styles. Adaptive-only models (Opus 4.7, the
-/// whole Fable 5 family) reject the fixed-budget `enabled` shape with HTTP
-/// 400 and require `adaptive`; budget-based models require `enabled`.
+/// Anthropic thinking request styles. Models numbered 4.7 or later reject
+/// the fixed-budget `enabled` shape with HTTP 400 and require `adaptive`;
+/// earlier models, and IDs with no such version, require `enabled`.
 ///
 /// Shared crate-wide: the OpenAI-compatible passthrough builder resolves the
 /// same style so gateway requests match the native provider's shapes.
@@ -280,18 +290,54 @@ pub(crate) enum AnthropicThinkingStyle {
     Adaptive,
 }
 
-/// Substring matching on purpose: gateway model IDs may carry routing
-/// prefixes (`claude-group/claude-opus-4-7`) that must resolve to the same
-/// style as the bare model name. The whole Fable 5 family is adaptive-only,
-/// so the bare `claude-fable-5` substring intentionally covers `fable-5` and
-/// `fable-5-1` alike; a hypothetical future budget-shaped member of the
-/// family would need this matcher revisited.
+/// Adaptive thinking for every Claude model numbered 4.7 or later, whatever
+/// the family. Anthropic rejects `enabled` + `budget_tokens` with HTTP 400
+/// on those models. 4.6 and earlier, and IDs that carry no such version
+/// (Mythos Preview, non-Claude models), keep the budget shape.
+///
+/// The version is the first `claude-<family>-<major>[-<minor>]` token.
+/// Text before it (gateway prefixes, `anthropic.`, `us.`) and after it
+/// (snapshot dates, `-v1:0`, `@...`, `-latest`, `-fast`) is ignored, so a
+/// decorated ID resolves the same way as the bare name.
 pub(crate) fn anthropic_thinking_style(model: &str) -> AnthropicThinkingStyle {
-    if model.contains("claude-opus-4-7") || model.contains("claude-fable-5") {
-        AnthropicThinkingStyle::Adaptive
-    } else {
-        AnthropicThinkingStyle::Budget
+    match claude_model_version(model) {
+        Some(version) if version >= (4, 7) => AnthropicThinkingStyle::Adaptive,
+        _ => AnthropicThinkingStyle::Budget,
     }
+}
+
+/// `(major, minor)` of the first `claude-<family>-<major>[-<minor>]` token
+/// in a model ID. A missing minor is `0`.
+fn claude_model_version(model: &str) -> Option<(u32, u32)> {
+    const FAMILIES: [&str; 5] = ["opus", "sonnet", "haiku", "fable", "mythos"];
+    model.match_indices("claude-").find_map(|(at, token)| {
+        let rest = &model[at + token.len()..];
+        let family = FAMILIES
+            .iter()
+            .copied()
+            .find(|family| rest.starts_with(family))?;
+        let rest = rest[family.len()..].strip_prefix('-')?;
+        let (major, rest) = leading_version_number(rest)?;
+        // A minor is one or two digits after `-` or `.`. An eight-digit
+        // snapshot date is not a minor, and neither is a later component
+        // such as the `2` in `claude-opus-4-5-2`.
+        let minor = rest
+            .strip_prefix('-')
+            .or_else(|| rest.strip_prefix('.'))
+            .and_then(leading_version_number)
+            .map_or(0, |(minor, _)| minor);
+        Some((major, minor))
+    })
+}
+
+/// Splits a leading run of one or two ASCII digits off `s`. A longer run is
+/// a date or build number, not a version component.
+fn leading_version_number(s: &str) -> Option<(u32, &str)> {
+    let digits = s.bytes().take_while(u8::is_ascii_digit).count();
+    if !(1..=2).contains(&digits) {
+        return None;
+    }
+    Some((s[..digits].parse().ok()?, &s[digits..]))
 }
 
 /// Characters legal between `data:` and `;base64,` in a data URI header: the
@@ -636,6 +682,7 @@ pub struct AnthropicBuilder {
     timeout_secs: Option<u64>,
     server_fallback_models: Vec<String>,
     cache_ttl: Option<CacheTtl>,
+    effort: Option<String>,
 }
 
 impl AnthropicBuilder {
@@ -691,6 +738,14 @@ impl AnthropicBuilder {
         self
     }
 
+    /// Effort level sent as `output_config.effort` on every request (`low`,
+    /// `medium`, `high`, `xhigh`, `max`). Defaults to unset, which leaves
+    /// requests byte-identical to today.
+    pub fn effort(mut self, effort: Option<&str>) -> Self {
+        self.effort = effort.map(ToString::to_string);
+        self
+    }
+
     pub fn build(self) -> AnthropicModelProvider {
         AnthropicModelProvider {
             alias: self.alias,
@@ -705,6 +760,7 @@ impl AnthropicBuilder {
                 .unwrap_or(zeroclaw_api::model_provider::BASELINE_TIMEOUT_SECS),
             server_fallback_models: self.server_fallback_models,
             cache_ttl: self.cache_ttl.unwrap_or_default(),
+            effort: self.effort,
             schema_cache: zeroclaw_api::schema::SchemaCleanCache::new(),
         }
     }
@@ -723,7 +779,12 @@ impl AnthropicModelProvider {
             timeout_secs: None,
             server_fallback_models: Vec::new(),
             cache_ttl: None,
+            effort: None,
         }
+    }
+
+    fn output_config(&self) -> Option<OutputConfig> {
+        self.effort.clone().map(|effort| OutputConfig { effort })
     }
 
     fn is_setup_token(token: &str) -> bool {
@@ -2916,6 +2977,7 @@ impl ModelProvider for AnthropicModelProvider {
             stream: None,
             thinking: None,
             fallbacks,
+            output_config: self.output_config(),
         };
 
         let mut request = self
@@ -3070,6 +3132,7 @@ impl ModelProvider for AnthropicModelProvider {
             stream: None,
             thinking: thinking_config,
             fallbacks,
+            output_config: self.output_config(),
         };
 
         let req = self
@@ -3308,6 +3371,7 @@ impl ModelProvider for AnthropicModelProvider {
                 // Streaming path (incl. this thinking `stream: None` request):
                 // never opts into server-side fallback.
                 fallbacks: None,
+                output_config: self.output_config(),
             };
             // Serialize eagerly so the request body is owned and `'static`
             // across the async boundary.
@@ -3439,6 +3503,7 @@ impl ModelProvider for AnthropicModelProvider {
             thinking: thinking_config,
             // Streaming never opts into server-side fallback.
             fallbacks: None,
+            output_config: self.output_config(),
         };
 
         let body = match Self::build_streaming_request(&native_request) {
@@ -4617,46 +4682,55 @@ data: {\"type\":\"message_stop\"}\n\n";
 
     #[test]
     fn anthropic_thinking_style_matrix() {
-        // Adaptive-only families: fixed-budget `enabled` returns 400.
-        assert_eq!(
-            anthropic_thinking_style("claude-opus-4-7"),
-            AnthropicThinkingStyle::Adaptive
-        );
-        assert_eq!(
-            anthropic_thinking_style("claude-opus-4-7-20260101"),
-            AnthropicThinkingStyle::Adaptive
-        );
-        assert_eq!(
-            anthropic_thinking_style("claude-fable-5-1"),
-            AnthropicThinkingStyle::Adaptive
-        );
-        assert_eq!(
-            anthropic_thinking_style("claude-fable-5-1-20260815"),
-            AnthropicThinkingStyle::Adaptive
-        );
-        // The whole Fable 5 family is adaptive-only: bare fable-5 and
-        // gateway-prefixed IDs resolve like fable-5-1.
-        assert_eq!(
-            anthropic_thinking_style("claude-fable-5"),
-            AnthropicThinkingStyle::Adaptive
-        );
-        assert_eq!(
-            anthropic_thinking_style("claude-group/claude-fable-5"),
-            AnthropicThinkingStyle::Adaptive
-        );
-        // Budget-based families keep the `enabled` shape.
-        assert_eq!(
-            anthropic_thinking_style("claude-opus-4-6"),
-            AnthropicThinkingStyle::Budget
-        );
-        assert_eq!(
-            anthropic_thinking_style("claude-sonnet-4-6"),
-            AnthropicThinkingStyle::Budget
-        );
-        assert_eq!(
-            anthropic_thinking_style("claude-haiku-4-5"),
-            AnthropicThinkingStyle::Budget
-        );
+        // Models numbered 4.7 or later reject `enabled`. Prefixes and
+        // suffixes must not change the answer; 4.6 and earlier, and IDs
+        // with no version, keep the budget shape.
+        let cases = [
+            ("claude-opus-4-7", AnthropicThinkingStyle::Adaptive),
+            ("claude-opus-4-7-20260101", AnthropicThinkingStyle::Adaptive),
+            ("claude-opus-4-7@20260101", AnthropicThinkingStyle::Adaptive),
+            ("claude-opus-4.7", AnthropicThinkingStyle::Adaptive),
+            ("claude-opus-5", AnthropicThinkingStyle::Adaptive),
+            ("claude-opus-5-5", AnthropicThinkingStyle::Adaptive),
+            ("claude-opus-5-5-20260101", AnthropicThinkingStyle::Adaptive),
+            ("claude-opus-5-5-fast", AnthropicThinkingStyle::Adaptive),
+            (
+                "anthropic.claude-opus-4-7-v1:0",
+                AnthropicThinkingStyle::Adaptive,
+            ),
+            ("claude-fable-5", AnthropicThinkingStyle::Adaptive),
+            ("claude-fable-5-1", AnthropicThinkingStyle::Adaptive),
+            (
+                "claude-fable-5-1-20260815",
+                AnthropicThinkingStyle::Adaptive,
+            ),
+            ("claude-fable-5-2-fast", AnthropicThinkingStyle::Adaptive),
+            (
+                "claude-group/claude-fable-5",
+                AnthropicThinkingStyle::Adaptive,
+            ),
+            ("claude-mythos-5-2", AnthropicThinkingStyle::Adaptive),
+            ("claude-sonnet-5", AnthropicThinkingStyle::Adaptive),
+            ("claude-sonnet-5-5", AnthropicThinkingStyle::Adaptive),
+            ("claude-haiku-5-5", AnthropicThinkingStyle::Adaptive),
+            (
+                "us.anthropic.claude-haiku-5-5",
+                AnthropicThinkingStyle::Adaptive,
+            ),
+            ("claude-opus-4-6", AnthropicThinkingStyle::Budget),
+            // A trailing component is not the version. Reading from the end
+            // would misread this as 5.2.
+            ("claude-opus-4-5-2", AnthropicThinkingStyle::Budget),
+            ("claude-opus-4-20250514", AnthropicThinkingStyle::Budget),
+            ("claude-sonnet-4-6", AnthropicThinkingStyle::Budget),
+            ("claude-sonnet-4-6-latest", AnthropicThinkingStyle::Budget),
+            ("claude-haiku-4-5", AnthropicThinkingStyle::Budget),
+            ("claude-mythos-preview", AnthropicThinkingStyle::Budget),
+            ("gpt-4o", AnthropicThinkingStyle::Budget),
+        ];
+        for (model, expected) in cases {
+            assert_eq!(anthropic_thinking_style(model), expected, "{model}");
+        }
     }
 
     #[test]
@@ -4679,6 +4753,52 @@ data: {\"type\":\"message_stop\"}\n\n";
         assert_eq!(config.display, None);
         assert_eq!(temp, Some(1.0));
         assert_eq!(max_tokens, provider.max_tokens);
+    }
+
+    #[test]
+    fn resolve_thinking_emits_adaptive_shape_for_4_7_families_and_decorated_ids() {
+        // The config this returns is what the messages request serializes.
+        // Qualified and fast-mode IDs must not fall back to `enabled`.
+        let provider = AnthropicModelProvider::builder("test")
+            .credential(Some("test-key"))
+            .build();
+        let params = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: 10_000,
+            display: None,
+        };
+        for model in [
+            "claude-opus-5-5",
+            "claude-fable-5-2-fast",
+            "anthropic.claude-opus-4-7-v1:0",
+            "claude-sonnet-5",
+            "claude-sonnet-5-5",
+            "claude-haiku-5-5",
+        ] {
+            let (temp, config, max_tokens) =
+                provider.resolve_thinking(Some(params), Some(0.7_f64), model);
+            let config = config.unwrap_or_else(|| panic!("thinking config for {model}"));
+            assert_eq!(
+                serde_json::to_value(&config).unwrap(),
+                serde_json::json!({"type": "adaptive"}),
+                "{model} must emit adaptive with no budget"
+            );
+            assert_eq!(temp, Some(1.0), "{model}");
+            assert_eq!(max_tokens, provider.max_tokens, "{model}");
+        }
+
+        for model in [
+            "claude-opus-4-20250514",
+            "claude-mythos-preview",
+            "claude-sonnet-4-6",
+        ] {
+            let (_, config, _) = provider.resolve_thinking(Some(params), Some(0.7_f64), model);
+            let config = config.unwrap_or_else(|| panic!("thinking config for {model}"));
+            assert_eq!(
+                serde_json::to_value(&config).unwrap(),
+                serde_json::json!({"type": "enabled", "budget_tokens": 10_000}),
+                "{model} must keep the budget shape"
+            );
+        }
     }
 
     #[test]
@@ -4732,6 +4852,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             stream: None,
             thinking: None,
             fallbacks: None,
+            output_config: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("max_tokens"));
@@ -4754,6 +4875,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             stream: None,
             thinking: None,
             fallbacks: None,
+            output_config: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(
@@ -5647,6 +5769,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             stream: None,
             thinking: None,
             fallbacks: None,
+            output_config: None,
         };
 
         let json = serde_json::to_string(&req).unwrap();
@@ -5676,6 +5799,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             stream: None,
             thinking: None,
             fallbacks: None,
+            output_config: None,
         };
 
         let json = serde_json::to_string(&req).unwrap();
@@ -9412,6 +9536,31 @@ data: {\"type\":\"message_stop\"}\n\n";
     }
 
     #[tokio::test]
+    async fn effort_config_adds_output_config_and_nothing_else() {
+        let (addr, captured, server) = spawn_capturing_server().await;
+        let builder = || {
+            AnthropicModelProvider::builder("test")
+                .credential(Some("sk-ant-api-key"))
+                .base_url(&format!("http://{addr}"))
+        };
+        for (effort, expected) in [
+            (Some("medium"), serde_json::json!({"effort": "medium"})),
+            (None, serde_json::Value::Null),
+        ] {
+            let result = builder()
+                .effort(effort)
+                .build()
+                .chat_with_system(None, "hello", "claude-opus-5-5", None)
+                .await;
+            assert!(result.is_ok(), "chat failed: {:?}", result.err());
+            let (_, body) = captured.lock().unwrap().take().expect("no request");
+            assert_eq!(body["output_config"], expected, "{body}");
+            assert!(body.get("thinking").is_none(), "no thinking: {body}");
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn oauth_credential_merges_beta_values_into_one_header() {
         let (addr, captured, server) = spawn_capturing_server().await;
         let provider = AnthropicModelProvider::builder("test")
@@ -10600,6 +10749,7 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"refusal\"},\"usag
                 display: Some(ThinkingDisplay::Updates),
             }),
             fallbacks: None,
+            output_config: None,
         };
 
         let body = serde_json::to_value(&request).expect("serialize");
@@ -10925,6 +11075,7 @@ data: {\"type\":\"message_stop\"}\n\n";
                 display: Some(ThinkingDisplay::Updates),
             }),
             fallbacks: None,
+            output_config: None,
         };
 
         let body = serde_json::to_value(&request).expect("serialize");
