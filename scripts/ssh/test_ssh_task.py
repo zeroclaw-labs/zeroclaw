@@ -48,6 +48,16 @@ class TaskTransportTests(unittest.TestCase):
         self.mock.stop()
         self.temp.cleanup()
 
+    def test_host_is_separated_from_openssh_options(self):
+        with self.assertRaisesRegex(ValueError, 'configured SSH host alias'):
+            module.parse_args(['--', '-invalid', 'true'])
+        with patch.object(module.subprocess, 'run') as inspect:
+            inspect.return_value.stdout = 'hostname example\n'
+            module.ssh_config(['-p', '2222'], 'example')
+            self.assertEqual(inspect.call_args.args[0][-2:], ['--', 'example'])
+        self.pool.acquire('boundary', ['-p', '2222'], 'example')
+        self.assertEqual(FakeMaster.starts[-1].command[-2:], ['--', 'example'])
+
     def test_command_options_cannot_control_the_shared_transport(self):
         from unittest.mock import MagicMock
         for command in [['-O', 'exit'], ['-o', 'ControlMaster=yes']]:

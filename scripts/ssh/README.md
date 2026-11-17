@@ -18,7 +18,7 @@ there is no automatic reconnect or unmanaged TCP fallback.
 
 ## Dependencies and setup
 
-Requires Linux, OpenSSH client, Python 3.10 or later, and util-linux `setpriv`
+Requires Linux, OpenSSH 8.7 or later, Python 3.10 or later, and util-linux `setpriv`
 with `--pdeathsig`. Other platforms and existing installations are unchanged
 when the helper is not configured. This initial implementation is for
 noninteractive commands, not interactive logins, port forwarding or SCP.
