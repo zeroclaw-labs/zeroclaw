@@ -1174,6 +1174,27 @@ impl Channel for XmppChannel {
 mod tests {
     use super::*;
 
+    #[test]
+    fn xmpp_parser_preserves_fractional_dates_and_rejects_invalid_input() {
+        use tokio_xmpp::parsers::{date::DateTime, delay::Delay};
+        let delay: Delay =
+            "<delay xmlns='urn:xmpp:delay' stamp='2026-01-01T00:00:00.123456789-00:30'/>"
+                .parse::<tokio_xmpp::minidom::Element>()
+                .unwrap()
+                .try_into()
+                .unwrap();
+        assert_eq!(delay.stamp.0.nanosecond(), 123456789);
+        assert_eq!(delay.stamp.timezone().whole_seconds(), -1800);
+        for invalid in [
+            "2017-13-01T12:23:34Z",
+            "2017-05-27T12:11:02+25:00",
+            "2017-05-27T12:11:02+0100",
+            "2017-05-27T12:11:02",
+        ] {
+            assert!(invalid.parse::<DateTime>().is_err(), "{invalid}");
+        }
+    }
+
     struct StalledControlSink {
         writes: Arc<std::sync::atomic::AtomicUsize>,
         dropped: Arc<std::sync::atomic::AtomicBool>,
