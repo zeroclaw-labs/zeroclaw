@@ -29,10 +29,10 @@ use zeroclaw_config::schema::{McpServerConfig, McpTransport};
 const RECV_TIMEOUT_SECS: u64 = 30;
 
 /// Default timeout for tool calls (seconds) when not configured per-server.
-const DEFAULT_TOOL_TIMEOUT_SECS: u64 = 180;
+pub(crate) const DEFAULT_TOOL_TIMEOUT_SECS: u64 = 180;
 
 /// Maximum allowed tool call timeout (seconds) — hard safety ceiling.
-const MAX_TOOL_TIMEOUT_SECS: u64 = 600;
+pub(crate) const MAX_TOOL_TIMEOUT_SECS: u64 = 600;
 
 /// Maximum automatic reconnect attempts when a request is known not to have
 /// been written. Outcome-unknown requests are never replayed.

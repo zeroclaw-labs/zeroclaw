@@ -168,7 +168,10 @@ impl McpOAuthManager {
         }
         let state = Arc::new(ServerState {
             canonical,
-            factory: OAuthClientFactory::new_with_nat64(config, self.nat64_prefixes.clone()),
+            factory: OAuthClientFactory::new_with_nat64(
+                config,
+                Arc::new(std::sync::Mutex::new(self.nat64_prefixes.clone())),
+            ),
             config: config.clone(),
             discovery: tokio::sync::RwLock::new(None),
             grant: tokio::sync::RwLock::new(None),
