@@ -484,8 +484,6 @@ pub async fn run_with_capability(
     execution_capability: Option<AgentExecutionCapability>,
 ) -> Result<()> {
     let poll_secs = config.reliability.scheduler_poll_secs.max(MIN_POLL_SECONDS);
-    let mut interval = time::interval(Duration::from_secs(poll_secs));
-    interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
 
     crate::health::mark_component_ok(SCHEDULER_COMPONENT);
 
@@ -569,21 +567,44 @@ pub async fn run_with_capability(
         skip_missed_jobs_on_startup(&config).await;
     }
 
+    poll_due_jobs(
+        &config,
+        &event_tx,
+        &cancel,
+        execution_capability.as_ref(),
+        SCHEDULER_COMPONENT,
+        Duration::from_secs(poll_secs),
+    )
+    .await
+}
+
+/// Poll for due jobs every `poll_every` until `cancel` fires.
+async fn poll_due_jobs(
+    config: &Config,
+    event_tx: &EventBroadcast,
+    cancel: &CancellationToken,
+    execution_capability: Option<&AgentExecutionCapability>,
+    component: &str,
+    poll_every: Duration,
+) -> Result<()> {
+    let mut interval = time::interval(poll_every);
+    interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+
     loop {
         tokio::select! {
             _ = interval.tick() => {
                 // Keep scheduler liveness fresh even when there are no due jobs.
-                crate::health::mark_component_ok(SCHEDULER_COMPONENT);
+                crate::health::mark_component_ok(component);
 
-                let execution_selection = execution_capability.as_ref()
+                let execution_selection = execution_capability
                     .map(AgentExecutionCapability::capture_selection);
                 let selection_config = execution_selection.as_ref()
                     .map(|selection| selection.config_handle().read().clone());
-                let config = selection_config.as_ref().unwrap_or(&config);
+                let config = selection_config.as_ref().unwrap_or(config);
                 let jobs = match due_jobs(config, Utc::now()) {
                     Ok(jobs) => jobs,
                     Err(e) => {
-                        crate::health::mark_component_error(SCHEDULER_COMPONENT, e.to_string());
+                        crate::health::mark_component_error(component, e.to_string());
                         ::zeroclaw_log::record!(
                             WARN,
                             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -599,14 +620,14 @@ pub async fn run_with_capability(
                 process_due_jobs(
                     config,
                     jobs,
-                    SCHEDULER_COMPONENT,
-                    &event_tx,
+                    component,
+                    event_tx,
                     execution_selection,
                 )
                 .await;
             }
             _ = cancel.cancelled() => {
-                crate::health::mark_component_ok(SCHEDULER_COMPONENT);
+                crate::health::mark_component_ok(component);
                 ::zeroclaw_log::record!(
                     INFO,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
