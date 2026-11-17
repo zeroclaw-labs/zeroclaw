@@ -51,6 +51,46 @@ struct HttpRequestUrlPolicy {
     private_resolution_allowed: bool,
 }
 
+fn redact_response_body(
+    body: String,
+    redact: &impl Fn(&str) -> String,
+    contains_credentials: bool,
+) -> String {
+    fn redact_json(value: &mut serde_json::Value, redact: &impl Fn(&str) -> String) {
+        match value {
+            serde_json::Value::String(text) => *text = redact(text),
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    redact_json(item, redact);
+                }
+            }
+            serde_json::Value::Object(fields) => {
+                *fields = std::mem::take(fields)
+                    .into_iter()
+                    .map(|(name, mut item)| {
+                        redact_json(&mut item, redact);
+                        (redact(&name), item)
+                    })
+                    .collect();
+            }
+            scalar => {
+                let original = scalar.to_string();
+                let redacted = redact(&original);
+                if redacted != original {
+                    *scalar = serde_json::Value::String(redacted);
+                }
+            }
+        }
+    }
+
+    if contains_credentials && let Ok(mut parsed) = serde_json::from_str(&body) {
+        redact_json(&mut parsed, redact);
+        return parsed.to_string();
+    }
+
+    redact(&body)
+}
+
 impl HttpRequestTool {
     pub fn new(
         security: Arc<SecurityPolicy>,
@@ -400,6 +440,11 @@ impl HttpRequestTool {
         let credential: ScopedHttpCredential = serde_json::from_str(&plaintext).map_err(|_| {
             anyhow::Error::msg(scoped_credential_message("tool-http-credential-invalid"))
         })?;
+        if !credential.http_allowed {
+            return Err(anyhow::Error::msg(scoped_credential_message(
+                "tool-http-credential-not-granted",
+            )));
+        }
         if ScopedHttpCredential::https_origin(&target.url).as_deref()
             != Some(credential.origin.as_str())
         {
@@ -797,7 +842,8 @@ impl Tool for HttpRequestTool {
                 });
             }
         };
-        let redact = |mut output: String| {
+        let redact = |output: &str| {
+            let mut output = output.to_owned();
             for value in &sensitive {
                 if !value.is_empty() {
                     output = output.replace(value, "[REDACTED]");
@@ -842,8 +888,19 @@ impl Tool for HttpRequestTool {
                         ),
                     };
 
-                let headers_text = redact(headers_text);
-                let response_text = redact(response_text);
+                let headers_text = redact(&headers_text);
+                // An exact-value scrub cannot match the partial credential
+                // left when a decoded body is cut across the secret.
+                let response_text = if !sensitive.is_empty()
+                    && response_text.ends_with("... [Response truncated due to size limit] ...")
+                {
+                    crate::i18n::get_required_tool_string(
+                        "tool-http-request-authenticated-response-truncated",
+                    )
+                } else {
+                    redact_response_body(response_text, &redact, !sensitive.is_empty())
+                };
+                let body_error = body_error.as_deref().map(redact);
                 let output = format!(
                     "Status: {} {}\nResponse Headers: {}\n\nResponse Body:\n{}",
                     status_code,
@@ -886,7 +943,7 @@ impl Tool for HttpRequestTool {
                 Ok(ToolResult {
                     success: false,
                     output: ToolOutput::default(),
-                    error: Some(error),
+                    error: Some(redact(&error)),
                 })
             }
         }
@@ -1238,6 +1295,7 @@ mod tests {
         tool.scoped_credential_fixture(
             dir.path(),
             ScopedHttpCredential {
+                http_allowed: true,
                 origin: "https://example.com".into(),
                 auth: ScopedHttpAuth::ApiKey {
                     value: "fixture-key".into(),
@@ -2457,6 +2515,17 @@ api_token = "Bearer from-secret"
         assert_eq!(parsed["authorization"], "Bearer secret");
         assert_eq!(parsed["x-api-key"], "my-key");
         assert_eq!(parsed["content-type"], "application/json");
+    }
+
+    #[test]
+    fn authenticated_json_body_redacts_decoded_values_and_keys() {
+        let secret = r#"token\"with\escapes"#;
+        let body = json!({"nested": [{"credential": secret}], (secret): "key"}).to_string();
+        let output = redact_response_body(body, &|text| text.replace(secret, "[REDACTED]"), true);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&output).unwrap(),
+            json!({"nested": [{"credential": "[REDACTED]"}], "[REDACTED]": "key"})
+        );
     }
 
     #[test]

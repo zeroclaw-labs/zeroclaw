@@ -158,7 +158,7 @@ still applies. The editor lists only aliases, types, and origins.
 For example, register an API token as `INVENTORY_API` for
 `https://inventory.example.com`. In chat, ask: “Read the inventory status at
 `https://inventory.example.com/status` using `INVENTORY_API`.” The
-`http_request` tool accepts the alias as its `credential` argument. The
+`http_request` tool accepts a granted alias as its `credential` argument. New aliases require an explicit HTTP Request grant. The
 operator enters the token in the editor, and the tool adds it to the request.
 A username and password credential uses the same reference flow for a
 service that accepts HTTP Basic. Browser form logins are outside this flow.

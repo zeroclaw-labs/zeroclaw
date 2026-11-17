@@ -464,11 +464,12 @@ pub(crate) async fn persist_and_swap(
         guard,
         Vec::new(),
         Vec::new(),
+        None,
     )
     .await
 }
 
-#[allow(clippy::result_large_err)]
+#[allow(clippy::result_large_err, clippy::too_many_arguments)]
 async fn persist_and_swap_retaining(
     state: &AppState,
     authorization: ConfigWriteAuthorization,
@@ -476,6 +477,7 @@ async fn persist_and_swap_retaining(
     guard: ConfigWriteGuard,
     agent_reservations: Vec<zeroclaw_runtime::live_config_authority::AgentAdmissionReservation>,
     annotations: Vec<(String, String)>,
+    credential_audit: Option<ScopedCredentialAudit>,
 ) -> Result<RetainedConfigWrite, Response> {
     let config_path = new_config.config_path.clone();
     let pending_reload = Arc::clone(&state.pending_reload);
@@ -488,9 +490,13 @@ async fn persist_and_swap_retaining(
                 controls,
                 new_config,
                 authorization,
+                credential_audit.is_some(),
             )
-            .await?;
-            finish_prepared_channel_generation(prepared, pending_reload).await;
+            .await;
+            if let Some(audit) = credential_audit {
+                audit.record(prepared.is_ok());
+            }
+            finish_prepared_channel_generation(prepared?, pending_reload).await;
             if let Err(e) =
                 zeroclaw_config::comment_writer::apply_comments(&config_path, &annotations).await
             {
@@ -615,6 +621,7 @@ async fn persist_and_swap_prepared(
     reload_controls: Option<zeroclaw_runtime::daemon::GatewayReloadControls>,
     mut new_config: zeroclaw_config::schema::Config,
     authorization: ConfigWriteAuthorization,
+    scoped_credential_mutation: bool,
 ) -> Result<
     Option<(
         zeroclaw_runtime::daemon::PreparedChannelGenerationDrain,
@@ -625,6 +632,17 @@ async fn persist_and_swap_prepared(
     authorization
         .covers_all(new_config.dirty_paths.iter().map(String::as_str))
         .map_err(IntoResponse::into_response)?;
+    // The catalog route authenticates an operator, validates grants, and audits
+    // the mutation. A generic property or section write cannot bypass it.
+    if !scoped_credential_mutation
+        && new_config.http_request.scoped_credentials
+            != commit.current_config().http_request.scoped_credentials
+    {
+        return Err(error_response(ConfigApiError::new(
+            ConfigApiCode::ValidationFailed,
+            "use the scoped credential API to change credential records",
+        )));
+    }
     if let Err(e) = zeroclaw_runtime::rpc::auth::validate_accepted_auth_config(&new_config) {
         return Err(error_response(ConfigApiError::new(
             ConfigApiCode::ValidationFailed,
@@ -1179,7 +1197,7 @@ struct PluginTlsCredentialMutation {
     value: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Copy, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum PluginTlsCredentialOperation {
     Create,
@@ -1347,6 +1365,40 @@ struct HttpCredentialMutation {
     name: String,
     operation: PluginTlsCredentialOperation,
     credential: Option<zeroclaw_config::schema::ScopedHttpCredential>,
+    permissions: Option<HttpCredentialGrant>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HttpCredentialGrant {
+    http_allowed: bool,
+}
+
+struct ScopedCredentialAudit {
+    actor: Option<String>,
+    name: String,
+    kind: Option<&'static str>,
+    operation: &'static str,
+    grant: Option<serde_json::Value>,
+}
+
+impl ScopedCredentialAudit {
+    fn record(self, saved: bool) {
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+                serde_json::json!({
+                    "actor": self.actor,
+                    "credential": self.name,
+                    "kind": self.kind,
+                    "operation": self.operation,
+                    "grant": self.grant,
+                    "saved": saved
+                })
+            ),
+            "Scoped credential mutation"
+        );
+    }
 }
 
 pub async fn list_http_credentials(
@@ -1384,14 +1436,19 @@ pub async fn list_http_credentials(
                 }) else {
                     return StatusCode::SERVICE_UNAVAILABLE.into_response();
                 };
-                let kind = match record.auth {
+                let kind = match &record.auth {
                     ScopedHttpAuth::ApiKey { .. } => "api_key",
                     ScopedHttpAuth::UserPassword { .. } => "user_password",
+                };
+                let header = match &record.auth {
+                    ScopedHttpAuth::ApiKey { header, .. } => Some(header),
+                    ScopedHttpAuth::UserPassword { .. } => None,
                 };
                 rows.push((
                     name,
                     serde_json::json!({
-                        "name": name, "origin": record.origin, "kind": kind
+                        "name": name, "origin": record.origin, "kind": kind,
+                        "header": header, "http_allowed": record.http_allowed
                     }),
                 ));
             }
@@ -1441,17 +1498,67 @@ pub async fn mutate_http_credential(
             }
             let credentials = &mut config.http_request.scoped_credentials;
             let present = credentials.contains_key(&mutation.name);
-            let verb = match (mutation.operation, &mutation.credential, present) {
-                (PluginTlsCredentialOperation::Create, Some(_), false) => Verb::Create,
-                (PluginTlsCredentialOperation::Replace, Some(_), true) => Verb::Update,
-                (PluginTlsCredentialOperation::Delete, None, true) => Verb::Delete,
+            let edit = match (mutation.operation, present) {
+                (PluginTlsCredentialOperation::Create, false) => (Verb::Create, "create"),
+                (PluginTlsCredentialOperation::Replace, true) => (Verb::Update, "replace"),
+                (PluginTlsCredentialOperation::Delete, true) => (Verb::Delete, "delete"),
                 _ => return StatusCode::CONFLICT.into_response(),
             };
-            if let Some(mut credential) = mutation.credential {
+            let store = SecretStore::new(dir, true);
+            let existing = || {
+                let stored = credentials.get(&mutation.name)?;
+                let decoded = if stored.starts_with("enc2:") {
+                    store.decrypt(stored).ok()?
+                } else {
+                    stored.clone()
+                };
+                serde_json::from_str::<ScopedHttpCredential>(&decoded).ok()
+            };
+            let (record, operation, grant) = match (mutation.credential, mutation.permissions) {
+                (None, Some(permissions)) if edit.1 == "replace" => {
+                    let Some(mut record) = existing() else {
+                        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                    };
+                    record.http_allowed = permissions.http_allowed;
+                    (
+                        Some(record),
+                        "update_grant",
+                        Some(serde_json::json!(permissions.http_allowed)),
+                    )
+                }
+                (Some(mut record), None) if edit.1 != "delete" => {
+                    // Creation always starts denied. Rotation preserves the prior grant.
+                    record.http_allowed = if present {
+                        let Some(prior) = existing() else {
+                            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                        };
+                        ScopedHttpCredential::https_origin(&record.origin).as_deref()
+                            == Some(prior.origin.as_str())
+                            && prior.http_allowed
+                    } else {
+                        false
+                    };
+                    (Some(record), edit.1, None)
+                }
+                (None, None) if edit.1 == "delete" => (None, edit.1, None),
+                _ => return StatusCode::BAD_REQUEST.into_response(),
+            };
+            let prior = if record.is_none() { existing() } else { None };
+            let kind =
+                record
+                    .as_ref()
+                    .or_else(|| prior.as_ref())
+                    .map(|record| match &record.auth {
+                        ScopedHttpAuth::ApiKey { .. } => "api_key",
+                        ScopedHttpAuth::UserPassword { .. } => "user_password",
+                    });
+            if let Some(mut credential) = record {
                 let Some(origin) = ScopedHttpCredential::https_origin(&credential.origin) else {
                     return StatusCode::BAD_REQUEST.into_response();
                 };
-                if credential.origin.trim_end_matches('/') != origin {
+                if !url::Url::parse(&credential.origin).is_ok_and(|url| {
+                    url.path() == "/" && url.query().is_none() && url.fragment().is_none()
+                }) {
                     return StatusCode::BAD_REQUEST.into_response();
                 }
                 credential.origin = origin;
@@ -1484,17 +1591,31 @@ pub async fn mutate_http_credential(
             config.mark_dirty(&path);
             let authorization = match authorize_config_write(
                 &principal,
-                ConfigWriteSet::default().with(path, verb),
+                ConfigWriteSet::default().with(path, edit.0),
                 &guard,
             ) {
                 Ok(authorization) => authorization,
                 Err(denied) => return denied.into_response(),
             };
-            if persist_and_swap(&state, authorization, config, guard)
-                .await
-                .is_err()
+            let audit = ScopedCredentialAudit {
+                actor: crate::principal_gate::request_principal_id(&principal).map(str::to_owned),
+                name: mutation.name,
+                kind,
+                operation,
+                grant,
+            };
+            if let Err(response) = persist_and_swap_retaining(
+                &state,
+                authorization,
+                config,
+                guard,
+                Vec::new(),
+                Vec::new(),
+                Some(audit),
+            )
+            .await
             {
-                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                return response;
             }
             StatusCode::NO_CONTENT.into_response()
         }
@@ -1627,6 +1748,7 @@ pub async fn handle_prop_put(
         _cfg_guard,
         agent_config_reservation.into_iter().collect(),
         annotations,
+        None,
     )
     .await
     {
@@ -1712,6 +1834,7 @@ pub async fn handle_prop_delete(
         _cfg_guard,
         agent_config_reservation.into_iter().collect(),
         Vec::new(),
+        None,
     )
     .await
     {
@@ -2122,6 +2245,7 @@ async fn delete_agent_cascade(
                 reload_controls,
                 working.clone(),
                 authorization,
+                false,
             )
             .await?;
             // Committed: advance the alias generation exactly once.
@@ -2335,6 +2459,7 @@ pub async fn handle_map_key(
             _cfg_guard,
             agent_config_reservation.into_iter().collect(),
             Vec::new(),
+            None,
         )
         .await
         {
@@ -2883,6 +3008,7 @@ async fn rename_agent_cascade(
                 reload_controls,
                 working.clone(),
                 authorization.expect("persisting rename was authorized"),
+                false,
             )
             .await?
         } else {
@@ -3375,6 +3501,7 @@ pub async fn handle_patch(
         _cfg_guard,
         agent_config_reservations,
         annotations,
+        None,
     )
     .await
     {

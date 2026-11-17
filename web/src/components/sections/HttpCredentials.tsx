@@ -67,6 +67,11 @@ export default function HttpCredentials({ kind }: { kind: HttpCredentialKind }) 
           <p className="break-all font-medium">{row.name}</p>
           <p className="break-all text-sm">{row.origin} · {t("plugin_tls.configured")}</p>
           <div className="flex flex-wrap gap-2">
+            <Button size="sm" variant="ghost" disabled={disabled} onClick={() => {
+              void update({ name: row.name, operation: "replace", permissions: { http_allowed: !row.http_allowed } });
+            }}>
+              {t(row.http_allowed ? "http_credentials.revoke" : "http_credentials.grant")}
+            </Button>
             <Button size="sm" disabled={disabled} onClick={() => { setRemoving(null); setEditing(row); }}>
               {t("plugin_tls.replace")}
             </Button>
@@ -92,7 +97,7 @@ export default function HttpCredentials({ kind }: { kind: HttpCredentialKind }) 
           {kind === "api_key" && (
             <label className="block space-y-1">
               <span>{t("http_credentials.header")}</span>
-              <select className={inputClass} name="header">
+              <select className={inputClass} name="header" defaultValue={editing === "new" ? "bearer" : editing.header ?? "bearer"}>
                 <option value="bearer">Authorization: Bearer</option>
                 <option value="x_api_key">X-API-Key</option>
               </select>

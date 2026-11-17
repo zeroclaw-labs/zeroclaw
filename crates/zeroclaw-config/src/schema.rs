@@ -9056,6 +9056,8 @@ pub struct HttpRequestConfig {
 #[serde(deny_unknown_fields)]
 pub struct ScopedHttpCredential {
     pub origin: String,
+    #[serde(default)]
+    pub http_allowed: bool,
     pub auth: ScopedHttpAuth,
 }
 
@@ -27667,6 +27669,18 @@ fn apply_dirty_path(
     // same precedent as the natural-key branch above.
     if let Some(section) = find_map_key_section_for_path(dotted) {
         return apply_dirty_map_key_path(root, &section, dotted, full_table, default_table);
+    }
+
+    // Credential aliases are opaque and case-sensitive. An alias deleted
+    // from memory must not resolve to a differently spelled sibling.
+    if let ["http_request", "scoped_credentials", alias] = raw.as_slice() {
+        write_or_delete_leaf(
+            root,
+            full_table,
+            default_table,
+            &["http_request", "scoped_credentials", alias],
+        );
+        return Ok(());
     }
 
     // Resolve each segment against the in-memory table: struct fields
@@ -55271,5 +55285,31 @@ model_provider = \"ollama.default\"
         duplicate_route
             .validate()
             .expect("legacy duplicate route hints remain valid");
+    }
+}
+
+#[cfg(test)]
+mod scoped_credential_dirty_paths {
+    use super::apply_dirty_path;
+
+    #[test]
+    fn deleting_dash_alias_preserves_underscore_sibling() {
+        let mut document =
+            "[http_request.scoped_credentials]\nTEST-KEY = 'old'\nTEST_KEY = 'neighbor'\n"
+                .parse::<toml_edit::DocumentMut>()
+                .unwrap();
+        let memory = "[http_request.scoped_credentials]\nTEST_KEY = 'neighbor'\n"
+            .parse::<toml::Table>()
+            .unwrap();
+        apply_dirty_path(
+            document.as_table_mut(),
+            "http_request.scoped_credentials.TEST-KEY",
+            &memory,
+            &toml::Table::new(),
+        )
+        .unwrap();
+        let aliases = &document["http_request"]["scoped_credentials"];
+        assert!(aliases.get("TEST-KEY").is_none());
+        assert_eq!(aliases["TEST_KEY"].as_str(), Some("neighbor"));
     }
 }
