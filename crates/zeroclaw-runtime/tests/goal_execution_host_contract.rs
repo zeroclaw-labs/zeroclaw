@@ -1603,6 +1603,7 @@ async fn matching_execution_scope_returns_a_working_session_lease() {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ScriptedStep {
     Parent(Vec<(String, String)>),
+    AdmissionRefused(String),
     Append(String, TaskStatus, i64),
     Verifier(String),
     Resume(String),
@@ -1643,6 +1644,7 @@ enum AnthropicCase {
     CompleteHandoff,
     CompleteHandoffStreamed,
     UnattributedTerminal,
+    CostLimitedUnpricedHandoff,
 }
 
 struct ExecutionScript {
@@ -1736,12 +1738,14 @@ impl ScriptedLease {
                 | AnthropicCase::CompleteHandoff
                 | AnthropicCase::CompleteHandoffStreamed
                 | AnthropicCase::UnattributedTerminal
+                | AnthropicCase::CostLimitedUnpricedHandoff
         ) {
             let terminal = if matches!(
                 case,
                 AnthropicCase::CompleteRefusal
                     | AnthropicCase::CompleteHandoff
                     | AnthropicCase::CompleteHandoffStreamed
+                    | AnthropicCase::CostLimitedUnpricedHandoff
             ) {
                 serde_json::json!({"type": "fallback_message", "model": "model-b", "input_tokens": terminal_input, "output_tokens": 5})
             } else {
@@ -2047,7 +2051,22 @@ impl GoalSessionExecutionLease for ScriptedLease {
                     .await?;
             }
             Some(ScriptedFault::ParentAnthropic(case)) => {
-                return self.run_anthropic(case).await;
+                let candidate = self.run_anthropic(case).await?;
+                if matches!(case, AnthropicCase::CostLimitedUnpricedHandoff) {
+                    let accounting = zeroclaw_goal::accounting::GOAL_OPERATION_ACCOUNTING
+                        .try_with(Clone::clone)?
+                        .expect("fixture requires Goal accounting");
+                    let error = accounting
+                        .admit(GoalOperationRequest::new("primary", "model-a"))
+                        .await
+                        .expect_err("unpriced Goal usage must refuse the next admission");
+                    self.script
+                        .lock()
+                        .unwrap()
+                        .steps
+                        .push(ScriptedStep::AdmissionRefused(format!("{error:#}")));
+                }
+                return Ok(candidate);
             }
             Some(ScriptedFault::CorruptLedgerAfterParent) => {
                 use std::io::Write as _;
@@ -3419,7 +3438,9 @@ async fn engine_classifies_real_anthropic_fallback_accounting() {
         AnthropicCase::CompleteHandoff,
         AnthropicCase::CompleteHandoffStreamed,
         AnthropicCase::UnattributedTerminal,
+        AnthropicCase::CostLimitedUnpricedHandoff,
     ] {
+        let cost_limited_unpriced = matches!(case, AnthropicCase::CostLimitedUnpricedHandoff);
         let mut fixture = EngineFixture::new(
             &[],
             &[SCRIPTED_COMPLETE],
@@ -3434,26 +3455,28 @@ async fn engine_classifies_real_anthropic_fallback_accounting() {
                     fixture.scope.session_id(),
                     fixture.scope.execution_epoch(),
                     Some(1_000),
-                    None,
+                    cost_limited_unpriced.then_some(1.0),
                 )
                 .await
                 .unwrap(),
             GoalTransitionResult::Applied
         );
         let (tracker, _) = real_goal_accounting(&fixture);
-        let pricing = Arc::new(HashMap::from([(
-            "primary".to_owned(),
-            HashMap::from([
-                ("model-a.input".to_owned(), 1.0),
-                ("model-a.output".to_owned(), 2.0),
-                ("model-a.cached_input".to_owned(), 0.5),
-                ("model-a.cache_write".to_owned(), 1.5),
-                ("model-b.input".to_owned(), 3.0),
-                ("model-b.output".to_owned(), 4.0),
-                ("(unattributed).input".to_owned(), 99.0),
-                ("(unattributed).output".to_owned(), 99.0),
-            ]),
-        )]));
+        let mut rates = HashMap::from([
+            ("model-a.input".to_owned(), 1.0),
+            ("model-a.output".to_owned(), 2.0),
+            ("model-a.cached_input".to_owned(), 0.5),
+            ("model-a.cache_write".to_owned(), 1.5),
+            ("model-b.input".to_owned(), 3.0),
+            ("model-b.output".to_owned(), 4.0),
+            ("(unattributed).input".to_owned(), 99.0),
+            ("(unattributed).output".to_owned(), 99.0),
+        ]);
+        if cost_limited_unpriced {
+            rates.remove("model-b.input");
+            rates.remove("model-b.output");
+        }
+        let pricing = Arc::new(HashMap::from([("primary".to_owned(), rates)]));
         let factory = Arc::new(
             zeroclaw_runtime::goal_accounting::RuntimeGoalOperationAccountingFactory::new(
                 fixture.store.clone() as Arc<dyn GoalTaskRegistry>,
@@ -3504,8 +3527,21 @@ async fn engine_classifies_real_anthropic_fallback_accounting() {
                 | AnthropicCase::CompleteHandoff
                 | AnthropicCase::CompleteHandoffStreamed
                 | AnthropicCase::UnattributedTerminal
+                | AnthropicCase::CostLimitedUnpricedHandoff
         );
-        if !no_handoff && !complete_handoff {
+        if cost_limited_unpriced {
+            assert!(result.is_err(), "{case:?}");
+            assert_eq!(fixture.task().await.status, TaskStatus::Failed);
+            assert_eq!(
+                fixture.reason().await.as_deref(),
+                Some("pricing_unavailable")
+            );
+            assert!(matches!(
+                steps.as_slice(),
+                [ScriptedStep::Parent(_), ScriptedStep::AdmissionRefused(message)]
+                    if message.contains("Goal cost budget lacks complete pricing")
+            ));
+        } else if !no_handoff && !complete_handoff {
             assert!(result.is_err(), "{case:?}");
             if complete_refusal {
                 assert!(
@@ -3548,7 +3584,7 @@ async fn engine_classifies_real_anthropic_fallback_accounting() {
             .unwrap();
         assert_eq!(
             goal.accounting_state,
-            if no_handoff || complete_handoff || complete_refusal {
+            if no_handoff || complete_handoff || complete_refusal || cost_limited_unpriced {
                 GoalAccountingState::Complete
             } else {
                 GoalAccountingState::OutcomeUnknown
@@ -3594,7 +3630,7 @@ async fn engine_classifies_real_anthropic_fallback_accounting() {
                 "model-b"
             }
         );
-        if unattributed {
+        if unattributed || cost_limited_unpriced {
             assert!(!terminal.usage.pricing_available);
             assert_eq!(terminal.usage.unpriced_tokens, 55);
             assert_eq!(terminal.usage.cost_usd, 0.0);
