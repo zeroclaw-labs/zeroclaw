@@ -167,6 +167,10 @@ pub enum SelectorChoice<T> {
     Fresh(T),
 }
 
+/// Memory backend for a fresh quickstart memory selection. It only travels
+/// from zerocode to the daemon (`quickstart/apply`); the picker builds its
+/// options from these variants, never from daemon data, so no daemon reply
+/// is parsed into this type.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum MemoryBackendKind {
@@ -176,7 +180,6 @@ pub enum MemoryBackendKind {
     Postgres,
     Qdrant,
     Markdown,
-    Lucid,
 }
 
 // ── Config explorer wire shapes ────────────────────────────────

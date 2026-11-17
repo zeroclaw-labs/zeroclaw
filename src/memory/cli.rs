@@ -307,7 +307,7 @@ fn unsupported_clear_backend_message(backend: &str) -> String {
     #[cfg(not(feature = "agent-runtime"))]
     {
         format!(
-            "memory clear is unsupported for append-only backend '{backend}'; switch to a deletable backend (sqlite, lucid, or postgres)"
+            "memory clear is unsupported for append-only backend '{backend}'; switch to a deletable backend (sqlite or postgres)"
         )
     }
 }

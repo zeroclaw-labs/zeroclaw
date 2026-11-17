@@ -32,6 +32,14 @@ pub enum MigrationNotice {
     /// A key held more than the schema honours, so it was lowered to its
     /// maximum (see [`CAPPED_KEYS`]). The reason names the maximum.
     Lowered { path: String, reason: &'static str },
+    /// A key held a value that selects something retired, so the value was
+    /// replaced with its successor (see [`RETIRED_VALUES`]). `replacement` is
+    /// that successor, a constant of the table, never the operator's value.
+    Replaced {
+        path: String,
+        replacement: &'static str,
+        reason: &'static str,
+    },
     /// A `ZEROCLAW_*` environment variable names a retired key, so it was
     /// ignored instead of failing startup.
     IgnoredEnvOverride {
@@ -70,6 +78,15 @@ impl MigrationNotice {
             }
             Self::Lowered { path, reason } => {
                 format!("lowered config key `{path}` to its maximum: {reason}")
+            }
+            Self::Replaced {
+                path,
+                replacement,
+                reason,
+            } => {
+                format!(
+                    "replaced retired value of config key `{path}` with `{replacement}`: {reason}"
+                )
             }
             Self::IgnoredEnvOverride { variable, reason } => {
                 format!("ignored `{variable}`, which sets a retired config key: {reason}")
@@ -296,6 +313,17 @@ pub const RETIRED_KEYS: &[RetiredKey] = &[
                  code cancels the previous one",
         reason_id: "cli-config-retired-reason-pairing-max-pending",
     },
+    // The Lucid memory backend wrapped the SQLite store and also called an
+    // external `lucid` CLI. Every memory it stored went to that SQLite store
+    // first, so its CLI settings have nothing left to configure. The values
+    // that selected it are replaced through `RETIRED_VALUES`.
+    RetiredKey {
+        retired_in: 4,
+        path: &["storage", "lucid"],
+        reason: "the Lucid memory backend was removed; its memories are already in the SQLite \
+                 store that `memory.backend = \"sqlite\"` reads",
+        reason_id: "cli-config-retired-reason-lucid",
+    },
 ];
 
 /// One key whose stored value the schema honours only up to a maximum.
@@ -334,6 +362,87 @@ pub const CAPPED_KEYS: &[CappedKey] = &[
     },
 ];
 
+/// One key whose stored value may select something that was retired.
+#[derive(Debug, Clone, Copy)]
+pub struct RetiredValue {
+    /// Path from the config root, one segment per table key, as in
+    /// [`RetiredKey::path`] (every accepted spelling is covered).
+    pub path: &'static [&'static str],
+    /// The retired selections. A string value matches one when its kind, the
+    /// part before the first `.`, trimmed, equals it in any ASCII case:
+    /// `lucid`, ` Lucid ` and `lucid.work` all select `lucid`.
+    pub retired: &'static [&'static str],
+    /// The value a retired selection is replaced with.
+    pub replacement: &'static str,
+    /// Why, and what the replacement keeps, in English: logs and `--json`
+    /// output carry it as is.
+    pub reason: &'static str,
+    /// The Fluent id of [`Self::reason`] in the CLI catalogue
+    /// (`cli-config-retired-reason-*`). Entries that share a reason share its
+    /// id.
+    pub reason_id: &'static str,
+}
+
+/// Every value replaced on load because it selects something retired. A
+/// stored string that selects one of `retired` becomes `replacement` with a
+/// [`MigrationNotice::Replaced`], by the migration chain and again on every
+/// load of a current config, the way [`CAPPED_KEYS`] lowers a value: a file
+/// written before the retirement keeps loading, and its value changes in the
+/// open instead of failing to deserialize or falling back to something else
+/// with only a log line. Other values, and values that are not strings, are
+/// left for deserialization and validation to judge.
+pub const RETIRED_VALUES: &[RetiredValue] = &[
+    // `memory.backend` is a string the memory factory classifies, and it
+    // falls back to Markdown for a kind it does not know, so a `lucid` left
+    // there would hide every memory behind an empty store.
+    RetiredValue {
+        path: &["memory", "backend"],
+        retired: RETIRED_MEMORY_BACKENDS,
+        replacement: "sqlite",
+        reason: RETIRED_LUCID_BACKEND,
+        reason_id: "cli-config-retired-reason-lucid-backend",
+    },
+    // An agent's backend is an enum without the retired kind, so a `lucid`
+    // left there would fail to deserialize and the resilient load would drop
+    // the whole `[agents]` section.
+    RetiredValue {
+        path: &["agents", ANY_KEY, "memory", "backend"],
+        retired: RETIRED_MEMORY_BACKENDS,
+        replacement: "sqlite",
+        reason: RETIRED_LUCID_BACKEND,
+        reason_id: "cli-config-retired-reason-lucid-backend",
+    },
+];
+
+/// Memory backend kinds that were removed. Load replaces a `memory.backend`
+/// value that selects one (see [`RETIRED_VALUES`]); one that arrives after
+/// load is refused (see [`is_retired_memory_backend`]).
+pub const RETIRED_MEMORY_BACKENDS: &[&str] = &["lucid"];
+
+const RETIRED_LUCID_BACKEND: &str = "the Lucid memory backend was removed; it stored every \
+     memory in the SQLite store that `sqlite` reads, so they are all kept, and only recall \
+     results that came from the external Lucid index stop appearing";
+
+/// Whether `value` selects one of `kinds`: its kind, the part before the
+/// first `.`, trimmed, equals one of them in any ASCII case.
+fn selects_one_of(value: &str, kinds: &[&str]) -> bool {
+    let kind = value.split('.').next().unwrap_or_default().trim();
+    kinds
+        .iter()
+        .any(|retired| kind.eq_ignore_ascii_case(retired))
+}
+
+/// Whether a memory backend reference (`memory.backend`, `<kind>` or
+/// `<kind>.<alias>`) selects a removed backend kind
+/// ([`RETIRED_MEMORY_BACKENDS`]), matched as [`RetiredValue::retired`] is.
+/// Load replaces such a value; this recognizes one that arrives after load,
+/// from an environment override or a config edit, so `Config::validate` and
+/// the memory factory refuse it instead of reading it as an unknown backend.
+#[must_use]
+pub fn is_retired_memory_backend(value: &str) -> bool {
+    selects_one_of(value, RETIRED_MEMORY_BACKENDS)
+}
+
 /// The retired key a config path lies at or under, matching [`ANY_KEY`]
 /// segments against any key. Used where a path arrives from outside the
 /// file, such as an environment override, to recognize a retired key rather
@@ -370,6 +479,16 @@ pub fn capped_reason_id(reason: &str) -> Option<&'static str> {
         .iter()
         .find(|key| key.reason == reason)
         .map(|key| key.reason_id)
+}
+
+/// The Fluent id of a [`RETIRED_VALUES`] reason, as [`retirement_reason_id`]
+/// is for retirements; `None` for any other text.
+#[must_use]
+pub fn retired_value_reason_id(reason: &str) -> Option<&'static str> {
+    RETIRED_VALUES
+        .iter()
+        .find(|value| value.reason == reason)
+        .map(|value| value.reason_id)
 }
 
 const RETIRED_GLOBAL_FALLBACK: &str = "the global fallback lists were removed in V3; set \
@@ -1368,6 +1487,7 @@ fn migrate_toml(value: toml::Value) -> Result<Option<Migrated>> {
             apply_retired_keys(&mut value, version, RETIRED_KEYS, &mut notices);
         }
         lower_capped_keys(&mut value, &mut notices);
+        replace_retired_values(&mut value, &mut notices);
         if notices.is_empty() && !selector_omitted {
             return Ok(None);
         }
@@ -1438,6 +1558,7 @@ pub fn migrate_file_with_notices(input: &str) -> Result<Option<(String, Vec<Migr
             unversioned_notice(&value, from).into_iter().collect();
         notices.extend(apply_retired_keys_to_doc(doc.as_table_mut()));
         notices.extend(lower_capped_keys_in_doc(doc.as_table_mut()));
+        notices.extend(replace_retired_values_in_doc(doc.as_table_mut()));
         if from == CURRENT_SCHEMA_VERSION
             && !selector_omitted
             && !notices.iter().any(MigrationNotice::changes_file)
@@ -2564,11 +2685,13 @@ fn run_chain_until(
             apply_retired_keys(&mut cur, version, RETIRED_KEYS, notices);
         }
     }
-    // Caps belong to the current schema: a chain that stops at a historical
-    // version produces what that version wrote, while every route to the
-    // current one (load, migrate, `config generate`) gets the caps applied.
+    // Caps and retired values belong to the current schema: a chain that
+    // stops at a historical version produces what that version wrote, while
+    // every route to the current one (load, migrate, `config generate`) gets
+    // them applied.
     if target == CURRENT_SCHEMA_VERSION {
         lower_capped_keys(&mut cur, notices);
+        replace_retired_values(&mut cur, notices);
     }
     Ok(cur)
 }
@@ -2749,6 +2872,76 @@ pub fn lower_capped_keys_in_doc(root: &mut toml_edit::Table) -> Vec<MigrationNot
                     notices.push(MigrationNotice::Lowered {
                         path: concrete.join("."),
                         reason: key.reason,
+                    });
+                }
+            }
+        }
+    }
+    notices
+}
+
+/// Replace every [`RETIRED_VALUES`] selection in a parsed config with its
+/// successor, recording a [`MigrationNotice::Replaced`] for each.
+fn replace_retired_values(value: &mut toml::Value, notices: &mut Vec<MigrationNotice>) {
+    let Some(root) = value.as_table_mut() else {
+        return;
+    };
+    for entry in RETIRED_VALUES {
+        for pattern in spellings_of(entry.path) {
+            for concrete in expand_path(root, &pattern) {
+                let Some((last, parents)) = concrete.split_last() else {
+                    continue;
+                };
+                let Some(table) = parents.iter().try_fold(&mut *root, |table, segment| {
+                    table.get_mut(segment.as_str())?.as_table_mut()
+                }) else {
+                    continue;
+                };
+                let Some(stored) = table.get_mut(last.as_str()) else {
+                    continue;
+                };
+                if stored
+                    .as_str()
+                    .is_some_and(|stored| selects_one_of(stored, entry.retired))
+                {
+                    *stored = toml::Value::String(entry.replacement.to_string());
+                    notices.push(MigrationNotice::Replaced {
+                        path: concrete.join("."),
+                        replacement: entry.replacement,
+                        reason: entry.reason,
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// `replace_retired_values` over an on-disk document, for the paths that
+/// edit a file in place, the way [`lower_capped_keys_in_doc`] lowers values
+/// there. Only the replaced value changes; its comments and every other byte
+/// stay. Returns what changed, for the caller to report once the file is
+/// written.
+pub fn replace_retired_values_in_doc(root: &mut toml_edit::Table) -> Vec<MigrationNotice> {
+    let mut notices = Vec::new();
+    for entry in RETIRED_VALUES {
+        for pattern in spellings_of(entry.path) {
+            for concrete in expand_doc_path(root, &pattern) {
+                let Some(stored) = item_at(root, &concrete).and_then(toml_edit::Item::as_value_mut)
+                else {
+                    continue;
+                };
+                if stored
+                    .as_str()
+                    .is_some_and(|stored| selects_one_of(stored, entry.retired))
+                {
+                    let decor = stored.decor().clone();
+                    let mut replaced = toml_edit::Value::from(entry.replacement);
+                    *replaced.decor_mut() = decor;
+                    *stored = replaced;
+                    notices.push(MigrationNotice::Replaced {
+                        path: concrete.join("."),
+                        replacement: entry.replacement,
+                        reason: entry.reason,
                     });
                 }
             }
@@ -7474,7 +7667,9 @@ mention_only = false
         assert_eq!(accepted, V3_AGENT_FIELDS);
     }
 
-    /// Each V3-only destination is a spelling the current schema reads there.
+    /// Each V3-only destination is a spelling the current schema reads there,
+    /// or a V3 section a later version retired: an unversioned file holding
+    /// one still has the V3 shape, and the retirement then drops it.
     #[test]
     fn v3_only_destinations_are_current_spellings() {
         for pattern in V3_ONLY_DESTINATIONS {
@@ -7484,8 +7679,14 @@ mention_only = false
                 .filter(|key| *key != ANY_KEY)
                 .collect();
             let (key, parent) = named.split_last().unwrap();
+            let concrete: Vec<&str> = pattern
+                .iter()
+                .map(|key| if *key == ANY_KEY { "x" } else { *key })
+                .collect();
             assert!(
-                accepted_at(&parent.join(".")).contains(key),
+                accepted_at(&parent.join(".")).contains(key)
+                    || retired_key_covering(&concrete)
+                        .is_some_and(|retired| retired.retired_in > 3),
                 "`{}` is not a current spelling",
                 pattern.join(".")
             );
@@ -7598,6 +7799,10 @@ mention_only = false
         (
             "security.nevis",
             "[security.nevis]\nclient_secret = \"x\"\n",
+        ),
+        (
+            "storage.lucid",
+            "[storage.lucid.default]\nbinary_path = \"x\"\n",
         ),
         (
             "agents.x.compact_context",
@@ -9118,5 +9323,288 @@ summary_model = "opus"
                 .any(|n| matches!(n, MigrationNotice::Removed { path, .. } if path == "identity")),
             "a moved identity is not reported as removed: {notices:?}"
         );
+    }
+
+    // ── The retired Lucid memory backend ──
+
+    /// A config written for the Lucid backend, the way quickstart wrote it:
+    /// the install-wide backend, a `[storage.lucid.<alias>]` table and an
+    /// agent on Lucid, with operator comments beside them.
+    const LUCID_BODY: &str = "locale = \"en\" # operator locale\n\n\
+         [memory]\n\
+         backend = \"lucid\" # chosen at quickstart\n\n\
+         [storage.lucid.default]\n\
+         binary_path = \"/opt/lucid/bin/lucid\"\n\n\
+         [agents.alpha.memory]\n\
+         backend = \"lucid\" # alpha's store\n\n\
+         [tools]\n\
+         optional = [\"*\"]\n";
+
+    /// The paths of the `Replaced` notices, sorted.
+    fn replaced_paths(notices: &[MigrationNotice]) -> Vec<&str> {
+        let mut paths: Vec<&str> = notices
+            .iter()
+            .filter_map(|notice| match notice {
+                MigrationNotice::Replaced { path, .. } => Some(path.as_str()),
+                _ => None,
+            })
+            .collect();
+        paths.sort_unstable();
+        paths
+    }
+
+    /// The paths of the `Removed` notices, sorted, ignoring the others.
+    fn only_removed_paths(notices: &[MigrationNotice]) -> Vec<&str> {
+        let mut paths: Vec<&str> = notices
+            .iter()
+            .filter_map(|notice| match notice {
+                MigrationNotice::Removed { path, .. } => Some(path.as_str()),
+                _ => None,
+            })
+            .collect();
+        paths.sort_unstable();
+        paths
+    }
+
+    const LUCID_REPLACED: [&str; 2] = ["agents.alpha.memory.backend", "memory.backend"];
+
+    /// A Lucid config keeps loading, on SQLite, through the strict load and
+    /// the daemon's resilient load, at V3 and V4: the values that selected
+    /// Lucid say `sqlite`, the CLI table is gone, every change is reported,
+    /// and nothing is dropped, so the agent keeps its settings.
+    #[test]
+    fn a_lucid_config_loads_on_sqlite_through_the_strict_and_resilient_paths() {
+        for version in [3, CURRENT_SCHEMA_VERSION] {
+            let raw = format!("schema_version = {version}\n{LUCID_BODY}");
+
+            let strict = migrate_to_current(&raw)
+                .unwrap_or_else(|err| panic!("V{version}: the strict load failed: {err:#}"));
+            assert_eq!(strict.memory.backend, "sqlite", "V{version}");
+            assert_eq!(
+                strict.agents.get("alpha").map(|agent| agent.memory.backend),
+                Some(crate::multi_agent::MemoryBackendKind::Sqlite),
+                "V{version}: the agent must load on SQLite"
+            );
+
+            let load = migrate_to_current_salvaged(&raw);
+            assert!(load.dropped.is_empty(), "V{version}: {:?}", load.dropped);
+            assert!(
+                load.dropped_security.is_empty(),
+                "V{version}: {:?}",
+                load.dropped_security
+            );
+            assert_eq!(load.config.memory.backend, "sqlite", "V{version}");
+            assert_eq!(
+                load.config
+                    .agents
+                    .get("alpha")
+                    .map(|agent| agent.memory.backend),
+                Some(crate::multi_agent::MemoryBackendKind::Sqlite),
+                "V{version}: the agent must survive the load on SQLite"
+            );
+            assert_eq!(load.notices.len(), 3, "V{version}: {:?}", load.notices);
+            assert_eq!(
+                only_removed_paths(&load.notices),
+                ["storage.lucid"],
+                "V{version}"
+            );
+            assert_eq!(replaced_paths(&load.notices), LUCID_REPLACED, "V{version}");
+            assert!(
+                load.notices.iter().all(MigrationNotice::changes_file),
+                "V{version}: every change is one `config migrate` writes"
+            );
+
+            let (value, _) = migrate_value(&raw).unwrap();
+            assert!(
+                value
+                    .get("storage")
+                    .and_then(|storage| storage.get("lucid"))
+                    .is_none(),
+                "V{version}: the Lucid table must be gone: {value:?}"
+            );
+        }
+    }
+
+    /// The value is matched by its kind, trimmed, in any case, with or
+    /// without an alias. Every other backend, and a kind that only starts
+    /// with `lucid`, is left alone with no notice.
+    #[test]
+    fn every_spelling_of_a_lucid_backend_is_replaced_and_no_other_value_is() {
+        for stored in ["lucid", "lucid.selected", " Lucid ", "LUCID", "Lucid.x"] {
+            let raw = format!(
+                "schema_version = {CURRENT_SCHEMA_VERSION}\n\n[memory]\nbackend = {stored:?}\n\n\
+                 [tools]\noptional = [\"*\"]\n"
+            );
+            let load = migrate_to_current_salvaged(&raw);
+            assert_eq!(load.config.memory.backend, "sqlite", "{stored:?}");
+            assert_eq!(
+                replaced_paths(&load.notices),
+                ["memory.backend"],
+                "{stored:?}"
+            );
+            let (migrated, notices) = migrate_file_with_notices(&raw)
+                .unwrap()
+                .unwrap_or_else(|| panic!("{stored:?}: the file must be rewritten"));
+            assert_eq!(replaced_paths(&notices), ["memory.backend"], "{stored:?}");
+            assert_eq!(
+                migrated,
+                raw.replace(&format!("{stored:?}"), "\"sqlite\""),
+                "{stored:?}: only the value changes"
+            );
+        }
+        for stored in [
+            "sqlite",
+            "sqlite.default",
+            "markdown",
+            "postgres.work",
+            "none",
+            "lucidity",
+        ] {
+            let raw = format!(
+                "schema_version = {CURRENT_SCHEMA_VERSION}\n\n[memory]\nbackend = {stored:?}\n\n\
+                 [agents.alpha.memory]\nbackend = \"markdown\"\n\n[tools]\noptional = [\"*\"]\n"
+            );
+            let load = migrate_to_current_salvaged(&raw);
+            assert!(load.notices.is_empty(), "{stored:?}: {:?}", load.notices);
+            assert_eq!(load.config.memory.backend, stored, "{stored:?}");
+            assert_eq!(
+                migrate_file_with_notices(&raw).unwrap(),
+                None,
+                "{stored:?}: nothing to rewrite"
+            );
+        }
+    }
+
+    /// `config migrate` rewrites a Lucid file in place, at V3 and V4: the
+    /// values change where they stand, their comments and every unrelated
+    /// byte stay, and the CLI table is removed.
+    #[test]
+    fn config_migrate_rewrites_a_lucid_file_in_place() {
+        for version in [3, CURRENT_SCHEMA_VERSION] {
+            let raw = format!("schema_version = {version}\n{LUCID_BODY}");
+            let (migrated, notices) = migrate_file_with_notices(&raw)
+                .unwrap()
+                .unwrap_or_else(|| panic!("V{version}: the file must be rewritten"));
+            assert_eq!(notices.len(), 3, "V{version}: {notices:?}");
+            assert_eq!(
+                only_removed_paths(&notices),
+                ["storage.lucid"],
+                "V{version}"
+            );
+            assert_eq!(replaced_paths(&notices), LUCID_REPLACED, "V{version}");
+            for kept in [
+                "locale = \"en\" # operator locale\n",
+                "[memory]\nbackend = \"sqlite\" # chosen at quickstart\n",
+                "[agents.alpha.memory]\nbackend = \"sqlite\" # alpha's store\n",
+            ] {
+                assert!(
+                    migrated.contains(kept),
+                    "V{version}: `{kept}` must survive:\n{migrated}"
+                );
+            }
+            assert!(
+                !migrated.contains("lucid") && !migrated.contains("storage"),
+                "V{version}:\n{migrated}"
+            );
+            assert!(
+                migrated.starts_with(&format!("schema_version = {CURRENT_SCHEMA_VERSION}\n")),
+                "V{version}:\n{migrated}"
+            );
+        }
+
+        // Without the CLI table only the two values change, byte for byte.
+        let raw = format!(
+            "schema_version = {CURRENT_SCHEMA_VERSION}\n{}",
+            LUCID_BODY.replace(
+                "[storage.lucid.default]\nbinary_path = \"/opt/lucid/bin/lucid\"\n\n",
+                ""
+            )
+        );
+        let (migrated, notices) = migrate_file_with_notices(&raw).unwrap().unwrap();
+        assert_eq!(replaced_paths(&notices), LUCID_REPLACED);
+        assert_eq!(notices.len(), 2, "{notices:?}");
+        assert_eq!(migrated, raw.replace("\"lucid\"", "\"sqlite\""));
+
+        let mut doc: toml_edit::DocumentMut = raw.parse().unwrap();
+        let notices = replace_retired_values_in_doc(doc.as_table_mut());
+        assert_eq!(replaced_paths(&notices), LUCID_REPLACED);
+        assert_eq!(doc.to_string(), raw.replace("\"lucid\"", "\"sqlite\""));
+    }
+
+    /// An inline-table spelling is rewritten too, and the notice never
+    /// carries the operator's original value, only the path, the constant
+    /// replacement and the reason.
+    #[test]
+    fn a_lucid_value_is_replaced_in_every_spelling_and_never_echoed() {
+        for body in [
+            "memory.backend = \"Lucid.private-alias\"\n",
+            "memory = { backend = \"Lucid.private-alias\" }\n",
+            "[memory]\nbackend = \"Lucid.private-alias\"\n",
+        ] {
+            let raw = format!(
+                "schema_version = {CURRENT_SCHEMA_VERSION}\n{body}[tools]\noptional = [\"*\"]\n"
+            );
+            let (migrated, notices) = migrate_file_with_notices(&raw)
+                .unwrap()
+                .unwrap_or_else(|| panic!("{body}: the file must be rewritten"));
+            assert_eq!(
+                migrated,
+                raw.replace("\"Lucid.private-alias\"", "\"sqlite\""),
+                "{body}"
+            );
+            assert_eq!(replaced_paths(&notices), ["memory.backend"], "{body}");
+            for notice in &notices {
+                let rendered = format!(
+                    "{} {}",
+                    notice.message(),
+                    serde_json::to_string(notice).unwrap()
+                );
+                assert!(!rendered.contains("private-alias"), "{rendered}");
+                assert!(rendered.contains("memory.backend"), "{rendered}");
+                assert!(rendered.contains("sqlite"), "{rendered}");
+                assert!(rendered.contains("\"kind\":\"replaced\""), "{rendered}");
+            }
+        }
+    }
+
+    /// Each retired value's reason has its own Fluent id, entries that share
+    /// a reason share it, and the shared matcher recognizes exactly the
+    /// retired kind.
+    #[test]
+    fn retired_values_have_reason_ids_and_match_only_the_retired_kind() {
+        for value in RETIRED_VALUES {
+            assert!(
+                value.reason_id.starts_with("cli-config-retired-reason-"),
+                "{value:?}"
+            );
+            assert_eq!(retired_value_reason_id(value.reason), Some(value.reason_id));
+            for other in RETIRED_VALUES {
+                assert_eq!(
+                    value.reason == other.reason,
+                    value.reason_id == other.reason_id,
+                    "{:?} and {:?}",
+                    value.path,
+                    other.path
+                );
+            }
+            assert!(
+                !selects_one_of(value.replacement, value.retired),
+                "{value:?}: the replacement must not select a retired kind"
+            );
+        }
+        assert_eq!(retired_value_reason_id("not a retired value reason"), None);
+        for retired in [
+            "lucid",
+            " Lucid ",
+            "LUCID",
+            "lucid.selected",
+            "Lucid.x",
+            "lucid .",
+        ] {
+            assert!(is_retired_memory_backend(retired), "{retired:?}");
+        }
+        for live in ["sqlite", "sqlite.lucid", "lucidity", "markdown", "", "none"] {
+            assert!(!is_retired_memory_backend(live), "{live:?}");
+        }
     }
 }

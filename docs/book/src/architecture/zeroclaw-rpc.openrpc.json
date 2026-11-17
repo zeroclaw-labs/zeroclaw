@@ -2105,11 +2105,6 @@
             "const": "markdown",
             "description": "Markdown files in the agent's workspace\n(`crates/zeroclaw-memory/src/markdown.rs`).",
             "type": "string"
-          },
-          {
-            "const": "lucid",
-            "description": "Hybrid local SQLite + external Lucid CLI\n(`crates/zeroclaw-memory/src/lucid.rs`).",
-            "type": "string"
           }
         ]
       },

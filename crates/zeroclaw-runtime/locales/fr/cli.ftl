@@ -173,7 +173,7 @@ cli-memory-list-about = Lister les entrées de mémoire avec des filtres optionn
 cli-memory-get-about = Obtenir une entrée de mémoire spécifique par clé
 cli-memory-stats-about = Afficher les statistiques et l'état de santé du backend mémoire
 cli-memory-clear-about = Effacer les mémoires par catégorie, par clé, ou tout effacer
-cli-memory-clear-unsupported-backend = memory clear n'est pas pris en charge pour le backend en ajout seul '{$backend}' ; passez à un backend supprimable (sqlite, lucid ou postgres)
+cli-memory-clear-unsupported-backend = memory clear n'est pas pris en charge pour le backend en ajout seul '{$backend}' ; passez à un backend supprimable (sqlite ou postgres)
 cli-estop-status-about = Non appliqué : la commande est refusée
 cli-estop-resume-about = Non appliqué : la commande est refusée
 cli-models-refresh-about = Actualiser et mettre en cache les modèles du fournisseur
@@ -193,7 +193,7 @@ cli-sop-list-about = Lister les SOP (Procédures Opérationnelles Standard) char
 cli-sop-validate-about = Valider les définitions des SOP
 cli-sop-show-about = Afficher les détails d'une SOP
 cli-migrate-openclaw-about = Importer la mémoire d'un espace de travail OpenClaw vers cet espace de travail ZeroClaw
-cli-migrate-openclaw-qdrant-unsupported = Qdrant n’est actuellement pas pris en charge comme cible de migration OpenClaw. Définissez memory.backend sur sqlite, lucid ou markdown, puis réessayez.
+cli-migrate-openclaw-qdrant-unsupported = Qdrant n’est actuellement pas pris en charge comme cible de migration OpenClaw. Définissez memory.backend sur sqlite ou markdown, puis réessayez.
 cli-agent-long-about =
     Démarrer la boucle de l'agent IA.
 
@@ -967,6 +967,9 @@ cli-config-retired-reason-tts-default = il n’y a pas de fournisseur TTS global
 cli-config-retired-reason-global-transcription = il n’y a pas de fournisseur de transcription global par défaut ; définissez plutôt `transcription_provider` sur chaque `[agents.<alias>]`
 cli-config-retired-reason-identity = l’identité se définit par agent ; déplacez-la vers `[agents.<alias>.identity]`
 cli-config-retired-reason-pairing-max-pending = la passerelle ne garde qu’un seul code d’appairage en attente à la fois, et émettre un nouveau code annule le précédent
+cli-config-retired-value-replaced = avertissement : la valeur obsolète de la clé de configuration `{$key}` de {$path} a été remplacée par `{$replacement}` : {$reason}
+cli-config-retired-reason-lucid = le backend mémoire Lucid a été supprimé ; ses mémoires se trouvent déjà dans le stockage SQLite que lit `memory.backend = "sqlite"`
+cli-config-retired-reason-lucid-backend = le backend mémoire Lucid a été supprimé ; il enregistrait chaque mémoire dans le stockage SQLite que lit `sqlite`, donc toutes sont conservées, et seuls les résultats de rappel issus de l’index Lucid externe n’apparaissent plus
 cli-config-migration-inferred-v3 = avertissement : {$path} n’a pas de `schema_version`, mais ses sections sont au format V3 ; il a donc été lu comme schéma V3 et migré à partir de là. Exécutez `zeroclaw config migrate` pour écrire le `schema_version` actuel dans le fichier.
 cli-config-env-override-retired = avertissement : `{$variable}` a été ignorée, car elle définit une clé de configuration obsolète : {$reason}
 cli-config-migration-pending = avertissement : ces modifications ne s’appliquent qu’à cette exécution. Lancez `zeroclaw config migrate` pour les écrire dans {$path}.
