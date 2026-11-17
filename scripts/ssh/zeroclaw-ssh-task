@@ -39,7 +39,7 @@ def parse_args(args):
         if flag == '-o' and value.split('=', 1)[0].lower() not in SAFE_OPTIONS:
             raise ValueError('SSH identity, trust and transport options cannot be overridden')
         options.extend((flag, value))
-    if not args or not re.fullmatch(r'[a-zA-Z0-9_.:@\[\]-]+', args[0]):
+    if not args or args[0].startswith('-') or not re.fullmatch(r'[a-zA-Z0-9_.:@\[\]-]+', args[0]):
         raise ValueError('A configured SSH host alias is required')
     host = args.pop(0)
     if not args:
@@ -48,7 +48,7 @@ def parse_args(args):
 
 
 def ssh_config(options, host):
-    p = subprocess.run([SSH, '-G', '-o', 'ForkAfterAuthentication=no', *options, host], check=True,
+    p = subprocess.run([SSH, '-G', '-o', 'ForkAfterAuthentication=no', *options, '--', host], check=True,
                        capture_output=True, text=True, timeout=10)
     config = {}
     for line in p.stdout.splitlines():
@@ -119,7 +119,7 @@ class Pool:
                            '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=12',
                            '-o', 'ConnectionAttempts=1', '-o', 'ForwardAgent=no',
                            '-o', 'ServerAliveInterval=30', '-o', 'ServerAliveCountMax=3',
-                           *options, host]
+                           *options, '--', host]
                 log = BoundedLog()
                 def spawn():
                     process = subprocess.Popen(command, stdin=subprocess.DEVNULL,
