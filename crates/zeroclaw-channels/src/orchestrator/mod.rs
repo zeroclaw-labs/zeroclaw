@@ -59177,7 +59177,7 @@ Done."#;
                     .iter()
                     .any(
                         |m| m.ends_with(&zeroclaw_runtime::i18n::get_required_cli_string(
-                            "channel-runtime-task-deadline"
+                            "channel-runtime-request-timeout"
                         ))
                     )
             );
