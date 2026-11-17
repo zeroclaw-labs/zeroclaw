@@ -1399,6 +1399,10 @@ jobs:
       # `plugins-wasm` feature, so the default-feature Test job never runs its
       # tests. The filter is a module path: it selects every test in the
       # handler's `plugin_webhook::tests`, not one test name.
+      - name: Run gateway plugin TLS credential tests
+        if: steps.changed.outputs.run == 'true' && matrix.suite == 'gateway'
+        run: cargo test --locked -p zeroclaw-gateway --features plugins-wasm --lib plugin_tls_credential_api
+
       - name: Run gateway plugin webhook tests
         if: steps.changed.outputs.run == 'true' && matrix.suite == 'gateway'
         run: cargo test --locked -p zeroclaw-gateway --features plugins-wasm --lib plugin_webhook

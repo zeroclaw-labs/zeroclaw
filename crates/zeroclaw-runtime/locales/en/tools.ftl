@@ -285,3 +285,19 @@ tool-ssh-task-state-directory = Task SSH owner omitted state directory
 tool-ssh-task-cleanup-timeout = Task SSH cleanup timed out
 tool-ssh-task-cleanup-failed = Task SSH cleanup failed
 tool-ssh-task-cleanup-status = Task SSH cleanup helper failed
+# Scoped HTTP credentials
+tool-http-credential-reference = Invalid external credential reference
+tool-http-credential-lookup = External credential lookup failed
+tool-http-credential-timeout = External credential lookup timed out
+tool-http-credential-value = Invalid external credential value
+tool-http-credential-store = Credential store unavailable
+tool-http-credential-missing = Scoped HTTP credential unavailable
+tool-http-credential-invalid = Invalid stored HTTP credential
+tool-http-credential-origin = Scoped HTTP credential does not allow this HTTPS origin
+tool-http-credential-kind = This credential type cannot authenticate HTTP requests
+tool-http-credential-argument = 'credential' must be a string
+tool-http-credential-exclusive = Choose credential or auth_secret, not both
+tool-http-credential-host = A custom Host header is forbidden when using a scoped credential.
+tool-http-credential-alias = Credential alias must contain 1 to 64 ASCII letters, numbers, underscores, or hyphens.
+
+tool-http-request-authenticated-response-truncated = [Truncated authenticated response omitted]

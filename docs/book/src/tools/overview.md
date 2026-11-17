@@ -149,6 +149,38 @@ The following built-in capabilities are available when compiled and selected, wh
 | `ask_user` | Send a question to the active channel and wait for a reply. Supports optional `choices` for structured responses (inline keyboard on Telegram, numbered list on CLI). On ACP, `choices` are required: free-form ask awaits the ACP elicitation RFD. Parameters: `question` (required), `choices` (optional list), `timeout_secs` (default 600). |
 | `escalate_to_human` | Send a structured escalation message with urgency routing. `high` / `critical` urgency additionally notifies any channels listed in `[escalation] alert_channels`. Parameters: `summary` (required), `context` (optional), `urgency` (`low`/`medium`/`high`/`critical`, default `medium`), `wait_for_response` (bool, default false), `timeout_secs` (default 600). On ACP, `wait_for_response: true` fails immediately if the channel cannot receive free-form replies (awaits ACP elicitation RFD). |
 
+In **Settings → Secrets**, operators can create, replace, and delete
+**Username and password credentials** (HTTP Basic) and **API token
+credentials** (Bearer or `X-API-Key`). Each alias is bound to one exact HTTPS
+origin, including any non-default port. The tool's existing domain policy
+still applies. The editor lists only aliases, types, and origins.
+
+For example, register an API token as `INVENTORY_API` for
+`https://inventory.example.com`. In chat, ask: “Read the inventory status at
+`https://inventory.example.com/status` using `INVENTORY_API`.” The
+`http_request` tool accepts the alias as its `credential` argument. The
+operator enters the token in the editor, and the tool adds it to the request.
+A username and password credential uses the same reference flow for a
+service that accepts HTTP Basic. Browser form logins are outside this flow.
+
+The credential editor offers local encryption and the following external reference
+formats. They apply to the API token or Basic password. The Basic username is
+entered in the editor.
+
+| Source | Reference | Service prerequisite |
+| --- | --- | --- |
+| OpenBao | `mount/path/field` | Authenticated `bao` CLI and configured server |
+| 1Password | `op://vault/item/field` | Authenticated `op` CLI |
+| Azure Key Vault | `vault/secret` | Authenticated `az` CLI |
+| AWS Secrets Manager | `region/secret-id` | Authenticated AWS CLI v2 and a string secret |
+| Google Cloud Secret Manager | `project/secret/version` | Authenticated `gcloud` CLI |
+
+Install the required CLI in the service environment and grant its service identity
+read access to the specific secret. The external value is fetched per authorized
+HTTP call and is never saved to the ZeroClaw configuration. The alias and reference
+are stored in the encrypted local record. Rotate external values at their source.
+Deleting an alias removes the ZeroClaw binding.
+
 ### AnySearch provider
 
 AnySearch is an explicit, opt-in backend for `web_search_tool`:
