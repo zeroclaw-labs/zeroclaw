@@ -41,9 +41,6 @@ static NON_OVERRIDABLE_PATHS: LazyLock<HashSet<&'static str>> =
 pub struct AppliedOverrides {
     pub paths: HashSet<String>,
     pub snapshots: HashMap<String, String>,
-    /// The legacy OpenAI STT table was absent before an env override created
-    /// it. Saves restore that absence after masking the key field.
-    pub openai_stt_section_was_absent: bool,
 }
 
 /// Apply every `ZEROCLAW_<lowercase>` env var to `config`. Returns the set of
@@ -51,7 +48,6 @@ pub struct AppliedOverrides {
 /// for each. Hard-errors on any env var that doesn't resolve to a known
 /// schema path or whose alias fails validation.
 pub fn apply_env_overrides(config: &mut Config) -> Result<AppliedOverrides> {
-    let openai_stt_section_was_absent = config.transcription.openai.is_none();
     let mut entries: Vec<(String, String, String)> = std::env::vars()
         .filter_map(|(k, v)| {
             let tail = k.strip_prefix(PREFIX)?;
@@ -157,7 +153,8 @@ pub fn apply_env_overrides(config: &mut Config) -> Result<AppliedOverrides> {
         .and_then(|openai| openai.api_key.as_deref())
         .map(str::trim)
         .is_some_and(|value| !value.is_empty());
-    if !has_openai_stt_key
+    if config.transcription.openai.is_some()
+        && !has_openai_stt_key
         && let Some((env_name, value)) = ["TRANSCRIPTION_API_KEY", "OPENAI_API_KEY"]
             .into_iter()
             .find_map(|name| {
@@ -171,11 +168,9 @@ pub fn apply_env_overrides(config: &mut Config) -> Result<AppliedOverrides> {
         snapshots
             .entry(OPENAI_STT_API_KEY_PATH.to_string())
             .or_insert(snapshot);
-        config
-            .transcription
-            .openai
-            .get_or_insert_with(Default::default)
-            .api_key = Some(value);
+        if let Some(openai) = config.transcription.openai.as_mut() {
+            openai.api_key = Some(value);
+        }
         paths.insert(OPENAI_STT_API_KEY_PATH.to_string());
         ::zeroclaw_log::record!(
             WARN,
@@ -189,8 +184,6 @@ pub fn apply_env_overrides(config: &mut Config) -> Result<AppliedOverrides> {
         );
     }
 
-    let openai_stt_section_was_absent =
-        openai_stt_section_was_absent && paths.contains(OPENAI_STT_API_KEY_PATH);
     if !paths.is_empty() {
         ::zeroclaw_log::record!(
             INFO,
@@ -199,11 +192,7 @@ pub fn apply_env_overrides(config: &mut Config) -> Result<AppliedOverrides> {
             "Applied env-var config overrides"
         );
     }
-    Ok(AppliedOverrides {
-        paths,
-        snapshots,
-        openai_stt_section_was_absent,
-    })
+    Ok(AppliedOverrides { paths, snapshots })
 }
 
 /// Walk an env-var tail against the schema. Map-keyed positions consume one
@@ -303,15 +292,11 @@ pub(crate) fn raw_value_for_path(source: &Config, path: &str) -> Option<String> 
 pub fn mask_env_overrides_for_save(
     config_to_save: &mut Config,
     snapshots: &HashMap<String, String>,
-    restore_missing_openai_stt_section: bool,
 ) -> Result<()> {
     for (path, value) in snapshots {
         config_to_save
             .set_prop(path, value)
             .with_context(|| format!("failed to restore env-overridden path {path} before save"))?;
-    }
-    if restore_missing_openai_stt_section {
-        config_to_save.transcription.openai = None;
     }
     Ok(())
 }
@@ -560,12 +545,7 @@ mod tests {
         assert_eq!(config.gateway.request_timeout_secs, 999);
 
         let mut to_save = config.clone();
-        mask_env_overrides_for_save(
-            &mut to_save,
-            &applied.snapshots,
-            applied.openai_stt_section_was_absent,
-        )
-        .expect("mask succeeds");
+        mask_env_overrides_for_save(&mut to_save, &applied.snapshots).expect("mask succeeds");
         assert_eq!(
             to_save.gateway.request_timeout_secs, original_timeout,
             "non-secret path resets to pre-override snapshot",
@@ -614,12 +594,7 @@ mod tests {
         // display mask. This is the regression bar for the data-loss bug
         // identified inreview.
         let mut to_save = config.clone();
-        mask_env_overrides_for_save(
-            &mut to_save,
-            &applied.snapshots,
-            applied.openai_stt_section_was_absent,
-        )
-        .expect("mask succeeds");
+        mask_env_overrides_for_save(&mut to_save, &applied.snapshots).expect("mask succeeds");
         assert_eq!(
             to_save
                 .providers
@@ -671,12 +646,8 @@ mod tests {
         assert!(applied.snapshots[path].starts_with('['));
 
         let mut to_save = config.clone();
-        mask_env_overrides_for_save(
-            &mut to_save,
-            &applied.snapshots,
-            applied.openai_stt_section_was_absent,
-        )
-        .expect("structured snapshot restores");
+        mask_env_overrides_for_save(&mut to_save, &applied.snapshots)
+            .expect("structured snapshot restores");
         assert_eq!(
             to_save.agents["alpha"].workspace.read_memory_from,
             vec![MemoryGrant::Scoped {
@@ -824,11 +795,10 @@ mod tests {
         assert_eq!(openai.model, "custom-whisper-model");
         assert!(applied.paths.contains(OPENAI_STT_API_KEY_PATH));
         assert!(Config::prop_is_secret(OPENAI_STT_API_KEY_PATH));
-        assert!(!applied.openai_stt_section_was_absent);
     }
 
     #[tokio::test]
-    async fn openai_stt_bridge_falls_back_to_openai_key_and_masks_synthetic_table() {
+    async fn openai_stt_bridge_falls_back_to_openai_key_and_masks_existing_table() {
         let _guard = super::env_test_lock().await;
         let env = EnvSnapshot::clear(&[
             "TRANSCRIPTION_API_KEY",
@@ -839,6 +809,10 @@ mod tests {
         env.set("OPENAI_API_KEY", "  openai-key  ");
 
         let mut config = Config::default();
+        config.transcription.openai = Some(crate::schema::OpenAiSttConfig {
+            api_key: None,
+            model: "whisper-1".to_string(),
+        });
         let applied = apply_env_overrides(&mut config).expect("apply succeeds");
         assert_eq!(
             config
@@ -848,23 +822,17 @@ mod tests {
                 .and_then(|openai| openai.api_key.as_deref()),
             Some("openai-key"),
         );
-        assert!(applied.openai_stt_section_was_absent);
-        assert_eq!(
-            applied.snapshots.get(OPENAI_STT_API_KEY_PATH),
-            Some(&String::new()),
-            "the absent key is masked to its pre-override empty value",
-        );
+        assert!(applied.paths.contains(OPENAI_STT_API_KEY_PATH));
 
         let mut to_save = config.clone();
-        mask_env_overrides_for_save(
-            &mut to_save,
-            &applied.snapshots,
-            applied.openai_stt_section_was_absent,
-        )
-        .expect("mask succeeds");
+        mask_env_overrides_for_save(&mut to_save, &applied.snapshots).expect("mask succeeds");
         assert!(
-            to_save.transcription.openai.is_none(),
-            "saving must not make an environment-created section durable",
+            to_save
+                .transcription
+                .openai
+                .as_ref()
+                .is_some_and(|openai| openai.api_key.is_none()),
+            "saving must restore the existing table's missing key",
         );
         assert!(
             !toml::to_string(&to_save)
@@ -875,7 +843,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn openai_stt_bridge_does_not_persist_a_synthetic_section() {
+    async fn openai_stt_bridge_does_not_persist_an_environment_key() {
         let _guard = super::env_test_lock().await;
         let env = EnvSnapshot::clear(&[
             "TRANSCRIPTION_API_KEY",
@@ -892,13 +860,16 @@ mod tests {
             ..Config::default()
         };
         config.transcription.enabled = true;
+        config.transcription.openai = Some(crate::schema::OpenAiSttConfig {
+            api_key: None,
+            model: "whisper-1".to_string(),
+        });
         config.save().await.expect("write the pre-bridge config");
         config.loaded_from = Some(config_path.clone());
 
         let applied = apply_env_overrides(&mut config).expect("apply succeeds");
         config.env_overridden_paths = applied.paths;
         config.pre_override_snapshots = applied.snapshots;
-        config.pre_override_openai_stt_section_was_absent = applied.openai_stt_section_was_absent;
         config
             .set_prop_persistent("gateway.request_timeout_secs", "91")
             .expect("mark an unrelated config edit dirty");
@@ -906,8 +877,8 @@ mod tests {
 
         let contents = std::fs::read_to_string(&config_path).expect("saved config exists");
         assert!(
-            !contents.contains("[transcription.openai]"),
-            "an env-created section must not become durable: {contents}",
+            contents.contains("[transcription.openai]"),
+            "the explicitly configured provider section must remain durable: {contents}",
         );
         assert!(
             !contents.contains("bridge-only-fixture"),
@@ -915,7 +886,12 @@ mod tests {
         );
         let reloaded = crate::migration::migrate_to_current(&contents)
             .expect("saved config can be loaded again");
-        assert!(reloaded.transcription.openai.is_none());
+        let openai = reloaded
+            .transcription
+            .openai
+            .expect("the explicitly configured provider remains enabled");
+        assert!(openai.api_key.is_none());
+        assert_eq!(openai.model, "whisper-1");
         assert_eq!(reloaded.gateway.request_timeout_secs, 91);
     }
 

@@ -872,8 +872,6 @@ impl ModelRoutingConfigTool {
             .map_err(ProbeConfigFailure::EnvironmentOverride)?;
         effective.env_overridden_paths = applied.paths;
         effective.pre_override_snapshots = applied.snapshots;
-        effective.pre_override_openai_stt_section_was_absent =
-            applied.openai_stt_section_was_absent;
         Ok(effective)
     }
 

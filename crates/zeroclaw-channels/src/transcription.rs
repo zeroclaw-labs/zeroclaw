@@ -1699,17 +1699,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn config_environment_bridge_registers_openai_provider() {
+    async fn config_environment_bridge_requires_existing_openai_section() {
         const CHILD_ENV: &str = "ZEROCLAW_TEST_OPENAI_STT_BRIDGE_CHILD";
         if std::env::var_os(CHILD_ENV).is_some() {
             let mut config = Config::default();
-            config.transcription.enabled = true;
+            config.transcription = toml::from_str("enabled = true\n[openai]\n")
+                .expect("deserialize configured OpenAI section with its serde model default");
+            assert_eq!(
+                config
+                    .transcription
+                    .openai
+                    .as_ref()
+                    .map(|openai| openai.model.as_str()),
+                Some("whisper-1"),
+                "the existing table uses the configured serde default",
+            );
             let applied = zeroclaw_config::env_overrides::apply_env_overrides(&mut config)
                 .expect("the supported env bridge applies");
             config.env_overridden_paths = applied.paths;
             config.pre_override_snapshots = applied.snapshots;
-            config.pre_override_openai_stt_section_was_absent =
-                applied.openai_stt_section_was_absent;
 
             assert_eq!(
                 config
@@ -1725,20 +1733,39 @@ mod tests {
                 manager.transcription_providers.contains_key("openai"),
                 "the typed config credential must reach legacy provider registration",
             );
+
+            let mut absent = Config::default();
+            absent.transcription.enabled = true;
+            absent.transcription.api_key = Some("existing-groq-config-key".to_string());
+            let applied = zeroclaw_config::env_overrides::apply_env_overrides(&mut absent)
+                .expect("an unrelated ambient OpenAI key does not fail config loading");
+            assert!(absent.transcription.openai.is_none());
+            assert!(
+                !applied.paths.contains("transcription.openai.api_key"),
+                "native aliases do not synthesize an OpenAI provider section",
+            );
+            let manager = TranscriptionManager::from_config_for_agent(&absent, None)
+                .expect("manager builds without an OpenAI section");
+            assert!(manager.transcription_providers.contains_key("groq"));
+            assert!(
+                !manager.transcription_providers.contains_key("openai"),
+                "ambient OpenAI keys must not opt an install into the provider",
+            );
             return;
         }
 
-        let output =
-            std::process::Command::new(std::env::current_exe().expect("test executable path"))
-                .arg("--exact")
-                .arg("transcription::tests::config_environment_bridge_registers_openai_provider")
-                .arg("--nocapture")
-                .env(CHILD_ENV, "1")
-                .env("TRANSCRIPTION_API_KEY", "  transcription-manager-fixture  ")
-                .env("OPENAI_API_KEY", "lower-precedence-fixture")
-                .env_remove("ZEROCLAW_transcription__openai__api_key")
-                .output()
-                .expect("run isolated child test");
+        let output = std::process::Command::new(
+            std::env::current_exe().expect("test executable path"),
+        )
+        .arg("--exact")
+        .arg("transcription::tests::config_environment_bridge_requires_existing_openai_section")
+        .arg("--nocapture")
+        .env(CHILD_ENV, "1")
+        .env("TRANSCRIPTION_API_KEY", "  transcription-manager-fixture  ")
+        .env("OPENAI_API_KEY", "lower-precedence-fixture")
+        .env_remove("ZEROCLAW_transcription__openai__api_key")
+        .output()
+        .expect("run isolated child test");
         assert!(
             output.status.success(),
             "isolated manager bridge test failed\nstdout:\n{}\nstderr:\n{}",

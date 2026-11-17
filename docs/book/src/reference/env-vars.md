@@ -100,10 +100,17 @@ The legacy `[transcription.openai]` provider also accepts `TRANSCRIPTION_API_KEY
 and `OPENAI_API_KEY`. During config loading, a non-empty
 `TRANSCRIPTION_API_KEY` fills a missing `[transcription.openai].api_key`; if it
 is unset or blank, `OPENAI_API_KEY` is tried. A non-empty configured key wins
-over these native aliases. When `[transcription.openai]` exists, the canonical
+over these native aliases. The bridge only applies when
+`[transcription.openai]` already exists; setting either native alias alone does
+not enable OpenAI transcription. Add an empty table to opt in:
+
+```toml
+[transcription.openai]
+```
+
+When the table exists, the canonical
 `ZEROCLAW_transcription__openai__api_key` schema-mirror override is applied
-first and keeps its usual override precedence. The native aliases also cover
-the case where that optional table is absent.
+first and keeps its usual override precedence.
 
 The bridge writes the selected value into the typed `Config` before the
 transcription manager is built. The value is treated as a secret, marked as an

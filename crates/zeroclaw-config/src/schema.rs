@@ -172,11 +172,6 @@ pub struct Config {
     /// original on-disk credentials survive any save cycle.
     #[serde(skip)]
     pub pre_override_snapshots: std::collections::HashMap<String, String>,
-    /// Whether an env-provided OpenAI STT key created a legacy
-    /// `[transcription.openai]` section that was absent before loading.
-    /// Saves use this to avoid persisting a synthetic empty section.
-    #[serde(skip)]
-    pub pre_override_openai_stt_section_was_absent: bool,
     /// Per-path snapshot of `op://` external secret references captured before
     /// `decrypt_secrets()` resolves them for runtime use. `save()` restores
     /// these references unless the same path was intentionally edited.
@@ -6686,8 +6681,9 @@ pub struct ToolFilterGroup {
 /// OpenAI Whisper STT provider configuration (`[transcription.openai]`).
 ///
 /// A missing API key can be supplied at config-load time by the native
-/// `TRANSCRIPTION_API_KEY` / `OPENAI_API_KEY` bridge; the resolved value still
-/// uses this typed field and the normal secret masking rules.
+/// `TRANSCRIPTION_API_KEY` / `OPENAI_API_KEY` bridge when this table is
+/// configured; the resolved value still uses this typed field and normal
+/// secret masking rules.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "transcription.openai"]
@@ -21750,7 +21746,6 @@ impl Default for Config {
             config_path: zeroclaw_dir.join("config.toml"),
             env_overridden_paths: std::collections::HashSet::new(),
             pre_override_snapshots: std::collections::HashMap::new(),
-            pre_override_openai_stt_section_was_absent: false,
             onepassword_reference_snapshots: std::collections::HashMap::new(),
             dirty_paths: std::collections::HashSet::new(),
             degraded_security: Vec::new(),
@@ -23770,8 +23765,6 @@ impl Config {
             let applied = crate::env_overrides::apply_env_overrides(&mut config)?;
             config.env_overridden_paths = applied.paths;
             config.pre_override_snapshots = applied.snapshots;
-            config.pre_override_openai_stt_section_was_absent =
-                applied.openai_stt_section_was_absent;
 
             // Validation must NOT prevent the daemon from booting. If
             // it did, a single broken agent reference would lock the
@@ -23819,8 +23812,6 @@ impl Config {
             let applied = crate::env_overrides::apply_env_overrides(&mut config)?;
             config.env_overridden_paths = applied.paths;
             config.pre_override_snapshots = applied.snapshots;
-            config.pre_override_openai_stt_section_was_absent =
-                applied.openai_stt_section_was_absent;
 
             // Same boot-resilience as the load-existing branch above:
             // a fresh-init config can't realistically fail validation,
@@ -23890,7 +23881,6 @@ impl Config {
         let applied = crate::env_overrides::apply_env_overrides(&mut config)?;
         config.env_overridden_paths = applied.paths;
         config.pre_override_snapshots = applied.snapshots;
-        config.pre_override_openai_stt_section_was_absent = applied.openai_stt_section_was_absent;
 
         // Strict validation: unlike resilient boot, an operator-driven
         // migration refuses a candidate the current schema rejects. The
@@ -26872,13 +26862,6 @@ impl Config {
         self.save_impl(false).await.map(|_| ())
     }
 
-    fn restore_missing_openai_stt_section_on_save(&self) -> bool {
-        self.pre_override_openai_stt_section_was_absent
-            && !self.dirty_paths.iter().any(|path| {
-                path.starts_with("transcription.openai.") && path != "transcription.openai.api_key"
-            })
-    }
-
     /// Same as `save()`, but skips the loaded-provenance guard. Only for
     /// callers that verifiably intend to replace an existing file with a
     /// `Config` that never read it.
@@ -26950,7 +26933,6 @@ impl Config {
             crate::env_overrides::mask_env_overrides_for_save(
                 &mut config_to_save,
                 &self.pre_override_snapshots,
-                self.restore_missing_openai_stt_section_on_save(),
             )?;
         }
         restore_onepassword_references_for_save(
@@ -27102,7 +27084,6 @@ impl Config {
             crate::env_overrides::mask_env_overrides_for_save(
                 &mut config_to_save,
                 &self.pre_override_snapshots,
-                self.restore_missing_openai_stt_section_on_save(),
             )?;
         }
         restore_onepassword_references_for_save(
@@ -27189,11 +27170,6 @@ impl Config {
         write_config_atomically(&config_path, &toml_str).await?;
         log_migration_saved(&migrated);
         log_retirements_saved(&retired);
-        if self.dirty_paths.iter().any(|path| {
-            path.starts_with("transcription.openai.") && path != "transcription.openai.api_key"
-        }) {
-            self.pre_override_openai_stt_section_was_absent = false;
-        }
         self.clear_dirty();
         Ok(())
     }
@@ -35112,7 +35088,6 @@ auto_save = true
             escalation: EscalationConfig::default(),
             env_overridden_paths: std::collections::HashSet::new(),
             pre_override_snapshots: std::collections::HashMap::new(),
-            pre_override_openai_stt_section_was_absent: false,
             onepassword_reference_snapshots: std::collections::HashMap::new(),
             dirty_paths: std::collections::HashSet::new(),
         };
@@ -36554,7 +36529,6 @@ default_temperature = 0.7
             escalation: EscalationConfig::default(),
             env_overridden_paths: std::collections::HashSet::new(),
             pre_override_snapshots: std::collections::HashMap::new(),
-            pre_override_openai_stt_section_was_absent: false,
             onepassword_reference_snapshots: std::collections::HashMap::new(),
             dirty_paths: std::collections::HashSet::new(),
         };
