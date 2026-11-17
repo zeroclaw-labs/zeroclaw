@@ -51,6 +51,40 @@ struct HttpRequestUrlPolicy {
     private_resolution_allowed: bool,
 }
 
+fn redact_response_body(
+    body: String,
+    redact: &impl Fn(&str) -> String,
+    contains_credentials: bool,
+) -> String {
+    fn redact_json(value: &mut serde_json::Value, redact: &impl Fn(&str) -> String) {
+        match value {
+            serde_json::Value::String(text) => *text = redact(text),
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    redact_json(item, redact);
+                }
+            }
+            serde_json::Value::Object(fields) => {
+                *fields = std::mem::take(fields)
+                    .into_iter()
+                    .map(|(name, mut item)| {
+                        redact_json(&mut item, redact);
+                        (redact(&name), item)
+                    })
+                    .collect();
+            }
+            _ => {}
+        }
+    }
+
+    if contains_credentials && let Ok(mut parsed) = serde_json::from_str(&body) {
+        redact_json(&mut parsed, redact);
+        return parsed.to_string();
+    }
+
+    redact(&body)
+}
+
 impl HttpRequestTool {
     pub fn new(
         security: Arc<SecurityPolicy>,
@@ -893,7 +927,8 @@ impl Tool for HttpRequestTool {
                 });
             }
         };
-        let redact = |mut output: String| {
+        let redact = |output: &str| {
+            let mut output = output.to_owned();
             for value in &sensitive {
                 if !value.is_empty() {
                     output = output.replace(value, "[REDACTED]");
@@ -938,7 +973,7 @@ impl Tool for HttpRequestTool {
                         ),
                     };
 
-                let headers_text = redact(headers_text);
+                let headers_text = redact(&headers_text);
                 // An exact-value scrub cannot match the partial credential
                 // left when a decoded body is cut across the secret.
                 let response_text = if !sensitive.is_empty()
@@ -948,9 +983,9 @@ impl Tool for HttpRequestTool {
                         "tool-http-request-authenticated-response-truncated",
                     )
                 } else {
-                    redact(response_text)
+                    redact_response_body(response_text, &redact, !sensitive.is_empty())
                 };
-                let body_error = body_error.map(redact);
+                let body_error = body_error.as_deref().map(redact);
                 let output = format!(
                     "Status: {} {}\nResponse Headers: {}\n\nResponse Body:\n{}",
                     status_code,
@@ -993,7 +1028,7 @@ impl Tool for HttpRequestTool {
                 Ok(ToolResult {
                     success: false,
                     output: ToolOutput::default(),
-                    error: Some(redact(error)),
+                    error: Some(redact(&error)),
                 })
             }
         }
@@ -2615,6 +2650,17 @@ api_token = "Bearer from-secret"
         assert_eq!(parsed["authorization"], "Bearer secret");
         assert_eq!(parsed["x-api-key"], "my-key");
         assert_eq!(parsed["content-type"], "application/json");
+    }
+
+    #[test]
+    fn authenticated_json_body_redacts_decoded_values_and_keys() {
+        let secret = r#"token\"with\escapes"#;
+        let body = json!({"nested": [{"credential": secret}], (secret): "key"}).to_string();
+        let output = redact_response_body(body, &|text| text.replace(secret, "[REDACTED]"), true);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&output).unwrap(),
+            json!({"nested": [{"credential": "[REDACTED]"}], "[REDACTED]": "key"})
+        );
     }
 
     #[test]

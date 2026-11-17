@@ -225,6 +225,16 @@ pub fn build_spec() -> serde_json::Value {
         "404": error_responses["404"].clone(),
     });
 
+    let ssh_destination = serde_json::json!({
+        "type": "object",
+        "required": ["host", "port", "username"],
+        "properties": {
+            "host": {"type": "string"},
+            "port": {"type": "integer", "minimum": 1, "maximum": 65535},
+            "username": {"type": "string"}
+        }
+    });
+
     let http_credentials = serde_json::json!({
         "get": {
             "tags": ["config"],
@@ -293,7 +303,7 @@ pub fn build_spec() -> serde_json::Value {
                                         "password": {"type": "string", "writeOnly": true},
                                         "seed": {"type": "string", "writeOnly": true},
                                         "private_key": {"type": "string", "writeOnly": true},
-                                        "destinations": {"type": "array", "items": {"type": "object"}}
+                                        "destinations": {"type": "array", "items": ssh_destination}
                                     }
                                 }
                             }
@@ -302,7 +312,7 @@ pub fn build_spec() -> serde_json::Value {
                             "type": "object",
                             "properties": {
                                 "http_allowed": {"type": "boolean"},
-                                "destinations": {"type": "array", "items": {"type": "object"}}
+                                "destinations": {"type": "array", "items": ssh_destination}
                             }
                         }
                     }
@@ -1151,6 +1161,19 @@ mod tests {
         assert!(path["post"]["responses"]["204"].is_object());
         let auth = &path["post"]["requestBody"]["content"]["application/json"]["schema"]["properties"]
             ["credential"]["properties"]["auth"]["properties"];
+        let request =
+            &path["post"]["requestBody"]["content"]["application/json"]["schema"]["properties"];
+        let destination = &auth["destinations"]["items"];
+        assert_eq!(
+            destination["required"],
+            serde_json::json!(["host", "port", "username"])
+        );
+        assert_eq!(destination["properties"]["port"]["minimum"], 1);
+        assert_eq!(destination["properties"]["port"]["maximum"], 65535);
+        assert_eq!(
+            destination,
+            &request["permissions"]["properties"]["destinations"]["items"]
+        );
         for name in ["value", "password", "seed", "private_key"] {
             assert_eq!(auth[name]["writeOnly"], true);
         }
