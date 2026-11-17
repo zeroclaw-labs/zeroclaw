@@ -7,9 +7,10 @@ use zeroclaw_api::model_provider::ChatMessage;
 use zeroclaw_goal::{
     GoalParentTurn, GoalVerifierResult, GoalVerifierTurn,
     accounting::{
-        GoalOperationAccounting, GoalOperationAccountingFactory, GoalOperationRequest,
-        GoalOperationSettlement,
+        GoalOperationAccounting, GoalOperationAccountingFactory, GoalOperationGuard,
+        GoalOperationRequest, GoalOperationSettlement,
     },
+    task::GoalDispatchStart,
 };
 
 struct Script {
@@ -42,12 +43,24 @@ struct NoPhysicalAttempts;
 
 #[async_trait]
 impl GoalOperationAccounting for NoPhysicalAttempts {
+    fn admission_guard(&self) -> Result<GoalOperationGuard> {
+        bail!("script unexpectedly guarded a physical provider attempt")
+    }
+
     async fn admit(&self, _request: GoalOperationRequest) -> Result<()> {
         bail!("script unexpectedly admitted a physical provider attempt")
     }
 
+    async fn begin_dispatch(&self) -> Result<GoalDispatchStart> {
+        bail!("script unexpectedly dispatched a physical provider attempt")
+    }
+
     async fn settle(&self, _settlement: GoalOperationSettlement) -> Result<()> {
         bail!("script unexpectedly settled a physical provider attempt")
+    }
+
+    async fn release_unstarted(&self) -> Result<()> {
+        bail!("script unexpectedly released a physical provider attempt")
     }
 
     async fn pricing_complete(&self) -> Result<bool> {

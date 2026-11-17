@@ -207,7 +207,7 @@ tokio::task_local! {
 pub(crate) async fn admit_goal_operation_if_scoped(
     provider_ref: &str,
     model: &str,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<zeroclaw_goal::accounting::GoalOperationGuard>> {
     if let Some(accounting) = GOAL_OPERATION_ACCOUNTING
         .try_with(Clone::clone)
         .ok()
@@ -224,14 +224,116 @@ pub(crate) async fn admit_goal_operation_if_scoped(
         accounting
             .admit(GoalOperationRequest::new(provider_ref, model))
             .await?;
+        return match accounting.admission_guard() {
+            Ok(guard) => Ok(Some(guard)),
+            Err(error) => match accounting.release_unstarted().await {
+                Ok(()) => Err(error),
+                Err(release_error) => Err(with_settlement_failure(error, release_error)),
+            },
+        };
     }
-    Ok(())
+    Ok(None)
 }
 
 pub(crate) fn goal_operation_accounting_is_scoped() -> bool {
     GOAL_OPERATION_ACCOUNTING
         .try_with(|accounting| accounting.is_some())
         .unwrap_or(false)
+}
+
+/// Mark dispatch entry before a provider future can perform any work.
+pub(crate) fn mark_goal_dispatch_entered() {
+    if let Some(accounting) = GOAL_OPERATION_ACCOUNTING
+        .try_with(Clone::clone)
+        .ok()
+        .flatten()
+    {
+        accounting.mark_dispatch_entered();
+    }
+}
+
+/// Retain the provider's live report if its enclosing Goal future is dropped.
+pub(crate) fn register_goal_attempt_scope(
+    scope: &Arc<zeroclaw_providers::dispatch::AccountedChatScope>,
+) {
+    if let Some(accounting) = GOAL_OPERATION_ACCOUNTING
+        .try_with(Clone::clone)
+        .ok()
+        .flatten()
+    {
+        let scope = Arc::clone(scope);
+        accounting.set_abandonment_settlement(Box::new(move || {
+            let (attempts, _, _) = scope.take().into_attempts_and_parts();
+            let mut settlement = interrupted_goal_operation_settlement(&attempts);
+            settlement.accounting_state = combine_accounting_state(
+                settlement.accounting_state,
+                crate::control_plane::GoalAccountingState::OutcomeUnknown,
+            );
+            settlement
+        }));
+    }
+}
+
+/// Retain a completed provider report until its caller settles it.
+pub(crate) fn register_goal_returned_attempts(
+    attempts: &[zeroclaw_providers::dispatch::AccountedAttempt],
+) {
+    if let Some(accounting) = GOAL_OPERATION_ACCOUNTING
+        .try_with(Clone::clone)
+        .ok()
+        .flatten()
+    {
+        let attempts = attempts.to_vec();
+        accounting.set_abandonment_settlement(Box::new(move || {
+            interrupted_goal_operation_settlement(&attempts)
+        }));
+    }
+}
+
+/// Acquire the final dispatch guard only for a Goal-scoped operation.
+pub(crate) async fn begin_goal_dispatch_if_scoped()
+-> anyhow::Result<Option<zeroclaw_goal::task::GoalDispatchStart>> {
+    match GOAL_OPERATION_ACCOUNTING
+        .try_with(Clone::clone)
+        .ok()
+        .flatten()
+    {
+        Some(accounting) => accounting.begin_dispatch().await.map(Some),
+        None => Ok(None),
+    }
+}
+
+/// Poll the dispatch once under its guard, then release it. Cancellation and
+/// timeout wrappers must remain outside this future: they can yield before
+/// polling their inner future and therefore are not the dispatch boundary.
+pub(crate) async fn release_after_first_poll<F: std::future::Future>(
+    mut start: Option<zeroclaw_goal::task::GoalDispatchStart>,
+    future: F,
+) -> F::Output {
+    let mut future = std::pin::pin!(future);
+    let mut entered = false;
+    std::future::poll_fn(|cx| {
+        if !entered {
+            mark_goal_dispatch_entered();
+            entered = true;
+        }
+        let result = future.as_mut().poll(cx);
+        drop(start.take());
+        result
+    })
+    .await
+}
+
+/// Release a Goal admission only when provider dispatch was never polled.
+pub(crate) async fn release_unstarted_goal_operation_if_scoped() -> anyhow::Result<()> {
+    if let Some(accounting) = GOAL_OPERATION_ACCOUNTING
+        .try_with(Clone::clone)
+        .ok()
+        .flatten()
+    {
+        accounting.release_unstarted().await?;
+    }
+    Ok(())
 }
 
 fn goal_operation_settlement(
@@ -247,6 +349,7 @@ fn goal_operation_settlement(
         let (usage, state) = goal_usage_event_for_attempt(
             attempt.provider_ref(),
             attempt.model(),
+            attempt.is_model_attributed(),
             attempt.outcome(),
         );
         accounting_state = combine_accounting_state(accounting_state, state);
@@ -269,6 +372,7 @@ fn goal_operation_settlement(
 fn goal_usage_event_for_attempt(
     provider_ref: &str,
     model: &str,
+    model_attributed: bool,
     outcome: &zeroclaw_providers::dispatch::AttemptUsageOutcome,
 ) -> (
     Option<GoalUsageEvent>,
@@ -279,18 +383,18 @@ fn goal_usage_event_for_attempt(
 
     match outcome {
         AttemptUsageOutcome::Complete(usage) => (
-            lower_bound_usage_event(provider_ref, model, usage),
+            lower_bound_usage_event(provider_ref, model, model_attributed, usage),
             GoalAccountingState::Complete,
         ),
         AttemptUsageOutcome::Missing => (None, GoalAccountingState::Missing),
         AttemptUsageOutcome::Invalid { observed, .. } => (
-            lower_bound_usage_event(provider_ref, model, observed),
+            lower_bound_usage_event(provider_ref, model, model_attributed, observed),
             GoalAccountingState::Invalid,
         ),
         AttemptUsageOutcome::OutcomeUnknown { observed } => (
-            observed
-                .as_ref()
-                .and_then(|usage| lower_bound_usage_event(provider_ref, model, usage)),
+            observed.as_ref().and_then(|usage| {
+                lower_bound_usage_event(provider_ref, model, model_attributed, usage)
+            }),
             GoalAccountingState::OutcomeUnknown,
         ),
     }
@@ -302,6 +406,7 @@ fn goal_usage_event_for_attempt(
 fn lower_bound_usage_event(
     provider_ref: &str,
     model: &str,
+    model_attributed: bool,
     observed: &zeroclaw_providers::traits::TokenUsage,
 ) -> Option<GoalUsageEvent> {
     let cached = observed.cached_input_tokens.unwrap_or(0);
@@ -337,7 +442,7 @@ fn lower_bound_usage_event(
             cached_input_tokens,
             cache_creation_input_tokens,
         },
-        priceable: cache_partition_is_valid,
+        priceable: cache_partition_is_valid && model_attributed,
     })
 }
 
@@ -509,6 +614,57 @@ pub fn compute_cost_usd(
     price_usage(model_provider_name, model, usage, None).map(|(cost_usage, _)| cost_usage.cost_usd)
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ModelAttribution {
+    Attributed,
+    Unattributed,
+}
+
+impl ModelAttribution {
+    fn for_attempt(attempt: Option<&zeroclaw_providers::dispatch::AccountedAttempt>) -> Self {
+        if attempt.is_some_and(|attempt| !attempt.is_model_attributed()) {
+            Self::Unattributed
+        } else {
+            Self::Attributed
+        }
+    }
+}
+
+/// Project an attempt's cost without pricing an unidentified model.
+pub(crate) fn compute_attempt_cost_usd(
+    attempt: &zeroclaw_providers::dispatch::AccountedAttempt,
+    usage: &zeroclaw_providers::traits::TokenUsage,
+) -> Option<f64> {
+    price_usage_with_attribution(
+        attempt.provider_ref(),
+        attempt.model(),
+        usage,
+        None,
+        ModelAttribution::for_attempt(Some(attempt)),
+    )
+    .map(|(cost_usage, _)| cost_usage.cost_usd)
+}
+
+/// Record accepted usage with the actual attempt's pricing authority, when known.
+pub(crate) fn record_accepted_attempt_cost_usage(
+    provider: &str,
+    model: &str,
+    usage: &zeroclaw_providers::traits::TokenUsage,
+    attempt: Option<&zeroclaw_providers::dispatch::AccountedAttempt>,
+) -> Option<(u64, f64)> {
+    let (provider, model) = attempt
+        .map(|attempt| (attempt.provider_ref(), attempt.model()))
+        .unwrap_or((provider, model));
+    record_tool_loop_cost_usage_with_attribution(
+        provider,
+        model,
+        usage,
+        true,
+        None,
+        ModelAttribution::for_attempt(attempt),
+    )
+}
+
 /// Resolve the effective rate sheet for one attempt from the task-local
 /// pricing context and price its usage, without touching any accumulator or
 /// tracker. Shared by the settlement path and the rejected-attempt projection
@@ -520,6 +676,22 @@ fn price_usage(
     model: &str,
     usage: &zeroclaw_providers::traits::TokenUsage,
     live_override: Option<ModelRates>,
+) -> Option<(CostTokenUsage, UnpricedUsage)> {
+    price_usage_with_attribution(
+        model_provider_name,
+        model,
+        usage,
+        live_override,
+        ModelAttribution::Attributed,
+    )
+}
+
+fn price_usage_with_attribution(
+    model_provider_name: &str,
+    model: &str,
+    usage: &zeroclaw_providers::traits::TokenUsage,
+    live_override: Option<ModelRates>,
+    attribution: ModelAttribution,
 ) -> Option<(CostTokenUsage, UnpricedUsage)> {
     let input_tokens = usage.input_tokens.unwrap_or(0);
     let output_tokens = usage.output_tokens.unwrap_or(0);
@@ -533,6 +705,29 @@ fn price_usage(
         .try_with(Clone::clone)
         .ok()
         .flatten()?;
+    if attribution == ModelAttribution::Unattributed {
+        let cache_creation_input_tokens = usage
+            .cache_creation_input_tokens
+            .unwrap_or(0)
+            .min(input_tokens.saturating_sub(cached_input_tokens));
+        return Some((
+            CostTokenUsage::new_with_cache_write(
+                model,
+                input_tokens,
+                cached_input_tokens,
+                cache_creation_input_tokens,
+                output_tokens,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+            ),
+            UnpricedUsage {
+                tokens: total_tokens,
+                dimensions: Vec::new(),
+            },
+        ));
+    }
     let cache_creation_input_tokens = usage
         .cache_creation_input_tokens
         .unwrap_or(0)
@@ -585,6 +780,22 @@ pub(crate) fn billable_provider_attempts(
     })
 }
 
+fn project_goal_attempts(
+    attempts: &[zeroclaw_providers::dispatch::AccountedAttempt],
+    accepted_attempt: Option<usize>,
+) {
+    for event in billable_provider_attempts(attempts) {
+        let _ = price_and_accumulate_tool_loop_cost_usage(
+            event.attempt.provider_ref(),
+            event.attempt.model(),
+            event.usage,
+            accepted_attempt == Some(event.index),
+            None,
+            ModelAttribution::for_attempt(Some(event.attempt)),
+        );
+    }
+}
+
 pub(crate) async fn settle_provider_attempts(
     attempts: &[zeroclaw_providers::dispatch::AccountedAttempt],
     accepted_attempt: Option<usize>,
@@ -594,27 +805,127 @@ pub(crate) async fn settle_provider_attempts(
         .ok()
         .flatten()
     {
-        for event in billable_provider_attempts(attempts) {
-            let _ = price_and_accumulate_tool_loop_cost_usage(
-                event.attempt.provider_ref(),
-                event.attempt.model(),
-                event.usage,
-                accepted_attempt == Some(event.index),
-                None,
-            );
-        }
+        project_goal_attempts(attempts, accepted_attempt);
         return accounting.settle(goal_operation_settlement(attempts)).await;
     }
     for event in billable_provider_attempts(attempts) {
         let updates_context_window_fill = accepted_attempt == Some(event.index);
-        let _ = record_tool_loop_cost_usage_inner(
+        let _ = record_tool_loop_cost_usage_with_attribution(
             event.attempt.provider_ref(),
             event.attempt.model(),
             event.usage,
             updates_context_window_fill,
+            None,
+            ModelAttribution::for_attempt(Some(event.attempt)),
         );
     }
     Ok(())
+}
+
+/// Preserve both failures while retaining the operation error as a source.
+#[derive(Debug)]
+pub(crate) struct OperationSettlementFailure {
+    operation: anyhow::Error,
+    settlement: anyhow::Error,
+}
+
+impl std::fmt::Display for OperationSettlementFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "Goal usage settlement also failed: {:#}; original operation error: {:#}",
+            self.settlement, self.operation
+        )
+    }
+}
+
+impl std::error::Error for OperationSettlementFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.operation.as_ref())
+    }
+}
+
+/// Keep the provider failure as the source while reporting a separate
+/// settlement failure. The Goal owner inspects durable accounting state.
+pub(crate) fn with_settlement_failure(
+    operation_error: anyhow::Error,
+    settlement_error: anyhow::Error,
+) -> anyhow::Error {
+    anyhow::Error::new(OperationSettlementFailure {
+        operation: operation_error,
+        settlement: settlement_error,
+    })
+}
+
+/// Some representation paths display only the outer error, so include the
+/// original diagnostic there while retaining it as the typed source.
+#[derive(Debug)]
+struct VisibleErrorContext(String);
+
+impl std::fmt::Display for VisibleErrorContext {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+pub(crate) fn with_visible_context(error: anyhow::Error, context: &str) -> anyhow::Error {
+    let detail = if error.downcast_ref::<VisibleErrorContext>().is_some()
+        || error.downcast_ref::<OperationSettlementFailure>().is_some()
+    {
+        error.to_string()
+    } else {
+        format!("{error:#}")
+    };
+    error.context(VisibleErrorContext(format!("{context}: {detail}")))
+}
+
+/// Preserve a Goal accounting diagnostic in outer-only renderers without
+/// changing the ordinary summary error's display.
+pub(crate) fn with_goal_diagnostic_context(error: anyhow::Error, context: &str) -> anyhow::Error {
+    let has_goal_diagnostic = error.downcast_ref::<VisibleErrorContext>().is_some()
+        || error.downcast_ref::<OperationSettlementFailure>().is_some()
+        || error
+            .downcast_ref::<zeroclaw_goal::accounting::GoalAccountingFailure>()
+            .is_some()
+        || error.chain().any(|source| {
+            source.is::<OperationSettlementFailure>()
+                || source.is::<zeroclaw_goal::accounting::GoalAccountingFailure>()
+        });
+    if has_goal_diagnostic {
+        with_visible_context(error, context)
+    } else {
+        error.context(context.to_owned())
+    }
+}
+
+/// A dispatch entered without a recorded physical leaf has an unknown outcome:
+/// a streaming constructor may send a request before its stream is polled.
+/// It is never reported as missing usage or released. Known leaves follow
+/// normal settlement and retain their reported lower bounds.
+fn interrupted_goal_operation_settlement(
+    attempts: &[zeroclaw_providers::dispatch::AccountedAttempt],
+) -> GoalOperationSettlement {
+    let mut settlement = goal_operation_settlement(attempts);
+    if attempts.is_empty() {
+        settlement.accounting_state = crate::control_plane::GoalAccountingState::OutcomeUnknown;
+    }
+    settlement
+}
+
+pub(crate) async fn settle_interrupted_provider_attempts(
+    attempts: &[zeroclaw_providers::dispatch::AccountedAttempt],
+) -> anyhow::Result<()> {
+    if let Some(accounting) = GOAL_OPERATION_ACCOUNTING
+        .try_with(Clone::clone)
+        .ok()
+        .flatten()
+    {
+        project_goal_attempts(attempts, None);
+        return accounting
+            .settle(interrupted_goal_operation_settlement(attempts))
+            .await;
+    }
+    settle_provider_attempts(attempts, None).await
 }
 
 fn record_tool_loop_cost_usage_inner(
@@ -639,15 +950,34 @@ fn record_tool_loop_cost_usage_inner_with_live(
     updates_context_window_fill: bool,
     live_override: Option<ModelRates>,
 ) -> Option<(u64, f64)> {
+    record_tool_loop_cost_usage_with_attribution(
+        model_provider_name,
+        model,
+        usage,
+        updates_context_window_fill,
+        live_override,
+        ModelAttribution::Attributed,
+    )
+}
+
+fn record_tool_loop_cost_usage_with_attribution(
+    model_provider_name: &str,
+    model: &str,
+    usage: &zeroclaw_providers::traits::TokenUsage,
+    updates_context_window_fill: bool,
+    live_override: Option<ModelRates>,
+    attribution: ModelAttribution,
+) -> Option<(u64, f64)> {
     let (ctx, cost_usage, unpriced) = price_and_accumulate_tool_loop_cost_usage(
         model_provider_name,
         model,
         usage,
         updates_context_window_fill,
         live_override,
+        attribution,
     )?;
 
-    if ctx.tracker.is_some() && unpriced.tokens > 0 {
+    if attribution == ModelAttribution::Attributed && ctx.tracker.is_some() && unpriced.tokens > 0 {
         warn_once_missing_pricing(model_provider_name, model, &unpriced.dimensions);
     }
 
@@ -680,10 +1010,17 @@ fn price_and_accumulate_tool_loop_cost_usage(
     usage: &zeroclaw_providers::traits::TokenUsage,
     updates_context_window_fill: bool,
     live_override: Option<ModelRates>,
+    attribution: ModelAttribution,
 ) -> Option<(ToolLoopCostTrackingContext, CostTokenUsage, UnpricedUsage)> {
     let input_tokens = usage.input_tokens.unwrap_or(0);
     let output_tokens = usage.output_tokens.unwrap_or(0);
-    let (mut cost_usage, unpriced) = price_usage(model_provider_name, model, usage, live_override)?;
+    let (mut cost_usage, unpriced) = price_usage_with_attribution(
+        model_provider_name,
+        model,
+        usage,
+        live_override,
+        attribution,
+    )?;
     let ctx = TOOL_LOOP_COST_TRACKING_CONTEXT
         .try_with(Clone::clone)
         .ok()
@@ -1478,12 +1815,26 @@ mod tests {
 
     #[async_trait::async_trait]
     impl zeroclaw_goal::accounting::GoalOperationAccounting for CapturedGoalSettlement {
+        fn admission_guard(&self) -> anyhow::Result<zeroclaw_goal::accounting::GoalOperationGuard> {
+            Ok(zeroclaw_goal::accounting::GoalOperationGuard::new(()))
+        }
+        async fn begin_dispatch(&self) -> anyhow::Result<zeroclaw_goal::task::GoalDispatchStart> {
+            Ok(zeroclaw_goal::task::GoalDispatchStart::new(
+                std::sync::Arc::new(tokio::sync::Mutex::new(()))
+                    .lock_owned()
+                    .await,
+            ))
+        }
         async fn admit(&self, _request: GoalOperationRequest) -> anyhow::Result<()> {
             Ok(())
         }
 
         async fn settle(&self, settlement: GoalOperationSettlement) -> anyhow::Result<()> {
             self.0.lock().push(settlement);
+            Ok(())
+        }
+
+        async fn release_unstarted(&self) -> anyhow::Result<()> {
             Ok(())
         }
 
@@ -1599,6 +1950,7 @@ mod tests {
         let (event, state) = goal_usage_event_for_attempt(
             "provider.primary",
             "model-a",
+            true,
             &AttemptUsageOutcome::Invalid {
                 observed: zeroclaw_providers::traits::TokenUsage {
                     input_tokens: Some(41),
@@ -1622,10 +1974,23 @@ mod tests {
     }
 
     #[test]
+    fn goal_settlement_uses_attempt_attribution_not_model_label_for_priceability() {
+        let outcome = AttemptUsageOutcome::Complete(reported_usage(50, 5));
+        let (unattributed, _) =
+            goal_usage_event_for_attempt("provider.primary", "(unattributed)", false, &outcome);
+        let (attributed, _) =
+            goal_usage_event_for_attempt("provider.primary", "(unattributed)", true, &outcome);
+
+        assert!(!unattributed.expect("known usage").priceable);
+        assert!(attributed.expect("known usage").priceable);
+    }
+
+    #[test]
     fn goal_settlement_keeps_fallback_and_partial_unknown_usage_with_actual_routes() {
         let primary = goal_usage_event_for_attempt(
             "openai.primary",
             "model-a",
+            true,
             &AttemptUsageOutcome::OutcomeUnknown {
                 observed: Some(reported_usage(10, 2)),
             },
@@ -1633,6 +1998,7 @@ mod tests {
         let fallback = goal_usage_event_for_attempt(
             "anthropic.fallback",
             "model-b",
+            true,
             &AttemptUsageOutcome::Complete(reported_usage(15, 3)),
         );
         let events = [primary.0.clone(), fallback.0.clone()]
@@ -1658,6 +2024,7 @@ mod tests {
         let (event, state) = goal_usage_event_for_attempt(
             "provider.primary",
             "model-a",
+            true,
             &AttemptUsageOutcome::Invalid {
                 observed: zeroclaw_providers::traits::TokenUsage {
                     input_tokens: Some(u64::MAX),
@@ -1678,6 +2045,7 @@ mod tests {
         let (event, state) = goal_usage_event_for_attempt(
             "provider.primary",
             "model-a",
+            true,
             &AttemptUsageOutcome::Invalid {
                 observed: zeroclaw_providers::traits::TokenUsage {
                     input_tokens: Some(41),
@@ -1703,6 +2071,7 @@ mod tests {
         let (event, state) = goal_usage_event_for_attempt(
             "provider.primary",
             "model-a",
+            true,
             &AttemptUsageOutcome::Invalid {
                 observed: zeroclaw_providers::traits::TokenUsage {
                     input_tokens: Some(41),
@@ -1725,9 +2094,10 @@ mod tests {
 
     #[tokio::test]
     async fn unscoped_turns_do_not_run_goal_operation_validation() {
-        admit_goal_operation_if_scoped("", "")
+        let guard = admit_goal_operation_if_scoped("", "")
             .await
             .expect("ordinary turns must not acquire Goal-only validation");
+        assert!(guard.is_none());
     }
 
     struct PricedLeaf {
@@ -1782,6 +2152,441 @@ mod tests {
                 reasoning_content: None,
             })
         }
+    }
+
+    struct PendingLeaf {
+        started: Arc<tokio::sync::Notify>,
+    }
+
+    impl Attributable for PendingLeaf {
+        fn role(&self) -> Role {
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+        }
+
+        fn alias(&self) -> &str {
+            "pending-leaf"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for PendingLeaf {
+        async fn chat_with_system(
+            &self,
+            _: Option<&str>,
+            _: &str,
+            _: &str,
+            _: Option<f64>,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("unused")
+        }
+
+        async fn chat(
+            &self,
+            _: ChatRequest<'_>,
+            _: &str,
+            _: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            self.started.notify_one();
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn abandoned_goal_attempt_scope_retains_completed_leaf_once() {
+        use zeroclaw_goal::{
+            GoalAccountingState, GoalTaskRegistry,
+            accounting::{
+                GoalAccountingFailure, GoalOperationAccountingFactory, GoalOperationRequest,
+            },
+        };
+
+        let (store, factory, tracker, goal_scope, directory) =
+            crate::goal_accounting::tests::fixture().await;
+        let accountant = factory.for_scope(goal_scope.clone());
+        let started = Arc::new(tokio::sync::Notify::new());
+        let child_started = Arc::clone(&started);
+        let mut child = Box::pin(GOAL_OPERATION_ACCOUNTING.scope(
+            Some(Arc::clone(&accountant)),
+            async move {
+                let _guard = admit_goal_operation_if_scoped("fallback", "model")
+                    .await
+                    .unwrap();
+                let start = begin_goal_dispatch_if_scoped().await.unwrap();
+                let scope = Arc::new(AccountedChatScope::new());
+                register_goal_attempt_scope(&scope);
+                let messages = [ChatMessage::user("test")];
+                let first = PricedLeaf {
+                    alias: "first",
+                    usage: reported_usage(10, 2),
+                };
+                let second = PendingLeaf {
+                    started: child_started,
+                };
+                release_after_first_poll(
+                    start,
+                    scope.scope(async {
+                        with_exact_dispatch_route(
+                            "fallback".to_owned(),
+                            "model".to_owned(),
+                            ProviderDispatch::from_ref(&first).chat(
+                                ChatRequest {
+                                    messages: &messages,
+                                    tools: None,
+                                    thinking: None,
+                                },
+                                "model",
+                                None,
+                            ),
+                        )
+                        .await
+                        .unwrap();
+                        with_exact_dispatch_route(
+                            "fallback".to_owned(),
+                            "model".to_owned(),
+                            ProviderDispatch::from_ref(&second).chat(
+                                ChatRequest {
+                                    messages: &messages,
+                                    tools: None,
+                                    thinking: None,
+                                },
+                                "model",
+                                None,
+                            ),
+                        )
+                        .await
+                    }),
+                )
+                .await
+            },
+        ));
+        tokio::select! {
+            result = &mut child => panic!("provider unexpectedly completed: {result:?}"),
+            () = started.notified() => {}
+        }
+        let mut successor =
+            Box::pin(accountant.admit(GoalOperationRequest::new("fallback", "model")));
+        tokio::select! {
+            biased;
+            result = &mut successor => panic!("live operation was not serialized: {result:?}"),
+            () = tokio::task::yield_now() => {}
+        }
+        drop(child);
+        let error = tokio::time::timeout(std::time::Duration::from_secs(1), &mut successor)
+            .await
+            .expect("abandonment settlement must wake the waiter")
+            .expect_err("unknown outcome must refuse a successor");
+        assert!(error.downcast_ref::<GoalAccountingFailure>().is_some());
+        assert_eq!(
+            tracker
+                .get_strict_usage_totals_for_task_with_pricing(goal_scope.task_id())
+                .unwrap()
+                .0,
+            12,
+        );
+        let ledger = std::fs::read_to_string(directory.path().join("state/costs.jsonl")).unwrap();
+        assert_eq!(ledger.lines().count(), 1);
+        let goal = store
+            .get_goal_task(goal_scope.task_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(goal.accounting_state, GoalAccountingState::OutcomeUnknown);
+        assert!(goal.pending_call_id.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn goal_anthropic_abandoned_fallback_retains_expanded_attempts_once() {
+        if crate::agent::turn::run_anthropic_test_in_fresh_process(
+            "agent::cost::tests::goal_anthropic_abandoned_fallback_retains_expanded_attempts_once",
+            "ZEROCLAW_GOAL_ANTHROPIC_ABANDONED_TEST_CHILD",
+        ) {
+            return;
+        }
+
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method, matchers::path};
+        use zeroclaw_goal::{
+            GoalAccountingState, GoalTaskRegistry,
+            accounting::{
+                GoalAccountingFailure, GoalOperationAccountingFactory, GoalOperationRequest,
+            },
+        };
+        use zeroclaw_providers::anthropic::AnthropicModelProvider;
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "content": [{"type": "text", "text": "done"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 50, "output_tokens": 5, "iterations": [
+                    {"type": "message", "model": "model-a", "input_tokens": 100, "output_tokens": 10},
+                    {"type": "fallback_message"}
+                ]}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let provider = AnthropicModelProvider::builder("test")
+            .credential(Some("test-key"))
+            .base_url(&server.uri())
+            .server_fallback_models(vec!["model-b".to_string()])
+            .build();
+        let (store, _, tracker, goal_scope, directory) =
+            crate::goal_accounting::tests::fixture().await;
+        let rates = Arc::new(HashMap::from([(
+            "fallback".to_string(),
+            HashMap::from([
+                ("model-a.input".to_string(), 1.0),
+                ("model-a.output".to_string(), 2.0),
+                ("(unattributed).input".to_string(), 99.0),
+                ("(unattributed).output".to_string(), 99.0),
+            ]),
+        )]));
+        let factory = crate::goal_accounting::RuntimeGoalOperationAccountingFactory::new(
+            store.clone() as Arc<dyn GoalTaskRegistry>,
+            Arc::clone(&tracker),
+            "main",
+            Arc::new(ModelProviderGoalUsagePricer::new(rates)),
+        )
+        .unwrap();
+        let accountant = factory.for_scope(goal_scope.clone());
+        let (returned, observed) = tokio::sync::oneshot::channel();
+        let mut child = Box::pin(GOAL_OPERATION_ACCOUNTING.scope(
+            Some(Arc::clone(&accountant)),
+            async move {
+                let _guard = admit_goal_operation_if_scoped("fallback", "model-a")
+                    .await
+                    .unwrap();
+                let start = begin_goal_dispatch_if_scoped().await.unwrap();
+                let scope = Arc::new(AccountedChatScope::new());
+                register_goal_attempt_scope(&scope);
+                let messages = [ChatMessage::user("test")];
+                release_after_first_poll(
+                    start,
+                    scope.scope(with_exact_dispatch_route(
+                        "fallback".to_owned(),
+                        "model-a".to_owned(),
+                        ProviderDispatch::from_ref(&provider).chat(
+                            ChatRequest {
+                                messages: &messages,
+                                tools: None,
+                                thinking: None,
+                            },
+                            "model-a",
+                            None,
+                        ),
+                    )),
+                )
+                .await
+                .unwrap();
+                scope.mark_logical_success();
+                returned.send(()).unwrap();
+                std::future::pending::<()>().await;
+            },
+        ));
+        tokio::select! {
+            _ = &mut child => panic!("child unexpectedly completed"),
+            result = observed => result.unwrap(),
+        }
+        // Drop after the response is decoded but before the report is taken
+        // or settled, exercising the registered abandonment owner.
+        drop(child);
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            accountant.admit(GoalOperationRequest::new("fallback", "model-a")),
+        )
+        .await
+        .expect("abandonment settlement must release admission")
+        .expect_err("the interrupted operation must fence a successor");
+        assert!(error.downcast_ref::<GoalAccountingFailure>().is_some());
+        let goal = store
+            .get_goal_task(goal_scope.task_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(goal.accounting_state, GoalAccountingState::OutcomeUnknown);
+        assert!(goal.pending_call_id.is_none());
+        let ledger = std::fs::read_to_string(directory.path().join("state/costs.jsonl")).unwrap();
+        let rows: Vec<zeroclaw_config::cost::types::CostRecord> = ledger
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(rows.len(), 2);
+        assert!(
+            rows.iter()
+                .all(|row| row.task_id.as_deref() == Some(goal_scope.task_id()))
+        );
+        assert_eq!(
+            (rows[0].usage.model.as_str(), rows[0].usage.total_tokens),
+            ("model-a", 110)
+        );
+        assert!(rows[0].usage.pricing_available);
+        assert_eq!(
+            (rows[1].usage.model.as_str(), rows[1].usage.total_tokens),
+            ("(unattributed)", 55)
+        );
+        assert!(!rows[1].usage.pricing_available);
+        assert_eq!(rows[1].usage.unpriced_tokens, 55);
+        assert_eq!(rows[1].usage.cost_usd, 0.0);
+    }
+
+    #[tokio::test]
+    async fn abandoned_returned_goal_attempts_are_settled_once() {
+        use zeroclaw_goal::{
+            GoalAccountingState, GoalTaskRegistry,
+            accounting::{GoalOperationAccountingFactory, GoalOperationRequest},
+        };
+
+        let (store, factory, tracker, goal_scope, directory) =
+            crate::goal_accounting::tests::fixture().await;
+        let accountant = factory.for_scope(goal_scope.clone());
+        let (returned, observed) = tokio::sync::oneshot::channel();
+        let mut child = Box::pin(GOAL_OPERATION_ACCOUNTING.scope(
+            Some(Arc::clone(&accountant)),
+            async move {
+                let _guard = admit_goal_operation_if_scoped("fallback", "model")
+                    .await
+                    .unwrap();
+                let start = begin_goal_dispatch_if_scoped().await.unwrap();
+                let scope = Arc::new(AccountedChatScope::new());
+                register_goal_attempt_scope(&scope);
+                let messages = [ChatMessage::user("test")];
+                let leaf = PricedLeaf {
+                    alias: "returned",
+                    usage: reported_usage(10, 2),
+                };
+                release_after_first_poll(
+                    start,
+                    scope.scope(with_exact_dispatch_route(
+                        "fallback".to_owned(),
+                        "model".to_owned(),
+                        ProviderDispatch::from_ref(&leaf).chat(
+                            ChatRequest {
+                                messages: &messages,
+                                tools: None,
+                                thinking: None,
+                            },
+                            "model",
+                            None,
+                        ),
+                    )),
+                )
+                .await
+                .unwrap();
+                scope.mark_logical_success();
+                let (attempts, _, _) = scope.take().into_attempts_and_parts();
+                register_goal_returned_attempts(&attempts);
+                returned.send(()).unwrap();
+                std::future::pending::<()>().await;
+            },
+        ));
+        tokio::select! {
+            _ = &mut child => panic!("child unexpectedly completed"),
+            result = observed => result.unwrap(),
+        }
+        drop(child);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            accountant.admit(GoalOperationRequest::new("fallback", "model")),
+        )
+        .await
+        .expect("returned-report recovery must release admission")
+        .expect("a complete returned report permits a successor");
+        accountant.release_unstarted().await.unwrap();
+        assert_eq!(
+            tracker
+                .get_strict_usage_totals_for_task_with_pricing(goal_scope.task_id())
+                .unwrap()
+                .0,
+            12,
+        );
+        let ledger = std::fs::read_to_string(directory.path().join("state/costs.jsonl")).unwrap();
+        assert_eq!(ledger.lines().count(), 1);
+        let goal = store
+            .get_goal_task(goal_scope.task_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(goal.accounting_state, GoalAccountingState::Complete);
+        assert!(goal.pending_call_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn dropped_goal_attempt_settlement_records_usage_once() {
+        use zeroclaw_goal::{
+            GoalAccountingState, GoalTaskRegistry, accounting::GoalOperationAccountingFactory,
+        };
+
+        let (store, factory, tracker, goal_scope, directory) =
+            crate::goal_accounting::tests::fixture().await;
+        let accountant = factory.for_scope(goal_scope.clone());
+        GOAL_OPERATION_ACCOUNTING
+            .scope(Some(Arc::clone(&accountant)), async {
+                let guard = admit_goal_operation_if_scoped("fallback", "model")
+                    .await
+                    .unwrap();
+                let start = begin_goal_dispatch_if_scoped().await.unwrap();
+                let attempts = AccountedChatScope::new();
+                let messages = [ChatMessage::user("test")];
+                let leaf = PricedLeaf {
+                    alias: "returned",
+                    usage: reported_usage(10, 2),
+                };
+                release_after_first_poll(
+                    start,
+                    attempts.scope(with_exact_dispatch_route(
+                        "fallback".to_owned(),
+                        "model".to_owned(),
+                        ProviderDispatch::from_ref(&leaf).chat(
+                            ChatRequest {
+                                messages: &messages,
+                                tools: None,
+                                thinking: None,
+                            },
+                            "model",
+                            None,
+                        ),
+                    )),
+                )
+                .await
+                .unwrap();
+                attempts.mark_logical_success();
+                let (events, _, _) = attempts.take().into_attempts_and_parts();
+                let mut settlement = Box::pin(settle_provider_attempts(&events, Some(0)));
+                std::future::poll_fn(|cx| {
+                    assert!(std::future::Future::poll(settlement.as_mut(), cx).is_pending());
+                    std::task::Poll::Ready(())
+                })
+                .await;
+                drop(settlement);
+                drop(guard);
+            })
+            .await;
+        tokio::time::timeout(std::time::Duration::from_secs(1), accountant.quiesce())
+            .await
+            .expect("dropped settlement must finish");
+        assert!(accountant.unsettled_failure().is_none());
+        assert_eq!(
+            tracker
+                .get_strict_usage_totals_for_task_with_pricing(goal_scope.task_id())
+                .unwrap()
+                .0,
+            12
+        );
+        assert_eq!(
+            std::fs::read_to_string(directory.path().join("state/costs.jsonl"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+        let goal = store
+            .get_goal_task(goal_scope.task_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(goal.accounting_state, GoalAccountingState::Complete);
+        assert!(goal.pending_call_id.is_none());
     }
 
     struct FailingWithUsageLeaf {
@@ -2181,6 +2986,58 @@ mod tests {
         map.insert(format!("{model}.cached_input"), cached_input);
         map.insert(format!("{model}.output"), output);
         map
+    }
+
+    #[tokio::test]
+    async fn unattributed_usage_skips_rates_without_reserving_its_label() {
+        let mut pricing = pricing_with_cache("(unattributed)", 7.0, 3.0, 11.0);
+        pricing.extend(pricing_with_cache(
+            "claude-haiku-4-5-20251001",
+            7.0,
+            3.0,
+            11.0,
+        ));
+        let mut ctx = ToolLoopCostTrackingContext::usage_only();
+        ctx.model_provider_pricing = Arc::new(HashMap::from([("configured".to_string(), pricing)]));
+        let usage = zeroclaw_providers::traits::TokenUsage {
+            input_tokens: Some(100),
+            output_tokens: Some(10),
+            cached_input_tokens: Some(20),
+            cache_creation_input_tokens: None,
+        };
+        let live = ModelRates {
+            input_per_mtok: Some(4.0),
+            output_per_mtok: Some(5.0),
+            cached_input_per_mtok: Some(2.0),
+            cache_write_per_mtok: None,
+        };
+        TOOL_LOOP_COST_TRACKING_CONTEXT
+            .scope(Some(ctx), async {
+                for model in ["(unattributed)", "claude-haiku-4-5-20251001"] {
+                    let (record, unpriced) = price_usage_with_attribution(
+                        "configured",
+                        model,
+                        &usage,
+                        Some(live),
+                        ModelAttribution::Unattributed,
+                    )
+                    .expect("scoped usage");
+                    assert_eq!(record.cost_usd, 0.0);
+                    assert_eq!(unpriced.tokens, 110);
+                    assert!(unpriced.dimensions.is_empty());
+                    let (priced, priced_gap) = price_usage_with_attribution(
+                        "configured",
+                        model,
+                        &usage,
+                        Some(live),
+                        ModelAttribution::Attributed,
+                    )
+                    .expect("attributed usage");
+                    assert!(priced.cost_usd > 0.0);
+                    assert_eq!(priced_gap.tokens, 0);
+                }
+            })
+            .await;
     }
 
     fn pricing_with_cache_write(

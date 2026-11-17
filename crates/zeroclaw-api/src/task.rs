@@ -54,9 +54,10 @@ impl TaskStatus {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskRecord {
-    /// Stable, globally unique, never-reused task id. Producers validate it
-    /// at registration boundaries; hard disposal must not make an id eligible
-    /// for reuse because Goal epoch fences are scoped to this identity.
+    /// Stable task identity. Producers must supply globally unique IDs and
+    /// never reuse them. Registry checks detect only IDs whose rows still
+    /// exist; hard disposal removes that history. Goal epoch fences remain
+    /// scoped to the ID, so each Goal producer must use a fresh UUID.
     pub id: String,
     /// Durable task domain type.
     pub kind: TaskKind,

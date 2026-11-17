@@ -97,6 +97,101 @@ fn paths_overlap(left: &str, right: &str) -> bool {
     left == right || is_path_prefix(left, right) || is_path_prefix(right, left)
 }
 
+fn split_list_index(path: &str, offset: usize) -> Option<(&str, usize, &str)> {
+    let (collection, indexed) = path.split_at(offset);
+    let indexed = indexed.strip_prefix('[')?;
+    let (index, suffix) = indexed.split_once(']')?;
+    if index.is_empty() || !index.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let inner = if suffix.is_empty() {
+        ""
+    } else {
+        suffix.strip_prefix('.')?
+    };
+    Some((collection, index.parse().ok()?, inner))
+}
+
+fn natural_keys(candidate: &Config, collection: &str) -> Option<Vec<String>> {
+    use crate::traits::MapKeyKind;
+
+    if Config::map_key_sections().iter().any(|section| {
+        section.path == collection
+            && section.kind == MapKeyKind::List
+            && section.natural_key.is_some()
+    }) {
+        return candidate.get_map_keys(collection);
+    }
+
+    let name = collection
+        .strip_prefix("plugins.entries.")?
+        .strip_suffix(".tls_profiles")?;
+    let mut entries = candidate
+        .plugins
+        .entries
+        .iter()
+        .filter(|entry| entry.name == name);
+    let entry = entries.next()?;
+    if entries.next().is_some() {
+        return None;
+    }
+    Some(
+        entry
+            .tls_profiles
+            .iter()
+            .map(|profile| profile.name.clone())
+            .collect(),
+    )
+}
+
+fn edit_overlaps(candidate: &Config, diagnostic_path: &str, dirty: &str) -> bool {
+    if paths_overlap(diagnostic_path, dirty) {
+        return true;
+    }
+    // Natural keys may contain brackets, so locate a resolvable list boundary.
+    for (offset, _) in diagnostic_path.match_indices('[').rev() {
+        let Some((collection, index, inner)) = split_list_index(diagnostic_path, offset) else {
+            continue;
+        };
+        let Some(keys) = natural_keys(candidate, collection) else {
+            continue;
+        };
+        if !dirty
+            .strip_prefix(collection)
+            .is_some_and(|suffix| suffix.starts_with('.'))
+        {
+            return false;
+        }
+        let (prefix, field) = collection.rsplit_once('.').unwrap_or(("", collection));
+        return match crate::helpers::route_vec_path(
+            dirty,
+            prefix,
+            field,
+            "",
+            keys.iter()
+                .enumerate()
+                .map(|(index, key)| (index, key.as_str())),
+        ) {
+            crate::helpers::VecRoute::Hit {
+                index: dirty_index,
+                inner_name,
+            } => {
+                dirty_index == index
+                    && (inner.is_empty()
+                        || paths_overlap(inner, &inner_name)
+                        || inner
+                            .split_once('[')
+                            .is_some_and(|(prefix, _)| paths_overlap(prefix, &inner_name)))
+            }
+            crate::helpers::VecRoute::Miss | crate::helpers::VecRoute::Ambiguous { .. } => true,
+        };
+    }
+    // An unresolvable indexed path remains conservative for related edits.
+    diagnostic_path
+        .split_once('[')
+        .is_some_and(|(prefix, _)| paths_overlap(prefix, dirty))
+}
+
 fn enumerate_baseline_diagnostics(baseline: &Config) -> Vec<DiagnosticIdentity> {
     let mut retained = Vec::new();
     loop {
@@ -128,6 +223,9 @@ impl Config {
     /// input the retained check reads, overlap a dirty path, and validation can
     /// continue past that site. New, dirty-related, pathless,
     /// unstructured, repeated, and baseline-overflow diagnostics fail closed.
+    /// Indexed list diagnostics are matched against edited natural-key paths;
+    /// unresolvable keys are treated as overlapping. A shifted index changes
+    /// diagnostic identity, so a reordered or deleted entry may be rejected.
     /// Candidate and baseline values are never mutated or default-substituted.
     pub fn validate_edit_against(
         &self,
@@ -156,11 +254,11 @@ impl Config {
                 || self
                     .dirty_paths
                     .iter()
-                    .any(|dirty| paths_overlap(&identity.path, dirty))
+                    .any(|dirty| edit_overlaps(self, &identity.path, dirty))
                 || pass.stop_related.iter().any(|related| {
                     self.dirty_paths
                         .iter()
-                        .any(|dirty| paths_overlap(related, dirty))
+                        .any(|dirty| edit_overlaps(self, related, dirty))
                 })
             {
                 return Err(diagnostic);
@@ -246,6 +344,40 @@ mod tests {
     }
 
     #[test]
+    fn repairing_a_noncontinuable_error_can_require_a_batch() {
+        let mut baseline = Config::default();
+        baseline.users.insert(
+            "u".into(),
+            crate::schema::UserConfig {
+                uid: Some(1000),
+                permission_profiles: vec!["missing".into()],
+                ..Default::default()
+            },
+        );
+        baseline.permission_profiles.insert(
+            "valid".into(),
+            crate::schema::PermissionProfileConfig::default(),
+        );
+        baseline.security.otp.challenge_max_attempts = 0;
+
+        let mut auth_only = baseline.clone();
+        auth_only.users.get_mut("u").unwrap().permission_profiles = vec!["valid".into()];
+        auth_only.mark_dirty("users.u.permission_profiles");
+        let error = validate_without_mutation(&auth_only, &baseline).unwrap_err();
+        assert_eq!(
+            error.path.as_deref(),
+            Some("security.otp.challenge_max_attempts"),
+            "{error:?}"
+        );
+
+        let mut both = auth_only;
+        both.security.otp.challenge_max_attempts =
+            Config::default().security.otp.challenge_max_attempts;
+        both.mark_dirty("security.otp.challenge_max_attempts");
+        assert!(validate_without_mutation(&both, &baseline).is_ok());
+    }
+
+    #[test]
     fn p1_goal_enable_introducing_missing_verifier_is_rejected() {
         let baseline = Config::default();
         let mut candidate = baseline.clone();
@@ -290,6 +422,160 @@ mod tests {
             ConfigApiCode::InvalidNumericRange,
             Some("delegate.timeout_secs"),
         );
+    }
+
+    #[test]
+    fn dashboard_sign_in_baseline_error_allows_unrelated_edit() {
+        let mut baseline = Config::default();
+        baseline.gateway.dashboard_sign_in.session_lifetime_secs = 0;
+        let mut candidate = baseline.clone();
+        candidate.scheduler.max_tasks += 1;
+        candidate.mark_dirty("scheduler.max_tasks");
+
+        let warnings = validate_without_mutation(&candidate, &baseline)
+            .expect("an unrelated edit should retain the dashboard warning");
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(
+            warnings[0].path,
+            "gateway.dashboard_sign_in.session_lifetime_secs"
+        );
+    }
+
+    #[test]
+    fn dashboard_sign_in_activation_requires_a_valid_existing_lifetime() {
+        let mut baseline = Config::default();
+        baseline.gateway.dashboard_sign_in.session_lifetime_secs = 0;
+        baseline.gateway.require_pairing = true;
+        baseline.permission_profiles.insert(
+            "operator".into(),
+            crate::schema::PermissionProfileConfig::default(),
+        );
+        baseline.oidc.insert(
+            "corp".into(),
+            crate::schema::OidcConfig {
+                issuer: "https://sso.example.com".into(),
+                audience: "zeroclaw".into(),
+                claim_path: "groups".into(),
+                profile_map: [("staff".into(), "operator".into())].into_iter().collect(),
+                ..crate::schema::OidcConfig::default()
+            },
+        );
+
+        let mut candidate = baseline.clone();
+        candidate.gateway.dashboard_sign_in.oidc.push("corp".into());
+        candidate.mark_dirty("gateway.dashboard_sign_in.oidc");
+        assert_error(
+            validate_without_mutation(&candidate, &baseline),
+            ConfigApiCode::InvalidNumericRange,
+            Some("gateway.dashboard_sign_in.session_lifetime_secs"),
+        );
+
+        let mut repaired = candidate.clone();
+        repaired.gateway.dashboard_sign_in.session_lifetime_secs = 28_800;
+        repaired.mark_dirty("gateway.dashboard_sign_in.session_lifetime_secs");
+        assert!(validate_without_mutation(&repaired, &baseline).is_ok());
+
+        let mut enabled_baseline = baseline.clone();
+        enabled_baseline
+            .gateway
+            .dashboard_sign_in
+            .oidc
+            .push("corp".into());
+        let mut disabled = enabled_baseline.clone();
+        disabled.gateway.dashboard_sign_in.oidc.clear();
+        disabled.mark_dirty("gateway.dashboard_sign_in.oidc");
+        let warnings = validate_without_mutation(&disabled, &enabled_baseline)
+            .expect("disabling sign-in must remain possible while the lifetime is invalid");
+        assert!(
+            warnings.iter().any(|warning| {
+                warning.path == "gateway.dashboard_sign_in.session_lifetime_secs"
+            })
+        );
+    }
+
+    #[test]
+    fn dashboard_sign_in_repaired_lifetime_does_not_hide_a_new_error() {
+        let mut baseline = Config::default();
+        baseline.gateway.dashboard_sign_in.session_lifetime_secs = 0;
+        let mut candidate = baseline.clone();
+        candidate
+            .gateway
+            .dashboard_sign_in
+            .oidc
+            .push("missing".into());
+        candidate.gateway.dashboard_sign_in.session_lifetime_secs = 28_800;
+        candidate.mark_dirty("gateway.dashboard_sign_in.oidc");
+        candidate.mark_dirty("gateway.dashboard_sign_in.session_lifetime_secs");
+
+        assert_error(
+            validate_without_mutation(&candidate, &baseline),
+            ConfigApiCode::DanglingReference,
+            Some("gateway.dashboard_sign_in.oidc"),
+        );
+    }
+
+    #[test]
+    fn relay_dashboard_baseline_errors_allow_unrelated_edit() {
+        let mut baseline = Config::default();
+        baseline.relay.enabled = true;
+        baseline.relay.url = "relay.example.com:443".into();
+        baseline.relay.dashboard.enabled = true;
+        let mut candidate = baseline.clone();
+        candidate.scheduler.max_tasks += 1;
+        candidate.mark_dirty("scheduler.max_tasks");
+
+        let warnings = validate_without_mutation(&candidate, &baseline)
+            .expect("an unrelated edit should retain the relay warnings");
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.path == "relay.dashboard.domain")
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.path == "gateway.dashboard_sign_in.oidc")
+        );
+    }
+
+    #[test]
+    fn relay_dashboard_baseline_error_does_not_hide_a_new_error() {
+        let mut baseline = Config::default();
+        baseline.relay.enabled = true;
+        baseline.relay.url = "relay.example.com:443".into();
+        baseline.relay.dashboard.enabled = true;
+        let mut candidate = baseline.clone();
+        candidate.relay.dashboard.port = 0;
+        candidate.mark_dirty("relay.dashboard.port");
+
+        assert_error(
+            validate_without_mutation(&candidate, &baseline),
+            ConfigApiCode::InvalidNumericRange,
+            Some("relay.dashboard.port"),
+        );
+    }
+
+    #[test]
+    fn enabling_relay_rejects_an_existing_invalid_dashboard_domain() {
+        let mut baseline = Config::default();
+        baseline.relay.url = "relay.example.com:443".into();
+        baseline.relay.dashboard.enabled = true;
+        let mut candidate = baseline.clone();
+        candidate.relay.enabled = true;
+        candidate.mark_dirty("relay.enabled");
+
+        assert_error(
+            validate_without_mutation(&candidate, &baseline),
+            ConfigApiCode::ValidationFailed,
+            Some("relay.dashboard.domain"),
+        );
+
+        let mut repaired = baseline.clone();
+        repaired.relay.dashboard.enabled = false;
+        repaired.mark_dirty("relay.dashboard.enabled");
+        let warnings = validate_without_mutation(&repaired, &baseline)
+            .expect("disabling the dashboard removes the invalid configuration");
+        assert!(warnings.is_empty());
     }
 
     #[test]
@@ -659,6 +945,293 @@ mod tests {
         assert_eq!(
             structured.message,
             "nodes.mdns.peer_ttl_secs must be greater than nodes.mdns.announce_interval_secs"
+        );
+    }
+
+    fn model_route(hint: &str, model: &str) -> crate::schema::ModelRouteConfig {
+        crate::schema::ModelRouteConfig {
+            hint: hint.into(),
+            model_provider: "openai.default".into(),
+            model: model.into(),
+            ..Default::default()
+        }
+    }
+
+    fn assert_route_warning(result: Result<Vec<ValidationWarning>, ConfigApiError>) {
+        let warnings = result.expect("unrelated edit retains the route diagnostic");
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].code, PRE_EXISTING_VALIDATION_ERROR);
+        assert_eq!(warnings[0].path, "model_routes[0].model");
+    }
+
+    #[test]
+    fn natural_key_edit_of_invalid_route_is_rejected() {
+        let mut baseline = config_with_valid_goal_verifier();
+        baseline.model_routes.push(model_route("reasoning", ""));
+        let mut candidate = baseline.clone();
+        candidate
+            .set_prop_persistent("model_routes.reasoning.model", "  ")
+            .unwrap();
+        assert_error(
+            validate_without_mutation(&candidate, &baseline),
+            ConfigApiCode::RequiredFieldEmpty,
+            Some("model_routes[0].model"),
+        );
+    }
+
+    #[test]
+    fn natural_key_edit_of_another_route_keeps_warning() {
+        let mut baseline = config_with_valid_goal_verifier();
+        baseline.model_routes = vec![model_route("reasoning", ""), model_route("fast", "m")];
+        let mut candidate = baseline.clone();
+        candidate
+            .set_prop_persistent("model_routes.fast.model", "m2")
+            .unwrap();
+        assert_route_warning(validate_without_mutation(&candidate, &baseline));
+    }
+
+    #[test]
+    fn natural_key_routing_uses_the_longest_dotted_hint() {
+        let mut baseline = config_with_valid_goal_verifier();
+        baseline.model_routes = vec![
+            model_route("reasoning", ""),
+            model_route("reasoning.deep", "m"),
+        ];
+        let mut other = baseline.clone();
+        other
+            .set_prop_persistent("model_routes.reasoning.deep.model", "m2")
+            .unwrap();
+        assert_route_warning(validate_without_mutation(&other, &baseline));
+
+        let mut invalid = baseline.clone();
+        invalid
+            .set_prop_persistent("model_routes.reasoning.model", "  ")
+            .unwrap();
+        assert_error(
+            validate_without_mutation(&invalid, &baseline),
+            ConfigApiCode::RequiredFieldEmpty,
+            Some("model_routes[0].model"),
+        );
+    }
+
+    #[test]
+    fn nested_tls_natural_key_edits_identify_the_profile() {
+        use crate::schema::PluginTlsProfileConfig;
+
+        let profile = |name: &str| PluginTlsProfileConfig {
+            name: name.into(),
+            hosts: vec!["example.test".into()],
+            system_roots: true,
+            custom_ca_secret: None,
+            client_certificate_secret: None,
+            client_private_key_secret: None,
+        };
+        let mut first = profile("a");
+        first.client_certificate_secret = Some("client_cert".into());
+        let mut baseline = Config::default();
+        baseline.plugins.entries.push(PluginEntryConfig {
+            name: "p".into(),
+            egress_hosts: vec!["example.test".into()],
+            tls_profiles: vec![first, profile("b")],
+            ..Default::default()
+        });
+        let mut invalid = baseline.clone();
+        let invalid_path = "plugins.entries.p.tls_profiles.a.client_private_key_secret";
+        if invalid.set_prop_persistent(invalid_path, "").is_err() {
+            invalid = baseline.clone();
+            invalid.mark_dirty(invalid_path);
+            eprintln!("nested TLS property is not settable; tested its dirty-path spelling");
+        }
+        assert_error(
+            validate_without_mutation(&invalid, &baseline),
+            ConfigApiCode::InvalidFormat,
+            Some("plugins.entries.p.tls_profiles[0]"),
+        );
+
+        let mut other = baseline.clone();
+        let other_path = "plugins.entries.p.tls_profiles.b.hosts";
+        if other
+            .set_prop_persistent(other_path, "example.test")
+            .is_err()
+        {
+            other = baseline.clone();
+            other.mark_dirty(other_path);
+        }
+        let warnings = validate_without_mutation(&other, &baseline).unwrap();
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].path, "plugins.entries.p.tls_profiles[0]");
+    }
+
+    #[test]
+    fn nested_tls_natural_keys_with_brackets_preserve_edit_scope() {
+        use crate::schema::PluginTlsProfileConfig;
+
+        for instance in ["plugin[1]", "plugin[name]"] {
+            let profile = |name: &str| PluginTlsProfileConfig {
+                name: name.into(),
+                hosts: vec!["example.test".into()],
+                system_roots: true,
+                custom_ca_secret: None,
+                client_certificate_secret: None,
+                client_private_key_secret: None,
+            };
+            let mut first = profile("a");
+            first.client_certificate_secret = Some("client_cert".into());
+            let mut baseline = Config::default();
+            baseline.plugins.entries.push(PluginEntryConfig {
+                name: instance.into(),
+                egress_hosts: vec!["example.test".into()],
+                tls_profiles: vec![first, profile("b")],
+                ..Default::default()
+            });
+            baseline.plugins.entries.push(PluginEntryConfig {
+                name: "plugin[other]".into(),
+                egress_hosts: vec!["example.test".into()],
+                tls_profiles: vec![profile("a")],
+                ..Default::default()
+            });
+
+            let mut edited = baseline.clone();
+            edited.mark_dirty(&format!(
+                "plugins.entries.{instance}.tls_profiles.a.client_private_key_secret"
+            ));
+            assert_error(
+                validate_without_mutation(&edited, &baseline),
+                ConfigApiCode::InvalidFormat,
+                Some(&format!("plugins.entries.{instance}.tls_profiles[0]")),
+            );
+
+            let mut other = baseline.clone();
+            other.mark_dirty(&format!("plugins.entries.{instance}.tls_profiles.b.hosts"));
+            let warnings = validate_without_mutation(&other, &baseline).unwrap();
+            assert_eq!(warnings.len(), 1);
+            assert_eq!(
+                warnings[0].path,
+                format!("plugins.entries.{instance}.tls_profiles[0]")
+            );
+            assert!(edit_overlaps(
+                &baseline,
+                &format!("plugins.entries.{instance}.tls_profiles[0].hosts[0]"),
+                &format!("plugins.entries.{instance}.tls_profiles.a.hosts.primary"),
+            ));
+
+            let mut other_instance = baseline.clone();
+            other_instance.mark_dirty("plugins.entries.plugin[other].tls_profiles.a.hosts");
+            let warnings = validate_without_mutation(&other_instance, &baseline).unwrap();
+            assert_eq!(warnings.len(), 1);
+        }
+    }
+
+    #[test]
+    fn unresolved_natural_key_edits_fail_closed() {
+        let mut baseline = config_with_valid_goal_verifier();
+        baseline.model_routes.push(model_route("reasoning", ""));
+        for dirty in ["model_routes.unknown.model", "model_routes.reasoning"] {
+            let mut candidate = baseline.clone();
+            candidate.mark_dirty(dirty);
+            assert_error(
+                validate_without_mutation(&candidate, &baseline),
+                ConfigApiCode::RequiredFieldEmpty,
+                Some("model_routes[0].model"),
+            );
+        }
+        let mut duplicate = baseline.clone();
+        duplicate.model_routes.push(model_route("reasoning", "m"));
+        duplicate.mark_dirty("model_routes.reasoning.model");
+        assert_error(
+            validate_without_mutation(&duplicate, &baseline),
+            ConfigApiCode::RequiredFieldEmpty,
+            Some("model_routes[0].model"),
+        );
+        let mut unrelated = baseline.clone();
+        unrelated.mark_dirty("scheduler.max_tasks");
+        assert_route_warning(validate_without_mutation(&unrelated, &baseline));
+    }
+
+    #[test]
+    fn shifted_list_diagnostic_identity_is_rejected() {
+        let mut baseline = config_with_valid_goal_verifier();
+        baseline.model_routes = vec![model_route("first", "m"), model_route("reasoning", "")];
+        let mut candidate = baseline.clone();
+        candidate.model_routes.remove(0);
+        candidate.mark_dirty("model_routes.first");
+        assert_error(
+            validate_without_mutation(&candidate, &baseline),
+            ConfigApiCode::RequiredFieldEmpty,
+            Some("model_routes[0].model"),
+        );
+    }
+
+    #[test]
+    fn natural_key_resolver_covers_configured_list_sections() {
+        use std::collections::BTreeSet;
+
+        use crate::traits::MapKeyKind;
+
+        let mut config = Config::default();
+        config.model_routes.push(model_route("route", "m"));
+        config
+            .embedding_routes
+            .push(crate::schema::EmbeddingRouteConfig {
+                hint: "embedding".into(),
+                ..Default::default()
+            });
+        config.mcp.servers.push(crate::schema::McpServerConfig {
+            name: "server".into(),
+            ..Default::default()
+        });
+        config.plugins.entries.push(PluginEntryConfig {
+            name: "plugin".into(),
+            tls_profiles: vec![crate::schema::PluginTlsProfileConfig {
+                name: "profile".into(),
+                hosts: Vec::new(),
+                system_roots: true,
+                custom_ca_secret: None,
+                client_certificate_secret: None,
+                client_private_key_secret: None,
+            }],
+            ..Default::default()
+        });
+        config
+            .a2a
+            .client
+            .peers
+            .push(crate::multi_agent::A2aClientPeerConfig {
+                name: "peer".into(),
+                ..Default::default()
+            });
+        for (path, expected) in [
+            ("model_routes", "route"),
+            ("embedding_routes", "embedding"),
+            ("mcp.servers", "server"),
+            ("plugins.entries", "plugin"),
+            ("plugins.entries.plugin.tls_profiles", "profile"),
+        ] {
+            assert_eq!(
+                natural_keys(&config, path),
+                Some(vec![expected.to_string()])
+            );
+        }
+        assert_eq!(natural_keys(&config, "a2a.client.peers"), None);
+        assert_eq!(
+            config.get_map_keys("a2a_client.peers"),
+            Some(vec!["peer".to_string()])
+        );
+        assert_eq!(config.get_map_keys("a2a.client.peers"), None);
+        let sections: BTreeSet<_> = Config::map_key_sections()
+            .into_iter()
+            .filter(|section| section.kind == MapKeyKind::List && section.natural_key.is_some())
+            .map(|section| section.path)
+            .collect();
+        assert_eq!(
+            sections,
+            BTreeSet::from([
+                "a2a_client.peers",
+                "embedding_routes",
+                "mcp.servers",
+                "model_routes",
+                "plugins.entries",
+            ])
         );
     }
 }

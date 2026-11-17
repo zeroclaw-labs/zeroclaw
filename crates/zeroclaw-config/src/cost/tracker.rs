@@ -1548,20 +1548,20 @@ impl CostStorage {
                     self.path.display()
                 )
             })?;
-            anyhow::ensure!(
-                !raw_line.trim().is_empty(),
-                "empty cost record at line {} in {}",
-                line_number + 1,
-                self.path.display()
-            );
-            let record = serde_json::from_str::<CostRecord>(&raw_line).with_context(|| {
-                format!(
-                    "Invalid cost record at line {} in {}",
-                    line_number + 1,
-                    self.path.display()
-                )
-            })?;
-            on_record(record)?;
+            let trimmed = raw_line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            for record in serde_json::Deserializer::from_str(trimmed).into_iter::<CostRecord>() {
+                let record = record.with_context(|| {
+                    format!(
+                        "Invalid cost record at line {} in {}",
+                        line_number + 1,
+                        self.path.display()
+                    )
+                })?;
+                on_record(record)?;
+            }
         }
         Ok(())
     }
@@ -2277,6 +2277,77 @@ mod tests {
                 .get_strict_usage_totals_for_task_with_pricing("goal-a")
                 .is_err(),
             "Goal admission must fail closed rather than treating malformed JSONL as no usage"
+        );
+    }
+
+    #[test]
+    fn strict_task_usage_totals_accept_recoverable_ledger_formatting() {
+        let tmp = TempDir::new().unwrap();
+        let path = resolve_storage_path(tmp.path()).unwrap();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let first = CostRecord::with_attribution(
+            "session-a",
+            Some("agent-a".into()),
+            Some("goal-a".into()),
+            TokenUsage::new("test/model", 2, 1, 0, 0.0, 0.0, 0.0),
+        );
+        let other = CostRecord::with_attribution(
+            "session-b",
+            Some("agent-b".into()),
+            Some("goal-b".into()),
+            TokenUsage::new("test/model", 8, 2, 0, 0.0, 0.0, 0.0),
+        );
+        let mut unpriced = TokenUsage::new("test/model", 3, 1, 0, 0.0, 0.0, 0.0);
+        unpriced.pricing_available = false;
+        let last = CostRecord::with_attribution(
+            "session-a",
+            Some("agent-a".into()),
+            Some("goal-a".into()),
+            unpriced,
+        );
+        fs::write(
+            &path,
+            format!(
+                " \n{}{}\n\t\n{}\n",
+                serde_json::to_string(&first).unwrap(),
+                serde_json::to_string(&other).unwrap(),
+                serde_json::to_string(&last).unwrap()
+            ),
+        )
+        .unwrap();
+
+        let tracker = CostTracker::new(enabled_config(), tmp.path()).unwrap();
+        assert_eq!(
+            tracker
+                .get_strict_usage_totals_for_task_with_pricing("goal-a")
+                .unwrap(),
+            (7, 0.0, false)
+        );
+    }
+
+    #[test]
+    fn strict_task_usage_totals_reject_a_torn_concatenated_record() {
+        let tmp = TempDir::new().unwrap();
+        let path = resolve_storage_path(tmp.path()).unwrap();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let first = CostRecord::with_attribution(
+            "session-a",
+            Some("agent-a".into()),
+            Some("goal-a".into()),
+            TokenUsage::new("test/model", 2, 1, 0, 0.0, 0.0, 0.0),
+        );
+        fs::write(
+            &path,
+            format!("{}{{\"usage\":", serde_json::to_string(&first).unwrap()),
+        )
+        .unwrap();
+
+        let tracker = CostTracker::new(enabled_config(), tmp.path()).unwrap();
+        assert!(
+            tracker
+                .get_strict_usage_totals_for_task_with_pricing("goal-a")
+                .is_err(),
+            "a readable prefix must not make a torn ledger complete"
         );
     }
 

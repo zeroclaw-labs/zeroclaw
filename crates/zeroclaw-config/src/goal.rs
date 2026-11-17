@@ -1,16 +1,11 @@
 //! Dormant Goal Mode configuration. Runtime admission is introduced later.
 
 use serde::{Deserialize, Serialize};
+pub use zeroclaw_api::goal::GoalBudgetLimits;
+use zeroclaw_api::goal::{is_valid_finite_goal_cost_limit, is_valid_finite_goal_token_limit};
 use zeroclaw_macros::Configurable;
 
 use crate::providers::ModelProviderRef;
-
-/// Normalized limits used by Goal Mode. `None` means unlimited in a dimension.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct GoalBudgetLimits {
-    pub token_limit: Option<u64>,
-    pub cost_limit_usd: Option<f64>,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GoalConfigError {
@@ -63,13 +58,13 @@ impl GoalConfig {
     pub fn validate(&self) -> Result<(), GoalConfigError> {
         if self
             .default_token_limit
-            .is_some_and(|limit| limit > i64::MAX as u64)
+            .is_some_and(|limit| limit != 0 && !is_valid_finite_goal_token_limit(limit))
         {
             return Err(GoalConfigError::TokenLimitOutOfRange);
         }
         if self
             .default_cost_limit_usd
-            .is_some_and(|cost| !cost.is_finite() || cost < 0.0)
+            .is_some_and(|cost| cost != 0.0 && !is_valid_finite_goal_cost_limit(cost))
         {
             return Err(GoalConfigError::InvalidCostLimit);
         }

@@ -14584,14 +14584,23 @@ impl Config {
     /// Kept out of [`Self::validate_auth`] on purpose: that boundary is
     /// shared with policy compilation, and a dashboard misconfiguration must
     /// not keep RPC's inbound-auth policy from compiling.
-    fn validate_dashboard_sign_in(&self) -> Result<()> {
+    fn validate_dashboard_sign_in(&self, pass: &mut ValidationPass<'_>) -> Result<()> {
         let sign_in = &self.gateway.dashboard_sign_in;
         if !(DASHBOARD_SESSION_LIFETIME_MIN_SECS..=DASHBOARD_SESSION_LIFETIME_MAX_SECS)
             .contains(&sign_in.session_lifetime_secs)
         {
-            validation_bail!(
+            // Enabling sign-in must not retain an invalid lifetime, but
+            // disabling it must remain possible while that warning exists.
+            let related = if sign_in.enabled() {
+                vec!["gateway.dashboard_sign_in.oidc".to_string()]
+            } else {
+                Vec::new()
+            };
+            retainable_bail!(
+                pass,
                 InvalidNumericRange,
                 "gateway.dashboard_sign_in.session_lifetime_secs",
+                related = &related,
                 "gateway.dashboard_sign_in.session_lifetime_secs must be between {DASHBOARD_SESSION_LIFETIME_MIN_SECS} and {DASHBOARD_SESSION_LIFETIME_MAX_SECS} seconds, got {}",
                 sign_in.session_lifetime_secs
             );
@@ -14601,14 +14610,17 @@ impl Config {
         }
         for (index, alias) in sign_in.oidc.iter().enumerate() {
             if !self.oidc.contains_key(alias) {
-                validation_bail!(
+                retainable_bail!(
+                    pass,
                     DanglingReference,
                     "gateway.dashboard_sign_in.oidc",
+                    related = &[format!("oidc.{alias}")],
                     "gateway.dashboard_sign_in.oidc names {alias:?} but [oidc.{alias}] is not configured",
                 );
             }
             if sign_in.oidc[..index].contains(alias) {
-                validation_bail!(
+                retainable_bail!(
+                    pass,
                     ValidationFailed,
                     "gateway.dashboard_sign_in.oidc",
                     "gateway.dashboard_sign_in.oidc lists {alias:?} more than once",
@@ -14620,9 +14632,11 @@ impl Config {
         // image writes `require_pairing = false` into its default config, so
         // the message names that case and both ways to change it.
         if !self.gateway.require_pairing {
-            validation_bail!(
+            retainable_bail!(
+                pass,
                 ValidationFailed,
                 "gateway.require_pairing",
+                related = &["gateway.dashboard_sign_in.oidc".to_string()],
                 "[gateway.dashboard_sign_in] needs gateway.require_pairing = true, but it is false. Set require_pairing = true under [gateway] (or ZEROCLAW_gateway__require_pairing=true); the official Docker image's default config sets it to false",
             );
         }
@@ -14632,48 +14646,70 @@ impl Config {
     /// `[relay.dashboard]`: the dashboard is put on the internet through the
     /// relay, so it is refused wherever that would expose more than the
     /// dashboard's own sign-in, or weaken the one link that protects it.
-    fn validate_relay_dashboard(&self) -> Result<()> {
+    fn validate_relay_dashboard(&self, pass: &mut ValidationPass<'_>) -> Result<()> {
         let dashboard = &self.relay.dashboard;
         if !dashboard.enabled {
             return Ok(());
         }
         if !self.relay.enabled {
-            validation_bail!(
+            retainable_bail!(
+                pass,
                 ValidationFailed,
                 "relay.dashboard.enabled",
+                related = &["relay.enabled".to_string()],
                 "[relay.dashboard] needs [relay] enabled = true: the dashboard is served through the relay link",
             );
         }
         if !is_dns_host_name(&dashboard.domain) {
-            validation_bail!(
+            retainable_bail!(
+                pass,
                 ValidationFailed,
                 "relay.dashboard.domain",
+                related = &[
+                    "relay.dashboard.enabled".to_string(),
+                    "relay.enabled".to_string()
+                ],
                 "relay.dashboard.domain must be the relay's dashboard domain, a lower-case DNS name such as relay.example.com, got {:?}",
                 dashboard.domain
             );
         }
         if dashboard.port == 0 {
-            validation_bail!(
+            retainable_bail!(
+                pass,
                 InvalidNumericRange,
                 "relay.dashboard.port",
+                related = &[
+                    "relay.dashboard.enabled".to_string(),
+                    "relay.enabled".to_string()
+                ],
                 "relay.dashboard.port must be the HTTPS port browsers reach the relay on (default 443), not 0",
             );
         }
         // With pairing off every dashboard route is open to whoever reaches
         // the gateway, and through the relay that is the internet.
         if !self.gateway.require_pairing {
-            validation_bail!(
+            retainable_bail!(
+                pass,
                 ValidationFailed,
                 "gateway.require_pairing",
+                related = &[
+                    "relay.dashboard.enabled".to_string(),
+                    "relay.enabled".to_string()
+                ],
                 "[relay.dashboard] needs gateway.require_pairing = true: with pairing off the dashboard would be open to anyone who reaches the relay address",
             );
         }
         // Pairing and paired tokens are refused through the relay, which
         // would see the code or token, so sign-in is the only way in.
         if !self.gateway.dashboard_sign_in.enabled() {
-            validation_bail!(
+            retainable_bail!(
+                pass,
                 ValidationFailed,
                 "gateway.dashboard_sign_in.oidc",
+                related = &[
+                    "relay.dashboard.enabled".to_string(),
+                    "relay.enabled".to_string()
+                ],
                 "[relay.dashboard] needs [gateway.dashboard_sign_in] with at least one provider: pairing and paired tokens are refused through the relay, which would see them, so dashboard sign-in is the only way in",
             );
         }
@@ -14684,18 +14720,28 @@ impl Config {
             .as_deref()
             .is_some_and(|prefix| !prefix.is_empty())
         {
-            validation_bail!(
+            retainable_bail!(
+                pass,
                 ValidationFailed,
                 "gateway.path_prefix",
+                related = &[
+                    "relay.dashboard.enabled".to_string(),
+                    "relay.enabled".to_string()
+                ],
                 "[relay.dashboard] serves the dashboard at the root of its own host; unset gateway.path_prefix",
             );
         }
         // For native clients the inner mTLS protects the traffic past the
         // relay; dashboard traffic has only the daemon's link to the relay.
         if self.relay.relay_insecure {
-            validation_bail!(
+            retainable_bail!(
+                pass,
                 ValidationFailed,
                 "relay.relay_insecure",
+                related = &[
+                    "relay.dashboard.enabled".to_string(),
+                    "relay.enabled".to_string()
+                ],
                 "[relay.dashboard] needs a verified relay certificate: dashboard traffic between the relay and this daemon is protected only by that link. Unset relay.relay_insecure and use public roots, relay_ca_path or tofu",
             );
         }
@@ -25352,8 +25398,8 @@ impl Config {
             );
         }
 
-        self.validate_dashboard_sign_in()?;
-        self.validate_relay_dashboard()?;
+        self.validate_dashboard_sign_in(pass)?;
+        self.validate_relay_dashboard(pass)?;
 
         // Security OTP / estop
         if self.security.otp.challenge_max_attempts == 0 {
@@ -36933,6 +36979,37 @@ default_temperature = 0.7
         let raw = fs::read_to_string(&config_path).await.unwrap();
         assert!(!raw.contains("default_token_limit"), "got:\n{raw}");
         assert_goal_budget_defaults_round_trip(&raw, true, None, Some(2.5));
+    }
+
+    #[tokio::test]
+    async fn goal_budget_dirty_save_also_removes_retired_config() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let config_path = temp.path().join("config.toml");
+        let seed = format!(
+            "schema_version = {}\n\n[goal]\nenabled = true\ndefault_token_limit = 500\ndefault_cost_limit_usd = 2.5\n\n[goal.verifier]\nmodel_provider = \"openai.default\"\n\n[security.nevis]\nclient_secret = \"retired-fixture-value\"\n",
+            crate::migration::CURRENT_SCHEMA_VERSION
+        );
+        fs::write(&config_path, seed).await.unwrap();
+
+        let mut config = goal_budget_defaults_config(&temp);
+        config.goal.enabled = true;
+        config.goal.verifier.model_provider = "openai.default".into();
+        config
+            .set_prop_persistent("goal.default_token_limit", "0")
+            .unwrap();
+        config.save_dirty().await.unwrap();
+
+        let raw = fs::read_to_string(&config_path).await.unwrap();
+        assert!(!raw.contains("nevis"), "retired config survived:\n{raw}");
+        assert!(!raw.contains("retired-fixture-value"));
+        assert_goal_budget_defaults_round_trip(&raw, true, Some(0), Some(2.5));
+
+        config
+            .set_prop_persistent("goal.default_cost_limit_usd", "")
+            .unwrap();
+        config.save_dirty().await.unwrap();
+        let raw = fs::read_to_string(&config_path).await.unwrap();
+        assert_goal_budget_defaults_round_trip(&raw, true, Some(0), None);
     }
 
     #[tokio::test]
