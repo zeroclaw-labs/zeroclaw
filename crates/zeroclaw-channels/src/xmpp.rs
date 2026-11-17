@@ -8,7 +8,7 @@ use std::{
     fs,
     path::PathBuf,
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use std::{
     pin::Pin,
@@ -33,6 +33,13 @@ use zeroclaw_config::schema::{XmppConfig, XmppProtocol};
 
 const OUTBOUND_TIMEOUT: Duration = Duration::from_secs(60);
 const TLS_SEEN_LIMIT: i64 = 8192;
+
+fn unix_timestamp() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
 
 // XmlStream serializes each borrowed stanza synchronously in start_send.
 // Adapt ownership at that boundary so split I/O does not retain a borrowed stanza.
@@ -389,7 +396,7 @@ impl XmppChannel {
             content: body,
             channel: "xmpp".into(),
             channel_alias: Some(self.alias.clone()),
-            timestamp: chrono::Utc::now().timestamp().max(0) as u64,
+            timestamp: unix_timestamp(),
             ..Default::default()
         })
     }
@@ -508,7 +515,7 @@ impl XmppChannel {
             content,
             channel: "xmpp".into(),
             channel_alias: Some(self.alias.clone()),
-            timestamp: chrono::Utc::now().timestamp().max(0) as u64,
+            timestamp: unix_timestamp(),
             ..Default::default()
         }))
     }
@@ -824,7 +831,7 @@ impl XmppChannel {
                         content: std::mem::take(&mut message.content),
                         channel: "xmpp".into(),
                         channel_alias: Some(self.alias.clone()),
-                        timestamp: chrono::Utc::now().timestamp().max(0) as u64,
+                        timestamp: unix_timestamp(),
                         ..Default::default()
                     })
                     .await
