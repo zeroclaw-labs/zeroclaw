@@ -490,6 +490,7 @@ async fn persist_and_swap_retaining(
                 controls,
                 new_config,
                 authorization,
+                credential_audit.is_some(),
             )
             .await;
             if let Some(audit) = credential_audit {
@@ -620,6 +621,7 @@ async fn persist_and_swap_prepared(
     reload_controls: Option<zeroclaw_runtime::daemon::GatewayReloadControls>,
     mut new_config: zeroclaw_config::schema::Config,
     authorization: ConfigWriteAuthorization,
+    scoped_credential_mutation: bool,
 ) -> Result<
     Option<(
         zeroclaw_runtime::daemon::PreparedChannelGenerationDrain,
@@ -630,6 +632,17 @@ async fn persist_and_swap_prepared(
     authorization
         .covers_all(new_config.dirty_paths.iter().map(String::as_str))
         .map_err(IntoResponse::into_response)?;
+    // The catalog route authenticates an operator, validates grants, and audits
+    // the mutation. A generic property or section write cannot bypass it.
+    if !scoped_credential_mutation
+        && new_config.http_request.scoped_credentials
+            != commit.current_config().http_request.scoped_credentials
+    {
+        return Err(error_response(ConfigApiError::new(
+            ConfigApiCode::ValidationFailed,
+            "use the scoped credential API to change credential records",
+        )));
+    }
     if let Err(e) = zeroclaw_runtime::rpc::auth::validate_accepted_auth_config(&new_config) {
         return Err(error_response(ConfigApiError::new(
             ConfigApiCode::ValidationFailed,
@@ -2377,6 +2390,7 @@ async fn delete_agent_cascade(
                 reload_controls,
                 working.clone(),
                 authorization,
+                false,
             )
             .await?;
             // Committed: advance the alias generation exactly once.
@@ -3139,6 +3153,7 @@ async fn rename_agent_cascade(
                 reload_controls,
                 working.clone(),
                 authorization.expect("persisting rename was authorized"),
+                false,
             )
             .await?
         } else {
