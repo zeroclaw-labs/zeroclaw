@@ -380,17 +380,30 @@ pub(crate) fn anthropic_thinking_style(model: &str) -> AnthropicThinkingStyle {
     }
 }
 
-/// Whether `model` runs adaptive thinking when the request omits `thinking`.
-/// Claude models numbered 5 or later do (Fable and Mythos always think);
-/// Opus 4.7 and 4.8 run without thinking unless asked, and earlier models
-/// need `enabled`. IDs with no such version are treated as not thinking.
-pub(crate) fn anthropic_thinks_by_default(model: &str) -> bool {
-    claude_model_version(model).is_some_and(|version| version >= (5, 0))
+/// Whether `model` runs Anthropic's prefix check on replayed thinking blocks
+/// ("preserved thinking"), the check `thinking.block_binding` controls.
+/// Anthropic lists Fable and Mythos 5.1 and 5.2, and Opus, Sonnet and Haiku
+/// 5.5; later versions in those families are taken to run it too. Opus 4.7
+/// and 4.8 and the 5.0 models (Opus 5, Sonnet 5, Fable 5, Mythos 5) don't,
+/// and neither do IDs with no such version. Every model that runs the check
+/// thinks adaptively when a request omits `thinking`.
+pub(crate) fn anthropic_has_preserved_thinking(model: &str) -> bool {
+    match claude_model_family_version(model) {
+        Some(("fable" | "mythos", version)) => version >= (5, 1),
+        Some(("opus" | "sonnet" | "haiku", version)) => version >= (5, 5),
+        _ => false,
+    }
 }
 
 /// `(major, minor)` of the first `claude-<family>-<major>[-<minor>]` token
 /// in a model ID. A missing minor is `0`.
 fn claude_model_version(model: &str) -> Option<(u32, u32)> {
+    claude_model_family_version(model).map(|(_, version)| version)
+}
+
+/// The family and `(major, minor)` of the first
+/// `claude-<family>-<major>[-<minor>]` token in a model ID.
+fn claude_model_family_version(model: &str) -> Option<(&'static str, (u32, u32))> {
     const FAMILIES: [&str; 5] = ["opus", "sonnet", "haiku", "fable", "mythos"];
     model.match_indices("claude-").find_map(|(at, token)| {
         let rest = &model[at + token.len()..];
@@ -408,7 +421,7 @@ fn claude_model_version(model: &str) -> Option<(u32, u32)> {
             .or_else(|| rest.strip_prefix('.'))
             .and_then(leading_version_number)
             .map_or(0, |(minor, _)| minor);
-        Some((major, minor))
+        Some((family, (major, minor)))
     })
 }
 
@@ -2562,7 +2575,7 @@ impl AnthropicModelProvider {
                             kind: "adaptive",
                             budget_tokens: None,
                             display: params.display,
-                            block_binding: self.adaptive_block_binding(),
+                            block_binding: self.adaptive_block_binding(model),
                             implicit: false,
                         },
                         self.max_tokens,
@@ -2578,16 +2591,13 @@ impl AnthropicModelProvider {
         }
     }
 
-    /// For a request with no native thinking to a model that thinks anyway:
-    /// an explicit `adaptive` config, which those models treat the same as an
-    /// omitted one, so the signed blocks they return carry `block_binding`
-    /// when replayed. `None` where this provider sends no binding, or the
-    /// model does not think by default.
+    /// For a request with no native thinking to a model with preserved
+    /// thinking: an explicit `adaptive` config, which those models treat the
+    /// same as an omitted one, so the signed blocks they return carry
+    /// `block_binding` when replayed. `None` where this provider or model gets
+    /// no binding.
     fn implicit_thinking_config(&self, model: &str) -> Option<NativeThinkingConfig> {
-        if !anthropic_thinks_by_default(model) {
-            return None;
-        }
-        let block_binding = self.adaptive_block_binding()?;
+        let block_binding = self.adaptive_block_binding(model)?;
         Some(NativeThinkingConfig {
             kind: "adaptive",
             budget_tokens: None,
@@ -2597,12 +2607,15 @@ impl AnthropicModelProvider {
         })
     }
 
-    /// The `thinking.block_binding` object for an adaptive-thinking request,
-    /// or `None` where this provider leaves the field out.
-    fn adaptive_block_binding(&self) -> Option<NativeBlockBinding> {
-        self.sends_block_binding().then_some(NativeBlockBinding {
-            prefix_mismatch_behavior: "drop_block",
-        })
+    /// The `thinking.block_binding` object for an adaptive-thinking request
+    /// to `model`, or `None` where this provider leaves the field out or the
+    /// model runs no prefix check.
+    fn adaptive_block_binding(&self, model: &str) -> Option<NativeBlockBinding> {
+        (self.sends_block_binding() && anthropic_has_preserved_thinking(model)).then_some(
+            NativeBlockBinding {
+                prefix_mismatch_behavior: "drop_block",
+            },
+        )
     }
 
     /// Send `thinking.block_binding` only to Anthropic's own API: an
@@ -4941,24 +4954,26 @@ data: {\"type\":\"message_stop\"}\n\n";
             budget_tokens: 10_000,
             display: None,
         };
-        for model in [
-            "claude-opus-5-5",
-            "claude-fable-5-2-fast",
-            "anthropic.claude-opus-4-7-v1:0",
-            "claude-sonnet-5",
-            "claude-sonnet-5-5",
-            "claude-haiku-5-5",
+        let bound = serde_json::json!({
+            "type": "adaptive",
+            "block_binding": {"prefix_mismatch_behavior": "drop_block"}
+        });
+        let plain = serde_json::json!({"type": "adaptive"});
+        for (model, expected) in [
+            ("claude-opus-5-5", &bound),
+            ("claude-fable-5-2-fast", &bound),
+            ("anthropic.claude-opus-4-7-v1:0", &plain),
+            ("claude-sonnet-5", &plain),
+            ("claude-sonnet-5-5", &bound),
+            ("claude-haiku-5-5", &bound),
         ] {
             let (temp, config, max_tokens) =
                 provider.resolve_thinking(Some(params), Some(0.7_f64), model);
             let config = config.unwrap_or_else(|| panic!("thinking config for {model}"));
             assert_eq!(
-                serde_json::to_value(&config).unwrap(),
-                serde_json::json!({
-                    "type": "adaptive",
-                    "block_binding": {"prefix_mismatch_behavior": "drop_block"}
-                }),
-                "{model} must emit adaptive with no budget, and drop_block on the Anthropic API"
+                &serde_json::to_value(&config).unwrap(),
+                expected,
+                "{model} must emit adaptive with no budget, and drop_block only with preserved thinking"
             );
             assert_eq!(temp, Some(1.0), "{model}");
             assert_eq!(max_tokens, provider.max_tokens, "{model}");
@@ -11859,7 +11874,37 @@ data: {\"type\":\"message_stop\"}\n\n";
     }
 
     #[test]
-    fn models_that_think_by_default_get_drop_block_without_a_thinking_config() {
+    fn preserved_thinking_covers_the_listed_models_and_no_earlier_ones() {
+        for model in [
+            "claude-fable-5-2",
+            "claude-fable-5-2-fast",
+            "claude-mythos-5-2",
+            "claude-fable-5-1",
+            "claude-mythos-5-1",
+            "claude-opus-5-5",
+            "claude-sonnet-5-5",
+            "claude-haiku-5-5",
+            "us.anthropic.claude-sonnet-5-5-v1:0",
+        ] {
+            assert!(anthropic_has_preserved_thinking(model), "{model}");
+        }
+        for model in [
+            "claude-opus-5",
+            "claude-sonnet-5",
+            "claude-fable-5",
+            "claude-mythos-5",
+            "claude-mythos-preview",
+            "claude-opus-4-8",
+            "claude-opus-4-7",
+            "claude-haiku-4-5",
+            "some-other-model",
+        ] {
+            assert!(!anthropic_has_preserved_thinking(model), "{model}");
+        }
+    }
+
+    #[test]
+    fn models_with_preserved_thinking_get_drop_block_without_a_thinking_config() {
         let provider = AnthropicModelProvider::builder("test").build();
         for model in [
             "claude-opus-5-5",
@@ -11867,10 +11912,10 @@ data: {\"type\":\"message_stop\"}\n\n";
             "claude-haiku-5-5",
             "claude-fable-5-1",
             "claude-fable-5-2-fast",
-            "claude-opus-5",
+            "claude-mythos-5-2",
         ] {
             let (temperature, config, _) = provider.resolve_thinking(None, Some(0.7), model);
-            let config = config.unwrap_or_else(|| panic!("{model} thinks by default"));
+            let config = config.unwrap_or_else(|| panic!("{model} has preserved thinking"));
             assert!(config.implicit, "{model}");
             assert_eq!(
                 serde_json::to_value(&config).expect("serialize"),
@@ -11885,9 +11930,15 @@ data: {\"type\":\"message_stop\"}\n\n";
     }
 
     #[test]
-    fn models_that_do_not_think_by_default_keep_no_thinking_config() {
+    fn models_without_preserved_thinking_keep_no_thinking_config() {
+        // The 5.0 models think when `thinking` is omitted but run no prefix
+        // check, so they have nothing to bind and keep the omitted field.
         let provider = AnthropicModelProvider::builder("test").build();
         for model in [
+            "claude-opus-5",
+            "claude-sonnet-5",
+            "claude-fable-5",
+            "claude-mythos-5",
             "claude-opus-4-8",
             "claude-opus-4-7",
             "claude-sonnet-4-6",
@@ -11905,7 +11956,7 @@ data: {\"type\":\"message_stop\"}\n\n";
     }
 
     #[tokio::test]
-    async fn chat_without_thinking_config_still_binds_a_model_that_thinks_by_default() {
+    async fn chat_without_thinking_config_still_binds_a_model_with_preserved_thinking() {
         let (addr, server, captured) =
             spawn_capturing_messages_server(json_reply_with_drops(), SSE_REPLY_WITH_DROPS).await;
         let provider = binding_test_provider(addr, true);
@@ -11958,7 +12009,35 @@ data: {\"type\":\"message_stop\"}\n\n";
     }
 
     #[tokio::test]
-    async fn chat_to_a_model_that_does_not_think_by_default_is_unchanged() {
+    async fn chat_to_a_model_without_preserved_thinking_is_unchanged() {
+        for model in ["claude-opus-4-8", "claude-opus-5"] {
+            let (addr, server, captured) =
+                spawn_capturing_messages_server(json_reply_with_drops(), SSE_REPLY_WITH_DROPS)
+                    .await;
+            let provider = binding_test_provider(addr, true);
+            let messages = vec![ChatMessage::user("hello")];
+            let request = ProviderChatRequest {
+                messages: messages.as_slice(),
+                tools: None,
+                thinking: None,
+            };
+            provider
+                .chat(request, model, None)
+                .await
+                .expect("chat succeeds");
+            server.abort();
+            let requests = captured.lock().expect("capture lock");
+            let (beta, body) = &requests[0];
+            assert!(beta.is_none(), "{model}: no beta header: {beta:?}");
+            assert!(
+                body.get("thinking").is_none(),
+                "{model}: no thinking field: {body}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn native_thinking_to_opus_4_8_keeps_plain_adaptive_and_no_beta() {
         let (addr, server, captured) =
             spawn_capturing_messages_server(json_reply_with_drops(), SSE_REPLY_WITH_DROPS).await;
         let provider = binding_test_provider(addr, true);
@@ -11966,7 +12045,7 @@ data: {\"type\":\"message_stop\"}\n\n";
         let request = ProviderChatRequest {
             messages: messages.as_slice(),
             tools: None,
-            thinking: None,
+            thinking: Some(adaptive_thinking_params(None)),
         };
         provider
             .chat(request, "claude-opus-4-8", None)
@@ -11976,7 +12055,7 @@ data: {\"type\":\"message_stop\"}\n\n";
         let requests = captured.lock().expect("capture lock");
         let (beta, body) = &requests[0];
         assert!(beta.is_none(), "no beta header: {beta:?}");
-        assert!(body.get("thinking").is_none(), "no thinking field: {body}");
+        assert_eq!(body["thinking"], serde_json::json!({"type": "adaptive"}));
     }
 
     #[tokio::test]
