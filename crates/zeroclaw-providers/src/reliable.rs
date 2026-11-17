@@ -7670,6 +7670,21 @@ mod tests {
     }
 
     #[test]
+    fn an_unsigned_thinking_rejection_is_not_retried() {
+        // The same history fails the same way on every attempt, streamed or not.
+        let message = r#"{"type":"error","error":{"type":"invalid_request_error","message":"messages.3.content.0.thinking.signature: Field required"}}"#;
+        assert!(is_non_retryable(&anyhow::Error::msg(format!(
+            "Anthropic API error (400 Bad Request): {message}"
+        ))));
+        assert!(is_non_retryable(&anyhow::Error::new(
+            StreamError::HttpStatus {
+                status: 400,
+                message: message.to_string(),
+            }
+        )));
+    }
+
+    #[test]
     fn non_retryable_detects_common_patterns() {
         assert!(is_non_retryable(&anyhow::Error::msg("400 Bad Request")));
         assert!(is_non_retryable(&anyhow::Error::msg("401 Unauthorized")));
