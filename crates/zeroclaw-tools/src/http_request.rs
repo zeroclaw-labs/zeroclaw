@@ -2659,6 +2659,23 @@ api_token = "Bearer from-secret"
     }
 
     #[test]
+    fn authenticated_json_body_preserves_large_integers() {
+        let body = r#"{"id":18446744073709551617,"nested":[-9223372036854775809,"fixture-key"]}"#;
+        let output = redact_response_body(
+            body.into(),
+            &|text| text.replace("fixture-key", "[REDACTED]"),
+            true,
+        );
+        assert!(output.contains("18446744073709551617"));
+        assert!(output.contains("-9223372036854775809"));
+        assert!(!output.contains("fixture-key"));
+        let value: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(value["id"].to_string(), "18446744073709551617");
+        assert_eq!(value["nested"][0].to_string(), "-9223372036854775809");
+        assert_eq!(value["nested"][1], "[REDACTED]");
+    }
+
+    #[test]
     fn authenticated_json_body_redacts_decoded_values_and_keys() {
         let secret = r#"token\"with\escapes"#;
         let body = json!({"nested": [{"credential": secret}], (secret): "key"}).to_string();
