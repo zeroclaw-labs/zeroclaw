@@ -14345,7 +14345,30 @@ pub struct OidcConfig {
     pub actor_claim_marks: OidcActorKind,
     /// Require the RFC 9068 typed JWT profile for JWKS validation. Opaque
     /// tokens remain valid only through configured introspection.
+    ///
+    /// Typing is how the verifier tells an access token from an ID token.
+    /// For issuers that don't type their access tokens (Okta: no `typ`;
+    /// Entra ID: `typ: JWT`), set `false` and prove the difference by
+    /// audience instead: an ID token's `aud` is always the client it was
+    /// issued to, so `audience` must be an API identifier that is not
+    /// `client_id` and not any client declared here or by another entry for
+    /// the same issuer. Untyped tokens are then accepted with no header
+    /// `typ` or `typ: JWT`; any other type is still refused, as are `nonce`
+    /// and non-access purpose markers. The IdP must also never sign anyone
+    /// in AS the API registration itself, which ZeroClaw cannot check.
     pub require_at_jwt: bool,
+    /// Top-level claim naming the OAuth client in JWKS-validated access
+    /// tokens. Default `client_id` (RFC 9068), where a person's token may
+    /// name its client in `azp` instead. Set it where the issuer uses another
+    /// claim: `cid` for Okta, `azp` for Entra ID v2.0 tokens (which then also
+    /// identifies service principals). A declared claim has no fallback, and
+    /// a token whose `client_id` contradicts it is refused. JWKS only:
+    /// introspection answers always use `client_id`.
+    pub client_id_claim: String,
+    /// Top-level claim holding the access token's unique identifier in
+    /// JWKS-validated tokens. Default `jti` (RFC 9068). Entra ID uses `uti`.
+    /// JWKS only.
+    pub token_id_claim: String,
     /// Maximum authentication lifetime (seconds) for offline-validated
     /// (JWKS) tokens. Offline validation cannot see revocation, so the
     /// identity expires at the EARLIER of the token `exp` and `iat` + this
@@ -14385,11 +14408,18 @@ impl std::fmt::Debug for OidcConfig {
             .field("actor_claim", &self.actor_claim)
             .field("actor_claim_marks", &self.actor_claim_marks)
             .field("require_at_jwt", &self.require_at_jwt)
+            .field("client_id_claim", &self.client_id_claim)
+            .field("token_id_claim", &self.token_id_claim)
             .field("max_auth_lifetime_secs", &self.max_auth_lifetime_secs)
             .field("revalidation_secs", &self.revalidation_secs)
             .finish()
     }
 }
+
+/// RFC 9068 claim naming the OAuth client; the `client_id_claim` default.
+pub const DEFAULT_OIDC_CLIENT_ID_CLAIM: &str = "client_id";
+/// RFC 9068 claim holding the token identifier; the `token_id_claim` default.
+pub const DEFAULT_OIDC_TOKEN_ID_CLAIM: &str = "jti";
 
 fn default_oidc_max_auth_lifetime_secs() -> u64 {
     86_400
@@ -14420,6 +14450,8 @@ impl Default for OidcConfig {
             actor_claim: String::new(),
             actor_claim_marks: OidcActorKind::default(),
             require_at_jwt: true,
+            client_id_claim: DEFAULT_OIDC_CLIENT_ID_CLAIM.to_string(),
+            token_id_claim: DEFAULT_OIDC_TOKEN_ID_CLAIM.to_string(),
             max_auth_lifetime_secs: default_oidc_max_auth_lifetime_secs(),
             revalidation_secs: default_oidc_revalidation_secs(),
         }
@@ -14493,6 +14525,31 @@ impl Config {
         for alias in oidc_aliases {
             let oidc = &self.oidc[alias];
             oidc.validate(alias)?;
+            // An entry that accepts untyped access tokens relies on no client
+            // signing in with its audience. Clients of other entries for the
+            // same issuer are clients of that issuer too.
+            if oidc.validation == OidcValidation::Jwks && !oidc.require_at_jwt {
+                let mut siblings: Vec<&String> = self
+                    .oidc
+                    .iter()
+                    .filter(|(other, entry)| *other != alias && entry.issuer == oidc.issuer)
+                    .map(|(other, _)| other)
+                    .collect();
+                siblings.sort();
+                for sibling in siblings {
+                    if let Some(field) = self.oidc[sibling].field_naming_client(&oidc.audience) {
+                        validation_bail!(
+                            ValidationFailed,
+                            format!("oidc.{alias}.audience"),
+                            "oidc.{alias}.require_at_jwt = false needs an audience no client \
+                             signs in as, but oidc.{sibling}.{field} names {:?} as a client of \
+                             the same issuer: an ID token issued to it would pass as an access \
+                             token for oidc.{alias}",
+                            oidc.audience
+                        );
+                    }
+                }
+            }
             let mut claim_values: Vec<&String> = oidc.profile_map.keys().collect();
             claim_values.sort();
             for claim_value in claim_values {
@@ -14801,11 +14858,50 @@ impl OidcConfig {
                  tokens need a bounded authentication lifetime"
             );
         }
-        if self.validation == OidcValidation::Jwks && !self.require_at_jwt {
+        if self.validation == OidcValidation::Jwks
+            && !self.require_at_jwt
+            && let Some(field) = self.audience_shared_with_a_client()
+        {
             anyhow::bail!(
-                "oidc.{alias}.require_at_jwt must be true: bearer authentication accepts only \
-                 RFC 9068 typed access tokens"
+                "oidc.{alias}.require_at_jwt = false needs an audience no client signs in as, \
+                 but `audience` {:?} is also named by `{field}`: an ID token issued to that \
+                 client would carry the same audience and pass as an access token. Use a \
+                 separate API identifier for `audience`, or keep require_at_jwt = true",
+                self.audience
             );
+        }
+        for (field, name) in [
+            ("client_id_claim", &self.client_id_claim),
+            ("token_id_claim", &self.token_id_claim),
+        ] {
+            if name.is_empty() || name.contains('.') || !name.bytes().all(|b| b.is_ascii_graphic())
+            {
+                anyhow::bail!(
+                    "oidc.{alias}.{field} = {name:?} must be one top-level claim name: \
+                     nonblank, without spaces or dots"
+                );
+            }
+        }
+        if self.validation == OidcValidation::Introspection {
+            for (field, name, default) in [
+                (
+                    "client_id_claim",
+                    &self.client_id_claim,
+                    DEFAULT_OIDC_CLIENT_ID_CLAIM,
+                ),
+                (
+                    "token_id_claim",
+                    &self.token_id_claim,
+                    DEFAULT_OIDC_TOKEN_ID_CLAIM,
+                ),
+            ] {
+                if name != default {
+                    anyhow::bail!(
+                        "oidc.{alias}.{field} applies to validation = \"jwks\" only: \
+                         introspection answers follow RFC 7662, so leave it at {default:?}"
+                    );
+                }
+            }
         }
         for (field, clients) in [
             ("service_clients", &self.service_clients),
@@ -14879,6 +14975,44 @@ impl OidcConfig {
     #[must_use]
     pub fn effective_service_scope(&self) -> String {
         join_scopes(&self.service_scopes)
+    }
+
+    /// The field that names `audience` as one of this entry's own clients,
+    /// or `None` when the audience is separate from all of them.
+    ///
+    /// Every ID token's `aud` is the client it was issued to (OIDC Core), so
+    /// an audience no client signs in as is what lets the verifier tell an
+    /// untyped access token from an ID token. Shared by config validation
+    /// and the verifier so the rule has one definition; clients of OTHER
+    /// entries for the same issuer are checked by [`Config::validate_auth`].
+    #[must_use]
+    pub fn audience_shared_with_a_client(&self) -> Option<&'static str> {
+        self.field_naming_client(&self.audience)
+    }
+
+    /// The first field of this entry that names `client` as an OAuth client
+    /// it signs in as or accepts tokens from, if any.
+    #[must_use]
+    pub fn field_naming_client(&self, client: &str) -> Option<&'static str> {
+        if self.effective_client_id() == client {
+            return Some("client_id");
+        }
+        [
+            ("interactive_clients", &self.interactive_clients),
+            ("service_clients", &self.service_clients),
+            (
+                "allowed_authorized_parties",
+                &self.allowed_authorized_parties,
+            ),
+        ]
+        .into_iter()
+        .find(|(_, clients)| clients.iter().any(|named| named == client))
+        .map(|(field, _)| field)
+        .or_else(|| {
+            self.service_profile_map
+                .contains_key(client)
+                .then_some("service_profile_map")
+        })
     }
 }
 
@@ -31443,6 +31577,163 @@ zeroclaw-operators = "operator"
         config.oidc.get_mut("corp").unwrap().require_at_jwt = false;
         let err = config.validate().unwrap_err().to_string();
         assert!(err.contains("require_at_jwt"), "got: {err}");
+    }
+
+    #[::core::prelude::v1::test]
+    fn oidc_claim_name_defaults_are_the_rfc_9068_claims() {
+        let defaults = OidcConfig::default();
+        assert_eq!(defaults.client_id_claim, "client_id");
+        assert_eq!(defaults.token_id_claim, "jti");
+    }
+
+    /// An entry that may waive RFC 9068 typing: its daemon client differs from
+    /// its API audience, so no ID token it receives can carry that audience.
+    fn untyped_jwks_config() -> Config {
+        let mut config = auth_config();
+        {
+            let oidc = config.oidc.get_mut("corp").unwrap();
+            oidc.require_at_jwt = false;
+            oidc.client_id = "zeroclaw-daemon".to_string();
+            oidc.interactive_clients = vec!["zerocode-cli".to_string()];
+        }
+        config
+    }
+
+    #[::core::prelude::v1::test]
+    fn oidc_untyped_tokens_are_allowed_when_audience_is_no_client() {
+        untyped_jwks_config()
+            .validate()
+            .expect("audience separated from every configured client");
+    }
+
+    #[::core::prelude::v1::test]
+    fn oidc_untyped_tokens_require_the_audience_to_differ_from_every_client() {
+        // Defaulted client_id (falls back to audience), an explicit equal
+        // client_id, and the audience declared as an interactive or service
+        // client: each would let an ID token issued to that client pass.
+        type Case = (&'static str, fn(&mut OidcConfig));
+        let cases: [Case; 5] = [
+            ("client_id", |oidc| oidc.client_id = String::new()),
+            ("client_id", |oidc| oidc.client_id = "zeroclaw".to_string()),
+            ("interactive_clients", |oidc| {
+                oidc.interactive_clients = vec!["zeroclaw".to_string()];
+            }),
+            ("service_clients", |oidc| {
+                oidc.service_clients = vec!["zeroclaw".to_string()];
+            }),
+            ("allowed_authorized_parties", |oidc| {
+                oidc.allowed_authorized_parties = vec!["zeroclaw".to_string()];
+            }),
+        ];
+        for (field, mutate) in cases {
+            let mut config = untyped_jwks_config();
+            mutate(config.oidc.get_mut("corp").unwrap());
+            let err = config.validate().unwrap_err().to_string();
+            assert!(
+                err.contains("require_at_jwt") && err.contains(field),
+                "{field}: got: {err}"
+            );
+        }
+    }
+
+    #[::core::prelude::v1::test]
+    fn oidc_untyped_tokens_refuse_an_audience_another_entry_signs_in_as() {
+        // A second entry for the SAME issuer whose client is this entry's
+        // audience would receive ID tokens carrying that audience.
+        let mut config = untyped_jwks_config();
+        let mut sibling = config.oidc["corp"].clone();
+        sibling.require_at_jwt = true;
+        sibling.audience = "dashboard".to_string();
+        sibling.client_id = "zeroclaw".to_string();
+        sibling.interactive_clients = Vec::new();
+        config
+            .oidc
+            .insert("corp-dashboard".to_string(), sibling.clone());
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("oidc.corp") && err.contains("oidc.corp-dashboard"),
+            "got: {err}"
+        );
+
+        // The same client id at a DIFFERENT issuer names a different client.
+        sibling.issuer = "https://other.example.com".to_string();
+        config.oidc.insert("corp-dashboard".to_string(), sibling);
+        config
+            .validate()
+            .expect("client ids are scoped to their issuer");
+    }
+
+    #[::core::prelude::v1::test]
+    fn oidc_claim_names_roundtrip_from_toml() {
+        // Okta custom authorization server shape.
+        let toml_src = r#"
+[permission_profiles.operator]
+allowed_agents = ["*"]
+
+[oidc.okta]
+issuer = "https://example.okta.com/oauth2/default"
+audience = "api://zeroclaw"
+client_id = "0oaexampleclient"
+claim_path = "groups"
+require_at_jwt = false
+client_id_claim = "cid"
+interactive_clients = ["0oaexampleclient"]
+
+[oidc.okta.profile_map]
+zeroclaw-operators = "operator"
+"#;
+        let config: Config = toml::from_str(toml_src).expect("claim names parse");
+        config.validate().expect("okta shape validates");
+        assert_eq!(config.oidc["okta"].client_id_claim, "cid");
+        assert_eq!(config.oidc["okta"].token_id_claim, "jti");
+    }
+
+    #[::core::prelude::v1::test]
+    fn oidc_claim_names_must_be_single_nonblank_claims() {
+        // Top-level names only: these are read from the verified payload,
+        // never by dotted path.
+        for bad in ["", " ", "client id", "a.b", " cid"] {
+            for field in ["client_id_claim", "token_id_claim"] {
+                let mut config = auth_config();
+                {
+                    let oidc = config.oidc.get_mut("corp").unwrap();
+                    if field == "client_id_claim" {
+                        oidc.client_id_claim = bad.to_string();
+                    } else {
+                        oidc.token_id_claim = bad.to_string();
+                    }
+                }
+                let err = config.validate().unwrap_err().to_string();
+                assert!(
+                    err.contains(&format!("oidc.corp.{field}")),
+                    "{field} = {bad:?}: got: {err}"
+                );
+            }
+        }
+    }
+
+    #[::core::prelude::v1::test]
+    fn oidc_claim_names_apply_to_jwks_only() {
+        // RFC 7662 answers name the client in `client_id`; a renamed claim
+        // there would silently do nothing, so it is refused instead.
+        for field in ["client_id_claim", "token_id_claim"] {
+            let mut config = auth_config();
+            {
+                let oidc = config.oidc.get_mut("corp").unwrap();
+                oidc.validation = OidcValidation::Introspection;
+                oidc.client_secret = Some("s3cret".to_string());
+                if field == "client_id_claim" {
+                    oidc.client_id_claim = "cid".to_string();
+                } else {
+                    oidc.token_id_claim = "uti".to_string();
+                }
+            }
+            let err = config.validate().unwrap_err().to_string();
+            assert!(
+                err.contains(&format!("oidc.corp.{field}")) && err.contains("jwks"),
+                "{field}: got: {err}"
+            );
+        }
     }
 
     #[::core::prelude::v1::test]
