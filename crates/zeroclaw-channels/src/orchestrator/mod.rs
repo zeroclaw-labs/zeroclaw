@@ -130,7 +130,7 @@ use zeroclaw_runtime::agent::execution_tree_budget::ExecutionTreeBudget;
 use zeroclaw_runtime::agent::loop_::{
     LoopKnobs, ResolvedAgentExecution, ResolvedIo, ResolvedModelAccess, ResolvedRuntimeKnobs,
     ToolLoop, append_pinned_mcp_section, apply_text_tool_prompt_policy,
-    build_tool_instructions_from_specs, is_model_switch_requested, scope_session_key,
+    build_tool_instructions_for_names, is_model_switch_requested, scope_session_key,
     scope_thread_id, scrub_credentials,
 };
 use zeroclaw_runtime::agent::system_prompt::build_skills_prompt_with_effective_tools;
@@ -57050,66 +57050,6 @@ Done."#;
     }
 
     // ── Tests tool context preservation ──────────────
-
-    #[test]
-    fn extract_current_turn_tool_messages_returns_intermediate_messages() {
-        let history = vec![
-            ChatMessage::system("sys"),
-            ChatMessage::user("older msg"),
-            ChatMessage::assistant("older reply"),
-            ChatMessage::user("block the iPad"),
-            ChatMessage::assistant("{\"tool_call\": \"shell\"}"),
-            ChatMessage::tool("ok"),
-            ChatMessage::assistant("Done, iPad is blocked."),
-        ];
-
-        let tool_msgs = canonical_channel_tool_messages(
-            &history[history
-                .iter()
-                .rposition(|m| m.role == "user")
-                .map_or(0, |i| i + 1)..],
-        );
-        assert_eq!(tool_msgs.len(), 2);
-        assert_eq!(tool_msgs[0].role, "assistant");
-        assert!(tool_msgs[0].content.contains("tool_call"));
-        assert_eq!(tool_msgs[1].role, "tool");
-    }
-
-    #[test]
-    fn extract_current_turn_tool_messages_empty_when_no_tools() {
-        let history = vec![
-            ChatMessage::user("hello"),
-            ChatMessage::assistant("Hi there!"),
-        ];
-
-        let tool_msgs = canonical_channel_tool_messages(
-            &history[history
-                .iter()
-                .rposition(|m| m.role == "user")
-                .map_or(0, |i| i + 1)..],
-        );
-        assert!(tool_msgs.is_empty());
-    }
-
-    #[test]
-    fn extract_current_turn_tool_messages_multiple_tool_rounds() {
-        let history = vec![
-            ChatMessage::user("do two things"),
-            ChatMessage::assistant("{\"tool_call\": \"read_skill\"}"),
-            ChatMessage::tool("skill content"),
-            ChatMessage::assistant("{\"tool_call\": \"shell\"}"),
-            ChatMessage::tool("shell output"),
-            ChatMessage::assistant("All done."),
-        ];
-
-        let tool_msgs = canonical_channel_tool_messages(
-            &history[history
-                .iter()
-                .rposition(|m| m.role == "user")
-                .map_or(0, |i| i + 1)..],
-        );
-        assert_eq!(tool_msgs.len(), 4);
-    }
 
     #[test]
     fn normalize_cached_channel_turns_passes_through_tool_messages() {

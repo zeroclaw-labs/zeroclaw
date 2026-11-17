@@ -3703,10 +3703,9 @@ async fn run_tool_call_loop_impl<'a>(
             accumulated_display_text.push_str(&visible_reason);
             if repetition_disposition.close {
                 turn_state.push_dual(ChatMessage::assistant(reason));
-                *history_has_trim_breadcrumb = turn_state.crumb_present;
-                return Ok(accumulated_display_text);
+            } else {
+                turn_state.push_dual(ChatMessage::system(reason));
             }
-            turn_state.push_dual(ChatMessage::system(reason));
         }
 
         let queued_sop_actions = crate::sop::executor::drain_live_actions(&live_sop_queue);
@@ -3765,6 +3764,11 @@ async fn run_tool_call_loop_impl<'a>(
             ))
             .await?;
             turn_state.mark_all_synced();
+        }
+
+        if repetition_disposition.close {
+            *history_has_trim_breadcrumb = turn_state.crumb_present;
+            return Ok(accumulated_display_text);
         }
 
         pending_reported_usage = reported_input_tokens.map(|reported| ReportedRequestUsage {
