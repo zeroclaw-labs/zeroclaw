@@ -17,6 +17,10 @@ use tokio::{
     task::JoinSet,
     time::{sleep, timeout},
 };
+use zeroclaw_config::{
+    schema::{Config, ScopedCredentialSource, ScopedHttpAuth, ScopedHttpCredential},
+    secrets::SecretStore,
+};
 
 const SSH: &str = "/usr/bin/ssh";
 const FOREGROUND: [&str; 2] = ["-o", "ForkAfterAuthentication=no"];
@@ -29,6 +33,7 @@ fn message(key: &str) -> String {
 #[derive(Serialize, Deserialize)]
 struct Request {
     argv: Vec<String>,
+    credential: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -132,6 +137,121 @@ async fn output(command: &mut Command, limit: u64) -> Result<Vec<u8>> {
     Ok(result)
 }
 
+fn record(alias: &str, effective: &str) -> Result<(String, ScopedCredentialSource, String)> {
+    let root = PathBuf::from(
+        std::env::var_os("ZEROCLAW_SSH_CREDENTIAL_DIR").context("missing catalog directory")?,
+    );
+    record_at(&root, alias, effective)
+}
+
+fn record_at(
+    root: &Path,
+    alias: &str,
+    effective: &str,
+) -> Result<(String, ScopedCredentialSource, String)> {
+    ensure!(ScopedHttpCredential::valid_name(alias), "invalid alias");
+    let config: Config = toml::from_str(&std::fs::read_to_string(root.join("config.toml"))?)?;
+    let stored = config
+        .http_request
+        .scoped_credentials
+        .get(alias)
+        .filter(|value| config.secrets.encrypt && value.starts_with("enc2:"))
+        .context("missing encrypted credential")?;
+    let decoded = SecretStore::new(root, true).decrypt(stored)?;
+    let record: ScopedHttpCredential = serde_json::from_str(&decoded)?;
+    let ScopedHttpAuth::SshKey {
+        private_key,
+        destinations,
+    } = record.auth
+    else {
+        anyhow::bail!("wrong credential kind");
+    };
+    let get = |key| ssh_setting(effective, key);
+    let port = get("port").and_then(|port| port.parse::<u16>().ok());
+    ensure!(
+        destinations.iter().any(|entry| get("hostname")
+            .is_some_and(|host| entry.host.eq_ignore_ascii_case(host))
+            && port == Some(entry.port)
+            && get("user") == Some(entry.username.as_str())),
+        "destination denied"
+    );
+    Ok((
+        format!("{:x}", Sha256::digest(stored)),
+        record.source,
+        private_key,
+    ))
+}
+
+fn ssh_setting<'a>(effective: &'a str, key: &str) -> Option<&'a str> {
+    effective
+        .lines()
+        .filter_map(|line| line.split_once(' '))
+        .find_map(|(name, value)| (name == key).then_some(value))
+}
+
+fn signer_loader_args(effective: &str, home: Option<&Path>) -> Result<Vec<std::ffi::OsString>> {
+    let host = ssh_setting(effective, "hostname").context("missing effective hostname")?;
+    let username = ssh_setting(effective, "user").context("missing effective user")?;
+    let port = ssh_setting(effective, "port")
+        .context("missing effective port")?
+        .parse::<u16>()?;
+    let valid = |value: &str, punctuation: &[u8]| {
+        !value.is_empty()
+            && !value.starts_with('-')
+            && value
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || punctuation.contains(&b))
+    };
+    ensure!(
+        valid(host, b".-:") && valid(username, b"_-") && port != 0,
+        "invalid effective destination"
+    );
+    let lookup = match ssh_setting(effective, "hostkeyalias").filter(|alias| *alias != "none") {
+        Some(alias) => {
+            ensure!(valid(alias, b".-:"), "invalid host key alias");
+            alias.to_owned()
+        }
+        None if port != 22 => format!("[{host}]:{port}"),
+        None => host.to_owned(),
+    };
+    let mut args = Vec::<std::ffi::OsString>::new();
+    for setting in ["userknownhostsfile", "globalknownhostsfile"] {
+        for file in ssh_setting(effective, setting)
+            .into_iter()
+            .flat_map(str::split_whitespace)
+        {
+            if file == "none" {
+                continue;
+            }
+            let home_relative = file.strip_prefix("~/").or_else(|| file.strip_prefix("%d/"));
+            ensure!(
+                !home_relative
+                    .unwrap_or(file)
+                    .contains(['%', '$', '"', '\'', '\\']),
+                "unsupported known-hosts path"
+            );
+            let path = if let Some(relative) = home_relative {
+                home.context("missing home for known-hosts path")?
+                    .join(relative)
+            } else {
+                PathBuf::from(file)
+            };
+            ensure!(path.is_absolute(), "known-hosts path must be absolute");
+            args.push("-H".into());
+            args.push(path.into_os_string());
+        }
+    }
+    ensure!(!args.is_empty(), "no configured known-hosts files");
+    args.extend([
+        "-t".into(),
+        "20".into(),
+        "-h".into(),
+        format!("{username}@{lookup}").into(),
+        "-".into(),
+    ]);
+    Ok(args)
+}
+
 struct OwnedMaster {
     child: Child,
     group: i32,
@@ -184,6 +304,66 @@ fn require_unused_socket(path: &Path) -> Result<()> {
     }
 }
 
+async fn signer(
+    path: &Path,
+    source: ScopedCredentialSource,
+    value: String,
+    effective: &str,
+) -> Result<Child> {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let loader_args = signer_loader_args(effective, home.as_deref())?;
+    let bytes = match source {
+        ScopedCredentialSource::Local => value.into_bytes(),
+        ScopedCredentialSource::OpenBao => {
+            let (program, args) = source.command(&value).context("invalid reference")?;
+            timeout(
+                Duration::from_secs(12),
+                output(Command::new(program).args(args), FRAME_LIMIT),
+            )
+            .await??
+        }
+        _ => anyhow::bail!("unsupported SSH credential source"),
+    };
+    let key = std::str::from_utf8(&bytes)?.trim_end();
+    ensure!(
+        bytes.len() as u64 <= FRAME_LIMIT
+            && key.starts_with("-----BEGIN OPENSSH PRIVATE KEY-----")
+            && key.ends_with("-----END OPENSSH PRIVATE KEY-----"),
+        "invalid SSH key"
+    );
+    require_unused_socket(path)?;
+    let mut signer = child()
+        .args(["/usr/bin/ssh-agent", "-D", "-a"])
+        .arg(path)
+        .spawn()?;
+    timeout(Duration::from_secs(3), async {
+        while !path.exists() {
+            ensure!(signer.try_wait()?.is_none(), "signer exited");
+            sleep(Duration::from_millis(25)).await;
+        }
+        Result::<()>::Ok(())
+    })
+    .await??;
+    ensure!(signer.try_wait()?.is_none(), "signer exited");
+    let mut loader = child()
+        .arg("/usr/bin/ssh-add")
+        .args(loader_args)
+        .env("SSH_AUTH_SOCK", path)
+        .env("SSH_ASKPASS_REQUIRE", "never")
+        .stdin(Stdio::piped())
+        .spawn()?;
+    timeout(Duration::from_secs(5), async {
+        let mut stdin = loader.stdin.take().context("missing key pipe")?;
+        stdin.write_all(key.as_bytes()).await?;
+        stdin.write_all(b"\n").await?;
+        drop(stdin);
+        ensure!(loader.wait().await?.success(), "key rejected");
+        Result::<()>::Ok(())
+    })
+    .await??;
+    Ok(signer)
+}
+
 #[derive(Default)]
 struct Entry {
     master: Option<OwnedMaster>,
@@ -201,8 +381,21 @@ impl Drop for SocketPath {
     }
 }
 
-async fn open(path: &Path, options: &[String], host: &str) -> Result<OwnedMaster> {
+async fn open(
+    path: &Path,
+    options: &[String],
+    host: &str,
+    credential: Option<(ScopedCredentialSource, String)>,
+    effective: &str,
+) -> Result<OwnedMaster> {
     require_unused_socket(path)?;
+    require_unused_socket(&path.with_extension("agent"))?;
+    let socket = SocketPath(path.with_extension("agent"));
+    let mut agent = if let Some((source, value)) = credential {
+        Some(signer(&socket.0, source, value, effective).await?)
+    } else {
+        None
+    };
     let mut command = child();
     command
         .args([SSH, "-M", "-N", "-S"])
@@ -226,6 +419,19 @@ async fn open(path: &Path, options: &[String], host: &str) -> Result<OwnedMaster
             "-o",
             "ServerAliveCountMax=3",
         ]);
+    if agent.is_some() {
+        command
+            .args(["-o", "StrictHostKeyChecking=yes", "-o"])
+            .arg(format!("IdentityAgent={}", socket.0.display()));
+        command.args([
+            "-o",
+            "IdentitiesOnly=no",
+            "-o",
+            "IdentityFile=none",
+            "-o",
+            "PreferredAuthentications=publickey",
+        ]);
+    }
     let mut master = OwnedMaster::spawn(command.args(options).args(["--", host]))?;
     timeout(Duration::from_secs(15), async {
         while !path.exists() {
@@ -235,6 +441,9 @@ async fn open(path: &Path, options: &[String], host: &str) -> Result<OwnedMaster
         Result::<()>::Ok(())
     })
     .await??;
+    if let Some(agent) = &mut agent {
+        agent.kill().await?;
+    }
     ensure!(master.try_wait()?.is_none(), "master exited");
     Ok(master)
 }
@@ -279,7 +488,16 @@ async fn lease(
     )
     .await??;
     let effective = std::str::from_utf8(&effective)?;
-    let fingerprint = serde_json::to_vec(&(host, effective))?;
+    let alias = request
+        .credential
+        .or_else(|| std::env::var("ZEROCLAW_SSH_DEFAULT_CREDENTIAL").ok());
+    let credential = alias
+        .as_deref()
+        .map(|alias| record(alias, effective))
+        .transpose()
+        .context("tool-native-ssh-credential")?;
+    let fingerprint =
+        serde_json::to_vec(&(host, effective, alias, credential.as_ref().map(|c| &c.0)))?;
     let key = format!("{:x}", Sha256::digest(fingerprint));
     let path = dir.join(&key[..24]);
     let entry = pool.lock().await.entry(path.clone()).or_default().clone();
@@ -288,9 +506,15 @@ async fn lease(
     if state.master.is_none() {
         state.failed = true;
         state.master = Some(
-            open(&path, options, host)
-                .await
-                .context("tool-native-ssh-connection")?,
+            open(
+                &path,
+                options,
+                host,
+                credential.map(|(_, source, value)| (source, value)),
+                effective,
+            )
+            .await
+            .context("tool-native-ssh-connection")?,
         );
         state.failed = false;
     }
@@ -419,12 +643,26 @@ async fn serve_inner(
     Ok(())
 }
 
-async fn client(args: Vec<String>) -> Result<i32> {
+async fn client(mut args: Vec<String>) -> Result<i32> {
     let id = std::env::var("ZEROCLAW_SSH_TASK")?;
     ensure!(valid_task(&id), "invalid task");
+    let credential = if args.first().is_some_and(|arg| arg == "--credential") {
+        ensure!(args.len() >= 3, "missing alias");
+        args.remove(0);
+        Some(args.remove(0))
+    } else {
+        None
+    };
     let (options, host, command) = parse(&args)?;
     let mut stream = UnixStream::connect(directory().join(id).join("broker")).await?;
-    write(&mut stream, &Request { argv: args.clone() }).await?;
+    write(
+        &mut stream,
+        &Request {
+            argv: args.clone(),
+            credential,
+        },
+    )
+    .await?;
     let reply: Reply = timeout(Duration::from_secs(48), read(&mut stream)).await??;
     let error_key = reply
         .error
@@ -502,9 +740,10 @@ pub fn run(args: Vec<String>) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        Entry, OwnedMaster, Pool, SocketPath, parse, require_unused_socket, retire_idle,
-        serve_inner, valid_task,
+        Entry, Pool, SecretStore, SocketPath, parse, record_at, retire_idle, serve_inner,
+        valid_task,
     };
+    use super::{OwnedMaster, require_unused_socket, signer_loader_args};
     use std::{
         sync::Arc,
         time::{Duration, Instant},
@@ -624,6 +863,37 @@ mod tests {
     }
 
     #[test]
+    fn signer_loader_requires_destination_scope_and_known_host_files() {
+        let base = "hostname build.example\nport 2222\nuser runner\nuserknownhostsfile ~/.ssh/known_hosts\nglobalknownhostsfile none\n";
+        let args = signer_loader_args(base, Some(Path::new("/home/test"))).unwrap();
+        assert_eq!(
+            args,
+            [
+                "-H",
+                "/home/test/.ssh/known_hosts",
+                "-t",
+                "20",
+                "-h",
+                "runner@[build.example]:2222",
+                "-"
+            ]
+        );
+        let tokenized = base.replace("~/", "%d/");
+        assert_eq!(
+            signer_loader_args(&tokenized, Some(Path::new("/home/test"))).unwrap(),
+            args
+        );
+        assert!(signer_loader_args(&tokenized, None).is_err());
+        let unsupported = base.replace("~/", "%h/");
+        assert!(signer_loader_args(&unsupported, Some(Path::new("/home/test"))).is_err());
+        let alias = format!("{base}hostkeyalias build-pin\n");
+        let args = signer_loader_args(&alias, Some(Path::new("/home/test"))).unwrap();
+        assert_eq!(args[5], "runner@build-pin");
+        assert!(signer_loader_args(base, None).is_err());
+        assert!(signer_loader_args("hostname build.example\nport 22\nuser runner", None).is_err());
+    }
+
+    #[test]
     fn signer_socket_path_is_removed_on_scope_exit() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("agent");
@@ -635,6 +905,70 @@ mod tests {
         drop(listener);
     }
     use std::path::Path;
+
+    fn write_catalog(root: &Path, auth: serde_json::Value, encrypted: bool, encrypt_enabled: bool) {
+        let record = serde_json::json!({ "origin": "", "auth": auth }).to_string();
+        let stored = if encrypted {
+            SecretStore::new(root, true).encrypt(&record).unwrap()
+        } else {
+            record
+        };
+        let config = serde_json::json!({
+            "secrets": {"encrypt": encrypt_enabled},
+            "http_request": {"scoped_credentials": {"FIXTURE": stored}}
+        });
+        std::fs::write(root.join("config.toml"), toml::to_string(&config).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn encrypted_key_is_limited_to_the_effective_host_port_and_user() {
+        let dir = tempfile::tempdir().unwrap();
+        write_catalog(
+            dir.path(),
+            serde_json::json!({
+                "kind": "ssh_key",
+                "private_key": "synthetic-key",
+                "destinations": [{"host": "build.example", "port": 2222, "username": "runner"}]
+            }),
+            true,
+            true,
+        );
+        let allowed = "hostname BUILD.example\nport 2222\nuser runner\n";
+        let (revision, _, key) = record_at(dir.path(), "FIXTURE", allowed).unwrap();
+        assert_eq!(revision.len(), 64);
+        assert_eq!(key, "synthetic-key");
+        assert!(record_at(dir.path(), "MISSING", allowed).is_err());
+        for effective in [
+            "hostname other.example\nport 2222\nuser runner\n",
+            "hostname build.example\nport 22\nuser runner\n",
+            "hostname build.example\nport 2222\nuser other\n",
+            "hostname build.example\nuser runner\n",
+        ] {
+            assert!(record_at(dir.path(), "FIXTURE", effective).is_err());
+        }
+    }
+
+    #[test]
+    fn catalog_rejects_plaintext_disabled_encryption_and_non_ssh_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = serde_json::json!({
+            "kind": "ssh_key",
+            "private_key": "synthetic-key",
+            "destinations": [{"host": "build.example", "port": 2222, "username": "runner"}]
+        });
+        let effective = "hostname build.example\nport 2222\nuser runner\n";
+        write_catalog(dir.path(), key.clone(), false, true);
+        assert!(record_at(dir.path(), "FIXTURE", effective).is_err());
+        write_catalog(dir.path(), key, true, false);
+        assert!(record_at(dir.path(), "FIXTURE", effective).is_err());
+        write_catalog(
+            dir.path(),
+            serde_json::json!({"kind": "api_key", "value": "synthetic-token"}),
+            true,
+            true,
+        );
+        assert!(record_at(dir.path(), "FIXTURE", effective).is_err());
+    }
 
     #[test]
     fn only_managed_options_and_explicit_commands_are_admitted() {
