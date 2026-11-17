@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test, { beforeEach } from 'node:test';
 import React, { createElement } from 'react';
+import { Check } from 'lucide-react';
 import {
   act,
   create,
@@ -2062,10 +2063,13 @@ for (const { keepCollapsed, label, whileThinking, afterChunk } of thinkingBoxCas
     const toggle = () => mounted.renderer.root.findAllByType('button')
       .find((button) => nodeText(button).includes('Keep thinking collapsed'));
     assert.equal(toggle()?.props['aria-pressed'], false);
+    assert.equal(toggle()!.findAllByType(Check).length, 0);
     if (keepCollapsed) {
       await act(async () => { toggle()!.props.onClick(); });
       assert.equal(toggle()?.props['aria-pressed'], true);
       assert.equal(storage.getItem('zeroclaw_keep_thinking_collapsed'), '1');
+      // The non-colour cue for the pressed state.
+      assert.equal(toggle()!.findAllByType(Check).length, 1);
     }
 
     const liveOpen = () => {
