@@ -279,8 +279,17 @@ tool-a2a-cancel-desc-peer = Configured peer name hosting the task.
 tool-a2a-cancel-desc-task-id = The task id to cancel.
 tool-a2a-cancel-desc-agent = Optional agent alias or tenant that created the task (from a2a_send). Helps route the cancel to the correct interface when discovery is re-run (the cached route is used first).
 
-
+tool-ssh-task-start-failed = Cannot start the task SSH owner
+tool-ssh-task-readiness-pipe = Task SSH owner has no readiness pipe
+tool-ssh-task-readiness-timeout = Task SSH owner readiness timed out
+tool-ssh-task-readiness-invalid = Invalid task SSH readiness
+tool-ssh-task-readiness-failed = Task SSH owner exited without readiness
+tool-ssh-task-state-directory = Task SSH owner omitted state directory
+tool-ssh-task-cleanup-timeout = Task SSH cleanup timed out
+tool-ssh-task-cleanup-failed = Task SSH cleanup failed
+tool-ssh-task-cleanup-status = Task SSH cleanup helper failed
+tool-native-ssh-arguments = Use a configured SSH destination and an explicit noninteractive command.
+tool-native-ssh-denied = Task SSH could not authorize or open the requested transport.
+tool-ssh-task-unsupported = The task SSH broker requires Linux.
 tool-native-ssh-credential = The SSH credential or destination grant is unavailable.
-
 tool-native-ssh-connection = The managed SSH connection could not be established.
-
