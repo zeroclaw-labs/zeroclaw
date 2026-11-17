@@ -820,6 +820,15 @@ mod graceful_summary_metering_tests {
         cancellation_token: Option<&tokio_util::sync::CancellationToken>,
         event_tx: Option<&Sender<TurnEvent>>,
     ) -> anyhow::Result<String> {
+        run_controlled_summary_with_hooks(provider, cancellation_token, event_tx, None).await
+    }
+
+    async fn run_controlled_summary_with_hooks(
+        provider: &dyn ModelProvider,
+        cancellation_token: Option<&tokio_util::sync::CancellationToken>,
+        event_tx: Option<&Sender<TurnEvent>>,
+        hooks: Option<&crate::hooks::HookRunner>,
+    ) -> anyhow::Result<String> {
         let mut history = vec![ChatMessage::user("do the work")];
         let pacing = PacingConfig {
             step_timeout_secs: Some(1),
@@ -845,7 +854,7 @@ mod graceful_summary_metering_tests {
             None,
             &MultimodalConfig::default(),
             None,
-            None,
+            hooks,
             None,
             None,
             |_, _| ResolvedContextLimits::legacy_fallback(0),
@@ -855,6 +864,123 @@ mod graceful_summary_metering_tests {
             None,
         )
         .await
+    }
+
+    struct SummaryPreparationHook {
+        calls: Arc<AtomicUsize>,
+        pending: bool,
+        cancel: Option<tokio_util::sync::CancellationToken>,
+    }
+
+    #[async_trait]
+    impl crate::hooks::HookHandler for SummaryPreparationHook {
+        fn name(&self) -> &str {
+            "summary-preparation"
+        }
+
+        async fn before_llm_call(
+            &self,
+            _messages: &mut Vec<ChatMessage>,
+            _model: &mut String,
+        ) -> crate::hooks::HookResult<()> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if let Some(token) = &self.cancel {
+                token.cancel();
+            }
+            if self.pending {
+                std::future::pending().await
+            } else {
+                crate::hooks::HookResult::Continue(())
+            }
+        }
+    }
+
+    async fn assert_interrupted_summary_preparation_does_not_admit(cancel: bool) {
+        let token = tokio_util::sync::CancellationToken::new();
+        let provider_calls = Arc::new(AtomicUsize::new(0));
+        let provider = CountingUsageProvider {
+            calls: Arc::clone(&provider_calls),
+        };
+        let hook_calls = Arc::new(AtomicUsize::new(0));
+        let mut hooks = crate::hooks::HookRunner::new();
+        hooks.register(Box::new(SummaryPreparationHook {
+            calls: Arc::clone(&hook_calls),
+            pending: true,
+            cancel: cancel.then(|| token.clone()),
+        }));
+        let accountant = Arc::new(SummaryAccounting::default());
+        let accounting: Arc<dyn zeroclaw_goal::accounting::GoalOperationAccounting> =
+            accountant.clone();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            zeroclaw_goal::accounting::GOAL_OPERATION_ACCOUNTING.scope(
+                Some(accounting),
+                run_controlled_summary_with_hooks(
+                    &provider,
+                    cancel.then_some(&token),
+                    None,
+                    Some(&hooks),
+                ),
+            ),
+        )
+        .await
+        .expect("summary preparation must not remain stuck");
+        let error = result.expect_err("interrupted preparation must stop the summary");
+        if cancel {
+            assert!(error.downcast_ref::<super::ToolLoopCancelled>().is_some());
+        } else {
+            assert_eq!(
+                zeroclaw_api::turn_stop::turn_stop(&error).unwrap().code,
+                zeroclaw_api::turn_stop::TurnStopCode::MaxIterations
+            );
+            assert!(error.to_string().contains("step_timeout_secs"));
+        }
+        assert_eq!(hook_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(accountant.admissions.load(Ordering::SeqCst), 0);
+        assert_eq!(accountant.releases.load(Ordering::SeqCst), 0);
+        assert!(accountant.settlements.lock().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn graceful_summary_preparation_timeout_does_not_admit_goal() {
+        assert_interrupted_summary_preparation_does_not_admit(false).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn graceful_summary_preparation_cancellation_does_not_admit_goal() {
+        assert_interrupted_summary_preparation_does_not_admit(true).await;
+    }
+
+    #[tokio::test]
+    async fn graceful_summary_preparation_completed_admits_goal() {
+        let provider_calls = Arc::new(AtomicUsize::new(0));
+        let provider = CountingUsageProvider {
+            calls: Arc::clone(&provider_calls),
+        };
+        let hook_calls = Arc::new(AtomicUsize::new(0));
+        let mut hooks = crate::hooks::HookRunner::new();
+        hooks.register(Box::new(SummaryPreparationHook {
+            calls: Arc::clone(&hook_calls),
+            pending: false,
+            cancel: None,
+        }));
+        let accountant = Arc::new(SummaryAccounting::default());
+        let accounting: Arc<dyn zeroclaw_goal::accounting::GoalOperationAccounting> =
+            accountant.clone();
+        let result = zeroclaw_goal::accounting::GOAL_OPERATION_ACCOUNTING
+            .scope(
+                Some(accounting),
+                run_controlled_summary_with_hooks(&provider, None, None, Some(&hooks)),
+            )
+            .await
+            .expect("completed preparation must allow the summary");
+        assert!(result.contains("wrap-up summary"));
+        assert_eq!(hook_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(accountant.admissions.load(Ordering::SeqCst), 1);
+        assert_eq!(accountant.releases.load(Ordering::SeqCst), 0);
+        assert_eq!(accountant.settlements.lock().len(), 1);
     }
 
     async fn assert_interrupted_summary_settles(cancel: bool) {
