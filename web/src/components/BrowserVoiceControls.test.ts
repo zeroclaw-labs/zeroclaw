@@ -460,6 +460,45 @@ test('a late selected-device response cannot repaint a different device configur
 });
 
 
+test('stopping one pane does not cancel playback owned by another pane', async () => {
+  const owner = await mount();
+  const other = await mount();
+  const speaker = (pane: ReactTestRenderer) => pane.root.findAllByType('button')[1]!;
+  const cancelled: string[] = [];
+  const cancel = speech.cancel;
+  speech.cancel = () => { cancelled.push('cancel'); };
+  try {
+    await act(async () => { speaker(owner).props.onClick(); });
+    assert.equal(speaker(owner).props['aria-busy'], true);
+    await act(async () => {
+      speaker(other).props.onKeyDown({ key: 'Enter', shiftKey: true, preventDefault() {} });
+      speaker(other).props.onKeyDown({ key: 'Enter', shiftKey: true, preventDefault() {} });
+    });
+    assert.deepEqual(cancelled, []);
+    assert.equal(speaker(owner).props['aria-busy'], true);
+    await act(async () => { speaker(owner).props.onClick(); });
+    assert.deepEqual(cancelled, ['cancel']);
+  } finally {
+    await act(async () => { other.unmount(); owner.unmount(); });
+    speech.cancel = cancel;
+  }
+});
+
+test('manual playback in a second pane shows the playback busy message', async () => {
+  const owner = await mount();
+  const other = await mount();
+  const speaker = (pane: ReactTestRenderer) => pane.root.findAllByType('button')[1]!;
+  try {
+    await act(async () => { speaker(owner).props.onClick(); });
+    await act(async () => { speaker(other).props.onClick(); });
+    assert.deepEqual(spoken, ['Historical reply']);
+    const alert = other.root.findByProps({ role: 'alert' });
+    assert.match(alert.children.join(''), /Voice playback is already in progress/);
+  } finally {
+    await act(async () => { other.unmount(); owner.unmount(); });
+  }
+});
+
 test('speaker reads rendered Markdown while preserving literal shell punctuation', async () => {
   const renderer = await mount();
   const markdown = '## **Status**\n\n- *Atualizado*\n- [Painel](https://example.com/private)\n\n---\n\n`apt-get --yes` e `a*b`.';
