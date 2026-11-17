@@ -1636,7 +1636,12 @@ pub(crate) fn run_tool_call_loop_with_initial_ingress<'a>(
     reported_usage: Option<ReportedRequestUsage>,
     repetition_guard: Option<&'a std::sync::Mutex<repetition::RepetitionGuard>>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String>> + Send + 'a>> {
-    Box::pin(run_tool_call_loop_impl(p, Some(subject), reported_usage, repetition_guard))
+    Box::pin(run_tool_call_loop_impl(
+        p,
+        Some(subject),
+        reported_usage,
+        repetition_guard,
+    ))
 }
 
 /// Non-streamed Agent turns own the guard without steering ingress.
@@ -3568,31 +3573,15 @@ async fn run_tool_call_loop_impl<'a>(
             repetition::RepetitionDisposition::default()
         };
 
-        record_executed_outcomes(
-            &ctx,
+        post_exec::store_executed_outcomes(
             &executed_completed_indices,
             &executed_completed_calls,
-            &executed_completed_stream_calls,
             executed_completed_outcomes
                 .into_iter()
-                .map(|completed| completed.outcome)
-                .collect(),
+                .map(|completed| completed.outcome),
             &mut ordered_results,
-            iteration,
-        )
-        .await;
+        );
         if cancelled_mid_batch {
-            // Completed calls already received their after hook; every other
-            // executable context of the batch was interrupted before
-            // post-execution handling and gets exactly one abandonment.
-            call_prep::abandon_unexecuted_prepared_contexts(
-                &ctx,
-                iteration,
-                &executable_indices,
-                &executable_calls,
-                &executed_completed_indices,
-            )
-            .await;
             for (idx, call) in tool_calls.iter().enumerate() {
                 if ordered_results[idx].is_none() {
                     ordered_results[idx] = Some((
@@ -3612,32 +3601,6 @@ async fn run_tool_call_loop_impl<'a>(
                     ));
                 }
             }
-            // Close pending cards only for executable calls whose terminal
-            // ToolResult was never emitted by the executor. A parallel call that
-            // completed before the cancellation already emitted its real result;
-            // re-emitting here would flip its card from completed to interrupted.
-            if let Some(tx) = ctx.event_tx {
-                let completed: std::collections::HashSet<usize> =
-                    executed_completed_indices.iter().copied().collect();
-                for (call_idx, call) in executable_indices.iter().zip(executable_calls.iter()) {
-                    if completed.contains(call_idx) {
-                        continue;
-                    }
-                    let call_id = events::resolve_tool_call_id(call);
-                    let interrupted = crate::agent::tool_execution::ToolExecutionOutcome {
-                        output: crate::i18n::get_required_cli_string(
-                            "turn-tool-interrupted-before-result",
-                        ),
-                        attachments: Vec::new(),
-                        success: false,
-                        error_reason: None,
-                        duration: std::time::Duration::ZERO,
-                        receipt: None,
-                        output_data: None,
-                    };
-                    events::emit_tool_result(tx, &call_id, &call.name, &interrupted).await;
-                }
-            }
         }
 
         let CollectedResults {
@@ -3645,7 +3608,7 @@ async fn run_tool_call_loop_impl<'a>(
             tool_results,
             detection_relevant_output,
         } = collect_tool_results(
-            ordered_results,
+            &ordered_results,
             &tool_calls,
             turn_state.history,
             &mut loop_detector,
@@ -3678,7 +3641,53 @@ async fn run_tool_call_loop_impl<'a>(
             use_native_tools,
         );
 
+        record_executed_outcomes(
+            &ctx,
+            &executed_completed_indices,
+            &executed_completed_calls,
+            &executed_completed_stream_calls,
+            &ordered_results,
+            iteration,
+        )
+        .await;
         if cancelled_mid_batch {
+            // Completed calls already received their after hook; every other
+            // executable context of the batch was interrupted before
+            // post-execution handling and gets exactly one abandonment.
+            call_prep::abandon_unexecuted_prepared_contexts(
+                &ctx,
+                iteration,
+                &executable_indices,
+                &executable_calls,
+                &executed_completed_indices,
+            )
+            .await;
+            // Close pending cards only for executable calls whose terminal
+            // ToolResult was never emitted by the executor. A parallel call that
+            // completed before the cancellation already emitted its real result;
+            // re-emitting here would flip its card from completed to interrupted.
+            if let Some(tx) = ctx.event_tx {
+                let completed: std::collections::HashSet<usize> =
+                    executed_completed_indices.iter().copied().collect();
+                for (call_idx, call) in executable_indices.iter().zip(executable_calls.iter()) {
+                    if completed.contains(call_idx) {
+                        continue;
+                    }
+                    let call_id = events::resolve_tool_call_id(call);
+                    let interrupted = crate::agent::tool_execution::ToolExecutionOutcome {
+                        output: crate::i18n::get_required_cli_string(
+                            "turn-tool-interrupted-before-result",
+                        ),
+                        attachments: Vec::new(),
+                        success: false,
+                        error_reason: None,
+                        duration: std::time::Duration::ZERO,
+                        receipt: None,
+                        output_data: None,
+                    };
+                    events::emit_tool_result(tx, &call_id, &call.name, &interrupted).await;
+                }
+            }
             return Err(ToolLoopCancelled.into());
         }
 

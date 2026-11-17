@@ -2643,11 +2643,7 @@ fn provider_ready_cached_turns(turns: Vec<ChatMessage>) -> Vec<ChatMessage> {
     // Strip stale tool_result blocks from cached turns so the LLM never
     // sees a `<tool_result>` without a preceding `<tool_call>`, which
     // causes hallucinated output on subsequent heartbeat ticks or sessions.
-    for turn in &mut turns {
-        if turn.content.contains("<tool_result") {
-            turn.content = strip_tool_result_content(&turn.content);
-        }
-    }
+    strip_orphan_prompt_tool_results(&mut turns);
 
     // Strip [Used tools: ...] prefixes from cached assistant turns so the
     // LLM never sees (and reproduces) this internal summary format.

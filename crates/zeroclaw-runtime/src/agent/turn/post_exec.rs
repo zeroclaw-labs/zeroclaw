@@ -1,5 +1,4 @@
-//! Post-execution recording: result log line, the `after_tool_call` hook, the
-//! completion Status, and filling the executed calls' `ordered_results` slots.
+//! Store tool outcomes and deliver post-execution notifications.
 
 use super::call_prep::StreamToolCall;
 use super::context::TurnCtx;
@@ -8,25 +7,36 @@ use super::redact::scrub_credentials;
 use crate::agent::tool_execution::ToolExecutionOutcome;
 use zeroclaw_tool_call_parser::ParsedToolCall;
 
-/// Record each executed tool call's outcome (upstream loop body,
-/// post-execution section): one `tool_call_result` log line, the
-/// `after_tool_call` hook, a completion Status to the draft, and the
-/// call's slot in `ordered_results`.
+type OrderedOutcome = Option<(String, Option<String>, ToolExecutionOutcome)>;
+
+/// Save settled outcomes before any notification can suspend the turn.
+pub(crate) fn store_executed_outcomes(
+    indices: &[usize],
+    calls: &[ParsedToolCall],
+    outcomes: impl IntoIterator<Item = ToolExecutionOutcome>,
+    ordered_results: &mut [OrderedOutcome],
+) {
+    for ((idx, call), outcome) in indices.iter().zip(calls).zip(outcomes) {
+        ordered_results[*idx] = Some((call.name.clone(), call.tool_call_id.clone(), outcome));
+    }
+}
+
 pub(crate) async fn record_executed_outcomes(
     ctx: &TurnCtx<'_>,
     executable_indices: &[usize],
     executable_calls: &[ParsedToolCall],
     stream_calls: &[Option<StreamToolCall>],
-    executed_outcomes: Vec<ToolExecutionOutcome>,
-    ordered_results: &mut [Option<(String, Option<String>, ToolExecutionOutcome)>],
+    ordered_results: &[OrderedOutcome],
     iteration: usize,
 ) {
-    for (((idx, call), stream_call), outcome) in executable_indices
+    for ((idx, call), stream_call) in executable_indices
         .iter()
-        .zip(executable_calls.iter())
-        .zip(stream_calls.iter())
-        .zip(executed_outcomes)
+        .zip(executable_calls)
+        .zip(stream_calls)
     {
+        let Some((_, _, outcome)) = &ordered_results[*idx] else {
+            continue;
+        };
         // The pending ToolCall and terminal ToolResult are emitted by the
         // executor (execute_one_tool) at dispatch and completion time so serial
         // batches interleave call->result per tool. Post-exec only records the
@@ -110,7 +120,5 @@ pub(crate) async fn record_executed_outcomes(
                 u64::try_from(outcome.duration.as_millis()).unwrap_or(u64::MAX),
             );
         }
-
-        ordered_results[*idx] = Some((call.name.clone(), call.tool_call_id.clone(), outcome));
     }
 }

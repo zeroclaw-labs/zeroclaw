@@ -47,7 +47,7 @@ pub(crate) struct CollectedResults {
 /// forms.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn collect_tool_results(
-    ordered_results: Vec<Option<(String, Option<String>, ToolExecutionOutcome)>>,
+    ordered_results: &[Option<(String, Option<String>, ToolExecutionOutcome)>],
     tool_calls: &[ParsedToolCall],
     history: &mut Vec<ChatMessage>,
     loop_detector: &mut LoopDetector,
@@ -64,9 +64,9 @@ pub(crate) fn collect_tool_results(
     // Use enumerate *before* filter_map so result_index stays aligned with
     // tool_calls even when some ordered_results entries are None.
     for (result_index, (tool_name, tool_call_id, outcome)) in ordered_results
-        .into_iter()
+        .iter()
         .enumerate()
-        .filter_map(|(i, opt)| opt.map(|v| (i, v)))
+        .filter_map(|(i, opt)| opt.as_ref().map(|v| (i, v)))
     {
         if !loop_ignore_tools.contains(tool_name.as_str()) {
             if outcome.success {
@@ -177,7 +177,7 @@ pub(crate) fn collect_tool_results(
             }
         }
         individual_results.push(ToolRoundResult {
-            tool_call_id,
+            tool_call_id: tool_call_id.clone(),
             output: result_output.clone(),
             attachments,
         });
@@ -308,7 +308,7 @@ mod tests {
             )));
         }
         let collected = collect_tool_results(
-            ordered,
+            &ordered,
             &tool_calls,
             &mut history,
             &mut detector,
@@ -431,7 +431,7 @@ mod tests {
                 outcome(output, success),
             ))];
             let collected = collect_tool_results(
-                ordered,
+                &ordered,
                 &tool_calls,
                 &mut history,
                 &mut detector,
@@ -482,7 +482,7 @@ mod tests {
         }];
         let ordered = vec![Some(("shell".to_string(), None, outcome(&output, true)))];
         let collected = collect_tool_results(
-            ordered,
+            &ordered,
             &tool_calls,
             &mut history,
             &mut detector,
@@ -528,7 +528,7 @@ mod tests {
             ordered.push(Some(("shell".to_string(), None, outcome("same", true))));
         }
         let err = collect_tool_results(
-            ordered,
+            &ordered,
             &tool_calls,
             &mut history,
             &mut detector,
