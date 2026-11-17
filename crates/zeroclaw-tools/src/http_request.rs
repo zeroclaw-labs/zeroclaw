@@ -60,46 +60,68 @@ fn redact_response_body(
         return redact(&body);
     }
 
-    // Decode only JSON string tokens. Rebuilding a whole Value would round
-    // large numbers and enabling arbitrary_precision affects other consumers.
+    // Scan JSON tokens without rebuilding numbers through Value. Exact scrubbing
+    // of the final text also catches quoted secrets spanning token boundaries in
+    // non-JSON replies, HTML, and malformed/truncated responses.
     let bytes = body.as_bytes();
     let mut output = String::with_capacity(body.len());
-    let mut start = 0;
     let mut cursor = 0;
     while cursor < bytes.len() {
-        if bytes[cursor] != b'"' {
-            cursor += 1;
-            continue;
-        }
-        output.push_str(&redact(&body[start..cursor]));
-        let token_start = cursor;
-        cursor += 1;
-        while cursor < bytes.len() {
-            match bytes[cursor] {
-                b'\\' => cursor = (cursor + 2).min(bytes.len()),
-                b'"' => {
-                    cursor += 1;
-                    break;
+        let start = cursor;
+        match bytes[cursor] {
+            b'"' => {
+                cursor += 1;
+                while cursor < bytes.len() {
+                    match bytes[cursor] {
+                        b'\\' => cursor = (cursor + 2).min(bytes.len()),
+                        b'"' => {
+                            cursor += 1;
+                            break;
+                        }
+                        _ => cursor += 1,
+                    }
                 }
-                _ => cursor += 1,
+                let token = &body[start..cursor];
+                if let Ok(decoded) = serde_json::from_str::<String>(token) {
+                    let redacted = redact(&decoded);
+                    if redacted == decoded {
+                        output.push_str(token);
+                    } else {
+                        // Serializing a String cannot fail.
+                        output.push_str(&serde_json::to_string(&redacted).expect("JSON string"));
+                    }
+                } else {
+                    output.push_str(token);
+                }
+            }
+            b'-' | b'0'..=b'9' => {
+                cursor += 1;
+                while cursor < bytes.len()
+                    && matches!(
+                        bytes[cursor],
+                        b'0'..=b'9' | b'.' | b'e' | b'E' | b'+' | b'-'
+                    )
+                {
+                    cursor += 1;
+                }
+                let token = &body[start..cursor];
+                let redacted = redact(token);
+                if redacted == token {
+                    output.push_str(token);
+                } else {
+                    // An altered scalar becomes a JSON string, preserving the
+                    // surrounding structured response and unrelated raw numbers.
+                    output.push_str(&serde_json::to_string(&redacted).expect("JSON string"));
+                }
+            }
+            _ => {
+                let character = body[cursor..].chars().next().expect("cursor is in bounds");
+                output.push(character);
+                cursor += character.len_utf8();
             }
         }
-        let token = &body[token_start..cursor];
-        if let Ok(decoded) = serde_json::from_str::<String>(token) {
-            let redacted = redact(&decoded);
-            if redacted == decoded {
-                output.push_str(token);
-            } else {
-                // Serializing a String cannot fail.
-                output.push_str(&serde_json::to_string(&redacted).expect("JSON string"));
-            }
-        } else {
-            output.push_str(&redact(token));
-        }
-        start = cursor;
     }
-    output.push_str(&redact(&body[start..]));
-    output
+    redact(&output)
 }
 
 impl HttpRequestTool {
@@ -2667,6 +2689,30 @@ api_token = "Bearer from-secret"
         assert_eq!(parsed["authorization"], "Bearer secret");
         assert_eq!(parsed["x-api-key"], "my-key");
         assert_eq!(parsed["content-type"], "application/json");
+    }
+
+    #[test]
+    fn authenticated_text_redacts_secret_containing_quotes() {
+        let secret = "abc\"def";
+        for body in [format!("credential: {secret}"), format!("<p>{secret}</p>")] {
+            let output =
+                redact_response_body(body, &|text| text.replace(secret, "[REDACTED]"), true);
+            assert!(!output.contains(secret));
+            assert!(output.contains("[REDACTED]"));
+        }
+    }
+
+    #[test]
+    fn authenticated_numeric_secrets_preserve_structured_json() {
+        let output = redact_response_body(
+            r#"{"count":123456,"ok":true,"large":18446744073709551617}"#.into(),
+            &|text| text.replace("123456", "[REDACTED]"),
+            true,
+        );
+        let structured: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(structured["count"], "[REDACTED]");
+        assert_eq!(structured["ok"], true);
+        assert!(output.contains("18446744073709551617"));
     }
 
     #[test]
