@@ -151,7 +151,7 @@ The following built-in capabilities are available when compiled and selected, wh
 
 In **Settings → Secrets**, operators can create, replace, and delete
 **Username and password credentials** (HTTP Basic) and **API token
-credentials** (Bearer or `X-API-Key`). Each alias is bound to one exact HTTPS
+credentials** (Bearer, `X-API-Key`, or `Authorization: Token`). Each alias is bound to one exact HTTPS
 origin, including any non-default port. The tool's existing domain policy
 still applies. The editor lists only aliases, types, and origins.
 

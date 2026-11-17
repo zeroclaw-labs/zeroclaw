@@ -9081,6 +9081,7 @@ pub enum ScopedApiKeyHeader {
     #[default]
     Bearer,
     XApiKey,
+    Token,
 }
 
 impl ScopedHttpCredential {

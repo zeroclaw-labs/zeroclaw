@@ -1387,12 +1387,12 @@ export type HttpCredentialRow = {
   name: string;
   origin: string;
   kind: HttpCredentialKind;
-  header?: "bearer" | "x_api_key" | null;
+  header?: "bearer" | "x_api_key" | "token" | null;
   http_allowed: boolean;
 };
 type HttpCredentialAuth =
   | { kind: "user_password"; username: string; password: string }
-  | { kind: "api_key"; value: string; header: "bearer" | "x_api_key" };
+  | { kind: "api_key"; value: string; header: "bearer" | "x_api_key" | "token" };
 
 const httpCredentialsPath = "/api/config/http-credentials";
 

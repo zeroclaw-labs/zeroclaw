@@ -245,7 +245,7 @@ pub fn build_spec() -> serde_json::Value {
                                     "origin": {"type": "string"},
                                     "kind": {"type": "string"},
                                     "http_allowed": {"type": "boolean"},
-                                    "header": {"type": ["string", "null"], "enum": ["bearer", "x_api_key", null]}
+                                    "header": {"type": ["string", "null"], "enum": ["bearer", "x_api_key", "token", null]}
                                 }
                             }}
                         }
@@ -277,7 +277,7 @@ pub fn build_spec() -> serde_json::Value {
                                     "required": ["kind"],
                                     "properties": {
                                         "kind": {"type": "string", "enum": ["api_key", "user_password"]},
-                                        "header": {"type": "string", "enum": ["bearer", "x_api_key"]},
+                                        "header": {"type": "string", "enum": ["bearer", "x_api_key", "token"]},
                                         "username": {"type": "string", "writeOnly": true},
                                         "value": {"type": "string", "writeOnly": true},
                                         "password": {"type": "string", "writeOnly": true}

@@ -44,8 +44,9 @@ export default function HttpCredentials({ kind }: { kind: HttpCredentialKind }) 
     const name = editing === "new" ? String(data.get("name")) : editing.name;
     const origin = String(data.get("origin"));
     const secret = String(data.get("secret"));
+    const header = data.get("header");
     const auth = kind === "api_key"
-      ? { kind, value: secret, header: data.get("header") === "x_api_key" ? "x_api_key" : "bearer" } as const
+      ? { kind, value: secret, header: header === "x_api_key" || header === "token" ? header : "bearer" } as const
       : { kind, username: String(data.get("username")), password: secret } as const;
     form.reset();
     setEditing(null);
@@ -100,6 +101,7 @@ export default function HttpCredentials({ kind }: { kind: HttpCredentialKind }) 
               <select className={inputClass} name="header" defaultValue={editing === "new" ? "bearer" : editing.header ?? "bearer"}>
                 <option value="bearer">Authorization: Bearer</option>
                 <option value="x_api_key">X-API-Key</option>
+                <option value="token">Authorization: Token</option>
               </select>
             </label>
           )}
