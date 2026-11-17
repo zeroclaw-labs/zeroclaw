@@ -35,6 +35,7 @@
 use anyhow::{Context, Result, bail};
 use reqwest::Url;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 use std::time::Duration;
 use zeroclaw_config::schema::McpServerConfig;
 use zeroclaw_infra::net_guard::Nat64Prefix;
@@ -356,23 +357,31 @@ fn url_host_kind_literal(url: &Url) -> Option<()> {
 pub struct OAuthClientFactory {
     config: McpServerConfig,
     /// Operator-declared `security.nat64_prefixes`, threaded from the process
-    /// config at manager construction. Empty for embedders/tests without a
-    /// security section: the well-known `64:ff9b::/96` decoding still applies
-    /// in the shared guard, network-specific translators just stay opaque.
-    nat64_prefixes: Vec<Nat64Prefix>,
+    /// config at manager construction. SHARED (`Arc`) with the manager and
+    /// every other factory of that manager: the wiring swaps the contents in
+    /// place on a config reload (greptile C9), so an already-built factory
+    /// for an already-connected server enforces the CURRENT rules at the
+    /// next `client_for`, not the snapshot it was constructed with. Empty
+    /// for embedders/tests without a security section: the well-known
+    /// `64:ff9b::/96` decoding still applies in the shared guard,
+    /// network-specific translators just stay opaque.
+    nat64_prefixes: Arc<std::sync::Mutex<Vec<Nat64Prefix>>>,
 }
 
 impl OAuthClientFactory {
     pub fn new(config: &McpServerConfig) -> Self {
         Self {
             config: config.clone(),
-            nat64_prefixes: Vec::new(),
+            nat64_prefixes: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
 
-    /// The production constructor: same as [`Self::new`] plus the parsed
-    /// `security.nat64_prefixes` from the process [`zeroclaw_config::schema::Config`].
-    pub fn new_with_nat64(config: &McpServerConfig, nat64_prefixes: Vec<Nat64Prefix>) -> Self {
+    /// The production constructor: same as [`Self::new`] plus the shared,
+    /// live-updated `security.nat64_prefixes` from the process manager.
+    pub fn new_with_nat64(
+        config: &McpServerConfig,
+        nat64_prefixes: Arc<std::sync::Mutex<Vec<Nat64Prefix>>>,
+    ) -> Self {
         Self {
             config: config.clone(),
             nat64_prefixes,
@@ -404,7 +413,22 @@ impl OAuthClientFactory {
     /// requirement, not a micro-optimization.
     pub async fn client_for(&self, target: &Url) -> Result<reqwest::Client> {
         let trusted = self.trusted_origin()?;
-        build_oauth_http_client(&self.config, target, &trusted, &self.nat64_prefixes).await
+        // Short lock: clone the CURRENT rules (the manager may swap them
+        // concurrently on reload); never held across the await below.
+        let prefixes = self
+            .nat64_prefixes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        build_oauth_http_client(&self.config, target, &trusted, &prefixes).await
+    }
+
+    /// Short lock; poison-tolerant read of the shared, live-updated rules.
+    pub fn nat64_prefixes_snapshot(&self) -> Vec<Nat64Prefix> {
+        self.nat64_prefixes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     pub fn config(&self) -> &McpServerConfig {
