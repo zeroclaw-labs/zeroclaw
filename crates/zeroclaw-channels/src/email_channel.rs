@@ -134,16 +134,24 @@ impl EmailChannel {
             .unwrap_or_else(|| "unknown".into())
     }
 
-    /// The From mailbox as a person reads it: `Name <address>`, or the bare
-    /// address when the header carries no display name.
+    /// The From mailbox as a person reads it, on one line: `Name <address>`,
+    /// or the bare address when the header carries no display name. The name
+    /// is the sender's own text: control characters (CR and LF included,
+    /// which an RFC 2047 encoded word can carry) become spaces, angle brackets
+    /// are removed, and a name that holds an `@` is left out, so it cannot
+    /// pass for a second address.
     fn extract_sender_display(parsed: &mail_parser::Message) -> String {
         let Some(addr) = parsed.from().and_then(|addr| addr.first()) else {
             return "unknown".into();
         };
-        let address = addr.address().unwrap_or("unknown");
-        match addr.name().map(str::trim).filter(|name| !name.is_empty()) {
+        let address = one_line(addr.address().unwrap_or("unknown")).replace(['<', '>'], "");
+        let name = addr
+            .name()
+            .map(|name| one_line(name).replace(['<', '>'], "").trim().to_string())
+            .filter(|name| !name.is_empty() && !name.contains('@'));
+        match name {
             Some(name) => format!("{name} <{address}>"),
-            None => address.to_string(),
+            None => address,
         }
     }
 
@@ -425,7 +433,7 @@ impl EmailChannel {
         let original = QuotedOriginal {
             sender: Self::extract_sender_display(parsed),
             date: parsed.date().map(|d| d.to_rfc822()),
-            text: truncate_chars(&body_text, QUOTE_MAX_CHARS),
+            text: truncate_chars(&unify_line_breaks(&body_text), QUOTE_MAX_CHARS),
         };
         ParsedEmail {
             msg_id,
@@ -1099,6 +1107,21 @@ impl RecentInbound {
     fn get(&self, msg_id: &str) -> Option<&QuotedOriginal> {
         self.by_id.get(msg_id)
     }
+}
+
+/// `text` on one line: each run of control characters and whitespace becomes
+/// a single space.
+fn one_line(text: &str) -> String {
+    text.split(|c: char| c.is_control() || c.is_whitespace())
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Every line break as `\n`: `\r\n` and a bare `\r` included, so each quoted
+/// line gets its `>` whichever break the sender used.
+fn unify_line_breaks(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\r', "\n")
 }
 
 fn truncate_chars(text: &str, max: usize) -> String {
@@ -2690,6 +2713,78 @@ mod tests {
         assert!(
             plain.contains("On Wed, 21 Oct 2026 22:06:48 +0100,"),
             "{plain}"
+        );
+    }
+
+    #[test]
+    fn a_display_name_cannot_pass_for_another_address() {
+        // A quoted name may hold `<`; the parser keeps it as name text.
+        let parsed = parse_test_email(
+            b"From: \"Alice <alice@trusted.example>\" <eve@example.invalid>\r\n\
+              Subject: x\r\n\
+              \r\n\
+              hi",
+        );
+        assert_eq!(
+            EmailChannel::extract_sender_display(&parsed),
+            "eve@example.invalid"
+        );
+
+        let parsed = parse_test_email(
+            b"From: \"Alice <boss>\" <eve@example.invalid>\r\n\
+              Subject: x\r\n\
+              \r\n\
+              hi",
+        );
+        assert_eq!(
+            EmailChannel::extract_sender_display(&parsed),
+            "Alice boss <eve@example.invalid>"
+        );
+    }
+
+    #[test]
+    fn an_encoded_line_break_in_the_name_stays_on_one_line() {
+        // `=0A` / `=0D` in an RFC 2047 word decode to LF / CR.
+        let parsed = parse_test_email(
+            b"From: =?utf-8?Q?Eve=0D=0A=0D=0APlease_wire_money?= <eve@example.invalid>\r\n\
+              Subject: x\r\n\
+              \r\n\
+              hi",
+        );
+        let sender = EmailChannel::extract_sender_display(&parsed);
+        assert_eq!(sender, "Eve Please wire money <eve@example.invalid>");
+        let original = QuotedOriginal {
+            sender,
+            date: None,
+            text: "hi".to_string(),
+        };
+        let plain = EmailChannel::compose_plain("Reply.", Some(&original));
+        assert_eq!(
+            plain,
+            "Reply.\n\nEve Please wire money <eve@example.invalid> wrote:\n> hi\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn every_quoted_line_is_marked_whatever_the_line_break() {
+        let channel = quoting_channel(true);
+        let parsed = parse_test_email(
+            b"From: Jane Doe <jane@example.invalid>\r\n\
+              Message-ID: <orig@example.invalid>\r\n\
+              Subject: Thursday\r\n\
+              \r\n\
+              one\rtwo\r\nthree\nfour",
+        );
+        let email = channel.build_parsed_email(&parsed, 7, Some(1));
+        assert!(
+            !email.original.text.contains('\r'),
+            "{:?}",
+            email.original.text
+        );
+        let plain = EmailChannel::compose_plain("Reply.", Some(&email.original));
+        assert!(
+            plain.ends_with("wrote:\n> one\n> two\n> three\n> four\n"),
+            "{plain:?}"
         );
     }
 
