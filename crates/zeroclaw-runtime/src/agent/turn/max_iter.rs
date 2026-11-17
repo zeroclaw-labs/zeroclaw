@@ -96,6 +96,9 @@ pub(crate) async fn finish_after_max_iterations(
     reported_usage: Option<super::ReportedRequestUsage>,
     observer: &dyn crate::observability::Observer,
     vision_source: Option<super::VisionProviderSource<'_>>,
+    // The summary request leaves out older turns' tool rows, as every ordinary
+    // request does; it is prepared from that view, before and after each trim.
+    tool_context: super::ToolContextRetention<'_>,
 ) -> Result<String> {
     let exhaustion = limit.explanation();
     ::zeroclaw_log::record!(
@@ -191,7 +194,7 @@ pub(crate) async fn finish_after_max_iterations(
             // Exclude the synthetic prompt so trailing tool-result images
             // remain in the latest run and receive normal image validation.
             let mut messages = super::vision_route::prepare_messages_for_iteration(
-                history,
+                &tool_context.request_view(history, *crumb_present).messages,
                 multimodal_config,
                 degrade_strip_images,
                 image_cache.as_deref_mut(),
@@ -270,7 +273,7 @@ pub(crate) async fn finish_after_max_iterations(
                     }
                     dropped_turns += 1;
                     messages = super::vision_route::prepare_messages_for_iteration(
-                        history,
+                        &tool_context.request_view(history, *crumb_present).messages,
                         multimodal_config,
                         degrade_strip_images,
                         image_cache.as_deref_mut(),
@@ -698,6 +701,7 @@ mod graceful_summary_metering_tests {
             None,
             &crate::observability::NoopObserver,
             None,
+            crate::agent::turn::ToolContextRetention::keep_all(),
         )
         .await
     }
@@ -1066,6 +1070,7 @@ mod graceful_summary_metering_tests {
                 None,
                 &crate::observability::NoopObserver,
                 None,
+                crate::agent::turn::ToolContextRetention::keep_all(),
             )
             .await;
             assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -1216,6 +1221,7 @@ mod graceful_summary_metering_tests {
                 None,
                 &crate::observability::NoopObserver,
                 None,
+                crate::agent::turn::ToolContextRetention::keep_all(),
             )
             .await
             .expect("graceful summary succeeds");
@@ -1291,6 +1297,7 @@ mod graceful_summary_metering_tests {
                 None,
                 &crate::observability::NoopObserver,
                 None,
+                crate::agent::turn::ToolContextRetention::keep_all(),
             )
             .await
             .expect_err("summary prompt must be included in the floor decision");
@@ -1321,6 +1328,95 @@ mod graceful_summary_metering_tests {
             assert!(!retained.breadcrumb);
             assert_eq!(retained.retained_messages.len(), 2);
         }
+    }
+
+    // The summary request leaves out older turns' tool rows exactly as an
+    // ordinary request does, instead of resending output the collapse hid.
+    #[tokio::test]
+    async fn graceful_summary_sends_the_collapsed_view_of_older_turns() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = CapturingProvider {
+            seen: Arc::clone(&seen),
+            ..Default::default()
+        };
+        let mut history = Vec::new();
+        for n in 1..=4 {
+            history.push(ChatMessage::user(format!("request {n}")));
+            history.push(ChatMessage::assistant(format!(
+                r#"{{"tool_calls":[{{"id":"call_{n}","name":"shell","arguments":"{{}}"}}]}}"#
+            )));
+            history.push(ChatMessage::tool(format!(
+                r#"{{"tool_call_id":"call_{n}","content":"output of turn {n}"}}"#
+            )));
+            history.push(ChatMessage::assistant(format!("answer {n}")));
+        }
+        let working_history = history.clone();
+        let known = std::collections::HashSet::from(["shell".to_string()]);
+        let pacing = PacingConfig::default();
+        let knobs = LoopKnobs::default();
+        let multimodal_config = MultimodalConfig::default();
+
+        finish_after_max_iterations(
+            &mut None,
+            &provider,
+            &mut history,
+            "custom",
+            "test-model",
+            "test-model",
+            None,
+            &pacing,
+            None,
+            CompletionLimit::LocalIterations(2),
+            String::new(),
+            "trace-collapsed-summary",
+            &knobs,
+            None,
+            None,
+            None,
+            None,
+            &multimodal_config,
+            None,
+            None,
+            None,
+            None,
+            |_, _| ResolvedContextLimits::legacy_fallback(0),
+            &mut false,
+            None,
+            &crate::observability::NoopObserver,
+            None,
+            crate::agent::turn::ToolContextRetention {
+                keep_prior_turns: 1,
+                known_tools: &known,
+            },
+        )
+        .await
+        .expect("graceful summary should succeed");
+
+        let captured = seen.lock().unwrap().join("\n");
+        for n in [1, 2] {
+            assert!(
+                !captured.contains(&format!("output of turn {n}")),
+                "turn {n}'s collapsed tool output reached the summary request: {captured}"
+            );
+            assert!(captured.contains(&format!("answer {n}")), "{captured}");
+        }
+        for n in [3, 4] {
+            assert!(
+                captured.contains(&format!("output of turn {n}")),
+                "turn {n} is inside the retention window: {captured}"
+            );
+        }
+        assert_eq!(
+            history[..working_history.len()]
+                .iter()
+                .map(|m| m.content.as_str())
+                .collect::<Vec<_>>(),
+            working_history
+                .iter()
+                .map(|m| m.content.as_str())
+                .collect::<Vec<_>>(),
+            "the working history keeps every row"
+        );
     }
 
     // The summary request must drop declared audio attachments before dispatch,
@@ -1380,6 +1476,7 @@ mod graceful_summary_metering_tests {
             None,
             &crate::observability::NoopObserver,
             None,
+            crate::agent::turn::ToolContextRetention::keep_all(),
         )
         .await
         .expect("graceful summary should succeed");
@@ -1464,6 +1561,7 @@ mod graceful_summary_metering_tests {
             None,
             &crate::observability::NoopObserver,
             None,
+            crate::agent::turn::ToolContextRetention::keep_all(),
         )
         .await
         .expect("graceful summary should succeed");
@@ -1563,6 +1661,7 @@ mod graceful_summary_metering_tests {
             None,
             &crate::observability::NoopObserver,
             None,
+            crate::agent::turn::ToolContextRetention::keep_all(),
         )
         .await
         .expect("graceful summary should succeed");
@@ -1645,6 +1744,7 @@ mod graceful_summary_metering_tests {
             None,
             &crate::observability::NoopObserver,
             None,
+            crate::agent::turn::ToolContextRetention::keep_all(),
         )
         .await
         .expect("graceful summary should succeed");
@@ -1737,6 +1837,7 @@ mod graceful_summary_metering_tests {
             None,
             &crate::observability::NoopObserver,
             None,
+            crate::agent::turn::ToolContextRetention::keep_all(),
         )
         .await
         .expect("graceful summary should succeed");
@@ -1792,6 +1893,7 @@ mod graceful_summary_metering_tests {
             None,
             &crate::observability::NoopObserver,
             None,
+            crate::agent::turn::ToolContextRetention::keep_all(),
         )
         .await
         .expect("graceful summary should succeed");
@@ -1879,6 +1981,7 @@ mod graceful_summary_metering_tests {
             None,
             &crate::observability::NoopObserver,
             None,
+            crate::agent::turn::ToolContextRetention::keep_all(),
         )
         .await
         .expect("graceful summary should succeed");
@@ -1969,6 +2072,7 @@ mod graceful_summary_metering_tests {
             None,
             &crate::observability::NoopObserver,
             None,
+            crate::agent::turn::ToolContextRetention::keep_all(),
         )
         .await
         .expect("graceful summary should succeed");
