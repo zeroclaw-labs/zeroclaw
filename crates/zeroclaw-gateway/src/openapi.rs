@@ -225,6 +225,70 @@ pub fn build_spec() -> serde_json::Value {
         "404": error_responses["404"].clone(),
     });
 
+    let http_credentials = serde_json::json!({
+        "get": {
+            "tags": ["config"],
+            "summary": "List scoped credential metadata",
+            "responses": {
+                "200": {"description": "Credential aliases, origins, kinds, sources and grants. Secret values and references are omitted."},
+                "403": {"description": "Authenticated operator required"},
+                "503": {"description": "Credential catalog unavailable"}
+            }
+        },
+        "post": {
+            "tags": ["config"],
+            "summary": "Create, replace or remove a scoped credential or update its grant",
+            "description": "New aliases have no HTTP grant. Grant changes use a separate replace request with permissions.",
+            "requestBody": {
+                "required": true,
+                "content": {"application/json": {"schema": {
+                    "type": "object",
+                    "required": ["name", "operation"],
+                    "properties": {
+                        "name": {"type": "string"},
+                        "operation": {"type": "string", "enum": ["create", "replace", "delete"]},
+                        "credential": {
+                            "type": "object",
+                            "required": ["origin", "auth"],
+                            "properties": {
+                                "origin": {"type": "string"},
+                                "source": {"type": "string"},
+                                "auth": {
+                                    "type": "object",
+                                    "required": ["kind"],
+                                    "properties": {
+                                        "kind": {"type": "string", "enum": ["api_key", "user_password", "totp", "ssh_key"]},
+                                        "header": {"type": "string"},
+                                        "username": {"type": "string", "writeOnly": true},
+                                        "value": {"type": "string", "writeOnly": true},
+                                        "password": {"type": "string", "writeOnly": true},
+                                        "seed": {"type": "string", "writeOnly": true},
+                                        "private_key": {"type": "string", "writeOnly": true},
+                                        "destinations": {"type": "array", "items": {"type": "object"}}
+                                    }
+                                }
+                            }
+                        },
+                        "permissions": {
+                            "type": "object",
+                            "properties": {
+                                "http_allowed": {"type": "boolean"},
+                                "destinations": {"type": "array", "items": {"type": "object"}}
+                            }
+                        }
+                    }
+                }}}
+            },
+            "responses": {
+                "204": {"description": "Mutation saved"},
+                "400": {"description": "Invalid credential or grant"},
+                "403": {"description": "Authenticated operator required"},
+                "404": {"description": "Credential not found for grant update"},
+                "409": {"description": "Credential state conflicts with the operation"},
+                "412": {"description": "Initialized encryption required"}
+            }
+        }
+    });
     let paths = serde_json::json!({
         "/api/status": {
             "get": {
@@ -265,70 +329,7 @@ pub fn build_spec() -> serde_json::Value {
                 "responses": prop_get_responses,
             },
         },
-        "/api/config/http-credentials": {
-            "get": {
-                "tags": ["config"],
-                "summary": "List scoped credential metadata",
-                "responses": {
-                    "200": {"description": "Credential aliases, origins, kinds, sources and grants. Secret values and references are omitted."},
-                    "403": {"description": "Authenticated operator required"},
-                    "503": {"description": "Credential catalog unavailable"}
-                }
-            },
-            "post": {
-                "tags": ["config"],
-                "summary": "Create, replace or remove a scoped credential or update its grant",
-                "description": "New aliases have no HTTP grant. Grant changes use a separate replace request with permissions.",
-                "requestBody": {
-                    "required": true,
-                    "content": {"application/json": {"schema": {
-                        "type": "object",
-                        "required": ["name", "operation"],
-                        "properties": {
-                            "name": {"type": "string"},
-                            "operation": {"type": "string", "enum": ["create", "replace", "delete"]},
-                            "credential": {
-                                "type": "object",
-                                "required": ["origin", "auth"],
-                                "properties": {
-                                    "origin": {"type": "string"},
-                                    "source": {"type": "string"},
-                                    "auth": {
-                                        "type": "object",
-                                        "required": ["kind"],
-                                        "properties": {
-                                            "kind": {"type": "string", "enum": ["api_key", "user_password", "totp", "ssh_key"]},
-                                            "header": {"type": "string"},
-                                            "username": {"type": "string", "writeOnly": true},
-                                            "value": {"type": "string", "writeOnly": true},
-                                            "password": {"type": "string", "writeOnly": true},
-                                            "seed": {"type": "string", "writeOnly": true},
-                                            "private_key": {"type": "string", "writeOnly": true},
-                                            "destinations": {"type": "array", "items": {"type": "object"}}
-                                        }
-                                    }
-                                }
-                            },
-                            "permissions": {
-                                "type": "object",
-                                "properties": {
-                                    "http_allowed": {"type": "boolean"},
-                                    "destinations": {"type": "array", "items": {"type": "object"}}
-                                }
-                            }
-                        }
-                    }}}
-                },
-                "responses": {
-                    "204": {"description": "Mutation saved"},
-                    "400": {"description": "Invalid credential or grant"},
-                    "403": {"description": "Authenticated operator required"},
-                    "404": {"description": "Credential not found for grant update"},
-                    "409": {"description": "Credential state conflicts with the operation"},
-                    "412": {"description": "Initialized encryption required"}
-                }
-            }
-        },
+        "/api/config/http-credentials": http_credentials,
         "/api/config/plugin-tls-credentials": {
             "get": {
                 "tags": ["config"],
