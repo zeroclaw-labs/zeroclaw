@@ -68,8 +68,8 @@ export interface ChatMessage {
   toolCall?: ToolCallInfo;
   timestamp: Date;
   /** True for messages composed locally in the web UI (verbatim user input).
-   *  Such content never carries the gateway's `[timestamp]` prefix, so the
-   *  bubble must NOT run stripServerTimestamp on it — otherwise a user message
+   *  Such content never carries a server prefix, so the bubble must NOT run
+   *  the server-prefix stripping on it — otherwise a user message
    *  that happens to start with a bracketed datetime would be clipped. Only
    *  server-sourced messages (live stream + hydrated history) can be prefixed. */
   local?: boolean;

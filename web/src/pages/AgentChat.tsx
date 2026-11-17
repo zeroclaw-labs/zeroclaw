@@ -4,6 +4,7 @@ import { Send, Square, Bot, User, AlertCircle, Copy, Check, X, Trash2, Minimize2
 import ReactMarkdown, { type Components } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { useAgent, type ChatMessage } from '@/contexts/AgentContext';
+import { normalizeServerUserContent } from '@/contexts/chatHydration.logic';
 import { ApiError, uploadChatImage } from '@/lib/api';
 import { useDraft } from '@/hooks/useDraft';
 import { useAvailableAgents, useNavAccess } from '@/hooks/useNavAccess';
@@ -1066,6 +1067,20 @@ function stripServerTimestamp(content: string): string {
   return content.replace(SERVER_TIMESTAMP_RE, '');
 }
 
+// A server user turn from the agent path carries the runtime's
+// `[CURRENT DATE & TIME: …]` prefix instead (see chatHydration.logic). Strip
+// one prefix or the other, never both, so a bracketed datetime the user typed
+// at the start of their message survives. Locally composed input and command
+// output are verbatim and never stripped.
+function displayContent(msg: ChatMessage): string {
+  if (msg.local || msg.ephemeral) return msg.content;
+  if (msg.role === 'user') {
+    const unlabeled = normalizeServerUserContent(msg.content);
+    if (unlabeled !== msg.content) return unlabeled;
+  }
+  return stripServerTimestamp(msg.content);
+}
+
 // Each chat message is rendered through this memoized component so that
 // typing into the input does not re-render every existing message (and
 // re-run ReactMarkdown on each one). Keep the prop surface small and pass
@@ -1088,11 +1103,7 @@ const MessageItem = memo(function MessageItem({
   onCopy,
   onDelete,
 }: MessageItemProps) {
-  // Locally-composed user input and locally-generated command output are
-  // verbatim and never carry the gateway's `[timestamp]` prefix, so don't strip
-  // them (that would clip a message starting with a bracketed datetime). Only
-  // server-sourced messages can be prefixed.
-  const cleanContent = msg.local || msg.ephemeral ? msg.content : stripServerTimestamp(msg.content);
+  const cleanContent = displayContent(msg);
 
   return (
     <div
