@@ -724,28 +724,21 @@ pub fn snapshot_state(cfg: &Config) -> QuickstartState {
 /// the wire key so there's no parallel mapping.
 fn memory_kind_keys() -> Vec<String> {
     use zeroclaw_config::multi_agent::MemoryBackendKind as M;
-    [
-        M::Sqlite,
-        M::Markdown,
-        M::Postgres,
-        M::Qdrant,
-        M::Lucid,
-        M::None,
-    ]
-    .into_iter()
-    .map(|k| {
-        // Exhaustiveness guard: adding a new variant forces this match to fail
-        // to compile until the contributor decides whether the new backend
-        // belongs in the quickstart picker.
-        match k {
-            M::Sqlite | M::Markdown | M::Postgres | M::Qdrant | M::Lucid | M::None => (),
-        }
-        serde_json::to_value(k)
-            .ok()
-            .and_then(|v| v.as_str().map(str::to_string))
-            .unwrap_or_default()
-    })
-    .collect()
+    [M::Sqlite, M::Markdown, M::Postgres, M::Qdrant, M::None]
+        .into_iter()
+        .map(|k| {
+            // Exhaustiveness guard: adding a new variant forces this match to fail
+            // to compile until the contributor decides whether the new backend
+            // belongs in the quickstart picker.
+            match k {
+                M::Sqlite | M::Markdown | M::Postgres | M::Qdrant | M::None => (),
+            }
+            serde_json::to_value(k)
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_string))
+                .unwrap_or_default()
+        })
+        .collect()
 }
 
 fn build_channel_type_options(

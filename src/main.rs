@@ -169,6 +169,28 @@ fn migration_notice_text(notice: &crate::config::migration::MigrationNotice, pat
                 format!("warning: lowered config key `{key}` in {path} to its maximum: {reason}"),
             )
         }
+        MigrationNotice::Replaced {
+            path: key,
+            replacement,
+            reason,
+        } => {
+            let reason = match crate::config::migration::retired_value_reason_id(reason) {
+                Some(id) => t(id, reason),
+                None => reason.to_string(),
+            };
+            ta(
+                "cli-config-retired-value-replaced",
+                &[
+                    ("key", key),
+                    ("path", path),
+                    ("replacement", replacement),
+                    ("reason", &reason),
+                ],
+                format!(
+                    "warning: replaced the retired value of config key `{key}` in {path} with `{replacement}`: {reason}"
+                ),
+            )
+        }
     }
 }
 
@@ -1205,7 +1227,7 @@ enum Commands {
         #[arg(long, hide = true)]
         model: Option<String>,
 
-        /// Memory backend (sqlite, lucid, markdown, none).
+        /// Memory backend (sqlite, markdown, none).
         #[arg(long, hide = true)]
         memory: Option<String>,
 
@@ -2438,12 +2460,11 @@ async fn run_quickstart_cli(
                 }
             }
             QuickstartChecklistAction::Memory => {
-                let kinds: [MemoryChoice; 6] = [
+                let kinds: [MemoryChoice; 5] = [
                     MemoryChoice::Sqlite,
                     MemoryChoice::Markdown,
                     MemoryChoice::Postgres,
                     MemoryChoice::Qdrant,
-                    MemoryChoice::Lucid,
                     MemoryChoice::None,
                 ];
                 #[allow(clippy::no_effect_underscore_binding)]
@@ -2452,7 +2473,6 @@ async fn run_quickstart_cli(
                     | MemoryChoice::Markdown
                     | MemoryChoice::Postgres
                     | MemoryChoice::Qdrant
-                    | MemoryChoice::Lucid
                     | MemoryChoice::None => (),
                 };
                 let labels: Vec<String> = kinds
@@ -17756,11 +17776,18 @@ mod tests {
                 );
             }
         }
-        // Lowered values: each reason, and the notice line that carries it.
+        // Lowered and replaced values: each reason, and the notice line that
+        // carries it.
         let capped = crate::config::migration::CAPPED_KEYS
             .iter()
             .map(|key| key.reason_id)
-            .chain(["cli-config-capped-key-lowered"]);
+            .chain(["cli-config-capped-key-lowered"])
+            .chain(
+                crate::config::migration::RETIRED_VALUES
+                    .iter()
+                    .map(|value| value.reason_id),
+            )
+            .chain(["cli-config-retired-value-replaced"]);
         for id in capped {
             for (locale, cli_ftl) in locales {
                 let entry = format!("{id} = ");

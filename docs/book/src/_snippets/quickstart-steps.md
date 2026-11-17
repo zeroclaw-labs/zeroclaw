@@ -13,7 +13,7 @@ before the agent can be created; optional steps can be skipped.
 |---|---|---|
 | **Model provider** | yes | Provider family (Anthropic, OpenAI, Ollama, OpenRouter, …), its API key or endpoint, and the model. |
 | **Risk profile** | yes | Autonomy and sandbox posture. Pick a preset or reuse an existing `[risk_profiles.<alias>]`. |
-| **Memory** | yes | Memory backend (`sqlite`, `markdown`, `postgres`, `qdrant`, `lucid`, or `none`). |
+| **Memory** | yes | Memory backend (`sqlite`, `markdown`, `postgres`, `qdrant`, or `none`). |
 | **Channels** | optional | Chat platforms (Telegram, Discord, Slack, …). The built-in `cli` channel always works; add others here or later. |
 | **Peer groups** | optional | Multi-agent peer membership for the channels you configured. |
 | **Plugins** | optional | Tool plugins from the plugin registry, installed and configured when the agent is created. Only in builds with WASM plugin support (`plugins-wasm`), and only in the CLI Quickstart for now; see [Plugins](../getting-started/quickstart.md#plugins). |

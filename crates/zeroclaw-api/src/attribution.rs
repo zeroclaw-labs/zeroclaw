@@ -372,7 +372,6 @@ pub enum MemoryKind {
     AgentScoped,
     Qdrant,
     Postgres,
-    Lucid,
     None,
     Plugin,
 }

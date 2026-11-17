@@ -171,7 +171,7 @@ cli-memory-list-about = オプションのフィルター付きでメモリエ�
 cli-memory-get-about = キーで特定のメモリエントリを取得
 cli-memory-stats-about = メモリバックエンド統計とヘルスを表示
 cli-memory-clear-about = カテゴリ別、キー別、またはすべてをクリアしてメモリをクリア
-cli-memory-clear-unsupported-backend = memory clear は追記専用バックエンド '{$backend}' ではサポートされていません。削除可能なバックエンド（sqlite、lucid、またはpostgres）に切り替えてください
+cli-memory-clear-unsupported-backend = memory clear は追記専用バックエンド '{$backend}' ではサポートされていません。削除可能なバックエンド（sqliteまたはpostgres）に切り替えてください
 cli-estop-status-about = 現在の estop ステータスを表示
 cli-estop-resume-about = エンゲージされた estop レベルから再開
 cli-models-refresh-about = プロバイダーモデルをリフレッシュしてキャッシュ
@@ -191,7 +191,7 @@ cli-sop-list-about = ロードされた SOP を一覧表示
 cli-sop-validate-about = SOP 定義を検証
 cli-sop-show-about = SOP の詳細を表示
 cli-migrate-openclaw-about = OpenClaw ワークスペースからこの ZeroClaw ワークスペースにメモリをインポート
-cli-migrate-openclaw-qdrant-unsupported = Qdrant は現在、OpenClaw の移行先としてサポートされていません。memory.backend を sqlite、lucid、または markdown に設定して再試行してください。
+cli-migrate-openclaw-qdrant-unsupported = Qdrant は現在、OpenClaw の移行先としてサポートされていません。memory.backend を sqlite または markdown に設定して再試行してください。
 cli-agent-long-about =
     AI エージェントループを起動します。
 
@@ -962,6 +962,9 @@ cli-config-retired-reason-tts-default = グローバルな既定の TTS プロ�
 cli-config-retired-reason-global-transcription = グローバルな既定の文字起こしプロバイダーはありません。代わりに各 `[agents.<alias>]` に `transcription_provider` を設定してください
 cli-config-retired-reason-identity = アイデンティティはエージェントごとに設定します。`[agents.<alias>.identity]` に移動してください
 cli-config-retired-reason-pairing-max-pending = ゲートウェイが保持する保留中のペアリングコードは常に 1 つで、新しいコードを発行すると以前のコードは無効になります
+cli-config-retired-value-replaced = 警告: {$path} の設定キー `{$key}` の廃止された値を `{$replacement}` に置き換えました: {$reason}
+cli-config-retired-reason-lucid = Lucid メモリバックエンドは削除されました。そのメモリは `memory.backend = "sqlite"` が読み込む SQLite ストアにすでに保存されています
+cli-config-retired-reason-lucid-backend = Lucid メモリバックエンドは削除されました。Lucid はすべてのメモリを `sqlite` が読み込む SQLite ストアに保存していたため、メモリはすべて保持されます。表示されなくなるのは、外部の Lucid インデックスから得られていた想起結果だけです
 cli-config-migration-inferred-v3 = 警告: {$path} に `schema_version` がありませんが、セクションが V3 形式のため、スキーマ V3 として読み込み、そこから移行しました。`zeroclaw config migrate` を実行して、現在の `schema_version` をファイルに書き込んでください。
 cli-config-env-override-retired = 警告: `{$variable}` は廃止された設定キーを指定しているため無視しました: {$reason}
 cli-config-migration-pending = 警告: これらの変更はこの実行にのみ適用されます。{$path} に書き込むには `zeroclaw config migrate` を実行してください。
