@@ -65,6 +65,13 @@ warning records the reason and the candidate count without any memory text.
 Point it at a service you would also trust with the memories themselves, such
 as a local llama.cpp server started with `--reranking`.
 
+The endpoint goes through the shared network guard. A cloud metadata or
+link-local address is refused when the config is loaded and again on every
+call. A private, loopback or local host (`127.0.0.1`, `192.168.x.x`,
+`localhost`, a `.local` name) needs `allow_private_endpoint = true`. Each call
+resolves the host once, checks every address it returns, and sends only to
+those addresses, without a proxy and without following redirects.
+
 The provider request can therefore contain recalled memory without making the
 current turn a new memory. Review prompt-assembly changes by asking:
 

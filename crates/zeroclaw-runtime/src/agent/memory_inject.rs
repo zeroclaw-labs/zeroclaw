@@ -141,6 +141,7 @@ fn external_rerank_settings(
         model: external.model.trim().to_string(),
         timeout: std::time::Duration::from_millis(external.timeout_ms.max(1)),
         max_candidates: external.max_candidates.max(1),
+        allow_private_endpoint: external.allow_private_endpoint,
     })
 }
 
@@ -2174,6 +2175,7 @@ mod tests {
                     model: String::new(),
                     timeout: std::time::Duration::from_millis(300),
                     max_candidates: 16,
+                    allow_private_endpoint: true,
                 }),
                 ..Default::default()
             }
@@ -2357,6 +2359,7 @@ mod tests {
             memory.external_rerank.endpoint = " http://127.0.0.1:8098 ".into();
             memory.external_rerank.timeout_ms = 900;
             memory.external_rerank.max_candidates = 12;
+            memory.external_rerank.allow_private_endpoint = true;
 
             memory.rerank_strategy = "external".into();
             let off = MemoryInjectConfig::from_memory_config(&memory, 5);
@@ -2369,6 +2372,7 @@ mod tests {
             assert_eq!(external.endpoint, "http://127.0.0.1:8098");
             assert_eq!(external.timeout, std::time::Duration::from_millis(900));
             assert_eq!(external.max_candidates, 12);
+            assert!(external.allow_private_endpoint);
 
             memory.rerank_strategy = "mmr".into();
             let mmr = MemoryInjectConfig::from_memory_config(&memory, 5);

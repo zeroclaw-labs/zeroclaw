@@ -92,7 +92,6 @@ const SUPPORTED_PROXY_SERVICE_KEYS: &[&str] = &[
     "tool.pushover",
     "tool.web_search",
     "memory.embeddings",
-    "memory.rerank",
     "tunnel.custom",
     "transcription.groq",
     "transcription.openai",
@@ -12968,6 +12967,13 @@ pub struct MemoryExternalRerankConfig {
     /// by the recall limit times `candidate_multiplier`.
     #[serde(default = "default_external_rerank_max_candidates")]
     pub max_candidates: usize,
+    /// Allow an endpoint on a private, loopback or local host (`127.0.0.1`,
+    /// `192.168.x.x`, `localhost`, a `.local` name), such as a reranker on
+    /// this machine or the home network. Off by default: memory text then goes
+    /// only to globally routable addresses. Cloud metadata addresses are
+    /// refused either way.
+    #[serde(default)]
+    pub allow_private_endpoint: bool,
 }
 
 impl Default for MemoryExternalRerankConfig {
@@ -12977,6 +12983,7 @@ impl Default for MemoryExternalRerankConfig {
             model: String::new(),
             timeout_ms: default_external_rerank_timeout_ms(),
             max_candidates: default_external_rerank_max_candidates(),
+            allow_private_endpoint: false,
         }
     }
 }
@@ -13139,6 +13146,26 @@ fn validate_external_rerank_config(external: &MemoryExternalRerankConfig) -> Res
             "memory.external_rerank.endpoint must be an http or https URL with a host (got {endpoint})"
         );
     }
+    let host = match parsed.host() {
+        Some(url::Host::Ipv4(ip)) => {
+            validate_external_rerank_ip(ip.into(), endpoint)?;
+            ip.to_string()
+        }
+        Some(url::Host::Ipv6(ip)) => {
+            validate_external_rerank_ip(ip.into(), endpoint)?;
+            ip.to_string()
+        }
+        Some(url::Host::Domain(domain)) => domain.to_string(),
+        None => String::new(),
+    };
+    if zeroclaw_infra::net_guard::is_private_or_local_host(&host)
+        && !external.allow_private_endpoint
+    {
+        anyhow::bail!(
+            "memory.external_rerank.endpoint {endpoint} is a private or local host; set \
+             memory.external_rerank.allow_private_endpoint = true to send memory text to it"
+        );
+    }
     if !(1..=MAX_EXTERNAL_RERANK_TIMEOUT_MS).contains(&external.timeout_ms) {
         anyhow::bail!(
             "memory.external_rerank.timeout_ms must be in 1..={MAX_EXTERNAL_RERANK_TIMEOUT_MS} (got {})",
@@ -13149,6 +13176,18 @@ fn validate_external_rerank_config(external: &MemoryExternalRerankConfig) -> Res
         anyhow::bail!(
             "memory.external_rerank.max_candidates must be in 1..={MAX_EXTERNAL_RERANK_CANDIDATES} (got {})",
             external.max_candidates
+        );
+    }
+    Ok(())
+}
+
+/// Cloud metadata addresses, and the link-local range that holds them, are
+/// never a rerank endpoint, whatever `allow_private_endpoint` says.
+fn validate_external_rerank_ip(ip: std::net::IpAddr, endpoint: &str) -> Result<()> {
+    if zeroclaw_infra::net_guard::is_cloud_metadata_ip(ip) {
+        anyhow::bail!(
+            "memory.external_rerank.endpoint {endpoint} is a cloud metadata or link-local \
+             address, which is never allowed"
         );
     }
     Ok(())
@@ -30003,6 +30042,7 @@ mod tests {
         assert!(cfg.external_rerank.model.is_empty());
         assert_eq!(cfg.external_rerank.timeout_ms, 1_500);
         assert_eq!(cfg.external_rerank.max_candidates, 16);
+        assert!(!cfg.external_rerank.allow_private_endpoint);
 
         let def = super::MemoryConfig::default();
         assert_eq!(
@@ -30030,6 +30070,7 @@ endpoint = "http://127.0.0.1:8098"
 model = "bge-reranker-v2-m3"
 timeout_ms = 900
 max_candidates = 12
+allow_private_endpoint = true
 "#,
         )
         .unwrap();
@@ -30037,6 +30078,57 @@ max_candidates = 12
         assert_eq!(cfg.external_rerank.model, "bge-reranker-v2-m3");
         assert_eq!(cfg.external_rerank.timeout_ms, 900);
         assert_eq!(cfg.external_rerank.max_candidates, 12);
+        assert!(cfg.external_rerank.allow_private_endpoint);
+    }
+
+    #[::core::prelude::v1::test]
+    fn config_validate_guards_the_external_rerank_endpoint_host() {
+        let external = |endpoint: &str, allow_private: bool| {
+            let mut config = super::Config::default();
+            config.memory.rerank_enabled = true;
+            config.memory.rerank_strategy = "external".into();
+            config.memory.external_rerank.endpoint = endpoint.into();
+            config.memory.external_rerank.allow_private_endpoint = allow_private;
+            config.validate()
+        };
+
+        // A metadata or link-local literal is refused before any client is
+        // built, with or without the private opt-in.
+        for endpoint in [
+            "http://169.254.169.254/",
+            "http://169.254.169.254:8080/latest",
+            "http://169.254.10.20:8091",
+            "http://[fd00:ec2::254]/",
+            "http://100.100.100.200/",
+        ] {
+            for allow_private in [false, true] {
+                let err = external(endpoint, allow_private)
+                    .expect_err("a metadata endpoint must fail validation");
+                assert!(
+                    err.to_string().contains("never allowed"),
+                    "{endpoint} (allow_private {allow_private}): {err}"
+                );
+            }
+        }
+
+        // Private, loopback and local hosts need the opt-in.
+        for endpoint in [
+            "http://127.0.0.1:8098",
+            "http://[::1]:8098",
+            "http://localhost:8098",
+            "http://192.168.5.65:8091",
+            "http://reranker.local:8091",
+        ] {
+            let err = external(endpoint, false).expect_err("a private endpoint needs the opt-in");
+            assert!(
+                err.to_string()
+                    .contains("memory.external_rerank.allow_private_endpoint"),
+                "{endpoint}: {err}"
+            );
+            external(endpoint, true).expect("the opt-in admits a private endpoint");
+        }
+
+        external("https://rerank.example.com", false).expect("a public endpoint needs no opt-in");
     }
 
     #[::core::prelude::v1::test]
@@ -30048,6 +30140,7 @@ max_candidates = 12
             config.memory.external_rerank.endpoint = endpoint.into();
             config.memory.external_rerank.timeout_ms = timeout_ms;
             config.memory.external_rerank.max_candidates = max_candidates;
+            config.memory.external_rerank.allow_private_endpoint = true;
             config.validate()
         };
 

@@ -10,20 +10,25 @@
 //! The client only orders. [`ExternalRerankSettings::rerank_pool`] runs the
 //! whole external strategy over a recall pool and falls back to the local
 //! order on any failure; nothing here logs memory text.
+//!
+//! Every call resolves the endpoint's host, checks the answer with the shared
+//! network guard ([`zeroclaw_infra::net_guard::ResolvedDestination`]) and
+//! dials only the addresses that passed, with redirects off. Cloud metadata
+//! addresses are refused always; private and local ones only pass with
+//! `allow_private_endpoint`.
 
 use crate::rerank::{self, RerankConfig};
 use crate::traits::MemoryEntry;
 use std::collections::HashSet;
+use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
+use zeroclaw_infra::net_guard::{PrivateNetworkAccess, ResolvedDestination};
 
 /// Longest text sent for the query or for one candidate, in characters.
 pub const MAX_RERANK_TEXT_CHARS: usize = 1_500;
 
 /// Largest reply body accepted from the endpoint.
 const MAX_RESPONSE_BYTES: usize = 1 << 20;
-
-/// Proxy service key for the endpoint's HTTP client.
-pub const RERANK_PROXY_SERVICE_KEY: &str = "memory.rerank";
 
 /// Resolved settings for one rerank endpoint.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,10 +37,13 @@ pub struct ExternalRerankSettings {
     pub endpoint: String,
     /// Model name passed through in the request; empty omits it.
     pub model: String,
-    /// Whole-request timeout.
+    /// Whole-request timeout, name resolution included.
     pub timeout: Duration,
     /// Most candidates sent per call.
     pub max_candidates: usize,
+    /// Whether the endpoint may resolve to private, loopback or local
+    /// addresses. Cloud metadata addresses are refused either way.
+    pub allow_private_endpoint: bool,
 }
 
 /// Why a rerank call produced no usable order.
@@ -51,6 +59,8 @@ pub enum RerankFailure {
     Malformed,
     /// The reply named a candidate index out of range, or one twice.
     InvalidIndex,
+    /// The network guard refused the endpoint's address, so nothing was sent.
+    Refused,
 }
 
 impl RerankFailure {
@@ -63,6 +73,7 @@ impl RerankFailure {
             Self::Status(_) => "status",
             Self::Malformed => "malformed",
             Self::InvalidIndex => "invalid_index",
+            Self::Refused => "refused",
         }
     }
 }
@@ -186,10 +197,12 @@ impl ExternalRerankSettings {
             body["model"] = serde_json::Value::String(self.model.trim().to_string());
         }
 
-        let client = zeroclaw_config::schema::build_runtime_proxy_client(RERANK_PROXY_SERVICE_KEY);
+        let deadline = Instant::now() + self.timeout;
+        let url = reqwest::Url::parse(&self.rerank_url()).map_err(|_| RerankFailure::Refused)?;
+        let client = self.pinned_client(&url, deadline).await?;
         let mut response = client
-            .post(self.rerank_url())
-            .timeout(self.timeout)
+            .post(url)
+            .timeout(deadline.saturating_duration_since(Instant::now()))
             .json(&body)
             .send()
             .await
@@ -214,6 +227,48 @@ impl ExternalRerankSettings {
             bytes.extend_from_slice(&chunk);
         }
         parse_order(&bytes, documents.len())
+    }
+
+    /// A client that can reach only the endpoint's checked addresses: the
+    /// host is resolved once, the answer goes through the network guard, and
+    /// the client dials exactly those addresses, with no proxy (which would
+    /// resolve the host again) and no redirects.
+    async fn pinned_client(
+        &self,
+        url: &reqwest::Url,
+        deadline: Instant,
+    ) -> Result<reqwest::Client, RerankFailure> {
+        let host = url.host_str().ok_or(RerankFailure::Refused)?;
+        let port = url.port_or_known_default().ok_or(RerankFailure::Refused)?;
+        let bare_host = host.trim_start_matches('[').trim_end_matches(']');
+        let literal = bare_host.parse::<IpAddr>().ok();
+        let addresses: Vec<SocketAddr> = match literal {
+            Some(ip) => vec![SocketAddr::new(ip, port)],
+            None => tokio::time::timeout(
+                deadline.saturating_duration_since(Instant::now()),
+                tokio::net::lookup_host((bare_host, port)),
+            )
+            .await
+            .map_err(|_| RerankFailure::Timeout)?
+            .map_err(|_| RerankFailure::Transport)?
+            .collect(),
+        };
+        let access = if self.allow_private_endpoint {
+            PrivateNetworkAccess::Allow
+        } else {
+            PrivateNetworkAccess::Deny
+        };
+        // No network-specific NAT64 prefixes are passed: the well-known
+        // `64:ff9b::/96` form is still decoded.
+        let destination = ResolvedDestination::new(host, port, addresses, access, &[])
+            .map_err(|_| RerankFailure::Refused)?;
+        let mut builder = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none());
+        if literal.is_none() {
+            builder = builder.resolve_to_addrs(destination.host(), destination.addresses());
+        }
+        builder.build().map_err(|_| RerankFailure::Transport)
     }
 }
 
@@ -281,7 +336,64 @@ mod tests {
             model: String::new(),
             timeout: Duration::from_millis(500),
             max_candidates: 16,
+            // The mock servers below listen on loopback.
+            allow_private_endpoint: true,
         }
+    }
+
+    #[tokio::test]
+    async fn a_metadata_address_is_refused_before_anything_is_sent() {
+        for endpoint in [
+            "http://169.254.169.254",
+            "http://169.254.169.254:8080/latest",
+            "http://[fd00:ec2::254]",
+            "http://100.100.100.200",
+        ] {
+            // The private opt-in never reaches metadata addresses.
+            let result = settings(endpoint).rerank("query", &["one", "two"]).await;
+            assert_eq!(result, Err(RerankFailure::Refused), "{endpoint}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_private_address_needs_the_opt_in() {
+        // Port 1 on loopback has no listener: a request that got past the
+        // guard would fail as a transport error, not as refused.
+        for endpoint in ["http://127.0.0.1:1", "http://[::1]:1", "http://localhost:1"] {
+            let mut denied = settings(endpoint);
+            denied.allow_private_endpoint = false;
+            assert_eq!(
+                denied.rerank("query", &["one", "two"]).await,
+                Err(RerankFailure::Refused),
+                "{endpoint}"
+            );
+        }
+        assert_eq!(
+            settings("http://127.0.0.1:1")
+                .rerank("query", &["one", "two"])
+                .await,
+            Err(RerankFailure::Transport)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_redirect_is_not_followed() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 8192];
+            let _ = stream.read(&mut request);
+            let _ = stream.write_all(
+                b"HTTP/1.1 307 Temporary Redirect\r\nlocation: http://169.254.169.254/\r\ncontent-length: 0\r\n\r\n",
+            );
+        });
+        let result = settings(&format!("http://{address}"))
+            .rerank("query", &["one", "two"])
+            .await;
+        assert_eq!(result, Err(RerankFailure::Status(307)));
+        server.join().unwrap();
     }
 
     #[test]
@@ -420,5 +532,6 @@ mod tests {
         assert_eq!(RerankFailure::Timeout.reason(), "timeout");
         assert_eq!(RerankFailure::Status(503).reason(), "status");
         assert_eq!(RerankFailure::InvalidIndex.reason(), "invalid_index");
+        assert_eq!(RerankFailure::Refused.reason(), "refused");
     }
 }
