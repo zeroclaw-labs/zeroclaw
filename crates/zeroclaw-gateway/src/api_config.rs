@@ -1553,14 +1553,11 @@ pub async fn mutate_http_credential(
                         ScopedHttpAuth::UserPassword { .. } => "user_password",
                     });
             if let Some(mut credential) = record {
-                let Some(origin) = ScopedHttpCredential::https_origin(&credential.origin) else {
+                let Some(origin) =
+                    ScopedHttpCredential::configured_https_origin(&credential.origin)
+                else {
                     return StatusCode::BAD_REQUEST.into_response();
                 };
-                if !url::Url::parse(&credential.origin).is_ok_and(|url| {
-                    url.path() == "/" && url.query().is_none() && url.fragment().is_none()
-                }) {
-                    return StatusCode::BAD_REQUEST.into_response();
-                }
                 credential.origin = origin;
                 let valid = |value: &str| {
                     !value.trim().is_empty()
