@@ -1544,14 +1544,13 @@ pub async fn mutate_http_credential(
                 _ => return StatusCode::BAD_REQUEST.into_response(),
             };
             let prior = if record.is_none() { existing() } else { None };
-            let kind =
-                record
-                    .as_ref()
-                    .or(prior.as_ref())
-                    .map(|record| match &record.auth {
-                        ScopedHttpAuth::ApiKey { .. } => "api_key",
-                        ScopedHttpAuth::UserPassword { .. } => "user_password",
-                    });
+            let kind = record
+                .as_ref()
+                .or(prior.as_ref())
+                .map(|record| match &record.auth {
+                    ScopedHttpAuth::ApiKey { .. } => "api_key",
+                    ScopedHttpAuth::UserPassword { .. } => "user_password",
+                });
             if let Some(mut credential) = record {
                 let Some(origin) =
                     ScopedHttpCredential::configured_https_origin(&credential.origin)
