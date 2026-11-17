@@ -17925,15 +17925,20 @@ fn refuse_disabled_channel_instance(
     if !disabled {
         return Ok(());
     }
-    let message = format!("[channels.{table}.{alias}] is disabled; set enabled = true to deliver");
     ::zeroclaw_log::record!(
         ERROR,
         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
             .with_outcome(::zeroclaw_log::EventOutcome::Failure)
             .with_attrs(::serde_json::json!({"channel": format!("{table}.{alias}")})),
-        &message
+        &format!("[channels.{table}.{alias}] is disabled; set enabled = true to deliver")
     );
-    anyhow::bail!("{message}")
+    anyhow::bail!(
+        "{}",
+        channel_runtime_cli_string_with_args(
+            "cli-channels-delivery-disabled",
+            &[("table", table.as_str()), ("alias", alias)],
+        )
+    )
 }
 
 pub async fn deliver_announcement(
