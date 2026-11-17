@@ -287,5 +287,4 @@ tool-ssh-task-cleanup-status = Task SSH cleanup helper failed
 tool-native-ssh-arguments = Use a configured SSH destination and an explicit noninteractive command.
 tool-native-ssh-denied = Task SSH could not authorize or open the requested transport.
 tool-ssh-task-unsupported = The task SSH broker requires Linux.
-tool-native-ssh-credential = The SSH credential or destination grant is unavailable.
 tool-native-ssh-connection = The managed SSH connection could not be established.

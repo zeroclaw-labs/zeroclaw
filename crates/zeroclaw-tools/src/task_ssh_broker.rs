@@ -401,7 +401,7 @@ async fn serve_inner(
                         Err(error) => {
                             let key = error.chain()
                                 .map(|cause| cause.to_string())
-                                .find(|text| matches!(text.as_str(), "tool-native-ssh-credential" | "tool-native-ssh-connection"))
+                                .find(|text| matches!(text.as_str(), "tool-native-ssh-connection"))
                                 .unwrap_or_else(|| "tool-native-ssh-denied".into());
                             let _ = write(&mut stream, &Reply {path:None, error:Some(key)}).await;
                         }
@@ -429,12 +429,7 @@ async fn client(args: Vec<String>) -> Result<i32> {
     let error_key = reply
         .error
         .as_deref()
-        .filter(|key| {
-            matches!(
-                *key,
-                "tool-native-ssh-credential" | "tool-native-ssh-connection"
-            )
-        })
+        .filter(|key| matches!(*key, "tool-native-ssh-connection"))
         .unwrap_or("tool-native-ssh-denied");
     let path = reply.path.context(message(error_key))?;
     let status = Command::new(SSH)
@@ -482,14 +477,10 @@ pub fn run(args: Vec<String>) -> i32 {
         Ok(code) => code,
         Err(error) => {
             let display = error.to_string();
-            let allowed = [
-                "tool-native-ssh-credential",
-                "tool-native-ssh-connection",
-                "tool-native-ssh-arguments",
-            ]
-            .iter()
-            .map(|key| message(key))
-            .find(|text| *text == display);
+            let allowed = ["tool-native-ssh-connection", "tool-native-ssh-arguments"]
+                .iter()
+                .map(|key| message(key))
+                .find(|text| *text == display);
             eprintln!(
                 "{}",
                 allowed.unwrap_or_else(|| message("tool-native-ssh-denied"))
@@ -624,7 +615,7 @@ mod tests {
     }
 
     #[test]
-    fn signer_socket_path_is_removed_on_scope_exit() {
+    fn broker_socket_path_is_removed_on_scope_exit() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("agent");
         let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
