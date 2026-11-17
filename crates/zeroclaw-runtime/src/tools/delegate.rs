@@ -23362,10 +23362,37 @@ command = "rm independent-delegate-marker"
         target_ceiling_cents: u32,
         track_per_agent: bool,
     ) -> DelegateCostFixture {
+        use zeroclaw_config::schema::{CostConfig, RuntimeProfileConfig};
+
+        delegate_cost_fixture_with(
+            mock_uri,
+            CostConfig {
+                enabled: cost_tracking_enabled,
+                track_per_agent,
+                daily_limit_usd,
+                monthly_limit_usd: 10_000.0,
+                ..CostConfig::default()
+            },
+            RuntimeProfileConfig {
+                agentic: true,
+                max_tool_iterations: 5,
+                max_cost_per_day_cents: target_ceiling_cents,
+                ..RuntimeProfileConfig::default()
+            },
+        )
+        .await
+    }
+
+    /// `delegate_cost_fixture_opts` with the `[cost]` section and the shared
+    /// runtime profile given whole, so a test can leave either at its
+    /// schema defaults.
+    async fn delegate_cost_fixture_with(
+        mock_uri: String,
+        cost: zeroclaw_config::schema::CostConfig,
+        runtime_profile: zeroclaw_config::schema::RuntimeProfileConfig,
+    ) -> DelegateCostFixture {
         use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
-        use zeroclaw_config::schema::{
-            CostConfig, OllamaModelProviderConfig, RuntimeProfileConfig,
-        };
+        use zeroclaw_config::schema::OllamaModelProviderConfig;
 
         let tmp = TempDir::new().unwrap();
         let data_dir = tmp.path().join("data");
@@ -23375,13 +23402,7 @@ command = "rm independent-delegate-marker"
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         };
-        root_config.cost = CostConfig {
-            enabled: cost_tracking_enabled,
-            track_per_agent,
-            daily_limit_usd,
-            monthly_limit_usd: 10_000.0,
-            ..CostConfig::default()
-        };
+        root_config.cost = cost;
         root_config.providers.models.ollama.insert(
             "default".to_string(),
             OllamaModelProviderConfig {
@@ -23413,15 +23434,9 @@ command = "rm independent-delegate-marker"
                 ..RiskProfileConfig::default()
             },
         );
-        root_config.runtime_profiles.insert(
-            "delegate_cost_runtime".to_string(),
-            RuntimeProfileConfig {
-                agentic: true,
-                max_tool_iterations: 5,
-                max_cost_per_day_cents: target_ceiling_cents,
-                ..RuntimeProfileConfig::default()
-            },
-        );
+        root_config
+            .runtime_profiles
+            .insert("delegate_cost_runtime".to_string(), runtime_profile);
         let target_config = AliasedAgentConfig {
             model_provider: "ollama.default".into(),
             risk_profile: "delegate_cost_profile".into(),
@@ -23842,6 +23857,50 @@ command = "rm independent-delegate-marker"
             requests.load(std::sync::atomic::Ordering::SeqCst),
             0,
             "provider must not be reached once the ceiling is exceeded"
+        );
+    }
+
+    /// Caller and target on a runtime profile that leaves
+    /// `max_cost_per_day_cents` unwritten, `[cost]` with no limit written,
+    /// and a priced model: what a delegated run gets when nobody chose a
+    /// ceiling.
+    #[tokio::test]
+    async fn default_profile_delegate_with_priced_spend_past_five_dollars() {
+        use zeroclaw_config::schema::{CostConfig, RuntimeProfileConfig};
+
+        let (server, requests) = start_usage_chat_server(1).await;
+        let fixture = delegate_cost_fixture_with(
+            server.uri.clone(),
+            CostConfig::default(),
+            RuntimeProfileConfig {
+                agentic: true,
+                max_tool_iterations: 5,
+                ..RuntimeProfileConfig::default()
+            },
+        )
+        .await;
+        // $6.00 of the target's own priced spend today: above $5.00, below
+        // the $10.00 shared daily limit.
+        record_agent_seed_spend(&fixture, "target", 6.0);
+
+        let result = fixture
+            .tool
+            .execute(json!({"agent": "target", "prompt": "produce a status line"}))
+            .await
+            .expect("delegate execute returns a result");
+        assert!(
+            !result.success,
+            "the built-in 500-cent ceiling refuses the delegate: {result:?}"
+        );
+        let error = result.error.clone().unwrap_or_default();
+        assert!(
+            error.contains("Budget exceeded for agent `target`") && error.contains("$5.00"),
+            "the refusal names the built-in $5.00 ceiling: {error}"
+        );
+        assert_eq!(
+            requests.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the provider is not reached"
         );
     }
 

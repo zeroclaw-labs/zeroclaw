@@ -11704,6 +11704,27 @@ mod tests {
         ));
     }
 
+    /// A parent with no cost ceiling of its own (`0`) and a child that sets
+    /// one: the child is tighter than the parent, not looser.
+    #[test]
+    fn ensure_no_escalation_parent_without_cost_ceiling_child_with_one() {
+        let parent = SecurityPolicy {
+            max_cost_per_day_cents: 0,
+            ..parent_policy_for_escalation_tests()
+        };
+        let child = SecurityPolicy {
+            max_cost_per_day_cents: 500,
+            ..parent.clone()
+        };
+        let err = child
+            .ensure_no_escalation_beyond(&parent)
+            .expect_err("today the numeric check rejects 500 under 0");
+        assert!(matches!(
+            err,
+            EscalationViolation::MaxCostExceeded { child, parent } if child == 500 && parent == 0
+        ));
+    }
+
     #[test]
     fn ensure_no_escalation_rejects_higher_autonomy() {
         let parent = SecurityPolicy {

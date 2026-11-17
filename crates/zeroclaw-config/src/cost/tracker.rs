@@ -2033,6 +2033,40 @@ mod tests {
         assert!(matches!(check, BudgetCheck::Exceeded { .. }));
     }
 
+    /// A `[cost]` section with no limit written, once a model is priced:
+    /// what an operator who never chose a dollar limit gets.
+    #[test]
+    fn default_cost_config_with_priced_spend_past_ten_dollars() {
+        let tmp = TempDir::new().unwrap();
+        let tracker = CostTracker::new(CostConfig::default(), tmp.path()).unwrap();
+        // $10.50 of priced input recorded today.
+        tracker
+            .record_usage(TokenUsage::new(
+                "test/model",
+                1_000_000,
+                0,
+                0,
+                10.5,
+                0.0,
+                0.0,
+            ))
+            .unwrap();
+
+        let check = tracker.check_budget(0.0).unwrap();
+        assert!(
+            matches!(
+                check,
+                BudgetCheck::Exceeded {
+                    period: UsagePeriod::Day,
+                    limit_usd,
+                    agent_alias: None,
+                    ..
+                } if limit_usd == 10.0
+            ),
+            "the built-in $10.00 daily limit refuses the next call: {check:?}"
+        );
+    }
+
     #[test]
     fn summary_by_model_is_daily_scoped() {
         let tmp = TempDir::new().unwrap();
