@@ -285,3 +285,4 @@ tool-http-credential-host = A custom Host header is forbidden when using a scope
 tool-http-credential-alias = Credential alias must contain 1 to 64 ASCII letters, numbers, underscores, or hyphens.
 tool-http-credential-not-granted = HTTP Request is not authorized to use this credential
 tool-http-request-authenticated-response-truncated = [Truncated authenticated response omitted]
+tool-http-credential-exclusive = Choose credential or auth_secret, not both

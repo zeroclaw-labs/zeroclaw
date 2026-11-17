@@ -825,9 +825,9 @@ impl Tool for HttpRequestTool {
             None => None,
         };
         let credential_result = match (scoped, auth_secret) {
-            (Some(_), Some(_)) => Err(anyhow::Error::msg(
-                "Choose credential or auth_secret, not both",
-            )),
+            (Some(_), Some(_)) => Err(anyhow::Error::msg(scoped_credential_message(
+                "tool-http-credential-exclusive",
+            ))),
             (Some(name), None) => self.apply_scoped_credential(&mut request_headers, name, &target),
             (None, _) => self
                 .apply_auth_secret(&mut request_headers, auth_secret)
@@ -2524,6 +2524,23 @@ api_token = "Bearer from-secret"
         assert_eq!(parsed["authorization"], "Bearer secret");
         assert_eq!(parsed["x-api-key"], "my-key");
         assert_eq!(parsed["content-type"], "application/json");
+    }
+
+    #[test]
+    fn authenticated_json_body_preserves_large_integers() {
+        let body = r#"{"id":18446744073709551617,"nested":[-9223372036854775809,"fixture-key"]}"#;
+        let output = redact_response_body(
+            body.into(),
+            &|text| text.replace("fixture-key", "[REDACTED]"),
+            true,
+        );
+        assert!(output.contains("18446744073709551617"));
+        assert!(output.contains("-9223372036854775809"));
+        assert!(!output.contains("fixture-key"));
+        let value: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(value["id"].to_string(), "18446744073709551617");
+        assert_eq!(value["nested"][0].to_string(), "-9223372036854775809");
+        assert_eq!(value["nested"][1], "[REDACTED]");
     }
 
     #[test]
