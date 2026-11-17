@@ -15,6 +15,11 @@ pub enum TransportKind {
     Local,
     /// The remote WSS listener.
     Wss,
+    /// An in-memory duplex inside the daemon process (the supervised
+    /// gateway's seam). Same host, but no OS credential vouches for the
+    /// caller and the local compatibility path does not apply: every
+    /// in-process connection must present an explicit credential.
+    Inproc,
 }
 
 #[async_trait]

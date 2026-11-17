@@ -1,0 +1,21 @@
+[package]
+name = "zeroclaw-rpc-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Client for the ZeroClaw daemon RPC: dial the local socket or any byte stream, run the initialize handshake, multiplex requests, notifications and server-initiated requests, and reconnect with backoff, without linking the runtime."
+publish = true
+
+# Client-side protocol crate. It must never depend on `zeroclaw-runtime`: the
+# runtime is the server, and a client that links the server is not a client.
+[dependencies]
+serde = { version = "1.0", default-features = false, features = ["derive", "std"] }
+serde_json = { version = "1.0", default-features = false, features = ["std"] }
+tokio = { version = "1.50", default-features = false, features = ["io-util", "net", "sync", "time", "rt", "macros"] }
+zeroclaw-api = { workspace = true }
+zeroclaw-rpc-proto = { workspace = true }
+
+[dev-dependencies]
+tokio = { version = "1.50", features = ["rt-multi-thread", "macros", "io-util", "sync", "time"] }

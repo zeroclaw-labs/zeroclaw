@@ -2,6 +2,7 @@
 //! known NOT to cover (spec: the eight seams in the consolidation plan).
 
 use super::*;
+use crate::observability;
 use async_trait::async_trait;
 use std::collections::VecDeque;
 use std::ops::{Deref, DerefMut};
@@ -582,6 +583,7 @@ async fn safety_net_thinking_never_leaks_into_draft_or_chunks() {
         parent_agent_alias: None,
         served_route_sink: None,
         sop_reassembly: None,
+        capability_binding: None,
         exec: crate::agent::loop_::ResolvedAgentExecution::resolve(
             crate::agent::loop_::ResolvedModelAccess {
                 model_provider: &provider,
@@ -611,6 +613,7 @@ async fn safety_net_thinking_never_leaks_into_draft_or_chunks() {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 30_000,
+                keep_tool_context_turns: 2,
                 context_limits: zeroclaw_config::schema::ResolvedContextLimits {
                     model_context_window: 100_000,
                     context_token_budget: 100_000,
@@ -997,6 +1000,7 @@ async fn safety_net_task_locals_probe_per_entry_path() {
                 parent_agent_alias: None,
                 served_route_sink: None,
                 sop_reassembly: None,
+                capability_binding: None,
                 exec: crate::agent::loop_::ResolvedAgentExecution::resolve(
                     crate::agent::loop_::ResolvedModelAccess {
                         model_provider: &provider,
@@ -1026,6 +1030,7 @@ async fn safety_net_task_locals_probe_per_entry_path() {
                         strict_tool_parsing: false,
                         parallel_tools: false,
                         max_tool_result_chars: 30_000,
+                        keep_tool_context_turns: 2,
                         context_limits: zeroclaw_config::schema::ResolvedContextLimits {
                             model_context_window: 100_000,
                             context_token_budget: 100_000,
@@ -2812,6 +2817,7 @@ async fn safety_net_narration_reaches_both_draft_and_event_channels_once() {
     crate::agent::loop_::run_tool_call_loop(crate::agent::loop_::ToolLoop {
         parent_agent_alias: None,
         sop_reassembly: None,
+        capability_binding: None,
         exec: crate::agent::loop_::ResolvedAgentExecution::resolve(
             crate::agent::loop_::ResolvedModelAccess {
                 model_provider: &provider,
@@ -2841,6 +2847,7 @@ async fn safety_net_narration_reaches_both_draft_and_event_channels_once() {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 30_000,
+                keep_tool_context_turns: 2,
                 context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0),
                 context_limits_resolver: None,
                 knobs: &crate::agent::loop_::LoopKnobs::default(),
@@ -4013,6 +4020,7 @@ async fn poisoned_model_switch_callback_still_raises_model_switch_requested() {
     let result = run_tool_call_loop(ToolLoop {
         parent_agent_alias: None,
         sop_reassembly: None,
+        capability_binding: None,
         exec: ResolvedAgentExecution::resolve(
             ResolvedModelAccess {
                 model_provider: &provider,
@@ -4042,6 +4050,7 @@ async fn poisoned_model_switch_callback_still_raises_model_switch_requested() {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 30_000,
+                keep_tool_context_turns: 2,
                 context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(
                     100_000,
                 ),

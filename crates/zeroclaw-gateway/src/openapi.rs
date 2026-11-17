@@ -386,7 +386,7 @@ pub fn build_spec() -> serde_json::Value {
             "post": {
                 "tags": ["config"],
                 "summary": "Apply on-disk schema migration in place",
-                "description": "Mirrors `zeroclaw config migrate`. Backs up the previous file as `config.toml.bak` before writing.",
+                "description": "Mirrors `zeroclaw config migrate`. Backs up the previous file as `config.toml.bak` before writing, and keeps the pre-upgrade original once per schema version as `config.toml.v<N>.backup`. Returns the migration notices.",
                 "responses": {
                     "200": {
                         "description": "Migration applied (or already at the current schema version).",
