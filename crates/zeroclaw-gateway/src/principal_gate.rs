@@ -1262,6 +1262,74 @@ mod tests {
     const SCOPED: (Option<&str>, Option<&str>) = (Some("opaque-token"), Some("oidc.test"));
     const OPERATOR: (Option<&str>, Option<&str>) = (Some("zc_paired"), None);
 
+    #[tokio::test]
+    async fn http_credential_api_is_operator_only_and_defaults_to_denied() {
+        let tmp = tempfile::tempdir().unwrap();
+        let idp = introspection_idp(&["ops"]).await;
+        let mut config = editor_config(
+            &tmp,
+            &idp.uri(),
+            &[Verb::Read, Verb::Create, Verb::Update, Verb::Delete],
+            &["*"],
+        );
+        config.secrets.encrypt = true;
+        zeroclaw_config::secrets::SecretStore::new(tmp.path(), true)
+            .encrypt("initialize-fixture-key")
+            .unwrap();
+        let router = router_for(config);
+        let url = "/api/config/http-credentials";
+        let create = serde_json::json!({
+            "name": "TEST_HTTP",
+            "operation": "create",
+            "credential": {
+                "origin": "https://example.com",
+                "http_allowed": true,
+                "auth": { "kind": "api_key", "value": "synthetic-credential", "header": "bearer" }
+            }
+        });
+
+        assert_eq!(
+            send(&router, "GET", url, SCOPED.0, SCOPED.1, None).await.0,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            send(&router, "POST", url, SCOPED.0, SCOPED.1, Some(create.clone()))
+                .await
+                .0,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            send(&router, "POST", url, OPERATOR.0, OPERATOR.1, Some(create))
+                .await
+                .0,
+            StatusCode::NO_CONTENT
+        );
+        let (status, body) = send(&router, "GET", url, OPERATOR.0, OPERATOR.1, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["credentials"][0]["http_allowed"], false);
+        assert!(!body.to_string().contains("synthetic-credential"));
+        let disk = std::fs::read_to_string(tmp.path().join("config.toml")).unwrap();
+        assert!(disk.contains("enc2:"));
+        assert!(!disk.contains("synthetic-credential"));
+
+        for allowed in [true, false] {
+            let update = serde_json::json!({
+                "name": "TEST_HTTP",
+                "operation": "replace",
+                "permissions": { "http_allowed": allowed }
+            });
+            assert_eq!(
+                send(&router, "POST", url, OPERATOR.0, OPERATOR.1, Some(update))
+                    .await
+                    .0,
+                StatusCode::NO_CONTENT
+            );
+            let (status, body) = send(&router, "GET", url, OPERATOR.0, OPERATOR.1, None).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body["credentials"][0]["http_allowed"], allowed);
+        }
+    }
+
     #[cfg(feature = "plugins-wasm")]
     #[tokio::test]
     async fn plugin_tls_credential_api_is_operator_only_and_write_only() {

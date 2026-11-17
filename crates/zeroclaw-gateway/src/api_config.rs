@@ -1529,6 +1529,7 @@ pub async fn mutate_http_credential(
                 _ => return StatusCode::CONFLICT.into_response(),
             };
             if let Some(mut credential) = mutation.credential {
+                credential.http_allowed = false;
                 if let Some(previous) = credentials.get(&mutation.name) {
                     let store = SecretStore::new(dir, true);
                     let decoded = if previous.starts_with("enc2:") {

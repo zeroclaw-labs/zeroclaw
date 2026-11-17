@@ -9056,7 +9056,7 @@ pub struct HttpRequestConfig {
 #[serde(deny_unknown_fields)]
 pub struct ScopedHttpCredential {
     pub origin: String,
-    #[serde(default = "default_true")]
+    #[serde(default)]
     pub http_allowed: bool,
     #[serde(default)]
     pub source: ScopedCredentialSource,
