@@ -92,6 +92,21 @@ class BoundedLog:
             self.data.clear()
 
 
+def supervise_master(parent_pid, command):
+    # Run as the dedicated session leader. OpenSSH and its proxy inherit
+    # this group, so helper death cannot leave the proxy running alone.
+    def stop_group(_signum=None, _frame=None):
+        os.killpg(os.getpgrp(), signal.SIGKILL)
+
+    signal.signal(signal.SIGTERM, stop_group)
+    if os.getppid() != parent_pid:
+        return 255
+    try:
+        return subprocess.call(command)
+    finally:
+        stop_group()
+
+
 class Pool:
     def __init__(self, directory, idle=IDLE_SECONDS, ssh=SSH, clock=time.monotonic):
         self.directory, self.idle, self.ssh, self.clock = directory, idle, ssh, clock
@@ -110,7 +125,10 @@ class Pool:
             owner = entry is None
             if owner:
                 path = str(self.directory / key)
-                command = ['/usr/bin/setpriv', '--pdeathsig', 'TERM', self.ssh, '-M', '-N', '-S', path,
+                command = ['/usr/bin/setpriv', '--pdeathsig', 'TERM', sys.executable,
+                           '-c', 'import runpy, sys; '
+                           'runpy.run_path(sys.argv[1])["supervise_master"](int(sys.argv[2]), sys.argv[3:])',
+                           str(pathlib.Path(__file__).resolve()), str(os.getpid()), self.ssh, '-M', '-N', '-S', path,
                            '-o', 'ControlMaster=yes', '-o', 'ControlPersist=no', '-o', 'ForkAfterAuthentication=no',
                            '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=12',
                            '-o', 'ConnectionAttempts=1', '-o', 'ForwardAgent=no',
