@@ -153,9 +153,12 @@ The following built-in capabilities are available when compiled and selected, wh
 
 To use [Parallel Unified MCP](https://docs.parallel.ai/integrations/mcp) for
 `web_search_tool`, set `search_provider = "parallel"` under `[web_search]`
-in `config.toml`. Searches send the query to Parallel and return source links
-and excerpts. Anonymous access is rate limited and requires no API key or MCP
-bundle. The built-in tool calls only `web_search`.
+in `config.toml`. ZeroClaw sends queries to Parallel's keyless MCP endpoint,
+where they may be retained and used to train Parallel's models under its
+[Customer Terms](https://parallel.ai/customer-terms) and
+[Privacy Policy](https://parallel.ai/privacy-policy). Searches return source
+links and excerpts. Anonymous access is rate limited and requires no API key or
+MCP bundle. The built-in tool calls only `web_search`.
 
 ### AnySearch provider
 
