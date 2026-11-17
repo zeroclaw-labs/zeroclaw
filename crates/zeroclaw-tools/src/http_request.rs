@@ -56,39 +56,50 @@ fn redact_response_body(
     redact: &impl Fn(&str) -> String,
     contains_credentials: bool,
 ) -> String {
-    fn redact_json(value: &mut serde_json::Value, redact: &impl Fn(&str) -> String) {
-        match value {
-            serde_json::Value::String(text) => *text = redact(text),
-            serde_json::Value::Array(items) => {
-                for item in items {
-                    redact_json(item, redact);
+    if !contains_credentials {
+        return redact(&body);
+    }
+
+    // Decode only JSON string tokens. Rebuilding a whole Value would round
+    // large numbers and enabling arbitrary_precision affects other consumers.
+    let bytes = body.as_bytes();
+    let mut output = String::with_capacity(body.len());
+    let mut start = 0;
+    let mut cursor = 0;
+    while cursor < bytes.len() {
+        if bytes[cursor] != b'"' {
+            cursor += 1;
+            continue;
+        }
+        output.push_str(&redact(&body[start..cursor]));
+        let token_start = cursor;
+        cursor += 1;
+        while cursor < bytes.len() {
+            match bytes[cursor] {
+                b'\\' => cursor = (cursor + 2).min(bytes.len()),
+                b'"' => {
+                    cursor += 1;
+                    break;
                 }
-            }
-            serde_json::Value::Object(fields) => {
-                *fields = std::mem::take(fields)
-                    .into_iter()
-                    .map(|(name, mut item)| {
-                        redact_json(&mut item, redact);
-                        (redact(&name), item)
-                    })
-                    .collect();
-            }
-            scalar => {
-                let original = scalar.to_string();
-                let redacted = redact(&original);
-                if redacted != original {
-                    *scalar = serde_json::Value::String(redacted);
-                }
+                _ => cursor += 1,
             }
         }
+        let token = &body[token_start..cursor];
+        if let Ok(decoded) = serde_json::from_str::<String>(token) {
+            let redacted = redact(&decoded);
+            if redacted == decoded {
+                output.push_str(token);
+            } else {
+                // Serializing a String cannot fail.
+                output.push_str(&serde_json::to_string(&redacted).expect("JSON string"));
+            }
+        } else {
+            output.push_str(&redact(token));
+        }
+        start = cursor;
     }
-
-    if contains_credentials && let Ok(mut parsed) = serde_json::from_str(&body) {
-        redact_json(&mut parsed, redact);
-        return parsed.to_string();
-    }
-
-    redact(&body)
+    output.push_str(&redact(&body[start..]));
+    output
 }
 
 impl HttpRequestTool {
@@ -2670,8 +2681,6 @@ api_token = "Bearer from-secret"
         assert!(output.contains("-9223372036854775809"));
         assert!(!output.contains("fixture-key"));
         let value: serde_json::Value = serde_json::from_str(&output).unwrap();
-        assert_eq!(value["id"].to_string(), "18446744073709551617");
-        assert_eq!(value["nested"][0].to_string(), "-9223372036854775809");
         assert_eq!(value["nested"][1], "[REDACTED]");
     }
 
