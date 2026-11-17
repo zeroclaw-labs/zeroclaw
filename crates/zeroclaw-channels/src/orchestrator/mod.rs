@@ -14041,6 +14041,11 @@ pub async fn send_channel_message(
     // Wrap into a private one-shot storage for the builder; the snapshot
     // is dropped immediately after send and never enters a supervised
     // publication domain.
+    // A bare id names the instance the one-shot builder uses, `default`.
+    let (channel_type, alias) = channel_id
+        .split_once('.')
+        .unwrap_or((channel_id, "default"));
+    refuse_disabled_channel_instance(config, &channel_type.to_ascii_lowercase(), alias)?;
     let config_arc = zeroclaw_config::live::LiveConfig::new(config.clone()).handle();
     // The builder gets first refusal so families it already resolves natively
     // (notably `linq.<alias>`) keep their established route and their own
@@ -17895,6 +17900,42 @@ pub async fn start_channels_with_authority_and_plugin_webhooks(
     Ok(())
 }
 
+/// Refuse an outbound send through a channel instance whose config block
+/// says `enabled = false`. The listener collector skips such an instance, but
+/// cron announcements and one-off sends build a transport from config without
+/// a live instance, so the switch is honoured here, once for every channel
+/// type. An instance with no config block passes, and is left to the
+/// caller's own "not configured" error.
+fn refuse_disabled_channel_instance(
+    config: &Config,
+    channel_type: &str,
+    alias: &str,
+) -> anyhow::Result<()> {
+    // The `[channels.<table>]` a delivery name reads: Feishu is configured
+    // under Lark, and the WhatsApp spellings under `whatsapp`.
+    let table = match channel_type {
+        "feishu" => "lark",
+        "whatsapp-web" | "whatsapp_web" => "whatsapp",
+        other => other,
+    }
+    .replace('-', "_");
+    let disabled = config.channels_by_alias().iter().any(|info| {
+        info.channel_type.replace('-', "_") == table && info.alias == alias && !info.enabled
+    });
+    if !disabled {
+        return Ok(());
+    }
+    let message = format!("[channels.{table}.{alias}] is disabled; set enabled = true to deliver");
+    ::zeroclaw_log::record!(
+        ERROR,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+            .with_attrs(::serde_json::json!({"channel": format!("{table}.{alias}")})),
+        &message
+    );
+    anyhow::bail!("{message}")
+}
+
 pub async fn deliver_announcement(
     config: &zeroclaw_config::schema::Config,
     channel: &str,
@@ -17933,6 +17974,7 @@ pub async fn deliver_announcement(
         ))
     })?;
     let channel_type = raw_type.to_ascii_lowercase();
+    refuse_disabled_channel_instance(config, &channel_type, alias)?;
     #[allow(unused_variables)]
     let not_configured = || {
         ::zeroclaw_log::record!(
@@ -18074,21 +18116,6 @@ pub async fn deliver_announcement(
         #[cfg(feature = "channel-qq")]
         "qq" => {
             let qq = config.channels.qq.get(alias).ok_or_else(not_configured)?;
-            // The listener collector skips a disabled alias, but cron and
-            // one-off delivery reach this arm without a live instance, so the
-            // off switch has to be honored here before the transport is built.
-            if !qq.enabled {
-                let message =
-                    format!("[channels.qq.{alias}] is disabled; set enabled = true to deliver");
-                ::zeroclaw_log::record!(
-                    ERROR,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({"channel": format!("qq.{alias}")})),
-                    &message
-                );
-                anyhow::bail!("{message}");
-            }
             let peers = config.channel_external_peers("qq", alias);
             let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> =
                 Arc::new(move || peers.clone());
@@ -57703,6 +57730,140 @@ Done."#;
             !msg.contains("unsupported delivery channel"),
             "disabled alias must reach the QQ arm; got: {msg}"
         );
+    }
+
+    /// A config whose email, Telegram and webhook `work` instances are set
+    /// up but switched off. Every endpoint is a refused loopback port, so a
+    /// regressed guard fails the send instead of reaching a real service.
+    fn config_with_disabled_work_instances(enabled: bool) -> zeroclaw_config::schema::Config {
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.channels.email.insert(
+            "work".to_string(),
+            zeroclaw_config::scattered_types::EmailConfig {
+                enabled,
+                smtp_host: Some("127.0.0.1".to_string()),
+                smtp_port: 1,
+                smtp_tls: false,
+                from_address: Some("bot@example.invalid".to_string()),
+                ..Default::default()
+            },
+        );
+        config.channels.telegram.insert(
+            "work".to_string(),
+            zeroclaw_config::schema::TelegramConfig {
+                enabled,
+                bot_token: "123:test".to_string(),
+                api_base_url: "http://127.0.0.1:1".to_string(),
+                ..Default::default()
+            },
+        );
+        config.channels.webhook.insert(
+            "work".to_string(),
+            zeroclaw_config::schema::WebhookConfig {
+                enabled,
+                send_url: Some("http://127.0.0.1:1/out".to_string()),
+                max_retries: Some(0),
+                ..Default::default()
+            },
+        );
+        config
+    }
+
+    #[tokio::test]
+    async fn deliver_announcement_rejects_a_disabled_instance_of_every_type() {
+        let config = config_with_disabled_work_instances(false);
+        for (channel, table) in [
+            ("email.work", "[channels.email.work]"),
+            ("telegram.work", "[channels.telegram.work]"),
+            ("webhook.work", "[channels.webhook.work]"),
+        ] {
+            let err = deliver_announcement(&config, channel, "someone@example.invalid", None, "hi")
+                .await
+                .expect_err("a disabled instance must not be delivered to");
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains(&format!(
+                    "{table} is disabled; set enabled = true to deliver"
+                )),
+                "{channel}: {msg}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn deliver_announcement_still_sends_through_an_enabled_instance() {
+        let config = config_with_disabled_work_instances(true);
+        for channel in ["email.work", "telegram.work", "webhook.work"] {
+            // The refused loopback port fails the send itself; what matters
+            // is that the off-switch refusal is not what stopped it.
+            let msg =
+                match deliver_announcement(&config, channel, "someone@example.invalid", None, "hi")
+                    .await
+                {
+                    Ok(()) => String::new(),
+                    Err(err) => format!("{err:#}"),
+                };
+            assert!(!msg.contains("is disabled"), "{channel}: {msg}");
+        }
+    }
+
+    #[test]
+    fn the_off_switch_is_read_from_the_table_a_delivery_name_uses() {
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.channels.lark.insert(
+            "work".to_string(),
+            zeroclaw_config::schema::LarkConfig {
+                enabled: false,
+                ..Default::default()
+            },
+        );
+        config.channels.whatsapp.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::WhatsAppConfig {
+                enabled: false,
+                ..Default::default()
+            },
+        );
+        for (channel_type, alias, table) in [
+            ("lark", "work", "[channels.lark.work]"),
+            ("feishu", "work", "[channels.lark.work]"),
+            ("whatsapp", "default", "[channels.whatsapp.default]"),
+            ("whatsapp-web", "default", "[channels.whatsapp.default]"),
+            ("whatsapp_web", "default", "[channels.whatsapp.default]"),
+        ] {
+            let err = refuse_disabled_channel_instance(&config, channel_type, alias)
+                .expect_err("a disabled instance is refused");
+            assert!(
+                err.to_string().contains(&format!("{table} is disabled")),
+                "{channel_type}.{alias}: {err}"
+            );
+        }
+        // No config block: left to the arm's own "not configured" error.
+        refuse_disabled_channel_instance(&config, "telegram", "work")
+            .expect("an unconfigured instance is not refused here");
+    }
+
+    #[tokio::test]
+    async fn a_one_off_send_by_bare_id_honours_the_default_instance_switch() {
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.channels.telegram.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::TelegramConfig {
+                enabled: false,
+                bot_token: "123:test".to_string(),
+                api_base_url: "http://127.0.0.1:1".to_string(),
+                ..Default::default()
+            },
+        );
+        for channel_id in ["telegram", "telegram.default"] {
+            let err = send_channel_message(&config, channel_id, "12345", "hi")
+                .await
+                .expect_err("a disabled instance must not be sent to");
+            assert!(
+                format!("{err:#}").contains("[channels.telegram.default] is disabled"),
+                "{channel_id}: {err:#}"
+            );
+        }
     }
 
     #[tokio::test]
