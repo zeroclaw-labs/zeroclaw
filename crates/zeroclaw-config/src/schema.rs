@@ -9093,6 +9093,14 @@ impl ScopedHttpCredential {
         Some(url.origin().ascii_serialization())
     }
 
+    pub fn configured_https_origin(raw: &str) -> Option<String> {
+        let url = url::Url::parse(raw).ok()?;
+        if url.path() != "/" || url.query().is_some() || url.fragment().is_some() {
+            return None;
+        }
+        Self::https_origin(raw)
+    }
+
     pub fn valid_name(name: &str) -> bool {
         (1..=64).contains(&name.len())
             && name
