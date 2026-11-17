@@ -73,7 +73,13 @@ fn redact_response_body(
                     })
                     .collect();
             }
-            _ => {}
+            scalar => {
+                let original = scalar.to_string();
+                let redacted = redact(&original);
+                if redacted != original {
+                    *scalar = serde_json::Value::String(redacted);
+                }
+            }
         }
     }
 
