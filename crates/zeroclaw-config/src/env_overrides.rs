@@ -754,6 +754,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn openai_stt_environment_does_not_enable_an_absent_provider() {
+        let _guard = super::env_test_lock().await;
+        let env = EnvSnapshot::clear(&[
+            "TRANSCRIPTION_API_KEY",
+            "OPENAI_API_KEY",
+            "ZEROCLAW_transcription__openai__api_key",
+        ]);
+        env.set("TRANSCRIPTION_API_KEY", "transcription-key");
+        env.set("OPENAI_API_KEY", "openai-key");
+
+        let mut config = Config::default();
+        let applied = apply_env_overrides(&mut config).expect("apply succeeds");
+
+        assert!(
+            config.transcription.openai.is_none(),
+            "ecosystem aliases must not enable a provider that was not configured",
+        );
+        assert!(
+            !applied.paths.contains(OPENAI_STT_API_KEY_PATH),
+            "an unused environment alias must not be reported as an applied override",
+        );
+    }
+
+    #[tokio::test]
     async fn openai_stt_environment_bridge_uses_config_precedence_and_fills_existing_table() {
         let _guard = super::env_test_lock().await;
         let env = EnvSnapshot::clear(&[
