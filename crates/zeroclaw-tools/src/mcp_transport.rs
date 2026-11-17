@@ -1365,10 +1365,12 @@ impl SharedMcpTransportConn for HttpTransport {
                     oauth_bearer = Some(oauth.on_unauthorized(challenge.as_deref(), &used).await?);
                     continue 'oauth;
                 }
-                // Not safe to replay (or already retried once): refresh
-                // the grant for FUTURE calls, surface this error to the
-                // caller. Two consecutive 401s are terminal.
-                if let Err(err) = oauth.on_unauthorized(challenge.as_deref(), &used).await {
+                // Not safe to replay: refresh the grant for FUTURE calls
+                // and surface this error to the caller. Two consecutive
+                // 401s are terminal.
+                if !oauth_retried
+                    && let Err(err) = oauth.on_unauthorized(challenge.as_deref(), &used).await
+                {
                     ::zeroclaw_log::record!(
                         WARN,
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -1376,6 +1378,10 @@ impl SharedMcpTransportConn for HttpTransport {
                         &format!("MCP OAuth refresh after 401 failed: {err:#}")
                     );
                 }
+                // Greptile C10: the replay already carried the freshly
+                // rotated token, so its 401 spends the call's single
+                // refresh budget; do not burn a second exchange on the
+                // known-failing path - the next call gets its own budget.
             }
             break resp;
         };
@@ -4931,5 +4937,112 @@ Connection: keep-alive\r\n\
         SharedMcpTransportConn::close(transport.as_ref())
             .await
             .expect("close transport");
+    }
+    #[tokio::test]
+    async fn oauth_http_redirect_off_origin_is_refused_and_bearer_never_rides_it() {
+        // An OAuth bearer rides every request of the HTTP transport. A
+        // server-sent redirect to another origin (here: another port on the
+        // loopback host) must be refused by the same-origin confinement the
+        // SSE leg already uses — reqwest would otherwise follow it and keep
+        // sending `Authorization`, and a same-host https-to-http downgrade
+        // would send it in plaintext.
+        let server = wiremock::MockServer::start().await;
+        let as_ = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/.well-known/oauth-protected-resource/mcp",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "resource": format!("{}/mcp", server.uri()),
+                    "authorization_servers": [as_.uri()],
+                    "bearer_methods_supported": ["header"],
+                })),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/.well-known/oauth-authorization-server",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "issuer": as_.uri(),
+                    "authorization_endpoint": format!("{}/authorize", as_.uri()),
+                    "token_endpoint": format!("{}/token", as_.uri()),
+                    "grant_types_supported": ["authorization_code", "refresh_token"],
+                    "response_types_supported": ["code"],
+                    "code_challenge_methods_supported": ["S256"],
+                    "token_endpoint_auth_methods_supported": ["none"],
+                })),
+            )
+            .mount(&as_)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/mcp"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(307)
+                    .insert_header("location", "http://127.0.0.1:1/moved"),
+            )
+            .mount(&server)
+            .await;
+
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let manager = std::sync::Arc::new(
+            crate::mcp_oauth::McpOAuthManager::with_launcher(
+                tmp.path(),
+                true,
+                std::sync::Arc::new(crate::mcp_oauth::browser::SystemBrowserLauncher),
+            )
+            .expect("manager"),
+        );
+        manager
+            .seed_authorization(
+                &crate::mcp_oauth::CanonicalResource::from_configured(
+                    &reqwest::Url::parse(&format!("{}/mcp", server.uri())).expect("url"),
+                )
+                .expect("canonical"),
+                "cid",
+                &reqwest::Url::parse(&as_.uri()).expect("issuer"),
+                zeroclaw_providers::auth::profiles::TokenSet {
+                    access_token: "at-confine".to_string(),
+                    refresh_token: Some("rt-confine".to_string()),
+                    id_token: None,
+                    expires_at: None,
+                    token_type: Some("Bearer".to_string()),
+                    scope: None,
+                },
+            )
+            .await
+            .expect("seed grant");
+
+        let config = McpServerConfig {
+            name: "confine-test".to_string(),
+            transport: zeroclaw_config::schema::McpTransport::Http,
+            url: Some(format!("{}/mcp", server.uri())),
+            oauth: true,
+            ..Default::default()
+        };
+        let oauth = crate::mcp_oauth::TransportOAuth::new(
+            std::sync::Arc::clone(&manager),
+            config.clone(),
+            false,
+        );
+        let transport = HttpTransport::new_with_oauth(&config, Some(oauth)).expect("transport");
+        let request = JsonRpcRequest::new(1, "tools/list", serde_json::json!({}));
+        let lifecycle = McpRequestLifecycle::uncoordinated(0);
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            SharedMcpTransportConn::send_and_recv(&transport, &request, &lifecycle),
+        )
+        .await
+        .expect("must not hang");
+        let err = result.expect_err("off-origin redirect must fail the request");
+        // The transport layers its own context on top; the confinement
+        // refusal is the cause, so match the full chain.
+        assert!(
+            format!("{err:#}").contains("must use the configured server origin"),
+            "expected the origin-confinement refusal, got: {err:#}"
+        );
     }
 }

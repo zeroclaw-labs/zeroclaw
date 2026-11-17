@@ -71,6 +71,21 @@ pub struct ValidatedAs {
     /// the callback flow MUST refuse a response that omits it (and bind the
     /// value to this issuer).
     pub require_iss: bool,
+    /// Whether a RFC 7591 registration document may ask for the refresh
+    /// grant. A strict AS that does not implement it rejects the whole
+    /// registration (`invalid_client_metadata`), which would stop sign-in
+    /// before the browser opens, so an ADVERTISED `grant_types_supported`
+    /// list decides. An absent list is treated as supporting the grant, and
+    /// that is a deliberate interop choice rather than the RFC reading: the
+    /// RFC 8414 default list is `authorization_code` and `implicit`, so it
+    /// does not name `refresh_token`, but servers that omit the field
+    /// overwhelmingly do rotate refresh tokens, and registering without the
+    /// grant costs renewability on the silent servers that do enforce the
+    /// registered grant list, while asking risks a rejected registration
+    /// only on the strict-and-silent minority. This is deliberately not the
+    /// same question as the capability gate in this function, which follows
+    /// the RFC minimum.
+    pub advertises_refresh_token: bool,
 }
 
 /// Outcome of a document fetch that distinguishes "this URL holds a
@@ -380,6 +395,10 @@ pub fn validate_auth_server(document: serde_json::Value, issuer: &Url) -> Result
 
     // Capability gates for the one grant ZeroClaw implements. Absent lists
     // fall back to the RFC defaults, which never satisfy public-client PKCE.
+    let advertises_refresh_token = metadata
+        .grant_types_supported
+        .as_ref()
+        .is_none_or(|advertised| advertised.iter().any(|g| g == "refresh_token"));
     let grants = metadata
         .grant_types_supported
         .unwrap_or_else(|| vec!["authorization_code".to_string(), "implicit".to_string()]);
@@ -422,6 +441,7 @@ pub fn validate_auth_server(document: serde_json::Value, issuer: &Url) -> Result
         require_iss: metadata
             .authorization_response_iss_parameter_supported
             .unwrap_or(false),
+        advertises_refresh_token,
     })
 }
 
@@ -616,6 +636,44 @@ mod tests {
         )
         .expect_err("plaintext endpoint");
         assert!(err.to_string().contains("URL policy"), "got: {err}");
+    }
+
+    #[test]
+    fn the_refresh_grant_registration_hint_follows_the_advertised_list() {
+        // Whether a RFC 7591 registration may ask for the refresh grant is a
+        // separate question from the capability gate below: a strict AS
+        // rejects a registration for an unimplemented grant, so an advertised
+        // list decides. An absent list is taken as supporting the grant by
+        // interop choice, NOT by the RFC reading (the RFC 8414 default list
+        // names only `authorization_code` and `implicit`); see the field doc.
+        let advertised = validate_auth_server(
+            asm_json(serde_json::json!(
+                {"grant_types_supported": ["authorization_code", "refresh_token"]}
+            )),
+            &issuer(),
+        )
+        .expect("valid AS");
+        assert!(advertised.advertises_refresh_token);
+
+        let withheld = validate_auth_server(
+            asm_json(serde_json::json!({"grant_types_supported": ["authorization_code"]})),
+            &issuer(),
+        )
+        .expect("valid AS");
+        assert!(
+            !withheld.advertises_refresh_token,
+            "an advertised list without refresh_token must not request it at registration"
+        );
+
+        let unadvertised = validate_auth_server(
+            asm_json(serde_json::json!({"grant_types_supported": null})),
+            &issuer(),
+        )
+        .expect("valid AS");
+        assert!(
+            unadvertised.advertises_refresh_token,
+            "an absent list is taken as supporting the grant (interop choice, not the RFC default)"
+        );
     }
 
     #[test]

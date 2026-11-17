@@ -210,6 +210,38 @@ impl AuthProfilesStore {
         Ok(true)
     }
 
+    /// Remove `profile_id` only when `authorize_removal` agrees, evaluated
+    /// against the profile read under the same file lock
+    /// [`Self::remove_profile`] takes. A caller that proved a credential dead
+    /// must not delete a profile another process re-minted in the meantime;
+    /// a read followed by an unconditional delete cannot promise that, this
+    /// can. Returns whether the profile was removed: a vanished profile and
+    /// a profile the predicate refused both report `false` without touching
+    /// the file.
+    pub async fn remove_profile_if<F>(&self, profile_id: &str, authorize_removal: F) -> Result<bool>
+    where
+        F: FnOnce(&AuthProfile) -> bool,
+    {
+        let _lock = self.acquire_lock().await?;
+        let mut data = self.load_locked().await?;
+
+        let Some(profile) = data.profiles.get(profile_id) else {
+            return Ok(false);
+        };
+        if !authorize_removal(profile) {
+            return Ok(false);
+        }
+
+        let removed = data.profiles.remove(profile_id).is_some();
+        if removed {
+            data.active_profiles
+                .retain(|_, active| active != profile_id);
+            data.updated_at = Utc::now();
+            self.save_locked(&data).await?;
+        }
+        Ok(removed)
+    }
+
     pub async fn set_active_profile(&self, model_provider: &str, profile_id: &str) -> Result<()> {
         let _lock = self.acquire_lock().await?;
         let mut data = self.load_locked().await?;
@@ -678,6 +710,72 @@ mod tests {
         assert_eq!(
             profile_id("openai-codex", "default"),
             "openai-codex:default"
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_profile_if_refuses_a_profile_the_caller_does_not_own() {
+        // A caller that proved one credential dead must not delete a profile
+        // another process re-minted in the meantime: the predicate and the
+        // removal share one lock acquisition, so what it checked cannot go
+        // stale before the write lands.
+        let tmp = TempDir::new().expect("tmp");
+        let store = AuthProfilesStore::new(tmp.path(), false);
+        let id = profile_id("mcp", "oauth-bound");
+        let tokens = TokenSet {
+            access_token: "at-old".to_string(),
+            refresh_token: Some("rt-old".to_string()),
+            id_token: None,
+            expires_at: None,
+            token_type: None,
+            scope: None,
+        };
+        store
+            .upsert_profile(AuthProfile::new_oauth("mcp", "oauth-bound", tokens), true)
+            .await
+            .expect("seed");
+
+        assert!(
+            !store
+                .remove_profile_if(&id, |profile| {
+                    profile
+                        .token_set
+                        .as_ref()
+                        .is_some_and(|set| set.access_token == "at-other")
+                })
+                .await
+                .expect("declined removal"),
+            "a profile the predicate refuses stays"
+        );
+        assert!(
+            store.list_profile_ids().await.expect("ids").contains(&id),
+            "the row must survive the declined removal"
+        );
+
+        assert!(
+            store
+                .remove_profile_if(&id, |profile| {
+                    profile
+                        .token_set
+                        .as_ref()
+                        .is_some_and(|set| set.access_token == "at-old")
+                })
+                .await
+                .expect("owned removal"),
+            "the profile the predicate names is removed"
+        );
+        assert!(
+            !store.list_profile_ids().await.expect("ids").contains(&id),
+            "the removal must delete the row"
+        );
+
+        // A vanished profile is not an error, and nothing is written.
+        assert!(
+            !store
+                .remove_profile_if(&id, |_| true)
+                .await
+                .expect("missing removal"),
+            "a vanished profile reports false"
         );
     }
 

@@ -193,18 +193,41 @@ impl McpTokenStore {
             })
     }
 
-    /// Persist rotated tokens after a successful refresh, keeping the stored
-    /// client identity untouched. Fails closed if the profile vanished
-    /// concurrently: the caller then re-authorizes rather than writing a
-    /// half-populated profile.
+    /// Rotate the stored tokens of `canonical`'s grant, but only while the
+    /// profile on disk still belongs to the party that minted them
+    /// (`minted_by_client_id` + `minted_by_issuer`). The documented operator
+    /// flow signs a resource in from ANOTHER process while this daemon runs:
+    /// if that sign-in replaced the authorization server (or the client)
+    /// during our token round-trip, writing our tokens into the replacement
+    /// profile would pair the replacement's `issuer` and `client_id` with
+    /// tokens it never minted, and the next restart would redeem them at the
+    /// wrong token endpoint. The check runs inside the store's own profile
+    /// lock, and a replacement sign-in is left untouched. A vanished profile
+    /// fails closed rather than leaving a half-populated write behind, and the
+    /// return value says whether the write landed.
     pub async fn save_refreshed_tokens(
         &self,
         canonical: &CanonicalResource,
         tokens: TokenSet,
-    ) -> Result<()> {
+        minted_by_client_id: &str,
+        minted_by_issuer: &Url,
+    ) -> Result<bool> {
         let id = profile_id(MCP_MODEL_PROVIDER, &profile_name_for(canonical));
+        let issuer = minted_by_issuer.as_str();
+        let mut applied = false;
         self.store
             .update_profile(&id, |profile| {
+                let minted_by_us = profile
+                    .metadata
+                    .get(META_ISSUER)
+                    .is_some_and(|stored| stored == issuer)
+                    && profile
+                        .metadata
+                        .get(META_CLIENT_ID)
+                        .is_some_and(|stored| stored == minted_by_client_id);
+                if !minted_by_us {
+                    return Ok(());
+                }
                 // RFC 6749 §6 (the norm: an omitted `refresh_token` on refresh means
                 // the old one stands) + S2-2: an absent (or normalized-
                 // empty, see tokens.rs) refresh_token in a refresh response
@@ -220,6 +243,7 @@ impl McpTokenStore {
                     refresh_token,
                     ..tokens.clone()
                 });
+                applied = true;
                 Ok(())
             })
             .await
@@ -229,19 +253,38 @@ impl McpTokenStore {
                     canonical.resource()
                 )
             })?;
-        Ok(())
+        Ok(applied)
     }
 
-    /// Drop the stored grant (after an unrecoverable `invalid_grant`, for
-    /// example, so the next connect starts clean).
-    pub async fn clear(&self, canonical: &CanonicalResource) -> Result<bool> {
+    /// Remove `canonical`'s stored grant, but only while it still holds the
+    /// access token the caller proved spent (`dead_access`). This is the
+    /// removal half of the ownership rule `save_refreshed_tokens` applies to
+    /// writes: the compare and the removal share one lock acquisition, so a
+    /// sign-in another process committed between the caller's inspection and
+    /// this call is never deleted, and the next verdict cannot lose a
+    /// credential it never disproved. Returns whether the profile was
+    /// removed; a vanished profile and a profile belonging to someone else
+    /// both report `false`.
+    pub async fn clear_if_access_matches(
+        &self,
+        canonical: &CanonicalResource,
+        dead_access: &str,
+    ) -> Result<bool> {
         let id = profile_id(MCP_MODEL_PROVIDER, &profile_name_for(canonical));
-        self.store.remove_profile(&id).await.with_context(|| {
-            format!(
-                "cannot clear the MCP OAuth grant for {}",
-                canonical.resource()
-            )
-        })
+        self.store
+            .remove_profile_if(&id, |profile| {
+                profile
+                    .token_set
+                    .as_ref()
+                    .is_some_and(|tokens| tokens.access_token == dead_access)
+            })
+            .await
+            .with_context(|| {
+                format!(
+                    "cannot clear the MCP OAuth grant for {}",
+                    canonical.resource()
+                )
+            })
     }
 }
 
@@ -294,7 +337,12 @@ mod tests {
         let mut rotated = tokens("at-2");
         rotated.refresh_token = None;
         store
-            .save_refreshed_tokens(&canonical, rotated)
+            .save_refreshed_tokens(
+                &canonical,
+                rotated,
+                "client-abc",
+                &Url::parse("https://auth.example.com").expect("url"),
+            )
             .await
             .expect("rotate without new refresh token");
         let loaded = store
@@ -311,7 +359,12 @@ mod tests {
 
         // A rotated refresh token replaces it, of course.
         store
-            .save_refreshed_tokens(&canonical, tokens("at-3"))
+            .save_refreshed_tokens(
+                &canonical,
+                tokens("at-3"),
+                "client-abc",
+                &Url::parse("https://auth.example.com").expect("url"),
+            )
             .await
             .expect("rotate with new refresh token");
         let loaded = store
@@ -464,7 +517,12 @@ mod tests {
             .expect("save");
 
         store
-            .save_refreshed_tokens(&canonical, tokens("rotated"))
+            .save_refreshed_tokens(
+                &canonical,
+                tokens("rotated"),
+                "cid",
+                &Url::parse("https://auth.example.com").expect("url"),
+            )
             .await
             .expect("rotate");
 
@@ -477,11 +535,123 @@ mod tests {
         assert_eq!(loaded.client_id, "cid");
 
         // Rotating onto a vanished profile fails closed.
-        store.clear(&canonical).await.expect("clear");
+        assert!(
+            store
+                .clear_if_access_matches(&canonical, "rotated")
+                .await
+                .expect("clear"),
+            "the profile still holding the spent token must be removed"
+        );
         store
-            .save_refreshed_tokens(&canonical, tokens("nowhere"))
+            .save_refreshed_tokens(
+                &canonical,
+                tokens("nowhere"),
+                "cid",
+                &Url::parse("https://auth.example.com").expect("url"),
+            )
             .await
             .expect_err("must fail closed");
+    }
+
+    #[tokio::test]
+    async fn a_rotation_never_rewrites_another_sign_ins_profile() {
+        // The daemon holds issuer A's grant and rotates it while the
+        // documented operator flow replaces this resource's sign-in with one
+        // from issuer B. Writing A's tokens into B's profile would pair B's
+        // `issuer` and `client_id` with tokens B never minted, and the next
+        // restart would redeem a foreign refresh token at B's endpoint.
+        let tmp = TempDir::new().expect("tmp");
+        let store = McpTokenStore::new(tmp.path(), true).expect("store");
+        let canonical = canonical("https://mcp.example.com/mcp");
+        let issuer_a = Url::parse("https://auth-a.example").expect("url");
+        let issuer_b = Url::parse("https://auth-b.example").expect("url");
+        store
+            .save_authorization(&canonical, "cid-a", &issuer_a, tokens("at-a"))
+            .await
+            .expect("seed A");
+        store
+            .save_authorization(&canonical, "cid-b", &issuer_b, tokens("at-b"))
+            .await
+            .expect("operator signs in at B");
+
+        let applied = store
+            .save_refreshed_tokens(&canonical, tokens("at-a2"), "cid-a", &issuer_a)
+            .await
+            .expect("rotate A");
+        assert!(
+            !applied,
+            "a profile another sign-in owns must not absorb our rotation"
+        );
+        let loaded = store
+            .load_authorization(&canonical)
+            .await
+            .expect("load")
+            .expect("present");
+        assert_eq!(
+            loaded.tokens.access_token, "at-b",
+            "the replacement sign-in must survive untouched"
+        );
+
+        // The replacement's own rotation still lands.
+        let applied = store
+            .save_refreshed_tokens(&canonical, tokens("at-b2"), "cid-b", &issuer_b)
+            .await
+            .expect("rotate B");
+        assert!(applied, "our own party's profile must still rotate");
+        let loaded = store
+            .load_authorization(&canonical)
+            .await
+            .expect("load")
+            .expect("present");
+        assert_eq!(loaded.tokens.access_token, "at-b2");
+        assert_eq!(loaded.client_id, "cid-b");
+    }
+
+    #[tokio::test]
+    async fn a_spent_verdict_removes_only_the_profile_it_disproved() {
+        // The removal half of the ownership rule. The compare and the
+        // removal run under one lock acquisition, so a sign-in that landed
+        // while this process was proving its own token dead is never
+        // deleted, and an owned profile is deleted for real rather than
+        // left as a credential-less shell.
+        let tmp = TempDir::new().expect("tmp");
+        let store = McpTokenStore::new(tmp.path(), true).expect("store");
+        let canonical = canonical("https://mcp.example.com/mcp");
+        store
+            .save_authorization(
+                &canonical,
+                "cid",
+                &Url::parse("https://auth.example.com").expect("url"),
+                tokens("at-old"),
+            )
+            .await
+            .expect("seed");
+
+        let removed = store
+            .clear_if_access_matches(&canonical, "at-other")
+            .await
+            .expect("clear attempt");
+        assert!(!removed, "a profile holding another token stays");
+        let loaded = store
+            .load_authorization(&canonical)
+            .await
+            .expect("load")
+            .expect("still present");
+        assert_eq!(loaded.tokens.access_token, "at-old");
+
+        let removed = store
+            .clear_if_access_matches(&canonical, "at-old")
+            .await
+            .expect("clear");
+        assert!(removed, "the disproved profile is removed");
+        assert!(
+            store
+                .load_authorization(&canonical)
+                .await
+                .expect("load")
+                .is_none(),
+            "the row must actually go away"
+        );
     }
 
     #[tokio::test]

@@ -328,6 +328,7 @@ mod tests {
             registration_endpoint: None,
             scopes_supported: None,
             require_iss: false,
+            advertises_refresh_token: true,
         }
     }
 
