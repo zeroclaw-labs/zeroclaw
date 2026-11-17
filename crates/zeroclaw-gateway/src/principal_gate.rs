@@ -451,6 +451,15 @@ pub struct RequestAuth {
 /// or published then.
 pub type RequestPrincipal = Option<axum::Extension<RequestAuth>>;
 
+pub(crate) fn request_principal_id(request: &RequestPrincipal) -> Option<&str> {
+    request
+        .as_ref()?
+        .0
+        .principal
+        .as_ref()
+        .map(|auth| auth.principal.id.as_str())
+}
+
 /// One config mutation's complete write set: every dotted path the
 /// mutation persists, each with the verb its effect requires.
 #[derive(Clone, Debug, Default)]

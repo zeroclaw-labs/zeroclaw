@@ -1379,7 +1379,7 @@ fn audit_scoped_credential_mutation(
         INFO,
         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
             serde_json::json!({
-                "actor": principal.as_ref().map(|auth| auth.0.principal.id.as_str()),
+                "actor": crate::principal_gate::request_principal_id(principal),
                 "credential": name,
                 "kind": kind,
                 "operation": operation,
