@@ -37946,9 +37946,10 @@ BTC is currently around $65,000 based on latest tool output."#
     // An empty in-progress emoji on a channel that posts its own native
     // acknowledgement (Telegram) must still reach `remove_reaction`: the
     // orchestrator added nothing, but the channel's reaction is on the message
-    // and the clear is the only thing that withdraws it. #11739 landed that
-    // clear on master; before this fix `withdraw_ack` returned early and
-    // stranded it for anyone running `ack_reaction_in_progress = ""`.
+    // and the clear is the only thing that withdraws it. The Telegram clear
+    // that landed on master is the one this path must still emit; before this
+    // fix `withdraw_ack` returned early and stranded it for anyone running
+    // `ack_reaction_in_progress = ""`.
     #[tokio::test]
     async fn process_channel_message_clears_native_ack_with_empty_in_progress() {
         let channel_impl = Arc::new(RecordingChannel {
