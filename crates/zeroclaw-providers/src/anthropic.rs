@@ -5857,12 +5857,6 @@ data: {\"type\":\"message_stop\"}\n\n";
         assert_eq!(native_msgs[2].role, "user");
     }
 
-    // The seam sanitizer rewrites an assistant tool-call envelope
-    // field-wise, so the thinking text (marker included) and its signature
-    // survive to the adapter. This converts the sanitized envelope through
-    // the real conversion path and asserts the native blocks the provider
-    // would send: the leading thinking block replays the exact signed bytes
-    // and the following text block carries the placeholder, not the path.
     #[test]
     fn convert_messages_leaves_out_thinking_that_has_no_signature() {
         // A stream cut off by max_tokens mid-thinking stores the text with an
@@ -5913,6 +5907,12 @@ data: {\"type\":\"message_stop\"}\n\n";
         );
     }
 
+    // The seam sanitizer rewrites an assistant tool-call envelope
+    // field-wise, so the thinking text (marker included) and its signature
+    // survive to the adapter. This converts the sanitized envelope through
+    // the real conversion path and asserts the native blocks the provider
+    // would send: the leading thinking block replays the exact signed bytes
+    // and the following text block carries the placeholder, not the path.
     #[test]
     fn convert_messages_replays_sanitized_envelope_thinking_and_signature_byte_for_byte() {
         let marker = format!("[{}:{}]", "IMAGE", "/tmp/shot.png");
