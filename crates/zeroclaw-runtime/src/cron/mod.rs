@@ -1,5 +1,6 @@
 use crate::security::SecurityPolicy;
 use anyhow::{Result, bail};
+use std::path::Path;
 use zeroclaw_api::runtime_traits::RuntimeAdapter;
 use zeroclaw_config::schema::{Config, CronShellOutputFormat};
 
@@ -84,19 +85,33 @@ pub fn validate_shell_command(
 ) -> Result<()> {
     let security = SecurityPolicy::for_agent(config, agent_alias)?;
     let runtime = crate::platform::create_runtime(&config.runtime)?;
-    validate_shell_command_with_security(runtime.as_ref(), &security, command, approved)
+    validate_shell_command_with_security(
+        runtime.as_ref(),
+        &security,
+        command,
+        approved,
+        &config.data_dir,
+    )
 }
 
 /// Validate a shell command using an existing `SecurityPolicy` instance.
 /// Preferred when the caller already holds a `SecurityPolicy` (e.g. scheduler).
+/// `cwd` is the directory the job's shell starts in (the data directory), so a
+/// working-directory check probes the folder the command really runs in.
 pub fn validate_shell_command_with_security(
     runtime: &dyn RuntimeAdapter,
     security: &SecurityPolicy,
     command: &str,
     approved: bool,
+    cwd: &Path,
 ) -> Result<()> {
     security
-        .validate_command_execution_for_shell(command, approved, runtime.shell_dialect())
+        .validate_command_execution_for_shell_in_dir(
+            command,
+            approved,
+            runtime.shell_dialect(),
+            cwd,
+        )
         .map(|_| ())
         .map_err(|reason| {
             ::zeroclaw_log::record!(
@@ -121,7 +136,7 @@ pub(crate) fn add_shell_job_with_runtime(
     delivery: Option<DeliveryConfig>,
     approved: bool,
 ) -> Result<CronJob> {
-    validate_shell_command_with_security(runtime, security, command, approved)?;
+    validate_shell_command_with_security(runtime, security, command, approved, &config.data_dir)?;
     store::add_shell_job_with_format(
         config,
         agent_alias,
@@ -300,7 +315,13 @@ pub(crate) fn update_shell_job_with_runtime(
 ) -> Result<CronJob> {
     let patch = remap_agent_command_patch(config, job_id, patch)?;
     if let Some(command) = patch.command.as_deref() {
-        validate_shell_command_with_security(runtime, security, command, approved)?;
+        validate_shell_command_with_security(
+            runtime,
+            security,
+            command,
+            approved,
+            &config.data_dir,
+        )?;
     }
     match owner {
         // Scoped: the ownership test travels with the write rather than being a
@@ -582,6 +603,7 @@ mod security_validation_tests {
             &security,
             "curl https://example.com",
             false,
+            &config.data_dir,
         );
         assert!(result.is_err());
         assert!(

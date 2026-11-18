@@ -1,7 +1,9 @@
 use crate::platform::RuntimeAdapter;
 use crate::security::SecurityPolicy;
 use crate::security::traits::Sandbox;
-use crate::tools::shell_env::{ForwardedEnvironment, SAFE_SHELL_ENV_VARS};
+use crate::tools::shell_env::{
+    ForwardedEnvironment, SAFE_SHELL_ENV_VARS, command_env_snapshot, reapply_command_env,
+};
 use async_trait::async_trait;
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
@@ -286,6 +288,12 @@ impl Tool for ShellTool {
             }
         };
 
+        // `command_env_snapshot` explains why the runtime builder's own
+        // variables must survive. Capture them before the sandbox wrap and the
+        // environment reset below, and restore them once the child
+        // environment has been rebuilt.
+        let builder_env = command_env_snapshot(&cmd);
+
         // Apply sandbox wrapping before execution.
         // The Sandbox trait operates on std::process::Command, so use as_std_mut
         // to get a mutable reference to the underlying command.
@@ -323,6 +331,10 @@ impl Tool for ShellTool {
                 cmd.env(k, v);
             }
         }
+
+        // Restored last: neither the reset nor a forwarded client environment
+        // may drop or override what the builder set.
+        reapply_command_env(&mut cmd, builder_env);
 
         // Android: platform tools (sh, getprop, am, dumpsys, content, pm, ...)
         // live in /system/bin and /system/xbin. The cleared+rebuilt PATH above
@@ -1834,6 +1846,86 @@ mod tests {
         assert!(
             !result.output.contains("sk-test-secret-67890"),
             "ZEROCLAW_API_KEY leaked to shell command output"
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn shell_child_sees_cwd_exe_search_hardening_after_env_clear() {
+        use zeroclaw_config::platform::native::NO_DEFAULT_CURRENT_DIRECTORY_IN_EXE_PATH as HARDENING;
+
+        // `set NAME` prints the variables whose names start with NAME.
+        let command = format!("{} {HARDENING}", env_print_command());
+        // A private workspace: the shared temp directory may hold stray files.
+        let workspace = tempfile::tempdir().unwrap();
+        let security = || {
+            Arc::new(SecurityPolicy {
+                autonomy: AutonomyLevel::Supervised,
+                workspace_dir: workspace.path().to_path_buf(),
+                allowed_commands: vec![env_print_command().into()],
+                ..SecurityPolicy::default()
+            })
+        };
+
+        let tool = ShellTool::new(security(), test_runtime());
+        let result = tool
+            .execute(json!({"command": command, "approved": true}))
+            .await
+            .expect("environment print command should succeed");
+        assert!(result.success, "{:?}", result.error);
+        assert!(
+            env_output_contains_assignment(&result.output, HARDENING, "1"),
+            "the builder's hardening must survive the environment reset: {}",
+            result.output.trim()
+        );
+
+        // A forwarded client environment cannot switch it off either.
+        let tool =
+            ShellTool::new(security(), test_runtime()).with_tui_env(Some(HashMap::from([(
+                HARDENING.to_string(),
+                "0".to_string(),
+            )])));
+        let result = tool
+            .execute(json!({"command": command, "approved": true}))
+            .await
+            .expect("environment print command should succeed");
+        assert!(result.success, "{:?}", result.error);
+        assert!(
+            env_output_contains_assignment(&result.output, HARDENING, "1"),
+            "a forwarded environment must not override the builder's hardening: {}",
+            result.output.trim()
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn shell_does_not_run_working_directory_shadow_on_windows() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("whoami.cmd"), "@echo HIJACKED\r\n").unwrap();
+        // A wildcard allowlist skips the policy's own shadow refusal, so this
+        // exercises the spawn-time hardening alone, after the environment reset.
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: workspace.path().to_path_buf(),
+            allowed_commands: vec!["*".into()],
+            block_high_risk_commands: false,
+            ..SecurityPolicy::default()
+        });
+
+        let tool = ShellTool::new(security, test_runtime());
+        let result = tool
+            .execute(json!({"command": "whoami"}))
+            .await
+            .expect("whoami should run");
+        assert!(result.success, "{:?}", result.error);
+        assert!(
+            !result.output.trim().is_empty(),
+            "whoami must print the account name"
+        );
+        assert!(
+            !result.output.contains("HIJACKED"),
+            "cmd.exe ran the working-directory file instead of whoami: {}",
+            result.output.trim()
         );
     }
 

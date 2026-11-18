@@ -206,6 +206,21 @@ const WINDOWS_COMMAND_INTERPRETER: &str = "cmd.exe";
 #[cfg(target_os = "windows")]
 const WINDOWS_COMMAND_EXECUTE_ARG: &str = "/C";
 
+/// `cmd.exe` searches the working directory before `PATH` for a bare command
+/// name unless this variable exists in its environment (it gates
+/// `NeedCurrentDirectoryForExePathW`). Without it a file written into the
+/// working directory, such as `git.bat`, runs in place of the allowlisted
+/// `git`. Every Windows shell builder sets it, PowerShell included so a nested
+/// `cmd /c <name>` inherits it. A spawner that clears the child environment
+/// after building must restore the variables the builder set.
+#[cfg(target_os = "windows")]
+pub const NO_DEFAULT_CURRENT_DIRECTORY_IN_EXE_PATH: &str = "NoDefaultCurrentDirectoryInExePath";
+
+#[cfg(target_os = "windows")]
+fn disable_cwd_exe_search(process: &mut std::process::Command) {
+    process.env(NO_DEFAULT_CURRENT_DIRECTORY_IN_EXE_PATH, "1");
+}
+
 #[cfg(target_os = "windows")]
 pub fn windows_tokio_cmd_shell_command(command: &str) -> tokio::process::Command {
     let mut process = tokio::process::Command::new(WINDOWS_COMMAND_INTERPRETER);
@@ -213,6 +228,7 @@ pub fn windows_tokio_cmd_shell_command(command: &str) -> tokio::process::Command
         .raw_arg(WINDOWS_COMMAND_EXECUTE_ARG)
         .raw_arg(windows_cmd_shell_raw_arg(command))
         .creation_flags(CREATE_NO_WINDOW);
+    disable_cwd_exe_search(process.as_std_mut());
     process
 }
 
@@ -262,6 +278,7 @@ pub fn windows_tokio_powershell_command(
 ) -> tokio::process::Command {
     let mut process = tokio_powershell_command(interpreter, command);
     process.creation_flags(CREATE_NO_WINDOW);
+    disable_cwd_exe_search(process.as_std_mut());
     process
 }
 
@@ -274,6 +291,7 @@ pub fn windows_std_cmd_shell_command(command: &str) -> std::process::Command {
         .raw_arg(WINDOWS_COMMAND_EXECUTE_ARG)
         .raw_arg(windows_cmd_shell_raw_arg(command))
         .creation_flags(CREATE_NO_WINDOW);
+    disable_cwd_exe_search(&mut process);
     process
 }
 
@@ -1301,6 +1319,61 @@ mod tests {
                 "batch shell name must not be spawned as PowerShell, got: {debug}"
             );
         }
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn windows_shell_builders_disable_cwd_exe_search() {
+        use std::ffi::OsStr;
+
+        fn hardened(command: &std::process::Command) -> bool {
+            command.get_envs().any(|(key, value)| {
+                key == OsStr::new(NO_DEFAULT_CURRENT_DIRECTORY_IN_EXE_PATH)
+                    && value == Some(OsStr::new("1"))
+            })
+        }
+
+        assert!(hardened(windows_tokio_cmd_shell_command("echo x").as_std()));
+        assert!(hardened(&windows_std_cmd_shell_command("echo x")));
+        assert!(hardened(
+            windows_tokio_powershell_command("powershell", "Write-Output x").as_std()
+        ));
+
+        let cwd = std::env::temp_dir();
+        for shell in ["cmd.exe", "powershell"] {
+            let command = NativeRuntime::with_shell(shell.into())
+                .build_shell_command("echo x", &cwd)
+                .unwrap();
+            assert!(
+                hardened(command.as_std()),
+                "a {shell} child must not search its working directory for commands"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(target_os = "windows")]
+    async fn windows_cmd_does_not_run_working_directory_shadow() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("whoami.cmd"), "@echo HIJACKED\r\n").unwrap();
+
+        let output = NativeRuntime::with_shell("cmd.exe".into())
+            .build_shell_command("whoami", workspace.path())
+            .unwrap()
+            .output()
+            .await
+            .expect("cmd /C whoami should execute");
+
+        assert!(output.status.success(), "whoami must resolve through PATH");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            !stdout.trim().is_empty(),
+            "whoami must print the account name"
+        );
+        assert!(
+            !stdout.contains("HIJACKED"),
+            "cmd.exe ran the working-directory file instead of whoami: {stdout}"
+        );
     }
 
     #[tokio::test]

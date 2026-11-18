@@ -1,8 +1,9 @@
 use crate::platform::RuntimeAdapter;
 use crate::security::traits::Sandbox;
+use crate::tools::shell_env::{command_env_snapshot, reapply_command_env};
 use crate::util::shell_escape;
 use async_trait::async_trait;
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsStr;
 use std::process::Output;
 use std::sync::Arc;
 use std::time::Duration;
@@ -75,16 +76,7 @@ impl CodingCliExecutor for RuntimeCodingCliExecutor {
 
         let runtime_sandbox_env = command_env_snapshot(&process);
         process.env_clear();
-        for (key, value) in runtime_sandbox_env {
-            match value {
-                Some(value) => {
-                    process.env(key, value);
-                }
-                None => {
-                    process.env_remove(key);
-                }
-            }
-        }
+        reapply_command_env(&mut process, runtime_sandbox_env);
         for (key, value) in command.env {
             process.env(key, value);
         }
@@ -95,14 +87,6 @@ impl CodingCliExecutor for RuntimeCodingCliExecutor {
             .map_err(|_| CodingCliExecutionError::Timeout)?
             .map_err(CodingCliExecutionError::Io)
     }
-}
-
-fn command_env_snapshot(process: &tokio::process::Command) -> Vec<(OsString, Option<OsString>)> {
-    process
-        .as_std()
-        .get_envs()
-        .map(|(key, value)| (key.to_os_string(), value.map(|value| value.to_os_string())))
-        .collect()
 }
 
 fn native_command(
@@ -126,6 +110,8 @@ fn shell_command(command: &CodingCliCommand) -> String {
 #[cfg(all(test, feature = "tool-codex-cli"))]
 mod tests {
     use super::*;
+    #[cfg(not(target_os = "windows"))]
+    use std::ffi::OsString;
     use std::path::PathBuf;
     #[cfg(not(target_os = "windows"))]
     use {

@@ -3393,6 +3393,128 @@ fn looks_like_path_for_shell(candidate: &str, dialect: ShellDialect) -> bool {
             && (candidate.contains('\\') || has_windows_drive_prefix(candidate)))
 }
 
+/// Whether a bare command-name allowlist entry may vouch for `executable`.
+/// Under the Windows dialects a path-shaped token (`.\git.bat`, `tools\git`,
+/// `./git.exe`, `C:\x\git.exe`) names a file by location instead of through
+/// the `PATH` lookup a bare entry stands for, and that location can be the
+/// agent's writable workspace. Only `*` or an equal path entry admits it.
+fn bare_allowlist_entry_may_match(executable: &str, dialect: ShellDialect) -> bool {
+    !(shell_uses_windows_path_syntax(dialect) && looks_like_path_for_shell(executable, dialect))
+}
+
+/// `PATHEXT` as documented for a default Windows installation, used when the
+/// daemon environment does not carry the variable.
+const DEFAULT_WINDOWS_PATHEXT: &str = ".COM;.EXE;.BAT;.CMD;.VBS;.VBE;.JS;.JSE;.WSF;.WSH;.MSC";
+
+/// Split a `PATHEXT` value into its extensions, falling back to the documented
+/// default when the variable is unset or blank.
+fn parse_windows_pathext(raw: Option<&str>) -> Vec<String> {
+    raw.filter(|value| !value.trim().is_empty())
+        .unwrap_or(DEFAULT_WINDOWS_PATHEXT)
+        .split(';')
+        .map(str::trim)
+        .filter(|ext| ext.len() > 1 && ext.starts_with('.'))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The file `cmd.exe` would run for the bare command `word` from `cwd` before
+/// it consults `PATH`: the word itself when it already carries an extension,
+/// then the word with each `PATHEXT` extension. Extensions are probed as given
+/// and lowercased, so a case-sensitive host finds the usual lowercase spelling
+/// that Windows' case-insensitive lookup would match. A directory of that name
+/// is never run, so only files count. A candidate that cannot be inspected is
+/// an error, never "absent": the caller refuses instead of guessing.
+fn cmd_cwd_shadowing_executable(
+    cwd: &Path,
+    word: &str,
+    pathext: &[String],
+) -> std::io::Result<Option<String>> {
+    if word.is_empty() || word.contains(['/', '\\', ':']) {
+        return Ok(None);
+    }
+    let literal = word.contains('.').then(|| word.to_owned());
+    let with_extensions = pathext.iter().flat_map(|ext| {
+        let lower = ext.to_ascii_lowercase();
+        let as_given = format!("{word}{ext}");
+        if lower == *ext {
+            vec![as_given]
+        } else {
+            vec![as_given, format!("{word}{lower}")]
+        }
+    });
+    for name in literal.into_iter().chain(with_extensions) {
+        match std::fs::metadata(cwd.join(&name)) {
+            Ok(metadata) if metadata.is_file() => return Ok(Some(name)),
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(None)
+}
+
+/// Commands `cmd.exe` implements itself. It runs one of these for a bare name
+/// before it looks for any file, so a same-named file in the working directory
+/// does not shadow it. Only the shadow refusal reads this list; the spawn-time
+/// hardening does not depend on it.
+const CMD_INTERNAL_COMMANDS: &[&str] = &[
+    "assoc", "break", "call", "cd", "chdir", "cls", "color", "copy", "date", "del", "dir", "dpath",
+    "echo", "endlocal", "erase", "exit", "for", "ftype", "goto", "if", "keys", "md", "mkdir",
+    "mklink", "move", "path", "pause", "popd", "prompt", "pushd", "rd", "rem", "ren", "rename",
+    "rmdir", "set", "setlocal", "shift", "start", "time", "title", "type", "ver", "verify", "vol",
+];
+
+fn is_cmd_internal_command(word: &str) -> bool {
+    CMD_INTERNAL_COMMANDS
+        .iter()
+        .any(|name| name.eq_ignore_ascii_case(word))
+}
+
+/// Under `cmd.exe`, the refusal for the first bare command in `command` that a
+/// file in `cwd` would run in place of.
+fn cmd_cwd_shadow_refusal(command: &str, cwd: &Path) -> Option<String> {
+    let dialect = ShellDialect::WindowsCmd;
+    // A command whose segments cannot be read is refused by the allowlist
+    // check that follows this one.
+    let segments = split_unquoted_segments_checked(command, dialect).ok()?;
+    let pathext = parse_windows_pathext(std::env::var("PATHEXT").ok().as_deref());
+    for segment in &segments {
+        let normalized = normalized_shell_command(segment, dialect);
+        let Some(word) = normalized.words.first() else {
+            continue;
+        };
+        let word = strip_wrapping_quotes(word).trim();
+        // A path-shaped executable is decided by the allowlist match instead,
+        // and no file shadows a command `cmd.exe` implements itself.
+        if word.is_empty()
+            || looks_like_path_for_shell(word, dialect)
+            || is_cmd_internal_command(word)
+        {
+            continue;
+        }
+        match cmd_cwd_shadowing_executable(cwd, word, &pathext) {
+            Ok(None) => {}
+            Ok(Some(file)) => {
+                return Some(format!(
+                    "Command blocked: working directory shadows command '{word}' with '{file}'; \
+                     cmd.exe would run that file instead of the PATH command. Invoke it \
+                     explicitly as '.\\{file}' with a matching allowlist entry, or remove the file"
+                ));
+            }
+            // A probe that could not run is not evidence that nothing shadows
+            // the command.
+            Err(error) => {
+                return Some(format!(
+                    "Command blocked: could not check the working directory for a file that \
+                     shadows command '{word}': {error}"
+                ));
+            }
+        }
+    }
+    None
+}
+
 fn shell_path_tokens_equal(left: &str, right: &str, dialect: ShellDialect) -> bool {
     if shell_uses_windows_path_syntax(dialect) {
         // Backslash acceptance is a dialect concern (PowerShell/cmd accept `\`
@@ -3597,12 +3719,17 @@ fn is_allowlist_entry_match(
         return true;
     }
 
-    // Path-like allowlist entries must match the executable token exactly
-    // after "~" expansion.
-    if looks_like_path(allowed) {
-        let allowed_path = expand_user_path(allowed);
-        let executable_path = expand_user_path(executable);
-        return executable_path == allowed_path;
+    // Path-like allowlist entries must match the executable token after "~"
+    // expansion, read in the dialect's path syntax: a Windows dialect accepts
+    // either separator and compares with the host filesystem's case rules.
+    if looks_like_path_for_shell(allowed, dialect) {
+        return shell_path_tokens_equal(allowed, executable, dialect);
+    }
+
+    // A bare name stands for the program `PATH` resolves. Under the Windows
+    // dialects it never vouches for an executable spelled as a path.
+    if !bare_allowlist_entry_may_match(executable, dialect) {
+        return false;
     }
 
     // Command-name entries continue to match by basename, case-insensitively.
@@ -3884,6 +4011,12 @@ fn is_powershell_allowlist_entry_match(
         // allowlist entry `/tmp/Safe/tool` authorize the distinct executable
         // `/tmp/safe/tool`.
         return shell_path_tokens_equal(allowed, executable, ShellDialect::PowerShell);
+    }
+
+    // A bare name stands for the command PowerShell resolves itself; it never
+    // vouches for an executable spelled as a path (`.\git.exe`).
+    if !bare_allowlist_entry_may_match(executable, ShellDialect::PowerShell) {
+        return false;
     }
 
     let allowed = strip_powershell_executable_suffix(allowed);
@@ -4290,6 +4423,25 @@ impl SecurityPolicy {
         approved: bool,
         dialect: ShellDialect,
     ) -> Result<CommandRiskLevel, String> {
+        self.validate_command_execution_for_shell_in_dir(
+            command,
+            approved,
+            dialect,
+            &self.workspace_dir,
+        )
+    }
+
+    /// [`Self::validate_command_execution_for_shell`] for a command the caller
+    /// starts in `cwd` instead of the workspace; cron shell jobs start in the
+    /// data directory. Only the `cmd.exe` working-directory shadow check reads
+    /// `cwd`. Every other rule is the same.
+    pub fn validate_command_execution_for_shell_in_dir(
+        &self,
+        command: &str,
+        approved: bool,
+        dialect: ShellDialect,
+        cwd: &Path,
+    ) -> Result<CommandRiskLevel, String> {
         if dialect == ShellDialect::None {
             return Err("Command blocked: configured runtime has no shell access".into());
         }
@@ -4305,6 +4457,19 @@ impl SecurityPolicy {
             && let Some(path) = self.forbidden_path_argument_for_shell(command, dialect)
         {
             return Err(format!("Command blocked: forbidden path argument: {path}"));
+        }
+
+        // cmd.exe runs a same-named file from its working directory before it
+        // consults PATH. The runtime's command builder disables that lookup in
+        // the child environment; refusing here as well names the shadowing file
+        // to the operator and holds if a spawner drops the variable. A wildcard
+        // allowlist has opted out of name-level admission and admits the
+        // explicit `.\name.bat` spelling anyway, so it skips the probe.
+        if dialect == ShellDialect::WindowsCmd
+            && !self.allowed_commands.iter().any(|c| c.trim() == "*")
+            && let Some(reason) = cmd_cwd_shadow_refusal(command, cwd)
+        {
+            return Err(reason);
         }
 
         if !self.is_command_allowed_for_shell(command, dialect) {
@@ -6969,12 +7134,29 @@ mod tests {
                     .is_err(),
                 "POSIX must not treat {command:?} as allowlisted git"
             );
-            assert!(
-                p.validate_command_execution_for_shell(command, false, ShellDialect::WindowsCmd)
-                    .is_ok(),
-                "cmd.exe semantics must remain available for {command:?}"
-            );
         }
+        assert!(
+            p.validate_command_execution_for_shell(
+                "git.exe status",
+                false,
+                ShellDialect::WindowsCmd
+            )
+            .is_ok(),
+            "cmd.exe must keep reading the executable suffix as part of the name"
+        );
+        // cmd.exe reads `attacker\git` as a path. A path names a file by its
+        // location, so the bare `git` entry does not vouch for it.
+        let error = p
+            .validate_command_execution_for_shell(
+                r"attacker\git status",
+                false,
+                ShellDialect::WindowsCmd,
+            )
+            .expect_err("a bare allowlist name must not admit a path-shaped executable");
+        assert!(
+            error.contains("Command not allowed by security policy"),
+            "{error}"
+        );
 
         assert_eq!(
             p.command_risk_level_for_shell(r"attacker\git commit", ShellDialect::Posix),
@@ -6983,6 +7165,338 @@ mod tests {
         assert_eq!(
             p.command_risk_level_for_shell(r"attacker\git commit", ShellDialect::WindowsCmd),
             CommandRiskLevel::Medium
+        );
+    }
+
+    #[test]
+    fn windows_dialects_refuse_path_shaped_executable_with_bare_allowlist_entry() {
+        let p = SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: tp_ws(),
+            allowed_commands: vec!["git".into()],
+            ..SecurityPolicy::default()
+        };
+
+        for dialect in [ShellDialect::WindowsCmd, ShellDialect::PowerShell] {
+            for command in [
+                r"attacker\git status",
+                r".\git.exe status",
+                "./git.exe status",
+                r"tools\git status",
+            ] {
+                let error = p
+                    .validate_command_execution_for_shell(command, true, dialect)
+                    .expect_err("a bare allowlist name must not admit a path-shaped executable");
+                assert!(
+                    error.contains("Command not allowed by security policy"),
+                    "{dialect:?} {command:?}: {error}"
+                );
+            }
+            for command in ["git status", "git.exe status"] {
+                assert!(
+                    p.validate_command_execution_for_shell(command, true, dialect)
+                        .is_ok(),
+                    "{dialect:?} must keep resolving {command:?} through PATH"
+                );
+            }
+        }
+
+        let error = p
+            .validate_command_execution_for_shell(
+                r".\git.bat status",
+                true,
+                ShellDialect::WindowsCmd,
+            )
+            .expect_err("a workspace batch file must not run as the allowlisted git");
+        assert!(
+            error.contains("Command not allowed by security policy"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn windows_dialects_accept_path_shaped_executable_with_equal_path_entry() {
+        let p = SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: tp_ws(),
+            allowed_commands: vec![r".\tools\git.exe".into()],
+            ..SecurityPolicy::default()
+        };
+
+        for dialect in [ShellDialect::WindowsCmd, ShellDialect::PowerShell] {
+            for command in [r".\tools\git.exe status", "./tools/git.exe status"] {
+                assert!(
+                    p.validate_command_execution_for_shell(command, true, dialect)
+                        .is_ok(),
+                    "{dialect:?}: a path entry must admit its own spelling {command:?}"
+                );
+            }
+            assert!(
+                p.validate_command_execution_for_shell(r".\other\git.exe status", true, dialect)
+                    .is_err(),
+                "{dialect:?}: a path entry must not admit a different path"
+            );
+            assert!(
+                p.validate_command_execution_for_shell("git status", true, dialect)
+                    .is_err(),
+                "{dialect:?}: a path entry must not admit the bare name"
+            );
+        }
+
+        let wildcard = SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: tp_ws(),
+            allowed_commands: vec!["*".into()],
+            ..SecurityPolicy::default()
+        };
+        assert!(
+            wildcard
+                .validate_command_execution_for_shell(
+                    r".\git.exe status",
+                    true,
+                    ShellDialect::WindowsCmd,
+                )
+                .is_ok(),
+            "the wildcard keeps admitting every executable spelling"
+        );
+    }
+
+    #[test]
+    fn windows_cmd_refuses_bare_command_shadowed_in_working_directory() {
+        const REFUSAL: &str = "Command blocked: working directory shadows command";
+
+        let shadowed = tempfile::tempdir().unwrap();
+        std::fs::write(shadowed.path().join("git.bat"), "@echo off\r\n").unwrap();
+        let clean = tempfile::tempdir().unwrap();
+        let p = SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: shadowed.path().to_path_buf(),
+            allowed_commands: vec!["git".into(), "echo".into()],
+            ..SecurityPolicy::default()
+        };
+
+        for command in ["git status", "echo hi && git status"] {
+            let error = p
+                .validate_command_execution_for_shell_in_dir(
+                    command,
+                    true,
+                    ShellDialect::WindowsCmd,
+                    shadowed.path(),
+                )
+                .expect_err("a working-directory file must not run as the allowlisted command");
+            assert!(error.contains(REFUSAL), "{command:?}: {error}");
+            assert!(
+                error.to_ascii_lowercase().contains("git.bat"),
+                "the refusal must name the shadowing file: {error}"
+            );
+        }
+        assert!(
+            p.validate_command_execution_for_shell_in_dir(
+                "echo hi",
+                true,
+                ShellDialect::WindowsCmd,
+                shadowed.path(),
+            )
+            .is_ok(),
+            "a command with no same-named file stays allowed"
+        );
+
+        // Only cmd.exe searches the working directory for a bare name.
+        for dialect in [ShellDialect::PowerShell, ShellDialect::Posix] {
+            assert!(
+                p.validate_command_execution_for_shell_in_dir(
+                    "git status",
+                    true,
+                    dialect,
+                    shadowed.path(),
+                )
+                .is_ok(),
+                "{dialect:?} does not run a working-directory file for a bare name"
+            );
+        }
+
+        // The probed directory is the one the caller will start the shell in.
+        // The workspace is only the default.
+        assert!(
+            p.validate_command_execution_for_shell_in_dir(
+                "git status",
+                true,
+                ShellDialect::WindowsCmd,
+                clean.path(),
+            )
+            .is_ok(),
+            "a clean working directory must not inherit the workspace's shadow"
+        );
+        let error = p
+            .validate_command_execution_for_shell("git status", true, ShellDialect::WindowsCmd)
+            .expect_err("the workspace is the default working directory");
+        assert!(error.contains(REFUSAL), "{error}");
+    }
+
+    #[test]
+    fn windows_cmd_shadow_refusal_skips_cmd_internal_commands() {
+        let workspace = tempfile::tempdir().unwrap();
+        for name in ["echo.bat", "git.bat"] {
+            std::fs::write(workspace.path().join(name), "@echo off\r\n").unwrap();
+        }
+        let p = SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: workspace.path().to_path_buf(),
+            allowed_commands: vec!["echo".into(), "git".into()],
+            ..SecurityPolicy::default()
+        };
+
+        // cmd.exe runs its own `echo` before it looks for any file, so the
+        // same-named script beside it changes nothing.
+        for command in ["echo hello", "ECHO hello"] {
+            assert!(
+                p.validate_command_execution_for_shell(command, true, ShellDialect::WindowsCmd)
+                    .is_ok(),
+                "{command:?} is an internal command and must not be refused"
+            );
+        }
+
+        // An external command in the same line is still checked.
+        let error = p
+            .validate_command_execution_for_shell(
+                "echo hello && git status",
+                true,
+                ShellDialect::WindowsCmd,
+            )
+            .expect_err("an external command must still be checked for a shadow");
+        assert!(
+            error.contains("Command blocked: working directory shadows command 'git'"),
+            "{error}"
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn cmd_internal_commands_are_not_shadowed_by_working_directory_files() {
+        use crate::platform::native::NO_DEFAULT_CURRENT_DIRECTORY_IN_EXE_PATH;
+
+        let dir = tempfile::tempdir().unwrap();
+        // `<name> /?` only prints help when cmd.exe implements the command
+        // itself. For any other name cmd.exe runs the planted script, which
+        // leaves a marker file.
+        let planted_script_ran = |name: &str| {
+            let marker = format!("ran-{name}.txt");
+            std::fs::write(
+                dir.path().join(format!("{name}.cmd")),
+                format!("@echo ran>{marker}\r\n"),
+            )
+            .unwrap();
+            std::process::Command::new("cmd.exe")
+                .args(["/d", "/c", &format!("{name} /?")])
+                .current_dir(dir.path())
+                // The premise under test is cmd.exe's own lookup order, so the
+                // spawn-time hardening stays off.
+                .env_remove(NO_DEFAULT_CURRENT_DIRECTORY_IN_EXE_PATH)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .unwrap();
+            dir.path().join(marker).exists()
+        };
+
+        assert!(
+            planted_script_ran("zc-not-a-cmd-command"),
+            "the probe must detect a name cmd.exe resolves to a file"
+        );
+        for name in CMD_INTERNAL_COMMANDS {
+            assert!(
+                !planted_script_ran(name),
+                "cmd.exe ran a working-directory file for `{name}`, so it is not internal"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_cmd_shadow_refusal_skipped_with_wildcard_allowlist() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("git.bat"), "@echo off\r\n").unwrap();
+        let p = SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: workspace.path().to_path_buf(),
+            allowed_commands: vec!["*".into()],
+            block_high_risk_commands: true,
+            ..SecurityPolicy::default()
+        };
+
+        // The wildcard admits `.\git.bat status` as written, so refusing the
+        // bare spelling would only block the honest form. The spawn-time
+        // hardening still keeps cmd.exe from running the file for `git`.
+        assert!(
+            p.validate_command_execution_for_shell("git status", true, ShellDialect::WindowsCmd)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn cmd_cwd_shadowing_executable_follows_pathext_and_case() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("git.bat"), "").unwrap();
+        std::fs::create_dir(dir.path().join("npm.cmd")).unwrap();
+        let exts =
+            |list: &[&str]| -> Vec<String> { list.iter().map(|ext| (*ext).to_string()).collect() };
+        let found = |word: &str, list: &[&str]| {
+            cmd_cwd_shadowing_executable(dir.path(), word, &exts(list))
+                .expect("the probe must be able to inspect the directory")
+                .map(|name| name.to_ascii_lowercase())
+        };
+
+        // `.BAT` from PATHEXT finds the lowercase file on a case-sensitive host.
+        assert_eq!(found("git", &[".EXE", ".BAT"]), Some("git.bat".to_string()));
+        assert_eq!(found("git", &[".EXE"]), None);
+        // A word that already carries an extension is tried as written.
+        assert_eq!(found("git.bat", &[]), Some("git.bat".to_string()));
+        // A directory of that name is never run.
+        assert_eq!(found("npm", &[".CMD"]), None);
+        // Path-shaped and empty words are not bare command names.
+        assert_eq!(found(r".\git", &[".BAT"]), None);
+        assert_eq!(found("sub/git", &[".BAT"]), None);
+        assert_eq!(found("", &[".BAT"]), None);
+    }
+
+    #[test]
+    fn windows_cmd_shadow_probe_error_refuses_instead_of_passing() {
+        let dir = tempfile::tempdir().unwrap();
+        // No filesystem accepts a name this long, so the probe cannot tell
+        // whether a shadowing file exists.
+        let word = "a".repeat(300);
+        assert!(
+            cmd_cwd_shadowing_executable(dir.path(), &word, &[".BAT".to_string()]).is_err(),
+            "an uninspectable candidate must surface as an error, not as absent"
+        );
+
+        let p = SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: dir.path().to_path_buf(),
+            allowed_commands: vec![word.clone()],
+            ..SecurityPolicy::default()
+        };
+        let error = p
+            .validate_command_execution_for_shell(&word, true, ShellDialect::WindowsCmd)
+            .expect_err("a probe that cannot run must refuse the command");
+        assert!(
+            error.contains("could not check the working directory"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn parse_windows_pathext_defaults_when_unset_or_blank() {
+        let default: Vec<String> = DEFAULT_WINDOWS_PATHEXT
+            .split(';')
+            .map(str::to_owned)
+            .collect();
+        assert!(default.iter().any(|ext| ext == ".BAT"));
+        assert_eq!(parse_windows_pathext(None), default);
+        assert_eq!(parse_windows_pathext(Some("  ")), default);
+        assert_eq!(
+            parse_windows_pathext(Some(".EXE; .CMD;;bad;.")),
+            vec![".EXE".to_string(), ".CMD".to_string()]
         );
     }
 
