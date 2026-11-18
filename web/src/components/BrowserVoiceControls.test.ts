@@ -900,10 +900,14 @@ test('a late completion from cancelled narration cannot clear replacement playba
     const speaker = () => renderer.root.findAllByType('button')[1]!;
     await act(async () => { speaker().props.onClick(); });
     const cancelled = spokenUtterance!;
+    const lateEnd = cancelled.onend;
+    const lateError = cancelled.onerror;
+    assert.equal(typeof lateEnd, 'function');
+    assert.equal(typeof lateError, 'function');
     await act(async () => { speaker().props.onClick(); });
     await act(async () => { speaker().props.onClick(); });
     assert.notEqual(spokenUtterance, cancelled);
-    await act(async () => { cancelled.onend?.(); cancelled.onerror?.(); });
+    await act(async () => { lateEnd!(); lateError!(); });
     assert.equal(speaker().props['aria-busy'], true);
     await act(async () => { await renderer.root.findAllByType('button')[0]!.props.onClick(); });
     assert.equal(renderer.root.findAllByType('button')[0]!.props['aria-pressed'], true);
