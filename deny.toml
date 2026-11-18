@@ -24,6 +24,14 @@ ignore = [
     # crate, so the lockfile cannot carry the fix yet. Drop this entry in the
     # rusqlite 0.41 bump; #12320 tracks it.
     { id = "RUSTSEC-2026-0459", reason = "libsqlite3-sys 0.38.2 bundles SQLite 3.53.2 (CVE-2026-119375, local, needs a crafted db and -wal pair); the 0.39 fix needs rusqlite 0.41, unreachable while matrix-sdk-sqlite 0.19.1 requires rusqlite 0.40.2; #12320" },
+    # chrono and chrono-tz -- unmaintained, every version affected, and neither
+    # advisory lists a patched release, so no version satisfies this check.
+    # chrono 0.4.45 is a direct dependency of 11 workspace crates and also comes
+    # in through async-imap 0.11.3, cron 0.15.0, oauth2 5.0.0 and chrono-tz.
+    # chrono-tz 0.10.4 is used only by zeroclaw-runtime. A temporary waiver, not
+    # a fix: drop both entries when the replacement tracked in #12505 lands.
+    { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained, all versions affected, no patched release; direct dependency of 11 workspace crates, also via async-imap, cron, oauth2 and chrono-tz; temporary until the replacement lands, tracked in #12505" },
+    { id = "RUSTSEC-2026-0555", reason = "chrono-tz unmaintained, all versions affected, no patched release; used only by zeroclaw-runtime; temporary until the replacement lands, tracked in #12505" },
 ]
 
 [licenses]
