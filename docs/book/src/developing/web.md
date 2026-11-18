@@ -116,6 +116,12 @@ may manage registered devices through the operator routes; non-administrators
 are refused. The selector shows each record’s saved voice; choosing/sampling
 available OS voices is performed in that device’s own browser.
 
+Within one dashboard page, split chat panes and the settings preview share
+browser-audio ownership. Microphone capture waits while another pane is
+speaking, and narration waits while any pane is capturing speech. Capture end
+or cancellation releases that ownership. Other browser tabs and applications
+are outside this page-local coordination.
+
 Dictation defaults to on-device recognition. It requires HTTPS (or localhost),
 a compatible browser, microphone permission, and an available language pack.
 Downloading a pack requires an explicit action. An unavailable local recognizer
