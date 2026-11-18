@@ -81,8 +81,8 @@ function VoiceControls({ messages, hydrated, typing, onTranscript, onSilence, ca
     if (!readable) return false;
     const next = new SpeechSynthesisUtterance(readable);
     next.voice = voice; next.lang = prefs.language; next.rate = prefs.rate;
-    next.onend = () => { utterance.current = null; setSpeaking(false); releaseVoice(next); };
-    next.onerror = () => { utterance.current = null; setSpeaking(false); releaseVoice(next); setError(t('voice.speech_error')); };
+    next.onend = () => { if (utterance.current !== next) return; utterance.current = null; setSpeaking(false); releaseVoice(next); };
+    next.onerror = () => { if (utterance.current !== next) return; utterance.current = null; setSpeaking(false); releaseVoice(next); setError(t('voice.speech_error')); };
     if (!playVoice(next)) return false;
     utterance.current = next; setSpeaking(true); setError('');
     return true;
