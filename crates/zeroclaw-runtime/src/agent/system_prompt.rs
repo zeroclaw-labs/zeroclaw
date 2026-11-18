@@ -1343,7 +1343,7 @@ mod tests {
 
     #[test]
     fn prompt_budget_cap_bootstrap_prompt_stays_within_cap() {
-        // Incident regression (2026-10-20 firstcontact flood): a non-compact
+        // Incident regression (#11908): a non-compact
         // profile with an oversized workspace must still hand the model a
         // prompt inside max_system_prompt_chars — 563K system chars against a
         // 40K-token budget is exactly the failure this gate closes.

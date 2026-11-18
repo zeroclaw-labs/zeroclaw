@@ -1367,8 +1367,8 @@ history-trim-reason-recovery = context window overflow recovery
 history-trim-floor-exceeds-budget = system prompt and tool definitions ({$floor} tokens) alone meet or exceed the context budget ({$budget} tokens); raise [runtime_profiles.<name>] max_context_tokens or reduce the tool surface by disabling unused integrations
 # Refusal returned to the user when the non-droppable system floor alone meets
 # or exceeds the context token budget, so the request is not sent to the model
-# at all (2026-10-20 firstcontact context flood: warning-only let a 563K-char
-# system prompt reach the provider against a 40K-token budget).
+# at all (incident #11908: warning-only let a 563K-char system prompt reach
+# the provider against a 40K-token budget).
 turn-system-floor-exceeds-budget-error = This request was not sent: the system prompt and tool definitions alone ({$floor} tokens) exceed this agent's context budget ({$budget} tokens). Raise [runtime_profiles.<name>] max_context_tokens or shrink the system prompt (workspace bootstrap files, enabled tools, skills).
 # Refusal returned when the ingress policy layer (RFC #6971) drops an inbound
 # turn before it reaches the model. Unreachable under the default `Loop` policy
