@@ -55556,10 +55556,11 @@ mod scoped_http_origin_regressions {
                 Some(expected)
             );
         }
-        assert!(
-            ScopedHttpCredential::password_service("https://api.example.com./v1").is_none()
+        assert!(ScopedHttpCredential::password_service("https://api.example.com./v1").is_none());
+        assert_eq!(
+            ScopedHttpCredential::password_service("https://api.example.com./").as_deref(),
+            Some("https://api.example.com")
         );
-        assert_eq!(ScopedHttpCredential::password_service("https://api.example.com./").as_deref(), Some("https://api.example.com"));
         assert!(ScopedHttpCredential::https_origin("https://./").is_none());
     }
 }
