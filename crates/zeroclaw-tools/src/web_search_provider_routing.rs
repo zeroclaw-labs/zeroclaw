@@ -9,6 +9,7 @@ pub enum WebSearchProviderRoute {
     AnySearch,
     Serply,
     Keenable,
+    Parallel,
 }
 
 /// Provider HTTP-failure status surfaced to the agent via the error message's
@@ -103,6 +104,11 @@ pub fn resolve_web_search_provider(raw_model_provider: &str) -> WebSearchProvide
         "keenable" | "keenable-search" | "keenable_search" => WebSearchProviderResolution {
             route: WebSearchProviderRoute::Keenable,
             canonical_provider: KEENABLE_PROVIDER,
+            used_fallback: false,
+        },
+        "parallel" => WebSearchProviderResolution {
+            route: WebSearchProviderRoute::Parallel,
+            canonical_provider: "parallel",
             used_fallback: false,
         },
         // Warns for unknown model_providers, falls back to default.
@@ -228,6 +234,14 @@ mod tests {
             assert_eq!(resolved.canonical_provider, KEENABLE_PROVIDER);
             assert!(!resolved.used_fallback);
         }
+    }
+
+    #[test]
+    fn resolves_parallel() {
+        assert_eq!(
+            resolve_web_search_provider("parallel").route,
+            WebSearchProviderRoute::Parallel
+        );
     }
 
     #[test]
