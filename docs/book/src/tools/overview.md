@@ -181,6 +181,17 @@ HTTP call and is never saved to the ZeroClaw configuration. The alias and refere
 are stored in the encrypted local record. Rotate external values at their source.
 Deleting an alias removes the ZeroClaw binding.
 
+Credential records and grants must be changed through the dedicated operator
+credential API. Generic gateway configuration writes and RPC configuration
+writes (including `config/set`, `config/set-many`, and retained map mutations)
+cannot change this catalog, even when a principal has a broader configuration
+write selector. A rejected batch saves none of its changes.
+
+Authenticated response redaction inspects decoded JSON strings in ordinary
+JSON and wrapped or streamed replies, including JSONP and NDJSON, alongside
+literal values in text. Malformed quotation runs are scanned in linear time.
+This does not make remote content trusted instructions.
+
 ### AnySearch provider
 
 AnySearch is an explicit, opt-in backend for `web_search_tool`:
