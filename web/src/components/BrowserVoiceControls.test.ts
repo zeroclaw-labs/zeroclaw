@@ -819,7 +819,7 @@ test('OIDC voice settings enable chat controls without pairing and isolate accou
     const speaker = chat.root.findAllByType('button')[1]!;
     await act(async () => { speaker.props.onClick(); });
     assert.equal(chat.root.findByProps({ role: 'alert' }).props.children,
-      'Browser audio is busy in another pane. Try again after it ends.');
+      'Browser audio is busy. Stop dictation or reading and try again.');
     await act(async () => { sample?.onend?.(); });
     await act(async () => { speaker.props.onClick(); });
     assert.deepEqual(spoken, ['Historical reply']);
