@@ -63,13 +63,9 @@ fn redact_response_body(
     // Validate without materializing numbers, preserving integers larger than
     // u64 and avoiding global serde_json numeric feature changes.
     let mut decoder = serde_json::Deserializer::from_str(&body);
-    if <serde::de::IgnoredAny as serde::Deserialize>::deserialize(&mut decoder)
+    let is_json = <serde::de::IgnoredAny as serde::Deserialize>::deserialize(&mut decoder)
         .and_then(|_| decoder.end())
-        .is_err()
-    {
-        // A literal credential may span quotation marks in text or HTML.
-        return redact(&body);
-    }
+        .is_ok();
 
     // Redact decoded JSON strings and scalar tokens without changing syntax
     // or escape sequences. Preserve every unrelated numeric token verbatim.
@@ -94,17 +90,27 @@ fn redact_response_body(
                 let token = &body[start..cursor];
                 if let Ok(decoded) = serde_json::from_str::<String>(token) {
                     let redacted = redact(&decoded);
-                    if redacted == decoded {
+                    if redacted == decoded && !is_json {
+                        // Every quote can begin a JSON string in an arbitrary
+                        // wrapper; an unrelated pair must not consume it.
+                        output.push('"');
+                        cursor = start + 1;
+                    } else if redacted == decoded {
                         output.push_str(token);
                     } else {
                         // Serializing a String cannot fail.
                         output.push_str(&serde_json::to_string(&redacted).expect("JSON string"));
                     }
-                } else {
+                } else if is_json {
                     output.push_str(token);
+                } else {
+                    // Invalid surrounding text must not hide a later valid
+                    // JSON string, e.g. an HTML attribute or a partial reply.
+                    output.push('"');
+                    cursor = start + 1;
                 }
             }
-            b'-' | b'0'..=b'9' | b't' | b'f' | b'n' => {
+            b'-' | b'0'..=b'9' | b't' | b'f' | b'n' if is_json => {
                 cursor += 1;
                 while cursor < bytes.len()
                     && matches!(
@@ -131,7 +137,13 @@ fn redact_response_body(
             }
         }
     }
-    output
+    if is_json {
+        output
+    } else {
+        // JSONP, NDJSON and malformed replies still need decoded-string
+        // scrubbing above, plus literal replacement across quotation marks.
+        redact(&output)
+    }
 }
 
 impl HttpRequestTool {
@@ -2557,6 +2569,42 @@ api_token = "Bearer from-secret"
         assert_eq!(parsed["authorization"], "Bearer secret");
         assert_eq!(parsed["x-api-key"], "my-key");
         assert_eq!(parsed["content-type"], "application/json");
+    }
+
+    #[test]
+    fn authenticated_non_json_redacts_escaped_strings() {
+        let secret = "secret123";
+        for body in [
+            r#"callback({"token":"\u0073ecret123"})"#,
+            r#"{"token":"\u0073ecret123","unfinished": "#,
+            r#"<p title="bad\q">{"token":"\u0073ecret123"}</p>"#,
+        ] {
+            let output = redact_response_body(
+                body.into(),
+                &|text| text.replace(secret, "[REDACTED]"),
+                true,
+            );
+            assert!(!output.contains(secret));
+            assert!(!output.contains(r"\u0073ecret123"));
+            assert!(output.contains("[REDACTED]"), "{output}");
+        }
+    }
+
+    #[test]
+    fn authenticated_ndjson_redacts_decoded_secrets_in_each_record() {
+        let secret = "abc\"def";
+        let body = "{\"message\":\"abc\\\"def\"}\n{\"message\":\"abc\\u0022def\"}";
+        let output = redact_response_body(
+            body.into(),
+            &|text| text.replace(secret, "[REDACTED]"),
+            true,
+        );
+        let rows: Vec<serde_json::Value> = output
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|row| row["message"] == "[REDACTED]"));
     }
 
     #[test]
