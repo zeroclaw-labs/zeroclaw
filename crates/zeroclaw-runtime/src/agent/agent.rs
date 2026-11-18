@@ -4234,7 +4234,7 @@ impl Agent {
             && selected_route.kind == zeroclaw_providers::router::RouteResolutionKind::MatchedHint
         {
             let config = self.full_config().ok_or_else(|| {
-                anyhow::anyhow!("a supplied model route requires the agent's config snapshot")
+                anyhow::Error::msg("a supplied model route requires the agent's config snapshot")
             })?;
             let scoped_config = selection
                 .allowed_provider_refs
@@ -24335,6 +24335,7 @@ mod capability_construction_tests {
     #[tokio::test]
     async fn supplied_effort_route_selects_the_provider_and_model_for_both_turn_paths() {
         use crate::composition::{ProviderRequest, ProviderSource};
+        use std::sync::atomic::{AtomicUsize, Ordering};
         use zeroclaw_config::schema::{ModelRouteConfig, RuntimeProfileConfig};
 
         struct EchoProvider(String);
@@ -24358,7 +24359,10 @@ mod capability_construction_tests {
                 Ok(format!("{} served {model}", self.0))
             }
         }
-        struct RouteSource(PrincipalId);
+        struct RouteSource {
+            principal: PrincipalId,
+            routed_requests: AtomicUsize,
+        }
         impl ProviderSource for RouteSource {
             fn model_provider(
                 &self,
@@ -24366,10 +24370,11 @@ mod capability_construction_tests {
             ) -> Result<Arc<dyn ModelProvider>> {
                 let reference = request.provider_ref.unwrap_or("default");
                 if reference != "default" {
+                    self.routed_requests.fetch_add(1, Ordering::Relaxed);
                     assert_eq!(reference, "openai.smart");
                     assert_eq!(request.model, Some("local-model"));
                     assert_eq!(request.agent_alias, "test-agent");
-                    assert_eq!(request.principal, Some(&self.0));
+                    assert_eq!(request.principal, Some(&self.principal));
                     assert!(
                         request
                             .config
@@ -24395,7 +24400,7 @@ mod capability_construction_tests {
             ) -> Result<Arc<dyn ModelProvider>> {
                 assert_eq!(request.provider_ref, Some("openai.fast"));
                 assert_eq!(request.model, Some("local-model"));
-                assert_eq!(request.principal, Some(&self.0));
+                assert_eq!(request.principal, Some(&self.principal));
                 Ok(Arc::new(EchoProvider("switched".into())))
             }
         }
@@ -24429,8 +24434,12 @@ mod capability_construction_tests {
         );
         config.agents.get_mut("test-agent").unwrap().runtime_profile = "effort".into();
         let principal = PrincipalId::for_oidc("https://issuer.example", "subject-1");
+        let source = Arc::new(RouteSource {
+            principal: principal.clone(),
+            routed_requests: AtomicUsize::new(0),
+        });
         let caps = RuntimeCapabilities {
-            providers: Arc::new(RouteSource(principal.clone())),
+            providers: source.clone(),
             ..capabilities(
                 Arc::new(RecordingProviders::default()),
                 Arc::new(RecordingMemory::default()),
@@ -24444,9 +24453,11 @@ mod capability_construction_tests {
             agent.turn("hello").await.unwrap(),
             "openai.smart served local-model"
         );
+        assert_eq!(source.routed_requests.load(Ordering::Relaxed), 1);
         let (tx, _events) = tokio::sync::mpsc::channel(256);
         let (reply, _) = agent.turn_streamed("hello", tx, None).await.unwrap();
         assert_eq!(reply, "openai.smart served local-model");
+        assert_eq!(source.routed_requests.load(Ordering::Relaxed), 2);
         assert_eq!(
             agent.model_provider.alias(),
             "default",
