@@ -35,7 +35,7 @@ tool blocks the PR. What actually fails each tool differs by category:
 - **`cargo audit`** (bare, no `--deny warnings`): vulnerability
   advisories are errors (exit 1); informational and unmaintained
   advisories are reported as allowed warnings and exit 0.
-- **`cargo deny check advisories`**: vulnerability *and* unmaintained advisories for crates in the resolved graph are errors (exit 1). That is why the live unmaintained exceptions for `rustls-pemfile`, `anymap2` and `pin-utils` remain in `deny.toml`. A stale graph-ignore instead emits `advisory-not-detected`, which is a warning (exit 0); it is never triggered by removing an entry from `.cargo/audit.toml`.
+- **`cargo deny check advisories`**: vulnerability *and* unmaintained advisories for crates in the resolved graph are errors (exit 1). That is why the live unmaintained exceptions for `rustls-pemfile`, `anymap2`, `pin-utils`, `chrono` and `chrono-tz` remain in `deny.toml`. A stale graph-ignore instead emits `advisory-not-detected`, which is a warning (exit 0); it is never triggered by removing an entry from `.cargo/audit.toml`.
 
 An audit-only ignore is needed by `cargo audit` but not by `cargo deny`
 under its configured graph. That describes tool scope, not advisory
@@ -123,6 +123,8 @@ Live, deny-only:
 
 - **`anymap2` (`RUSTSEC-2026-0319`)**: unmaintained; `matrix-sdk 0.19.1` still depends on it, with no replacement SDK release available. The advisory recommends `anymap3`. Only `deny.toml` needs an exception because the configured `cargo audit` invocation treats this maintenance advisory as an allowed warning. Remove the exception once the resolved dependency graph no longer includes an affected `anymap2`. Tracking #11429.
 - **`pin-utils` (`RUSTSEC-2026-0441`)**: unmaintained; its only path is `async-imap` 0.11.3, used by `zeroclaw-channels` and `zeroclaw-tools`, and the latest release, `async-imap` 0.12.0, still depends on it, so no upgrade removes it today. Only `deny.toml` needs an exception because the configured `cargo audit` invocation treats this maintenance advisory as an allowed warning. Remove the exception once the resolved dependency graph no longer includes `pin-utils`, through an `async-imap` release without it or a move off `async-imap`. Tracking #12252.
+- **`chrono` (`RUSTSEC-2026-0543`)**: unmaintained; all versions are affected and the advisory lists no patched release, so no version satisfies `cargo deny`. `chrono` 0.4.45 is a direct dependency of 11 workspace crates and also comes in through `async-imap` 0.11.3, `cron` 0.15.0, `oauth2` 5.0.0 and `chrono-tz`. The advisory recommends `jiff` or `time`. Only `deny.toml` needs an exception because the configured `cargo audit` invocation treats this maintenance advisory as an allowed warning. This is a temporary waiver, not a fix: remove it when the replacement lands. Where a third-party crate still brings `chrono` in after the workspace moves off it, the exception stays until that path is gone too. Tracking #12505.
+- **`chrono-tz` (`RUSTSEC-2026-0555`)**: unmaintained; all versions are affected and the advisory lists no patched release. `chrono-tz` 0.10.4 is used only by `zeroclaw-runtime`. Only `deny.toml` needs an exception, for the same reason as `chrono`. Remove it with the `chrono` exception, when the replacement lands. Tracking #12505.
 
 ### Audit-only inventory (scope, not severity)
 
@@ -221,6 +223,7 @@ unaffected by the advisory):
   workspace moves to `rusqlite` 0.41 and `libsqlite3-sys` 0.39.1 or later,
   which needs a `matrix-sdk-sqlite` release that accepts `rusqlite` 0.41.
   That change removes the waiver from both files.
+- **#12505**: *Track replacement of unmaintained chrono and chrono-tz dependencies.* Owns the `chrono` (RUSTSEC-2026-0543) and `chrono-tz` (RUSTSEC-2026-0555) exceptions, both present only in `deny.toml`. It stays open until the workspace and its dependencies no longer pull either crate into the resolved graph; that change removes both exceptions and updates this inventory.
 - **#8059**: *Policy cleanup: deny.toml ignored-advisory tracking,
   multiple-versions, wildcards.* piiiico's RFC on adding per-entry
   rationale to `deny.toml` ignore blocks. This doc is the
@@ -255,6 +258,15 @@ two tools have drifted again. Open or update the tracking issue.
 
 ## Change log
 
+- 2026-11-17: Added `RUSTSEC-2026-0543` (`chrono`) and `RUSTSEC-2026-0555`
+  (`chrono-tz`) to `deny.toml` only, with their deny-only entries above.
+  - **Why a waiver:** both advisories were assigned their IDs in the
+    advisory database on 2026-11-17 and from then failed `cargo deny check`
+    in the `Security` job on every build. Neither
+    lists a patched release, and replacing the crates is a migration of its
+    own, tracked in #12505.
+  - **Why only `deny.toml`:** bare `cargo audit` reports both as allowed
+    warnings (exit 0), as it does for `anymap2` and `pin-utils`.
 - 2026-11-09: Added `RUSTSEC-2026-0459` (`libsqlite3-sys` 0.38.2, bundled
   SQLite 3.53.2, CVE-2026-119375) to both files, with its category 1 entry
   above.
