@@ -50,6 +50,12 @@ When a turn owns a host SSH broker, the built-in shell refuses commands under
 an OS sandbox, including ordinary non-SSH commands. Unrelated turns without
 a broker remain governed by the configured sandbox policy.
 
+Foreground parallel delegates awaited by the current turn reuse its SSH task
+owner. Tokio workers restore the captured task identity before entering their
+loop, so they do not silently start another helper with a different agent.
+The parent retains the lease and closes it at the task boundary. Detached
+background jobs do not inherit this owner and keep their own lifetime.
+
 ## Trust and credentials
 
 The Python helper uses the operator-configured SSH agent. Catalog aliases and
