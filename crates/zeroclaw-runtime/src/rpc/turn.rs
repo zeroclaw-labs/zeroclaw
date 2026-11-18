@@ -109,6 +109,39 @@ where
     F: Fn(TurnEvent) -> Fut + Send + 'static,
     Fut: std::future::Future<Output = ()> + Send,
 {
+    execute_turn_prepared(
+        agent,
+        prompt,
+        cancel,
+        attribution,
+        cost_context,
+        connection_activity,
+        steering_rx,
+        admission,
+        (|guard| async { Ok(guard) }, on_event),
+    )
+    .await
+}
+
+pub async fn execute_turn_prepared<F, Fut, P, Prep>(
+    agent: Arc<Mutex<Agent>>,
+    prompt: String,
+    cancel: CancellationToken,
+    attribution: TurnAttribution,
+    cost_context: Option<ToolLoopCostTrackingContext>,
+    connection_activity: Option<crate::rpc::ConnectionActivity>,
+    steering_rx: Option<mpsc::Receiver<crate::agent::SteeringInput>>,
+    admission: Option<TurnAdmission>,
+    callbacks: (P, F),
+) -> Result<TurnOutcome, TurnError>
+where
+    F: Fn(TurnEvent) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send,
+    P: FnOnce(tokio::sync::OwnedMutexGuard<Agent>) -> Prep + Send + 'static,
+    Prep: std::future::Future<Output = Result<tokio::sync::OwnedMutexGuard<Agent>, StreamedTurnError>>
+        + Send,
+{
+    let (prepare, on_event) = callbacks;
     let (event_tx, mut event_rx) = mpsc::channel::<TurnEvent>(64);
     let cancel_clone = cancel.clone();
     let session_key = attribution.session_key.clone();
@@ -120,7 +153,8 @@ where
         // it, and the reload drain must not read zero while it does.
         let _connection_activity = connection_activity;
         let mut steering_rx = steering_rx;
-        let mut guard = agent.lock().await;
+        let guard = agent.lock_owned().await;
+        let mut guard = prepare(guard).await?;
         // Judged on this guard, with no await before the turn starts under
         // it: every earlier check predates at least this lock wait.
         if let Some(admit) = admission
@@ -369,13 +403,18 @@ fn outcome_from_task_result(
                 crate::agent::terminal_completion_error_message(&error, None)
             {
                 return Err(TurnError::TerminalCompletion {
-                    diagnostic: error.to_string(),
+                    diagnostic: safe_turn_diagnostic(&error),
                     user_message,
                 });
             }
-            Err(TurnError::AgentError(error.to_string()))
+            Err(TurnError::AgentError(safe_turn_diagnostic(&error)))
         }
     }
+}
+
+/// Scrub the diagnostic shared by logs, turn-completion events, and RPC errors.
+fn safe_turn_diagnostic(error: &anyhow::Error) -> String {
+    crate::security::scrub(&crate::agent::loop_::scrub_credentials(&error.to_string()))
 }
 
 /// Why [`drain_until_done_or_cancelled`] returned. `ExplicitCancel` is an
@@ -1129,11 +1168,92 @@ mod tests {
             new_messages: Vec::new(),
         };
         let outcome = outcome_from_task_result(Err(err), String::new());
-        assert!(
-            matches!(outcome, Err(TurnError::AgentError(_))),
-            "a genuine agent failure must surface as an error, not a silent \
-             cancel"
+        let Err(TurnError::AgentError(message)) = outcome else {
+            panic!("a genuine agent failure must surface as an error, not a silent cancel");
+        };
+        assert_eq!(message, "provider exploded");
+    }
+
+    #[test]
+    fn cancellation_with_settlement_failure_is_visible_as_an_error() {
+        let error = crate::agent::cost::with_settlement_failure(
+            anyhow::Error::new(crate::agent::loop_::ToolLoopCancelled),
+            anyhow::Error::msg("fixture settlement failed"),
         );
+        let outcome = outcome_from_task_result(
+            Err(StreamedTurnError {
+                error,
+                committed_response: String::new(),
+                new_messages: Vec::new(),
+            }),
+            String::new(),
+        );
+        let Err(TurnError::AgentError(message)) = outcome else {
+            panic!("combined failure must not become a silent cancellation");
+        };
+        assert!(message.contains("tool loop cancelled"));
+        assert!(message.contains("fixture settlement failed"));
+    }
+
+    #[test]
+    fn combined_turn_error_redacts_credentials_at_rpc_boundary() {
+        let error = crate::agent::cost::with_settlement_failure(
+            anyhow::Error::msg("provider failed token=QWxhZGRpbjpvcGVuIHNlc2FtZQ=="),
+            anyhow::Error::msg("fixture settlement failed"),
+        );
+        let outcome = outcome_from_task_result(
+            Err(StreamedTurnError {
+                error,
+                committed_response: String::new(),
+                new_messages: Vec::new(),
+            }),
+            String::new(),
+        );
+        let Err(TurnError::AgentError(message)) = outcome else {
+            panic!("combined failure must remain an error");
+        };
+        assert!(message.contains("provider failed"));
+        assert!(message.contains("fixture settlement failed"));
+        assert!(message.contains("[REDACTED"));
+        assert!(!message.contains("IHNlc2FtZQ"));
+    }
+
+    #[test]
+    fn ordinary_turn_diagnostics_redact_secrets_without_changing_clean_text() {
+        let secret = anyhow::Error::msg("provider failed token=QWxhZGRpbjpvcGVuIHNlc2FtZQ==");
+        let diagnostic = safe_turn_diagnostic(&secret);
+        assert!(diagnostic.contains("provider failed"));
+        assert!(diagnostic.contains("[REDACTED"));
+        assert!(!diagnostic.contains("IHNlc2FtZQ"));
+
+        let clean = "provider returned 400: max_tokens: 4096 exceeds limit";
+        assert_eq!(safe_turn_diagnostic(&anyhow::Error::msg(clean)), clean);
+    }
+
+    #[test]
+    fn terminal_completion_redacts_diagnostic_but_preserves_delivery_text() {
+        let expected = crate::agent::semantic_empty_terminal_completion_message(None);
+        let error =
+            anyhow::Error::new(zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion)
+                .context("provider failed token=QWxhZGRpbjpvcGVuIHNlc2FtZQ==");
+        let outcome = outcome_from_task_result(
+            Err(StreamedTurnError {
+                error,
+                committed_response: String::new(),
+                new_messages: Vec::new(),
+            }),
+            String::new(),
+        );
+        let Err(TurnError::TerminalCompletion {
+            diagnostic,
+            user_message,
+        }) = outcome
+        else {
+            panic!("terminal completion must retain its delivery message");
+        };
+        assert!(diagnostic.contains("[REDACTED"));
+        assert!(!diagnostic.contains("IHNlc2FtZQ"));
+        assert_eq!(user_message, expected);
     }
 
     #[test]

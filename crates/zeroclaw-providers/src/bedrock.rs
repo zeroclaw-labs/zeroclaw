@@ -668,6 +668,17 @@ struct ConverseResponse {
     usage: Option<BedrockUsage>,
 }
 
+impl crate::dispatch::accounting::ObserveRejectedStringWire for ConverseResponse {
+    fn observe_rejected_usage(wire: &serde_json::Value) {
+        crate::dispatch::accounting::observe_string_usage_fields(
+            wire.get("usage"),
+            "inputTokens",
+            "outputTokens",
+            None,
+        );
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct BedrockUsage {
@@ -1636,10 +1647,13 @@ impl BedrockModelProvider {
         };
 
         if !response.status().is_success() {
-            return Err(super::api_error("Bedrock", response).await);
+            return Err(
+                super::string_wire_api_error::<ConverseResponse>("Bedrock", response).await,
+            );
         }
 
-        let converse_response: ConverseResponse = response.json().await?;
+        let crate::dispatch::accounting::StringWireResponse(converse_response) =
+            response.json().await?;
         Ok(converse_response)
     }
 }
@@ -2144,7 +2158,7 @@ mod tests {
             Missing,
             Complete(Option<u64>, Option<u64>),
             Invalid(InvalidUsageReason, Option<u64>, Option<u64>),
-            Unknown,
+            RejectMalformed,
         }
         let cases = vec![
             (None, Expected::Missing),
@@ -2172,15 +2186,15 @@ mod tests {
             ),
             (
                 Some(json!({"inputTokens":"8","outputTokens":3})),
-                Expected::Unknown,
+                Expected::RejectMalformed,
             ),
             (
                 Some(json!({"inputTokens":-1,"outputTokens":3})),
-                Expected::Unknown,
+                Expected::RejectMalformed,
             ),
             (
                 Some(json!({"inputTokens":1.8446744073709552e19,"outputTokens":3})),
-                Expected::Unknown,
+                Expected::RejectMalformed,
             ),
         ];
         for (usage, expected) in cases {
@@ -2236,8 +2250,18 @@ mod tests {
                     assert_eq!(*actual, reason);
                     assert_eq!((observed.input_tokens, observed.output_tokens), (i, o));
                 }
-                (Expected::Unknown, AttemptUsageOutcome::OutcomeUnknown { observed: None }) => {
-                    assert!(result.is_err())
+                (
+                    Expected::RejectMalformed,
+                    AttemptUsageOutcome::Invalid {
+                        observed,
+                        reason: InvalidUsageReason::MalformedUsage,
+                    },
+                ) => {
+                    assert!(result.is_err());
+                    assert_eq!(
+                        (observed.input_tokens, observed.output_tokens),
+                        (None, Some(3))
+                    );
                 }
                 (_, actual) => panic!("unexpected Bedrock outcome: {actual:?}"),
             }
@@ -2337,6 +2361,11 @@ mod tests {
                 false,
             ),
             (
+                json!({"message":"fixture rejection","usage":{"inputTokens":8,"outputTokens":3}}),
+                StatusCode::TOO_MANY_REQUESTS,
+                false,
+            ),
+            (
                 json!({"output":{"message":{"content":"invalid"}}}),
                 StatusCode::OK,
                 false,
@@ -2367,6 +2396,11 @@ mod tests {
             assert_eq!(report.attempts().len(), 1);
             assert!(report.accepted_route().is_none());
             match report.attempts()[0].outcome() {
+                AttemptUsageOutcome::Complete(u) if status == StatusCode::TOO_MANY_REQUESTS => {
+                    assert_eq!((u.input_tokens, u.output_tokens), (Some(8), Some(3)));
+                    assert_eq!(report.rejected_attempts().len(), 1);
+                }
+                AttemptUsageOutcome::Missing if status == StatusCode::BAD_REQUEST => (),
                 AttemptUsageOutcome::OutcomeUnknown { observed: Some(u) } if lower_bound => {
                     assert_eq!((u.input_tokens, u.output_tokens), (Some(8), Some(3)))
                 }

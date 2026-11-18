@@ -1380,7 +1380,12 @@ async fn assert_matrix_fenced_parent_failure_delivery(
             assert_eq!(
                 parked[0].1.content,
                 format!(
-                    "⚠️ Error: Goal failure lost its execution fence: Goal parent operation failed: {unsettled_diagnostic}"
+                    concat!(
+                        "⚠️ Error: Goal failure lost its execution fence: ",
+                        "Goal accounting is incomplete: an earlier Goal model call has not settled; ",
+                        "no further Goal model call will be admitted: Goal parent operation failed: {}"
+                    ),
+                    unsettled_diagnostic
                 ),
                 "the handed aggregate has its own exact warning role; {diagnostic}"
             );
@@ -5411,6 +5416,7 @@ forward_matrix_audit_registry! {
     resume_session_goal(task_id: &str, session_id: &str, epoch: i64, owner_pid: u32, boot_id: &str) -> anyhow::Result<zeroclaw_goal::GoalTransitionResult>;
     finish_session_goal(task_id: &str, session_id: &str, epoch: i64, status: zeroclaw_api::task::TaskStatus, error: Option<String>) -> anyhow::Result<zeroclaw_goal::GoalTransitionResult>;
     admit_pending_operation(task_id: &str, session_id: &str, epoch: i64, call_id: &str) -> anyhow::Result<zeroclaw_goal::GoalTransitionResult>;
+    begin_operation_dispatch(task_id: &str, session_id: &str, epoch: i64, call_id: &str) -> anyhow::Result<Option<zeroclaw_goal::task::GoalDispatchStart>>;
     settle_pending_operation(task_id: &str, session_id: &str, epoch: i64, call_id: &str, state: zeroclaw_goal::GoalAccountingState) -> anyhow::Result<zeroclaw_goal::GoalTransitionResult>;
     update_session_goal_limits(task_id: &str, session_id: &str, epoch: i64, tokens: Option<u64>, cost: Option<f64>) -> anyhow::Result<zeroclaw_goal::GoalTransitionResult>;
     delete_session_goal(task_id: &str, session_id: &str, epoch: i64) -> anyhow::Result<zeroclaw_goal::GoalTransitionResult>;

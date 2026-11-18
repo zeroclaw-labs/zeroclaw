@@ -109,7 +109,7 @@ fn daemon_surfaces_retired_wati_config_without_leaking_tokens() {
     let cases = [
         (
             "current",
-            r#"schema_version = 3
+            r#"schema_version = 4
 
 [gateway]
 require_pairing = false
@@ -134,7 +134,9 @@ api_token = "WATI_LEGACY_PLACEHOLDER_MUST_NOT_APPEAR"
 api_url = "https://example.invalid"
 allowed_numbers = ["1234567890"]
 "#,
-            "channels_config.wati",
+            // Unversioned, so the V1 migration first renames `channels_config`
+            // to `channels`; the retirement notice names the migrated path.
+            "channels.wati",
             "WATI_LEGACY_PLACEHOLDER_MUST_NOT_APPEAR",
         ),
     ];
@@ -221,8 +223,7 @@ allowed_numbers = ["1234567890"]
             );
         }
         assert!(
-            stderr.contains("retired WATI channel config section")
-                && stderr.contains(expected_path),
+            stderr.contains(&format!("dropped retired config key `{expected_path}`")),
             "{case}: stderr must name retired path {expected_path}: {stderr}"
         );
         assert!(

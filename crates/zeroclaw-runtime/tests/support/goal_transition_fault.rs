@@ -119,6 +119,18 @@ impl FinishFaultRegistry {
 
 #[async_trait]
 impl GoalTaskRegistry for FinishFaultRegistry {
+    async fn begin_operation_dispatch(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        expected_epoch: i64,
+        pending_call_id: &str,
+    ) -> anyhow::Result<Option<zeroclaw_goal::task::GoalDispatchStart>> {
+        self.store
+            .begin_operation_dispatch(task_id, session_id, expected_epoch, pending_call_id)
+            .await
+    }
+
     async fn latest_active_goal_for_agent(
         &self,
         agent: &str,

@@ -31,7 +31,10 @@ pub struct GoalTaskRecord {
     /// goal-specific pauses.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub blockers: Vec<GoalBlocker>,
-    /// Durable fence for one admitted logical provider operation.
+    /// Durable fence for one admitted logical provider operation. Producers
+    /// must use a fresh UUID for every operation and never reuse it, including
+    /// after settlement, so a delayed duplicate settlement cannot match a
+    /// later operation in the same epoch.
     #[serde(default)]
     pub pending_call_id: Option<String>,
     /// Epoch that admitted `pending_call_id`; always paired with the identifier.
@@ -59,16 +62,23 @@ impl Default for GoalTaskRecord {
     }
 }
 
+/// Durable usage-accounting classification for Goal-owned operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum GoalAccountingState {
     #[default]
+    /// All usage known through the last settled operation is present and valid.
     Complete,
+    /// A settled operation did not provide usage data.
     Missing,
+    /// Usage data for a settled operation failed validation.
     Invalid,
+    /// An admitted operation ended without a durable outcome or usage
+    /// settlement.
     OutcomeUnknown,
 }
 
+/// Result of a guarded Goal control-plane mutation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GoalTransitionResult {
     /// The guarded mutation committed for the exact task, session, and epoch.
@@ -318,6 +328,28 @@ pub enum TaskContinuationConversationScope {
     ReplyTarget,
 }
 
+/// Proof that an admitted operation passed its final lifecycle check while
+/// holding its session's dispatch gate. Drop it immediately after the first
+/// provider-dispatch poll, without awaiting anything else while it is held.
+#[must_use = "dropping before dispatch entry reopens the fence race"]
+pub struct GoalDispatchStart {
+    _gate: tokio::sync::OwnedMutexGuard<()>,
+}
+
+impl GoalDispatchStart {
+    pub fn new(gate: tokio::sync::OwnedMutexGuard<()>) -> Self {
+        Self { _gate: gate }
+    }
+}
+
+impl std::fmt::Debug for GoalDispatchStart {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GoalDispatchStart")
+            .finish_non_exhaustive()
+    }
+}
+
 #[async_trait::async_trait]
 pub trait GoalTaskRegistry: Send + Sync {
     /// Persist a pending audit intent before acknowledging deferred work.
@@ -417,13 +449,35 @@ pub trait GoalTaskRegistry: Send + Sync {
 
     /// Atomically create a session-bound Goal or replace its fully settled
     /// terminal predecessor. New Goals always begin at execution epoch one.
+    ///
+    /// The caller must supply a globally unique task ID that has never been
+    /// used before, including when replacing a terminal predecessor. This
+    /// registry rejects IDs still present in storage, but cannot detect reuse
+    /// after a task row has been disposed. Goal producers should use a fresh
+    /// UUID for each new Goal.
     async fn create_or_replace_session_goal(
         &self,
         task: TaskRecord,
         goal: GoalTaskRecord,
     ) -> anyhow::Result<GoalTransitionResult>;
 
-    /// Fence a running Goal and persist its pause state. An operation already
+    /// Acquire this registry instance's session dispatch gate and atomically
+    /// confirm the exact running Goal and pending operation. Returns `None`
+    /// when any guard fails. A second registry instance or process does not
+    /// share this gate, although durable epoch and marker guards still apply.
+    /// Implementations must hold the same gate for pause and finish commits.
+    async fn begin_operation_dispatch(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        expected_epoch: i64,
+        pending_call_id: &str,
+    ) -> anyhow::Result<Option<GoalDispatchStart>>;
+
+    /// Fence a running Goal and persist its pause state. The commit is
+    /// serialized with dispatch entry through this registry instance: a
+    /// fence that commits first prevents entry, and a waiting fence observes
+    /// an operation that has entered. An operation already
     /// admitted for the fenced epoch is allowed to settle; resume remains
     /// unavailable until that settlement clears the pending-operation slot.
     async fn pause_session_goal(
@@ -445,7 +499,15 @@ pub trait GoalTaskRegistry: Send + Sync {
     ) -> anyhow::Result<GoalTransitionResult>;
 
     /// Complete a lifecycle transition only for the exact running or paused
-    /// Goal epoch. Terminal state remains owned by the task record.
+    /// Goal epoch. Terminal state remains owned by the task record. This method
+    /// serializes its commit with dispatch entry in the same way as pause. It
+    /// does not inspect or clear the pending-operation slot; callers must
+    /// settle that slot before finishing. If an executor disappears with the
+    /// slot still reserved, the Goal remains fenced for the rest of that daemon
+    /// boot. The store does not recover an abandoned reservation during the
+    /// same daemon boot; a controller must explicitly classify or settle it
+    /// before admitting further work. Startup recovery classifies a reservation
+    /// that remains when the daemon restarts.
     async fn finish_session_goal(
         &self,
         task_id: &str,
@@ -457,8 +519,15 @@ pub trait GoalTaskRegistry: Send + Sync {
 
     /// Reserve the one durable pending-operation slot for the exact running
     /// Goal epoch. This is an execution fence, not a usage reservation.
-    /// Callers must settle the exact slot on every local completion path; an
-    /// unsettled slot remains fenced until recovery classifies it.
+    /// `pending_call_id` must be a fresh UUID that is globally unique across
+    /// Goal operations and is never reused, including after settlement. This
+    /// prevents a delayed duplicate settlement from matching a later operation
+    /// in the same epoch. Callers must settle the exact slot on every local
+    /// completion path. If an executor disappears before settlement, the slot
+    /// remains fenced until a controller explicitly classifies or settles it.
+    /// The store does not recover abandoned reservations during the same
+    /// daemon boot; startup recovery classifies a reservation that remains when
+    /// the daemon restarts.
     async fn admit_pending_operation(
         &self,
         task_id: &str,

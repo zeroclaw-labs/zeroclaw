@@ -38,6 +38,8 @@ pub enum BuiltinCommandId {
     Config,
     /// Show or change model thinking/reasoning effort.
     Thinking,
+    /// Goal command identity retained while admission is not yet wired.
+    Goal,
 }
 
 impl BuiltinCommandId {
@@ -51,6 +53,7 @@ impl BuiltinCommandId {
             Self::Models => "models",
             Self::Config => "config",
             Self::Thinking => "thinking",
+            Self::Goal => "goal",
         }
     }
 }
@@ -63,6 +66,8 @@ pub enum CommandExecution {
     ClientLocal,
     /// The channel/runtime command handler owns the command.
     RuntimeCommand,
+    /// Goal admission ownership retained while admission is not yet wired.
+    GoalAdmission,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -322,6 +327,11 @@ mod tests {
 
     #[test]
     fn dormant_goal_parser_does_not_advertise_an_unwired_command() {
+        assert_eq!(BuiltinCommandId::Goal.as_str(), "goal");
+        assert_ne!(
+            CommandExecution::GoalAdmission,
+            CommandExecution::RuntimeCommand
+        );
         assert!(parse_command_token("/goal", CommandSurface::Channel).is_none());
         assert!(command_by_name("/goal").is_none());
     }

@@ -45,6 +45,11 @@ pub struct SendMessageToPeerTool {
     live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
     sender_alias: String,
     description: String,
+    /// The capabilities and principal the sending turn was built from. When
+    /// bound, the recipient's in-process turn runs through them, so it uses
+    /// the sender's sources and resolves for the same principal. Empty only
+    /// for a registry no capability entry point bound.
+    capabilities: crate::composition::CapabilitySlot,
     task_control_plane: Option<ControlPlaneHandle>,
     execution_capability: Option<AgentExecutionCapability>,
 }
@@ -75,19 +80,47 @@ impl SendMessageToPeerTool {
             live_config,
             sender_alias,
             description,
+            capabilities: Arc::new(std::sync::OnceLock::new()),
             task_control_plane: None,
             execution_capability,
         }
+    }
+
+    /// The slot this tool reads its capabilities from, for the registry that
+    /// builds it to hand to the owning entry point.
+    pub(crate) fn capabilities_slot(&self) -> crate::composition::CapabilitySlot {
+        Arc::clone(&self.capabilities)
     }
 
     pub fn with_control_plane(mut self, handle: ControlPlaneHandle) -> Self {
         self.task_control_plane = Some(handle);
         self
     }
+
+    fn target_agent_alias(&self, target: &str) -> Option<&str> {
+        let target = target.trim().trim_start_matches('@');
+        self.config
+            .agents
+            .keys()
+            .find(|alias| alias.eq_ignore_ascii_case(target))
+            .map(String::as_str)
+    }
 }
 
 #[async_trait]
 impl Tool for SendMessageToPeerTool {
+    fn may_invoke_agent_child(&self, args: &serde_json::Value) -> bool {
+        args.get("target")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|target| self.target_agent_alias(target))
+            .is_some()
+    }
+
+    fn requires_unrestricted_principal(&self) -> bool {
+        // This path uses agent authority without carrying the session owner.
+        true
+    }
+
     fn name(&self) -> &str {
         "send_message_to_peer"
     }
@@ -217,25 +250,13 @@ impl Tool for SendMessageToPeerTool {
             });
         }
 
-        let target_norm = target.trim_start_matches('@').to_ascii_lowercase();
-        let target_is_agent = self
-            .config
-            .agents
-            .keys()
-            .any(|alias| alias.to_ascii_lowercase() == target_norm);
-
-        if target_is_agent {
-            // The target's resolved alias may differ in case from the
-            // raw input ("@Beta" -> "beta"). Look up the canonical
-            // alias once so the agent loop's `agent_alias` field
-            // matches the [agents.<alias>] config key.
-            let canonical = self
-                .config
-                .agents
-                .keys()
-                .find(|alias| alias.to_ascii_lowercase() == target_norm)
-                .cloned()
-                .unwrap_or_else(|| target.clone());
+        if let Some(canonical) = self.target_agent_alias(&target) {
+            if crate::goal_accounting::GoalForegroundContext::is_participating() {
+                return Ok(ToolResult::err(crate::i18n::get_required_cli_string(
+                    "goal-mode-child-route-unsupported",
+                )));
+            }
+            let canonical = canonical.to_owned();
 
             let admission = self
                 .execution_capability
@@ -327,25 +348,26 @@ impl Tool for SendMessageToPeerTool {
             let turn_usage = cost_ctx
                 .as_ref()
                 .map(|_| Arc::new(Mutex::new(TurnUsage::default())));
+            let bound = self.capabilities.get().cloned();
             let task_id = task.id.clone();
             let task_owner_pid = task.owner_pid;
             let task_owner_boot_id = task.owner_boot_id.clone();
             zeroclaw_spawn::spawn!(async move {
-                // Keep the admitted recipient turn out of the cost-scope wrappers.
-                let turn: Pin<Box<dyn Future<Output = Result<String>> + Send + '_>> = Box::pin(
-                    crate::agent::loop_::process_message_shared_with_live_config_and_admission_and_principal(
-                        cfg,
-                        live_config,
-                        &turn_recipient_alias,
-                        &body,
-                        None,
-                        zeroclaw_api::ingress::TurnOrigin::AgentDirect,
-                        admission,
-                        Some(zeroclaw_api::ingress::InternalPrincipal::PeerAgent {
-                            sender_alias: sender.clone(),
-                        }),
-                    ),
-                );
+                let internal_principal =
+                    Some(zeroclaw_api::ingress::InternalPrincipal::PeerAgent {
+                        sender_alias: sender.clone(),
+                    });
+                let turn: Pin<Box<dyn Future<Output = Result<String>> + Send + '_>> = match bound {
+                    Some(bound) => Box::pin(crate::agent::loop_::process_message_shared_with_capabilities(
+                        cfg, live_config, bound.capabilities, bound.principal,
+                        &turn_recipient_alias, &body, None,
+                        zeroclaw_api::ingress::TurnOrigin::AgentDirect, admission, internal_principal,
+                    )),
+                    None => Box::pin(crate::agent::loop_::process_message_shared_with_live_config_and_admission_and_principal(
+                        cfg, live_config, &turn_recipient_alias, &body, None,
+                        zeroclaw_api::ingress::TurnOrigin::AgentDirect, admission, internal_principal,
+                    )),
+                };
                 let result = run_peer_turn_with_panic_recovery(cost_ctx, turn_usage, turn).await;
                 if let Err(error) = settle_peer_inbox_task(
                     task_store.as_ref(),
@@ -1159,6 +1181,54 @@ mod tests {
         assert!(!description.contains("\"@Operator\""));
         assert!(!description.contains("\"gamma\""));
         assert!(description.contains("Do not pass peer group names as the `channel` parameter"));
+    }
+
+    #[tokio::test]
+    async fn goal_refuses_agent_peer_before_task_admission() {
+        use zeroclaw_api::tool::ToolExecutionContext;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = Config::default();
+        for alias in ["sender", "recipient"] {
+            config.agents.insert(
+                alias.into(),
+                AliasedAgentConfig {
+                    channels: vec!["telegram.prod".into()],
+                    ..AliasedAgentConfig::default()
+                },
+            );
+        }
+        config.peer_groups.insert(
+            "ops".into(),
+            PeerGroupConfig {
+                channel: "telegram".into(),
+                agents: vec![AgentAlias::new("sender"), AgentAlias::new("recipient")],
+                external_peers: vec![PeerUsername::new("@Operator")],
+                ..PeerGroupConfig::default()
+            },
+        );
+        let control_plane = ControlPlaneHandle::open(tmp.path()).unwrap();
+        let store = Arc::clone(&control_plane.store);
+        let tool = SendMessageToPeerTool::new(Arc::new(config), "sender")
+            .with_control_plane(control_plane);
+        let args =
+            json!({"channel": "telegram.prod", "target": " @Recipient ", "message": "status"});
+        assert!(tool.may_invoke_agent_child(&args));
+        assert!(!tool.may_invoke_agent_child(&json!({"target": "@Operator"})));
+        let result = tool
+            .execute_with_context(
+                args,
+                &ToolExecutionContext::default().with_goal_foreground(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            result.error.as_deref(),
+            Some(
+                crate::i18n::get_required_cli_string("goal-mode-child-route-unsupported").as_str()
+            )
+        );
+        assert!(store.list_by_agent("recipient").await.unwrap().is_empty());
     }
 
     #[test]

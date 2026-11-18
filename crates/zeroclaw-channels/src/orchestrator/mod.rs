@@ -10984,9 +10984,15 @@ async fn process_channel_message_body(
                 // with that agent's own gated tools/policy/MCP scope rather than
                 // this turn's.
                 served_route_sink: None,
+                // The channels orchestrator builds its turns from config.
+                capability_binding: None,
                 sop_reassembly: Some(zeroclaw_runtime::agent::loop_::SopStepReassembly {
                     config: ctx.prompt_config.as_ref(),
+                    // The channels orchestrator builds its turns from config;
+                    // it binds capabilities once it moves onto the contract.
+                    capabilities: None,
                     live_config: Some(ctx.live_config.clone()),
+                    memory_owner: ctx.memory.principal_scope(),
                 }),
             }));
             // Scope this turn's routing handle so concurrent same-agent turns,
@@ -11361,7 +11367,10 @@ async fn process_channel_message_body(
 
             // Persist intermediate tool-call/result messages from this turn
             // so the model retains concrete "I used tools" examples in
-            // context, preventing drift toward tool-less responses.
+            // context, preventing drift toward tool-less responses. How many
+            // turns keep those rows on the provider-facing history is decided
+            // per request by the tool loop (`keep_tool_context_turns` counts
+            // turns there); here the key only gates whether they are stored.
             //
             // Skipped when the pre-trim resync above could not confirm the
             // cache matches what's durable: appending onto an evicted cache
@@ -12038,6 +12047,7 @@ fn render_goal_response(response: &zeroclaw_goal::GoalResponse) -> String {
         GoalResponse::Cancelled(_) => "goal-mode-cancelled",
         GoalResponse::AlreadyCancelled(_) => "goal-mode-already-cancelled",
         GoalResponse::NoCurrentGoal => "goal-mode-no-current",
+        GoalResponse::SessionUnavailable => "goal-mode-session-unavailable",
         GoalResponse::AlreadyActive => "goal-mode-already-active",
         GoalResponse::Terminal(_) => "goal-mode-terminal",
         GoalResponse::Stale => "goal-mode-stale",
@@ -12078,6 +12088,14 @@ mod goal_command_message_tests {
             assert!(rendered.contains(control), "missing {control}: {rendered}");
         }
         assert!(!rendered.contains("--unlimited"));
+    }
+
+    #[test]
+    fn matrix_renders_session_unavailable_without_goal_details() {
+        assert_eq!(
+            render_goal_response(&GoalResponse::SessionUnavailable),
+            "This session is unavailable."
+        );
     }
 
     #[test]
@@ -24738,7 +24756,7 @@ temperature = 0.3
         tokio::fs::write(
             &config_path,
             r#"
-schema_version = 3
+schema_version = 4
 
 [agents.agent_a]
 model_provider = "openrouter.hot"
@@ -27034,7 +27052,7 @@ api_key = "anthropic-key"
     fn email_wire(message: &SendMessage) -> String {
         let channel = EmailChannel::new(
             crate::email_channel::EmailConfig {
-                from_address: "bot@example.invalid".to_string(),
+                from_address: Some("bot@example.invalid".to_string()),
                 ..crate::email_channel::EmailConfig::default()
             },
             "test",
@@ -30758,17 +30776,7 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     fn channel_all_tools_result(tools: Vec<Box<dyn Tool>>) -> tools::AllToolsResult {
-        tools::AllToolsResult {
-            tools,
-            reserved_host_names: std::collections::HashSet::new(),
-            delegate_handle: None,
-            ask_user_handle: None,
-            reaction_handle: Arc::new(parking_lot::RwLock::new(HashMap::new())),
-            poll_handle: None,
-            escalate_handle: None,
-            channel_room_handle: None,
-            unfiltered_tool_arcs: Vec::new(),
-        }
+        tools::AllToolsResult::from_prebuilt_tools(tools)
     }
 
     /// A mock HTTP MCP server that advertises `resources` support and serves one

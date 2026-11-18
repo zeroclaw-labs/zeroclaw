@@ -1688,6 +1688,7 @@ impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
                     // Drop the borrowing loop futures before applying a route switch.
                     let result = {
                         let tool_loop = run_tool_call_loop(ToolLoop {
+            capability_binding: None,
             exec: resolved_channel_execution(
                 self.context.as_ref(),
                 provider.as_ref(),
@@ -1737,6 +1738,8 @@ impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
             sop_reassembly: Some(zeroclaw_runtime::agent::loop_::SopStepReassembly {
                 config: self.context.prompt_config.as_ref(),
                 live_config: Some(self.context.live_config.clone()),
+                memory_owner: self.context.memory.principal_scope(),
+                capabilities: None,
             }),
         });
                         let tool_loop = zeroclaw_runtime::tools::TURN_ROUTING
@@ -11676,6 +11679,37 @@ mod tests {
 
     #[async_trait]
     impl zeroclaw_goal::accounting::GoalOperationAccounting for MatrixHeldChildSettlement {
+        fn admission_guard(&self) -> anyhow::Result<zeroclaw_goal::accounting::GoalOperationGuard> {
+            self.inner.admission_guard()
+        }
+
+        async fn begin_dispatch(&self) -> anyhow::Result<zeroclaw_goal::task::GoalDispatchStart> {
+            self.inner.begin_dispatch().await
+        }
+
+        fn mark_dispatch_entered(&self) {
+            self.inner.mark_dispatch_entered();
+        }
+
+        fn set_abandonment_settlement(
+            &self,
+            settlement: zeroclaw_goal::accounting::GoalAbandonmentSettlement,
+        ) {
+            self.inner.set_abandonment_settlement(settlement);
+        }
+
+        async fn quiesce(&self) {
+            self.inner.quiesce().await;
+        }
+
+        fn unsettled_failure(&self) -> Option<zeroclaw_goal::accounting::GoalAccountingFailure> {
+            self.inner.unsettled_failure()
+        }
+
+        async fn release_unstarted(&self) -> anyhow::Result<()> {
+            self.inner.release_unstarted().await
+        }
+
         async fn admit(
             &self,
             request: zeroclaw_goal::accounting::GoalOperationRequest,

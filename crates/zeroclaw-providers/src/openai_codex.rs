@@ -95,6 +95,83 @@ struct ResponsesResponse {
     output_text: Option<String>,
     #[serde(default)]
     usage: Option<Value>,
+    #[serde(default, deserialize_with = "deserialize_present_responses_status")]
+    status: Option<Value>,
+    #[serde(default)]
+    error: Option<Value>,
+    #[serde(default)]
+    incomplete_details: Option<Value>,
+}
+
+pub(super) fn deserialize_present_responses_status<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Value>, D::Error> {
+    Value::deserialize(deserializer).map(Some)
+}
+
+pub(super) fn responses_status_error(
+    status: Option<&Value>,
+    error: Option<&Value>,
+    incomplete_details: Option<&Value>,
+) -> Option<ResponsesStreamApiError> {
+    let status = status?;
+    if status.as_str() == Some("completed") {
+        return None;
+    }
+    Some(ResponsesStreamApiError(responses_failure_message(
+        error,
+        incomplete_details,
+    )))
+}
+
+fn responses_failure_message(error: Option<&Value>, incomplete_details: Option<&Value>) -> String {
+    first_nonempty(
+        error
+            .and_then(|value| value.get("message"))
+            .and_then(Value::as_str),
+    )
+    .or_else(|| {
+        first_nonempty(
+            incomplete_details
+                .and_then(|value| value.get("reason"))
+                .and_then(Value::as_str),
+        )
+    })
+    .map_or_else(
+        || "response did not complete".into(),
+        |reason| super::sanitize_api_error(&reason),
+    )
+}
+
+/// Recover independent billing and terminal status when strict decoding fails.
+/// Both callers invoke this only in a scoped String attempt.
+pub(super) fn observe_rejected_responses_json(body: &str) -> Option<ResponsesStreamApiError> {
+    let wire: Value = serde_json::from_str(body).ok()?;
+    crate::dispatch::accounting::observe_responses_string_usage(wire.get("usage"));
+    responses_status_error(
+        wire.get("status"),
+        wire.get("error"),
+        wire.get("incomplete_details"),
+    )
+}
+
+pub(super) async fn responses_api_error(
+    provider: &str,
+    response: reqwest::Response,
+) -> anyhow::Error {
+    if !crate::dispatch::accounting::string_usage_observation_enabled() {
+        return super::api_error(provider, response).await;
+    }
+    let status = response.status();
+    let body = match response.text().await {
+        Ok(body) => {
+            let _ = observe_rejected_responses_json(&body);
+            crate::dispatch::accounting::finish_current_string_attempt_after_completed_response();
+            body
+        }
+        Err(_) => "<failed to read model_provider error body>".to_string(),
+    };
+    super::api_error_from_parts(provider, status, &body)
 }
 
 #[derive(Debug, Default)]
@@ -717,10 +794,55 @@ impl std::fmt::Display for ResponsesStreamApiError {
 
 impl std::error::Error for ResponsesStreamApiError {}
 
+#[derive(Debug, thiserror::Error)]
+#[error("error reading OpenAI Codex response stream: {0}")]
+struct ResponsesBodyReadError(#[source] reqwest::Error);
+
+#[derive(Debug)]
+struct ResponsesDecodeRetryError {
+    stream_err: anyhow::Error,
+    fallback_err: anyhow::Error,
+}
+
+impl std::fmt::Display for ResponsesDecodeRetryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "OpenAI Codex streaming response decode failed ({}); non-streaming retry failed ({})",
+            self.stream_err, self.fallback_err
+        )
+    }
+}
+
+impl std::error::Error for ResponsesDecodeRetryError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.fallback_err.as_ref())
+    }
+}
+
 pub(crate) fn process_responses_stream_event(
     event: Value,
     state: &mut ResponsesStreamState,
 ) -> anyhow::Result<Vec<StreamEvent>> {
+    if matches!(
+        event.get("type").and_then(Value::as_str),
+        Some("response.failed" | "response.incomplete")
+    ) && crate::dispatch::accounting::string_usage_observation_enabled()
+    {
+        crate::dispatch::accounting::observe_responses_string_usage(
+            event
+                .get("response")
+                .and_then(|response| response.get("usage")),
+        );
+        // Billing evidence on an explicitly unsuccessful terminal event
+        // does not make its accumulated text a successful Goal response.
+        let response = event.get("response");
+        let message = responses_failure_message(
+            response.and_then(|value| value.get("error")),
+            response.and_then(|value| value.get("incomplete_details")),
+        );
+        return Err(ResponsesStreamApiError(message).into());
+    }
     if let Some(message) = extract_stream_error_message(&event) {
         return Err(ResponsesStreamApiError(message).into());
     }
@@ -871,10 +993,36 @@ pub(crate) fn process_responses_stream_event(
         Some(event_type @ ("response.completed" | "response.done")) => {
             state.saw_completion = true;
             let is_completed = event_type == "response.completed";
-            if let Some(response) = event
-                .get("response")
-                .and_then(|value| serde_json::from_value::<ResponsesResponse>(value.clone()).ok())
-            {
+            let wire = event.get("response");
+            let observe = crate::dispatch::accounting::string_usage_observation_enabled();
+            let terminal_error = if observe {
+                wire.and_then(|response| {
+                    responses_status_error(
+                        response.get("status"),
+                        response.get("error"),
+                        response.get("incomplete_details"),
+                    )
+                })
+            } else {
+                None
+            };
+            if is_completed || terminal_error.is_some() {
+                crate::dispatch::accounting::observe_responses_string_usage(
+                    wire.and_then(|response| response.get("usage")),
+                );
+            }
+            if let Some(error) = terminal_error {
+                return Err(error.into());
+            }
+            let decoded = wire
+                .map(|value| serde_json::from_value::<ResponsesResponse>(value.clone()))
+                .transpose();
+            if observe && is_completed && !matches!(&decoded, Ok(Some(_))) {
+                // A malformed terminal body is a decode error, not a
+                // successful response assembled from preceding deltas.
+                anyhow::bail!("OpenAI Codex could not decode the completed response");
+            }
+            if let Ok(Some(response)) = decoded {
                 if !state.saw_text_delta && state.fallback_text.is_none() {
                     state.fallback_text = extract_responses_text(&response);
                 }
@@ -902,7 +1050,7 @@ pub(crate) fn process_sse_chunk(
     state: &mut ResponsesStreamState,
 ) -> anyhow::Result<Vec<StreamEvent>> {
     let data_lines: Vec<String> = chunk
-        .lines()
+        .split(['\n', '\r'])
         .filter_map(|line| line.strip_prefix("data:"))
         .map(|line| line.trim().to_string())
         .collect();
@@ -969,7 +1117,11 @@ fn parse_sse_turn(body: &str) -> anyhow::Result<ResponsesTurnResult> {
         process_sse_chunk(&buffer, &mut state)?;
     }
 
-    Ok(ResponsesTurnResult {
+    Ok(responses_turn_from_stream(state))
+}
+
+fn responses_turn_from_stream(state: ResponsesStreamState) -> ResponsesTurnResult {
+    ResponsesTurnResult {
         text: if state.saw_text_delta {
             nonempty_preserve(Some(&state.text_accumulator))
         } else {
@@ -981,7 +1133,7 @@ fn parse_sse_turn(body: &str) -> anyhow::Result<ResponsesTurnResult> {
         ),
         tool_calls: state.collected_tool_calls,
         usage: state.usage,
-    })
+    }
 }
 
 fn ensure_nonempty_responses_turn(
@@ -1086,26 +1238,15 @@ pub(crate) fn append_utf8_stream_chunk(
 }
 
 fn parse_responses_body(body: &str) -> anyhow::Result<ResponsesTurnResult> {
-    let body_trimmed = body.trim_start();
-    let looks_like_sse = body_trimmed.starts_with("event:") || body_trimmed.starts_with("data:");
-    if looks_like_sse {
-        let result = parse_sse_turn(body)?;
-        return ensure_nonempty_responses_turn(result, || {
-            let sanitized = super::sanitize_api_error(body);
-            ::zeroclaw_log::record!(
-                ERROR,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({"payload": &sanitized})),
-                "openai_codex: empty SSE stream payload"
-            );
-            anyhow::Error::msg(format!(
-                "No response from OpenAI Codex stream payload: {sanitized}"
-            ))
-        });
+    if looks_like_responses_sse(body) {
+        return ensure_nonempty_sse_turn(parse_sse_turn(body)?, body);
     }
 
+    let observe_string_usage = crate::dispatch::accounting::string_usage_observation_enabled();
     let parsed: ResponsesResponse = serde_json::from_str(body).map_err(|err| {
+        if observe_string_usage && let Some(terminal) = observe_rejected_responses_json(body) {
+            return terminal.into();
+        }
         let sanitized = super::sanitize_api_error(body);
         ::zeroclaw_log::record!(
             ERROR,
@@ -1121,6 +1262,16 @@ fn parse_responses_body(body: &str) -> anyhow::Result<ResponsesTurnResult> {
             "OpenAI Codex JSON parse failed: {err}. Payload: {sanitized}"
         ))
     })?;
+    crate::dispatch::accounting::observe_responses_string_usage(parsed.usage.as_ref());
+    if observe_string_usage
+        && let Some(error) = responses_status_error(
+            parsed.status.as_ref(),
+            parsed.error.as_ref(),
+            parsed.incomplete_details.as_ref(),
+        )
+    {
+        return Err(error.into());
+    }
     let result = responses_turn_from_response(&parsed);
     ensure_nonempty_responses_turn(result, || {
         let sanitized = super::sanitize_api_error(body);
@@ -1135,10 +1286,79 @@ fn parse_responses_body(body: &str) -> anyhow::Result<ResponsesTurnResult> {
     })
 }
 
+fn looks_like_responses_sse(body: &str) -> bool {
+    let body = body.trim_start();
+    body.starts_with("event:") || body.starts_with("data:")
+}
+
+fn ensure_nonempty_sse_turn(
+    result: ResponsesTurnResult,
+    body: &str,
+) -> anyhow::Result<ResponsesTurnResult> {
+    ensure_nonempty_responses_turn(result, || {
+        let sanitized = super::sanitize_api_error(body);
+        ::zeroclaw_log::record!(
+            ERROR,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({"payload": &sanitized})),
+            "openai_codex: empty SSE stream payload"
+        );
+        anyhow::Error::msg(format!(
+            "No response from OpenAI Codex stream payload: {sanitized}"
+        ))
+    })
+}
+
+#[derive(Default)]
+struct ResponsesSseFrames {
+    frame_start: usize,
+    line_start: usize,
+    scanned: usize,
+}
+
+impl ResponsesSseFrames {
+    fn next<'a>(&mut self, input: &'a str) -> Option<&'a str> {
+        while let Some(delta) = input[self.scanned..].find(['\r', '\n']) {
+            let line_end = self.scanned + delta;
+            let blank = line_end == self.line_start;
+            let ending = &input[line_end..];
+            if !blank && ending == "\r" {
+                // The next chunk may finish a CRLF, not start a blank line.
+                self.scanned = line_end;
+                return None;
+            }
+            let next_line = line_end + if ending.starts_with("\r\n") { 2 } else { 1 };
+            self.scanned = next_line;
+            self.line_start = next_line;
+            if blank {
+                let frame = &input[self.frame_start..line_end];
+                self.frame_start = next_line;
+                return Some(frame);
+            }
+        }
+        self.scanned = input.len();
+        None
+    }
+
+    fn remaining<'a>(&self, input: &'a str) -> &'a str {
+        &input[self.frame_start..]
+    }
+}
+
+fn has_sse_data_field(frame: &str) -> bool {
+    frame
+        .split(['\n', '\r'])
+        .any(|line| line.starts_with("data:"))
+}
+
 async fn decode_responses_body(response: reqwest::Response) -> anyhow::Result<ResponsesTurnResult> {
     let mut body = String::new();
     let mut pending_utf8 = Vec::new();
     let mut stream = response.bytes_stream();
+    let observe = crate::dispatch::accounting::string_usage_observation_enabled();
+    let mut sse = None;
+    let mut frames = ResponsesSseFrames::default();
 
     while let Some(chunk) = stream.next().await {
         let bytes = chunk.map_err(|err| {
@@ -1152,9 +1372,21 @@ async fn decode_responses_body(response: reqwest::Response) -> anyhow::Result<Re
                     })),
                 "openai_codex: error reading response stream"
             );
-            anyhow::Error::msg(format!("error reading OpenAI Codex response stream: {err}"))
+            ResponsesBodyReadError(err)
         })?;
-        append_utf8_stream_chunk(&mut body, &mut pending_utf8, &bytes)?;
+        let decoded = append_utf8_stream_chunk(&mut body, &mut pending_utf8, &bytes);
+        if observe {
+            let content = body.strip_prefix('\u{feff}').unwrap_or(&body);
+            while let Some(frame) = frames.next(content) {
+                // Unquoted data fields distinguish SSE from JSON; ignored
+                // fields before the first event need not look like SSE.
+                if sse.is_some() || has_sse_data_field(frame) {
+                    let state = sse.get_or_insert_with(ResponsesStreamState::default);
+                    process_sse_chunk(frame, state)?;
+                }
+            }
+        }
+        decoded?;
     }
 
     if !pending_utf8.is_empty() {
@@ -1188,6 +1420,21 @@ async fn decode_responses_body(response: reqwest::Response) -> anyhow::Result<Re
         )));
     }
 
+    if observe {
+        let content = body.strip_prefix('\u{feff}').unwrap_or(&body);
+        if sse.as_ref().is_some_and(|state| !state.saw_completion)
+            || (sse.is_none()
+                && (looks_like_responses_sse(content)
+                    || has_sse_data_field(frames.remaining(content))))
+        {
+            anyhow::bail!("OpenAI Codex response ended without a complete SSE terminal event");
+        }
+        if let Some(state) = sse {
+            // Only frames dispatched by the cursor are evidence. EOF does
+            // not turn a buffered partial event into a completion or bill.
+            return ensure_nonempty_sse_turn(responses_turn_from_stream(state), &body);
+        }
+    }
     parse_responses_body(&body)
 }
 
@@ -1354,6 +1601,48 @@ impl OpenAiCodexModelProvider {
         request_builder
     }
 
+    async fn send_responses_attempt(
+        &self,
+        creds: &ResolvedCodexCredentials,
+        request: &ResponsesRequest,
+        capture_string_usage: bool,
+    ) -> anyhow::Result<anyhow::Result<ResponsesTurnResult>> {
+        // Transport/HTTP errors never trigger the body-decode fallback.
+        // Within a successful HTTP response, usage and decode acceptance
+        // are independent; keep both on this physical attempt.
+        let attempt = async {
+            let response = self
+                .responses_request_builder(
+                    &creds.bearer_token,
+                    creds.account_id.as_deref(),
+                    creds.access_token.as_deref(),
+                    creds.use_gateway_api_key_auth,
+                    request,
+                )
+                .json(request)
+                .send()
+                .await?;
+            if !response.status().is_success() {
+                return Err(responses_api_error("OpenAI Codex", response).await);
+            }
+            match decode_responses_body(response).await {
+                Err(error) if error.is::<ResponsesBodyReadError>() => Err(error),
+                decoded => Ok(decoded),
+            }
+        };
+        let result = if capture_string_usage {
+            crate::dispatch::accounted_string_call(self, &request.model, attempt).await
+        } else {
+            attempt.await
+        };
+        match result {
+            // Leave this physical attempt outcome unknown without taking
+            // away the caller's existing body-decode retry policy.
+            Err(error) if error.is::<ResponsesBodyReadError>() => Ok(Err(error)),
+            result => result,
+        }
+    }
+
     async fn send_responses_request(
         &self,
         input: Vec<Value>,
@@ -1405,21 +1694,11 @@ impl OpenAiCodexModelProvider {
             );
         }
 
-        let request_builder = self.responses_request_builder(
-            &creds.bearer_token,
-            creds.account_id.as_deref(),
-            creds.access_token.as_deref(),
-            creds.use_gateway_api_key_auth,
-            &request,
-        );
-
-        let response = request_builder.json(&request).send().await?;
-
-        if !response.status().is_success() {
-            return Err(super::api_error("OpenAI Codex", response).await);
-        }
-
-        match decode_responses_body(response).await {
+        let capture_string_usage = crate::dispatch::accounting::string_usage_observation_enabled();
+        match self
+            .send_responses_attempt(&creds, &request, capture_string_usage)
+            .await?
+        {
             Ok(result) => Ok(result),
             Err(stream_err) => {
                 if stream_err
@@ -1438,38 +1717,31 @@ impl OpenAiCodexModelProvider {
                 );
 
                 request.stream = false;
-                let non_streaming_response = self
-                    .responses_request_builder(
-                        &creds.bearer_token,
-                        creds.account_id.as_deref(),
-                        creds.access_token.as_deref(),
-                        creds.use_gateway_api_key_auth,
-                        &request,
-                    )
-                    .json(&request)
-                    .send()
-                    .await?;
-
-                if !non_streaming_response.status().is_success() {
-                    return Err(super::api_error("OpenAI Codex", non_streaming_response).await);
-                }
-
-                decode_responses_body(non_streaming_response)
-                    .await
+                self.send_responses_attempt(&creds, &request, capture_string_usage)
+                    .await?
                     .map_err(|fallback_err| {
                         ::zeroclaw_log::record!(
                             ERROR,
-                            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                                .with_attrs(::serde_json::json!({
-                                    "stream_err": format!("{}", stream_err),
-                                    "fallback_err": format!("{}", fallback_err),
-                                })),
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Fail
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "stream_err": format!("{}", stream_err),
+                                "fallback_err": format!("{}", fallback_err),
+                            })),
                             "openai_codex: stream + non-stream fallback both failed"
                         );
-                        anyhow::Error::msg(format!(
-                            "OpenAI Codex streaming response decode failed ({stream_err}); non-streaming retry failed ({fallback_err})"
-                        ))
+                        let error = ResponsesDecodeRetryError {
+                            stream_err,
+                            fallback_err,
+                        };
+                        if capture_string_usage {
+                            error.into()
+                        } else {
+                            anyhow::Error::msg(error.to_string())
+                        }
                     })
             }
         }
@@ -1518,10 +1790,7 @@ impl ModelProvider for OpenAiCodexModelProvider {
         let (instructions, input) = build_responses_input(&prepared.messages);
         self.send_responses_request(input, instructions, None, model)
             .await
-            .map(|response| {
-                crate::dispatch::accounting::observe_string_usage(response.usage);
-                response.text.unwrap_or_default()
-            })
+            .map(|response| response.text.unwrap_or_default())
     }
 
     async fn chat_with_history(
@@ -1705,6 +1974,8 @@ mod tests {
 
     enum MockCodexReply {
         Sse(&'static str),
+        SseBody(axum::body::Body),
+        TruncatedSse(&'static str),
         Json(serde_json::Value),
         Status(axum::http::StatusCode, &'static str),
     }
@@ -1749,9 +2020,33 @@ mod tests {
                         MockCodexReply::Sse(body) => (
                             axum::http::StatusCode::OK,
                             [(header::CONTENT_TYPE, "text/event-stream")],
-                            body.to_string(),
+                            format!("{body}\n\n"),
                         )
                             .into_response(),
+                        MockCodexReply::SseBody(body) => {
+                            ([(header::CONTENT_TYPE, "text/event-stream")], body).into_response()
+                        }
+                        MockCodexReply::TruncatedSse(prefix) => {
+                            let prefix_chunks = futures_util::stream::iter([Ok(
+                                axum::body::Bytes::from_static(prefix.as_bytes()),
+                            )]);
+                            let interruption = futures_util::stream::once(async {
+                                // Permit a flush cycle so the client reaches
+                                // the body reader before the wire closes.
+                                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                                Err(std::io::Error::other("fixture body interrupted"))
+                            });
+                            let body =
+                                axum::body::Body::from_stream(prefix_chunks.chain(interruption));
+                            (
+                                [
+                                    (header::CONTENT_TYPE, "text/event-stream".to_string()),
+                                    (header::CONTENT_LENGTH, (prefix.len() + 64).to_string()),
+                                ],
+                                body,
+                            )
+                                .into_response()
+                        }
                         MockCodexReply::Json(body) => Json(body).into_response(),
                         MockCodexReply::Status(status, body) => {
                             (status, body.to_string()).into_response()
@@ -1925,6 +2220,9 @@ mod tests {
             output: vec![],
             output_text: Some("hello".into()),
             usage: None,
+            status: None,
+            error: None,
+            incomplete_details: None,
         };
         assert_eq!(extract_responses_text(&response).as_deref(), Some("hello"));
     }
@@ -1944,6 +2242,9 @@ mod tests {
             })],
             output_text: None,
             usage: None,
+            status: None,
+            error: None,
+            incomplete_details: None,
         };
         assert_eq!(extract_responses_text(&response).as_deref(), Some("nested"));
     }
@@ -2075,6 +2376,520 @@ mod tests {
             1
         );
         assert!(requests[0].get("temperature").is_none());
+    }
+
+    #[tokio::test]
+    async fn goal_string_usage_distinguishes_codex_responses_cache_shapes() {
+        use crate::dispatch::{AccountedChatScope, AttemptUsageOutcome, InvalidUsageReason};
+
+        let (provider, _, server, _temp_dir, _proxy_guard) = mock_codex_provider(vec![
+            MockCodexReply::Json(serde_json::json!({
+                "output_text":"ok","usage":{"input_tokens":8,"output_tokens":3}
+            })),
+            MockCodexReply::Json(serde_json::json!({
+                "output_text":"ok","usage":{"input_tokens":8,"output_tokens":3,"input_tokens_details":{"cached_tokens":0}}
+            })),
+            MockCodexReply::Sse(r#"data: {"type":"response.completed","response":{"output_text":"ok","usage":{"input_tokens":8,"output_tokens":3,"input_tokens_details":{"cached_tokens":2}}}}"#),
+            MockCodexReply::Sse(r#"data: {"type":"response.completed","response":{"output_text":"ok","usage":{"input_tokens":8,"output_tokens":3,"input_tokens_details":{"cached_tokens":"bad"}}}}"#),
+        ])
+        .await;
+        let dispatch = crate::dispatch::ProviderDispatch::from_ref(&provider);
+        for (index, cache) in [None, Some(0), Some(2), None].into_iter().enumerate() {
+            let scope = AccountedChatScope::new_with_string_usage();
+            assert_eq!(
+                scope
+                    .scope(dispatch.chat_with_system(None, "hello", "gpt-5-codex", None))
+                    .await
+                    .unwrap(),
+                "ok"
+            );
+            let report = scope.take();
+            let usage = match report.attempts()[0].outcome() {
+                AttemptUsageOutcome::Complete(usage) if index < 3 => usage,
+                AttemptUsageOutcome::Invalid {
+                    observed: usage,
+                    reason: InvalidUsageReason::MalformedUsage,
+                } if index == 3 => usage,
+                other => panic!("unexpected cache case {index}: {other:?}"),
+            };
+            assert_eq!(
+                (
+                    usage.input_tokens,
+                    usage.output_tokens,
+                    usage.cached_input_tokens
+                ),
+                (Some(8), Some(3), cache)
+            );
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn goal_string_usage_settles_both_codex_requests_after_decode_retry() {
+        use crate::dispatch::{AccountedChatScope, AttemptUsageOutcome, ProviderDispatch};
+
+        for first in [
+            MockCodexReply::Json(serde_json::json!({
+                "output":null,"usage":{"input_tokens":12,"output_tokens":3}
+            })),
+            MockCodexReply::Sse(
+                r#"data: {"type":"response.completed","response":{"output":null,"usage":{"input_tokens":12,"output_tokens":3}}}"#,
+            ),
+            MockCodexReply::Sse(concat!(
+                r#"data: {"type":"response.output_text.delta","delta":"partial"}"#,
+                "\n\n",
+                r#"data: {"type":"response.completed","response":{"output":null,"usage":{"input_tokens":12,"output_tokens":3}}}"#,
+            )),
+        ] {
+            let (provider, captured, server, _temp_dir, _proxy_guard) = mock_codex_provider(vec![
+                first,
+                MockCodexReply::Json(serde_json::json!({
+                    "output_text":"fallback","usage":{"input_tokens":7,"output_tokens":2}
+                })),
+            ])
+            .await;
+            let dispatch = ProviderDispatch::from_ref(&provider);
+            let scope = AccountedChatScope::new_with_string_usage();
+            let result = scope
+                .scope(dispatch.chat_with_system(None, "hello", "gpt-5-codex", None))
+                .await;
+            assert_eq!(result.unwrap(), "fallback");
+            scope.mark_logical_success();
+            let report = scope.take();
+            assert_eq!(report.attempts().len(), 2);
+            assert_eq!(report.rejected_attempts().len(), 1);
+            assert!(report.accepted_route().is_some());
+            for (attempt, (input, output)) in report.attempts().iter().zip([(12, 3), (7, 2)]) {
+                assert!(
+                    matches!(attempt.outcome(), AttemptUsageOutcome::Complete(usage)
+                    if usage.input_tokens == Some(input) && usage.output_tokens == Some(output))
+                );
+            }
+            let requests = captured.lock().unwrap();
+            assert_eq!(requests.len(), 2);
+            assert_eq!(requests[0]["stream"], true);
+            assert_eq!(requests[1]["stream"], false);
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn goal_string_usage_retains_final_codex_terminal_cause_after_decode_retry() {
+        use crate::dispatch::{AccountedChatScope, AttemptUsageOutcome, ProviderDispatch};
+
+        for second in [
+            MockCodexReply::Json(serde_json::json!({
+                "status":"failed","output":null,"usage":{"input_tokens":8,"output_tokens":3}
+            })),
+            MockCodexReply::Sse(
+                r#"data: {"type":"response.failed","response":{"usage":{"input_tokens":8,"output_tokens":3}}}"#,
+            ),
+        ] {
+            let (provider, captured, server, _temp_dir, _proxy_guard) = mock_codex_provider(vec![
+                MockCodexReply::Json(serde_json::json!({
+                    "output":null,"usage":{"input_tokens":12,"output_tokens":4}
+                })),
+                second,
+            ])
+            .await;
+            let dispatch = ProviderDispatch::from_ref(&provider);
+            let scope = AccountedChatScope::new_with_string_usage();
+            let error = scope
+                .scope(dispatch.chat_with_system(None, "hello", "gpt-5-codex", None))
+                .await
+                .unwrap_err();
+            assert!(
+                error
+                    .chain()
+                    .any(|cause| cause.is::<ResponsesStreamApiError>())
+            );
+            let message = error.to_string();
+            assert!(message.contains("OpenAI Codex JSON parse failed"));
+            assert!(message.contains("response did not complete"));
+            let report = scope.take();
+            assert!(report.accepted_route().is_none());
+            assert_eq!(report.attempts().len(), 2);
+            assert_eq!(report.rejected_attempts().len(), 2);
+            for (attempt, (input, output)) in report.attempts().iter().zip([(12, 4), (8, 3)]) {
+                assert!(
+                    matches!(attempt.outcome(), AttemptUsageOutcome::Complete(usage)
+                    if (usage.input_tokens, usage.output_tokens) == (Some(input), Some(output)))
+                );
+            }
+            let requests = captured.lock().unwrap();
+            assert_eq!(requests.len(), 2);
+            assert_eq!(requests[0]["stream"], true);
+            assert_eq!(requests[1]["stream"], false);
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn goal_string_usage_rejects_unsuccessful_codex_body_status_without_retry() {
+        use crate::dispatch::{AccountedChatScope, AttemptUsageOutcome, ProviderDispatch};
+
+        for (reply, expected_error) in [
+            (
+                MockCodexReply::Json(serde_json::json!({
+                    "status":"incomplete","output_text":"partial",
+                    "usage":{"input_tokens":8,"output_tokens":3}
+                })),
+                Some("response did not complete"),
+            ),
+            (
+                MockCodexReply::Json(serde_json::json!({
+                    "status":"in_progress","output_text":"partial",
+                    "usage":{"input_tokens":8,"output_tokens":3}
+                })),
+                Some("response did not complete"),
+            ),
+            (
+                MockCodexReply::Json(serde_json::json!({
+                    "status":{},"output_text":"partial",
+                    "usage":{"input_tokens":8,"output_tokens":3}
+                })),
+                Some("response did not complete"),
+            ),
+            (
+                MockCodexReply::Json(serde_json::json!({
+                    "status":null,"output_text":"partial",
+                    "usage":{"input_tokens":8,"output_tokens":3}
+                })),
+                Some("response did not complete"),
+            ),
+            (
+                MockCodexReply::Json(serde_json::json!({
+                    "status":"failed","output_text":"partial","error":{"message":"native failure"},
+                    "usage":{"input_tokens":8,"output_tokens":3}
+                })),
+                Some("native failure"),
+            ),
+            (
+                MockCodexReply::Json(serde_json::json!({
+                    "status":"failed","output":null,"error":{"message":"native failure"},
+                    "usage":{"input_tokens":8,"output_tokens":3}
+                })),
+                Some("native failure"),
+            ),
+            (
+                MockCodexReply::Sse(concat!(
+                    r#"data: {"type":"response.output_text.delta","delta":"partial"}"#,
+                    "\n\n",
+                    r#"data: {"type":"response.completed","response":{"status":"failed","usage":{"input_tokens":8,"output_tokens":3}}}"#,
+                )),
+                Some("response did not complete"),
+            ),
+            (
+                MockCodexReply::Json(serde_json::json!({
+                    "status":"completed","output_text":"done",
+                    "usage":{"input_tokens":8,"output_tokens":3}
+                })),
+                None,
+            ),
+            (
+                MockCodexReply::Json(serde_json::json!({
+                    "output_text":"done","usage":{"input_tokens":8,"output_tokens":3}
+                })),
+                None,
+            ),
+            (
+                MockCodexReply::Sse(concat!(
+                    "{\n\n",
+                    r#""data: ignored":"inline data: marker","output_text":"done","usage":{"input_tokens":8,"output_tokens":3}}"#,
+                )),
+                None,
+            ),
+        ] {
+            let (provider, captured, server, _temp_dir, _proxy_guard) =
+                mock_codex_provider(vec![reply]).await;
+            let dispatch = ProviderDispatch::from_ref(&provider);
+            let scope = AccountedChatScope::new_with_string_usage();
+            let result = scope
+                .scope(dispatch.chat_with_system(None, "hello", "gpt-5-codex", None))
+                .await;
+            let successful = expected_error.is_none();
+            if let Some(expected) = expected_error {
+                let error = result.unwrap_err();
+                let terminal = error.downcast_ref::<ResponsesStreamApiError>().unwrap();
+                assert_eq!(terminal.0, expected);
+            } else {
+                assert_eq!(result.unwrap(), "done");
+                scope.mark_logical_success();
+            }
+            let report = scope.take();
+            assert_eq!(report.accepted_route().is_some(), successful);
+            assert_eq!(report.rejected_attempts().len(), usize::from(!successful));
+            let [attempt] = report.attempts() else {
+                panic!("expected one physical attempt");
+            };
+            assert!(matches!(
+                attempt.outcome(),
+                AttemptUsageOutcome::Complete(usage)
+                    if (usage.input_tokens, usage.output_tokens) == (Some(8), Some(3))
+            ));
+            assert_eq!(captured.lock().unwrap().len(), 1);
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn goal_string_usage_preserves_http_responses_rejection_in_both_adapters() {
+        use crate::dispatch::{AccountedChatScope, AttemptUsageOutcome, ProviderDispatch};
+        use crate::openai::OpenAiResponsesModelProvider;
+
+        const BODY: &str = r#"{"error":{"message":"hardware quota"},"usage":{"input_tokens":8,"output_tokens":3}}"#;
+        let status = axum::http::StatusCode::TOO_MANY_REQUESTS;
+        let (codex, captured, server, _temp_dir, _proxy_guard) = mock_codex_provider(vec![
+            MockCodexReply::Status(status, BODY),
+            MockCodexReply::Status(status, BODY),
+        ])
+        .await;
+        let base_url = codex.responses_url.strip_suffix("/responses").unwrap();
+        let openai = OpenAiResponsesModelProvider::builder("fixture")
+            .api_url(base_url)
+            .credential(Some("test-key"))
+            .build();
+        for provider in [&codex as &dyn ModelProvider, &openai] {
+            let dispatch = ProviderDispatch::from_ref(provider);
+            let scope = AccountedChatScope::new_with_string_usage();
+            let error = scope
+                .scope(dispatch.chat_with_system(None, "hello", "gpt-5-codex", None))
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("hardware quota"));
+            let report = scope.take();
+            let [attempt] = report.attempts() else {
+                panic!("expected one rejected HTTP request");
+            };
+            assert!(matches!(
+                attempt.outcome(),
+                AttemptUsageOutcome::Complete(usage)
+                    if (usage.input_tokens, usage.output_tokens) == (Some(8), Some(3))
+            ));
+            assert_eq!(report.rejected_attempts().len(), 1);
+            assert!(report.accepted_route().is_none());
+        }
+        assert_eq!(captured.lock().unwrap().len(), 2);
+        server.abort();
+    }
+
+    #[test]
+    fn sse_frame_cursor_does_not_treat_split_crlf_as_blank_line() {
+        let mut frames = ResponsesSseFrames::default();
+        let prefix = "{extension}: ignored\r\ndata: {}";
+        let mut input = format!("{prefix}\r");
+        assert_eq!(frames.next(&input), None);
+        input.push('\n');
+        assert_eq!(frames.next(&input), None);
+        input.push('\r');
+        assert_eq!(
+            frames.next(&input),
+            Some("{extension}: ignored\r\ndata: {}\r\n")
+        );
+        input.push_str("\ndata: {}\r\r");
+        assert_eq!(frames.next(&input), Some(""));
+        assert_eq!(frames.next(&input), Some("data: {}\r"));
+        assert_eq!(frames.next(&input), None);
+        assert!(frames.remaining(&input).is_empty());
+    }
+
+    #[tokio::test]
+    async fn goal_string_usage_codex_terminal_frame_precedes_reader_completion() {
+        use crate::dispatch::{AccountedChatScope, AttemptUsageOutcome, ProviderDispatch};
+        use axum::body::{Body, Bytes};
+
+        const FAILED: &str = concat!(
+            "[extension]: ignored\n\n: keepalive\n\n",
+            r#"data: {"type":"response.failed","response":{"error":{"message":"native failure"},"usage":{"input_tokens":8,"output_tokens":3}}}"#,
+            "\n\r\n"
+        );
+        const INCOMPLETE: &str = concat!(
+            "\u{feff}id: 1\r\n",
+            r#"data: {"type":"response.incomplete","response":{"incomplete_details":{"reason":"max_output_tokens"},"usage":{"input_tokens":8,"output_tokens":3}}}"#,
+            "\r\r"
+        );
+        let trailing_invalid_utf8 = [FAILED.as_bytes(), &[0xff]].concat();
+        let unterminated_body = futures_util::stream::iter([Ok::<_, std::io::Error>(
+            Bytes::from_static(INCOMPLETE.as_bytes()),
+        )])
+        .chain(futures_util::stream::pending());
+
+        for (reply, reason) in [
+            (
+                MockCodexReply::SseBody(Body::from(trailing_invalid_utf8)),
+                "native failure",
+            ),
+            (MockCodexReply::TruncatedSse(FAILED), "native failure"),
+            (
+                MockCodexReply::SseBody(Body::from_stream(unterminated_body)),
+                "max_output_tokens",
+            ),
+        ] {
+            let (provider, captured, server, _temp_dir, _proxy_guard) =
+                mock_codex_provider(vec![reply]).await;
+            let dispatch = ProviderDispatch::from_ref(&provider);
+            let scope = AccountedChatScope::new_with_string_usage();
+            let err = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                scope.scope(dispatch.chat_with_system(None, "hello", "gpt-5-codex", None)),
+            )
+            .await
+            .expect("a framed failure does not need EOF")
+            .unwrap_err();
+            let terminal = err
+                .downcast_ref::<ResponsesStreamApiError>()
+                .unwrap_or_else(|| panic!("expected framed {reason}: {err:#}"));
+            assert_eq!(terminal.0, reason);
+            assert_eq!(captured.lock().unwrap().len(), 1);
+            let report = scope.take();
+            assert_eq!(report.rejected_attempts().len(), 1);
+            assert!(report.accepted_route().is_none());
+            assert!(matches!(
+                report.attempts()[0].outcome(),
+                AttemptUsageOutcome::Complete(usage)
+                    if (usage.input_tokens, usage.output_tokens) == (Some(8), Some(3))
+            ));
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn goal_string_usage_codex_eof_does_not_dispatch_an_unfinished_event() {
+        use crate::dispatch::{AccountedChatScope, AttemptUsageOutcome, ProviderDispatch};
+        use axum::body::Body;
+
+        const DELTA: &str = concat!(
+            "[extension]: ignored\n\n",
+            r#"data: {"type":"response.output_text.delta","delta":"partial"}"#,
+            "\n\n"
+        );
+        const TERMINAL: &str = concat!(
+            r#"data: {"type":"response.completed","response":{"output_text":"partial","usage":{"input_tokens":8,"output_tokens":3}}}"#,
+            "\n"
+        );
+        for (prefix, framed) in [("", false), (DELTA, false), (DELTA, true)] {
+            let body = format!("{prefix}{TERMINAL}{}", if framed { "\n" } else { "" });
+            let mut replies = vec![MockCodexReply::SseBody(Body::from(body))];
+            if !framed {
+                replies.push(MockCodexReply::Json(serde_json::json!({
+                    "output_text":"fallback","usage":{"input_tokens":5,"output_tokens":2}
+                })));
+            }
+            let (provider, captured, server, _temp_dir, _proxy_guard) =
+                mock_codex_provider(replies).await;
+            let dispatch = ProviderDispatch::from_ref(&provider);
+            let scope = AccountedChatScope::new_with_string_usage();
+            let answer = scope
+                .scope(dispatch.chat_with_system(None, "hello", "gpt-5-codex", None))
+                .await
+                .unwrap();
+            assert_eq!(answer, if framed { "partial" } else { "fallback" });
+            scope.mark_logical_success();
+            let report = scope.take();
+            assert!(report.accepted_route().is_some());
+            assert_eq!(report.attempts().len(), if framed { 1 } else { 2 });
+            assert!(report.rejected_attempts().is_empty());
+            if !framed {
+                assert!(matches!(
+                    report.attempts()[0].outcome(),
+                    AttemptUsageOutcome::Missing
+                ));
+            }
+            let expected_usage = if framed {
+                (Some(8), Some(3))
+            } else {
+                (Some(5), Some(2))
+            };
+            assert!(matches!(
+                report.attempts().last().unwrap().outcome(),
+                AttemptUsageOutcome::Complete(usage)
+                    if (usage.input_tokens, usage.output_tokens) == expected_usage
+            ));
+            let requests = captured.lock().unwrap();
+            assert_eq!(requests.len(), report.attempts().len());
+            assert_eq!(requests[0]["stream"], true);
+            if !framed {
+                assert_eq!(requests[1]["stream"], false);
+            }
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn goal_string_usage_codex_broken_body_stays_unknown_after_decode_retry() {
+        use crate::dispatch::{AccountedChatScope, AttemptUsageOutcome, ProviderDispatch};
+
+        let (provider, captured, server, _temp_dir, _proxy_guard) = mock_codex_provider(vec![
+            MockCodexReply::TruncatedSse("data: {"),
+            MockCodexReply::Json(serde_json::json!({
+                "output_text":"fallback","usage":{"input_tokens":8,"output_tokens":3}
+            })),
+        ])
+        .await;
+        let dispatch = ProviderDispatch::from_ref(&provider);
+        let scope = AccountedChatScope::new_with_string_usage();
+        let response = scope
+            .scope(dispatch.chat_with_system(None, "hello", "gpt-5-codex", None))
+            .await
+            .unwrap();
+        assert_eq!(response, "fallback");
+        scope.mark_logical_success();
+        let report = scope.take();
+        let [interrupted, accepted] = report.attempts() else {
+            panic!("expected interrupted request followed by its ordinary retry");
+        };
+        assert!(matches!(
+            interrupted.outcome(),
+            AttemptUsageOutcome::OutcomeUnknown { observed: None }
+        ));
+        assert!(matches!(
+            accepted.outcome(),
+            AttemptUsageOutcome::Complete(usage)
+                if (usage.input_tokens, usage.output_tokens) == (Some(8), Some(3))
+        ));
+        assert!(report.accepted_route().is_some());
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0]["stream"], true);
+        assert_eq!(requests[1]["stream"], false);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn goal_string_usage_preserves_ordinary_codex_json_status_and_decode_retry() {
+        let (provider, captured, server, _temp_dir, _proxy_guard) = mock_codex_provider(vec![
+            MockCodexReply::Json(serde_json::json!({
+                "status":"incomplete","output_text":"partial",
+                "usage":{"input_tokens":8,"output_tokens":3}
+            })),
+            MockCodexReply::Json(serde_json::json!({
+                "status":"failed","output":null,
+                "usage":{"input_tokens":8,"output_tokens":3}
+            })),
+            MockCodexReply::Json(serde_json::json!({"output_text":"fallback"})),
+        ])
+        .await;
+        assert_eq!(
+            provider
+                .chat_with_system(None, "hello", "gpt-5-codex", None)
+                .await
+                .unwrap(),
+            "partial"
+        );
+        assert_eq!(captured.lock().unwrap().len(), 1);
+        assert_eq!(
+            provider
+                .chat_with_system(None, "hello", "gpt-5-codex", None)
+                .await
+                .unwrap(),
+            "fallback"
+        );
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[0]["stream"], true);
+        assert_eq!(requests[1]["stream"], true);
+        assert_eq!(requests[2]["stream"], false);
+        server.abort();
     }
 
     #[tokio::test]
@@ -2313,6 +3128,84 @@ mod tests {
         assert_eq!(requests[1]["stream"], false);
 
         server_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn goal_string_usage_retains_codex_stream_failure_usage_without_retry() {
+        use crate::dispatch::{AccountedChatScope, AttemptUsageOutcome, ProviderDispatch};
+
+        for (event, billed, partial) in [
+            (
+                r#"data: {"type":"response.failed","response":{"error":{"message":"failed"},"usage":{"input_tokens":8,"output_tokens":3}}}"#,
+                true,
+                false,
+            ),
+            (
+                r#"data: {"type":"response.failed","response":{"error":{"message":"failed"}}}"#,
+                false,
+                false,
+            ),
+            (
+                concat!(
+                    r#"data: {"type":"response.output_text.delta","delta":"partial"}"#,
+                    "\n\n",
+                    r#"data: {"type":"response.incomplete","response":{"usage":{"input_tokens":8,"output_tokens":3}}}"#,
+                ),
+                true,
+                true,
+            ),
+            (
+                concat!(
+                    r#"data: {"type":"response.output_text.delta","delta":"partial"}"#,
+                    "\n\n",
+                    r#"data: {"type":"response.failed","response":{"usage":{"input_tokens":8,"output_tokens":3}}}"#,
+                ),
+                true,
+                true,
+            ),
+        ] {
+            let mut replies = vec![MockCodexReply::Sse(event)];
+            if partial {
+                replies.push(MockCodexReply::Sse(event));
+            }
+            let (provider, captured, server, _temp_dir, _proxy_guard) =
+                mock_codex_provider(replies).await;
+            let dispatch = ProviderDispatch::from_ref(&provider);
+            let scope = AccountedChatScope::new_with_string_usage();
+            let error = scope
+                .scope(dispatch.chat_with_system(None, "hello", "gpt-5-codex", None))
+                .await
+                .unwrap_err();
+            assert!(
+                error.downcast_ref::<ResponsesStreamApiError>().is_some(),
+                "{error:#}"
+            );
+            let report = scope.take();
+            assert!(report.accepted_route().is_none());
+            let [attempt] = report.attempts() else {
+                panic!("expected one physical attempt");
+            };
+            if billed {
+                assert!(
+                    matches!(attempt.outcome(), AttemptUsageOutcome::Complete(usage)
+                    if (usage.input_tokens, usage.output_tokens) == (Some(8), Some(3)))
+                );
+            } else {
+                assert!(matches!(attempt.outcome(), AttemptUsageOutcome::Missing));
+            }
+            assert_eq!(captured.lock().unwrap().len(), 1);
+            if partial {
+                assert_eq!(
+                    dispatch
+                        .chat_with_system(None, "hello", "gpt-5-codex", None)
+                        .await
+                        .unwrap(),
+                    "partial"
+                );
+                assert_eq!(captured.lock().unwrap().len(), 2);
+            }
+            server.abort();
+        }
     }
 
     #[tokio::test]

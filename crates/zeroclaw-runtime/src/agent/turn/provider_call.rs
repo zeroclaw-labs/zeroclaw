@@ -12,7 +12,7 @@ use super::redact::scrub_credentials;
 use super::stream_consume::{
     StreamProviderFailure, consume_provider_streaming_response_with_policy,
 };
-use crate::agent::cost::{admit_goal_operation_if_scoped, check_tool_loop_budget};
+use crate::agent::cost::check_tool_loop_budget;
 use crate::cost::types::{BudgetCheck, UsagePeriod};
 use crate::observability::ObserverEvent;
 use crate::tools::ToolSpec;
@@ -294,12 +294,24 @@ pub(crate) fn announce_budget_warning(
     });
 }
 
+/// Check the Goal foreground lifetime before entering provider admission.
+pub(super) fn ensure_goal_foreground_active() -> Result<()> {
+    let foreground = crate::goal_accounting::GoalForegroundContext::current();
+    if foreground.as_ref().is_some_and(|context| {
+        context.token().is_cancelled() || tokio::time::Instant::now() >= context.deadline()
+    }) {
+        return Err(ToolLoopCancelled.into());
+    }
+    Ok(())
+}
+
 /// One provider call: streaming via `consume_provider_streaming_response`
 /// with non-streaming fallback, or plain non-streaming chat with optional
 /// per-step timeout and cancel select. See [`ProviderCallOutcome`] for the
 /// cancel asymmetry this function must preserve.
-/// An active Goal foreground token or absolute deadline is checked before
-/// accountant admission; once admitted, existing settlement and drain apply.
+/// Callers must admit Goal work and pass its pre-dispatch gate first. The guard
+/// is held until the dispatch future is first polled (or the stream is
+/// constructed), even if an outer cancellation select yields beforehand.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn call_provider(
     ctx: &TurnCtx<'_>,
@@ -313,14 +325,8 @@ pub(crate) async fn call_provider(
     policy: zeroclaw_api::model_provider::ToolRoundPolicy,
     iteration: usize,
     guard_tools: Option<&[ToolSpec]>,
+    dispatch_start: Option<zeroclaw_goal::task::GoalDispatchStart>,
 ) -> Result<ProviderCallOutcome> {
-    let foreground = crate::goal_accounting::GoalForegroundContext::current();
-    if foreground.as_ref().is_some_and(|context| {
-        context.token().is_cancelled() || tokio::time::Instant::now() >= context.deadline()
-    }) {
-        return Err(ToolLoopCancelled.into());
-    }
-    admit_goal_operation_if_scoped(ctx.provider_name, active_model).await?;
     let mut streamed_live_deltas = false;
     let mut streamed_protocol_suppressed = false;
     let mut streamed_visible_text = String::new();
@@ -332,25 +338,24 @@ pub(crate) async fn call_provider(
         // The stream is lazily consumed inside this call-scoped owner. Its
         // permitted non-stream recovery therefore shares the same Reliable
         // attempt ledger instead of opening a second scope.
-        let scope = if crate::agent::cost::goal_operation_accounting_is_scoped() {
-            zeroclaw_providers::dispatch::AccountedChatScope::new_with_string_usage()
-        } else {
-            zeroclaw_providers::dispatch::AccountedChatScope::new()
-        };
+        let scope = crate::agent::cost::new_provider_attempt_scope();
         let (result, live_deltas, protocol_suppressed, visible_text, recovered_image_request) = scope
             .scope(Box::pin(zeroclaw_providers::reliable::scope_provider_fallback(Box::pin(async {
-                    match consume_provider_streaming_response_with_policy(
-                        active_model_provider,
-                        original_request,
-                        active_dispatch_model,
-                        ctx.temperature,
-                        ctx.cancellation_token,
-                        ctx.on_delta,
-                        ctx.event_tx,
-                        ctx.strict_tool_parsing,
-                        ctx.draft_reasoning,
-                        policy,
-                        guard_tools,
+                    match crate::agent::cost::release_after_first_poll(
+                        dispatch_start,
+                        consume_provider_streaming_response_with_policy(
+                            active_model_provider,
+                            original_request,
+                            active_dispatch_model,
+                            ctx.temperature,
+                            ctx.cancellation_token,
+                            ctx.on_delta,
+                            ctx.event_tx,
+                            ctx.strict_tool_parsing,
+                            ctx.draft_reasoning,
+                            policy,
+                            guard_tools,
+                        ),
                     )
                     .await
                     {
@@ -600,14 +605,10 @@ pub(crate) async fn call_provider(
         // Non-streaming path: wrap with optional per-step timeout from
         // pacing config to catch hung model responses.
         let dispatcher = ProviderDispatch::from_ref(active_model_provider);
-        let scope = if crate::agent::cost::goal_operation_accounting_is_scoped() {
-            zeroclaw_providers::dispatch::AccountedChatScope::new_with_string_usage()
-        } else {
-            zeroclaw_providers::dispatch::AccountedChatScope::new()
-        };
+        let scope = crate::agent::cost::new_provider_attempt_scope();
         // Both attempts belong to one inference step: recovery must not
         // outlive cancellation or receive a fresh timeout allowance.
-        let chat_future = async {
+        let chat_future = crate::agent::cost::release_after_first_poll(dispatch_start, async {
             let result = scope
                 .scope(Box::pin(with_exact_dispatch_route(
                     active_model_provider_name.to_string(),
@@ -660,7 +661,7 @@ pub(crate) async fn call_provider(
                 }
                 result => result,
             }
-        };
+        });
 
         let result = match ctx.pacing.step_timeout_secs {
             Some(step_secs) if step_secs > 0 => {
@@ -701,6 +702,7 @@ pub(crate) async fn call_provider(
         (result, scope.take())
     };
     let (attempts, _, accepted_route) = accounting.into_attempts_and_parts();
+    crate::agent::cost::register_goal_returned_attempts(&attempts);
 
     Ok(ProviderCallOutcome {
         chat_result,
@@ -1248,6 +1250,137 @@ mod streaming_fallback_tests {
         ModelProvider, ReliableProviderTerminalFailure, ReliableProviderTerminalFailureKind,
     };
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Ordinary-call fixture mirrors the production seam"
+    )]
+    async fn call_provider(
+        ctx: &TurnCtx<'_>,
+        provider: &dyn ModelProvider,
+        provider_name: &str,
+        model: &str,
+        dispatch_model: &str,
+        request: ChatRequest<'_>,
+        recovery_messages: Option<&[ChatMessage]>,
+        streaming: bool,
+        policy: ToolRoundPolicy,
+        iteration: usize,
+        guard_tools: Option<&[ToolSpec]>,
+    ) -> Result<ProviderCallOutcome> {
+        super::call_provider(
+            ctx,
+            provider,
+            provider_name,
+            model,
+            dispatch_model,
+            request,
+            recovery_messages,
+            streaming,
+            policy,
+            iteration,
+            guard_tools,
+            None,
+        )
+        .await
+    }
+
+    struct DispatchGateProvider {
+        gate: Arc<tokio::sync::Mutex<()>>,
+        calls: AtomicUsize,
+    }
+
+    impl Attributable for DispatchGateProvider {
+        fn role(&self) -> Role {
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+        }
+
+        fn alias(&self) -> &str {
+            "dispatch-gate-test"
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for DispatchGateProvider {
+        async fn chat_with_system(
+            &self,
+            _: Option<&str>,
+            _: &str,
+            _: &str,
+            _: Option<f64>,
+        ) -> Result<String> {
+            unreachable!("the fixture uses structured chat")
+        }
+
+        async fn chat(&self, _: ChatRequest<'_>, _: &str, _: Option<f64>) -> Result<ChatResponse> {
+            assert!(
+                self.gate.try_lock().is_err(),
+                "dispatch must hold the gate on entry"
+            );
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn goal_dispatch_gate_survives_cooperative_yield_before_provider_poll() {
+        for step_timeout_secs in [None, Some(10)] {
+            let gate = Arc::new(tokio::sync::Mutex::new(()));
+            let start =
+                zeroclaw_goal::task::GoalDispatchStart::new(Arc::clone(&gate).lock_owned().await);
+            let provider = DispatchGateProvider {
+                gate: Arc::clone(&gate),
+                calls: AtomicUsize::new(0),
+            };
+            let observer = NoopObserver;
+            let pacing = PacingConfig {
+                step_timeout_secs,
+                ..Default::default()
+            };
+            let token = tokio_util::sync::CancellationToken::new();
+            let mut ctx = recovery_test_ctx(&observer, &pacing);
+            ctx.cancellation_token = Some(&token);
+            let messages = [ChatMessage::user("test")];
+            let mut call = Box::pin(super::call_provider(
+                &ctx,
+                &provider,
+                "test-provider",
+                "test-model",
+                "test-model",
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                None,
+                false,
+                ToolRoundPolicy::Batch,
+                0,
+                None,
+                Some(start),
+            ));
+
+            // Exhaust the current task's cooperative budget without yielding.
+            // Tokio's select then returns Pending before polling either arm.
+            while tokio::task::coop::has_budget_remaining() {
+                tokio::task::coop::consume_budget().await;
+            }
+            assert!(futures_util::poll!(call.as_mut()).is_pending());
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+            assert!(
+                gate.try_lock().is_err(),
+                "the unpolled dispatch must retain the gate"
+            );
+
+            tokio::task::yield_now().await;
+            assert!(futures_util::poll!(call.as_mut()).is_pending());
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+            assert!(
+                gate.try_lock().is_ok(),
+                "the gate must not cover the response wait"
+            );
+        }
+    }
+
     fn recovery_test_ctx<'a>(observer: &'a NoopObserver, pacing: &'a PacingConfig) -> TurnCtx<'a> {
         TurnCtx {
             observer,
@@ -1347,6 +1480,22 @@ mod streaming_fallback_tests {
 
     #[async_trait]
     impl zeroclaw_goal::accounting::GoalOperationAccounting for AdmissionSpy {
+        fn admission_guard(&self) -> Result<zeroclaw_goal::accounting::GoalOperationGuard> {
+            assert!(!self.forbidden);
+            Ok(zeroclaw_goal::accounting::GoalOperationGuard::new(()))
+        }
+
+        async fn begin_dispatch(&self) -> Result<zeroclaw_goal::task::GoalDispatchStart> {
+            assert!(!self.forbidden);
+            Ok(zeroclaw_goal::task::GoalDispatchStart::new(
+                Arc::new(tokio::sync::Mutex::new(())).lock_owned().await,
+            ))
+        }
+
+        async fn release_unstarted(&self) -> Result<()> {
+            panic!("a stopped call must not admit; a live call must dispatch")
+        }
+
         async fn admit(
             &self,
             request: zeroclaw_goal::accounting::GoalOperationRequest,
@@ -1373,11 +1522,16 @@ mod streaming_fallback_tests {
         provider: &AdmissionProvider,
         streaming: bool,
     ) -> Result<ProviderCallOutcome> {
+        ensure_goal_foreground_active()?;
+        let _admission =
+            crate::agent::cost::admit_goal_operation_if_scoped("test-provider", "test-model")
+                .await?;
+        let dispatch_start = crate::agent::cost::begin_goal_dispatch_if_scoped().await?;
         let observer = NoopObserver;
         let pacing = PacingConfig::default();
         let ctx = recovery_test_ctx(&observer, &pacing);
         let messages = [ChatMessage::user("hello")];
-        call_provider(
+        super::call_provider(
             &ctx,
             provider,
             "test-provider",
@@ -1393,6 +1547,7 @@ mod streaming_fallback_tests {
             ToolRoundPolicy::Batch,
             0,
             None,
+            dispatch_start,
         )
         .await
     }
