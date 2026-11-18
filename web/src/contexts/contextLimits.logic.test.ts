@@ -2,7 +2,10 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { resolveContextBarState } from '../lib/contextBar.ts';
-import { contextLimitsFromDoneFrame } from './contextLimits.logic.ts';
+import {
+  applyHistoryTrimToDisplayedBudget,
+  contextLimitsFromDoneFrame,
+} from './contextLimits.logic.ts';
 
 test('a done frame without capacity clears the previous route denominator', () => {
   let limits = contextLimitsFromDoneFrame({
@@ -24,4 +27,39 @@ test('a done frame without capacity clears the previous route denominator', () =
   assert.ok(rendered);
   assert.equal(rendered.denominator, 32_000);
   assert.equal(rendered.trimMarkerIndex, null);
+});
+
+test('a real trim replaces only the count and preserves the canonical budget', () => {
+  const current = { inputTokens: 180_000, source: 'provider' };
+  const trimmed = applyHistoryTrimToDisplayedBudget(current, {
+    tokens_after: 90_000,
+    dropped_messages: 4,
+    tokens_after_source: 'calibrated',
+  });
+  assert.deepEqual(trimmed, { inputTokens: 90_000, source: 'calibrated' });
+
+  const rendered = resolveContextBarState(160_000, 200_000, trimmed.inputTokens);
+  assert.ok(rendered);
+  assert.equal(rendered.used, 90_000);
+  assert.equal(rendered.denominator, 200_000);
+});
+
+test('a message-limit trim leaves the displayed budget alone', () => {
+  const current = { inputTokens: 12_000, source: 'provider' };
+  assert.deepEqual(applyHistoryTrimToDisplayedBudget(current, {}), current);
+});
+
+test('a zero-drop floor notice cannot replace the displayed count', () => {
+  const current = { inputTokens: 12_000, source: 'provider' };
+  assert.equal(applyHistoryTrimToDisplayedBudget(current, {
+    dropped_messages: 0,
+    tokens_after: 4_000,
+  }), current);
+});
+
+test('a trim without provenance cannot inherit a previous provider label', () => {
+  assert.deepEqual(applyHistoryTrimToDisplayedBudget(
+    { inputTokens: 12_000, source: 'provider' },
+    { dropped_messages: 2, tokens_after: 6_000 },
+  ), { inputTokens: 6_000, source: null });
 });
