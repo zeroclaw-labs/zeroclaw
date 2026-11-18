@@ -51,9 +51,9 @@ a broker remain governed by the configured sandbox policy.
 
 ## Trust and credentials
 
-The Python helper uses the operator-configured SSH agent. Catalog aliases and
-the vault belong to the native broker. The Python helper needs only the
-standard library, OpenSSH and the existing process supervision tools.
+The Python helper uses the operator-configured SSH agent. Scoped catalog
+credentials and vault loading are not supported by this helper. It needs only
+the standard library, OpenSSH and the existing process supervision tools.
 
 For localized helper diagnostics, install the optional compiled gettext
 catalog for the service locale. Set `LANG` and, when using a custom catalog
