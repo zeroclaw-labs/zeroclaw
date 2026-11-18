@@ -9,6 +9,7 @@ cli-daemon-about = 長時間実行自動デーモンを開始
 cli-service-about = OSサービスライフサイクルを管理 (launchd/systemd ユーザーサービス)
 cli-doctor-about = デーモン/スケジューラー/チャネル鮮度の診断を実行
 cli-status-about = システムステータスを表示 (詳細)
+cli-status-format-local-health = 出力形式: 「exit-code」は、ローカルデーモンが health に応答し、デーモンの状態が「ok」のときに 0、それ以外のときに 1 で終了します。
 cli-estop-about = エマージェンシーストップ状態を開始・検査・再開
 cli-cron-about = スケジュール済みタスクを設定・管理
 cli-models-about = プロバイダーモデルカタログを管理

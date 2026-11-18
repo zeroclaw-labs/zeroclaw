@@ -9,6 +9,7 @@ cli-daemon-about = 启动长时间运行的自主守护进程
 cli-service-about = 管理操作系统服务生命周期（launchd/systemd 用户服务）
 cli-doctor-about = 运行守护进程/调度器/渠道新鲜度诊断
 cli-status-about = 显示系统状态（完整详情）
+cli-status-format-local-health = 输出格式：“exit-code”在本地守护进程响应 health 请求且守护进程状态为“ok”时以 0 退出，否则以 1 退出。
 cli-estop-about = 启用、检查和恢复紧急停止状态
 cli-cron-about = 配置和管理定时任务
 cli-models-about = 管理提供商模型目录

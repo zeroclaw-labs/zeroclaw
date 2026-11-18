@@ -8912,6 +8912,14 @@ fn probe_config_dir(
 fn apply_i18n_to_command(cmd: clap::Command) -> clap::Command {
     #[cfg(feature = "agent-runtime")]
     {
+        #[cfg(not(feature = "gateway"))]
+        let cmd = cmd.mut_subcommand("status", |cmd| {
+            cmd.mut_arg("format", |arg| {
+                arg.help(crate::i18n::get_required_cli_string(
+                    "cli-status-format-local-health",
+                ))
+            })
+        });
         apply_cmd_translations(cmd, "cli")
     }
     #[cfg(not(feature = "agent-runtime"))]
@@ -11628,27 +11636,7 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
 
         Commands::Status { format } => {
             if format.as_deref() == Some("exit-code") {
-                // Lightweight health probe for Docker HEALTHCHECK
-                let port = config.gateway.port;
-                let host = if config.gateway.host == "[::]" || config.gateway.host == "0.0.0.0" {
-                    "127.0.0.1"
-                } else {
-                    &config.gateway.host
-                };
-                let url = format!("http://{}:{}/health", host, port);
-                match reqwest::Client::new()
-                    .get(&url)
-                    .timeout(std::time::Duration::from_secs(5))
-                    .send()
-                    .await
-                {
-                    Ok(resp) if resp.status().is_success() => {
-                        std::process::exit(0);
-                    }
-                    _ => {
-                        std::process::exit(1);
-                    }
-                }
+                std::process::exit(i32::from(!status_is_healthy(&config).await));
             }
             println!("{}", t("cli-status-title", "🦀 ZeroClaw Status"));
             println!();
@@ -14565,19 +14553,52 @@ async fn shutdown_gateway(host: &str, port: u16, path_prefix: Option<&str>) -> R
     }
 }
 
-/// Dispatch the gateway-backed SOP verbs. Requires the `agent-runtime` build (the
-/// gateway HTTP client + `gateway_admin_url` live behind it, like `shutdown_gateway`);
-/// without it these verbs cannot reach the daemon, so they error clearly.
-#[cfg(feature = "agent-runtime")]
-async fn sop_admin_dispatch(cmd: SopCommands, config: &crate::config::Config) -> Result<()> {
-    sop_admin_request(cmd, config).await
+/// Standard builds retain the gateway HTTP probe used by Docker HEALTHCHECK.
+#[cfg(all(feature = "agent-runtime", feature = "gateway"))]
+async fn status_is_healthy(config: &crate::config::Config) -> bool {
+    let port = config.gateway.port;
+    let host = if config.gateway.host == "[::]" || config.gateway.host == "0.0.0.0" {
+        "127.0.0.1"
+    } else {
+        &config.gateway.host
+    };
+    reqwest::Client::new()
+        .get(format!("http://{host}:{port}/health"))
+        .timeout(std::time::Duration::from_secs(5))
+        .send()
+        .await
+        .is_ok_and(|response| response.status().is_success())
+}
+
+#[cfg(all(feature = "agent-runtime", not(feature = "gateway")))]
+async fn status_is_healthy(config: &crate::config::Config) -> bool {
+    let request = zeroclaw_runtime::rpc::local::call_local(config, "health", serde_json::json!({}));
+    matches!(
+        tokio::time::timeout(std::time::Duration::from_secs(5), request).await,
+        Ok(Ok(snapshot)) if daemon_reports_healthy(&snapshot)
+    )
+}
+
+#[cfg(all(feature = "agent-runtime", not(feature = "gateway")))]
+fn daemon_reports_healthy(snapshot: &serde_json::Value) -> bool {
+    snapshot
+        .pointer("/components/daemon/status")
+        .and_then(serde_json::Value::as_str)
+        == Some("ok")
+}
+
+/// These SOP verbs depend on the gateway's administration routes.
+#[cfg(all(feature = "agent-runtime", not(feature = "gateway")))]
+#[allow(clippy::unused_async)]
+async fn sop_admin_dispatch(_cmd: SopCommands, _config: &crate::config::Config) -> Result<()> {
+    bail!("{}", no_dashboard_in_build_message())
 }
 
 /// CLI -> daemon dispatch for the out-of-band SOP approval verbs (EPIC C, C8).
 /// Posts to `/admin/sop/*` on the running gateway (mirrors `shutdown_gateway`);
 /// never builds a throwaway local engine, which cannot see the daemon's runs.
-#[cfg(feature = "agent-runtime")]
-async fn sop_admin_request(cmd: SopCommands, config: &crate::config::Config) -> Result<()> {
+#[cfg(all(feature = "agent-runtime", feature = "gateway"))]
+async fn sop_admin_dispatch(cmd: SopCommands, config: &crate::config::Config) -> Result<()> {
     let host = config.gateway.host.clone();
     let port = config.gateway.port;
     let prefix = config.gateway.path_prefix.as_deref();
@@ -18987,6 +19008,22 @@ mod tests {
             has_model_flag,
             "onboard help should include --model for quick setup overrides"
         );
+    }
+
+    #[cfg(all(feature = "agent-runtime", not(feature = "gateway")))]
+    #[test]
+    fn cli_only_health_requires_the_daemon_component_to_report_ok() {
+        for state in ["starting", "error", "unknown"] {
+            assert!(!daemon_reports_healthy(&serde_json::json!({
+                "components": { "daemon": { "status": state } }
+            })));
+        }
+        assert!(!daemon_reports_healthy(&serde_json::json!({
+            "components": { "channel:example": { "status": "ok" } }
+        })));
+        assert!(daemon_reports_healthy(&serde_json::json!({
+            "components": { "daemon": { "status": "ok" }, "channel:example": { "status": "error" } }
+        })));
     }
 
     #[test]
