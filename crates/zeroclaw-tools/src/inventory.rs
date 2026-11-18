@@ -743,6 +743,20 @@ mod tests {
     }
 
     #[test]
+    fn core_rows_match_configured_core_names() {
+        let mut core: Vec<_> = builtin_tools_in(ToolTier::Core)
+            .map(|spec| spec.name)
+            .collect();
+        let mut configured = zeroclaw_config::builtin_tools::CORE_TOOL_NAMES.to_vec();
+        core.sort_unstable();
+        configured.sort_unstable();
+        assert_eq!(
+            core, configured,
+            "Core inventory and CORE_TOOL_NAMES differ"
+        );
+    }
+
+    #[test]
     fn lookup_finds_rows_and_rejects_unknown_names() {
         let shell = builtin_tool("shell").expect("shell is inventoried");
         assert_eq!(shell.name, "shell");
