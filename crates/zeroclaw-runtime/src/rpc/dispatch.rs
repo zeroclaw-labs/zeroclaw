@@ -36678,7 +36678,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn session_goal_sibling_sweep_skips_a_held_lifecycle_lock() {
         let fixture = GoalAdmissionFixture::new(RpcAccessPolicy::TrustedLocal).await;
         let context = &fixture.dispatcher.ctx;
@@ -36692,8 +36692,20 @@ mod tests {
             .lock_goal_lifecycle(GoalAdmissionFixture::SESSION, generation)
             .await
             .unwrap();
+        let deadline = std::time::Duration::from_secs(2);
+        assert!(
+            tokio::time::timeout(
+                deadline,
+                context
+                    .sessions
+                    .lock_goal_lifecycle(GoalAdmissionFixture::SESSION, generation),
+            )
+            .await
+            .is_err(),
+            "the watchdog must still reject waiting on the held lock"
+        );
         let created = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
+            deadline,
             fixture.dispatcher.handle_session_new_for_test(&json!({
                 "agent_alias": "test-agent",
                 "chat_mode": "chat",
@@ -41887,12 +41899,12 @@ mod tests {
         new_chat_session_for_eviction_test(&dispatcher, "sibling-goal", Some(true)).await;
         let goal_store = Arc::new(crate::control_plane::SqliteTaskStore::new_in_memory().unwrap());
         let durable_session_id = "rpc_sibling-goal";
-        insert_running_goal(&goal_store, durable_session_id, "sibling-goal-task").await;
+        insert_running_goal(goal_store.as_ref(), durable_session_id, "sibling-goal-task").await;
         let goal_runtime = Arc::new(crate::rpc::goal::RpcGoalRuntime::default());
         goal_runtime
             .install_supervisor_if_absent(
                 "sibling-goal".to_string(),
-                test_goal_supervisor(Arc::clone(&goal_store)),
+                test_goal_supervisor(goal_store.clone()),
             )
             .await;
         Arc::get_mut(&mut dispatcher.ctx)
@@ -42506,10 +42518,10 @@ mod tests {
     }
 
     fn test_goal_supervisor(
-        store: Arc<crate::control_plane::SqliteTaskStore>,
+        registry: Arc<dyn zeroclaw_goal::GoalTaskRegistry>,
     ) -> Arc<zeroclaw_goal::control::GoalExecutionSupervisor> {
         use zeroclaw_goal::{
-            GoalExecutionScope, GoalTaskRegistry,
+            GoalExecutionScope,
             accounting::{
                 GoalOperationAccounting, GoalOperationAccountingFactory, GoalOperationRequest,
                 GoalOperationSettlement,
@@ -42558,19 +42570,18 @@ mod tests {
             }
         }
 
-        let registry: Arc<dyn GoalTaskRegistry> = store;
         let runtime = GoalRuntime::new(registry);
         let engine = Arc::new(runtime.execution_engine(Arc::new(NoopAccountingFactory)));
         Arc::new(GoalExecutionSupervisor::new(engine))
     }
 
     async fn insert_running_goal(
-        store: &crate::control_plane::SqliteTaskStore,
+        store: &dyn zeroclaw_goal::GoalTaskRegistry,
         session_id: &str,
         task_id: &str,
     ) {
         use zeroclaw_api::task::{TaskKind, TaskRecord, TaskStatus};
-        use zeroclaw_goal::{GoalTaskRecord, GoalTaskRegistry, GoalTransitionResult};
+        use zeroclaw_goal::{GoalTaskRecord, GoalTransitionResult};
 
         let task = TaskRecord {
             id: task_id.to_owned(),
@@ -48288,13 +48299,12 @@ mod tests {
             .expect("initial ACP session should succeed");
         let original_generation = sessions.get_generation(sid).await.unwrap();
 
-        let goal_store = Arc::new(crate::control_plane::SqliteTaskStore::new_in_memory().unwrap());
+        let control_plane = crate::control_plane::ControlPlaneHandle::open(&data_dir).unwrap();
+        let goal_store = control_plane.goal_store().unwrap();
         let goal_runtime = Arc::new(crate::rpc::goal::RpcGoalRuntime::default());
+        goal_runtime.install_test_control_plane(control_plane);
         goal_runtime
-            .install_supervisor_if_absent(
-                sid.to_owned(),
-                test_goal_supervisor(Arc::clone(&goal_store)),
-            )
+            .install_supervisor_if_absent(sid.to_owned(), test_goal_supervisor(goal_store.clone()))
             .await;
         Arc::get_mut(&mut dispatcher.ctx)
             .expect("dispatcher context is uniquely owned before spawning")
@@ -48323,12 +48333,9 @@ mod tests {
         assert_ne!(successor_generation, original_generation);
 
         let durable_session_id = format!("rpc_{sid}");
-        insert_running_goal(&goal_store, &durable_session_id, "successor-goal").await;
+        insert_running_goal(goal_store.as_ref(), &durable_session_id, "successor-goal").await;
         goal_runtime
-            .install_supervisor_if_absent(
-                sid.to_owned(),
-                test_goal_supervisor(Arc::clone(&goal_store)),
-            )
+            .install_supervisor_if_absent(sid.to_owned(), test_goal_supervisor(goal_store.clone()))
             .await;
 
         release_removal.notify_one();
@@ -48341,7 +48348,6 @@ mod tests {
             sessions.get_generation(sid).await,
             Some(successor_generation)
         );
-        use zeroclaw_goal::GoalTaskRegistry;
         let current = goal_store
             .current_goal_for_session(&durable_session_id)
             .await
@@ -48372,13 +48378,15 @@ mod tests {
 
         let goal_store = Arc::new(crate::control_plane::SqliteTaskStore::new_in_memory().unwrap());
         let durable_session_id = format!("rpc_{sid}");
-        insert_running_goal(&goal_store, &durable_session_id, "reaped-session-goal").await;
+        insert_running_goal(
+            goal_store.as_ref(),
+            &durable_session_id,
+            "reaped-session-goal",
+        )
+        .await;
         let goal_runtime = Arc::new(crate::rpc::goal::RpcGoalRuntime::default());
         goal_runtime
-            .install_supervisor_if_absent(
-                sid.to_owned(),
-                test_goal_supervisor(Arc::clone(&goal_store)),
-            )
+            .install_supervisor_if_absent(sid.to_owned(), test_goal_supervisor(goal_store.clone()))
             .await;
         Arc::get_mut(&mut dispatcher.ctx)
             .expect("dispatcher context is uniquely owned before spawning")
@@ -48409,13 +48417,10 @@ mod tests {
         let sid = "unknown-session-delete-preserves-goal";
         let goal_store = Arc::new(crate::control_plane::SqliteTaskStore::new_in_memory().unwrap());
         let durable_session_id = format!("rpc_{sid}");
-        insert_running_goal(&goal_store, &durable_session_id, "orphan-goal").await;
+        insert_running_goal(goal_store.as_ref(), &durable_session_id, "orphan-goal").await;
         let goal_runtime = Arc::new(crate::rpc::goal::RpcGoalRuntime::default());
         goal_runtime
-            .install_supervisor_if_absent(
-                sid.to_owned(),
-                test_goal_supervisor(Arc::clone(&goal_store)),
-            )
+            .install_supervisor_if_absent(sid.to_owned(), test_goal_supervisor(goal_store.clone()))
             .await;
         Arc::get_mut(&mut dispatcher.ctx)
             .expect("dispatcher context is uniquely owned before spawning")
@@ -48484,12 +48489,9 @@ mod tests {
         assert_ne!(successor_generation, original_generation);
 
         let durable_session_id = format!("rpc_{sid}");
-        insert_running_goal(&goal_store, &durable_session_id, "successor-goal").await;
+        insert_running_goal(goal_store.as_ref(), &durable_session_id, "successor-goal").await;
         goal_runtime
-            .install_supervisor_if_absent(
-                sid.to_owned(),
-                test_goal_supervisor(Arc::clone(&goal_store)),
-            )
+            .install_supervisor_if_absent(sid.to_owned(), test_goal_supervisor(goal_store.clone()))
             .await;
 
         release_removal.notify_one();
@@ -48522,13 +48524,10 @@ mod tests {
         let sid = "unknown-session-kill-preserves-goal";
         let goal_store = Arc::new(crate::control_plane::SqliteTaskStore::new_in_memory().unwrap());
         let durable_session_id = format!("rpc_{sid}");
-        insert_running_goal(&goal_store, &durable_session_id, "orphan-goal").await;
+        insert_running_goal(goal_store.as_ref(), &durable_session_id, "orphan-goal").await;
         let goal_runtime = Arc::new(crate::rpc::goal::RpcGoalRuntime::default());
         goal_runtime
-            .install_supervisor_if_absent(
-                sid.to_owned(),
-                test_goal_supervisor(Arc::clone(&goal_store)),
-            )
+            .install_supervisor_if_absent(sid.to_owned(), test_goal_supervisor(goal_store.clone()))
             .await;
         Arc::get_mut(&mut dispatcher.ctx)
             .expect("dispatcher context is uniquely owned before spawning")
@@ -48597,12 +48596,9 @@ mod tests {
         assert_ne!(successor_generation, original_generation);
 
         let durable_session_id = format!("rpc_{sid}");
-        insert_running_goal(&goal_store, &durable_session_id, "successor-goal").await;
+        insert_running_goal(goal_store.as_ref(), &durable_session_id, "successor-goal").await;
         goal_runtime
-            .install_supervisor_if_absent(
-                sid.to_owned(),
-                test_goal_supervisor(Arc::clone(&goal_store)),
-            )
+            .install_supervisor_if_absent(sid.to_owned(), test_goal_supervisor(goal_store.clone()))
             .await;
 
         release_removal.notify_one();
