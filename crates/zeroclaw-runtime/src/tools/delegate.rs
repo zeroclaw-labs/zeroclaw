@@ -5833,9 +5833,83 @@ impl DelegateTool {
                     Arc<zeroclaw_tools::session_memory::SessionMemoryRoute>,
                 > = None;
                 let mut target_owner_scope: Option<PrincipalScope> = None;
-                if (needs_workspace_bound_tools || needs_identity_bound_tools)
-                    && let Some(root_config) = rebuild_config.as_ref()
-                {
+                let identity_block_runs = (needs_workspace_bound_tools
+                    || needs_identity_bound_tools)
+                    && rebuild_config.is_some();
+                let inherits_route_sharing = bounded_base_tools.iter().any(|tool| {
+                    crate::tools::scoped::ROUTE_SHARING_TOOL_NAMES.contains(&tool.name())
+                });
+                // The route is the target's own, shared by the `spawn_subagent`
+                // rebuilt below and by the `sop_execute` and `sop_advance`
+                // rebound further down. A target can inherit only the SOP tools
+                // and need nothing else rebuilt, so the route is made here, not
+                // inside that rebuild.
+                let route = Arc::new(zeroclaw_tools::session_memory::SessionMemoryRoute::default());
+                if identity_block_runs || (inherits_route_sharing && rebuild_config.is_some()) {
+                    // In an owned session the child of the rebuilt
+                    // `spawn_subagent`, and the audit rows of the rebound
+                    // `sop_execute` and `sop_advance`, go to the owner's plane
+                    // for the target, as the normal registry's go to the
+                    // owner's plane for its agent. The route is pinned now:
+                    // nothing pins this registry later, and an empty route
+                    // reads as an unowned session. Without an owner it stays
+                    // empty, as there. One read of the owner decides both
+                    // whether this hop is owned and which plane the sealed
+                    // registry must hold.
+                    let owner_scope = self
+                        .principal_scope
+                        .read()
+                        .clone()
+                        .map(|scope| scope.with_agent(Some(agent_name.to_string())));
+                    if let Some(owner_scope) = owner_scope
+                        && inherits_route_sharing
+                    {
+                        let plane = match target_memory.as_ref() {
+                            Some(memory) => {
+                                #[cfg(test)]
+                                record_plane_source("target_memory");
+                                Arc::clone(memory)
+                            }
+                            None => match self
+                                .memory_for_target_agent(target_config, agent_name)
+                                .await
+                            {
+                                Ok(Some(memory)) => {
+                                    #[cfg(test)]
+                                    record_plane_source("reopened");
+                                    memory
+                                }
+                                // A config is in hand here, and with one the
+                                // target's memory is always opened or fails.
+                                Ok(None) => {
+                                    return Ok(Self::bounded_owner_plane_refusal(
+                                        agent_name,
+                                        "target_memory_absent",
+                                    ));
+                                }
+                                Err(_) => {
+                                    return Ok(Self::bounded_owner_plane_refusal(
+                                        agent_name,
+                                        "target_memory_unavailable",
+                                    ));
+                                }
+                            },
+                        };
+                        // The route was created empty just above, and an
+                        // empty route takes any plane.
+                        let pinned = route.pin(plane, Arc::clone(&target_policy));
+                        debug_assert!(pinned.is_ok(), "a fresh session memory route pins");
+                        if pinned.is_err() {
+                            return Ok(Self::bounded_owner_plane_refusal(
+                                agent_name,
+                                "route_pin_refused",
+                            ));
+                        }
+                        target_owner_scope = Some(owner_scope);
+                    }
+                    target_session_memory = Some(Arc::clone(&route));
+                }
+                if identity_block_runs && let Some(root_config) = rebuild_config.as_ref() {
                     if let Some(tool) =
                         self.rebuild_target_git_operations_tool(Arc::clone(&target_policy))
                     {
@@ -5993,71 +6067,6 @@ impl DelegateTool {
                             self.capabilities.get(),
                         ))),
                     );
-                    // In an owned session the child of the rebuilt
-                    // `spawn_subagent`, and the audit rows of the rebound
-                    // `sop_execute` and `sop_advance`, go to the owner's plane
-                    // for the target, as the normal registry's go to the
-                    // owner's plane for its agent. The route is the target's
-                    // own and is pinned now: nothing pins this registry later,
-                    // and an empty route reads as an unowned session. Without
-                    // an owner it stays empty, as there. One read of the owner
-                    // decides both whether this hop is owned and which plane
-                    // the sealed registry must hold.
-                    let route =
-                        Arc::new(zeroclaw_tools::session_memory::SessionMemoryRoute::default());
-                    let owner_scope = self
-                        .principal_scope
-                        .read()
-                        .clone()
-                        .map(|scope| scope.with_agent(Some(agent_name.to_string())));
-                    if let Some(owner_scope) = owner_scope
-                        && bounded_base_tools.iter().any(|tool| {
-                            crate::tools::scoped::ROUTE_SHARING_TOOL_NAMES.contains(&tool.name())
-                        })
-                    {
-                        let plane = match target_memory.as_ref() {
-                            Some(memory) => {
-                                #[cfg(test)]
-                                record_plane_source("target_memory");
-                                Arc::clone(memory)
-                            }
-                            None => match self
-                                .memory_for_target_agent(target_config, agent_name)
-                                .await
-                            {
-                                Ok(Some(memory)) => {
-                                    #[cfg(test)]
-                                    record_plane_source("reopened");
-                                    memory
-                                }
-                                // A config is in hand here, and with one the
-                                // target's memory is always opened or fails.
-                                Ok(None) => {
-                                    return Ok(Self::bounded_owner_plane_refusal(
-                                        agent_name,
-                                        "target_memory_absent",
-                                    ));
-                                }
-                                Err(_) => {
-                                    return Ok(Self::bounded_owner_plane_refusal(
-                                        agent_name,
-                                        "target_memory_unavailable",
-                                    ));
-                                }
-                            },
-                        };
-                        // The route was created empty just above, and an
-                        // empty route takes any plane.
-                        let pinned = route.pin(plane, Arc::clone(&target_policy));
-                        debug_assert!(pinned.is_ok(), "a fresh session memory route pins");
-                        if pinned.is_err() {
-                            return Ok(Self::bounded_owner_plane_refusal(
-                                agent_name,
-                                "route_pin_refused",
-                            ));
-                        }
-                        target_owner_scope = Some(owner_scope);
-                    }
                     target_identity_bound_tools.insert(
                         "spawn_subagent".to_string(),
                         Box::new(ToolArcRef::new(crate::tools::spawn_subagent_tool(
@@ -6071,7 +6080,6 @@ impl DelegateTool {
                             Arc::clone(&route),
                         ))),
                     );
-                    target_session_memory = Some(route);
 
                     if let Some(runtime) = self.runtime.as_ref() {
                         let persistent_writes = runtime.has_filesystem_access();
@@ -22680,7 +22688,7 @@ target = "memory_recall"
                 hop.tool
                     .bind_principal_scope(owner_scope())
                     .expect("the session's owner binds");
-                let engine = with_caller_sop_execute(&hop);
+                let _engine = with_caller_sop_execute(&hop);
 
                 let probe = Arc::new(std::sync::Mutex::new(OwnerPlaneProbe::default()));
                 let result = OWNER_PLANE_PROBE
@@ -22695,13 +22703,17 @@ target = "memory_recall"
                     "the owned hop is not refused; delegate output: {}; error: {:?}",
                     result.output, result.error
                 );
-                let run_id = engine
-                    .lock()
-                    .unwrap()
-                    .active_runs()
-                    .keys()
-                    .next()
-                    .cloned()
+                // The run is no longer active once the bounded turn ends, so its
+                // id is read from what `sop_execute` reported.
+                let run_id: String = result
+                    .output
+                    .split("SOP run started: ")
+                    .nth(1)
+                    .map(|rest| {
+                        rest.chars()
+                            .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
+                            .collect()
+                    })
                     .unwrap_or_else(|| {
                         panic!(
                             "precondition: the target's sop_execute started a run; delegate \
