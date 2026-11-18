@@ -5,6 +5,8 @@ import pathlib
 import io
 import os
 import signal
+import subprocess
+import sys
 import threading
 import time
 import tempfile
@@ -348,6 +350,59 @@ class ProxyLifecycleTests(unittest.TestCase):
                         except ProcessLookupError:
                             pass
                     pool.close()
+
+
+    def test_proxy_exits_when_task_helper_is_killed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            pid_file = root / 'proxy.pid'
+            config = root / 'ssh_config'
+            config.write_text(f'Host fixture\n  ProxyCommand {root}/proxy\n')
+            for name, body in [
+                ('ssh', f'exec /usr/bin/ssh -F {config} "$@"'),
+                ('proxy', f'trap "" TERM\necho $$ > {pid_file}\nexec /usr/bin/sleep 60'),
+            ]:
+                script = root / name
+                script.write_text('#!/bin/sh\n' + body + '\n')
+                script.chmod(0o700)
+            owner = subprocess.Popen([
+                sys.executable, '-c',
+                'import pathlib, runpy, sys; '
+                'pool = runpy.run_path(sys.argv[1])["Pool"]; '
+                'pool(pathlib.Path(sys.argv[2]), ssh=sys.argv[3]).acquire("master", [], "fixture")',
+                str(path), str(root), str(root / 'ssh'),
+            ])
+            pid = None
+            try:
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline:
+                    if pid_file.exists() and (value := pid_file.read_text().strip()):
+                        pid = int(value)
+                        break
+                    self.assertIsNone(owner.poll())
+                    time.sleep(0.02)
+                self.assertIsNotNone(pid, 'OpenSSH did not start the proxy')
+                owner.kill()
+                owner.wait(timeout=5)
+                status = pathlib.Path(f'/proc/{pid}/stat')
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline:
+                    try:
+                        if status.read_text().rsplit(')', 1)[1].split()[0] == 'Z':
+                            return
+                    except FileNotFoundError:
+                        return
+                    time.sleep(0.02)
+                self.fail('ProxyCommand survived abrupt task-helper termination')
+            finally:
+                if owner.poll() is None:
+                    owner.kill()
+                    owner.wait(timeout=5)
+                if pid is not None:
+                    try:
+                        os.kill(pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
 
 
 if __name__ == '__main__':
