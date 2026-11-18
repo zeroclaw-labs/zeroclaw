@@ -123,8 +123,9 @@ are refused. The selector shows each record’s saved voice; choosing/sampling
 available OS voices is performed in that device’s own browser.
 
 Within one dashboard page, split chat panes and the settings preview share
-browser-audio ownership. Microphone capture waits while another pane is
-speaking, and narration waits while any pane is capturing speech. Capture end
+browser-audio ownership. Manual microphone, speaker and preview clicks show a busy message while
+another pane owns audio; click again after it ends. Only continuous narration
+keeps replies pending and retries after capture or playback ends. Capture end
 or cancellation releases that ownership. Other browser tabs and applications
 are outside this page-local coordination.
 
