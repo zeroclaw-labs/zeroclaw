@@ -4025,6 +4025,14 @@ impl TelegramChannel {
     /// collapsed, `PREVIEW_MAX_CHARS` cap with an ellipsis. Non-text
     /// payloads (voice, bare attachments) preview as an empty string — the
     /// owner notice still names the sender and the source chat.
+    /// Collapse the unauthorized message into a single-line preview for the
+    /// operator heads-up.
+    ///
+    /// The preview quotes an untrusted sender, so markdown link and image
+    /// targets are stripped before the notice ever reaches
+    /// [`Self::markdown_to_telegram_html`]: `[click](https://…)` renders as
+    /// the inert text `click`, never as a clickable disguised link in the
+    /// owner's DM.
     fn unauthorized_preview(message: &serde_json::Value) -> String {
         const PREVIEW_MAX_CHARS: usize = 160;
         let text = message
@@ -4033,11 +4041,85 @@ impl TelegramChannel {
             .or_else(|| message.get("caption").and_then(serde_json::Value::as_str))
             .unwrap_or_default();
         let collapsed: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
-        let mut preview: String = collapsed.chars().take(PREVIEW_MAX_CHARS).collect();
-        if collapsed.chars().count() > PREVIEW_MAX_CHARS {
+        let neutralized = Self::strip_untrusted_markup(&collapsed);
+        let mut preview: String = neutralized.chars().take(PREVIEW_MAX_CHARS).collect();
+        if neutralized.chars().count() > PREVIEW_MAX_CHARS {
             preview.push('…');
         }
         preview
+    }
+
+    /// Drop link targets from untrusted quoted text.
+    ///
+    /// Two passes, in order:
+    /// 1. Remove every `http(s)` URL token outright — with no URL anywhere in
+    ///    the preview, the markdown renderer cannot mint a clickable link,
+    ///    including nested or re-synthesized `[text](url)` shapes.
+    /// 2. De-link leftover markdown link/image syntax (`[click]()` after the
+    ///    URL pass), keeping only the quoted label.
+    fn strip_untrusted_markup(text: &str) -> String {
+        let without_urls: String = text
+            .split_whitespace()
+            .filter(|token| {
+                let trimmed = token.trim_start_matches(|c: char| "([{<\"'«".contains(c));
+                !(trimmed.starts_with("http://") || trimmed.starts_with("https://"))
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        Self::delink_markdown(&without_urls)
+    }
+
+    /// Keep only the label of markdown link/image syntax; the target is
+    /// expected to be already stripped or non-URL (inert in the renderer).
+    fn delink_markdown(text: &str) -> String {
+        let mut out = String::with_capacity(text.len());
+        let mut rest = text;
+        while let Some(open) = rest.find('[') {
+            out.push_str(&rest[..open]);
+            let Some(bracket_rel) = rest[open + 1..].find(']') else {
+                out.push_str(&rest[open..]);
+                rest = "";
+                break;
+            };
+            let after_bracket = open + 1 + bracket_rel + 1;
+            if rest[after_bracket..].starts_with('(')
+                && let Some(paren_rel) = rest[after_bracket..].find(')')
+            {
+                if out.ends_with('!') {
+                    out.pop();
+                }
+                out.push_str(&rest[open + 1..open + 1 + bracket_rel]);
+                rest = &rest[after_bracket + 1 + paren_rel..];
+            } else {
+                out.push('[');
+                rest = &rest[open + 1..];
+            }
+        }
+        out.push_str(rest);
+        out
+    }
+
+    /// Per-owner-chat rate limit for the heads-up delivery: one detached
+    /// send per interval, so a flood of unauthorized messages cannot pile
+    /// concurrent deliveries onto a single chat. Skipped attempts leave a
+    /// DEBUG trace — the operator still sees the first notice of the burst.
+    fn owner_notice_allow(alias: &str, owner_chat: &str, now: std::time::Instant) -> bool {
+        const MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+        static LAST: std::sync::OnceLock<
+            std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
+        > = std::sync::OnceLock::new();
+        let key = format!("{alias}:{owner_chat}");
+        let mut guard = LAST
+            .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(last) = guard.get(&key)
+            && now.duration_since(*last) < MIN_INTERVAL
+        {
+            return false;
+        }
+        guard.insert(key, now);
+        true
     }
 
     /// Compose the operator-facing heads-up for a turned-away sender.
@@ -5122,6 +5204,19 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         if let Some(owner_chat) = self.configured_owner_chat()
             && owner_chat != chat_id
         {
+            if !Self::owner_notice_allow(&self.alias, &owner_chat, std::time::Instant::now()) {
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({
+                            "alias": self.alias,
+                            "owner_chat": owner_chat,
+                            "sender": suggested_identity,
+                        })),
+                    "Telegram owner notice throttled within rate interval"
+                );
+                return;
+            }
             let owner_notice = Self::unauthorized_owner_notice(
                 &suggested_identity,
                 &chat_id,
@@ -16685,6 +16780,65 @@ mod tests {
             "voice": {"file_id": "v1"}
         }));
         assert_eq!(voice, "", "non-text payloads preview as empty");
+    }
+
+    #[test]
+    fn unauthorized_preview_neutralizes_disguised_links() {
+        let linked = TelegramChannel::unauthorized_preview(&serde_json::json!({
+            "text": "hey [click my refund](https://evil.example/steal) ok"
+        }));
+        assert_eq!(linked, "hey click my refund ok");
+        assert!(
+            !linked.contains("evil.example"),
+            "the untrusted URL must never reach the owner notice: {linked:?}"
+        );
+
+        let image = TelegramChannel::unauthorized_preview(&serde_json::json!({
+            "text": "![invoice](https://evil.example/x.png) attached"
+        }));
+        assert_eq!(image, "invoice attached");
+
+        let benign = TelegramChannel::unauthorized_preview(&serde_json::json!({
+            "text": "see [the docs](not-a-url) and a bare https://example.com/page"
+        }));
+        assert_eq!(
+            benign, "see the docs and a bare",
+            "labels are kept; every URL is stripped from untrusted text"
+        );
+    }
+
+    #[test]
+    fn owner_notice_allow_throttles_repeat_sends_per_chat() {
+        let start = std::time::Instant::now();
+        let key_alias = "throttle-test-alias";
+        assert!(
+            TelegramChannel::owner_notice_allow(key_alias, "9001", start),
+            "first notice for a chat is always allowed"
+        );
+        assert!(
+            !TelegramChannel::owner_notice_allow(
+                key_alias,
+                "9001",
+                start + std::time::Duration::from_secs(5)
+            ),
+            "a repeat within the interval is throttled"
+        );
+        assert!(
+            TelegramChannel::owner_notice_allow(
+                key_alias,
+                "9002",
+                start + std::time::Duration::from_secs(5)
+            ),
+            "a different owner chat is not coupled to the first chat's window"
+        );
+        assert!(
+            TelegramChannel::owner_notice_allow(
+                key_alias,
+                "9001",
+                start + std::time::Duration::from_secs(31)
+            ),
+            "after the interval the chat may be notified again"
+        );
     }
 
     /// Every `sendMessage` body the mock server received, in order, reduced
