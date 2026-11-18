@@ -1,4 +1,11 @@
 //! Sliding-window rate limiter for authentication attempts.
+//!
+//! Three ledgers are built from it, each with the thresholds below and the
+//! loopback exemption, and each counting on its own so a lockout earned on
+//! one surface never reaches another: `AppState::auth_limiter` for pairing
+//! and webhook auth, the enrollment relay's own in
+//! `api_oidc::OidcEnrollmentState`, and the config route group's bearer
+//! ledger in `principal_gate::BearerVerificationLimits`.
 
 use parking_lot::Mutex;
 use std::collections::HashMap;
@@ -19,6 +26,17 @@ const SWEEP_INTERVAL_SECS: u64 = 300;
 pub struct RateLimitError {
     /// Seconds until the client may retry.
     pub retry_after_secs: u64,
+}
+
+/// Returns `true` if `key` names a loopback address, which every limiter on
+/// the auth surface exempts. Shared so surfaces with their own budget (the
+/// OIDC enrollment relay) exempt exactly the same clients this one does.
+pub(crate) fn is_loopback_key(key: &str) -> bool {
+    matches!(key, "127.0.0.1" | "::1")
+        || key
+            .parse::<IpAddr>()
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(false)
 }
 
 /// Per-IP auth attempt tracker with sliding window and lockout.
@@ -49,11 +67,7 @@ impl AuthRateLimiter {
 
     /// Returns `true` if the given IP is a loopback address (exempt from limiting).
     fn is_loopback(key: &str) -> bool {
-        matches!(key, "127.0.0.1" | "::1")
-            || key
-                .parse::<IpAddr>()
-                .map(|ip| ip.is_loopback())
-                .unwrap_or(false)
+        is_loopback_key(key)
     }
 
     /// Check whether the client identified by `key` is allowed to attempt auth.

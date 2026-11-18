@@ -51,19 +51,24 @@ By default an approval prompt is delivered through whichever channel initiated t
 ```toml
 [risk_profiles.frontline.approval_route]
 approver_channel = "matrix.ops"     # a channel registry key, NOT the originator
+approver_recipient = "!ops:example.org" # Matrix room ID; route-specific destination
 on_no_approver   = "deny"           # default; or "inherit-originator"
 timeout_secs     = 120              # default; bounds the approver's response window
 ```
 
 - `approver_channel` is the channel registry key that receives the approval request. Keys are platform-qualified, `<channel>.<alias>` (for example `matrix.ops` or `telegram.default`); a bare platform name (e.g. `matrix`) resolves only when it is the single channel of that platform. An alias on its own is not a registry key and will fail closed. When the route is set, the approval gate asks **only** that channel, not the originating one.
+- `approver_recipient` is the destination on that channel, not the originator's recipient. It is channel-specific: use a Matrix room ID such as `!ops:example.org`, a Telegram chat ID such as `-1001234567890`, a Slack channel ID such as `C0123456789`, or a Discord channel ID such as `123456789012345678`. The configured destination is used for the approver hop; the origin recipient is never reused for it.
 - `on_no_approver` decides what happens when the approver does not answer decisively, is unreachable, is not a registered channel, or times out:
   - `deny` (the default) fails closed and denies the tool call.
   - `inherit-originator` falls back to the originating-channel prompt (today's behavior).
+- A missing or blank `approver_recipient` makes the approver unavailable. It follows `on_no_approver`: the default `deny` fails closed, while `inherit-originator` explicitly permits the originating-channel fallback.
 - `timeout_secs` (default 120) bounds how long the gate waits for the approver before applying `on_no_approver`, so a hung approver channel cannot stall a turn.
 
 When `approval_route` is absent (the default), approvals behave exactly as described above: delivered through whichever channel initiated the conversation. The fail-closed default means a misconfigured or unreachable approver denies rather than silently self-approving.
 
 > **Scope.** `approval_route` is honored on both turn paths: the interactive, channel-driven path (a turn that carries a live channel handle, e.g. a streamed agent chat) and the non-interactive path that runs without an originating channel (gateway chat/webhook dispatch and agent-to-agent peer messages). On the non-interactive path the approver must be a **live, registered channel** in the running daemon (it is resolved through the daemon's channel registry); if that registry is unavailable (for example a one-shot CLI run with no channels started) or the named approver is not live, the gate falls back to the profile's non-interactive default, which fails closed (denies) under the default `on_no_approver = "deny"`.
+
+Independent agentic delegates can use the target risk profile's explicit route across foreground, background, and parallel execution. Both the channel and recipient must be configured. The child gets a fresh approval manager, so the caller's session grants and originating client channel are not inherited. An unavailable approver fails closed even under `inherit-originator`, because the child has no origin channel. See [Independent delegate approvals](../agents/delegation.md#independent-delegate-approvals) for configuration and grant lifetime. Bounded agentic delegates retain their existing no-operator approval rules.
 
 ## Command allow list
 

@@ -5,9 +5,9 @@
   here once; every surface page picks up the change via {{#include}}.
 -->
 
-Every surface walks the same checklist and writes the same config. Required
-steps must be satisfied before the agent can be created; optional steps can be
-skipped.
+Every surface walks the same checklist and writes the same config; only the
+optional Plugins step is CLI-only for now. Required steps must be satisfied
+before the agent can be created; optional steps can be skipped.
 
 | Step | Required | What it sets |
 |---|---|---|
@@ -16,6 +16,7 @@ skipped.
 | **Memory** | yes | Memory backend (`sqlite`, `markdown`, `postgres`, `qdrant`, `lucid`, or `none`). |
 | **Channels** | optional | Chat platforms (Telegram, Discord, Slack, …). The built-in `cli` channel always works; add others here or later. |
 | **Peer groups** | optional | Multi-agent peer membership for the channels you configured. |
+| **Plugins** | optional | Tool plugins from the plugin registry, installed and configured when the agent is created. Only in builds with WASM plugin support (`plugins-wasm`), and only in the CLI Quickstart for now; see [Plugins](../getting-started/quickstart.md#plugins). |
 | **Agent** | yes | Agent alias, system prompt, and any personality files. |
 
 > The runtime profile is set automatically. Quickstart installs the

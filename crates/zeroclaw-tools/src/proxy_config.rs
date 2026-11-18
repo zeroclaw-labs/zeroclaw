@@ -55,6 +55,9 @@ impl ProxyConfigTool {
         })?;
         parsed.config_path = self.config.config_path.clone();
         parsed.data_dir = self.config.data_dir.clone();
+        // This value was parsed from the file at `config_path`; it holds
+        // save-over provenance for the guard in `Config::save`.
+        parsed.loaded_from = Some(parsed.config_path.clone());
         Ok(parsed)
     }
 
@@ -441,6 +444,12 @@ impl ProxyConfigTool {
 
 #[async_trait]
 impl Tool for ProxyConfigTool {
+    fn requires_unrestricted_principal(&self) -> bool {
+        // Saving config changes every agent's later runs, which RPC gates
+        // behind `config:update`; the caller's principal does not reach them.
+        true
+    }
+
     fn name(&self) -> &str {
         "proxy_config"
     }
@@ -564,6 +573,13 @@ mod tests {
         };
         config.save().await.unwrap();
         Arc::new(config)
+    }
+
+    #[tokio::test]
+    async fn proxy_config_requires_an_unrestricted_principal() {
+        let tmp = TempDir::new().unwrap();
+        let tool = ProxyConfigTool::new(test_config(&tmp).await, test_security());
+        assert!(tool.requires_unrestricted_principal());
     }
 
     #[test]

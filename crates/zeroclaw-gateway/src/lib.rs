@@ -12,9 +12,10 @@ pub mod api;
 pub mod api_browse;
 pub mod api_config;
 pub mod api_logs;
+pub mod api_oidc;
+mod api_oidc_enroll;
 pub mod api_pairing;
 pub mod api_personality;
-#[cfg(feature = "plugins-wasm")]
 pub mod api_plugins;
 pub mod api_quickstart;
 pub mod api_sections;
@@ -33,12 +34,17 @@ pub mod api_webauthn;
 pub mod api_webhook;
 pub mod auth_rate_limit;
 pub mod canvas;
-pub mod hardware_context;
+mod chat_core;
+pub mod core_rpc;
+pub mod dashboard_core;
+pub mod dashboard_session;
 pub mod node_tool;
 pub mod nodes;
 pub mod openapi;
 #[cfg(feature = "plugins-wasm")]
 mod plugin_webhook;
+pub mod principal_gate;
+mod relay_ingress;
 pub mod security_headers;
 pub mod session_queue;
 pub mod sse;
@@ -81,7 +87,7 @@ use axum::{
     },
     routing::{delete, get, post, put},
 };
-use parking_lot::{Mutex, RwLock};
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
@@ -166,7 +172,8 @@ use zeroclaw_runtime::cost::CostTracker;
 use zeroclaw_runtime::i18n;
 use zeroclaw_runtime::platform;
 use zeroclaw_runtime::security::pairing::{
-    PairingCodePolicy, PairingGuard, constant_time_eq, is_public_bind,
+    GATEWAY_ADMIN_TOKEN_HEADER, PairingCodePolicy, PairingGuard, PairingLimits, constant_time_eq,
+    gateway_admin_token_path, is_public_bind,
 };
 use zeroclaw_runtime::tools;
 use zeroclaw_runtime::tools::CanvasStore;
@@ -264,7 +271,7 @@ fn hash_webhook_secret(value: &str) -> String {
 const RATE_LIMITER_SWEEP_INTERVAL_SECS: u64 = 300; // 5 minutes
 
 #[derive(Debug)]
-struct SlidingWindowRateLimiter {
+pub(crate) struct SlidingWindowRateLimiter {
     limit_per_window: u32,
     window: Duration,
     max_keys: usize,
@@ -272,7 +279,7 @@ struct SlidingWindowRateLimiter {
 }
 
 impl SlidingWindowRateLimiter {
-    fn new(limit_per_window: u32, window: Duration, max_keys: usize) -> Self {
+    pub(crate) fn new(limit_per_window: u32, window: Duration, max_keys: usize) -> Self {
         Self {
             limit_per_window,
             window,
@@ -289,8 +296,16 @@ impl SlidingWindowRateLimiter {
     }
 
     fn allow(&self, key: &str) -> bool {
+        self.allow_or_retry_after(key).is_ok()
+    }
+
+    /// Consume one request from `key`'s budget. On refusal, the error is the
+    /// whole seconds until the oldest request still inside the window ages
+    /// out (rounded up, never below 1), which is what a caller puts in
+    /// `Retry-After`.
+    pub(crate) fn allow_or_retry_after(&self, key: &str) -> Result<(), u64> {
         if self.limit_per_window == 0 {
-            return true;
+            return Ok(());
         }
 
         let now = Instant::now();
@@ -325,11 +340,18 @@ impl SlidingWindowRateLimiter {
         entry.retain(|instant| *instant > cutoff);
 
         if entry.len() >= self.limit_per_window as usize {
-            return false;
+            // Timestamps are pushed in order, so the first one still inside
+            // the window is the one whose expiry frees the next slot.
+            let remaining = entry
+                .first()
+                .map(|oldest| self.window.saturating_sub(now.duration_since(*oldest)))
+                .unwrap_or(self.window);
+            let secs = remaining.as_secs() + u64::from(remaining.subsec_nanos() > 0);
+            return Err(secs.max(1));
         }
 
         entry.push(now);
-        true
+        Ok(())
     }
 }
 
@@ -607,11 +629,32 @@ fn auto_detect_web_dist_dir() -> Option<std::path::PathBuf> {
 }
 
 fn forwarded_client_ip(headers: &HeaderMap) -> Option<IpAddr> {
-    if let Some(xff) = headers.get("X-Forwarded-For").and_then(|v| v.to_str().ok()) {
-        for candidate in xff.split(',') {
-            if let Some(ip) = parse_client_ip(candidate) {
+    // Appending proxies add the connecting peer at the right-hand end. Prefer
+    // that hop so a client-supplied leading entry cannot pick the rate-limit key.
+    // Skip loopback hops: a real client never arrives as loopback through a
+    // proxy, and a same-host proxy chain can append 127.0.0.1 while the real
+    // caller sits further left.
+    if let Some(xff) = headers.get("X-Forwarded-For") {
+        let mut rightmost_loopback = None;
+        // A proxy can append a valid address to a caller's opaque header
+        // bytes. Decode each hop separately so that prefix cannot hide the
+        // proxy's suffix and restore the loopback peer's limiter exemption.
+        for candidate in xff.as_bytes().rsplit(|byte| *byte == b',') {
+            if let Some(ip) = std::str::from_utf8(candidate)
+                .ok()
+                .and_then(parse_client_ip)
+            {
+                if ip.is_loopback() {
+                    if rightmost_loopback.is_none() {
+                        rightmost_loopback = Some(ip);
+                    }
+                    continue;
+                }
                 return Some(ip);
             }
+        }
+        if rightmost_loopback.is_some() {
+            return rightmost_loopback;
         }
     }
 
@@ -621,13 +664,26 @@ fn forwarded_client_ip(headers: &HeaderMap) -> Option<IpAddr> {
         .and_then(parse_client_ip)
 }
 
-fn client_key_from_request(
+pub(crate) fn client_key_from_request(
     peer_addr: Option<SocketAddr>,
     headers: &HeaderMap,
     trust_forwarded_headers: bool,
 ) -> String {
     if trust_forwarded_headers && let Some(ip) = forwarded_client_ip(headers) {
-        return ip.to_string();
+        // A real loopback caller never arrives through a proxy with a
+        // forwarded header. Treat a loopback-only forwarded value as spoofed.
+        if !ip.is_loopback() {
+            return ip.to_string();
+        }
+        // Do not inherit a loopback peer exemption from a proxied path — that
+        // would let a remote caller behind a same-host proxy skip per-client
+        // limits. Prefer a non-loopback peer; otherwise a non-exempt sentinel.
+        if let Some(addr) = peer_addr {
+            if !addr.ip().is_loopback() {
+                return addr.ip().to_string();
+            }
+        }
+        return "unknown".to_string();
     }
 
     peer_addr
@@ -652,33 +708,27 @@ fn default_agent_alias(config: &Config) -> Option<String> {
         .min()
 }
 
-/// Owned guard for [`AppState::config_write_lock`]. Owned (not borrowed) so
-/// a handler can release it explicitly at its commit point, or pass it by
-/// value into a delegated helper without lifetime coupling.
-pub(crate) type ConfigWriteGuard = tokio::sync::OwnedMutexGuard<()>;
+/// Serialization witness for config authorization and retained persistence.
+pub(crate) type ConfigWriteGuard = zeroclaw_runtime::live_config_authority::ConfigCommit;
 
 /// Shared state for all axum handlers
 #[derive(Clone)]
 pub struct AppState {
-    pub config: Arc<RwLock<Config>>,
+    /// Read-only live config handle: HTTP readers observe the published
+    /// config and its revision as one pair and cannot bypass publication
+    /// with a raw write. Mutating handlers admit through
+    /// `AppState::begin_config_commit` instead.
+    pub config: zeroclaw_config::live::LiveConfigHandle,
 
-    /// Serializes the read-mutate-save-swap critical section of every HTTP
-    /// handler that mutates `config` (per-property PUT/DELETE/PATCH, map-key
-    /// create/delete/rename, channel bind, config migrate, section select,
-    /// quickstart apply, cron settings patch, pairing-token persistence). A
-    /// tokio mutex, not `parking_lot`, because the guard must survive the
-    /// `.await` on config-save I/O. Mirrors
-    /// `RpcContext::config_write_lock` in the RPC path.
-    ///
-    /// Invariant: every mutation of `config` must happen while holding this
-    /// mutex, acquired before the first `config` read-for-modify and held
-    /// through the swap that installs the mutated snapshot. Never acquire it
-    /// while holding a `config` guard — lock order is this mutex first,
-    /// `config` second, always. A writer that bypasses this lock and swaps
-    /// the live config while a concurrent writer's save is in flight loses
-    /// that writer's change — clobbered in memory and, if its save hadn't
-    /// landed yet, on disk too.
-    pub config_write_lock: Arc<tokio::sync::Mutex<()>>,
+    /// The live-config authority owning this gateway run's publication
+    /// transaction: the process-wide writer mutex, the config-write
+    /// lifecycle lease, and the published pair. Every HTTP config writer
+    /// serializes through it before cloning the current config; the
+    /// irreversible save-and-publish phase of each commit runs retained,
+    /// so request cancellation cannot abandon a dispatched commit. Mirrors
+    /// `RpcContext::config_authority` in the RPC path.
+    pub config_authority: zeroclaw_runtime::LiveConfigAuthority,
+    pub agent_lifecycle: zeroclaw_runtime::live_config_authority::AgentLifecycleCoordinator,
     pub model_provider: Arc<dyn ModelProvider>,
     pub model: String,
     /// `None` means "let the provider decide" — required for models
@@ -739,7 +789,7 @@ pub struct AppState {
     /// here; the daemon's wait loop reacts and re-instantiates every
     /// subsystem in place. `None` when running standalone (`zeroclaw gateway start`)
     /// — reload then degrades to a 503 with a clear message.
-    pub reload_tx: Option<tokio::sync::watch::Sender<bool>>,
+    pub reload_tx: Option<zeroclaw_runtime::daemon::GatewayReloadControls>,
     /// Registry of dynamically connected nodes
     pub node_registry: Arc<nodes::NodeRegistry>,
     /// LAN-local peer hints discovered by multicast. These are informational
@@ -755,8 +805,6 @@ pub struct AppState {
     pub session_queue: Arc<session_queue::SessionActorQueue>,
     /// Device registry for paired device management
     pub device_registry: Option<Arc<api_pairing::DeviceRegistry>>,
-    /// Pending pairing request store
-    pub pending_pairings: Option<Arc<api_pairing::PairingStore>>,
     /// Shared canvas store for Live Canvas (A2UI) system
     pub canvas_store: CanvasStore,
     /// WebAuthn state for hardware key authentication (optional, requires `webauthn` feature)
@@ -781,12 +829,44 @@ pub struct AppState {
     pub sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
     /// Shared SOP audit logger from the daemon (for WS agent sessions).
     pub sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
+    pub sop_driver_handles: Option<zeroclaw_runtime::sop::SopDriverHandles>,
+}
+
+impl AppState {
+    pub(crate) fn reserve_agent_turn_at(
+        &self,
+        alias: impl Into<String>,
+        generation: u64,
+    ) -> Result<
+        zeroclaw_runtime::live_config_authority::AgentTurnLease,
+        zeroclaw_runtime::live_config_authority::AgentAdmissionError,
+    > {
+        self.agent_lifecycle.reserve_turn_at(alias, generation)
+    }
+    /// Admit one serialized config write on this gateway's authority.
+    /// Fails closed once the daemon generation is closing.
+    pub(crate) async fn begin_config_commit(
+        &self,
+    ) -> Result<
+        zeroclaw_runtime::live_config_authority::ConfigCommit,
+        zeroclaw_runtime::live_config_authority::ConfigCommitError,
+    > {
+        self.config_authority.begin_config_commit().await
+    }
 }
 
 /// Daemon-owned services whose lifecycle matches one supervised gateway run.
 pub struct GatewaySupervision {
     readiness: Option<zeroclaw_runtime::daemon::GatewayReadinessReporter>,
     plugin_webhooks: Arc<zeroclaw_api::webhook::PluginWebhookRegistry>,
+    authority: zeroclaw_runtime::LiveConfigAuthority,
+    /// The daemon generation's driver supervisor set. Approval surfaces
+    /// register resumed headless drivers here so a reload drains them with the
+    /// generation that owns them. `None` standalone, where no generation exists.
+    sop_driver_handles: Option<zeroclaw_runtime::sop::SopDriverHandles>,
+    /// Where the relay bridge hands over the browser connections of a
+    /// relay-served dashboard (`[relay.dashboard]`). `None` serves none.
+    dashboard_ingress: Option<zeroclaw_runtime::relay_dashboard::DashboardIngress>,
 }
 
 impl GatewaySupervision {
@@ -795,20 +875,432 @@ impl GatewaySupervision {
     pub fn new(
         readiness: Option<zeroclaw_runtime::daemon::GatewayReadinessReporter>,
         plugin_webhooks: Arc<zeroclaw_api::webhook::PluginWebhookRegistry>,
+        authority: zeroclaw_runtime::LiveConfigAuthority,
+        sop_driver_handles: Option<zeroclaw_runtime::sop::SopDriverHandles>,
     ) -> Self {
         Self {
             readiness,
             plugin_webhooks,
+            authority,
+            sop_driver_handles,
+            dashboard_ingress: None,
+        }
+    }
+
+    /// Serve the dashboard connections the relay bridge delivers to
+    /// `ingress` as well as this gateway's own listener.
+    #[must_use]
+    pub fn with_dashboard_ingress(
+        mut self,
+        ingress: zeroclaw_runtime::relay_dashboard::DashboardIngress,
+    ) -> Self {
+        self.dashboard_ingress = Some(ingress);
+        self
+    }
+}
+
+/// The relay-forwarded dashboard connections one gateway generation
+/// serves. Waits forever when it has none attached, or once a later
+/// generation has taken over and every connection queued here is served.
+struct DashboardFeed(Option<zeroclaw_runtime::relay_dashboard::DashboardIngressReceiver>);
+
+impl DashboardFeed {
+    async fn next(&mut self) -> zeroclaw_runtime::relay_dashboard::DashboardConn {
+        loop {
+            match &mut self.0 {
+                Some(receiver) => match receiver.recv().await {
+                    Some(conn) => return conn,
+                    None => self.0 = None,
+                },
+                None => std::future::pending::<()>().await,
+            }
         }
     }
 }
 
+/// The config/onboarding route group. Authentication is enforced
+/// structurally by the `route_layer` at the tail (see [`principal_gate`]),
+/// never per handler: every route whose handler lives in `api_config`,
+/// `api_quickstart`, or `api_sections` MUST be registered on THIS router,
+/// whatever its URL prefix.
+fn config_admin_router(route_auth: principal_gate::ConfigRouteAuth) -> Router<AppState> {
+    Router::new()
+        .route(
+            "/api/config",
+            get(api_config::handle_config_get)
+                .patch(api_config::handle_patch)
+                .options(api_config::handle_options_config),
+        )
+        .route(
+            "/api/config/prop",
+            get(api_config::handle_prop_get)
+                .put(api_config::handle_prop_put)
+                .delete(api_config::handle_prop_delete)
+                .options(api_config::handle_options_prop),
+        )
+        .route("/api/config/list", get(api_config::handle_list))
+        .route("/api/config/drift", get(api_config::handle_drift))
+        .route(
+            "/api/config/reload-status",
+            get(api_config::handle_reload_status),
+        )
+        .route("/api/config/templates", get(api_config::handle_templates))
+        .route("/api/config/map-keys", get(api_config::handle_get_map_keys))
+        .route(
+            "/api/config/resolve-alias-source",
+            get(api_config::handle_resolve_alias_source),
+        )
+        .route(
+            "/api/config/map-key",
+            post(api_config::handle_map_key).delete(api_config::handle_delete_map_key),
+        )
+        .route(
+            "/api/config/rename-map-key",
+            post(api_config::handle_rename_map_key),
+        )
+        .route(
+            "/api/config/model-providers/{type}/{alias}/refresh-context-window",
+            post(api_config::handle_refresh_context_window),
+        )
+        .route(
+            "/api/config/delete-plan",
+            get(api_config::handle_delete_plan),
+        )
+        .route("/api/config/catalog", get(api_sections::handle_catalog))
+        .route(
+            "/api/config/catalog/models",
+            get(api_sections::handle_catalog_models),
+        )
+        .route(
+            "/api/config/status",
+            get(api_sections::handle_section_status),
+        )
+        .route(
+            "/api/config/agent-options",
+            get(api_sections::handle_agent_options),
+        )
+        .route("/api/config/sections", get(api_sections::handle_sections))
+        .route(
+            "/api/config/sections/{section}",
+            get(api_sections::handle_section_picker),
+        )
+        .route(
+            "/api/config/sections/{section}/items/{key}",
+            post(api_sections::handle_section_select),
+        )
+        .route("/api/quickstart/state", get(api_quickstart::handle_state))
+        .route(
+            "/api/quickstart/fields",
+            post(api_quickstart::handle_fields),
+        )
+        .route(
+            "/api/quickstart/validate",
+            post(api_quickstart::handle_validate),
+        )
+        .route("/api/quickstart/apply", post(api_quickstart::handle_apply))
+        .route(
+            "/api/quickstart/dismiss",
+            post(api_quickstart::handle_dismiss),
+        )
+        .route("/api/config/init", post(api_config::handle_init))
+        .route("/api/config/migrate", post(api_config::handle_migrate))
+        .route(
+            "/api/channels/bind",
+            post(api_config::handle_api_channel_bind),
+        )
+        .route_layer(axum::middleware::from_fn_with_state(
+            route_auth,
+            principal_gate::config_route_auth,
+        ))
+}
+
+/// How long a stopping gateway lets its connections finish the requests in
+/// flight. With [`RETIRE_JOIN`] it stays inside the daemon's 500 ms grace for
+/// the gateway, so what is left is cancelled before that grace runs out.
+const CONNECTION_DRAIN: Duration = Duration::from_millis(300);
+
+/// How long retirement waits for the tasks it cancelled to end. Cancelling
+/// only asks: a task ends, and drops what it owns, when it is next polled.
+const RETIRE_JOIN: Duration = Duration::from_millis(100);
+
+/// Every task one gateway's serving runs: one per connection, and the
+/// stream tasks hyper's HTTP/2 spawns through its executor. A stop cancels
+/// them all at once, and the set counts each task until it has been
+/// destroyed.
+#[derive(Clone, Default)]
+struct ServeTasks(Arc<ServeTasksInner>);
+
+#[derive(Default)]
+struct ServeTasksInner {
+    live: std::sync::atomic::AtomicUsize,
+    idle: tokio::sync::Notify,
+    cancelled: tokio_util::sync::CancellationToken,
+}
+
+/// A task of the set. Fields drop in declaration order, so the future, and
+/// everything it owns, is destroyed before `_done` takes the task off the
+/// count, also when the task is dropped before its first poll.
+struct ServeTask {
+    future: std::pin::Pin<Box<dyn Future<Output = ()> + Send>>,
+    _done: ServeTaskDone,
+}
+
+/// Takes its task off the count.
+struct ServeTaskDone(Arc<ServeTasksInner>);
+
+impl Drop for ServeTaskDone {
+    fn drop(&mut self) {
+        if self
+            .0
+            .live
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel)
+            == 1
+        {
+            self.0.idle.notify_waiters();
+        }
+    }
+}
+
+impl ServeTasks {
+    fn spawn<F>(&self, future: F)
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        self.0
+            .live
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        let task = ServeTask {
+            future: Box::pin(future),
+            _done: ServeTaskDone(Arc::clone(&self.0)),
+        };
+        let cancelled = self.0.cancelled.clone();
+        // No lock is held here: spawning can drop the task at once (a runtime
+        // that has shut down does), and that only updates the count.
+        zeroclaw_spawn::spawn!(async move {
+            // Moves the whole task in. Naming only `task.future` below would
+            // capture just that field, and `_done` would take the task off the
+            // count as soon as `spawn` returned.
+            let mut task = task;
+            // The cancel is checked first, so a task spawned after it never
+            // runs.
+            tokio::select! {
+                biased;
+                () = cancelled.cancelled() => {}
+                () = task.future.as_mut() => {}
+            }
+        });
+    }
+
+    /// How many tasks are running, or not yet destroyed.
+    fn live(&self) -> usize {
+        self.0.live.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Resolves once no task is running.
+    async fn idle(&self) {
+        loop {
+            let notified = self.0.idle.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.live() == 0 {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    /// Cancel every task, and any spawned later: each ends at its next poll.
+    fn cancel(&self) {
+        self.0.cancelled.cancel();
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.0.cancelled.is_cancelled()
+    }
+
+    /// Wait up to `within` for every task to finish, then cancel the rest and
+    /// wait a little for them to end. Whether all finished in time. A task in
+    /// code that never yields can outlast this; it admits no request, and
+    /// ends at its next poll.
+    async fn retire_within(&self, within: Duration) -> bool {
+        if tokio::time::timeout(within, self.idle()).await.is_ok() {
+            return true;
+        }
+        self.cancel();
+        if tokio::time::timeout(RETIRE_JOIN, self.idle())
+            .await
+            .is_err()
+        {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"remaining": self.live()})),
+                "gateway tasks were still running after they were cancelled; each ends at its next poll"
+            );
+        }
+        false
+    }
+}
+
+impl<F> hyper::rt::Executor<F> for ServeTasks
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    fn execute(&self, future: F) {
+        self.spawn(async move {
+            let _ = future.await;
+        });
+    }
+}
+
+/// Owned by a gateway's serve loop. If the gateway is dropped before its
+/// drain ran (the daemon aborted it), its tasks are cancelled here.
+struct ServeTasksGuard(ServeTasks);
+
+impl ServeTasksGuard {
+    fn new(tasks: ServeTasks) -> Self {
+        Self(tasks)
+    }
+}
+
+impl Drop for ServeTasksGuard {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
+/// Whether the gateway that accepted a connection still admits requests on
+/// it: not once it has been told to stop, and not once its tasks were
+/// cancelled (it was dropped without a stop).
+#[derive(Clone)]
+struct Admission {
+    stopping: tokio::sync::watch::Receiver<bool>,
+    tasks: ServeTasks,
+}
+
+impl Admission {
+    fn admits(&self) -> bool {
+        // The stop is a value, not a change: a receiver made after it still
+        // reads it.
+        !*self.stopping.borrow() && !self.tasks.is_cancelled()
+    }
+}
+
+/// Serve one request on a connection the gateway accepted, unless the
+/// gateway has stopped since. So nothing reaches a stopped gateway's
+/// router, whichever connection or HTTP/2 stream it arrives on, an upgrade
+/// request included.
+async fn serve_while_current<S, B>(
+    mut svc: S,
+    admission: &Admission,
+    req: axum::http::Request<B>,
+) -> Result<Response, std::convert::Infallible>
+where
+    S: tower::Service<
+            axum::http::Request<B>,
+            Response = Response,
+            Error = std::convert::Infallible,
+        >,
+{
+    if !admission.admits() {
+        return Ok(gateway_restarting(req.version()));
+    }
+    tower::Service::call(&mut svc, req).await
+}
+
+/// What a stopped gateway answers: try again on a new connection, which the
+/// next gateway serves. Nothing in it comes from the stopped gateway's
+/// configuration or state.
+pub(crate) fn gateway_restarting(version: axum::http::Version) -> Response {
+    let mut response = (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [(header::RETRY_AFTER, "1")],
+        Json(serde_json::json!({
+            "error": "The gateway is restarting. Try again.",
+            "reason": "gateway_restarting",
+        })),
+    )
+        .into_response();
+    // HTTP/1 closes the connection after this response. HTTP/2 has no
+    // Connection header: its connection gets GOAWAY from the graceful
+    // shutdown.
+    if version < axum::http::Version::HTTP_2 {
+        response.headers_mut().insert(
+            header::CONNECTION,
+            axum::http::HeaderValue::from_static("close"),
+        );
+    }
+    response
+}
+
+/// What the accept loop does after `accept()` failed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AcceptErrorAction {
+    /// Accept again at once.
+    Retry,
+    /// Accept again after this long, unless the gateway is stopped first.
+    RetryAfter(Duration),
+    /// The listener cannot recover: stop serving.
+    Fail,
+}
+
+fn accept_error_action(error: &std::io::Error, tls: bool) -> AcceptErrorAction {
+    if tls {
+        return if is_recoverable_accept_error(error) {
+            AcceptErrorAction::RetryAfter(Duration::from_millis(ACCEPT_ERROR_BACKOFF_MS))
+        } else {
+            AcceptErrorAction::Fail
+        };
+    }
+    // The plain listener's rule from `axum::serve`: a connection that failed
+    // before it was accepted is skipped, anything else (running out of file
+    // descriptors, say) is waited out for a second, and it never gives up.
+    if matches!(
+        error.kind(),
+        std::io::ErrorKind::ConnectionRefused
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::ConnectionReset
+    ) {
+        AcceptErrorAction::Retry
+    } else {
+        AcceptErrorAction::RetryAfter(Duration::from_secs(1))
+    }
+}
+
+/// Wait `delay` before accepting again. Whether the gateway was told to stop
+/// meanwhile.
+async fn accept_backoff(
+    delay: Duration,
+    stopping: &mut tokio::sync::watch::Receiver<bool>,
+) -> bool {
+    tokio::select! {
+        () = tokio::time::sleep(delay) => false,
+        () = gateway_stop_requested(stopping) => true,
+    }
+}
+
+/// Resolves when the gateway is told to stop; never, if it no longer can be.
+async fn gateway_stop_requested(stopping: &mut tokio::sync::watch::Receiver<bool>) {
+    if stopping.changed().await.is_err() {
+        std::future::pending::<()>().await;
+    }
+}
+
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
+#[allow(clippy::too_many_lines)]
+// One parameter per daemon-owned dependency; a bundling struct would only
+// move the list. Matches the existing allowance on the runtime spawn paths.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_gateway(
     host: &str,
     port: u16,
     config: Config,
-    external_event_tx: Option<tokio::sync::broadcast::Sender<serde_json::Value>>,
+    // The daemon's event bus. The daemon owns the observer broadcast hook, so a
+    // supervised gateway reuses its sender and history and installs nothing;
+    // a standalone gateway (`None`) builds and installs its own.
+    external_event_bus: Option<zeroclaw_runtime::observability::EventBus>,
     // Reload controls owned by the daemon for supervised runs. RPC reloads
     // write to `shutdown_tx` before signalling daemon reload so the listener
     // releases its socket before the replacement gateway binds. /admin/reload
@@ -820,46 +1312,125 @@ pub async fn run_gateway(
     // Shared SOP engine from the daemon. `None` when standalone — sessions build their own.
     sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
     sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
+    // The daemon generation's one inbound-auth state (pairing guard,
+    // accepted policy, live configuration), shared with the RPC context.
+    // `None` (standalone gateway) builds all three locally from config.
+    daemon_authority: Option<zeroclaw_runtime::daemon::DaemonInboundAuthority>,
+    // The daemon generation's driver supervisor set: approval surfaces
+    // register resumed headless drivers here so reload drains them.
+    sop_driver_handles: Option<zeroclaw_runtime::sop::SopDriverHandles>,
     readiness: Option<zeroclaw_runtime::daemon::GatewayReadinessReporter>,
 ) -> Result<()> {
-    Box::pin(run_gateway_with_plugin_webhooks(
+    let authority = zeroclaw_runtime::LiveConfigAuthority::new_owned(config.clone())?;
+    run_gateway_with_authority(
         host,
         port,
         config,
-        external_event_tx,
+        external_event_bus,
         reload_controls,
         tui_registry,
         canvas_store,
         sop_engine,
         sop_audit,
+        daemon_authority,
+        sop_driver_handles,
+        readiness,
+        authority,
+    )
+    .await
+}
+
+/// Run the gateway with the live config authority owned by its daemon
+/// generation.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+pub async fn run_gateway_with_authority(
+    host: &str,
+    port: u16,
+    config: Config,
+    external_event_bus: Option<zeroclaw_runtime::observability::EventBus>,
+    reload_controls: Option<zeroclaw_runtime::daemon::GatewayReloadControls>,
+    tui_registry: Option<Arc<zeroclaw_runtime::rpc::tui_identity::TuiRegistry>>,
+    canvas_store: Option<CanvasStore>,
+    sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
+    sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
+    daemon_authority: Option<zeroclaw_runtime::daemon::DaemonInboundAuthority>,
+    sop_driver_handles: Option<zeroclaw_runtime::sop::SopDriverHandles>,
+    readiness: Option<zeroclaw_runtime::daemon::GatewayReadinessReporter>,
+    authority: zeroclaw_runtime::LiveConfigAuthority,
+) -> Result<()> {
+    Box::pin(run_gateway_with_plugin_webhooks(
+        host,
+        port,
+        config,
+        external_event_bus,
+        reload_controls,
+        tui_registry,
+        canvas_store,
+        sop_engine,
+        sop_audit,
+        daemon_authority,
         GatewaySupervision::new(
             readiness,
             Arc::new(zeroclaw_api::webhook::PluginWebhookRegistry::new()),
+            authority,
+            sop_driver_handles,
         ),
     ))
     .await
 }
 
 /// Run the supervised gateway with the daemon generation's channel-plugin
-/// webhook registry. Standalone callers use [`run_gateway`], because no channel
-/// supervisor exists there to publish live routes.
+/// webhook registry and live-config authority.
 #[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments)] // supervised-run wiring; params mirror run_gateway plus the plugin webhook registry
 pub async fn run_gateway_with_plugin_webhooks(
     host: &str,
     port: u16,
     config: Config,
-    external_event_tx: Option<tokio::sync::broadcast::Sender<serde_json::Value>>,
+    external_event_bus: Option<zeroclaw_runtime::observability::EventBus>,
     reload_controls: Option<zeroclaw_runtime::daemon::GatewayReloadControls>,
     tui_registry: Option<Arc<zeroclaw_runtime::rpc::tui_identity::TuiRegistry>>,
     canvas_store: Option<CanvasStore>,
     sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
     sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
+    // The daemon generation's one inbound-auth state, shared with the RPC
+    // context so pairing, revocation and policy changes persisted through
+    // either surface bind both. Standalone runs pass `None` and build their
+    // own guard, authority and configuration state from config.
+    daemon_authority: Option<zeroclaw_runtime::daemon::DaemonInboundAuthority>,
     supervision: GatewaySupervision,
 ) -> Result<()> {
     let GatewaySupervision {
         readiness,
         plugin_webhooks,
+        authority,
+        sop_driver_handles,
+        dashboard_ingress,
     } = supervision;
+    let (shared_pairing, shared_inbound_auth, shared_config, shared_cert_audit) =
+        match daemon_authority {
+            Some(authority) => (
+                Some(authority.pairing),
+                Some(authority.inbound_auth),
+                Some(authority.config),
+                authority.cert_audit,
+            ),
+            None => (None, None, None, None),
+        };
+
+    // The in-process RPC seam: dial the daemon's dispatcher when a
+    // supervised run provides its connector, and hand the handle to every
+    // request as an extension so routes can migrate onto RPC one at a time.
+    // The gateway has no credential of its own yet, so the dial is refused
+    // and the seam stays idle until that credential exists; it never rides
+    // the daemon's anonymous compatibility path.
+    let core_rpc = core_rpc::CoreRpc::default();
+    if let Some(connector) = reload_controls
+        .as_ref()
+        .and_then(|controls| controls.inproc.clone())
+    {
+        core_rpc.attach_inproc(connector, zeroclaw_rpc_client::ConnectOptions::default());
+    }
     // ── Security: warn on public bind without tunnel or explicit opt-in ──
     if is_public_bind(host)
         && config.tunnel.tunnel_provider == "none"
@@ -875,17 +1446,8 @@ pub async fn run_gateway_with_plugin_webhooks(
              Docker/VM: if you are running inside a container or VM, this is expected."
         );
     }
-    let config_state = Arc::new(RwLock::new(config.clone()));
-
-    // ── Hooks ──────────────────────────────────────────────────────
-    let hooks: Option<std::sync::Arc<zeroclaw_runtime::hooks::HookRunner>> = if config.hooks.enabled
-    {
-        Some(std::sync::Arc::new(
-            zeroclaw_runtime::hooks::HookRunner::new(),
-        ))
-    } else {
-        None
-    };
+    // Supervised HTTP and RPC readers share the daemon's published config.
+    let config_state = shared_config.unwrap_or_else(|| authority.live_handle());
 
     let addr: SocketAddr = match zeroclaw_infra::parse_gateway_bind_socket_addr(host, port) {
         Ok(a) => a,
@@ -1068,7 +1630,7 @@ pub async fn run_gateway_with_plugin_webhooks(
 
     let (tools_registry_raw, _delegate_handle_gw) = match (&agent_alias_opt, agent_setup) {
         (Some(agent_alias), Some((risk_profile, security))) => {
-            let all_tools_result = tools::all_tools_with_runtime(
+            match tools::all_tools_with_runtime(
                 Arc::new(config.clone()),
                 &security,
                 &risk_profile,
@@ -1092,56 +1654,73 @@ pub async fn run_gateway_with_plugin_webhooks(
                 sop_engine.clone(),
                 sop_audit.clone(),
                 None,
-            )?;
-            let assembled = scoped::ScopedToolRegistry::assemble(scoped::ScopedAssembly {
-                config: &config,
-                agent_alias,
-                security: &security,
-                built: all_tools_result,
-                // The gateway registers no skills today; unifying the two
-                // skill loaders through this seam is the Epic F follow-up.
-                skills: &[],
-                runtime: Arc::clone(&runtime),
-                caller_allowed: None,
-                connect_mcp: true,
-                // Gateway tool-listing path: short-lived, no cross-turn reuse
-                // contract, so the per-call connect is correct.
-                mcp_registry: None,
-                // Listing-only registry: loading peripherals physically opens
-                // hardware (exclusive serial holds) that the live turn paths
-                // need. Never connect them for a registry no turn runs against.
-                connect_peripherals: false,
-                emit_assembly_logs: false,
-                exclude_memory: false,
-                acp_delivery: false,
-                list_deferred_mcp_specs: true,
-            })
-            .await;
-            let reaction_handle_gw_opt = Some(assembled.reaction_handle.clone());
-            let channel_names = zeroclaw_channels::orchestrator::register_channels_for_tools(
-                &config,
-                &assembled.ask_user_handle,
-                &assembled.channel_room_handle,
-                &reaction_handle_gw_opt,
-                &assembled.poll_handle,
-                &assembled.escalate_handle,
-            );
-            if !channel_names.is_empty() {
-                ::zeroclaw_log::record!(
-                    INFO,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_attrs(::serde_json::json!({"count": channel_names.len()})),
-                    &format!(
-                        "Registered {} channel(s) for dashboard agent",
-                        channel_names.len()
-                    ),
-                );
+            ) {
+                Ok(all_tools_result) => {
+                    let assembled = scoped::ScopedToolRegistry::assemble(scoped::ScopedAssembly {
+                        config: &config,
+                        agent_alias,
+                        security: &security,
+                        built: all_tools_result,
+                        // The gateway registers no skills today; unifying the two
+                        // skill loaders through this seam is the Epic F follow-up.
+                        skills: &[],
+                        runtime: Arc::clone(&runtime),
+                        caller_allowed: None,
+                        connect_mcp: true,
+                        // Gateway tool-listing path: short-lived, no cross-turn reuse
+                        // contract, so the per-call connect is correct.
+                        mcp_registry: None,
+                        // Listing-only registry: loading peripherals physically opens
+                        // hardware (exclusive serial holds) that the live turn paths
+                        // need. Never connect them for a registry no turn runs against.
+                        connect_peripherals: false,
+                        emit_assembly_logs: false,
+                        exclude_memory: false,
+                        acp_delivery: false,
+                        list_deferred_mcp_specs: true,
+                    })
+                    .await;
+                    let reaction_handle_gw_opt = Some(assembled.reaction_handle.clone());
+                    let channel_names =
+                        zeroclaw_channels::orchestrator::register_channels_for_tools(
+                            &config,
+                            &assembled.ask_user_handle,
+                            &assembled.channel_room_handle,
+                            &reaction_handle_gw_opt,
+                            &assembled.poll_handle,
+                            &assembled.escalate_handle,
+                        );
+                    if !channel_names.is_empty() {
+                        ::zeroclaw_log::record!(
+                            INFO,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_attrs(::serde_json::json!({"count": channel_names.len()})),
+                            &format!(
+                                "Registered {} channel(s) for dashboard agent",
+                                channel_names.len()
+                            ),
+                        );
+                    }
+                    // Listing-only registry: no turn runs against it, so the
+                    // deferred-MCP prompt section and activation handle returned by
+                    // `assemble` have no consumer here (live gateway chat resolves
+                    // its tools inside process_message).
+                    (assembled.registry.into_inner(), assembled.delegate_handle)
+                }
+                Err(e) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({"agent_alias": agent_alias, "error": format!("{e}")})),
+                        "Gateway: agent tool registry failed to build; booting with empty tools registry. Fix via /admin/reload or /quickstart."
+                    );
+                    (Vec::new(), None)
+                }
             }
-            // Listing-only registry: no turn runs against it, so the
-            // deferred-MCP prompt section and activation handle returned by
-            // `assemble` have no consumer here (live gateway chat resolves
-            // its tools inside process_message).
-            (assembled.registry.into_inner(), assembled.delegate_handle)
         }
         (Some(_), None) => {
             // Agent existed but its config failed to resolve. Warned
@@ -1202,7 +1781,7 @@ pub async fn run_gateway_with_plugin_webhooks(
                 continue;
             }
         };
-        let agent_tools_result = tools::all_tools_with_runtime(
+        let agent_tools_result = match tools::all_tools_with_runtime(
             Arc::new(config.clone()),
             &security,
             &risk_profile,
@@ -1226,7 +1805,23 @@ pub async fn run_gateway_with_plugin_webhooks(
             sop_engine.clone(),
             sop_audit.clone(),
             None,
-        )?;
+        ) {
+            Ok(result) => result,
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(
+                            ::serde_json::json!({"agent_alias": alias, "error": format!("{e}")})
+                        ),
+                    "Gateway: agent tool registry failed to build; exposing an empty /api/tools listing. Fix via /admin/reload or /quickstart."
+                );
+                // An absent alias falls back to the default agent's tools.
+                tools_registry_by_agent.insert(alias, Arc::new(Vec::new()));
+                continue;
+            }
+        };
         // Same gated seam as the dashboard seed above, so this listing shows
         // the agent's policy-filtered set (filter + MCP). The tools are only
         // enumerated for their specs, never invoked, so the returned channel
@@ -1264,20 +1859,26 @@ pub async fn run_gateway_with_plugin_webhooks(
     // Cost tracker — process-global singleton so channels share the same instance
     let cost_tracker = CostTracker::get_or_init_global(config.cost.clone(), &config.data_dir);
 
-    // Live model-pricing refresher (once per process; idempotent, no-op unless a
-    // provider sets `live_pricing = true`). Each call re-binds the refresher's
-    // config handle, so reloads that re-instantiate the config Arc are honored
-    // without a restart; shares the global price snapshot the cost path reads.
-    zeroclaw_providers::pricing::spawn_refresher(config_state.clone());
+    // The live-pricing refresher and the gateway-start hook belong to the
+    // process that owns this listener (the daemon, or the standalone
+    // `zeroclaw gateway` command), not to the listener: the refresher must run
+    // with the gateway disabled, and the hook fires from the readiness report.
+    // The gateway does own the live config handle its config API writes in
+    // place, so it points the refresher at that handle. An operator's change
+    // (an opt-out, a new endpoint or model) then reaches the next refresh
+    // without a reload.
+    zeroclaw_providers::pricing::bind_config(config_state.clone());
 
     // SSE broadcast channel for real-time events.
     // Use an externally provided sender (e.g. from the daemon) so that other
     // components (cron, heartbeat) can publish events to the same bus.
-    let event_tx = external_event_tx.unwrap_or_else(|| {
-        let (tx, _rx) = tokio::sync::broadcast::channel::<serde_json::Value>(256);
-        tx
-    });
-    let event_buffer = Arc::new(sse::EventBuffer::new(500));
+    // Under the daemon the bus and its observer hook are already live; a
+    // standalone gateway builds and installs its own. Either way there is one
+    // hook, so each observer event is delivered once and buffered once.
+    let (event_bus, broadcast_hook_guard) =
+        zeroclaw_runtime::observability::EventBus::shared_or_installed(external_event_bus);
+    let event_tx = event_bus.sender().clone();
+    let event_buffer = Arc::clone(event_bus.history());
     // WhatsApp channel instances (one per cloud-configured alias), keyed by
     // alias so `/whatsapp/{alias}` webhooks reach the matching instance
     #[cfg(feature = "channel-whatsapp-cloud")]
@@ -1503,14 +2104,22 @@ pub async fn run_gateway_with_plugin_webhooks(
     };
 
     // ── Pairing guard ──────────────────────────────────────
-    // The pairing-code policy is resolved from config here and nowhere
-    // else: startup pairing, `gateway get-paircode --new`, the dashboard
-    // pairing flow, and rotate-device all issue through this guard.
-    let pairing = Arc::new(PairingGuard::new(
-        config.gateway.require_pairing,
-        &config.gateway.paired_tokens,
-        config.gateway.pairing_code,
-    ));
+    // Supervised runs share the daemon's live authority so pairing and
+    // revocation reach RPC authentication too; standalone constructs its
+    // own from config exactly as before. Either way the pairing-code policy
+    // is resolved from config in exactly one guard: startup pairing,
+    // `gateway get-paircode --new`, the dashboard pairing flow, and
+    // rotate-device all issue through it. Its code lifetime and brute-force
+    // limits are read from `[gateway.pairing_dashboard]` in live config on
+    // every use, in the daemon's guard as in this one.
+    let pairing = Arc::new(shared_pairing.unwrap_or_else(|| {
+        PairingGuard::new(
+            config.gateway.require_pairing,
+            &config.gateway.paired_tokens,
+            config.gateway.pairing_code,
+        )
+        .with_live_limits(PairingLimits::live(config_state.clone()))
+    }));
     let rate_limit_max_keys = normalize_max_keys(
         config.gateway.rate_limit_max_keys,
         RATE_LIMIT_MAX_KEYS_DEFAULT,
@@ -1562,6 +2171,40 @@ pub async fn run_gateway_with_plugin_webhooks(
             Ok(url) => {
                 println!("🌐 Tunnel active: {url}");
                 tunnel_url = Some(url);
+                // The WSS RPC plane and enrollment endpoint terminate their
+                // own TLS; publish them as raw TCP passthrough where the
+                // provider supports it. Resolved from this run's config, the
+                // same source the daemon starts those listeners from.
+                let services = zeroclaw_runtime::tunnel::daemon_tcp_services(&config);
+                match tun.publish_tcp_services(&services).await {
+                    Ok(published) => {
+                        for p in &published {
+                            println!(
+                                "{}",
+                                i18n::get_required_cli_string_with_args(
+                                    "cli-tunnel-tcp-service-published",
+                                    &[("service", p.service.name), ("endpoint", &p.endpoint)],
+                                )
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Fail
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "tunnel_provider": tun.name(),
+                                "error": format!("{e}"),
+                            })),
+                            "Gateway: tunnel could not publish WSS/enrollment listeners; \
+                             they remain reachable only at their configured bind"
+                        );
+                    }
+                }
             }
             Err(e) => {
                 println!("⚠️  Tunnel failed to start: {e}");
@@ -1654,6 +2297,24 @@ pub async fn run_gateway_with_plugin_webhooks(
              (`./install.sh --source` on Linux/macOS, `setup.bat` on Windows) to build it"
         );
     }
+    // Start this run's admin-token generation. The pairing-code admin routes
+    // accept only the token the guard holds in memory. If the file cannot be
+    // written the guard holds none, so they refuse everyone (fail closed) and
+    // no file left by an earlier run is honoured; the banner below stays the
+    // way to read the first-run code.
+    let admin_token_path = gateway_admin_token_path(&config.data_dir);
+    if let Err(e) = pairing.rotate_admin_token(&config.data_dir) {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({
+                    "path": admin_token_path.display().to_string(),
+                    "error": e.to_string(),
+                })),
+            "gateway admin token could not be written; pairing-code admin routes will refuse all callers"
+        );
+    }
     if let Some(code) = pairing.pairing_code() {
         // The box is sized from the code, not from a literal: since the policy became config-driven,
         // the code length is operator-configurable (6..=128 chars).
@@ -1665,7 +2326,7 @@ pub async fn run_gateway_with_plugin_webhooks(
         println!("     └{rule}┘");
         println!("     Send: POST {pfx}/pair with header X-Pairing-Code: {code}");
     } else if pairing.require_pairing() {
-        for line in already_paired_pairing_notice(host, actual_port, pfx) {
+        for line in already_paired_pairing_notice(host, actual_port, pfx, &admin_token_path) {
             println!("{line}");
         }
         println!();
@@ -1699,21 +2360,10 @@ pub async fn run_gateway_with_plugin_webhooks(
 
     zeroclaw_runtime::health::mark_component_ok("gateway");
 
-    // Fire gateway start hook
-    if let Some(ref hooks) = hooks {
-        hooks.fire_gateway_start(host, actual_port).await;
-    }
-
-    let broadcast_layer: Arc<dyn zeroclaw_runtime::observability::Observer> = Arc::new(
-        sse::BroadcastObserver::new(event_tx.clone(), event_buffer.clone()),
-    );
-    let broadcast_hook_guard =
-        zeroclaw_runtime::observability::set_scoped_broadcast_hook(broadcast_layer);
-
     zeroclaw_log::set_broadcast_hook(event_tx.clone());
 
-    // Bound into AppState. Not a broadcaster — the broadcaster is the
-    // `broadcast_layer` installed above as the global hook. This is the
+    // Bound into AppState. Not a broadcaster — the broadcaster is the event
+    // bus's hook (`EventBus::shared_or_installed` above). This is the
     // configured backend (Log/Prometheus/...) wrapped by `TeeObserver`,
     // which tees events into the hook on every record.
     let state_observer: Arc<dyn zeroclaw_runtime::observability::Observer> = Arc::from(
@@ -1722,13 +2372,13 @@ pub async fn run_gateway_with_plugin_webhooks(
 
     let (owned_shutdown_tx, _) = tokio::sync::watch::channel(false);
     let (shutdown_tx, reload_tx) = reload_controls
-        .map(|controls| (controls.shutdown_tx, Some(controls.reload_tx)))
+        .map(|controls| (controls.shutdown_tx.clone(), Some(controls)))
         .unwrap_or((owned_shutdown_tx, None));
     let mut shutdown_rx = shutdown_tx.subscribe();
 
     // Node registry for dynamic node discovery
     let node_registry = Arc::new(nodes::NodeRegistry::new(config.nodes.max_nodes));
-    let mdns_config_state = Arc::clone(&config_state);
+    let mdns_config_state = config_state.clone();
     let mdns_peer_registry =
         nodes::mdns::MdnsPeerRegistry::new(move || mdns_config_state.read().nodes.mdns.max_peers);
     let mdns_task = if config.nodes.mdns.enabled
@@ -1796,15 +2446,22 @@ pub async fn run_gateway_with_plugin_webhooks(
     } else {
         None
     };
-    let pending_pairings = if config.gateway.require_pairing {
-        Some(Arc::new(api_pairing::PairingStore::new()))
-    } else {
-        None
-    };
+
+    // The gateway's inbound-auth authority. Supervised runs share the
+    // daemon's accepted policy with the RPC context, so a revocation
+    // persisted through either surface binds this one without a reload.
+    // Standalone runs build their own from config and the local pairing
+    // guard. Either way the policy moves only when a config mutation
+    // persists (see `persist_and_swap`).
+    let inbound_auth = Arc::new(match shared_inbound_auth {
+        Some(shared) => principal_gate::GatewayInboundAuth::from_shared(shared),
+        None => principal_gate::GatewayInboundAuth::from_config(&config, Arc::clone(&pairing))?,
+    });
 
     let state = AppState {
         config: config_state,
-        config_write_lock: zeroclaw_config::write_lock::shared_config_write_lock(),
+        config_authority: authority.clone(),
+        agent_lifecycle: authority.agent_lifecycle(),
         model_provider,
         model,
         temperature,
@@ -1843,7 +2500,6 @@ pub async fn run_gateway_with_plugin_webhooks(
         session_backend,
         session_queue: Arc::new(session_queue::SessionActorQueue::new(8, 30, 600)),
         device_registry,
-        pending_pairings,
         path_prefix: path_prefix.unwrap_or("").to_string(),
         web_dist_dir,
         canvas_store,
@@ -1852,6 +2508,7 @@ pub async fn run_gateway_with_plugin_webhooks(
         tui_registry,
         sop_engine,
         sop_audit,
+        sop_driver_handles,
         #[cfg(feature = "webauthn")]
         webauthn: if config.security.webauthn.enabled {
             let secret_store = Arc::new(zeroclaw_runtime::security::SecretStore::new(
@@ -1878,12 +2535,24 @@ pub async fn run_gateway_with_plugin_webhooks(
         },
     };
 
+    let dashboard_layer_state = state.clone();
+    // On every route that issues or redeems a pairing code: refused through a
+    // relay-served dashboard, where the relay would see the code.
+    let no_relayed_pairing = axum::middleware::from_fn(relay_ingress::no_pairing_through_a_relay);
+
     // Build router with middleware
     let inner = Router::new()
+        .merge(config_admin_router(principal_gate::ConfigRouteAuth::new(
+            &inbound_auth,
+            &state.config,
+        )))
+        .merge(api_oidc::routes())
+        .merge(api_oidc_enroll::routes(Arc::clone(&inbound_auth), shared_cert_audit))
         // ── Admin routes (for CLI management) ──
         .route("/admin/shutdown", post(handle_admin_shutdown))
         .route("/admin/reload", post(handle_admin_reload))
         .route("/admin/sop/pending", get(api_sop::handle_sop_pending))
+        .route("/admin/sop/logs", get(api_sop::handle_sop_logs))
         .route("/admin/sop/approve", post(api_sop::handle_sop_approve))
         .route("/admin/sop/deny", post(api_sop::handle_sop_deny))
         .route("/admin/paircode", get(handle_admin_paircode))
@@ -1891,15 +2560,17 @@ pub async fn run_gateway_with_plugin_webhooks(
         // ── Existing routes ──
         .route("/health", get(handle_health))
         .route("/metrics", get(handle_metrics))
-        .route("/pair", post(handle_pair))
+        .route(
+            "/pair",
+            post(handle_pair).layer(no_relayed_pairing.clone()),
+        )
         .route("/pair/code", get(handle_pair_code))
         .route("/webhook", post(handle_webhook))
         .merge(sop_webhook_routes())
         .merge(optional_channel_routes())
-        // ── Claude Code runner hooks ──
-        .route("/hooks/claude-code", post(api::handle_claude_code_hook))
+        .merge(optional_tool_routes())
         // ── Web Dashboard API routes ──
-        .route("/api/status", get(api::handle_api_status))
+        .route("/api/status", get(dashboard_core::status))
         .route("/api/version/check", get(version::handle_version_check))
         .route("/api/version/upgrade", post(version::handle_version_upgrade))
         .route(
@@ -1907,20 +2578,6 @@ pub async fn run_gateway_with_plugin_webhooks(
             get(version::handle_version_upgrade_status),
         )
         .route("/api/logs", get(api_logs::handle_api_logs))
-        .route(
-            "/api/config",
-            get(api_config::handle_config_get)
-                .patch(api_config::handle_patch)
-                .options(api_config::handle_options_config),
-        )
-        .route(
-            "/api/config/prop",
-            get(api_config::handle_prop_get)
-                .put(api_config::handle_prop_put)
-                .delete(api_config::handle_prop_delete)
-                .options(api_config::handle_options_prop),
-        )
-        .route("/api/config/list", get(api_config::handle_list))
         .route(
             "/api/sops",
             get(api_sop_author::handle_sops_list).post(api_sop_author::handle_sop_create),
@@ -1936,6 +2593,10 @@ pub async fn run_gateway_with_plugin_webhooks(
         .route(
             "/api/sops/{name}/run",
             post(api_sop_author::handle_sop_run),
+        )
+        .route(
+            "/api/sops/{name}/rename",
+            post(api_sop_author::handle_sop_rename),
         )
         .route("/api/sops/runs", get(api_sop_author::handle_sop_runs))
         .route(
@@ -1953,6 +2614,10 @@ pub async fn run_gateway_with_plugin_webhooks(
         .route(
             "/api/sops/trigger-sources",
             get(api_sop_author::handle_sop_trigger_sources),
+        )
+        .route(
+            "/api/sops/decision-models",
+            get(api_sop_author::handle_sop_decision_models),
         )
         .route(
             "/api/sops/graph-legend",
@@ -1974,67 +2639,7 @@ pub async fn run_gateway_with_plugin_webhooks(
             "/api/sops/{name}/runs/{run_id}/cancel",
             post(api_sop_author::handle_sop_cancel),
         )
-        .route("/api/config/drift", get(api_config::handle_drift))
-        .route(
-            "/api/config/reload-status",
-            get(api_config::handle_reload_status),
-        )
-        .route("/api/config/templates", get(api_config::handle_templates))
-        .route("/api/config/map-keys", get(api_config::handle_get_map_keys))
-        .route(
-            "/api/config/resolve-alias-source",
-            get(api_config::handle_resolve_alias_source),
-        )
-        .route(
-            "/api/config/map-key",
-            post(api_config::handle_map_key).delete(api_config::handle_delete_map_key),
-        )
-        .route("/api/config/rename-map-key", post(api_config::handle_rename_map_key))
-        .route(
-            "/api/config/model-providers/{type}/{alias}/refresh-context-window",
-            post(api_config::handle_refresh_context_window),
-        )
-        .route("/api/config/delete-plan", get(api_config::handle_delete_plan))
-        .route("/api/config/catalog", get(api_sections::handle_catalog))
-        .route(
-            "/api/config/catalog/models",
-            get(api_sections::handle_catalog_models),
-        )
-        .route("/api/config/status", get(api_sections::handle_section_status))
-        .route(
-            "/api/config/agent-options",
-            get(api_sections::handle_agent_options),
-        )
-        .route("/api/config/sections", get(api_sections::handle_sections))
-        .route(
-            "/api/config/sections/{section}",
-            get(api_sections::handle_section_picker),
-        )
-        .route(
-            "/api/config/sections/{section}/items/{key}",
-            post(api_sections::handle_section_select),
-        )
         .route("/api/personality", get(api_personality::handle_index))
-        .route(
-            "/api/quickstart/state",
-            get(api_quickstart::handle_state),
-        )
-        .route(
-            "/api/quickstart/fields",
-            post(api_quickstart::handle_fields),
-        )
-        .route(
-            "/api/quickstart/validate",
-            post(api_quickstart::handle_validate),
-        )
-        .route(
-            "/api/quickstart/apply",
-            post(api_quickstart::handle_apply),
-        )
-        .route(
-            "/api/quickstart/dismiss",
-            post(api_quickstart::handle_dismiss),
-        )
         .route(
             "/api/personality/templates",
             get(api_personality::handle_templates),
@@ -2085,8 +2690,6 @@ pub async fn run_gateway_with_plugin_webhooks(
                 .put(api_skills::handle_write_skill)
                 .delete(api_skills::handle_delete_skill),
         )
-        .route("/api/config/init", post(api_config::handle_init))
-        .route("/api/config/migrate", post(api_config::handle_migrate))
         .route("/api/openapi.json", get(openapi::handle_openapi_json))
         .route("/api/docs", get(openapi::handle_docs))
         .route("/api/tools", get(api::handle_api_tools))
@@ -2120,27 +2723,30 @@ pub async fn run_gateway_with_plugin_webhooks(
         .route("/api/cli-tools", get(api::handle_api_cli_tools))
         .route("/api/channels", get(api::handle_api_channels))
         .route(
-            "/api/channels/bind",
-            post(api_config::handle_api_channel_bind),
-        )
-        .route(
             "/api/channels/{channel}/relink",
             post(api::handle_api_channel_relink),
         )
         .route("/api/health", get(api::handle_api_health))
         .route("/api/tuis", get(api::handle_api_tuis))
-        .route("/api/sessions", get(api::handle_api_sessions_list))
+        .route("/api/sessions", get(dashboard_core::sessions_list))
         .route("/api/sessions/running", get(api::handle_api_sessions_running))
         .route(
             "/api/sessions/{id}/messages",
-            get(api::handle_api_session_messages).post(api::handle_api_session_message_post),
+            get(dashboard_core::session_messages).post(api::handle_api_session_message_post),
         )
-        .route("/api/sessions/{id}", delete(api::handle_api_session_delete).put(api::handle_api_session_rename))
+        .route("/api/sessions/{id}", delete(dashboard_core::session_delete).put(dashboard_core::session_rename))
         .route("/api/sessions/{id}/state", get(api::handle_api_session_state))
-        .route("/api/sessions/{id}/abort", post(api::handle_api_session_abort))
+        .route("/api/sessions/{id}/abort", post(dashboard_core::session_abort))
+        .route("/api/agents/available", get(dashboard_core::agents_available))
         // ── Pairing + Device management API ──
-        .route("/api/pairing/initiate", post(api_pairing::initiate_pairing))
-        .route("/api/pair", post(api_pairing::submit_pairing_enhanced))
+        .route(
+            "/api/pairing/initiate",
+            post(api_pairing::initiate_pairing).layer(no_relayed_pairing.clone()),
+        )
+        .route(
+            "/api/pair",
+            post(api_pairing::submit_pairing_enhanced).layer(no_relayed_pairing.clone()),
+        )
         .route("/api/devices", get(api_pairing::list_devices))
         .route(
             "/api/devices/me/capabilities",
@@ -2149,7 +2755,7 @@ pub async fn run_gateway_with_plugin_webhooks(
         .route("/api/devices/{id}", delete(api_pairing::revoke_device))
         .route(
             "/api/devices/{id}/token/rotate",
-            post(api_pairing::rotate_token),
+            post(api_pairing::rotate_token).layer(no_relayed_pairing),
         )
         // ── Live Canvas (A2UI) routes ──
         .route("/api/canvas", get(canvas::handle_canvas_list))
@@ -2202,12 +2808,9 @@ pub async fn run_gateway_with_plugin_webhooks(
             delete(api_webauthn::handle_delete_credential),
         );
 
-    // ── Plugin management API (requires plugins-wasm feature) ──
-    #[cfg(feature = "plugins-wasm")]
-    let inner = inner.route(
-        "/api/plugins",
-        get(api_plugins::plugin_routes::list_plugins),
-    );
+    // The read-only package catalog remains discoverable in every gateway
+    // build; WASM-specific sources degrade explicitly when support is absent.
+    let inner = inner.route("/api/plugins", get(api_plugins::list_plugins));
 
     let inner = inner
         // ── SSE event stream ──
@@ -2273,7 +2876,9 @@ pub async fn run_gateway_with_plugin_webhooks(
             Duration::from_secs(gateway_long_running_request_timeout_secs(&config.gateway)),
         ));
 
-    let inner = inner.merge(long_running_router);
+    let inner = inner
+        .merge(long_running_router)
+        .layer(axum::Extension(core_rpc));
 
     // Nest under path prefix when configured (axum strips prefix before routing).
     // nest() at "/prefix" handles both "/prefix" and "/prefix/*" but not "/prefix/"
@@ -2287,6 +2892,26 @@ pub async fn run_gateway_with_plugin_webhooks(
     } else {
         inner
     };
+
+    // Dashboard sign-in sessions: classified once per request for every
+    // route, upgrades and the fallback included. A no-op unless
+    // `[gateway.dashboard_sign_in]` offers a provider.
+    // Bound to this generation before it serves anything, so its stop
+    // retires the sessions' sockets and refuses their later requests.
+    let dashboard_auth = Arc::new(
+        dashboard_session::DashboardAuth::new(
+            dashboard_session::DashboardSessions::process_shared(),
+            Arc::clone(&inbound_auth),
+        )
+        .for_generation(&dashboard_layer_state),
+    );
+    let app = app.layer(axum::middleware::from_fn_with_state(
+        dashboard_session::DashboardLayer {
+            state: dashboard_layer_state,
+            auth: dashboard_auth,
+        },
+        dashboard_session::layer,
+    ));
 
     let tls_enabled = config
         .gateway
@@ -2325,84 +2950,206 @@ pub async fn run_gateway_with_plugin_webhooks(
         readiness.report_ready(actual_addr);
     }
 
-    if let Some(tls_acceptor) = tls_acceptor {
-        // Manual TLS accept loop — serves each connection via hyper.
-        let app = app.into_make_service_with_connect_info::<SocketAddr>();
-        let mut app = app;
-
-        let mut shutdown_signal = shutdown_rx;
-        loop {
-            tokio::select! {
-                conn = listener.accept() => {
-                    let (tcp_stream, remote_addr) = match conn {
-                        Ok(pair) => pair,
-                        Err(e) => {
-                            if is_recoverable_accept_error(&e) {
-                                // Transient (e.g. EMFILE under fd pressure):
-                                // the listener is still valid. Back off
-                                // briefly to avoid hot-spinning, then keep
-                                // serving rather than killing the daemon
-                                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": format!("{}", e)})), "gateway accept() failed with a transient error; backing off and continuing");
-                                tokio::time::sleep(Duration::from_millis(ACCEPT_ERROR_BACKOFF_MS)).await;
-                                continue;
+    // One accept loop for plain and TLS connections. Every connection
+    // watches this gateway's stop and serves through `admission`, so after
+    // the stop no request reaches this gateway's router. Its tasks are in
+    // `tasks`, so the stop also cancels whatever outlasts the drain.
+    let mut app = app.into_make_service_with_connect_info::<SocketAddr>();
+    // Attached once this generation is about to serve, and detached when
+    // it returns, so the bridge never hands a connection to a gateway that
+    // can't serve it.
+    let mut dashboard_feed = DashboardFeed(
+        dashboard_ingress
+            .as_ref()
+            .map(zeroclaw_runtime::relay_dashboard::DashboardIngress::attach),
+    );
+    let tasks = ServeTasks::default();
+    let _cancel_on_drop = ServeTasksGuard::new(tasks.clone());
+    let admission = Admission {
+        stopping: shutdown_rx.clone(),
+        tasks: tasks.clone(),
+    };
+    loop {
+        tokio::select! {
+            conn = listener.accept() => {
+                let (tcp_stream, remote_addr) = match conn {
+                    Ok(pair) => pair,
+                    Err(e) => match accept_error_action(&e, tls_acceptor.is_some()) {
+                        AcceptErrorAction::Retry => continue,
+                        AcceptErrorAction::RetryAfter(delay) => {
+                            // Transient (e.g. EMFILE under fd pressure):
+                            // the listener is still valid. Back off
+                            // briefly to avoid hot-spinning, then keep
+                            // serving rather than killing the daemon
+                            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": format!("{}", e)})), "gateway accept() failed with a transient error; backing off and continuing");
+                            if accept_backoff(delay, &mut shutdown_rx).await {
+                                ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "ZeroClaw Gateway shutting down");
+                                break;
                             }
-                            return Err(e.into());
+                            continue;
+                        }
+                        AcceptErrorAction::Fail => return Err(e.into()),
+                    },
+                };
+                let tls_acceptor = tls_acceptor.clone();
+                let svc = tower::MakeService::<
+                    SocketAddr,
+                    hyper::Request<hyper::body::Incoming>,
+                >::make_service(&mut app, remote_addr)
+                .await
+                .expect("infallible make_service");
+                // A clone of this loop's receiver, which was subscribed when
+                // the gateway started: it sees a stop that lands while the
+                // connection is being handed over too.
+                let mut stopping = shutdown_rx.clone();
+                let executor = tasks.clone();
+                let admission = admission.clone();
+
+                tasks.spawn(async move {
+                    let hyper_svc = hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+                        let svc = svc.clone();
+                        let admission = admission.clone();
+                        async move { serve_while_current(svc, &admission, req).await }
+                    });
+                    let builder = hyper_util::server::conn::auto::Builder::new(executor);
+                    // Serve until the connection ends or the gateway stops; then
+                    // finish the request in flight and close (HTTP/1 closes
+                    // once its response is done). The drain below bounds it.
+                    macro_rules! serve_until_stopped {
+                        ($connection:expr) => {{
+                            let connection = $connection;
+                            tokio::pin!(connection);
+                            tokio::select! {
+                                served = connection.as_mut() => served,
+                                () = gateway_stop_requested(&mut stopping) => {
+                                    connection.as_mut().graceful_shutdown();
+                                    connection.as_mut().await
+                                }
+                            }
+                        }};
+                    }
+                    let served = match tls_acceptor {
+                        Some(tls_acceptor) => {
+                            let accepted = tokio::select! {
+                                accepted = tls_acceptor.accept(tcp_stream) => accepted,
+                                () = gateway_stop_requested(&mut stopping) => return,
+                            };
+                            let tls_stream = match accepted {
+                                Ok(s) => s,
+                                Err(e) => {
+                                    ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"error": format!("{}", e), "remote_addr": remote_addr})), "TLS handshake failed from");
+                                    return;
+                                }
+                            };
+                            let io = hyper_util::rt::TokioIo::new(tls_stream);
+                            // With upgrades, as over plain HTTP: WebSockets work over TLS too.
+                            serve_until_stopped!(builder.serve_connection_with_upgrades(io, hyper_svc))
+                        }
+                        None => {
+                            let io = hyper_util::rt::TokioIo::new(tcp_stream);
+                            serve_until_stopped!(builder.serve_connection_with_upgrades(io, hyper_svc))
                         }
                     };
-                    let tls_acceptor = tls_acceptor.clone();
-                    let svc = tower::MakeService::<
-                        SocketAddr,
-                        hyper::Request<hyper::body::Incoming>,
-                    >::make_service(&mut app, remote_addr)
-                    .await
-                    .expect("infallible make_service");
-
-                    zeroclaw_spawn::spawn!(async move {
-                        let tls_stream = match tls_acceptor.accept(tcp_stream).await {
-                            Ok(s) => s,
-                            Err(e) => {
-                                ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"error": format!("{}", e), "remote_addr": remote_addr})), "TLS handshake failed from");
-                                return;
+                    if let Err(e) = served {
+                        ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"error": format!("{}", e), "remote_addr": remote_addr})), "connection error from");
+                    }
+                });
+            }
+            conn = dashboard_feed.next() => {
+                // A browser connection a relay-served dashboard forwarded.
+                // Served like an accepted socket - same router, admission
+                // and drain - with the browser's address as the peer (never
+                // loopback) and each request admitted for that dashboard's
+                // origin alone. No TLS here: the browser's ended at the
+                // relay, and the bridge carries the stream inside the
+                // daemon's own TLS link to it.
+                let (stream, client_addr, origin) = conn.into_parts();
+                let relay = relay_ingress::RelayConnection::new(origin);
+                let svc = tower::MakeService::<
+                    SocketAddr,
+                    hyper::Request<hyper::body::Incoming>,
+                >::make_service(&mut app, client_addr)
+                .await
+                .expect("infallible make_service");
+                let mut stopping = shutdown_rx.clone();
+                let admission = admission.clone();
+                tasks.spawn(async move {
+                    let hyper_svc = hyper::service::service_fn(move |mut req: hyper::Request<hyper::body::Incoming>| {
+                        let svc = svc.clone();
+                        let admission = admission.clone();
+                        let admitted = relay.admit(&mut req);
+                        async move {
+                            match admitted {
+                                Ok(()) => serve_while_current(svc, &admission, req).await,
+                                Err(refusal) => Ok(*refusal),
                             }
-                        };
-                        let io = hyper_util::rt::TokioIo::new(tls_stream);
-                        let hyper_svc = hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
-                            let mut svc = svc.clone();
-                            async move {
-                                tower::Service::call(&mut svc, req).await
-                            }
-                        });
-                        if let Err(e) = hyper_util::server::conn::auto::Builder::new(
-                            hyper_util::rt::TokioExecutor::new(),
-                        )
-                        .serve_connection(io, hyper_svc)
-                        .await
-                        {
-                            ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"error": format!("{}", e), "remote_addr": remote_addr})), "connection error from");
                         }
                     });
-                }
-                _ = shutdown_signal.changed() => {
-                    ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "ZeroClaw Gateway shutting down");
-                    break;
-                }
+                    // HTTP/1.1 only, which is all the relay offers browsers:
+                    // one connection then carries requests for one host.
+                    let connection = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(hyper_util::rt::TokioIo::new(stream), hyper_svc)
+                        .with_upgrades();
+                    tokio::pin!(connection);
+                    let served = tokio::select! {
+                        served = connection.as_mut() => served,
+                        () = gateway_stop_requested(&mut stopping) => {
+                            connection.as_mut().graceful_shutdown();
+                            connection.as_mut().await
+                        }
+                    };
+                    if let Err(e) = served {
+                        ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"error": format!("{}", e), "remote_addr": client_addr})), "relay dashboard connection error from");
+                    }
+                });
+            }
+            _ = shutdown_rx.changed() => {
+                ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "ZeroClaw Gateway shutting down");
+                break;
             }
         }
-    } else {
-        // Plain TCP — use axum's built-in serve.
-        axum::serve(
-            listener,
-            app.into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .with_graceful_shutdown(async move {
-            let _ = shutdown_rx.changed().await;
+    }
+    // Let go of the port at once, as `axum::serve` does: a connection made
+    // from here on is refused, not accepted into a backlog nothing serves.
+    drop(listener);
+    // And stop taking relay-forwarded dashboard connections: the bridge
+    // refuses them until the next generation attaches.
+    drop(dashboard_feed);
+    // Every connection finishes the request in flight and closes; whatever
+    // is still open after the drain (an event stream, a connection that
+    // ignored the shutdown) is cancelled. Nothing waits on it beyond that:
+    // it admits no request, and the next gateway can serve.
+    if !tasks.retire_within(CONNECTION_DRAIN).await {
+        ::zeroclaw_log::record!(
+            DEBUG,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            "gateway connections still open after the drain; closing them"
+        );
+    }
+
+    // Withdraw the tunnel before slower teardown below: the daemon allows a
+    // short grace window before aborting the gateway. An early error return
+    // above still drops the tunnel, which kills its processes without waiting.
+    if let Some(tun) = tunnel {
+        if let Err(e) = tun.stop().await {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "tunnel_provider": tun.name(),
+                        "error": format!("{e}"),
+                    })),
+                "Gateway: tunnel did not stop cleanly"
+            );
+        } else {
             ::zeroclaw_log::record!(
                 INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-                "ZeroClaw Gateway shutting down"
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"tunnel_provider": tun.name()})),
+                "Gateway: tunnel stopped"
             );
-        })
-        .await?;
+        }
     }
 
     if let Some(task) = mdns_task {
@@ -2439,7 +3186,12 @@ fn format_paircode_recovery_command(_host: &str, port: u16) -> String {
     format!("zeroclaw gateway get-paircode --new --port {port}")
 }
 
-fn already_paired_pairing_notice(host: &str, port: u16, path_prefix: &str) -> Vec<String> {
+fn already_paired_pairing_notice(
+    host: &str,
+    port: u16,
+    path_prefix: &str,
+    admin_token_path: &std::path::Path,
+) -> Vec<String> {
     vec![
         "  🔒 Pairing: ACTIVE — this gateway is already paired, so no new \
          one-time code was generated on this start."
@@ -2449,18 +3201,31 @@ fn already_paired_pairing_notice(host: &str, port: u16, path_prefix: &str) -> Ve
             format_paircode_recovery_command(host, port)
         ),
         format!(
-            "     Fallback (localhost only): {}",
-            format_paircode_recovery_curl(host, port, path_prefix)
+            "     Fallback (on this host, as this user): {}",
+            format_paircode_recovery_curl(host, port, path_prefix, admin_token_path)
         ),
     ]
 }
 
-fn format_paircode_recovery_curl(host: &str, port: u16, path_prefix: &str) -> String {
+fn format_paircode_recovery_curl(
+    host: &str,
+    port: u16,
+    path_prefix: &str,
+    admin_token_path: &std::path::Path,
+) -> String {
     // Admin paircode routes are localhost-only, so the curl fallback must point
     // at loopback. Bind-only hosts and non-loopback advertised hosts are
-    // normalized to `127.0.0.1`; explicit loopback hosts are preserved.
+    // normalized to `127.0.0.1`; explicit loopback hosts are preserved. They
+    // also require this run's admin secret, read from its owner-only file.
     let recovery_host = paircode_recovery_curl_host(host);
-    format!("curl -s -X POST http://{recovery_host}:{port}{path_prefix}/admin/paircode/new")
+    format!(
+        "curl -s -X POST -H \"{GATEWAY_ADMIN_TOKEN_HEADER}: $(cat '{}')\" \
+         http://{recovery_host}:{port}{path_prefix}/admin/paircode/new",
+        admin_token_path
+            .display()
+            .to_string()
+            .replace('\'', "'\\''")
+    )
 }
 
 fn paircode_recovery_curl_host(host: &str) -> &str {
@@ -2640,13 +3405,7 @@ async fn handle_pair(
                     return (StatusCode::INTERNAL_SERVER_ERROR, Json(body));
                 }
             }
-            if let Err(err) = Box::pin(persist_pairing_tokens(
-                state.config.clone(),
-                &state.pairing,
-                state.config_write_lock.clone(),
-            ))
-            .await
-            {
+            if let Err(err) = Box::pin(persist_pairing_tokens(&state)).await {
                 ::zeroclaw_log::record!(
                     ERROR,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
@@ -2700,33 +3459,50 @@ async fn handle_pair(
     }
 }
 
-pub(crate) async fn persist_pairing_tokens(
-    config: Arc<RwLock<Config>>,
-    pairing: &PairingGuard,
-    config_write_lock: Arc<tokio::sync::Mutex<()>>,
-) -> Result<()> {
+pub(crate) async fn persist_pairing_tokens(state: &AppState) -> Result<()> {
     // Self-contained: no caller pre-reads config for modify, so this
-    // acquires the witness itself rather than taking it as a param. Held
-    // across the whole read-modify-save-swap below.
-    let _guard = Arc::clone(&config_write_lock).lock_owned().await;
-    debug_assert!(
-        config_write_lock.try_lock().is_err(),
-        "persist_pairing_tokens must hold config_write_lock across its read-modify-save-swap"
-    );
-    let paired_tokens = pairing.tokens();
-    // This is needed because parking_lot's guard is not Send so we clone the inner
-    // this should be removed once async mutexes are used everywhere
-    let mut updated_cfg = { config.read().clone() };
+    // admits its own commit rather than taking one as a param.
+    let commit = state.begin_config_commit().await?;
+    persist_pairing_tokens_under(state, commit).await.map(drop)
+}
+
+/// [`persist_pairing_tokens`] for a caller that already holds an admitted
+/// commit: a revocation that removed a live token under it, through
+/// [`PairingGuard::revoke_under_config_write_lock`], persists under the same
+/// commit.
+///
+/// The commit (writer guard + config-work lease) is held across the whole
+/// read-modify-save-publish below and runs the irreversible phase retained,
+/// so a cancelled request cannot strand a committed token write without its
+/// publication. It is handed back once the publication lands, so a caller
+/// that must stay serialized past the persist (a rotation issuing its new
+/// pairing code) keeps the writer gate until it is done.
+pub(crate) async fn persist_pairing_tokens_under(
+    state: &AppState,
+    commit: ConfigWriteGuard,
+) -> Result<ConfigWriteGuard> {
+    let paired_tokens = state.pairing.tokens();
+    let mut updated_cfg = commit.current_config();
     updated_cfg.gateway.paired_tokens = paired_tokens;
     updated_cfg.mark_dirty("gateway.paired_tokens");
-    updated_cfg
-        .save_dirty()
-        .await
-        .context("Failed to persist paired tokens to config.toml")?;
-
-    // Keep shared runtime config in sync with persisted tokens.
-    *config.write() = updated_cfg;
-    Ok(())
+    // Checked revision before the irreversible save.
+    let revision = commit
+        .next_revision()
+        .context("Failed to allocate a config revision for paired tokens")?;
+    let task =
+        zeroclaw_runtime::live_config_authority::spawn_agent_lifecycle_job(Box::pin(async move {
+            let mut config = updated_cfg;
+            config
+                .save_dirty()
+                .await
+                .context("Failed to persist paired tokens to config.toml")?;
+            // Keep the published pair in sync with the persisted tokens.
+            commit
+                .publish(revision, config)
+                .context("Failed to publish paired tokens to the live config")?;
+            Ok::<ConfigWriteGuard, anyhow::Error>(commit)
+        }));
+    task.await.context("Paired-token persistence task failed")?
 }
 
 /// Result of a gateway chat turn.
@@ -2819,7 +3595,10 @@ async fn lock_gateway_chat_dispatch_capture_for_test() -> tokio::sync::MutexGuar
     GATEWAY_CHAT_DISPATCH_CAPTURE_TEST_LOCK.lock().await
 }
 
-#[cfg(all(test, feature = "channel-linq"))]
+#[cfg(all(
+    test,
+    any(feature = "channel-linq", feature = "channel-whatsapp-cloud")
+))]
 fn clear_gateway_chat_dispatch_captures_for_test() {
     GATEWAY_CHAT_DISPATCH_CAPTURES
         .lock()
@@ -2877,8 +3656,25 @@ pub(crate) async fn run_gateway_chat_with_tools(
 
     #[cfg(not(test))]
     {
-        let config = state.config.read().clone();
-        let agent_alias = require_gateway_chat_agent_alias(&config, agent_override)?;
+        let initial_config = state.config.read().clone();
+        let requested_alias = require_gateway_chat_agent_alias(&initial_config, agent_override)?;
+        let execution_capability =
+            zeroclaw_runtime::live_config_authority::AgentExecutionCapability::from_parts(
+                state.config.clone(),
+                state.agent_lifecycle.clone(),
+            );
+        let execution_admission = execution_capability
+            .resolve_and_admit(&requested_alias)
+            .map_err(|error| anyhow::Error::msg(error.to_string()))?;
+        let agent_alias = execution_admission.alias().to_string();
+        let config = execution_admission.config().as_ref().clone();
+        // The admission snapshot is authoritative for both the alias and the
+        // target config, so a delete/recreate cannot run with predecessor data.
+        let current_alias = require_gateway_chat_agent_alias(&config, agent_override)?;
+        anyhow::ensure!(
+            current_alias == agent_alias,
+            "gateway chat agent changed during turn admission"
+        );
 
         // Scope the cost tracking context so per-LLM-call usage flows into
         // the gateway's cost tracker and costs.jsonl. A separate
@@ -2905,12 +3701,14 @@ pub(crate) async fn run_gateway_chat_with_tools(
             turn_usage.clone(),
             zeroclaw_runtime::agent::cost::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
                 cost_tracking_context,
-                zeroclaw_runtime::agent::process_message(
+                zeroclaw_runtime::agent::loop_::process_message_with_live_config_and_admission(
                     config,
+                    state.config.clone(),
                     &agent_alias,
                     message,
                     session_id,
                     zeroclaw_api::ingress::TurnOrigin::Interactive,
+                    Some(execution_admission),
                 ),
             ),
         ))
@@ -2941,6 +3739,15 @@ fn require_gateway_chat_agent_alias(
         );
         anyhow::Error::msg("webhook chat requires at least one configured [agents.<alias>] entry")
     })
+}
+
+/// Routes owned by opt-in tools, present only when the tool is compiled in.
+fn optional_tool_routes() -> Router<AppState> {
+    let router: Router<AppState> = Router::new();
+    // Claude Code runner hooks
+    #[cfg(feature = "tool-claude-code-runner")]
+    let router = router.route("/hooks/claude-code", post(api::handle_claude_code_hook));
+    router
 }
 
 fn optional_channel_routes() -> Router<AppState> {
@@ -3011,8 +3818,8 @@ fn configured_gateway_webhook_secret_hash(state: &AppState) -> Option<String> {
 
 /// Immutable snapshot of the credential policy applied to ONE request.
 ///
-/// `AppState::config` is a live `Arc<RwLock<Config>>` that the config
-/// PUT/PATCH handlers and `POST /admin/reload` legitimately mutate while a
+/// `AppState::config` is a live, published config that the config
+/// PUT/PATCH handlers and `POST /admin/reload` legitimately replace while a
 /// request is in flight. Reading the policy twice therefore lets a single
 /// request straddle two security states: a headerless request can pass an
 /// "unconfigured" read and then satisfy a "configured" read after an operator
@@ -3924,7 +4731,7 @@ async fn dispatch_gateway_turn_streaming_with_agent(
     let agent_alias = require_gateway_chat_agent_alias(&config, agent_override)?;
     let mut agent =
         zeroclaw_runtime::agent::Agent::from_live_config_with_session_cwd_and_mcp_backchannel(
-            Arc::clone(&state.config),
+            state.config.clone(),
             &agent_alias,
             None,
             true,
@@ -4157,19 +4964,25 @@ async fn process_whatsapp_message(
 
     // Route approval replies to pending approval requests before dispatching
     // to the agent.
-    let mut approvals = wa.pending_approvals().lock().await;
-    verified.retain(|msg| {
+    let mut handled_approval_messages = std::collections::HashSet::new();
+    for msg in verified.messages() {
         let Some((token, response)) = zeroclaw_channels::util::parse_approval_reply(&msg.content)
         else {
-            return true;
+            continue;
         };
-        let Some(sender) = approvals.remove(&token) else {
-            return true;
-        };
-        let _ = sender.send(response);
-        false
-    });
-    drop(approvals);
+        if wa
+            .resolve_pending_approval(
+                &token,
+                response,
+                msg.sender.as_str(),
+                msg.reply_target.as_str(),
+            )
+            .await
+        {
+            handled_approval_messages.insert(msg.id.clone());
+        }
+    }
+    verified.retain(|msg| !handled_approval_messages.contains(&msg.id));
 
     let channel: Arc<dyn Channel> = wa.clone();
     webhook_ingress::dispatch_verified_webhook(
@@ -4445,6 +5258,14 @@ async fn process_nextcloud_talk_webhook(
 #[cfg(feature = "channel-email")]
 const GMAIL_WEBHOOK_MAX_BODY: usize = 1024 * 1024;
 
+/// Compare the presented Gmail push bearer against the configured secret in
+/// constant time, so a wrong token's rejection latency does not reveal how
+/// many leading bytes matched.
+#[cfg(feature = "channel-email")]
+fn gmail_bearer_matches(provided: &str, secret: &str) -> bool {
+    zeroclaw_config::pairing::constant_time_eq(provided, secret)
+}
+
 /// POST /webhook/gmail — incoming Gmail Pub/Sub push notification
 #[cfg(feature = "channel-email")]
 async fn handle_gmail_push_webhook(
@@ -4476,7 +5297,7 @@ async fn handle_gmail_push_webhook(
             .and_then(|auth| auth.strip_prefix("Bearer "))
             .unwrap_or("");
 
-        if provided != secret {
+        if !gmail_bearer_matches(provided, &secret) {
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -4552,6 +5373,36 @@ fn require_localhost(peer: &SocketAddr) -> Result<(), (StatusCode, Json<serde_js
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({
                 "error": "Admin endpoints are restricted to localhost"
+            })),
+        ))
+    }
+}
+
+/// Reject a pairing-code admin request that does not present this run's admin
+/// secret. [`require_localhost`] alone is not enough for these routes: a reverse
+/// proxy or tunnel on the same host relays remote callers from loopback, and
+/// a code read or minted here is exchanged at `/pair` for a shared-operator
+/// bearer. The secret reaches local clients through an owner-only file, so
+/// presenting it proves the caller runs as the gateway's user on its host.
+/// Admission compares against the token the pairing guard holds for this
+/// run, never the file, so a stale file or a failed rotation matches nothing.
+fn require_gateway_admin_token(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    let presented = headers
+        .get(GATEWAY_ADMIN_TOKEN_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if state.pairing.admin_token_matches(presented) {
+        Ok(())
+    } else {
+        Err((
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "Pairing-code admin requests need this gateway's admin token. \
+                          Run `zeroclaw gateway get-paircode` on the gateway host, as the \
+                          user that runs the gateway."
             })),
         ))
     }
@@ -4696,12 +5547,15 @@ async fn handle_admin_reload(
     ))
 }
 
-/// GET /admin/paircode — fetch current pairing code (localhost only)
+/// GET /admin/paircode — fetch current pairing code (localhost only, and only
+/// with this run's admin token)
 async fn handle_admin_paircode(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     require_localhost(&peer)?;
+    require_gateway_admin_token(&state, &headers)?;
     let code = state.pairing.pairing_code();
 
     let body = if let Some(c) = code {
@@ -4738,6 +5592,20 @@ pub(crate) fn live_pairing_code_policy(state: &AppState) -> PairingCodePolicy {
     state.config.read().gateway.pairing_code
 }
 
+/// The admin rotate response when its config commit is refused before
+/// anything changed: the daemon generation is closing.
+fn admin_revocation_not_admitted(
+    error: zeroclaw_runtime::live_config_authority::ConfigCommitError,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let body = serde_json::json!({
+        "success": false,
+        "pairing_required": true,
+        "pairing_code": null,
+        "message": format!("Revocation refused without any change: {error}"),
+    });
+    (StatusCode::SERVICE_UNAVAILABLE, Json(body))
+}
+
 #[derive(Debug, serde::Deserialize, Default)]
 pub struct AdminPaircodeQuery {
     #[serde(default)]
@@ -4747,9 +5615,11 @@ pub struct AdminPaircodeQuery {
 async fn handle_admin_paircode_new(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Query(params): Query<AdminPaircodeQuery>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     require_localhost(&peer)?;
+    require_gateway_admin_token(&state, &headers)?;
 
     if !state.pairing.require_pairing() {
         let body = serde_json::json!({
@@ -4769,25 +5639,33 @@ async fn handle_admin_paircode_new(
 
     let revocation_message = match rotate {
         Some("all") => {
-            let revoked = state.pairing.revoke_all_tokens();
-            if let Some(registry) = state.device_registry.as_ref() {
-                if let Err(e) = registry.clear() {
-                    let body = serde_json::json!({
-                        "success": false,
-                        "pairing_required": true,
-                        "pairing_code": null,
-                        "message": format!("Tokens revoked in memory but device registry clear failed: {e}"),
-                    });
-                    return Ok((StatusCode::INTERNAL_SERVER_ERROR, Json(body)));
-                }
-            }
-            if let Err(e) = persist_pairing_tokens(
-                state.config.clone(),
-                &state.pairing,
-                state.config_write_lock.clone(),
-            )
-            .await
+            // Every live token and every device row go in one step under
+            // the lock, so a dropped request leaves neither half behind.
+            let ((revoked, cleared), config_write_guard) = match state
+                .pairing
+                .revoke_under_config_write_lock(state.begin_config_commit(), |pairing| {
+                    let revoked = pairing.revoke_all_tokens();
+                    let cleared = state
+                        .device_registry
+                        .as_ref()
+                        .map(|registry| registry.clear());
+                    (revoked, cleared)
+                })
+                .await
             {
+                Ok(revoked) => revoked,
+                Err(e) => return Ok(admin_revocation_not_admitted(e)),
+            };
+            if let Some(Err(e)) = cleared {
+                let body = serde_json::json!({
+                    "success": false,
+                    "pairing_required": true,
+                    "pairing_code": null,
+                    "message": format!("Tokens revoked in memory but device registry clear failed: {e}"),
+                });
+                return Ok((StatusCode::INTERNAL_SERVER_ERROR, Json(body)));
+            }
+            if let Err(e) = persist_pairing_tokens_under(&state, config_write_guard).await {
                 let body = serde_json::json!({
                     "success": false,
                     "pairing_required": true,
@@ -4816,9 +5694,20 @@ async fn handle_admin_paircode_new(
                 });
                 return Ok((StatusCode::SERVICE_UNAVAILABLE, Json(body)));
             };
-            let token_hash = match registry.revoke(device_id) {
-                Ok(Some(hash)) => hash,
-                Ok(None) => {
+            let config_write_guard = match state.begin_config_commit().await {
+                Ok(commit) => commit,
+                Err(e) => return Ok(admin_revocation_not_admitted(e)),
+            };
+            let revoked = api_pairing::revoke_device_credential(
+                &state,
+                registry,
+                device_id,
+                &config_write_guard,
+                || require_gateway_admin_token(&state, &headers),
+            )?;
+            match revoked {
+                Ok(true) => {}
+                Ok(false) => {
                     let body = serde_json::json!({
                         "success": false,
                         "pairing_required": true,
@@ -4836,15 +5725,8 @@ async fn handle_admin_paircode_new(
                     });
                     return Ok((StatusCode::INTERNAL_SERVER_ERROR, Json(body)));
                 }
-            };
-            state.pairing.revoke_token_hash(&token_hash);
-            if let Err(e) = persist_pairing_tokens(
-                state.config.clone(),
-                &state.pairing,
-                state.config_write_lock.clone(),
-            )
-            .await
-            {
+            }
+            if let Err(e) = persist_pairing_tokens_under(&state, config_write_guard).await {
                 let body = serde_json::json!({
                     "success": false,
                     "pairing_required": true,
@@ -4893,35 +5775,52 @@ async fn handle_admin_paircode_new(
     Ok((StatusCode::OK, Json(body)))
 }
 
+/// GET /pair/code — whether pairing is required. It never returns the code.
+///
+/// No HTTP caller can prove it is on this host: a reverse proxy or tunnel on
+/// the same host relays remote callers from loopback, with or without
+/// forwarding headers, and whoever reads a first-run code can pair as the
+/// shared operator. The code reaches operators only through the startup
+/// banner in the gateway log and `zeroclaw gateway get-paircode`, which
+/// presents the owner-only admin token. `pairing_code` stays in the response,
+/// always `null`, so existing dashboard clients fall back to manual entry.
 async fn handle_pair_code(State(state): State<AppState>) -> impl IntoResponse {
-    let require = state.pairing.require_pairing();
-    let is_paired = state.pairing.is_paired();
-
-    // Only expose the code during initial setup (before first pairing)
-    let code = if require && !is_paired {
-        state.pairing.pairing_code()
-    } else {
-        None
-    };
-
     let body = serde_json::json!({
         "success": true,
-        "pairing_required": require,
-        "pairing_code": code,
+        "pairing_required": state.pairing.require_pairing(),
+        "pairing_code": serde_json::Value::Null,
     });
 
     (StatusCode::OK, Json(body))
 }
 
+/// Serializes tests that start `run_gateway`, which binds the process-global
+/// pricing config handle, so a test that reads that handle sees its own bind.
+#[cfg(test)]
+pub(crate) static PRICING_BINDING_TEST_LOCK: tokio::sync::Mutex<()> =
+    tokio::sync::Mutex::const_new(());
+
 #[cfg(test)]
 mod tests {
+    impl AppState {
+        /// Install a mutated config as the next publication — the test
+        /// stand-in for the raw handle write this state type no longer
+        /// exposes. Unsynchronized on purpose: tests that exercise writer
+        /// serialization hold real admitted commits instead.
+        pub(super) fn publish_test_config(&self, mutate: impl FnOnce(&mut Config)) {
+            let mut next = self.config.snapshot();
+            mutate(&mut next);
+            self.config_authority.publish_for_test(next);
+        }
+    }
+
     use super::*;
     use async_trait::async_trait;
     use axum::body::Body;
     use axum::http::{HeaderValue, Request, Uri};
     use axum::response::IntoResponse;
     use http_body_util::BodyExt;
-    use parking_lot::{Mutex, RwLock};
+    use parking_lot::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tower::ServiceExt;
     #[cfg(feature = "channel-whatsapp-cloud")]
@@ -5088,9 +5987,15 @@ mod tests {
             "recovery command should omit --host so the CLI uses its loopback default: {cmd}"
         );
 
-        let curl = format_paircode_recovery_curl("192.168.1.20", 42617, "");
+        let curl = format_paircode_recovery_curl(
+            "192.168.1.20",
+            42617,
+            "",
+            std::path::Path::new("/zc/data/gateway-admin.token"),
+        );
         assert_eq!(
-            curl, "curl -s -X POST http://127.0.0.1:42617/admin/paircode/new",
+            curl,
+            "curl -s -X POST -H \"x-zeroclaw-admin-token: $(cat '/zc/data/gateway-admin.token')\" http://127.0.0.1:42617/admin/paircode/new",
             "curl fallback must target loopback, not the non-loopback bound host"
         );
         assert!(
@@ -5100,16 +6005,26 @@ mod tests {
 
         // Path prefix is still preserved while the host is normalized.
         assert_eq!(
-            format_paircode_recovery_curl("192.168.1.20", 42617, "/gw"),
-            "curl -s -X POST http://127.0.0.1:42617/gw/admin/paircode/new"
+            format_paircode_recovery_curl(
+                "192.168.1.20",
+                42617,
+                "/gw",
+                std::path::Path::new("/zc/data/gateway-admin.token")
+            ),
+            "curl -s -X POST -H \"x-zeroclaw-admin-token: $(cat '/zc/data/gateway-admin.token')\" http://127.0.0.1:42617/gw/admin/paircode/new"
         );
     }
 
     #[test]
     fn paircode_recovery_curl_targets_running_instance() {
         assert_eq!(
-            format_paircode_recovery_curl("127.0.0.1", 42617, ""),
-            "curl -s -X POST http://127.0.0.1:42617/admin/paircode/new"
+            format_paircode_recovery_curl(
+                "127.0.0.1",
+                42617,
+                "",
+                std::path::Path::new("/zc/data/gateway-admin.token")
+            ),
+            "curl -s -X POST -H \"x-zeroclaw-admin-token: $(cat '/zc/data/gateway-admin.token')\" http://127.0.0.1:42617/admin/paircode/new"
         );
     }
 
@@ -5119,7 +6034,12 @@ mod tests {
         // (already paired), not just "Pairing: ACTIVE" — otherwise the operator
         // hits the dashboard's pairing-code prompt with no code printed
         // anywhere.
-        let lines = already_paired_pairing_notice("127.0.0.1", 3001, "");
+        let lines = already_paired_pairing_notice(
+            "127.0.0.1",
+            3001,
+            "",
+            std::path::Path::new("/zc/data/gateway-admin.token"),
+        );
         let joined = lines.join("\n");
         assert!(
             joined.contains("already paired"),
@@ -5136,14 +6056,24 @@ mod tests {
         // The notice is the single source of truth for the on-demand recovery
         // commands; it must reuse the loopback-safe builders so the banner and
         // any future surface never drift from's no-`--host` rule.
-        let lines = already_paired_pairing_notice("192.168.1.20", 3001, "/gw");
+        let lines = already_paired_pairing_notice(
+            "192.168.1.20",
+            3001,
+            "/gw",
+            std::path::Path::new("/zc/data/gateway-admin.token"),
+        );
         let joined = lines.join("\n");
         assert!(
             joined.contains(&format_paircode_recovery_command("192.168.1.20", 3001)),
             "notice must surface the get-paircode recovery command: {joined}"
         );
         assert!(
-            joined.contains(&format_paircode_recovery_curl("192.168.1.20", 3001, "/gw")),
+            joined.contains(&format_paircode_recovery_curl(
+                "192.168.1.20",
+                3001,
+                "/gw",
+                std::path::Path::new("/zc/data/gateway-admin.token")
+            )),
             "notice must surface the curl fallback (honoring the path prefix): {joined}"
         );
         // never advertise the non-loopback bound host in the hint.
@@ -5156,32 +6086,82 @@ mod tests {
     #[test]
     fn paircode_recovery_curl_normalizes_unspecified_bind_hosts() {
         assert_eq!(
-            format_paircode_recovery_curl("0.0.0.0", 42617, ""),
-            "curl -s -X POST http://127.0.0.1:42617/admin/paircode/new"
+            format_paircode_recovery_curl(
+                "0.0.0.0",
+                42617,
+                "",
+                std::path::Path::new("/zc/data/gateway-admin.token")
+            ),
+            "curl -s -X POST -H \"x-zeroclaw-admin-token: $(cat '/zc/data/gateway-admin.token')\" http://127.0.0.1:42617/admin/paircode/new"
         );
         assert_eq!(
-            format_paircode_recovery_curl("::", 42617, ""),
-            "curl -s -X POST http://127.0.0.1:42617/admin/paircode/new"
+            format_paircode_recovery_curl(
+                "::",
+                42617,
+                "",
+                std::path::Path::new("/zc/data/gateway-admin.token")
+            ),
+            "curl -s -X POST -H \"x-zeroclaw-admin-token: $(cat '/zc/data/gateway-admin.token')\" http://127.0.0.1:42617/admin/paircode/new"
         );
     }
 
     #[test]
     fn paircode_recovery_curl_preserves_actual_loopback_hosts() {
         assert_eq!(
-            format_paircode_recovery_curl("localhost", 42617, ""),
-            "curl -s -X POST http://localhost:42617/admin/paircode/new"
+            format_paircode_recovery_curl(
+                "localhost",
+                42617,
+                "",
+                std::path::Path::new("/zc/data/gateway-admin.token")
+            ),
+            "curl -s -X POST -H \"x-zeroclaw-admin-token: $(cat '/zc/data/gateway-admin.token')\" http://localhost:42617/admin/paircode/new"
         );
         assert_eq!(
-            format_paircode_recovery_curl("::1", 42617, ""),
-            "curl -s -X POST http://[::1]:42617/admin/paircode/new"
+            format_paircode_recovery_curl(
+                "::1",
+                42617,
+                "",
+                std::path::Path::new("/zc/data/gateway-admin.token")
+            ),
+            "curl -s -X POST -H \"x-zeroclaw-admin-token: $(cat '/zc/data/gateway-admin.token')\" http://[::1]:42617/admin/paircode/new"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn paircode_recovery_curl_quotes_admin_token_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let token_path = tmp.path().join("owner's $(touch escaped).token");
+        std::fs::write(&token_path, "synthetic-admin-token").unwrap();
+        let command = format_paircode_recovery_curl("127.0.0.1", 42617, "", &token_path);
+        // Intercept curl: exercise actual shell parsing and cat without a
+        // network call, and verify path contents cannot become shell syntax.
+        let output = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!("curl() {{ printf '%s\\n' \"$@\"; }}; {command}"))
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{:?}", output.stderr);
+        let args = String::from_utf8(output.stdout).unwrap();
+        assert!(
+            args.lines()
+                .any(|arg| arg == "x-zeroclaw-admin-token: synthetic-admin-token"),
+            "{args}"
+        );
+        assert!(!tmp.path().join("escaped").exists());
     }
 
     #[test]
     fn paircode_recovery_curl_preserves_path_prefix() {
         assert_eq!(
-            format_paircode_recovery_curl("127.0.0.1", 42617, "/gw"),
-            "curl -s -X POST http://127.0.0.1:42617/gw/admin/paircode/new"
+            format_paircode_recovery_curl(
+                "127.0.0.1",
+                42617,
+                "/gw",
+                std::path::Path::new("/zc/data/gateway-admin.token")
+            ),
+            "curl -s -X POST -H \"x-zeroclaw-admin-token: $(cat '/zc/data/gateway-admin.token')\" http://127.0.0.1:42617/gw/admin/paircode/new"
         );
     }
 
@@ -5309,9 +6289,11 @@ mod tests {
             ..Config::default()
         };
         let registry = with_registry.then(|| Arc::new(api_pairing::DeviceRegistry::new(&data_dir)));
+        let state_authority = zeroclaw_runtime::LiveConfigAuthority::new(config);
         AppState {
-            config: Arc::new(RwLock::new(config)),
-            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            config: state_authority.live_handle(),
+            config_authority: state_authority.clone(),
+            agent_lifecycle: state_authority.agent_lifecycle(),
             model_provider: Arc::new(MockModelProvider::default()),
             model: "test-model".into(),
             temperature: None,
@@ -5362,16 +6344,38 @@ mod tests {
                 8, 30, 600,
             )),
             device_registry: registry,
-            pending_pairings: None,
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
             sop_audit: None,
+            sop_driver_handles: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         }
+    }
+
+    #[test]
+    fn gateway_and_ws_turn_admission_blocks_destructive_alias_work() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let state = admin_paircode_state(&temp, false, false);
+        let generation = state.agent_lifecycle.alias_generation("alpha");
+        let turn = state
+            .reserve_agent_turn_at("alpha", generation)
+            .expect("gateway turn is admitted");
+
+        assert!(matches!(
+            state.agent_lifecycle.begin_delete("alpha"),
+            Err(
+                zeroclaw_runtime::live_config_authority::AgentDeleteBlocker::ActiveTurns {
+                    count: 1,
+                    ..
+                }
+            )
+        ));
+        drop(turn);
+        assert!(state.agent_lifecycle.begin_delete("alpha").is_ok());
     }
 
     fn webhook_sop_state(
@@ -5409,11 +6413,12 @@ path = "{trigger_path}"
         let mut sop_config = state.config.read().sop.clone();
         sop_config.sops_dir = Some(sops_dir.to_string_lossy().into_owned());
         sop_config.persist_runs = false;
-        state.config.write().sop = sop_config.clone();
+        state.publish_test_config(|c| c.sop = sop_config.clone());
         let data_dir = state.config.read().data_dir.clone();
         let install_root = state.config.read().install_root_dir();
         let (engine, audit) = zeroclaw_runtime::sop::build_sop_engine(
             sop_config,
+            &std::collections::HashMap::new(),
             &data_dir,
             &install_root,
             Arc::clone(&state.mem),
@@ -5465,11 +6470,12 @@ path = "{trigger_path}"
         let mut sop_config = state.config.read().sop.clone();
         sop_config.sops_dir = Some(sops_dir.to_string_lossy().into_owned());
         sop_config.persist_runs = false;
-        state.config.write().sop = sop_config.clone();
+        state.publish_test_config(|c| c.sop = sop_config.clone());
         let data_dir = state.config.read().data_dir.clone();
         let install_root = state.config.read().install_root_dir();
         let (engine, audit) = zeroclaw_runtime::sop::build_sop_engine(
             sop_config,
+            &std::collections::HashMap::new(),
             &data_dir,
             &install_root,
             Arc::clone(&state.mem),
@@ -5486,7 +6492,7 @@ path = "{trigger_path}"
     /// a SOP run can start.
     fn with_webhook_secret(state: AppState) -> (AppState, String) {
         let secret = generate_test_secret();
-        state.config.write().gateway.webhook_secret = Some(secret.clone());
+        state.publish_test_config(|c| c.gateway.webhook_secret = Some(secret.clone()));
         (state, secret)
     }
 
@@ -5567,6 +6573,48 @@ path = "{trigger_path}"
         token
     }
 
+    #[tokio::test]
+    async fn plugin_catalog_rejects_missing_and_invalid_bearer_tokens() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = admin_paircode_state(&tmp, true, false);
+
+        let response = api_plugins::list_plugins(State(state.clone()), HeaderMap::new()).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer invalid-token"),
+        );
+        let response = api_plugins::list_plugins(State(state), headers).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn plugin_catalog_accepts_a_paired_bearer_in_every_gateway_build() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = admin_paircode_state(&tmp, true, true);
+        let token = pair_device(&state, "plugin-catalog-browser").await;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+        );
+
+        let response = api_plugins::list_plugins(State(state), headers).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json["wasm_plugins_available"],
+            cfg!(feature = "plugins-wasm")
+        );
+        assert!(json["plugins"].is_array());
+        assert!(json["issues"].is_array());
+    }
+
     async fn admin_paircode_response_json(
         result: Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)>,
     ) -> (StatusCode, serde_json::Value) {
@@ -5587,6 +6635,7 @@ path = "{trigger_path}"
             handle_admin_paircode_new(
                 State(state.clone()),
                 test_connect_info(),
+                admin_headers(&state),
                 Query(AdminPaircodeQuery::default()),
             )
             .await,
@@ -5615,13 +6664,14 @@ path = "{trigger_path}"
 
         // Boot weak: six numeric digits, the legacy shape.
         let weak = PairingCodePolicy::numeric_compat();
-        state.config.write().gateway.pairing_code = weak;
+        state.publish_test_config(|c| c.gateway.pairing_code = weak);
         let guard_before = Arc::as_ptr(&state.pairing);
 
         let (status, json) = admin_paircode_response_json(
             handle_admin_paircode_new(
                 State(state.clone()),
                 test_connect_info(),
+                admin_headers(&state),
                 Query(AdminPaircodeQuery::default()),
             )
             .await,
@@ -5637,12 +6687,13 @@ path = "{trigger_path}"
 
         // Operator strengthens the policy. No restart, no new guard.
         let strong = PairingCodePolicy::new(28, PairingCodeCharset::Unambiguous).unwrap();
-        state.config.write().gateway.pairing_code = strong;
+        state.publish_test_config(|c| c.gateway.pairing_code = strong);
 
         let (status, json) = admin_paircode_response_json(
             handle_admin_paircode_new(
                 State(state.clone()),
                 test_connect_info(),
+                admin_headers(&state),
                 Query(AdminPaircodeQuery::default()),
             )
             .await,
@@ -5679,6 +6730,7 @@ path = "{trigger_path}"
             handle_admin_paircode_new(
                 State(state.clone()),
                 test_connect_info(),
+                admin_headers(&state),
                 Query(AdminPaircodeQuery {
                     rotate: Some("all".into()),
                 }),
@@ -5707,6 +6759,67 @@ path = "{trigger_path}"
         );
     }
 
+    /// The admin rotate paths dropped while they wait for the config write
+    /// lock, as the gateway's request timeout drops them, must leave every
+    /// device row and token in place, and the retried request revokes them.
+    #[tokio::test]
+    async fn admin_paircode_rotate_dropped_while_waiting_can_be_retried() {
+        for target in ["dev-a", "all"] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let state = admin_paircode_state(&tmp, true, true);
+            let token_a = pair_device(&state, "dev-a").await;
+            let token_b = pair_device(&state, "dev-b").await;
+            let listed = |state: &AppState| -> Vec<String> {
+                let mut ids: Vec<String> = state
+                    .device_registry
+                    .as_ref()
+                    .unwrap()
+                    .list()
+                    .expect("test device registry list")
+                    .into_iter()
+                    .map(|device| device.id)
+                    .collect();
+                ids.sort();
+                ids
+            };
+            let call = |state: AppState| {
+                handle_admin_paircode_new(
+                    State(state.clone()),
+                    test_connect_info(),
+                    admin_headers(&state),
+                    Query(AdminPaircodeQuery {
+                        rotate: Some(target.into()),
+                    }),
+                )
+            };
+
+            let in_flight = state.config_authority.lock_config_writer().await;
+            let mut waiting = Box::pin(call(state.clone()));
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            assert!(
+                std::future::Future::poll(waiting.as_mut(), &mut cx).is_pending(),
+                "{target}: the rotation must wait for the config write lock"
+            );
+            drop(waiting);
+            drop(in_flight);
+
+            assert_eq!(listed(&state), vec!["dev-a", "dev-b"], "{target}");
+            assert!(state.pairing.is_authenticated(&token_a), "{target}");
+            assert!(state.pairing.is_authenticated(&token_b), "{target}");
+
+            let (status, _) = admin_paircode_response_json(call(state.clone()).await).await;
+            assert_eq!(status, StatusCode::OK, "{target}: the retry");
+            assert!(!state.pairing.is_authenticated(&token_a), "{target}");
+            if target == "all" {
+                assert!(listed(&state).is_empty());
+                assert!(!state.pairing.is_authenticated(&token_b));
+            } else {
+                assert_eq!(listed(&state), vec!["dev-b"]);
+                assert!(state.pairing.is_authenticated(&token_b));
+            }
+        }
+    }
+
     #[tokio::test]
     async fn admin_paircode_new_rotate_device_revokes_one() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -5718,6 +6831,7 @@ path = "{trigger_path}"
             handle_admin_paircode_new(
                 State(state.clone()),
                 test_connect_info(),
+                admin_headers(&state),
                 Query(AdminPaircodeQuery {
                     rotate: Some("dev-a".into()),
                 }),
@@ -5754,6 +6868,7 @@ path = "{trigger_path}"
             handle_admin_paircode_new(
                 State(state.clone()),
                 test_connect_info(),
+                admin_headers(&state),
                 Query(AdminPaircodeQuery {
                     rotate: Some("ghost".into()),
                 }),
@@ -5776,8 +6891,9 @@ path = "{trigger_path}"
 
         let (status, json) = admin_paircode_response_json(
             handle_admin_paircode_new(
-                State(state),
+                State(state.clone()),
                 test_connect_info(),
+                admin_headers(&state),
                 Query(AdminPaircodeQuery {
                     rotate: Some("all".into()),
                 }),
@@ -5797,8 +6913,13 @@ path = "{trigger_path}"
 
         let remote = ConnectInfo(SocketAddr::from(([203, 0, 113, 7], 40_000)));
         let (status, _json) = admin_paircode_response_json(
-            handle_admin_paircode_new(State(state), remote, Query(AdminPaircodeQuery::default()))
-                .await,
+            handle_admin_paircode_new(
+                State(state.clone()),
+                remote,
+                admin_headers(&state),
+                Query(AdminPaircodeQuery::default()),
+            )
+            .await,
         )
         .await;
 
@@ -5807,6 +6928,258 @@ path = "{trigger_path}"
             StatusCode::FORBIDDEN,
             "minting a pairing code must be rejected for non-loopback peers"
         );
+    }
+
+    /// Headers carrying this test gateway's admin secret, minted the way a
+    /// gateway start mints it.
+    fn admin_headers(state: &AppState) -> HeaderMap {
+        let data_dir = state.config.read().data_dir.clone();
+        let secret = state
+            .pairing
+            .rotate_admin_token(&data_dir)
+            .expect("rotate admin token");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            GATEWAY_ADMIN_TOKEN_HEADER,
+            HeaderValue::from_str(&secret).expect("admin token is a valid header value"),
+        );
+        headers
+    }
+
+    /// Headers a same-host reverse proxy or tunnel produces for a remote
+    /// caller. Some proxies add a forwarding header and some add none; the
+    /// admin gates must not depend on either.
+    fn proxied_headers(with_forwarding_header: bool) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        if with_forwarding_header {
+            headers.insert("X-Forwarded-For", HeaderValue::from_static("203.0.113.7"));
+        }
+        headers
+    }
+
+    async fn json_of(response: Response) -> (StatusCode, serde_json::Value) {
+        let status = response.status();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    async fn pair_with(state: &AppState, code: &str) -> (StatusCode, serde_json::Value) {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "X-Pairing-Code",
+            HeaderValue::from_str(code).expect("code is a valid header value"),
+        );
+        json_of(
+            handle_pair(State(state.clone()), test_connect_info(), headers)
+                .await
+                .into_response(),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn pair_code_never_returns_the_code_even_to_a_loopback_caller() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = admin_paircode_state(&tmp, true, false);
+        assert!(
+            state.pairing.pairing_code().is_some(),
+            "a fresh guard holds a first-run code"
+        );
+
+        let (status, json) = json_of(handle_pair_code(State(state)).await.into_response()).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["pairing_required"], true);
+        assert!(
+            json["pairing_code"].is_null(),
+            "no HTTP caller can prove it is local, so the code is never served: {json}"
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_paircode_refuses_loopback_callers_without_the_admin_token() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = admin_paircode_state(&tmp, true, false);
+        let _current = admin_headers(&state);
+
+        let mut wrong = HeaderMap::new();
+        wrong.insert(
+            GATEWAY_ADMIN_TOKEN_HEADER,
+            HeaderValue::from_static("zc_wrong"),
+        );
+        for headers in [proxied_headers(true), proxied_headers(false), wrong] {
+            let (status, json) = admin_paircode_response_json(
+                handle_admin_paircode(State(state.clone()), test_connect_info(), headers).await,
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{json}");
+            assert!(json.get("pairing_code").is_none(), "{json}");
+        }
+    }
+
+    #[tokio::test]
+    async fn admin_paircode_serves_the_code_with_the_admin_token() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = admin_paircode_state(&tmp, true, false);
+        let expected = state.pairing.pairing_code();
+
+        let (status, json) = admin_paircode_response_json(
+            handle_admin_paircode(
+                State(state.clone()),
+                test_connect_info(),
+                admin_headers(&state),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["pairing_code"].as_str(), expected.as_deref());
+    }
+
+    #[tokio::test]
+    async fn admin_paircode_new_refuses_loopback_callers_without_the_admin_token() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = admin_paircode_state(&tmp, true, true);
+        let _current = admin_headers(&state);
+        let before = state.pairing.pairing_code();
+
+        for headers in [proxied_headers(true), proxied_headers(false)] {
+            let (status, _json) = admin_paircode_response_json(
+                handle_admin_paircode_new(
+                    State(state.clone()),
+                    test_connect_info(),
+                    headers,
+                    Query(AdminPaircodeQuery::default()),
+                )
+                .await,
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+        }
+        assert_eq!(
+            state.pairing.pairing_code(),
+            before,
+            "a refused mint must not issue or replace a code"
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_token_from_an_earlier_gateway_start_is_refused() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = admin_paircode_state(&tmp, true, false);
+        let stale = admin_headers(&state);
+        let _restart = admin_headers(&state);
+
+        let (status, _json) = admin_paircode_response_json(
+            handle_admin_paircode(State(state), test_connect_info(), stale).await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    /// A rotation that cannot write its file must fail closed: the token that
+    /// worked before, still sitting in the file, is refused afterwards.
+    #[tokio::test]
+    async fn failed_admin_token_rotation_refuses_the_token_left_on_disk() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = admin_paircode_state(&tmp, true, false);
+        let working = admin_headers(&state);
+        let data_dir = state.config.read().data_dir.clone();
+        let on_disk = std::fs::read_to_string(gateway_admin_token_path(&data_dir)).unwrap();
+
+        let unwritable = tmp.path().join("not-a-dir");
+        std::fs::write(&unwritable, b"x").unwrap();
+        assert!(state.pairing.rotate_admin_token(&unwritable).is_err());
+        assert_eq!(
+            std::fs::read_to_string(gateway_admin_token_path(&data_dir)).unwrap(),
+            on_disk,
+            "the previous token file is still in place"
+        );
+
+        let (status, json) = admin_paircode_response_json(
+            handle_admin_paircode(State(state), test_connect_info(), working).await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{json}");
+        assert!(json.get("pairing_code").is_none(), "{json}");
+    }
+
+    /// The composed attack from review A1: a remote caller relayed from
+    /// loopback by a same-host proxy tries every route that reads or mints a
+    /// code, then tries to pair. It must end with no code, no paired token and
+    /// no authenticated access. A caller holding the admin token completes the
+    /// same sequence, so the admin token is the only thing standing between.
+    #[tokio::test]
+    async fn proxied_loopback_caller_cannot_reach_operator_access_through_any_code_route() {
+        for with_forwarding_header in [true, false] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let state = admin_paircode_state(&tmp, true, true);
+            let _current = admin_headers(&state);
+
+            let (_, public) =
+                json_of(handle_pair_code(State(state.clone())).await.into_response()).await;
+            assert!(public["pairing_code"].is_null());
+
+            let (read_status, _) = admin_paircode_response_json(
+                handle_admin_paircode(
+                    State(state.clone()),
+                    test_connect_info(),
+                    proxied_headers(with_forwarding_header),
+                )
+                .await,
+            )
+            .await;
+            assert_eq!(read_status, StatusCode::FORBIDDEN);
+
+            let (mint_status, _) = admin_paircode_response_json(
+                handle_admin_paircode_new(
+                    State(state.clone()),
+                    test_connect_info(),
+                    proxied_headers(with_forwarding_header),
+                    Query(AdminPaircodeQuery::default()),
+                )
+                .await,
+            )
+            .await;
+            assert_eq!(mint_status, StatusCode::FORBIDDEN);
+
+            // With no code in hand, a guess cannot pair.
+            let (pair_status, _) = pair_with(&state, "000000").await;
+            assert_ne!(pair_status, StatusCode::OK);
+            assert!(!state.pairing.is_paired(), "no token may have been minted");
+            assert!(
+                api::require_auth(&state, &HeaderMap::new()).is_err(),
+                "the caller must end with no authenticated access"
+            );
+        }
+
+        // Control: the same sequence with the admin token reaches a bearer.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = admin_paircode_state(&tmp, true, true);
+        let (_, minted) = admin_paircode_response_json(
+            handle_admin_paircode_new(
+                State(state.clone()),
+                test_connect_info(),
+                admin_headers(&state),
+                Query(AdminPaircodeQuery::default()),
+            )
+            .await,
+        )
+        .await;
+        let code = minted["pairing_code"]
+            .as_str()
+            .expect("admin mint issues a code");
+        let (pair_status, paired) = pair_with(&state, code).await;
+        assert_eq!(pair_status, StatusCode::OK, "{paired}");
+        let bearer = paired["token"].as_str().expect("pairing returns a bearer");
+        let mut auth = HeaderMap::new();
+        auth.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {bearer}")).unwrap(),
+        );
+        assert!(api::require_auth(&state, &auth).is_ok());
     }
 
     #[test]
@@ -6001,6 +7374,8 @@ path = "{trigger_path}"
 
     #[tokio::test]
     async fn run_gateway_starts_with_zero_agents() {
+        // `run_gateway` binds the process-global pricing config handle.
+        let _pricing_binding = crate::PRICING_BINDING_TEST_LOCK.lock().await;
         // Isolate data_dir so parallel nextest runs don't race on the
         // real ~/.zeroclaw/data
         let tmp = tempfile::TempDir::new().unwrap();
@@ -6023,6 +7398,8 @@ path = "{trigger_path}"
                 "127.0.0.1",
                 0,
                 config,
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -6065,6 +7442,8 @@ path = "{trigger_path}"
 
     #[tokio::test]
     async fn run_gateway_starts_with_unresolved_agent_risk_profile() {
+        // `run_gateway` binds the process-global pricing config handle.
+        let _pricing_binding = crate::PRICING_BINDING_TEST_LOCK.lock().await;
         use zeroclaw_config::schema::AliasedAgentConfig;
 
         // Isolate data_dir so parallel nextest runs don't race on the
@@ -6091,6 +7470,8 @@ path = "{trigger_path}"
                 "127.0.0.1",
                 0,
                 config,
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -6125,8 +7506,1715 @@ path = "{trigger_path}"
         handle.abort();
     }
 
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn run_gateway_isolates_failed_seatbelt_tool_listings() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use zeroclaw_config::schema::{AliasedAgentConfig, RiskProfileConfig};
+
+        if !std::path::Path::new("/usr/bin/sandbox-exec").is_file() {
+            return;
+        }
+        let _pricing_binding = crate::PRICING_BINDING_TEST_LOCK.lock().await;
+        for failed_default in [true, false] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let cycle = tmp.path().join("cycle");
+            std::os::unix::fs::symlink("cycle", &cycle).unwrap();
+            let mut config = Config {
+                data_dir: tmp.path().join("data"),
+                config_path: tmp.path().join("config.toml"),
+                ..Config::default()
+            };
+            std::fs::create_dir_all(&config.data_dir).unwrap();
+            config.gateway.require_pairing = false;
+            config.memory.backend = "none".into();
+            config.risk_profiles.insert(
+                "healthy".into(),
+                RiskProfileConfig {
+                    sandbox_enabled: Some(true),
+                    sandbox_backend: Some("sandbox-exec".into()),
+                    ..RiskProfileConfig::default()
+                },
+            );
+            let mut failed_profile = config.risk_profiles["healthy"].clone();
+            failed_profile.allowed_roots = vec![cycle.display().to_string()];
+            config.risk_profiles.insert("failed".into(), failed_profile);
+            let (failed_alias, healthy_alias) = if failed_default {
+                ("a-failed", "z-healthy")
+            } else {
+                ("z-failed", "a-healthy")
+            };
+            for (alias, profile) in [(failed_alias, "failed"), (healthy_alias, "healthy")] {
+                config.agents.insert(
+                    alias.into(),
+                    AliasedAgentConfig {
+                        enabled: true,
+                        risk_profile: profile.into(),
+                        ..AliasedAgentConfig::default()
+                    },
+                );
+            }
+            assert_eq!(
+                default_agent_alias(&config).as_deref(),
+                Some(if failed_default {
+                    failed_alias
+                } else {
+                    healthy_alias
+                })
+            );
+
+            let (ready_tx, mut ready_rx) = tokio::sync::watch::channel(None);
+            let readiness = zeroclaw_runtime::daemon::GatewayReadinessReporter::new(move |addr| {
+                let _ = ready_tx.send(Some(addr));
+            });
+            let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+            let (reload_tx, _) = tokio::sync::watch::channel(false);
+            let controls = zeroclaw_runtime::daemon::GatewayReloadControls::standalone(
+                shutdown_tx.clone(),
+                reload_tx,
+            );
+            let server = zeroclaw_spawn::spawn!(async move {
+                run_gateway(
+                    "127.0.0.1",
+                    0,
+                    config,
+                    None,
+                    Some(controls),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(readiness),
+                )
+                .await
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                ready_rx.wait_for(Option::is_some).await.unwrap();
+            })
+            .await
+            .expect("failed listing must not prevent gateway readiness");
+            let addr = ready_rx.borrow().unwrap();
+            let get = |path: String| async move {
+                tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+                    let request =
+                        format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
+                    stream.write_all(request.as_bytes()).await.unwrap();
+                    let mut response = String::new();
+                    stream.read_to_string(&mut response).await.unwrap();
+                    assert!(response.starts_with("HTTP/1.1 200"), "{path}: {response}");
+                    let (_, body) = response.split_once("\r\n\r\n").unwrap();
+                    serde_json::from_str::<serde_json::Value>(body).unwrap()
+                })
+                .await
+                .expect("gateway must serve the HTTP response")
+            };
+            get("/health".into()).await;
+            get("/api/config".into()).await;
+            let failed = get(format!("/api/tools?agent={failed_alias}")).await;
+            assert_eq!(failed["tools"], serde_json::json!([]));
+            let healthy = get(format!("/api/tools?agent={healthy_alias}")).await;
+            assert!(
+                healthy["tools"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|tool| tool["name"] == "shell")
+            );
+            let default = get("/api/tools".into()).await;
+            assert_eq!(
+                default["tools"],
+                if failed_default {
+                    failed["tools"].clone()
+                } else {
+                    healthy["tools"].clone()
+                }
+            );
+
+            shutdown_tx.send(true).unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(5), server)
+                .await
+                .expect("gateway should shut down")
+                .expect("gateway task should not panic")
+                .expect("gateway shutdown should succeed");
+        }
+    }
+
+    /// A gateway generation for the connection-drain tests: pairing off, on
+    /// `port` (0 for any), over TLS when `tls` names a certificate and key.
+    async fn start_drain_test_gateway(
+        data: &std::path::Path,
+        port: u16,
+        tls: Option<(&std::path::Path, &std::path::Path)>,
+    ) -> (
+        SocketAddr,
+        tokio::sync::watch::Sender<bool>,
+        tokio::task::JoinHandle<Result<()>>,
+    ) {
+        start_drain_test_gateway_with(data, port, tls, None).await
+    }
+
+    async fn start_drain_test_gateway_with(
+        data: &std::path::Path,
+        port: u16,
+        tls: Option<(&std::path::Path, &std::path::Path)>,
+        event_bus: Option<zeroclaw_runtime::observability::EventBus>,
+    ) -> (
+        SocketAddr,
+        tokio::sync::watch::Sender<bool>,
+        tokio::task::JoinHandle<Result<()>>,
+    ) {
+        let mut config = Config {
+            data_dir: data.join("data"),
+            config_path: data.join("config.toml"),
+            ..Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        config.gateway.require_pairing = false;
+        config.memory.backend = "none".into();
+        if let Some((cert_path, key_path)) = tls {
+            // The process's rustls provider, as `main.rs` installs it: with both
+            // ring and aws-lc-rs compiled in (a workspace build), rustls picks none.
+            let _ = rustls::crypto::ring::default_provider().install_default();
+            config.gateway.tls = Some(zeroclaw_config::schema::GatewayTlsConfig {
+                enabled: true,
+                cert_path: cert_path.display().to_string(),
+                key_path: key_path.display().to_string(),
+                ..Default::default()
+            });
+        }
+        let (ready_tx, mut ready_rx) = tokio::sync::watch::channel(None);
+        let readiness = zeroclaw_runtime::daemon::GatewayReadinessReporter::new(move |addr| {
+            let _ = ready_tx.send(Some(addr));
+        });
+        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+        let (reload_tx, _) = tokio::sync::watch::channel(false);
+        let controls = zeroclaw_runtime::daemon::GatewayReloadControls::standalone(
+            shutdown_tx.clone(),
+            reload_tx,
+        );
+        let server = zeroclaw_spawn::spawn!(async move {
+            run_gateway(
+                "127.0.0.1",
+                port,
+                config,
+                event_bus,
+                Some(controls),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(readiness),
+            )
+            .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            ready_rx.wait_for(Option::is_some).await.unwrap();
+        })
+        .await
+        .expect("the gateway becomes ready");
+        let addr = ready_rx.borrow().unwrap();
+        (addr, shutdown_tx, server)
+    }
+
+    /// Send one HTTP/1.1 request on `stream`, which stays open, and return
+    /// what the first read brings back (enough for a status line).
+    async fn drain_test_request<S>(stream: &mut S, path: &str) -> String
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        stream
+            .write_all(format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        let mut buf = vec![0u8; 64 * 1024];
+        let n = tokio::time::timeout(std::time::Duration::from_secs(5), stream.read(&mut buf))
+            .await
+            .expect("response deadline")
+            .unwrap();
+        String::from_utf8_lossy(&buf[..n]).to_string()
+    }
+
+    /// Read `stream` until it ends. `Some(true)`: closed cleanly (TLS
+    /// close_notify or a plain FIN), `Some(false)`: torn down, `None`: still
+    /// open at the deadline.
+    async fn drain_test_closed<S>(stream: &mut S) -> Option<bool>
+    where
+        S: tokio::io::AsyncRead + Unpin,
+    {
+        use tokio::io::AsyncReadExt;
+        let mut buf = vec![0u8; 64 * 1024];
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                match stream.read(&mut buf).await {
+                    Ok(0) => break true,
+                    Ok(_) => continue,
+                    Err(_) => break false,
+                }
+            }
+        })
+        .await
+        .ok()
+    }
+
+    async fn drain_test_tls_connect(
+        connector: &tokio_rustls::TlsConnector,
+        addr: SocketAddr,
+    ) -> tokio_rustls::client::TlsStream<tokio::net::TcpStream> {
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+        connector.connect(name, tcp).await.expect("TLS handshake")
+    }
+
+    /// A TLS gateway told to stop closes the connections it accepted rather
+    /// than leaving them to serve its router: an idle kept-alive connection
+    /// closes cleanly at once, one with an event stream in flight is cut off
+    /// within the drain, the gateway returns promptly, and a new connection
+    /// reaches the gateway that replaces it.
+    #[tokio::test]
+    async fn a_stopped_tls_gateway_closes_its_connections_and_the_next_one_serves() {
+        let _pricing_binding = crate::PRICING_BINDING_TEST_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = rcgen::CertificateParams::new(vec!["localhost".into()])
+            .unwrap()
+            .self_signed(&key)
+            .unwrap();
+        let cert_path = tmp.path().join("gateway.crt");
+        let key_path = tmp.path().join("gateway.key");
+        std::fs::write(&cert_path, cert.pem()).unwrap();
+        std::fs::write(&key_path, key.serialize_pem()).unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert.der().clone()).unwrap();
+        let client = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(client));
+
+        let (addr, shutdown_tx, server) =
+            start_drain_test_gateway(&tmp.path().join("first"), 0, Some((&cert_path, &key_path)))
+                .await;
+        let mut idle = drain_test_tls_connect(&connector, addr).await;
+        let head = drain_test_request(&mut idle, "/health").await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        let mut streaming = drain_test_tls_connect(&connector, addr).await;
+        let head = drain_test_request(&mut streaming, "/api/events").await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        // A connection whose TLS handshake never starts.
+        let mut handshaking = tokio::net::TcpStream::connect(addr).await.unwrap();
+
+        shutdown_tx.send(true).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), server)
+            .await
+            .expect("an open connection held up the gateway's stop")
+            .expect("the gateway task does not panic")
+            .expect("the gateway stops cleanly");
+        assert_eq!(
+            drain_test_closed(&mut idle).await,
+            Some(true),
+            "the idle kept-alive connection is closed cleanly"
+        );
+        assert!(
+            drain_test_closed(&mut streaming).await.is_some(),
+            "the connection with an event stream in flight is closed"
+        );
+        assert!(
+            drain_test_closed(&mut handshaking).await.is_some(),
+            "the connection still waiting for its TLS handshake is closed"
+        );
+
+        let (_, next_shutdown, next) = start_drain_test_gateway(
+            &tmp.path().join("next"),
+            addr.port(),
+            Some((&cert_path, &key_path)),
+        )
+        .await;
+        let mut fresh = drain_test_tls_connect(&connector, addr).await;
+        let head = drain_test_request(&mut fresh, "/health").await;
+        assert!(
+            head.starts_with("HTTP/1.1 200"),
+            "the next gateway serves: {head}"
+        );
+        next_shutdown.send(true).unwrap();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), next).await;
+    }
+
+    /// An HTTP/2 event stream (h2c on the plain listener) is retired with its
+    /// gateway: by the time the gateway returns, the stream's task has ended,
+    /// and its subscription to the event bus with it.
+    #[tokio::test]
+    async fn a_stopped_gateway_has_retired_its_http2_streams_when_it_returns() {
+        let _pricing_binding = crate::PRICING_BINDING_TEST_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let bus = zeroclaw_runtime::observability::EventBus::new();
+        let events = bus.sender().clone();
+        let (addr, shutdown_tx, server) =
+            start_drain_test_gateway_with(&tmp.path().join("h2"), 0, None, Some(bus)).await;
+        let before = events.receiver_count();
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (client, connection) = h2::client::handshake(tcp).await.expect("h2c handshake");
+        let driver = zeroclaw_spawn::spawn!(async move {
+            let _ = connection.await;
+        });
+        let mut client = client.ready().await.expect("the h2 connection is ready");
+        let request = axum::http::Request::get(format!("http://{addr}/api/events"))
+            .body(())
+            .unwrap();
+        let (response, _) = client
+            .send_request(request, true)
+            .expect("send the request");
+        let response = tokio::time::timeout(std::time::Duration::from_secs(5), response)
+            .await
+            .expect("response deadline")
+            .expect("response");
+        assert_eq!(response.status(), 200);
+        let _body = response.into_body();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while events.receiver_count() <= before {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the event stream subscribes to the bus");
+
+        shutdown_tx.send(true).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), server)
+            .await
+            .expect("an HTTP/2 stream held up the gateway's stop")
+            .expect("the gateway task does not panic")
+            .expect("the gateway stops cleanly");
+        assert!(
+            events.receiver_count() <= before,
+            "an HTTP/2 stream outlived its gateway's retirement"
+        );
+        driver.abort();
+    }
+
+    /// Retiring waits until the tasks it cancelled have actually ended, so
+    /// nothing they owned outlives it.
+    #[tokio::test]
+    async fn retiring_waits_until_the_aborted_tasks_have_ended() {
+        let tasks = ServeTasks::default();
+        let owned = Arc::new(());
+        let held = Arc::clone(&owned);
+        tasks.spawn(async move {
+            let _held = held;
+            std::future::pending::<()>().await;
+        });
+        assert!(
+            !tasks.retire_within(Duration::from_millis(10)).await,
+            "the task outlasts the drain"
+        );
+        assert_eq!(
+            Arc::strong_count(&owned),
+            1,
+            "an aborted task still held what it owned when retiring returned"
+        );
+    }
+
+    /// The tasks hyper's HTTP/2 spawns for its streams belong to the gateway
+    /// too, and are retired with its connections.
+    #[tokio::test]
+    async fn stream_tasks_hyper_spawns_are_retired_with_the_connections() {
+        let tasks = ServeTasks::default();
+        let owned = Arc::new(());
+        let held = Arc::clone(&owned);
+        hyper::rt::Executor::execute(&tasks, async move {
+            let _held = held;
+            std::future::pending::<()>().await;
+        });
+        tasks.retire_within(Duration::from_millis(10)).await;
+        assert_eq!(
+            Arc::strong_count(&owned),
+            1,
+            "a stream task outlived its gateway's retirement"
+        );
+    }
+
+    /// Retiring takes at most the drain plus the join of what it cancelled,
+    /// which together fit inside the daemon's 500 ms grace.
+    #[tokio::test]
+    async fn retiring_ends_within_the_daemons_grace() {
+        tokio::time::pause();
+        let tasks = ServeTasks::default();
+        tasks.spawn(std::future::pending());
+        let started = tokio::time::Instant::now();
+        tasks.retire_within(CONNECTION_DRAIN).await;
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "retiring took {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// A gateway dropped before its drain ran (the daemon aborted it)
+    /// cancels its tasks, so they end at their next poll.
+    #[tokio::test]
+    async fn dropping_the_serve_loop_cancels_its_tasks() {
+        let tasks = ServeTasks::default();
+        let owned = Arc::new(());
+        let held = Arc::clone(&owned);
+        tasks.spawn(async move {
+            let _held = held;
+            std::future::pending::<()>().await;
+        });
+        drop(ServeTasksGuard::new(tasks.clone()));
+        tokio::time::timeout(std::time::Duration::from_secs(1), tasks.idle())
+            .await
+            .expect("a task of the dropped serve loop kept running");
+        assert_eq!(
+            Arc::strong_count(&owned),
+            1,
+            "a cancelled task still holds what it owned"
+        );
+    }
+
+    /// Records how many tasks its set counts at the moment it is dropped.
+    struct CountAtDrop(ServeTasks, Arc<std::sync::atomic::AtomicUsize>);
+
+    impl Drop for CountAtDrop {
+        fn drop(&mut self) {
+            self.1
+                .store(self.0.live(), std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// A gateway that has stopped admits no request on a connection it
+    /// accepted earlier. HTTP/1.1 (an upgrade request too) and HTTP/2 get a
+    /// 503 `gateway_restarting` with `Retry-After`, and the router never sees
+    /// them. HTTP/1.1 is told to close; HTTP/2 gets no `Connection` header,
+    /// since its connection gets GOAWAY. The same once the gateway's tasks
+    /// were cancelled without a stop.
+    #[tokio::test]
+    async fn a_stopped_generation_admits_no_request() {
+        use axum::http::Version;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let routed = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&routed);
+        let router = axum::Router::new().route(
+            "/",
+            axum::routing::get(move || {
+                counted.fetch_add(1, Ordering::SeqCst);
+                async { StatusCode::OK }
+            }),
+        );
+        let request = |version: Version, upgrade: bool| {
+            let mut request = axum::http::Request::get("/").version(version);
+            if upgrade {
+                request = request
+                    .header(header::CONNECTION, "upgrade")
+                    .header(header::UPGRADE, "websocket");
+            }
+            request.body(axum::body::Body::empty()).unwrap()
+        };
+        async fn assert_gateway_restarting(response: Response, version: Version) {
+            assert_eq!(
+                response.status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "a stopped generation served {version:?}"
+            );
+            let headers = response.headers();
+            assert_eq!(
+                headers
+                    .get(header::RETRY_AFTER)
+                    .and_then(|v| v.to_str().ok()),
+                Some("1"),
+                "{version:?}"
+            );
+            let connection = headers
+                .get(header::CONNECTION)
+                .and_then(|v| v.to_str().ok());
+            if version == Version::HTTP_2 {
+                assert_eq!(connection, None, "HTTP/2 has no Connection header");
+            } else {
+                assert_eq!(connection, Some("close"), "{version:?}");
+            }
+            let mut names: Vec<_> = headers.keys().map(|name| name.as_str()).collect();
+            names.sort_unstable();
+            names.retain(|name| *name != "connection");
+            assert_eq!(names, ["content-type", "retry-after"], "{version:?}");
+            let body = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(
+                body,
+                serde_json::json!({
+                    "error": "The gateway is restarting. Try again.",
+                    "reason": "gateway_restarting",
+                }),
+                "{version:?}"
+            );
+        }
+
+        let (stop, stopping) = tokio::sync::watch::channel(false);
+        let admission = Admission {
+            stopping,
+            tasks: ServeTasks::default(),
+        };
+        let response =
+            serve_while_current(router.clone(), &admission, request(Version::HTTP_11, false))
+                .await
+                .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "admitted while current");
+        assert_eq!(routed.load(Ordering::SeqCst), 1);
+
+        stop.send_replace(true);
+        for (version, upgrade) in [
+            (Version::HTTP_11, false),
+            (Version::HTTP_11, true),
+            (Version::HTTP_2, false),
+        ] {
+            let response =
+                serve_while_current(router.clone(), &admission, request(version, upgrade))
+                    .await
+                    .unwrap();
+            assert_gateway_restarting(response, version).await;
+        }
+        assert_eq!(
+            routed.load(Ordering::SeqCst),
+            1,
+            "a request reached a stopped generation's router"
+        );
+
+        let (_stop, stopping) = tokio::sync::watch::channel(false);
+        let tasks = ServeTasks::default();
+        let admission = Admission {
+            stopping,
+            tasks: tasks.clone(),
+        };
+        tasks.cancel();
+        let response =
+            serve_while_current(router.clone(), &admission, request(Version::HTTP_11, false))
+                .await
+                .unwrap();
+        assert_gateway_restarting(response, Version::HTTP_11).await;
+        assert_eq!(
+            routed.load(Ordering::SeqCst),
+            1,
+            "a request reached a cancelled generation's router"
+        );
+    }
+
+    /// A request whose service call was made before the stop, but that is
+    /// first polled after it, is refused like any other: admission is
+    /// decided when the request is first served, not when it was read.
+    #[tokio::test]
+    async fn a_request_taken_before_the_stop_and_served_after_it_is_refused() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let routed = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&routed);
+        let router = axum::Router::new().route(
+            "/",
+            axum::routing::get(move || {
+                counted.fetch_add(1, Ordering::SeqCst);
+                async { StatusCode::OK }
+            }),
+        );
+        let (stop, stopping) = tokio::sync::watch::channel(false);
+        let admission = Admission {
+            stopping,
+            tasks: ServeTasks::default(),
+        };
+        let request = axum::http::Request::get("/")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let served = serve_while_current(router, &admission, request);
+        stop.send_replace(true);
+        let response = served.await.unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            routed.load(Ordering::SeqCst),
+            0,
+            "a request taken before the stop reached the router after it"
+        );
+    }
+
+    /// A WebSocket upgrade request that races the stop on a kept HTTP/1.1
+    /// connection never upgrades. Written, then the stop sent, with no
+    /// yield between, the connection's task sees both at once: either the
+    /// connection closes before the request is read, or the request gets
+    /// the generic 503 and the connection closes.
+    #[tokio::test]
+    async fn an_upgrade_racing_the_stop_never_upgrades() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let _pricing_binding = crate::PRICING_BINDING_TEST_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (addr, shutdown_tx, server) =
+            start_drain_test_gateway(&tmp.path().join("upgrade"), 0, None).await;
+        let mut kept = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let head = drain_test_request(&mut kept, "/health").await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+
+        kept.write_all(
+            b"GET /ws/chat HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\n\
+              Upgrade: websocket\r\nSec-WebSocket-Version: 13\r\n\
+              Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
+        )
+        .await
+        .unwrap();
+        shutdown_tx.send(true).unwrap();
+        let mut answer = Vec::new();
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            kept.read_to_end(&mut answer),
+        )
+        .await
+        .expect("the kept connection closes");
+        let answer = String::from_utf8_lossy(&answer).to_ascii_lowercase();
+        assert!(
+            !answer.contains(" 101 "),
+            "an upgrade was admitted after the stop: {answer}"
+        );
+        if !answer.is_empty() {
+            assert!(answer.starts_with("http/1.1 503"), "{answer}");
+            assert!(answer.contains("connection: close"), "{answer}");
+            assert!(
+                answer.contains(r#""reason":"gateway_restarting""#),
+                "{answer}"
+            );
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(2), server)
+            .await
+            .expect("the gateway returns")
+            .expect("the gateway task does not panic")
+            .expect("the gateway stops cleanly");
+    }
+
+    /// A task submitted after the set was cancelled (an HTTP/2 stream
+    /// racing the stop) never runs: it is dropped, without another cancel.
+    /// Sixteen of them, so a cancel checked in random order would let one
+    /// run.
+    #[tokio::test]
+    async fn a_task_spawned_after_the_cancel_never_runs() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let tasks = ServeTasks::default();
+        tasks.cancel();
+        let polled = Arc::new(AtomicUsize::new(0));
+        let owned = Arc::new(());
+        for _ in 0..16 {
+            let (count, held) = (Arc::clone(&polled), Arc::clone(&owned));
+            hyper::rt::Executor::execute(&tasks, async move {
+                let _held = held;
+                count.fetch_add(1, Ordering::SeqCst);
+                std::future::pending::<()>().await;
+            });
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(1), tasks.idle())
+            .await
+            .expect("a task spawned after the cancel was left running");
+        assert_eq!(
+            polled.load(Ordering::SeqCst),
+            0,
+            "a task spawned after the cancel ran"
+        );
+        assert_eq!(
+            Arc::strong_count(&owned),
+            1,
+            "a task spawned after the cancel still holds what it owned"
+        );
+    }
+
+    /// The set counts a task until everything the task owns has been
+    /// destroyed: one cancelled before its first poll, and one that panics.
+    #[tokio::test]
+    async fn a_task_is_counted_until_it_has_been_destroyed() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let tasks = ServeTasks::default();
+        let seen = Arc::new(AtomicUsize::new(usize::MAX));
+        let sentinel = CountAtDrop(tasks.clone(), Arc::clone(&seen));
+        tasks.spawn(async move {
+            let _sentinel = sentinel;
+            std::future::pending::<()>().await;
+        });
+        tasks.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(1), tasks.idle())
+            .await
+            .expect("the cancelled task ends");
+        assert_eq!(
+            seen.load(Ordering::SeqCst),
+            1,
+            "a task cancelled before its first poll was counted as gone before it was destroyed"
+        );
+
+        let tasks = ServeTasks::default();
+        let seen = Arc::new(AtomicUsize::new(usize::MAX));
+        let sentinel = CountAtDrop(tasks.clone(), Arc::clone(&seen));
+        tasks.spawn(async move {
+            let _sentinel = sentinel;
+            tokio::task::yield_now().await;
+            panic!("a serve task panics");
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), tasks.idle())
+            .await
+            .expect("the panicked task ends");
+        assert_eq!(
+            seen.load(Ordering::SeqCst),
+            1,
+            "a task that panicked was counted as gone before it was destroyed"
+        );
+    }
+
+    /// Spawning on a runtime that has shut down drops the task inside the
+    /// spawn. That must not deadlock, and the count must stay right.
+    #[test]
+    fn spawning_on_a_shut_down_runtime_drops_the_task_without_a_deadlock() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let handle = runtime.handle().clone();
+        drop(runtime);
+        let tasks = ServeTasks::default();
+        let seen = Arc::new(AtomicUsize::new(usize::MAX));
+        let sentinel = CountAtDrop(tasks.clone(), Arc::clone(&seen));
+        let spawner = tasks.clone();
+        let (spawned, returned) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _entered = handle.enter();
+            hyper::rt::Executor::execute(&spawner, async move {
+                let _sentinel = sentinel;
+                std::future::pending::<()>().await;
+            });
+            let _ = spawned.send(());
+        });
+        returned
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("spawning on a shut-down runtime deadlocked");
+        assert_eq!(
+            seen.load(Ordering::SeqCst),
+            1,
+            "the dropped task was counted as gone before it was destroyed"
+        );
+        assert_eq!(tasks.live(), 0, "the dropped task is still counted");
+    }
+
+    /// A task stuck in code that never yields outlasts retirement, which
+    /// returns within its bound anyway and leaves the task counted. The task
+    /// ends at its next poll.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_task_in_non_yielding_code_ends_at_its_next_poll() {
+        let tasks = ServeTasks::default();
+        let (release, stuck) = std::sync::mpsc::channel::<()>();
+        let (entered, entering) = tokio::sync::oneshot::channel();
+        tasks.spawn(async move {
+            let _ = entered.send(());
+            let _ = stuck.recv();
+            std::future::pending::<()>().await;
+        });
+        entering.await.unwrap();
+        let started = std::time::Instant::now();
+        assert!(!tasks.retire_within(Duration::from_millis(50)).await);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "retiring waited on a stuck task: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(tasks.live(), 1, "the stuck task is still counted");
+        release.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), tasks.idle())
+            .await
+            .expect("the released task ends at its next poll");
+    }
+
+    /// A certificate and key for `localhost` written under `dir`, and a
+    /// client that trusts them.
+    fn drain_test_tls(
+        dir: &std::path::Path,
+    ) -> (
+        std::path::PathBuf,
+        std::path::PathBuf,
+        tokio_rustls::TlsConnector,
+    ) {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = rcgen::CertificateParams::new(vec!["localhost".into()])
+            .unwrap()
+            .self_signed(&key)
+            .unwrap();
+        let cert_path = dir.join("gateway.crt");
+        let key_path = dir.join("gateway.key");
+        std::fs::write(&cert_path, cert.pem()).unwrap();
+        std::fs::write(&key_path, key.serialize_pem()).unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert.der().clone()).unwrap();
+        let client = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+        (
+            cert_path,
+            key_path,
+            tokio_rustls::TlsConnector::from(Arc::new(client)),
+        )
+    }
+
+    trait DrainTestIo: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+
+    impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> DrainTestIo for T {}
+
+    /// A new connection to `addr`, over TLS when `tls` is given.
+    async fn drain_test_connect(
+        addr: SocketAddr,
+        tls: Option<&tokio_rustls::TlsConnector>,
+    ) -> Box<dyn DrainTestIo> {
+        match tls {
+            Some(connector) => Box::new(drain_test_tls_connect(connector, addr).await),
+            None => Box::new(tokio::net::TcpStream::connect(addr).await.unwrap()),
+        }
+    }
+
+    fn h2_frame(kind: u8, flags: u8, stream: u32, payload: &[u8]) -> Vec<u8> {
+        let len = u32::try_from(payload.len()).unwrap().to_be_bytes();
+        let mut frame = vec![len[1], len[2], len[3], kind, flags];
+        frame.extend_from_slice(&stream.to_be_bytes());
+        frame.extend_from_slice(payload);
+        frame
+    }
+
+    /// An HTTP/2 client written frame by frame. It never acknowledges a
+    /// PING, so a server's graceful shutdown stays in its first phase:
+    /// GOAWAY sent, and streams the client sends meanwhile still accepted.
+    /// Its settings turn the server's header table off, so each response
+    /// header block decodes on its own.
+    struct RawH2(Box<dyn DrainTestIo>);
+
+    /// One frame read: its type, flags and payload.
+    struct H2Frame {
+        kind: u8,
+        flags: u8,
+        payload: Vec<u8>,
+    }
+
+    const H2_DATA: u8 = 0x0;
+    const H2_HEADERS: u8 = 0x1;
+    const H2_RST_STREAM: u8 = 0x3;
+    const H2_SETTINGS: u8 = 0x4;
+    const H2_GOAWAY: u8 = 0x7;
+
+    impl RawH2 {
+        async fn open(mut io: Box<dyn DrainTestIo>) -> Self {
+            use tokio::io::AsyncWriteExt;
+            io.write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+                .await
+                .unwrap();
+            // SETTINGS_HEADER_TABLE_SIZE = 0.
+            let settings = [0x00, 0x01, 0, 0, 0, 0];
+            io.write_all(&h2_frame(H2_SETTINGS, 0, 0, &settings))
+                .await
+                .unwrap();
+            let mut raw = Self(io);
+            raw.next_frame_of(|kind, flags, _| kind == H2_SETTINGS && flags & 0x1 == 0)
+                .await
+                .expect("the server's settings");
+            raw.0
+                .write_all(&h2_frame(H2_SETTINGS, 0x1, 0, &[]))
+                .await
+                .unwrap();
+            raw
+        }
+
+        /// Send `GET path` on `stream`, header block and end of stream in
+        /// one frame. Literal fields without indexing, so no table state.
+        async fn get(&mut self, stream: u32, path: &str) {
+            use tokio::io::AsyncWriteExt;
+            // :method GET and :scheme http, from the static table.
+            let mut block = vec![0x82, 0x86];
+            for (name_index, value) in [(4u8, path), (1, "localhost")] {
+                block.push(name_index);
+                block.push(u8::try_from(value.len()).unwrap());
+                block.extend_from_slice(value.as_bytes());
+            }
+            self.0
+                .write_all(&h2_frame(H2_HEADERS, 0x5, stream, &block))
+                .await
+                .unwrap();
+        }
+
+        /// Read frames until one matches `(type, flags, stream)`; `None` if
+        /// the connection ends first.
+        async fn next_frame_of(
+            &mut self,
+            matches: impl Fn(u8, u8, u32) -> bool,
+        ) -> Option<H2Frame> {
+            use tokio::io::AsyncReadExt;
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    let mut head = [0u8; 9];
+                    self.0.read_exact(&mut head).await.ok()?;
+                    let len = u32::from_be_bytes([0, head[0], head[1], head[2]]);
+                    let mut payload = vec![0u8; usize::try_from(len).unwrap()];
+                    self.0.read_exact(&mut payload).await.ok()?;
+                    let stream =
+                        u32::from_be_bytes([head[5], head[6], head[7], head[8]]) & 0x7fff_ffff;
+                    if matches(head[3], head[4], stream) {
+                        return Some(H2Frame {
+                            kind: head[3],
+                            flags: head[4],
+                            payload,
+                        });
+                    }
+                }
+            })
+            .await
+            .expect("frame deadline")
+        }
+    }
+
+    /// Decode an HPACK Huffman string made only of digits (RFC 7541,
+    /// appendix B: `0` to `2` take five bits, `3` to `9` six); `None` for
+    /// anything else.
+    fn huffman_digits(bytes: &[u8]) -> Option<String> {
+        let bits: Vec<u8> = bytes
+            .iter()
+            .flat_map(|byte| (0..8).rev().map(move |i| (byte >> i) & 1))
+            .collect();
+        let take = |at: usize, n: usize| bits[at..at + n].iter().fold(0u8, |v, b| (v << 1) | b);
+        let mut digits = String::new();
+        let mut at = 0;
+        while at < bits.len() {
+            let rest = bits.len() - at;
+            if rest < 8 && bits[at..].iter().all(|bit| *bit == 1) {
+                break;
+            }
+            if rest >= 5 && take(at, 5) <= 2 {
+                digits.push(char::from(b'0' + take(at, 5)));
+                at += 5;
+            } else if rest >= 6 && (0x19..=0x1f).contains(&take(at, 6)) {
+                digits.push(char::from(b'0' + 3 + take(at, 6) - 0x19));
+                at += 6;
+            } else {
+                return None;
+            }
+        }
+        Some(digits)
+    }
+
+    /// The fields of a header block from a server keeping no header table.
+    /// Names beyond the few a gateway response uses read as `#<index>`, or
+    /// as their literal; a Huffman-coded string decodes only when it is all
+    /// digits (as a status or `Retry-After` is), and reads `<huffman>`
+    /// otherwise.
+    fn h2_header_fields(block: &[u8]) -> Vec<(String, String)> {
+        fn integer(block: &[u8], at: &mut usize, prefix: u32) -> usize {
+            let max = (1usize << prefix) - 1;
+            let mut value = usize::from(block[*at]) & max;
+            *at += 1;
+            if value == max {
+                let mut shift = 0;
+                loop {
+                    let byte = block[*at];
+                    *at += 1;
+                    value += usize::from(byte & 0x7f) << shift;
+                    shift += 7;
+                    if byte & 0x80 == 0 {
+                        break;
+                    }
+                }
+            }
+            value
+        }
+        fn string(block: &[u8], at: &mut usize) -> String {
+            let huffman = block[*at] & 0x80 != 0;
+            let len = integer(block, at, 7);
+            let bytes = &block[*at..*at + len];
+            *at += len;
+            if huffman {
+                huffman_digits(bytes).unwrap_or_else(|| "<huffman>".into())
+            } else {
+                String::from_utf8_lossy(bytes).into_owned()
+            }
+        }
+        fn name(index: usize) -> String {
+            match index {
+                8..=14 => ":status".into(),
+                28 => "content-length".into(),
+                31 => "content-type".into(),
+                33 => "date".into(),
+                53 => "retry-after".into(),
+                _ => format!("#{index}"),
+            }
+        }
+        let mut fields = Vec::new();
+        let mut at = 0;
+        while at < block.len() {
+            let first = block[at];
+            if first & 0x80 != 0 {
+                let index = integer(block, &mut at, 7);
+                let statuses = ["200", "204", "206", "304", "400", "404", "500"];
+                let value = index
+                    .checked_sub(8)
+                    .and_then(|i| statuses.get(i))
+                    .map_or("<indexed>", |status| *status);
+                fields.push((name(index), value.to_string()));
+            } else if first & 0xe0 == 0x20 {
+                integer(block, &mut at, 5);
+            } else {
+                let prefix = if first & 0xc0 == 0x40 { 6 } else { 4 };
+                let index = integer(block, &mut at, prefix);
+                let field = if index == 0 {
+                    string(block, &mut at)
+                } else {
+                    name(index)
+                };
+                fields.push((field, string(block, &mut at)));
+            }
+        }
+        fields
+    }
+
+    /// Once stopped, a gateway admits no new HTTP/2 stream, though HTTP/2's
+    /// graceful shutdown still accepts the streams a client sent before it
+    /// saw GOAWAY: such a stream gets the generic 503 on the wire, with no
+    /// `Connection` header, and never reaches the router. Over plain HTTP
+    /// (h2c) and TLS.
+    #[tokio::test]
+    async fn a_stopped_gateway_admits_no_http2_stream_after_its_goaway() {
+        let _pricing_binding = crate::PRICING_BINDING_TEST_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (cert_path, key_path, connector) = drain_test_tls(tmp.path());
+        for over_tls in [false, true] {
+            let bus = zeroclaw_runtime::observability::EventBus::new();
+            let events = bus.sender().clone();
+            let (addr, shutdown_tx, server) = start_drain_test_gateway_with(
+                &tmp.path().join(if over_tls { "tls" } else { "plain" }),
+                0,
+                over_tls.then_some((cert_path.as_path(), key_path.as_path())),
+                Some(bus),
+            )
+            .await;
+            let before = events.receiver_count();
+            let mut h2 =
+                RawH2::open(drain_test_connect(addr, over_tls.then_some(&connector)).await).await;
+            h2.get(1, "/health").await;
+            h2.next_frame_of(|kind, _, stream| kind == H2_HEADERS && stream == 1)
+                .await
+                .expect("a response on the kept connection");
+
+            shutdown_tx.send(true).unwrap();
+            h2.next_frame_of(|kind, _, _| kind == H2_GOAWAY)
+                .await
+                .expect("the kept HTTP/2 connection gets GOAWAY");
+            h2.get(3, "/api/events").await;
+            let answer = h2
+                .next_frame_of(|kind, _, stream| {
+                    stream == 3 && (kind == H2_HEADERS || kind == H2_RST_STREAM)
+                })
+                .await;
+            assert!(
+                events.receiver_count() <= before,
+                "a stream sent after GOAWAY reached the stopped gateway's router (TLS: {over_tls})"
+            );
+            let answer = answer.expect("the stream sent after GOAWAY is answered");
+            assert_eq!(
+                answer.kind, H2_HEADERS,
+                "the stream sent after GOAWAY is answered, not reset (TLS: {over_tls})"
+            );
+            assert_eq!(answer.flags & 0x4, 0x4, "one header frame");
+            let fields = h2_header_fields(&answer.payload);
+            assert!(
+                fields.contains(&(":status".into(), "503".into())),
+                "TLS: {over_tls}: {fields:?}"
+            );
+            assert!(
+                fields.contains(&("retry-after".into(), "1".into())),
+                "TLS: {over_tls}: {fields:?}"
+            );
+            let allowed = [
+                ":status",
+                "content-length",
+                "content-type",
+                "date",
+                "retry-after",
+            ];
+            assert!(
+                fields
+                    .iter()
+                    .all(|(name, _)| allowed.contains(&name.as_str())),
+                "no other header, and no Connection (TLS: {over_tls}): {fields:?}"
+            );
+            let mut body = Vec::new();
+            if answer.flags & 0x1 == 0 {
+                loop {
+                    let data = h2
+                        .next_frame_of(|kind, _, stream| stream == 3 && kind == H2_DATA)
+                        .await
+                        .expect("the response body");
+                    body.extend_from_slice(&data.payload);
+                    if data.flags & 0x1 != 0 {
+                        break;
+                    }
+                }
+            }
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(
+                body,
+                serde_json::json!({
+                    "error": "The gateway is restarting. Try again.",
+                    "reason": "gateway_restarting",
+                }),
+                "TLS: {over_tls}"
+            );
+
+            drop(h2);
+            tokio::time::timeout(std::time::Duration::from_secs(2), server)
+                .await
+                .expect("the gateway returns")
+                .expect("the gateway task does not panic")
+                .expect("the gateway stops cleanly");
+        }
+    }
+
+    /// Kept clients of a stopped gateway end up on a fresh connection that
+    /// reaches the next gateway. A kept HTTP/1.1 connection is closed; a
+    /// kept HTTP/2 client's connection ends after GOAWAY and it can open no
+    /// stream on it. The request each sends next, on a new connection, is
+    /// served by the next gateway's router: its event stream subscribes to
+    /// the next gateway's bus. Over plain HTTP and TLS.
+    #[tokio::test]
+    async fn kept_clients_reach_the_next_generation_on_a_fresh_connection() {
+        let _pricing_binding = crate::PRICING_BINDING_TEST_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (cert_path, key_path, connector) = drain_test_tls(tmp.path());
+        for over_tls in [false, true] {
+            let certs = over_tls.then_some((cert_path.as_path(), key_path.as_path()));
+            let tls = over_tls.then_some(&connector);
+            let label = if over_tls { "tls" } else { "plain" };
+            let (addr, shutdown_tx, server) = start_drain_test_gateway_with(
+                &tmp.path().join(format!("{label}-first")),
+                0,
+                certs,
+                None,
+            )
+            .await;
+            let mut kept_h1 = drain_test_connect(addr, tls).await;
+            let head = drain_test_request(&mut kept_h1, "/health").await;
+            assert!(head.starts_with("HTTP/1.1 200"), "{label}: {head}");
+            let (kept_h2, connection) = h2::client::handshake(drain_test_connect(addr, tls).await)
+                .await
+                .expect("HTTP/2 handshake");
+            let kept_h2_driver = zeroclaw_spawn::spawn!(async move {
+                let _ = connection.await;
+            });
+            let mut kept_h2 = kept_h2.ready().await.expect("the h2 connection is ready");
+            let (response, _) = kept_h2
+                .send_request(
+                    axum::http::Request::get(format!("http://{addr}/health"))
+                        .body(())
+                        .unwrap(),
+                    true,
+                )
+                .expect("send the request");
+            let response = tokio::time::timeout(std::time::Duration::from_secs(5), response)
+                .await
+                .expect("response deadline")
+                .expect("response");
+            assert_eq!(response.status(), 200, "{label}");
+
+            shutdown_tx.send(true).unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(2), server)
+                .await
+                .expect("the gateway returns")
+                .expect("the gateway task does not panic")
+                .expect("the gateway stops cleanly");
+            assert!(
+                drain_test_closed(&mut kept_h1).await.is_some(),
+                "{label}: the kept HTTP/1.1 connection is closed"
+            );
+            tokio::time::timeout(std::time::Duration::from_secs(2), kept_h2_driver)
+                .await
+                .expect("the kept HTTP/2 connection ends")
+                .expect("the connection driver does not panic");
+            assert!(
+                kept_h2.ready().await.is_err(),
+                "{label}: the kept HTTP/2 client can still open a stream"
+            );
+
+            let bus = zeroclaw_runtime::observability::EventBus::new();
+            let events = bus.sender().clone();
+            let (_, next_shutdown, next) = start_drain_test_gateway_with(
+                &tmp.path().join(format!("{label}-next")),
+                addr.port(),
+                certs,
+                Some(bus),
+            )
+            .await;
+            let before = events.receiver_count();
+            let mut fresh_h1 = drain_test_connect(addr, tls).await;
+            let head = drain_test_request(&mut fresh_h1, "/api/events").await;
+            assert!(head.starts_with("HTTP/1.1 200"), "{label}: {head}");
+            let (fresh_h2, connection) = h2::client::handshake(drain_test_connect(addr, tls).await)
+                .await
+                .expect("HTTP/2 handshake with the next gateway");
+            let fresh_h2_driver = zeroclaw_spawn::spawn!(async move {
+                let _ = connection.await;
+            });
+            let mut fresh_h2 = fresh_h2.ready().await.expect("the h2 connection is ready");
+            let (response, _) = fresh_h2
+                .send_request(
+                    axum::http::Request::get(format!("http://{addr}/api/events"))
+                        .body(())
+                        .unwrap(),
+                    true,
+                )
+                .expect("send the request");
+            let response = tokio::time::timeout(std::time::Duration::from_secs(5), response)
+                .await
+                .expect("response deadline")
+                .expect("response");
+            assert_eq!(response.status(), 200, "{label}");
+            let _body = response.into_body();
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while events.receiver_count() < before + 2 {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| {
+                panic!("{label}: the fresh connections reach the next gateway's router")
+            });
+
+            next_shutdown.send(true).unwrap();
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), next).await;
+            fresh_h2_driver.abort();
+        }
+    }
+
+    /// The plain listener keeps the rule it had: a failed connection is
+    /// skipped at once, anything else retried after a second, never fatal.
+    /// The TLS listener keeps its own.
+    #[test]
+    fn each_listener_keeps_its_accept_error_rule() {
+        use std::io::{Error, ErrorKind};
+        for kind in [
+            ErrorKind::ConnectionRefused,
+            ErrorKind::ConnectionAborted,
+            ErrorKind::ConnectionReset,
+        ] {
+            assert_eq!(
+                accept_error_action(&Error::from(kind), false),
+                AcceptErrorAction::Retry,
+                "plain, {kind:?}"
+            );
+        }
+        for kind in [ErrorKind::Other, ErrorKind::PermissionDenied] {
+            assert_eq!(
+                accept_error_action(&Error::from(kind), false),
+                AcceptErrorAction::RetryAfter(Duration::from_secs(1)),
+                "plain, {kind:?}"
+            );
+        }
+        assert_eq!(
+            accept_error_action(&Error::from(ErrorKind::ConnectionAborted), true),
+            AcceptErrorAction::RetryAfter(Duration::from_millis(ACCEPT_ERROR_BACKOFF_MS)),
+            "TLS, a transient error"
+        );
+        assert_eq!(
+            accept_error_action(&Error::from(ErrorKind::PermissionDenied), true),
+            AcceptErrorAction::Fail,
+            "TLS, a broken listener"
+        );
+    }
+
+    /// A stop does not wait for an accept-error backoff to run out.
+    #[tokio::test]
+    async fn a_stop_cuts_an_accept_backoff_short() {
+        let (stop, mut stopping) = tokio::sync::watch::channel(false);
+        let (stopped, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(
+                accept_backoff(Duration::from_secs(60), &mut stopping),
+                async {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    stop.send_replace(true);
+                }
+            )
+        })
+        .await
+        .expect("the backoff waited out its delay despite the stop");
+        assert!(stopped, "the stop is reported");
+    }
+
+    /// The same over plain HTTP: a gateway told to stop returns promptly
+    /// even with an event stream in flight, every connection it served is
+    /// closed, and the next gateway serves.
+    #[tokio::test]
+    async fn a_stopped_plain_gateway_closes_its_connections_and_the_next_one_serves() {
+        let _pricing_binding = crate::PRICING_BINDING_TEST_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (addr, shutdown_tx, server) =
+            start_drain_test_gateway(&tmp.path().join("first"), 0, None).await;
+        let mut idle = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let head = drain_test_request(&mut idle, "/health").await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        let mut streaming = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let head = drain_test_request(&mut streaming, "/api/events").await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+
+        shutdown_tx.send(true).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), server)
+            .await
+            .expect("an event stream in flight held up the gateway's stop")
+            .expect("the gateway task does not panic")
+            .expect("the gateway stops cleanly");
+        assert!(
+            drain_test_closed(&mut idle).await.is_some(),
+            "the idle kept-alive connection is closed"
+        );
+        assert!(
+            drain_test_closed(&mut streaming).await.is_some(),
+            "the connection with an event stream in flight is closed"
+        );
+
+        let (_, next_shutdown, next) =
+            start_drain_test_gateway(&tmp.path().join("next"), addr.port(), None).await;
+        let mut fresh = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let head = drain_test_request(&mut fresh, "/health").await;
+        assert!(
+            head.starts_with("HTTP/1.1 200"),
+            "the next gateway serves: {head}"
+        );
+        next_shutdown.send(true).unwrap();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), next).await;
+    }
+
+    /// A stopped gateway lets go of its port as soon as it stops accepting,
+    /// as `axum::serve` does, so a fresh connection is refused rather than
+    /// left in a backlog nothing serves, even while the drain still holds a
+    /// response in flight. The next gateway then takes the port. Over plain
+    /// HTTP and TLS.
+    #[tokio::test]
+    async fn a_stopped_gateway_releases_its_port_before_its_drain_ends() {
+        let _pricing_binding = crate::PRICING_BINDING_TEST_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (cert_path, key_path, connector) = drain_test_tls(tmp.path());
+        for over_tls in [false, true] {
+            let certs = over_tls.then_some((cert_path.as_path(), key_path.as_path()));
+            let tls = over_tls.then_some(&connector);
+            let label = if over_tls { "tls" } else { "plain" };
+            let (addr, shutdown_tx, server) = start_drain_test_gateway_with(
+                &tmp.path().join(format!("{label}-first")),
+                0,
+                certs,
+                None,
+            )
+            .await;
+            let mut streaming = drain_test_connect(addr, tls).await;
+            let head = drain_test_request(&mut streaming, "/api/events").await;
+            assert!(head.starts_with("HTTP/1.1 200"), "{label}: {head}");
+
+            shutdown_tx.send(true).unwrap();
+            let released = tokio::time::timeout(std::time::Duration::from_millis(150), async {
+                loop {
+                    match tokio::net::TcpStream::connect(addr).await {
+                        Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => break,
+                        _ => tokio::time::sleep(std::time::Duration::from_millis(5)).await,
+                    }
+                }
+            })
+            .await;
+            assert!(
+                released.is_ok(),
+                "{label}: the stopped gateway still held its port while it drained"
+            );
+            assert!(
+                !server.is_finished(),
+                "{label}: the drain still holds the event stream"
+            );
+            tokio::time::timeout(std::time::Duration::from_secs(2), server)
+                .await
+                .expect("the gateway returns")
+                .expect("the gateway task does not panic")
+                .expect("the gateway stops cleanly");
+
+            let (_, next_shutdown, next) = start_drain_test_gateway_with(
+                &tmp.path().join(format!("{label}-next")),
+                addr.port(),
+                certs,
+                None,
+            )
+            .await;
+            let mut fresh = drain_test_connect(addr, tls).await;
+            let head = drain_test_request(&mut fresh, "/health").await;
+            assert!(
+                head.starts_with("HTTP/1.1 200"),
+                "{label}: the next gateway serves: {head}"
+            );
+            next_shutdown.send(true).unwrap();
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), next).await;
+        }
+    }
+
+    /// The native TLS listener serves WebSocket upgrades, as plain HTTP
+    /// does: a socket opened over TLS completes its upgrade, gets its
+    /// route's first frame, and stays open.
+    #[tokio::test]
+    async fn a_websocket_over_native_tls_stays_open() {
+        use futures_util::StreamExt;
+        let _pricing_binding = crate::PRICING_BINDING_TEST_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (cert_path, key_path, connector) = drain_test_tls(tmp.path());
+        let (addr, shutdown_tx, server) = start_drain_test_gateway_with(
+            &tmp.path().join("tls-ws"),
+            0,
+            Some((cert_path.as_path(), key_path.as_path())),
+            None,
+        )
+        .await;
+        let tls = drain_test_tls_connect(&connector, addr).await;
+        let url = format!("ws://localhost:{}/ws/canvas/tls-upgrade", addr.port());
+        let (mut socket, response) = tokio_tungstenite::client_async(url, tls)
+            .await
+            .expect("the upgrade completes");
+        assert_eq!(response.status(), 101);
+        let first = tokio::time::timeout(std::time::Duration::from_secs(5), socket.next())
+            .await
+            .expect("a first frame in time")
+            .expect("the upgraded TLS socket is still open")
+            .expect("a frame, not an error");
+        let text = first.into_text().expect("a text frame").to_string();
+        assert!(text.contains(r#""type":"connected""#), "{text}");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(500), socket.next())
+                .await
+                .is_err(),
+            "the upgraded TLS socket closed on its own"
+        );
+        drop(socket);
+        shutdown_tx.send(true).unwrap();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), server).await;
+    }
+
+    /// A TLS gateway generation with dashboard sign-in on, at the root path,
+    /// verified by the mock provider at `issuer`.
+    async fn start_signed_in_tls_gateway(
+        data: &std::path::Path,
+        cert_path: &std::path::Path,
+        key_path: &std::path::Path,
+        issuer: &str,
+    ) -> (
+        SocketAddr,
+        Config,
+        tokio::sync::watch::Sender<bool>,
+        tokio::task::JoinHandle<Result<()>>,
+    ) {
+        let mut config = Config {
+            data_dir: data.join("data"),
+            config_path: data.join("config.toml"),
+            ..Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        config.memory.backend = "none".into();
+        crate::dashboard_session::test_support::add_sign_in(&mut config, issuer);
+        // The process's rustls provider, as `main.rs` installs it: with both
+        // ring and aws-lc-rs compiled in (a workspace build), rustls picks none.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        config.gateway.tls = Some(zeroclaw_config::schema::GatewayTlsConfig {
+            enabled: true,
+            cert_path: cert_path.display().to_string(),
+            key_path: key_path.display().to_string(),
+            ..Default::default()
+        });
+        let (ready_tx, mut ready_rx) = tokio::sync::watch::channel(None);
+        let readiness = zeroclaw_runtime::daemon::GatewayReadinessReporter::new(move |addr| {
+            let _ = ready_tx.send(Some(addr));
+        });
+        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+        let (reload_tx, _) = tokio::sync::watch::channel(false);
+        let controls = zeroclaw_runtime::daemon::GatewayReloadControls::standalone(
+            shutdown_tx.clone(),
+            reload_tx,
+        );
+        let served = config.clone();
+        let server = zeroclaw_spawn::spawn!(async move {
+            run_gateway(
+                "127.0.0.1",
+                0,
+                served,
+                None,
+                Some(controls),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(readiness),
+            )
+            .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            ready_rx.wait_for(Option::is_some).await.unwrap();
+        })
+        .await
+        .expect("the gateway becomes ready");
+        let addr = ready_rx.borrow().unwrap();
+        (addr, config, shutdown_tx, server)
+    }
+
+    /// A signed-in dashboard socket over native TLS is closed with 1001
+    /// (going away) when its gateway stops, as over plain HTTP: the upgrade
+    /// hands the socket to its route, and the session's watch ends it.
+    #[tokio::test]
+    async fn a_signed_in_socket_over_native_tls_closes_when_its_gateway_stops() {
+        use futures_util::StreamExt;
+        use tokio_tungstenite::tungstenite::{
+            Message, client::IntoClientRequest, protocol::frame::coding::CloseCode,
+        };
+        let _pricing_binding = crate::PRICING_BINDING_TEST_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (cert_path, key_path, connector) = drain_test_tls(tmp.path());
+        let idp = crate::dashboard_session::test_support::idp(&["admins"], "gw").await;
+        let (addr, config, shutdown_tx, server) = start_signed_in_tls_gateway(
+            &tmp.path().join("signed-in"),
+            &cert_path,
+            &key_path,
+            &idp.uri(),
+        )
+        .await;
+        // Signed in on the process's shared store, which every generation reads.
+        let pairing = Arc::new(PairingGuard::new(
+            config.gateway.require_pairing,
+            &config.gateway.paired_tokens,
+            zeroclaw_config::pairing::PairingCodePolicy::default(),
+        ));
+        let auth = crate::dashboard_session::DashboardAuth::new(
+            crate::dashboard_session::DashboardSessions::process_shared(),
+            Arc::new(
+                crate::principal_gate::GatewayInboundAuth::from_config(&config, pairing).unwrap(),
+            ),
+        );
+        let (cookie, _) = auth
+            .sign_in(
+                "corp",
+                crate::dashboard_session::ProviderPin::of(&config.oidc["corp"]),
+                "at-alice".into(),
+                3600,
+            )
+            .await
+            .expect("alice signs in");
+
+        let tls = drain_test_tls_connect(&connector, addr).await;
+        let origin = format!("https://localhost:{}", addr.port());
+        let mut request = format!("{origin}/ws/canvas/signed-in")
+            .replacen("https", "ws", 1)
+            .into_client_request()
+            .unwrap();
+        let headers = request.headers_mut();
+        headers.insert(
+            "cookie",
+            format!("{}={cookie}", crate::dashboard_session::HOST_SESSION_COOKIE)
+                .parse()
+                .unwrap(),
+        );
+        headers.insert("origin", origin.parse().unwrap());
+        let (mut socket, response) = tokio_tungstenite::client_async(request, tls)
+            .await
+            .expect("the signed-in upgrade completes");
+        assert_eq!(response.status(), 101);
+        let first = tokio::time::timeout(std::time::Duration::from_secs(5), socket.next())
+            .await
+            .expect("a first frame in time")
+            .expect("the socket is open")
+            .expect("a frame");
+        assert!(
+            first.to_string().contains(r#""type":"connected""#),
+            "{first}"
+        );
+
+        shutdown_tx.send(true).unwrap();
+        let closed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while let Some(frame) = socket.next().await {
+                if let Ok(Message::Close(close)) = frame {
+                    return close.map(|close| close.code);
+                }
+            }
+            None
+        })
+        .await
+        .expect("the socket is closed when its gateway stops");
+        assert_eq!(
+            closed,
+            Some(CloseCode::Away),
+            "closed with 1001 (going away)"
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(2), server)
+            .await
+            .expect("the gateway returns")
+            .expect("the gateway task does not panic")
+            .expect("the gateway stops cleanly");
+    }
+
+    /// The same race as `an_upgrade_racing_the_stop_never_upgrades`, over
+    /// native TLS, which now serves upgrades: the upgrade request never
+    /// upgrades once the stop is sent.
+    #[tokio::test]
+    async fn an_upgrade_racing_the_stop_over_tls_never_upgrades() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let _pricing_binding = crate::PRICING_BINDING_TEST_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (cert_path, key_path, connector) = drain_test_tls(tmp.path());
+        let (addr, shutdown_tx, server) = start_drain_test_gateway_with(
+            &tmp.path().join("tls-upgrade"),
+            0,
+            Some((cert_path.as_path(), key_path.as_path())),
+            None,
+        )
+        .await;
+        let mut kept = drain_test_tls_connect(&connector, addr).await;
+        let head = drain_test_request(&mut kept, "/health").await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+
+        kept.write_all(
+            b"GET /ws/canvas/race HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\n\
+              Upgrade: websocket\r\nSec-WebSocket-Version: 13\r\n\
+              Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
+        )
+        .await
+        .unwrap();
+        kept.flush().await.unwrap();
+        shutdown_tx.send(true).unwrap();
+        let mut answer = Vec::new();
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            kept.read_to_end(&mut answer),
+        )
+        .await
+        .expect("the kept connection closes");
+        let answer = String::from_utf8_lossy(&answer).to_ascii_lowercase();
+        assert!(
+            !answer.contains(" 101 "),
+            "an upgrade was admitted after the stop: {answer}"
+        );
+        if !answer.is_empty() {
+            assert!(answer.starts_with("http/1.1 503"), "{answer}");
+            assert!(answer.contains("connection: close"), "{answer}");
+            assert!(
+                answer.contains(r#""reason":"gateway_restarting""#),
+                "{answer}"
+            );
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(2), server)
+            .await
+            .expect("the gateway returns")
+            .expect("the gateway task does not panic")
+            .expect("the gateway stops cleanly");
+    }
+
     #[tokio::test]
     async fn run_gateway_starts_with_mismatched_provider_api_key() {
+        // `run_gateway` binds the process-global pricing config handle.
+        let _pricing_binding = crate::PRICING_BINDING_TEST_LOCK.lock().await;
         let mut config = Config::default();
         config.providers.models.anthropic.insert(
             "default".to_string(),
@@ -6145,6 +9233,8 @@ path = "{trigger_path}"
                 "127.0.0.1",
                 0,
                 config,
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -6182,6 +9272,8 @@ path = "{trigger_path}"
 
     #[tokio::test]
     async fn daemon_startup_gateway_reports_ready_and_uses_external_shutdown_sender() {
+        // `run_gateway` binds the process-global pricing config handle.
+        let _pricing_binding = crate::PRICING_BINDING_TEST_LOCK.lock().await;
         let port_probe = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let port = port_probe.local_addr().unwrap().port();
         drop(port_probe);
@@ -6196,10 +9288,10 @@ path = "{trigger_path}"
 
         let (shutdown_tx, _) = tokio::sync::watch::channel(false);
         let (reload_tx, _) = tokio::sync::watch::channel(false);
-        let reload_controls = zeroclaw_runtime::daemon::GatewayReloadControls {
-            shutdown_tx: shutdown_tx.clone(),
+        let reload_controls = zeroclaw_runtime::daemon::GatewayReloadControls::standalone(
+            shutdown_tx.clone(),
             reload_tx,
-        };
+        );
         let (ready_tx, mut ready_rx) = tokio::sync::watch::channel(None);
         let readiness = zeroclaw_runtime::daemon::GatewayReadinessReporter::new(move |addr| {
             let _ = ready_tx.send(Some(addr));
@@ -6212,6 +9304,8 @@ path = "{trigger_path}"
                 config,
                 None,
                 Some(reload_controls),
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -6257,6 +9351,8 @@ path = "{trigger_path}"
 
     #[tokio::test]
     async fn daemon_startup_gateway_does_not_report_ready_when_tls_setup_fails() {
+        // `run_gateway` binds the process-global pricing config handle.
+        let _pricing_binding = crate::PRICING_BINDING_TEST_LOCK.lock().await;
         let tmp = tempfile::TempDir::new().unwrap();
         let mut config = zeroclaw_config::schema::Config {
             data_dir: tmp.path().join("workspace"),
@@ -6285,6 +9381,8 @@ path = "{trigger_path}"
             None,
             None,
             None,
+            None,
+            None,
             Some(readiness),
         )
         .await;
@@ -6301,9 +9399,11 @@ path = "{trigger_path}"
 
     #[tokio::test]
     async fn metrics_endpoint_returns_hint_when_prometheus_is_disabled() {
+        let state_authority = zeroclaw_runtime::LiveConfigAuthority::new(Config::default());
         let state = AppState {
-            config: Arc::new(RwLock::new(Config::default())),
-            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            config: state_authority.live_handle(),
+            config_authority: state_authority.clone(),
+            agent_lifecycle: state_authority.agent_lifecycle(),
             model_provider: Arc::new(MockModelProvider::default()),
             model: "test-model".into(),
             temperature: None,
@@ -6350,13 +9450,13 @@ path = "{trigger_path}"
                 8, 30, 600,
             )),
             device_registry: None,
-            pending_pairings: None,
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
             sop_audit: None,
+            sop_driver_handles: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -6387,9 +9487,11 @@ path = "{trigger_path}"
         );
 
         let observer: Arc<dyn zeroclaw_runtime::observability::Observer> = Arc::new(prom);
+        let state_authority = zeroclaw_runtime::LiveConfigAuthority::new(Config::default());
         let state = AppState {
-            config: Arc::new(RwLock::new(Config::default())),
-            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            config: state_authority.live_handle(),
+            config_authority: state_authority.clone(),
+            agent_lifecycle: state_authority.agent_lifecycle(),
             model_provider: Arc::new(MockModelProvider::default()),
             model: "test-model".into(),
             temperature: None,
@@ -6436,13 +9538,13 @@ path = "{trigger_path}"
                 8, 30, 600,
             )),
             device_registry: None,
-            pending_pairings: None,
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
             sop_audit: None,
+            sop_driver_handles: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -6561,11 +9663,69 @@ path = "{trigger_path}"
         let mut headers = HeaderMap::new();
         headers.insert(
             "X-Forwarded-For",
+            // Client-supplied leftmost entry, then the address the immediate
+            // proxy appended (rightmost).
             HeaderValue::from_static("198.51.100.10, 203.0.113.11"),
         );
 
         let key = client_key_from_request(Some(peer), &headers, true);
+        assert_eq!(key, "203.0.113.11");
+    }
+
+    #[test]
+    fn client_key_preserves_proxy_suffix_after_opaque_xff_prefix() {
+        let peer = SocketAddr::from(([127, 0, 0, 1], 42617));
+        for value in [
+            &b"\x80, 198.51.100.10"[..],
+            &b"\x80, 198.51.100.10, 127.0.0.1"[..],
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert("X-Forwarded-For", HeaderValue::from_bytes(value).unwrap());
+            assert_eq!(
+                client_key_from_request(Some(peer), &headers, true),
+                "198.51.100.10"
+            );
+            assert_eq!(
+                client_key_from_request(Some(peer), &headers, false),
+                "127.0.0.1"
+            );
+        }
+    }
+
+    #[test]
+    fn client_key_ignores_spoofed_loopback_forwarded_header() {
+        let peer = SocketAddr::from(([203, 0, 113, 50], 42617));
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Forwarded-For", HeaderValue::from_static("127.0.0.1"));
+
+        let key = client_key_from_request(Some(peer), &headers, true);
+        assert_eq!(key, "203.0.113.50");
+    }
+
+    #[test]
+    fn client_key_skips_rightmost_loopback_for_earlier_xff_hop() {
+        // Same-host proxy chain: immediate hop appended loopback; the real
+        // caller remains further left. Must not fall back to a loopback peer
+        // (that would grant the local-only limiter exemption).
+        let peer = SocketAddr::from(([127, 0, 0, 1], 42617));
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "X-Forwarded-For",
+            HeaderValue::from_static("198.51.100.10, 127.0.0.1"),
+        );
+
+        let key = client_key_from_request(Some(peer), &headers, true);
         assert_eq!(key, "198.51.100.10");
+    }
+
+    #[test]
+    fn client_key_loopback_only_xff_with_loopback_peer_is_non_exempt() {
+        let peer = SocketAddr::from(([127, 0, 0, 1], 42617));
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Forwarded-For", HeaderValue::from_static("127.0.0.1"));
+
+        let key = client_key_from_request(Some(peer), &headers, true);
+        assert_eq!(key, "unknown");
     }
 
     #[test]
@@ -6608,19 +9768,12 @@ path = "{trigger_path}"
         let token = guard.try_pair(&code, "test_client").await.unwrap().unwrap();
         assert!(guard.is_authenticated(&token));
 
-        let shared_config = Arc::new(RwLock::new(config));
-        let config_write_lock = Arc::new(tokio::sync::Mutex::new(()));
-        Box::pin(persist_pairing_tokens(
-            shared_config.clone(),
-            &guard,
-            config_write_lock,
-        ))
-        .await
-        .unwrap();
+        let state = pairing_persistence_state(config, guard);
+        Box::pin(persist_pairing_tokens(&state)).await.unwrap();
 
-        // In-memory tokens should remain as plaintext 64-char hex hashes.
+        // The published pair keeps tokens as plaintext 64-char hex hashes.
         let plaintext = {
-            let in_memory = shared_config.read();
+            let in_memory = state.config.read();
             assert_eq!(in_memory.gateway.paired_tokens.len(), 1);
             in_memory.gateway.paired_tokens[0].clone()
         };
@@ -6638,17 +9791,16 @@ path = "{trigger_path}"
         );
     }
 
-    /// Unlike the `persist_and_swap` callers (which pre-acquire the witness
-    /// before their own read-for-modify), `persist_pairing_tokens` acquires
-    /// `config_write_lock` internally since it is self-contained. This
-    /// proves that internal acquisition still serializes it against a
-    /// second, concurrent config mutation the same way. A single Pending
-    /// poll wouldn't distinguish "blocked on `config_write_lock`" from
-    /// "transiently Pending on unrelated I/O", so this polls repeatedly
-    /// with a no-op waker while the witness stays held and asserts the
-    /// future never completes -- proving it stays parked on the lock for as
-    /// long as it's held. Once the lock is released both changes land —
-    /// neither clobbers the other.
+    /// `persist_pairing_tokens` admits its own config commit since it is
+    /// self-contained. This proves that internal admission still
+    /// serializes it against a second, concurrent config writer: while an
+    /// admitted commit holds the writer guard, the pairing persistence
+    /// stays parked on commit admission; once the in-flight commit
+    /// publishes and releases, both publications land — neither clobbers
+    /// the other. A single Pending poll wouldn't distinguish "blocked on
+    /// commit admission" from "transiently Pending on unrelated I/O", so
+    /// this polls repeatedly with a no-op waker while the commit stays
+    /// held.
     #[tokio::test]
     async fn persist_pairing_tokens_serializes_against_concurrent_config_write() {
         let temp = tempfile::tempdir().unwrap();
@@ -6664,22 +9816,18 @@ path = "{trigger_path}"
         let token = guard.try_pair(&code, "test_client").await.unwrap().unwrap();
         assert!(guard.is_authenticated(&token));
 
-        let shared_config = Arc::new(RwLock::new(config));
-        let config_write_lock = Arc::new(tokio::sync::Mutex::new(()));
+        let state = pairing_persistence_state(config, guard);
 
-        // Simulate another in-flight config mutation already holding the
-        // witness for its own read-mutate-save-swap section.
-        let held_guard = Arc::clone(&config_write_lock).lock_owned().await;
+        // Simulate another in-flight config commit already holding the
+        // writer serialization for its own read-mutate-save-publish
+        // section.
+        let held_commit = state.begin_config_commit().await.unwrap();
 
-        let mut persist_fut = Box::pin(persist_pairing_tokens(
-            shared_config.clone(),
-            &guard,
-            config_write_lock.clone(),
-        ));
+        let mut persist_fut = Box::pin(persist_pairing_tokens(&state));
 
-        // Bounded, sleep-free: `persist_pairing_tokens` acquires the witness
+        // Bounded, sleep-free: `persist_pairing_tokens` admits its commit
         // as its very first action, so poll with a no-op waker 50 times
-        // while `held_guard` stays live and assert Pending every time,
+        // while `held_commit` stays live and assert Pending every time,
         // rather than resolving synchronously or racing ahead after a
         // single yield.
         let waker = std::task::Waker::noop();
@@ -6687,21 +9835,24 @@ path = "{trigger_path}"
         for _ in 0..50 {
             assert!(
                 std::future::Future::poll(persist_fut.as_mut(), &mut cx).is_pending(),
-                "persist_pairing_tokens must stay parked on config_write_lock \
-                 acquisition for as long as another writer holds it"
+                "persist_pairing_tokens must stay parked on commit admission \
+                 for as long as another writer holds the serialization"
             );
         }
 
-        // Land a distinct, concurrent write directly on live config while
-        // persist_pairing_tokens is parked waiting for the lock.
-        shared_config.write().gateway.port = 55555;
+        // The concurrent writer's own publication: it holds the same
+        // serialization, so it lands before the pairing persistence.
+        let mut concurrent = held_commit.current_config();
+        concurrent.gateway.port = 55555;
+        let revision = held_commit.next_revision().unwrap();
+        held_commit.publish(revision, concurrent).unwrap();
+        drop(held_commit);
 
-        drop(held_guard);
         persist_fut
             .await
             .expect("persist_pairing_tokens must still succeed once unblocked");
 
-        let live = shared_config.read();
+        let live = state.config.read();
         assert_eq!(
             live.gateway.port, 55555,
             "the concurrent writer's change must survive — no lost update"
@@ -6711,6 +9862,21 @@ path = "{trigger_path}"
             1,
             "persist_pairing_tokens' own token write must also land"
         );
+    }
+
+    /// Minimal AppState carrying one pairing guard, for the pairing
+    /// persistence serialization test. The pairing guard cannot be
+    /// cloned with its tokens; the test re-pairs inside the fresh guard
+    /// before calling this.
+    fn pairing_persistence_state(config: Config, guard: PairingGuard) -> AppState {
+        let state_authority = zeroclaw_runtime::LiveConfigAuthority::new(config);
+        AppState {
+            config: state_authority.live_handle(),
+            config_authority: state_authority.clone(),
+            agent_lifecycle: state_authority.agent_lifecycle(),
+            pairing: Arc::new(guard),
+            ..crate::api::tests::test_state(Config::default())
+        }
     }
 
     #[test]
@@ -7057,9 +10223,12 @@ path = "{trigger_path}"
     /// Minimal AppState for webhook-SSE regressions.
     fn sse_test_state(model_provider: Arc<dyn ModelProvider>) -> AppState {
         let memory: Arc<dyn Memory> = Arc::new(MockMemory);
+
+        let state_authority = zeroclaw_runtime::LiveConfigAuthority::new(Config::default());
         AppState {
-            config: Arc::new(RwLock::new(Config::default())),
-            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            config: state_authority.live_handle(),
+            config_authority: state_authority.clone(),
+            agent_lifecycle: state_authority.agent_lifecycle(),
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -7106,7 +10275,6 @@ path = "{trigger_path}"
                 8, 30, 600,
             )),
             device_registry: None,
-            pending_pairings: None,
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -7115,6 +10283,7 @@ path = "{trigger_path}"
             sop_audit: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
+            sop_driver_handles: None,
         }
     }
 
@@ -7807,8 +10976,9 @@ data: [DONE]\n\n";
         .await;
         let tmp = tempfile::tempdir().expect("production receipt fixture temp dir");
         let (state, _) = production_sse_state(&tmp, &fixture.base_url(), 1.0, false);
-        {
-            let mut config = state.config.write();
+        state.publish_test_config(|config| {
+            // Selection admits the tool; the existing allowlist still controls execution.
+            config.tools.optional = vec!["calculator".into()];
             config
                 .risk_profiles
                 .get_mut("fixture")
@@ -7828,7 +10998,7 @@ data: [DONE]\n\n";
                 show_in_response: true,
                 ..ToolReceiptsConfig::default()
             };
-        }
+        });
 
         let text = collect_production_sse(&state, "receipt stream", "production-receipt").await;
 
@@ -8641,9 +11811,11 @@ data: [DONE]\n\n";
         let model_provider: Arc<dyn ModelProvider> = provider_impl.clone();
         let memory: Arc<dyn Memory> = Arc::new(MockMemory);
 
+        let state_authority = zeroclaw_runtime::LiveConfigAuthority::new(Config::default());
         let state = AppState {
-            config: Arc::new(RwLock::new(Config::default())),
-            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            config: state_authority.live_handle(),
+            config_authority: state_authority.clone(),
+            agent_lifecycle: state_authority.agent_lifecycle(),
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -8690,13 +11862,13 @@ data: [DONE]\n\n";
                 8, 30, 600,
             )),
             device_registry: None,
-            pending_pairings: None,
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
             sop_audit: None,
+            sop_driver_handles: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -8893,7 +12065,7 @@ data: [DONE]\n\n";
         let protected_tmp = tempfile::tempdir().unwrap();
         let (protected, provider) = webhook_sop_state(&protected_tmp, "/sop/deploy");
         let secret = generate_test_secret();
-        protected.config.write().gateway.webhook_secret = Some(secret);
+        protected.publish_test_config(|c| c.gateway.webhook_secret = Some(secret));
         let unauthorized = api_sop_webhook::handle_sop_webhook(
             State(protected),
             test_connect_info(),
@@ -9080,7 +12252,7 @@ data: [DONE]\n\n";
             .expect("no configured control -> authorization itself passes");
 
         // Concurrent operator action lands between authorization and dispatch.
-        state.config.write().gateway.webhook_secret = Some(generate_test_secret());
+        state.publish_test_config(|c| c.gateway.webhook_secret = Some(generate_test_secret()));
 
         // The dispatch decision must come from the snapshot, not the new config.
         let rejection = require_sop_dispatch_credentials(verdict)
@@ -9116,7 +12288,7 @@ data: [DONE]\n\n";
         let tmp = tempfile::tempdir().unwrap();
         let (state, _provider) = webhook_sop_state(&tmp, "/sop/deploy");
         let secret_a = generate_test_secret();
-        state.config.write().gateway.webhook_secret = Some(secret_a.clone());
+        state.publish_test_config(|c| c.gateway.webhook_secret = Some(secret_a.clone()));
 
         let verdict = authorize_webhook_request(
             &state,
@@ -9127,7 +12299,7 @@ data: [DONE]\n\n";
 
         // Rotation lands between authorization and dispatch.
         let secret_b = generate_test_secret();
-        state.config.write().gateway.webhook_secret = Some(secret_b.clone());
+        state.publish_test_config(|c| c.gateway.webhook_secret = Some(secret_b.clone()));
 
         assert!(
             require_sop_dispatch_credentials(verdict).is_ok(),
@@ -9171,7 +12343,7 @@ data: [DONE]\n\n";
             api_sop_webhook::has_matching_webhook_sop(&state, "/webhook").unwrap(),
             "fixture must load a matching /webhook trigger"
         );
-        state.config.write().gateway.webhook_secret = Some(generate_test_secret());
+        state.publish_test_config(|c| c.gateway.webhook_secret = Some(generate_test_secret()));
 
         assert!(
             require_sop_dispatch_credentials(verdict).is_err(),
@@ -9218,7 +12390,7 @@ data: [DONE]\n\n";
         let before = require_sop_dispatch_credentials(unconfigured).is_ok();
 
         // Flip the live config to the opposite policy in every way we can.
-        state.config.write().gateway.webhook_secret = Some(generate_test_secret());
+        state.publish_test_config(|c| c.gateway.webhook_secret = Some(generate_test_secret()));
         let after = require_sop_dispatch_credentials(unconfigured).is_ok();
 
         assert_eq!(
@@ -9560,9 +12732,11 @@ data: [DONE]\n\n";
         let model_provider: Arc<dyn ModelProvider> = provider_impl.clone();
         let memory: Arc<dyn Memory> = Arc::new(MockMemory);
 
+        let state_authority = zeroclaw_runtime::LiveConfigAuthority::new(Config::default());
         let state = AppState {
-            config: Arc::new(RwLock::new(Config::default())),
-            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            config: state_authority.live_handle(),
+            config_authority: state_authority.clone(),
+            agent_lifecycle: state_authority.agent_lifecycle(),
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -9609,13 +12783,13 @@ data: [DONE]\n\n";
                 8, 30, 600,
             )),
             device_registry: None,
-            pending_pairings: None,
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
             sop_audit: None,
+            sop_driver_handles: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -9681,9 +12855,11 @@ data: [DONE]\n\n";
             },
         );
 
+        let state_authority = zeroclaw_runtime::LiveConfigAuthority::new(config);
         let state = AppState {
-            config: Arc::new(RwLock::new(config)),
-            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            config: state_authority.live_handle(),
+            config_authority: state_authority.clone(),
+            agent_lifecycle: state_authority.agent_lifecycle(),
             model_provider,
             model: "startup-model".into(),
             temperature: None,
@@ -9730,13 +12906,13 @@ data: [DONE]\n\n";
                 8, 30, 600,
             )),
             device_registry: None,
-            pending_pairings: None,
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
             sop_audit: None,
+            sop_driver_handles: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -9781,9 +12957,11 @@ data: [DONE]\n\n";
         let tracking_impl = Arc::new(TrackingMemory::default());
         let memory: Arc<dyn Memory> = tracking_impl.clone();
 
+        let state_authority = zeroclaw_runtime::LiveConfigAuthority::new(Config::default());
         let state = AppState {
-            config: Arc::new(RwLock::new(Config::default())),
-            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            config: state_authority.live_handle(),
+            config_authority: state_authority.clone(),
+            agent_lifecycle: state_authority.agent_lifecycle(),
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -9830,13 +13008,13 @@ data: [DONE]\n\n";
                 8, 30, 600,
             )),
             device_registry: None,
-            pending_pairings: None,
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
             sop_audit: None,
+            sop_driver_handles: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -9898,8 +13076,7 @@ data: [DONE]\n\n";
     fn gateway_webhook_secret_uses_one_live_config_owner() {
         let tmp = tempfile::tempdir().unwrap();
         let state = admin_paircode_state(&tmp, false, false);
-        {
-            let mut config = state.config.write();
+        state.publish_test_config(|config| {
             config.channels.webhook.insert(
                 "enabled-a".into(),
                 zeroclaw_config::schema::WebhookConfig {
@@ -9924,7 +13101,7 @@ data: [DONE]\n\n";
                     ..Default::default()
                 },
             );
-        }
+        });
         assert_eq!(
             configured_gateway_webhook_secret_hash(&state),
             None,
@@ -9938,7 +13115,7 @@ data: [DONE]\n\n";
         );
 
         let startup_secret = "synthetic-startup-gateway-secret".to_string();
-        state.config.write().gateway.webhook_secret = Some(startup_secret.clone());
+        state.publish_test_config(|c| c.gateway.webhook_secret = Some(startup_secret.clone()));
         assert!(
             authorize_webhook_request(
                 &state,
@@ -9958,7 +13135,7 @@ data: [DONE]\n\n";
         );
 
         let rotated_secret = "synthetic-rotated-gateway-secret".to_string();
-        state.config.write().gateway.webhook_secret = Some(rotated_secret.clone());
+        state.publish_test_config(|c| c.gateway.webhook_secret = Some(rotated_secret.clone()));
         assert!(
             authorize_webhook_request(
                 &state,
@@ -9988,9 +13165,11 @@ data: [DONE]\n\n";
         let mut config = Config::default();
         config.gateway.webhook_secret = Some(secret.clone());
 
+        let state_authority = zeroclaw_runtime::LiveConfigAuthority::new(config);
         let state = AppState {
-            config: Arc::new(RwLock::new(config)),
-            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            config: state_authority.live_handle(),
+            config_authority: state_authority.clone(),
+            agent_lifecycle: state_authority.agent_lifecycle(),
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -10037,13 +13216,13 @@ data: [DONE]\n\n";
                 8, 30, 600,
             )),
             device_registry: None,
-            pending_pairings: None,
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
             sop_audit: None,
+            sop_driver_handles: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -10075,9 +13254,11 @@ data: [DONE]\n\n";
         let mut config = Config::default();
         config.gateway.webhook_secret = Some(valid_secret.clone());
 
+        let state_authority = zeroclaw_runtime::LiveConfigAuthority::new(config);
         let state = AppState {
-            config: Arc::new(RwLock::new(config)),
-            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            config: state_authority.live_handle(),
+            config_authority: state_authority.clone(),
+            agent_lifecycle: state_authority.agent_lifecycle(),
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -10124,13 +13305,13 @@ data: [DONE]\n\n";
                 8, 30, 600,
             )),
             device_registry: None,
-            pending_pairings: None,
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
             sop_audit: None,
+            sop_driver_handles: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -10167,9 +13348,11 @@ data: [DONE]\n\n";
         let mut config = Config::default();
         config.gateway.webhook_secret = Some(secret.clone());
 
+        let state_authority = zeroclaw_runtime::LiveConfigAuthority::new(config);
         let state = AppState {
-            config: Arc::new(RwLock::new(config)),
-            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            config: state_authority.live_handle(),
+            config_authority: state_authority.clone(),
+            agent_lifecycle: state_authority.agent_lifecycle(),
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -10216,13 +13399,13 @@ data: [DONE]\n\n";
                 8, 30, 600,
             )),
             device_registry: None,
-            pending_pairings: None,
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
             sop_audit: None,
+            sop_driver_handles: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -10264,9 +13447,11 @@ data: [DONE]\n\n";
         let model_provider: Arc<dyn ModelProvider> = Arc::new(MockModelProvider::default());
         let memory: Arc<dyn Memory> = Arc::new(MockMemory);
 
+        let state_authority = zeroclaw_runtime::LiveConfigAuthority::new(Config::default());
         let state = AppState {
-            config: Arc::new(RwLock::new(Config::default())),
-            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            config: state_authority.live_handle(),
+            config_authority: state_authority.clone(),
+            agent_lifecycle: state_authority.agent_lifecycle(),
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -10313,13 +13498,13 @@ data: [DONE]\n\n";
                 8, 30, 600,
             )),
             device_registry: None,
-            pending_pairings: None,
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
             sop_audit: None,
+            sop_driver_handles: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -10358,9 +13543,11 @@ data: [DONE]\n\n";
         let _valid_signature = compute_nextcloud_signature_hex(secret, random, body);
         let invalid_signature = "deadbeef";
 
+        let state_authority = zeroclaw_runtime::LiveConfigAuthority::new(Config::default());
         let state = AppState {
-            config: Arc::new(RwLock::new(Config::default())),
-            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            config: state_authority.live_handle(),
+            config_authority: state_authority.clone(),
+            agent_lifecycle: state_authority.agent_lifecycle(),
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -10405,13 +13592,13 @@ data: [DONE]\n\n";
                 8, 30, 600,
             )),
             device_registry: None,
-            pending_pairings: None,
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
             sop_audit: None,
+            sop_driver_handles: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -10458,9 +13645,11 @@ data: [DONE]\n\n";
 
         let body = r#"{"type":"message","object":{"token":"room-token"},"message":{"actorType":"users","actorId":"user_a","message":"hello"}}"#;
 
+        let state_authority = zeroclaw_runtime::LiveConfigAuthority::new(Config::default());
         let state = AppState {
-            config: Arc::new(RwLock::new(Config::default())),
-            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            config: state_authority.live_handle(),
+            config_authority: state_authority.clone(),
+            agent_lifecycle: state_authority.agent_lifecycle(),
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -10505,12 +13694,12 @@ data: [DONE]\n\n";
                 8, 30, 600,
             )),
             device_registry: None,
-            pending_pairings: None,
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
+            sop_driver_handles: None,
             sop_audit: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
@@ -10598,9 +13787,11 @@ data: [DONE]\n\n";
         let body = r#"{"type":"message","object":{"token":"room-token"},"actor":{"id":"user_a","name":"User A"},"message":{"actorType":"users","actorId":"user_a","message":"hello"}}"#;
         let signature = compute_nextcloud_signature_hex(secret, random, body);
 
+        let state_authority = zeroclaw_runtime::LiveConfigAuthority::new(Config::default());
         let state = AppState {
-            config: Arc::new(RwLock::new(Config::default())),
-            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            config: state_authority.live_handle(),
+            config_authority: state_authority.clone(),
+            agent_lifecycle: state_authority.agent_lifecycle(),
             model_provider: provider,
             model: "test-model".into(),
             temperature: None,
@@ -10656,11 +13847,11 @@ data: [DONE]\n\n";
                 8, 30, 600,
             )),
             device_registry: None,
-            pending_pairings: None,
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_handles: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -11232,13 +14423,16 @@ data: [DONE]\n\n";
         tokens: &[String],
     ) -> AppState {
         let mut state = admin_paircode_state(tmp, require_pairing, false);
-        state.config.write().gateway.allow_remote_admin = allow_remote_admin;
+        state.publish_test_config(|c| c.gateway.allow_remote_admin = allow_remote_admin);
         state.pairing = Arc::new(PairingGuard::new(
             require_pairing,
             tokens,
             PairingCodePolicy::default(),
         ));
-        state.reload_tx = Some(tokio::sync::watch::channel(false).0);
+        state.reload_tx = Some(zeroclaw_runtime::daemon::GatewayReloadControls::standalone(
+            tokio::sync::watch::channel(false).0,
+            tokio::sync::watch::channel(false).0,
+        ));
         state
     }
 
@@ -11489,9 +14683,11 @@ data: [DONE]\n\n";
             linq_signing_secrets.insert(alias.to_string(), Arc::from(secret));
         }
 
+        let state_authority = zeroclaw_runtime::LiveConfigAuthority::new(config);
         AppState {
-            config: Arc::new(RwLock::new(config)),
-            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            config: state_authority.live_handle(),
+            config_authority: state_authority.clone(),
+            agent_lifecycle: state_authority.agent_lifecycle(),
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -11538,13 +14734,13 @@ data: [DONE]\n\n";
                 8, 30, 600,
             )),
             device_registry: None,
-            pending_pairings: None,
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
             sop_audit: None,
+            sop_driver_handles: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         }
@@ -11574,9 +14770,11 @@ data: [DONE]\n\n";
         let model_provider: Arc<dyn ModelProvider> = Arc::new(MockModelProvider::default());
         let memory: Arc<dyn Memory> = Arc::new(MockMemory);
 
+        let state_authority = zeroclaw_runtime::LiveConfigAuthority::new(Config::default());
         let state = AppState {
-            config: Arc::new(RwLock::new(Config::default())),
-            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            config: state_authority.live_handle(),
+            config_authority: state_authority.clone(),
+            agent_lifecycle: state_authority.agent_lifecycle(),
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -11623,13 +14821,13 @@ data: [DONE]\n\n";
                 8, 30, 600,
             )),
             device_registry: None,
-            pending_pairings: None,
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
             sop_audit: None,
+            sop_driver_handles: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -12186,9 +15384,11 @@ data: [DONE]\n\n";
     fn webhook_baseline_state() -> AppState {
         let model_provider: Arc<dyn ModelProvider> = Arc::new(MockModelProvider::default());
         let mem: Arc<dyn Memory> = Arc::new(MockMemory);
+        let state_authority = zeroclaw_runtime::LiveConfigAuthority::new(Config::default());
         AppState {
-            config: Arc::new(RwLock::new(Config::default())),
-            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            config: state_authority.live_handle(),
+            config_authority: state_authority.clone(),
+            agent_lifecycle: state_authority.agent_lifecycle(),
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -12235,13 +15435,13 @@ data: [DONE]\n\n";
                 8, 30, 600,
             )),
             device_registry: None,
-            pending_pairings: None,
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
             sop_audit: None,
+            sop_driver_handles: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         }
@@ -12250,6 +15450,19 @@ data: [DONE]\n\n";
     #[cfg(feature = "channel-whatsapp-cloud")]
     fn whatsapp_instance(alias: &str, verify_token: &str) -> Arc<WhatsAppChannel> {
         let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = Arc::new(Vec::new);
+        Arc::new(WhatsAppChannel::new(
+            "access-token".into(),
+            "phone-number-id".into(),
+            verify_token.into(),
+            alias,
+            peer_resolver,
+        ))
+    }
+
+    #[cfg(feature = "channel-whatsapp-cloud")]
+    fn whatsapp_instance_allowing_all(alias: &str, verify_token: &str) -> Arc<WhatsAppChannel> {
+        let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> =
+            Arc::new(|| vec!["*".to_string()]);
         Arc::new(WhatsAppChannel::new(
             "access-token".into(),
             "phone-number-id".into(),
@@ -12266,6 +15479,36 @@ data: [DONE]\n\n";
         let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
         mac.update(body);
         format!("sha256={}", hex::encode(mac.finalize().into_bytes()))
+    }
+
+    #[cfg(feature = "channel-whatsapp-cloud")]
+    fn whatsapp_webhook_body(sender: &str, text: &str) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "object": "whatsapp_business_account",
+            "entry": [{
+                "changes": [{
+                    "value": {
+                        "messages": [{
+                            "from": sender,
+                            "timestamp": "1700000000",
+                            "type": "text",
+                            "text": { "body": text }
+                        }]
+                    }
+                }]
+            }]
+        }))
+        .expect("WhatsApp test payload must serialize")
+    }
+
+    #[cfg(feature = "channel-whatsapp-cloud")]
+    fn whatsapp_signed_headers(secret: &str, body: &[u8]) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "X-Hub-Signature-256",
+            HeaderValue::from_str(&whatsapp_signature(secret, body)).unwrap(),
+        );
+        headers
     }
 
     #[cfg(feature = "channel-whatsapp-cloud")]
@@ -12401,6 +15644,109 @@ data: [DONE]\n\n";
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
+    #[cfg(feature = "channel-whatsapp-cloud")]
+    #[tokio::test]
+    async fn authenticated_webhook_binds_approval_to_alias_responder_and_destination() {
+        use tokio::sync::oneshot::error::TryRecvError;
+        use zeroclaw_api::channel::ChannelApprovalResponse;
+
+        let _capture_guard = lock_gateway_chat_dispatch_capture_for_test().await;
+        clear_gateway_chat_dispatch_captures_for_test();
+
+        const SECRET: &str = "app-secret";
+        const TOKEN: &str = "gw1024";
+        const APPROVER: &str = "+15551234567";
+        const APPROVER_WEBHOOK: &str = "15551234567";
+
+        let mut state = webhook_baseline_state();
+        state.whatsapp = HashMap::from([
+            (
+                "work".to_string(),
+                whatsapp_instance_allowing_all("work", "tok-work"),
+            ),
+            (
+                "personal".to_string(),
+                whatsapp_instance_allowing_all("personal", "tok-personal"),
+            ),
+        ]);
+        state.whatsapp_app_secret = HashMap::from([
+            ("work".to_string(), Arc::<str>::from(SECRET)),
+            ("personal".to_string(), Arc::<str>::from(SECRET)),
+        ]);
+
+        let mut decision = zeroclaw_channels::whatsapp::register_pending_approval_for_test(
+            TOKEN, "work", APPROVER,
+        )
+        .await;
+
+        let wrong_alias = whatsapp_webhook_body(APPROVER_WEBHOOK, &format!("{TOKEN} approve"));
+        let response = Box::pin(handle_whatsapp_message_alias(
+            State(state.clone()),
+            Path("personal".to_string()),
+            whatsapp_signed_headers(SECRET, &wrong_alias),
+            Bytes::from(wrong_alias),
+        ))
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(matches!(decision.try_recv(), Err(TryRecvError::Empty)));
+        assert!(
+            gateway_chat_dispatch_captures_for_test()
+                .iter()
+                .all(|capture| !capture.message.contains(TOKEN))
+        );
+
+        let wrong_responder = whatsapp_webhook_body("15557654321", &format!("{TOKEN} approve"));
+        let response = Box::pin(handle_whatsapp_message_alias(
+            State(state.clone()),
+            Path("work".to_string()),
+            whatsapp_signed_headers(SECRET, &wrong_responder),
+            Bytes::from(wrong_responder),
+        ))
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(matches!(decision.try_recv(), Err(TryRecvError::Empty)));
+        assert!(
+            gateway_chat_dispatch_captures_for_test()
+                .iter()
+                .all(|capture| !capture.message.contains(TOKEN))
+        );
+
+        let correct = whatsapp_webhook_body(APPROVER_WEBHOOK, &format!("{TOKEN} approve"));
+        let response = Box::pin(handle_whatsapp_message_alias(
+            State(state.clone()),
+            Path("work".to_string()),
+            whatsapp_signed_headers(SECRET, &correct),
+            Bytes::from(correct),
+        ))
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(decision.await.unwrap(), ChannelApprovalResponse::Approve);
+        assert!(
+            gateway_chat_dispatch_captures_for_test()
+                .iter()
+                .all(|capture| !capture.message.contains(TOKEN))
+        );
+
+        let ordinary_text = "continue with the ordinary request";
+        let ordinary = whatsapp_webhook_body(APPROVER_WEBHOOK, ordinary_text);
+        let response = Box::pin(handle_whatsapp_message_alias(
+            State(state),
+            Path("work".to_string()),
+            whatsapp_signed_headers(SECRET, &ordinary),
+            Bytes::from(ordinary),
+        ))
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            gateway_chat_dispatch_captures_for_test()
+                .iter()
+                .filter(|capture| capture.message == ordinary_text)
+                .count(),
+            1,
+            "a non-approval message must still dispatch through the gateway"
+        );
+    }
+
     /// Fail closed. A configured alias with no app secret cannot verify
     /// `X-Hub-Signature-256`, so the webhook is refused rather than
     /// dispatched to the agent unverified.
@@ -12491,7 +15837,7 @@ data: [DONE]\n\n";
         let state = admin_paircode_state(&tmp, true, false);
         let blocker = tmp.path().join("legacy-pair-blocker");
         std::fs::write(&blocker, b"").expect("seed blocker file");
-        state.config.write().config_path = blocker.join("config.toml");
+        state.publish_test_config(|c| c.config_path = blocker.join("config.toml"));
 
         let code = state
             .pairing
@@ -12550,5 +15896,130 @@ mod accept_error_tests {
         assert!(!is_recoverable_accept_error(&Error::from(
             ErrorKind::InvalidInput
         )));
+    }
+
+    /// The gateway points the pricing refresher at the live config handle its
+    /// config API writes. An operator opt-out made through `PUT
+    /// /api/config/prop` on a running standalone gateway must therefore reach
+    /// the refresher without a restart, instead of being lost on a private
+    /// copy of the startup config.
+    #[tokio::test]
+    async fn a_config_api_opt_out_reaches_the_pricing_refresher_without_a_restart() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let _pricing_binding = crate::PRICING_BINDING_TEST_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        config.gateway.require_pairing = false;
+        config.providers.models.ollama.insert(
+            "priced".to_string(),
+            zeroclaw_config::schema::OllamaModelProviderConfig {
+                base: zeroclaw_config::schema::ModelProviderConfig {
+                    uri: Some("http://127.0.0.1:9".to_string()),
+                    model: Some("priced-model".to_string()),
+                    live_pricing: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+
+        // The exact property path the config API accepts for this flag, taken
+        // from the schema rather than spelled by hand.
+        let live_pricing_path = config
+            .prop_fields()
+            .into_iter()
+            .map(|field| field.name)
+            .find(|name| name.contains(".priced.") && name.contains("live"))
+            .expect("the schema exposes the provider's live-pricing flag");
+
+        let (addr_tx, addr_rx) = tokio::sync::oneshot::channel();
+        let addr_tx = std::sync::Mutex::new(Some(addr_tx));
+        let readiness = zeroclaw_runtime::daemon::GatewayReadinessReporter::new(move |addr| {
+            if let Some(tx) = addr_tx.lock().unwrap().take() {
+                let _ = tx.send(addr);
+            }
+        });
+        let server = zeroclaw_spawn::spawn!(async move {
+            crate::run_gateway(
+                "127.0.0.1",
+                0,
+                config,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(readiness),
+            )
+            .await
+        });
+        let addr = tokio::time::timeout(std::time::Duration::from_secs(10), addr_rx)
+            .await
+            .expect("the gateway reports readiness")
+            .expect("the readiness sender is kept until it fires");
+        assert!(
+            zeroclaw_providers::pricing::live_pricing_enabled(),
+            "the refresher is bound to the gateway's config, which opts in"
+        );
+
+        let body = serde_json::json!({
+            "path": live_pricing_path,
+            "value": false,
+        })
+        .to_string();
+        let request = format!(
+            "PUT /api/config/prop HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.unwrap();
+        assert!(
+            response.starts_with("HTTP/1.1 200"),
+            "the config API accepts the opt-out: {response}"
+        );
+
+        assert!(
+            !zeroclaw_providers::pricing::live_pricing_enabled(),
+            "the opt-out written through the config API must reach the refresher \
+             without a restart"
+        );
+        server.abort();
+    }
+}
+
+#[cfg(all(test, feature = "channel-email"))]
+mod gmail_bearer_tests {
+    use super::gmail_bearer_matches;
+
+    #[test]
+    fn matching_bearer_is_accepted() {
+        assert!(gmail_bearer_matches("s3cret-token", "s3cret-token"));
+    }
+
+    #[test]
+    fn prefix_and_same_length_mismatches_are_rejected() {
+        // A correct prefix must fail exactly like an equal-length mismatch:
+        // the compare runs over the longer input regardless of where the
+        // first differing byte is, so neither shape leaks progress.
+        assert!(!gmail_bearer_matches("s3cret", "s3cret-token"));
+        assert!(!gmail_bearer_matches("s3cret-tokeN", "s3cret-token"));
+        assert!(!gmail_bearer_matches("s3cret-token-longer", "s3cret-token"));
+    }
+
+    #[test]
+    fn missing_bearer_never_matches_a_configured_secret() {
+        assert!(!gmail_bearer_matches("", "s3cret-token"));
     }
 }

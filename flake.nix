@@ -45,10 +45,10 @@
           inherit nixpkgs system;
         };
         # >>> generated:flake-packages by `cargo generate installers` - do not edit <<<
-        # Default feature sets: zeroclaw uses canonical lean Dist,
+        # Default feature sets: zeroclaw uses canonical Dist,
         # zerocode uses its own package features (currently empty).
         # Override per-package, e.g. `packages.zeroclaw.override { features = [ ... ]; }`.
-        zeroclawDefaultFeatures = [ "acp-bridge" "agent-runtime" "channel-acp-server" "channel-discord" "channel-email" "channel-filesystem" "channel-git" "channel-lark" "channel-matrix" "channel-telegram" "channel-webhook" "gateway" "observability-prometheus" "schema-export" "whatsapp-web" ];
+        zeroclawDefaultFeatures = [ "acp-bridge" "agent-runtime" "channel-acp-server" "channel-discord" "channel-email" "channel-filesystem" "channel-git" "channel-lark" "channel-matrix" "channel-telegram" "channel-webhook" "gateway" "observability-prometheus" "plugins-wasm-cranelift" "schema-export" "tool-claude-code" "tool-claude-code-runner" "tool-codex-cli" "tool-composio" "tool-gemini-cli" "tool-google-workspace" "tool-jira" "tool-linkedin" "tool-microsoft365" "tool-notion" "tool-opencode-cli" "tool-project-intel" "tools-external" "whatsapp-web" ];
         zerocodeDefaultFeatures = [  ];
         buildZeroclaw = { pname, cargoPkg, features }:
           (pkgs.makeRustPlatform {
@@ -56,7 +56,7 @@
             rustc = rustToolchain;
           }).buildRustPackage {
             inherit pname;
-            version = "0.8.5";
+            version = "0.9.0";
             src = ./.;
             cargoLock = {
               lockFile = ./Cargo.lock;
@@ -68,12 +68,19 @@
                 [ "--features" (pkgs.lib.concatStringsSep "," features) ];
             doCheck = false;
             buildInputs = [ pkgs.stdenv.cc.cc ];
+            meta = { mainProgram = pname; };
           };
         # >>> end generated:flake-packages <<<
+        webPkgs = pkgs.callPackage ./nix/web.nix { inherit rustToolchain; };
       in {
         packages.zeroclaw = buildZeroclaw { pname = "zeroclaw"; cargoPkg = "zeroclaw"; features = zeroclawDefaultFeatures; };
         packages.zerocode = buildZeroclaw { pname = "zerocode"; cargoPkg = "zerocode"; features = zerocodeDefaultFeatures; };
         packages.default = buildZeroclaw { pname = "zeroclaw"; cargoPkg = "zeroclaw"; features = zeroclawDefaultFeatures; };
+        # Web dashboard bundle (see nix/web.nix). Kept outside the
+        # `generated:flake-packages` block so `cargo generate installers`
+        # does not clobber it.
+        packages.zeroclaw-web = webPkgs.zeroclawWeb;
+        packages.zeroclaw-openapi-spec = webPkgs.openapiSpec;
         checks = pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
           nixos-module-eval = pkgs.writeText "zeroclaw-nixos-module-eval" (
             builtins.toJSON nixosModuleEvalTests

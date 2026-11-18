@@ -866,6 +866,29 @@ impl fmt::Display for FinalizePartialDelivery {
 
 impl std::error::Error for FinalizePartialDelivery {}
 
+/// Error a [`Channel::finalize_draft`] implementation returns when it could not
+/// deliver any part of the final answer and the platform has asked it not to
+/// send again yet (for example a Telegram flood limit with `retry_after`).
+/// Nothing is on the wire, but a caller that falls back to resending the whole
+/// answer would only extend the platform's penalty. Callers must treat this as
+/// failed delivery and must NOT resend.
+#[derive(Debug)]
+pub struct FinalizeUndelivered {
+    pub reason: String,
+}
+
+impl fmt::Display for FinalizeUndelivered {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "final answer not delivered and must not be resent: {}",
+            self.reason
+        )
+    }
+}
+
+impl std::error::Error for FinalizeUndelivered {}
+
 /// Core channel trait — implement for any messaging platform.
 ///
 /// Every `Channel` is `Attributable`: the orchestrator's spawn site opens
@@ -891,6 +914,18 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
 
     /// Start listening for incoming messages (long-running)
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()>;
+
+    /// Receive the supervisor lifecycle token before `listen()` is called.
+    /// Channels that internally wait for shutdown can subscribe instead of
+    /// independently catching SIGINT.
+    fn set_cancel_token(&self, _token: CancellationToken) {}
+
+    /// Whether this channel participates in the cooperative cancellation
+    /// contract via `set_cancel_token`. Only participating channels get
+    /// a bounded grace period for cleanup after cancellation.
+    fn uses_cancel_token(&self) -> bool {
+        false
+    }
 
     /// Check if channel is healthy
     async fn health_check(&self) -> bool {
@@ -1120,6 +1155,20 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
         800
     }
 
+    /// Confirmed-delivery byte offset for a MultiMessage draft: how many bytes
+    /// of the cumulative visible text previously handed to `update_draft` have
+    /// already been emitted on the transport as paragraph messages (including
+    /// their trailing `\n\n` delimiters).
+    ///
+    /// The orchestrator reads this before `finalize_draft` so it can reconcile
+    /// a sanitized final response against the paragraphs that are already on
+    /// the wire without stranding or replaying content. Channels that do not
+    /// support multi-message streaming keep the default of `0` (nothing
+    /// confirmed).
+    async fn multi_message_confirmed_offset(&self, _recipient: &str, _message_id: &str) -> usize {
+        0
+    }
+
     /// Send an initial draft message. Returns a platform-specific message ID for later edits.
     async fn send_draft(&self, _message: &SendMessage) -> anyhow::Result<Option<String>> {
         Ok(None)
@@ -1347,6 +1396,31 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
             .request_approval(recipient, request)
             .await?
             .map(AttributedApprovalResponse::operator))
+    }
+
+    /// Request an attributed approval using a caller-owned response budget.
+    ///
+    /// The default keeps the existing caller-side timeout semantics. Channels
+    /// with a claim-aware deadline handoff may override this so their pending
+    /// decision and any bounded resolution grace share one deadline owner.
+    async fn request_approval_attributed_with_timeout(
+        &self,
+        recipient: &str,
+        request: &ChannelApprovalRequest,
+        timeout: std::time::Duration,
+    ) -> anyhow::Result<Option<AttributedApprovalResponse>> {
+        match tokio::time::timeout(
+            timeout,
+            self.request_approval_attributed(recipient, request),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Ok(Some(AttributedApprovalResponse::from_runtime(
+                ChannelApprovalResponse::Deny,
+                ApprovalSource::TimedOut,
+            ))),
+        }
     }
 
     /// Present a long-lived, out-of-band gate prompt (e.g. a parked SOP

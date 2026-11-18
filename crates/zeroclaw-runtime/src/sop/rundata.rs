@@ -9,6 +9,10 @@ use super::types::{SopStepResult, SopStepStatus};
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct RunData {
     pub outputs: BTreeMap<u32, Value>,
+    /// The decision model's p(yes) per conditional-part step, exposed to
+    /// `when:` conditions as `$.decisions.<step>`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub decisions: BTreeMap<u32, f64>,
 }
 
 impl RunData {
@@ -22,6 +26,11 @@ impl RunData {
         data
     }
 
+    pub fn with_decisions(mut self, decisions: &BTreeMap<u32, f64>) -> Self {
+        self.decisions.clone_from(decisions);
+        self
+    }
+
     pub fn insert_output(&mut self, step_number: u32, output: Value) {
         self.outputs.insert(step_number, output);
     }
@@ -33,6 +42,7 @@ impl RunData {
 
     pub fn merge(&mut self, other: RunData) {
         self.outputs.extend(other.outputs);
+        self.decisions.extend(other.decisions);
     }
 
     pub fn to_payload(&self) -> Value {
@@ -41,7 +51,15 @@ impl RunData {
             .iter()
             .map(|(step, value)| (step.to_string(), value.clone()))
             .collect();
-        json!({ "steps": Value::Object(steps) })
+        if self.decisions.is_empty() {
+            return json!({ "steps": Value::Object(steps) });
+        }
+        let decisions = self
+            .decisions
+            .iter()
+            .map(|(step, p)| (step.to_string(), json!(p)))
+            .collect();
+        json!({ "steps": Value::Object(steps), "decisions": Value::Object(decisions) })
     }
 
     pub fn get_path(&self, path: &str) -> Option<Value> {

@@ -2,6 +2,7 @@
 //! known NOT to cover (spec: the eight seams in the consolidation plan).
 
 use super::*;
+use crate::observability;
 use async_trait::async_trait;
 use std::collections::VecDeque;
 use std::ops::{Deref, DerefMut};
@@ -10,6 +11,9 @@ use tokio::sync::mpsc;
 use zeroclaw_api::ingress::IngressContext;
 use zeroclaw_api::model_provider::TokenUsage;
 use zeroclaw_providers::{ChatResponse, ToolCall};
+
+#[path = "safety_net_loop_recovery.rs"]
+mod loop_recovery;
 
 // ── shared fixtures ─────────────────────────────────────────────────────
 
@@ -579,6 +583,7 @@ async fn safety_net_thinking_never_leaks_into_draft_or_chunks() {
         parent_agent_alias: None,
         served_route_sink: None,
         sop_reassembly: None,
+        capability_binding: None,
         exec: crate::agent::loop_::ResolvedAgentExecution::resolve(
             crate::agent::loop_::ResolvedModelAccess {
                 model_provider: &provider,
@@ -598,6 +603,7 @@ async fn safety_net_thinking_never_leaks_into_draft_or_chunks() {
                 activated_tools: None,
                 model_switch_callback: None,
                 receipt_generator: None,
+                security: None,
             },
             crate::agent::loop_::ResolvedRuntimeKnobs {
                 max_tool_iterations: 5,
@@ -607,6 +613,7 @@ async fn safety_net_thinking_never_leaks_into_draft_or_chunks() {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 30_000,
+                keep_tool_context_turns: 2,
                 context_limits: zeroclaw_config::schema::ResolvedContextLimits {
                     model_context_window: 100_000,
                     context_token_budget: 100_000,
@@ -869,7 +876,7 @@ async fn safety_net_steering_persistence_includes_tool_round_shapes() {
         })],
     );
     let (tx, _rx) = mpsc::channel(256);
-    let (steer_tx, mut steer_rx) = mpsc::channel::<String>(4);
+    let (steer_tx, mut steer_rx) = mpsc::channel::<crate::agent::SteeringInput>(4);
     steer_tx
         .send("steer-text".into())
         .await
@@ -993,6 +1000,7 @@ async fn safety_net_task_locals_probe_per_entry_path() {
                 parent_agent_alias: None,
                 served_route_sink: None,
                 sop_reassembly: None,
+                capability_binding: None,
                 exec: crate::agent::loop_::ResolvedAgentExecution::resolve(
                     crate::agent::loop_::ResolvedModelAccess {
                         model_provider: &provider,
@@ -1012,6 +1020,7 @@ async fn safety_net_task_locals_probe_per_entry_path() {
                         activated_tools: None,
                         model_switch_callback: None,
                         receipt_generator: None,
+                        security: None,
                     },
                     crate::agent::loop_::ResolvedRuntimeKnobs {
                         max_tool_iterations: 5,
@@ -1021,6 +1030,7 @@ async fn safety_net_task_locals_probe_per_entry_path() {
                         strict_tool_parsing: false,
                         parallel_tools: false,
                         max_tool_result_chars: 30_000,
+                        keep_tool_context_turns: 2,
                         context_limits: zeroclaw_config::schema::ResolvedContextLimits {
                             model_context_window: 100_000,
                             context_token_budget: 100_000,
@@ -1933,6 +1943,69 @@ impl zeroclaw_api::channel::Channel for RecordingApprovalChannel {
     }
 }
 
+/// A channel that can carry turns but inherits the API's `Ok(None)` approval
+/// response because it has no inline approval surface.
+struct UnsupportedApprovalChannel;
+impl ::zeroclaw_api::attribution::Attributable for UnsupportedApprovalChannel {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Channel(
+            ::zeroclaw_api::attribution::ChannelKind::AcpChannel,
+        )
+    }
+    fn alias(&self) -> &str {
+        "unsupported"
+    }
+}
+#[async_trait]
+impl zeroclaw_api::channel::Channel for UnsupportedApprovalChannel {
+    fn name(&self) -> &str {
+        "unsupported"
+    }
+    async fn send(&self, _message: &zeroclaw_api::channel::SendMessage) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn listen(
+        &self,
+        _tx: mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+struct ErroringApprovalChannel;
+impl ::zeroclaw_api::attribution::Attributable for ErroringApprovalChannel {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Channel(
+            ::zeroclaw_api::attribution::ChannelKind::AcpChannel,
+        )
+    }
+    fn alias(&self) -> &str {
+        "erroring"
+    }
+}
+#[async_trait]
+impl zeroclaw_api::channel::Channel for ErroringApprovalChannel {
+    fn name(&self) -> &str {
+        "erroring"
+    }
+    async fn send(&self, _message: &zeroclaw_api::channel::SendMessage) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn listen(
+        &self,
+        _tx: mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn request_approval(
+        &self,
+        _recipient: &str,
+        _request: &zeroclaw_api::channel::ChannelApprovalRequest,
+    ) -> anyhow::Result<Option<zeroclaw_api::channel::ChannelApprovalResponse>> {
+        anyhow::bail!("approval transport failed")
+    }
+}
+
 /// Counts executions and captures the args it was actually invoked with —
 /// the observable for the `approved`-arg trust assertions.
 struct CapturingArgTool {
@@ -2171,6 +2244,105 @@ async fn safety_net_loop_shell_marks_args_approved_after_backchannel_approval() 
         args["approved"], true,
         "runtime injects approved=true only after a real back-channel approval"
     );
+}
+
+#[tokio::test]
+async fn safety_net_loop_unsupported_approval_backchannel_defers_ordinary_shell_to_tool_policy() {
+    let exec = Arc::new(AtomicUsize::new(0));
+    let captured = Arc::new(parking_lot::Mutex::new(None));
+    let mut agent = approval_agent(
+        Box::new(ScriptedProvider::new(vec![tool_response(vec![
+            tool_call_args(
+                "tc1",
+                "shell",
+                serde_json::json!({"command": "ls -la", "approved": true}),
+            ),
+        ])])),
+        vec![Box::new(CapturingArgTool {
+            name: "shell",
+            output: "shell-out",
+            calls: Arc::clone(&exec),
+            last_args: Arc::clone(&captured),
+        })],
+        Some(Arc::new(ApprovalManager::for_non_interactive_backchannel(
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+        ))),
+        Some(Arc::new(UnsupportedApprovalChannel)),
+    );
+    let (tx, _rx) = mpsc::channel(256);
+    agent
+        .turn_streamed_with_steering_state("go", tx, None, None)
+        .await
+        .expect("streamed turn should succeed");
+
+    assert_eq!(exec.load(Ordering::SeqCst), 1, "shell reaches tool policy");
+    let args = captured.lock().clone().expect("executed args captured");
+    assert_eq!(
+        args["approved"], false,
+        "unsupported approval must never manufacture operator approval"
+    );
+}
+
+#[tokio::test]
+async fn safety_net_loop_unsupported_approval_backchannel_does_not_bypass_always_ask_shell() {
+    let exec = Arc::new(AtomicUsize::new(0));
+    let captured = Arc::new(parking_lot::Mutex::new(None));
+    let risk = zeroclaw_config::schema::RiskProfileConfig {
+        always_ask: vec!["shell".into()],
+        ..zeroclaw_config::schema::RiskProfileConfig::default()
+    };
+    let mut agent = approval_agent(
+        Box::new(ScriptedProvider::new(vec![tool_response(vec![
+            tool_call_args(
+                "tc1",
+                "shell",
+                serde_json::json!({"command": "ls -la", "approved": true}),
+            ),
+        ])])),
+        vec![Box::new(CapturingArgTool {
+            name: "shell",
+            output: "shell-out",
+            calls: Arc::clone(&exec),
+            last_args: Arc::clone(&captured),
+        })],
+        Some(Arc::new(ApprovalManager::for_non_interactive_backchannel(
+            &risk,
+        ))),
+        Some(Arc::new(UnsupportedApprovalChannel)),
+    );
+    let (tx, _rx) = mpsc::channel(256);
+    agent
+        .turn_streamed_with_steering_state("go", tx, None, None)
+        .await
+        .expect("streamed turn should succeed");
+
+    assert_eq!(exec.load(Ordering::SeqCst), 0, "always_ask remains closed");
+    assert!(captured.lock().is_none());
+}
+
+#[tokio::test]
+async fn safety_net_loop_approval_backchannel_error_denies_ordinary_shell() {
+    let exec = Arc::new(AtomicUsize::new(0));
+    let mut agent = approval_agent(
+        Box::new(ScriptedProvider::new(vec![tool_response(vec![
+            tool_call_args("tc1", "shell", serde_json::json!({"command": "ls -la"})),
+        ])])),
+        vec![Box::new(CountingTool {
+            name: "shell",
+            calls: Arc::clone(&exec),
+        })],
+        Some(Arc::new(ApprovalManager::for_non_interactive_backchannel(
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+        ))),
+        Some(Arc::new(ErroringApprovalChannel)),
+    );
+    let (tx, _rx) = mpsc::channel(256);
+    agent
+        .turn_streamed_with_steering_state("go", tx, None, None)
+        .await
+        .expect("streamed turn should succeed");
+
+    assert_eq!(exec.load(Ordering::SeqCst), 0, "channel errors fail closed");
 }
 
 #[tokio::test]
@@ -2645,6 +2817,7 @@ async fn safety_net_narration_reaches_both_draft_and_event_channels_once() {
     crate::agent::loop_::run_tool_call_loop(crate::agent::loop_::ToolLoop {
         parent_agent_alias: None,
         sop_reassembly: None,
+        capability_binding: None,
         exec: crate::agent::loop_::ResolvedAgentExecution::resolve(
             crate::agent::loop_::ResolvedModelAccess {
                 model_provider: &provider,
@@ -2658,6 +2831,7 @@ async fn safety_net_narration_reaches_both_draft_and_event_channels_once() {
                 observer: &observability::NoopObserver {},
                 silent: true,
                 approval: None,
+                security: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
                 config: None,
                 hooks: None,
@@ -2673,6 +2847,7 @@ async fn safety_net_narration_reaches_both_draft_and_event_channels_once() {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 30_000,
+                keep_tool_context_turns: 2,
                 context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0),
                 context_limits_resolver: None,
                 knobs: &crate::agent::loop_::LoopKnobs::default(),
@@ -2939,6 +3114,7 @@ async fn usage_event_coherent_tuple_vision_route() {
         let cfg_arc = Arc::new(cfg.clone());
         let switch_cfg = ProviderSwitchConfig {
             config: Some(cfg_arc.clone()),
+            live_config: None,
             live: None,
         };
         let mut base_resp = text_response("base response");
@@ -3134,6 +3310,7 @@ async fn usage_event_coherent_tuple_in_turn_model_switch() {
         let cfg_arc = Arc::new(cfg.clone());
         let switch_cfg = ProviderSwitchConfig {
             config: Some(cfg_arc.clone()),
+            live_config: None,
             live: None,
         };
 
@@ -3316,6 +3493,7 @@ async fn usage_by_provider_breakdown_after_in_turn_model_switch() {
     let cfg_arc = Arc::new(cfg.clone());
     let switch_cfg = ProviderSwitchConfig {
         config: Some(cfg_arc),
+        live_config: None,
         live: None,
     };
 
@@ -3842,6 +4020,7 @@ async fn poisoned_model_switch_callback_still_raises_model_switch_requested() {
     let result = run_tool_call_loop(ToolLoop {
         parent_agent_alias: None,
         sop_reassembly: None,
+        capability_binding: None,
         exec: ResolvedAgentExecution::resolve(
             ResolvedModelAccess {
                 model_provider: &provider,
@@ -3861,6 +4040,7 @@ async fn poisoned_model_switch_callback_still_raises_model_switch_requested() {
                 activated_tools: None,
                 model_switch_callback: Some(Arc::clone(&callback)),
                 receipt_generator: None,
+                security: None,
             },
             ResolvedRuntimeKnobs {
                 max_tool_iterations: 5,
@@ -3870,6 +4050,7 @@ async fn poisoned_model_switch_callback_still_raises_model_switch_requested() {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 30_000,
+                keep_tool_context_turns: 2,
                 context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(
                     100_000,
                 ),

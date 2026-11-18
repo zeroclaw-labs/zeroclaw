@@ -539,6 +539,10 @@ pub(crate) struct Logs {
     follow: bool,
     min_severity: u8,
     subscribed: bool,
+    /// The daemon's reason for refusing this principal its log, shown in
+    /// place of the list. The daemon-wide log is limited to administrators
+    /// and the shared operator, and needs `logs:read`.
+    refused: Option<String>,
     detail_open: bool,
     detail: DetailState,
     /// Id of the event whose detail is currently being fetched
@@ -551,6 +555,9 @@ pub(crate) struct Logs {
     search_active: bool,
     search_buf: String,
     search_query: String, // committed query (applied on Enter)
+    run_filter_active: bool,
+    run_filter_buf: String,
+    sop_run_id: Option<String>,
     /// Segment-aware cursor from the previous page. Preferred over
     /// `next_cursor_offset`: it is the only cursor that can advance once
     /// the oldest event on a page lives in a rotated archive segment.
@@ -589,6 +596,7 @@ impl Logs {
             follow: true,
             min_severity: SEV_DEBUG,
             subscribed: false,
+            refused: None,
             detail_open: false,
             detail: DetailState::Loading,
             detail_request_id: None,
@@ -597,6 +605,9 @@ impl Logs {
             search_active: false,
             search_buf: String::new(),
             search_query: String::new(),
+            run_filter_active: false,
+            run_filter_buf: String::new(),
+            sop_run_id: None,
             next_cursor_segment: None,
             next_cursor_offset: None,
             next_cursor_legacy: None,
@@ -619,8 +630,15 @@ impl Logs {
     }
 
     pub(crate) async fn init(&mut self) -> anyhow::Result<()> {
-        self.rpc.logs_subscribe().await?;
-        self.subscribed = true;
+        match self.rpc.logs_subscribe().await {
+            Ok(()) => self.subscribed = true,
+            // A principal the daemon does not show its log still gets the
+            // rest of the TUI; this pane says why it is empty.
+            Err(error) => match crate::client::forbidden_reason(&error).map(str::to_string) {
+                Some(reason) => self.refused = Some(reason),
+                None => return Err(error),
+            },
+        }
         // Load initial history
         self.load_page(None, None, None).await;
         Ok(())
@@ -633,6 +651,11 @@ impl Logs {
         cursor_offset: Option<u64>,
         cursor_legacy: Option<(String, String)>,
     ) {
+        // The persisted log is refused with the stream: there is nothing to
+        // page, so don't ask.
+        if self.refused.is_some() {
+            return;
+        }
         self.loading = true;
         // Set when a cursor-bearing response turns out to contain only events
         // already in the buffer, which means the cursor bought no older
@@ -665,6 +688,7 @@ impl Logs {
             } else {
                 Some(self.search_query.clone())
             },
+            sop_run_id: self.sop_run_id.clone(),
             hide_internal: true,
             limit: Some(if has_cursor { PAGE_SIZE } else { INITIAL_LOAD }),
             ..Default::default()
@@ -677,6 +701,15 @@ impl Logs {
                     .events
                     .iter()
                     .rev()
+                    // New daemons apply this exact filter in the reader. Keep
+                    // the client guard too: an older RPC server may ignore the
+                    // newly added parameter, and must not make the run view
+                    // silently display unrelated rows.
+                    .filter(|event| {
+                        self.sop_run_id
+                            .as_deref()
+                            .is_none_or(|run_id| event_matches_sop_run_id(event, run_id))
+                    })
                     .filter_map(LogEntry::from_value)
                     .collect();
                 let prepended = new_entries.len();
@@ -802,7 +835,11 @@ impl Logs {
         loop {
             match self.notif_rx.try_recv() {
                 Ok(notif) if notif.method == LOGS_EVENT_METHOD => {
-                    if let Some(entry) = LogEntry::from_live_value(notif.params) {
+                    let matches_run = self
+                        .sop_run_id
+                        .as_deref()
+                        .is_none_or(|run_id| event_matches_sop_run_id(&notif.params, run_id));
+                    if matches_run && let Some(entry) = LogEntry::from_live_value(notif.params) {
                         self.events.push(entry);
                     }
                 }
@@ -880,7 +917,7 @@ impl Logs {
             .split(area);
 
         // Status bar
-        let help: String = if self.search_active {
+        let help: String = if self.search_active || self.run_filter_active {
             format!(
                 "Enter:{apply}  Esc:{cancel}",
                 apply = crate::i18n::t("zc-logs-search-action-apply"),
@@ -893,9 +930,11 @@ impl Logs {
         let status = Line::from(vec![
             Span::styled(" Logs ", theme::title_style()),
             Span::styled(format!("({}) ", filtered.len()), theme::dim_style()),
+            // Older events are offered only while there is history to page:
+            // a refused pane has none, whatever a refilter did to `at_end`.
             if self.loading {
                 Span::styled("[loading] ", theme::warn_style())
-            } else if !self.at_end {
+            } else if !self.at_end && self.refused.is_none() {
                 Span::styled("[more\u{2191}] ", theme::dim_style())
             } else {
                 Span::raw("")
@@ -918,7 +957,13 @@ impl Logs {
         frame.render_widget(Paragraph::new(status), chunks[0]);
 
         // Filter bar (always visible)
-        let filter_line = if self.search_active {
+        let filter_line = if self.run_filter_active {
+            Line::from(vec![
+                Span::styled(" run:", theme::dim_style()),
+                Span::styled(&self.run_filter_buf, theme::input_style()),
+                Span::styled("\u{2588}", theme::accent_style()),
+            ])
+        } else if self.search_active {
             Line::from(vec![
                 Span::styled(" sev\u{2265}", theme::dim_style()),
                 Span::styled(
@@ -946,6 +991,17 @@ impl Logs {
                 spans.push(Span::styled(" search: ", theme::dim_style()));
                 spans.push(Span::styled(&self.search_query, theme::accent_style()));
                 spans.push(Span::styled("  (c:clear)", theme::dim_style()));
+            }
+            if let Some(run_id) = &self.sop_run_id {
+                spans.push(Span::styled(
+                    format!(" {}: ", crate::i18n::t("zc-logs-run-filter-label")),
+                    theme::dim_style(),
+                ));
+                spans.push(Span::styled(run_id, theme::accent_style()));
+                spans.push(Span::styled(
+                    format!("  ({})", crate::i18n::t("zc-logs-run-filter-clear")),
+                    theme::dim_style(),
+                ));
             }
             Line::from(spans)
         };
@@ -986,6 +1042,21 @@ impl Logs {
         self.last_list_area = area;
         // Track inner height (minus borders) for scroll centering.
         self.list_height = area.height.saturating_sub(2);
+
+        if let Some(reason) = &self.refused {
+            let notice = crate::i18n::t_args("zc-logs-refused", &[("reason", reason)]);
+            frame.render_widget(
+                Paragraph::new(Span::styled(notice, theme::warn_style()))
+                    .wrap(Wrap { trim: true })
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .border_style(theme::dim_style()),
+                    ),
+                area,
+            );
+            return;
+        }
 
         let items: Vec<ListItem> = filtered
             .iter()
@@ -1459,6 +1530,9 @@ impl Logs {
     pub(crate) async fn handle_key(&mut self, key: KeyEvent) -> bool {
         use crate::keymap::LogsTabAction;
 
+        if self.run_filter_active {
+            return self.handle_run_filter_key(key).await;
+        }
         if self.search_active {
             self.copy_menu = None;
             self.text_selection = None;
@@ -1485,6 +1559,55 @@ impl Logs {
             return self.handle_detail_key(key).await;
         }
         self.handle_normal_key(key).await
+    }
+
+    async fn handle_run_filter_key(&mut self, key: KeyEvent) -> bool {
+        use crate::keymap::SearchBoxAction;
+        match SearchBoxAction::from_chord(&key) {
+            Some(SearchBoxAction::Accept) => {
+                let run_id = self.run_filter_buf.trim();
+                self.sop_run_id = (!run_id.is_empty()).then(|| run_id.to_string());
+                self.run_filter_active = false;
+                self.reload_for_run_filter().await;
+            }
+            Some(SearchBoxAction::Cancel) => {
+                self.run_filter_active = false;
+                self.run_filter_buf = self.sop_run_id.clone().unwrap_or_default();
+            }
+            Some(SearchBoxAction::Backspace) => {
+                self.run_filter_buf.pop();
+            }
+            _ => {
+                if let KeyCode::Char(c) = key.code
+                    && !key.modifiers.contains(KeyModifiers::CONTROL)
+                {
+                    self.run_filter_buf.push(c);
+                }
+            }
+        }
+        false
+    }
+
+    async fn reload_for_run_filter(&mut self) {
+        self.events.clear();
+        self.list_state.select(None);
+        // A new run filter is a new query: every cursor from the old one,
+        // including the segment cursor into rotated archives, is stale, and a
+        // gap reported for the old query says nothing about the new pages.
+        self.next_cursor_segment = None;
+        self.next_cursor_offset = None;
+        self.next_cursor_legacy = None;
+        self.at_end = false;
+        self.history_incomplete = false;
+        self.detail_open = false;
+        self.detail = DetailState::Loading;
+        self.detail_request_id = None;
+        self.load_page(None, None, None).await;
+        let filtered = self.filtered_indices();
+        self.follow = true;
+        if !filtered.is_empty() {
+            self.list_state.select(Some(filtered.len() - 1));
+        }
     }
 
     async fn handle_search_key(&mut self, key: KeyEvent) -> bool {
@@ -1537,6 +1660,15 @@ impl Logs {
             Some(LogsTabAction::BeginSearch) => {
                 self.search_active = true;
                 self.search_buf = self.search_query.clone();
+            }
+            Some(LogsTabAction::BeginRunFilter) => {
+                self.run_filter_active = true;
+                self.run_filter_buf = self.sop_run_id.clone().unwrap_or_default();
+            }
+            Some(LogsTabAction::ClearRunFilter) if self.sop_run_id.is_some() => {
+                self.sop_run_id = None;
+                self.run_filter_buf.clear();
+                self.reload_for_run_filter().await;
             }
             Some(LogsTabAction::DetailScrollDown) => {
                 self.detail_scroll = self.detail_scroll.saturating_add(1);
@@ -1597,6 +1729,15 @@ impl Logs {
             Some(LogsTabAction::BeginSearch) => {
                 self.search_active = true;
                 self.search_buf = self.search_query.clone();
+            }
+            Some(LogsTabAction::BeginRunFilter) => {
+                self.run_filter_active = true;
+                self.run_filter_buf = self.sop_run_id.clone().unwrap_or_default();
+            }
+            Some(LogsTabAction::ClearRunFilter) if self.sop_run_id.is_some() => {
+                self.sop_run_id = None;
+                self.run_filter_buf.clear();
+                self.reload_for_run_filter().await;
             }
             Some(LogsTabAction::OpenDetail) if self.selected_event_idx().is_some() => {
                 self.detail_open = true;
@@ -1843,17 +1984,18 @@ impl Logs {
         }
     }
 
-    /// Whether the pane is in a text-input mode (search bar active).
+    /// Whether the pane is in a text-input mode (search or run filter active).
     pub(crate) fn wants_text_input(&self) -> bool {
-        self.search_active
+        self.search_active || self.run_filter_active
     }
 
-    /// Route a bracketed-paste payload into the search buffer when the
-    /// search bar is open. Mirrors the char-insertion path in
-    /// `handle_search_key`; ignored when search isn't active so a stray
-    /// paste can't silently mutate hidden state.
+    /// Route a bracketed-paste payload into whichever filter editor is active.
+    /// Ignored outside text-input mode so a stray paste cannot mutate hidden
+    /// state.
     pub(crate) fn handle_paste(&mut self, text: &str) {
-        if self.search_active {
+        if self.run_filter_active {
+            self.run_filter_buf.push_str(text);
+        } else if self.search_active {
             self.search_buf.push_str(text);
         }
     }
@@ -1864,7 +2006,7 @@ impl crate::widgets::HelpContext for Logs {
         use crate::help::entries_for;
         use crate::keymap::LogsTabAction as L;
         use crate::widgets::{HelpEntry as E, HelpNode};
-        if self.search_active {
+        if self.search_active || self.run_filter_active {
             HelpNode::entries(entries_for([
                 crate::keymap::SearchBoxAction::Accept,
                 crate::keymap::SearchBoxAction::Cancel,
@@ -1880,6 +2022,8 @@ impl crate::widgets::HelpContext for Logs {
                 L::DetailWidenRight,
                 L::ToggleFollow,
                 L::BeginSearch,
+                L::BeginRunFilter,
+                L::ClearRunFilter,
                 L::IncreaseLevel,
                 L::DecreaseLevel,
                 L::ClearSearch,
@@ -1896,6 +2040,8 @@ impl crate::widgets::HelpContext for Logs {
                 L::OpenDetail,
                 L::ToggleFollow,
                 L::BeginSearch,
+                L::BeginRunFilter,
+                L::ClearRunFilter,
                 L::IncreaseLevel,
                 L::DecreaseLevel,
                 L::ClearSearch,
@@ -1910,6 +2056,23 @@ impl crate::widgets::HelpContext for Logs {
             HelpNode::entries(entries)
         }
     }
+}
+
+/// Mirror the persisted reader's narrow SOP compatibility bridge for live
+/// broadcast events, which have not yet round-tripped through `logs/query`.
+fn event_matches_sop_run_id(event: &Value, run_id: &str) -> bool {
+    if event
+        .pointer("/zeroclaw/sop_run_id")
+        .and_then(Value::as_str)
+        == Some(run_id)
+        || event.pointer("/attributes/run_id").and_then(Value::as_str) == Some(run_id)
+    {
+        return true;
+    }
+    event
+        .get("message")
+        .and_then(Value::as_str)
+        .is_some_and(|message| message.starts_with(&format!("SOP audit: run {run_id} ")))
 }
 
 #[cfg(test)]
@@ -2015,6 +2178,127 @@ mod tests {
         assert!(!logs.search_active);
         assert!(logs.copy_menu.is_none());
         assert!(logs.copy_feedback.is_none());
+    }
+
+    /// A log pane on a fake daemon that answers every request with `answer`
+    /// and records the method of each.
+    fn logs_with_daemon(
+        answer: crate::jsonrpc::JsonRpcError,
+    ) -> (Logs, Arc<std::sync::Mutex<Vec<String>>>) {
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let outbound = Arc::new(RpcOutbound::new(tx));
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (daemon, daemon_seen) = (Arc::clone(&outbound), Arc::clone(&seen));
+        tokio::spawn(async move {
+            while let Some(frame) = rx.recv().await {
+                let request: serde_json::Value = serde_json::from_str(&frame).expect("a request");
+                daemon_seen
+                    .lock()
+                    .unwrap()
+                    .push(request["method"].as_str().unwrap_or_default().to_string());
+                let id = request["id"].as_str().unwrap_or_default().to_string();
+                daemon.dispatch_response(&id, None, Some(answer.clone()));
+            }
+        });
+        (Logs::new(Arc::new(RpcClient::with_rpc(outbound))), seen)
+    }
+
+    fn rpc_error(code: i32, message: &str) -> crate::jsonrpc::JsonRpcError {
+        crate::jsonrpc::JsonRpcError {
+            code,
+            message: message.to_string(),
+            data: None,
+        }
+    }
+
+    fn rendered(logs: &mut Logs, width: u16, height: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("test terminal");
+        terminal
+            .draw(|frame| logs.draw(frame, frame.area()))
+            .expect("draw logs");
+        let buffer = terminal.backend().buffer();
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The daemon keeps its log from a scoped principal, as it does for any
+    /// account that is neither an administrator nor the shared operator.
+    /// Startup goes on: the pane shows the daemon's reason, and the
+    /// persisted log is not asked for.
+    #[tokio::test]
+    async fn a_refused_log_leaves_the_pane_open_with_the_reason() {
+        let reason = "Scoped principals cannot read the daemon-wide logs";
+        let (mut logs, seen) =
+            logs_with_daemon(rpc_error(crate::jsonrpc::error_codes::FORBIDDEN, reason));
+
+        logs.init()
+            .await
+            .expect("a refused log is not a startup failure");
+
+        assert!(!logs.subscribed);
+        assert_eq!(logs.refused.as_deref(), Some(reason));
+        assert_eq!(*seen.lock().unwrap(), ["logs/subscribe"]);
+        let screen = rendered(&mut logs, 120, 12);
+        assert!(screen.contains(reason), "{screen}");
+        assert!(
+            !screen.contains("[more\u{2191}]"),
+            "no older events are offered: {screen}"
+        );
+    }
+
+    /// Changing the severity or the search refilters the pane, which resets
+    /// its paging. A refused pane must still offer no older events, and ask
+    /// the daemon for nothing more.
+    #[tokio::test]
+    async fn a_refused_log_never_offers_older_events() {
+        let (mut logs, seen) = logs_with_daemon(rpc_error(
+            crate::jsonrpc::error_codes::FORBIDDEN,
+            "Scoped principals cannot read the daemon-wide logs",
+        ));
+        logs.init()
+            .await
+            .expect("a refused log is not a startup failure");
+        let offers_more = |logs: &mut Logs| rendered(logs, 120, 12).contains("[more\u{2191}]");
+        assert!(!offers_more(&mut logs));
+
+        for (key, what) in [
+            (KeyCode::Char('+'), "severity up"),
+            (KeyCode::Char('-'), "severity down"),
+            (KeyCode::Char('/'), "search begun"),
+            (KeyCode::Char('x'), "search typed"),
+            (KeyCode::Enter, "search accepted"),
+        ] {
+            logs.handle_key(KeyEvent::new(key, KeyModifiers::NONE))
+                .await;
+            assert!(!offers_more(&mut logs), "older events offered after {what}");
+        }
+        assert_eq!(logs.search_query, "x", "the search was accepted");
+        logs.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE))
+            .await;
+        assert!(logs.search_query.is_empty(), "the search was cleared");
+        assert!(
+            !offers_more(&mut logs),
+            "older events offered after the search was cleared"
+        );
+        assert_eq!(*seen.lock().unwrap(), ["logs/subscribe"]);
+    }
+
+    /// Any other failure still fails startup, as before.
+    #[tokio::test]
+    async fn a_failed_log_subscription_still_fails_startup() {
+        let (mut logs, _) = logs_with_daemon(rpc_error(
+            crate::jsonrpc::error_codes::INTERNAL_ERROR,
+            "boom",
+        ));
+
+        assert!(logs.init().await.is_err());
+        assert!(logs.refused.is_none());
     }
 
     #[test]
@@ -2146,6 +2430,29 @@ mod tests {
             .collect();
         assert!(text.contains("switched-model"));
         assert!(!text.contains(&crate::i18n::t("zc-logs-preview-only")));
+    }
+
+    #[test]
+    fn run_filter_matches_canonical_and_legacy_live_events() {
+        let run_id = "run-123-0001";
+        assert!(event_matches_sop_run_id(
+            &serde_json::json!({ "zeroclaw": { "sop_run_id": run_id } }),
+            run_id,
+        ));
+        assert!(event_matches_sop_run_id(
+            &serde_json::json!({ "attributes": { "run_id": run_id } }),
+            run_id,
+        ));
+        assert!(event_matches_sop_run_id(
+            &serde_json::json!({
+                "message": format!("SOP audit: run {run_id} started for 'review'")
+            }),
+            run_id,
+        ));
+        assert!(!event_matches_sop_run_id(
+            &serde_json::json!({ "attributes": { "run_id": "run-other" } }),
+            run_id,
+        ));
     }
 
     #[tokio::test]

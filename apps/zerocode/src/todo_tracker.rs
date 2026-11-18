@@ -15,7 +15,9 @@ use crate::wire::{PlanEntry, PlanStatus};
 // Re-export the config-owned runtime types so existing `crate::todo_tracker::*`
 // call sites keep resolving after these moved to `crate::config` (their single
 // owner). The widget below is built from them.
-pub(crate) use crate::config::{TodoLocation, TodoTrackerSettings};
+#[cfg(test)]
+pub(crate) use crate::config::TodoLocation;
+pub(crate) use crate::config::TodoTrackerSettings;
 
 #[derive(Debug)]
 pub(crate) struct TodoTracker {
@@ -54,16 +56,19 @@ impl TodoTracker {
         self.settings
     }
 
+    #[cfg(test)]
     pub(crate) fn location(&self) -> TodoLocation {
         self.settings.location
     }
 
     /// Side-panel target column width from config (left/right).
+    #[cfg(test)]
     pub(crate) fn width(&self) -> u16 {
         self.settings.width
     }
 
     /// Bottom-strip max height from config.
+    #[cfg(test)]
     pub(crate) fn max_height(&self) -> u16 {
         self.settings.max_height
     }
@@ -96,6 +101,7 @@ impl TodoTracker {
     }
 
     /// Explicitly hide the tracker while retaining the current plan.
+    #[cfg(test)]
     pub(crate) fn hide(&mut self) {
         if self.settings.enabled {
             self.visible = false;
@@ -127,6 +133,7 @@ impl TodoTracker {
     /// Side panels always claim space when visible (placeholder when
     /// empty); the bottom strip claims space only when it has entries
     /// (terminal row height is precious).
+    #[cfg(test)]
     pub(crate) fn wants_space(&self) -> bool {
         if !self.is_visible() {
             return false;
@@ -137,10 +144,24 @@ impl TodoTracker {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn render(
         &self,
         frame: &mut ratatui::Frame,
         area: ratatui::layout::Rect,
+    ) -> Option<ratatui::layout::Rect> {
+        self.render_with_close(frame, area, true)
+    }
+
+    pub(crate) fn render_docked(&self, frame: &mut ratatui::Frame, area: ratatui::layout::Rect) {
+        self.render_with_close(frame, area, false);
+    }
+
+    fn render_with_close(
+        &self,
+        frame: &mut ratatui::Frame,
+        area: ratatui::layout::Rect,
+        show_close: bool,
     ) -> Option<ratatui::layout::Rect> {
         use ratatui::style::{Modifier, Style};
         use ratatui::text::{Line, Span};
@@ -148,23 +169,26 @@ impl TodoTracker {
 
         use crate::theme;
 
+        let total = self.total().to_string();
+        let done = self.done().to_string();
         let title = format!(
-            " Plan ({}) — {}/{} done ",
-            self.total(),
-            self.done(),
-            self.total()
+            " {} ",
+            crate::i18n::t_args("zc-todo-plan-title", &[("total", &total), ("done", &done)],)
         );
         // Themed pane chrome: dim border + bold themed title, matching
         // every other split-pane in the Code/Chat view. `fill_style`
         // paints the panel interior with the theme background so the
         // tracker never shows the terminal default through.
-        let close_rect = close_hit_rect(area);
+        let close_rect = show_close.then(|| close_hit_rect(area)).flatten();
         let block = theme::panel_block(&title).style(theme::fill_style());
 
         if self.entries.is_empty() {
-            let placeholder = Paragraph::new(Span::styled("No active plan", theme::dim_style()))
-                .style(theme::fill_style())
-                .block(block);
+            let placeholder = Paragraph::new(Span::styled(
+                crate::i18n::t("zc-todo-plan-empty"),
+                theme::dim_style(),
+            ))
+            .style(theme::fill_style())
+            .block(block);
             frame.render_widget(placeholder, area);
             if let Some(rect) = close_rect {
                 frame.render_widget(

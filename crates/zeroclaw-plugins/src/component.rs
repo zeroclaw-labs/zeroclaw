@@ -7,15 +7,17 @@ use std::time::Duration;
 use wasmtime::component::{Component, ResourceTable};
 use wasmtime::{Config, Engine, Store, StoreLimits, StoreLimitsBuilder};
 use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
-use wasmtime_wasi_http::WasiHttpCtx;
-use wasmtime_wasi_http::p2::{WasiHttpCtxView, WasiHttpView};
+use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpCtxView, WasiHttpView};
 
 use crate::config::ResolvedPluginConfig;
-use crate::egress::EgressHostService;
+use crate::egress::{AuthorizedEgress, EgressError, EgressHostService, build_tls_client_config};
 use crate::error::PluginError;
 use crate::host::AdmittedComponent;
 use crate::instance::PluginInstanceScope;
-use crate::services::{ConfigLookupError, PluginHostServices, SecretLookupError};
+use crate::services::{
+    ConfigLookupError, PluginHostServices, PluginStateError, PluginStateKey, PluginStateValue,
+    SecretLookupError,
+};
 use crate::wasi_http::PluginEgressHooks;
 use crate::{PluginCapability, PluginPermission};
 
@@ -170,16 +172,30 @@ pub mod bindings {
         wasmtime::component::bindgen!({
             world: "tool-plugin",
             path: "wit/v0",
-            imports: { default: async },
+            imports: {
+                default: async,
+                "zeroclaw:plugin/websocket": async | trappable,
+            },
             exports: { default: async },
+            with: {
+                "zeroclaw:plugin/sockets.connection": crate::sockets::SocketConnection,
+                "zeroclaw:plugin/websocket.connection": crate::component_websocket::WebSocketConnection,
+            },
         });
     }
     pub mod channel {
         wasmtime::component::bindgen!({
             world: "channel-plugin",
             path: "wit/v0",
-            imports: { default: async },
+            imports: {
+                default: async,
+                "zeroclaw:plugin/websocket": async | trappable,
+            },
             exports: { default: async },
+            with: {
+                "zeroclaw:plugin/sockets.connection": crate::sockets::SocketConnection,
+                "zeroclaw:plugin/websocket.connection": crate::component_websocket::WebSocketConnection,
+            },
         });
     }
     pub mod memory {
@@ -200,6 +216,9 @@ pub struct PluginState {
     wasi: WasiCtx,
     table: ResourceTable,
     http: Option<HttpSurface>,
+    /// The host-owned egress authority for socket and WebSocket imports.
+    /// `None` is deny-by-default, exactly as for `wasi:http`.
+    egress: Option<EgressHostService>,
     inbound: InboundQueue,
     limits: StoreLimits,
     fuel_per_call: u64,
@@ -273,6 +292,7 @@ impl PluginState {
             wasi: WasiCtx::builder().build(),
             table: ResourceTable::new(),
             http,
+            egress: spec.egress,
             inbound: spec.inbound,
             limits: StoreLimitsBuilder::new()
                 .memory_size(spec.limits.max_memory_bytes)
@@ -290,9 +310,108 @@ impl PluginState {
         &self.scope
     }
 
+    /// The egress authority transport imports authorize through, or `None`
+    /// when this instance has no reach at all.
+    #[must_use]
+    pub(crate) fn egress_service(&self) -> Option<EgressHostService> {
+        self.egress.clone()
+    }
+
+    /// The store's resource table, which holds host-owned connection resources.
+    #[must_use]
+    pub(crate) fn resource_table(&self) -> &ResourceTable {
+        &self.table
+    }
+
+    /// Mutable access to the store's resource table.
+    pub(crate) fn resource_table_mut(&mut self) -> &mut ResourceTable {
+        &mut self.table
+    }
+
+    /// Whether the admitted scope holds `permission`. Optional host imports are
+    /// linked from this answer, so a grant and an import cannot disagree.
+    #[must_use]
+    pub(crate) fn permission_enabled(&self, permission: PluginPermission) -> bool {
+        self.scope.grants().allows(permission)
+    }
+
+    /// Build the TLS client configuration for one authorized connection.
+    ///
+    /// Starts from the roots plugin HTTPS trusts, unless the authorization's TLS
+    /// profile keeps no system roots, and applies that profile, reading any
+    /// referenced certificate material from this frame's resolved config. The
+    /// material is host-consumed: this read does not go through the
+    /// guest-facing `secrets` gate, and the runtime marks every
+    /// profile-referenced property host-only so that gate refuses it.
+    ///
+    /// The configuration is built for the one connection that asked for it and
+    /// is owned by that connection, which drops it on close. Nothing else keeps
+    /// it, and the profile's CA and client-identity material lives only in this
+    /// frame's transient config view, so a rotation reaches connections opened
+    /// in later frames. System roots are the exception: they come from the
+    /// plugin HTTPS trust assembly, which is read once per process.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EgressError`] for an authorization issued under another
+    /// admission than this store's, including one with an equal logical
+    /// instance ID, trust roots that could not be assembled in time, an
+    /// unavailable referenced secret, or invalid certificate material.
+    pub(crate) async fn tls_client_config(
+        &mut self,
+        authorized: &AuthorizedEgress,
+    ) -> Result<Arc<rustls::ClientConfig>, EgressError> {
+        // Admission issuance, not logical identity: a separately admitted scope
+        // can share this store's instance ID while carrying different grants.
+        // Checked before any trust root, config, or secret is read.
+        if !authorized.request().scope().same_issuance(&self.scope) {
+            return Err(EgressError::AuthorizationScopeMismatch);
+        }
+        let profile = authorized.tls_profile();
+        if profile.is_some_and(|profile| {
+            profile.custom_ca().is_some() || profile.client_identity().is_some()
+        }) {
+            self.with_call_config(|config| config.ensure_tls_authorization(authorized))
+                .map_err(|_| EgressError::TlsConfigMismatch)??;
+        }
+        // A profile that keeps no system roots never reads them, so it neither
+        // waits on nor depends on the machine-store assembly.
+        let roots = if crate::egress::trusts_system_roots(profile) {
+            crate::wasi_http::plugin_trust_roots(
+                tokio::time::Instant::now() + crate::egress::EGRESS_CONNECT_DEADLINE,
+            )
+            .await
+            .map_err(|_| {
+                EgressError::PolicyUnavailable("plugin trust roots unavailable".to_string())
+            })?
+        } else {
+            Arc::new(rustls::RootCertStore::empty())
+        };
+        if profile.is_some_and(|profile| {
+            profile.custom_ca().is_some() || profile.client_identity().is_some()
+        }) {
+            self.with_call_config(|config| config.tls_client_config(authorized, &roots))
+                .map_err(|_| EgressError::TlsConfigMismatch)?
+        } else {
+            build_tls_client_config(profile, &roots, |_| Err(EgressError::TlsConfigMismatch))
+        }
+    }
+
     fn start_call(&mut self, phase: PluginCallPhase) {
         self.call_config = CallConfig::Unresolved(phase);
         self.host_calls_remaining = MAX_HOST_CALLS_PER_FRAME;
+    }
+
+    /// Open a frame without a store: a service frame for this instance's
+    /// capability when `service` is set, otherwise a metadata frame.
+    #[cfg(test)]
+    pub(crate) fn start_test_frame(&mut self, service: bool) {
+        let phase = match (service, self.scope.id().capability()) {
+            (true, PluginCapability::Tool) => PluginCallPhase::ToolExecute,
+            (true, PluginCapability::Channel) => PluginCallPhase::ChannelService,
+            _ => PluginCallPhase::Standard,
+        };
+        self.start_call(phase);
     }
 
     fn finish_call(&mut self) {
@@ -340,8 +459,11 @@ impl PluginState {
         true
     }
 
-    /// Whether the active frame may resolve this instance's secret properties.
-    fn secret_service_enabled(&self) -> bool {
+    /// Whether the active frame may use this instance's scoped host services.
+    ///
+    /// Durable state, secrets, and new socket or WebSocket connections all
+    /// require it, so a metadata probe cannot reach the network or storage.
+    pub(crate) fn instance_services_enabled(&self) -> bool {
         matches!(
             (self.call_config.phase(), self.scope.id().capability()),
             (Some(PluginCallPhase::ToolExecute), PluginCapability::Tool)
@@ -377,15 +499,76 @@ impl PluginState {
         if !self.charge_host_call() {
             return Err(SecretLookupError::Unavailable);
         }
-        if !self.secret_service_enabled() {
+        if !self.instance_services_enabled() {
             return Err(SecretLookupError::Unavailable);
         }
         if !self.scope.grants().allows(PluginPermission::ConfigRead) {
             return Err(SecretLookupError::AccessDenied);
         }
-        self.with_call_config(|config| config.secret(name).map(ToOwned::to_owned))
-            .map_err(|_| SecretLookupError::Unavailable)?
-            .ok_or(SecretLookupError::NotFound)
+        self.with_call_config(|config| {
+            if config.is_host_only(name) {
+                return Err(SecretLookupError::AccessDenied);
+            }
+            config
+                .secret(name)
+                .map(ToOwned::to_owned)
+                .ok_or(SecretLookupError::NotFound)
+        })
+        .map_err(|_| SecretLookupError::Unavailable)?
+    }
+
+    /// Read durable state under the immutable store-owned instance scope.
+    pub(crate) async fn state_get(
+        &mut self,
+        key: String,
+    ) -> Result<Option<PluginStateValue>, PluginStateError> {
+        if !self.charge_host_call() || !self.instance_services_enabled() {
+            return Err(PluginStateError::Unavailable);
+        }
+        if !self.scope.grants().allows(PluginPermission::StateRead) {
+            return Err(PluginStateError::AccessDenied);
+        }
+        let key = PluginStateKey::parse(key)?;
+        let state = self.services.state().clone();
+        let scope = self.scope.clone();
+        state.get(&scope, &key).await
+    }
+
+    /// Commit durable state with compare-and-swap semantics.
+    pub(crate) async fn state_put(
+        &mut self,
+        key: String,
+        value: Vec<u8>,
+        expected_revision: Option<u64>,
+    ) -> Result<u64, PluginStateError> {
+        if !self.charge_host_call() || !self.instance_services_enabled() {
+            return Err(PluginStateError::Unavailable);
+        }
+        if !self.scope.grants().allows(PluginPermission::StateWrite) {
+            return Err(PluginStateError::AccessDenied);
+        }
+        let key = PluginStateKey::parse(key)?;
+        let state = self.services.state().clone();
+        let scope = self.scope.clone();
+        state.put(&scope, &key, &value, expected_revision).await
+    }
+
+    /// Delete durable state with compare-and-swap semantics.
+    pub(crate) async fn state_delete(
+        &mut self,
+        key: String,
+        expected_revision: u64,
+    ) -> Result<(), PluginStateError> {
+        if !self.charge_host_call() || !self.instance_services_enabled() {
+            return Err(PluginStateError::Unavailable);
+        }
+        if !self.scope.grants().allows(PluginPermission::StateWrite) {
+            return Err(PluginStateError::AccessDenied);
+        }
+        let key = PluginStateKey::parse(key)?;
+        let state = self.services.state().clone();
+        let scope = self.scope.clone();
+        state.delete(&scope, &key, expected_revision).await
     }
 
     /// Whether this state was built with outbound HTTP attached.
@@ -415,7 +598,7 @@ impl WasiView for PluginState {
 
 impl WasiHttpView for PluginState {
     /// Hand `wasi:http` ZeroClaw's policy hooks instead of
-    /// `wasmtime_wasi_http::p2::default_hooks()`. The default hooks send every
+    /// `wasmtime_wasi_http::default_hooks()`. The default hooks send every
     /// request the guest asks for; these submit it to the host-owned egress
     /// boundary first and own the connect (see [`crate::wasi_http`]).
     fn http(&mut self) -> WasiHttpCtxView<'_> {
@@ -448,6 +631,66 @@ pub fn add_wasi_http(linker: &mut wasmtime::component::Linker<PluginState>) -> R
         wasmtime_wasi_http::p2::add_only_http_to_linker_async(linker),
         "failed to add wasi:http imports to plugin linker",
     )
+}
+
+/// Which optional host imports a store's linker exposes, derived from the
+/// store's own admitted scope. Also the key for cached linkers, which bounds
+/// the cache by these flags.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct OptionalImports {
+    pub(crate) http: bool,
+    pub(crate) sockets: bool,
+    pub(crate) websocket: bool,
+}
+
+impl OptionalImports {
+    /// The imports `state`'s scope authorizes.
+    pub(crate) fn for_store(state: &PluginState) -> Self {
+        Self {
+            http: state.http_enabled(),
+            sockets: state.permission_enabled(PluginPermission::SocketClient),
+            websocket: state.permission_enabled(PluginPermission::WebSocketClient),
+        }
+    }
+}
+
+/// Refuse to instantiate when a linker's optional imports differ from what the
+/// store's scope grants. The linker is derived from the same scope, so this is
+/// defense in depth: a future caller cannot pair a store with a wider linker.
+pub(crate) fn ensure_imports_coherent(
+    store: &Store<PluginState>,
+    imports: OptionalImports,
+) -> Result<()> {
+    ensure_http_coherent(store, imports.http)?;
+    ensure_permission_coherent(
+        store,
+        PluginPermission::SocketClient,
+        "zeroclaw:plugin/sockets",
+        imports.sockets,
+    )?;
+    ensure_permission_coherent(
+        store,
+        PluginPermission::WebSocketClient,
+        "zeroclaw:plugin/websocket",
+        imports.websocket,
+    )
+}
+
+/// Refuse an optional import whose presence differs from the store's grant.
+pub(crate) fn ensure_permission_coherent(
+    store: &Store<PluginState>,
+    permission: PluginPermission,
+    import_name: &str,
+    linker_has_import: bool,
+) -> Result<()> {
+    let granted = store.data().permission_enabled(permission);
+    if granted != linker_has_import {
+        anyhow::bail!(
+            "plugin store/linker mismatch for {import_name}: store {permission:?}={granted}, \
+             linker import={linker_has_import}; refusing to instantiate"
+        );
+    }
+    Ok(())
 }
 
 pub fn ensure_http_coherent(store: &Store<PluginState>, linker_has_http: bool) -> Result<()> {
@@ -551,11 +794,10 @@ pub(crate) fn call_timeout_error(deadline: Duration) -> anyhow::Error {
     ))
 }
 
-/// Error returned after an interrupted warm instance has been discarded.
+/// Error returned after a warm instance has been discarded because a call into
+/// it was interrupted or failed inside Wasmtime.
 pub(crate) fn unavailable_instance_error() -> anyhow::Error {
-    anyhow::Error::msg(
-        "plugin instance is unavailable: a previous call was interrupted before completion",
-    )
+    anyhow::Error::msg("plugin instance is unavailable: a previous call failed or was interrupted")
 }
 
 /// Hint appended to instantiation failures, pointing plugin authors at the
@@ -603,8 +845,18 @@ fn load_inner(component: &AdmittedComponent) -> wasmtime::Result<Component> {
 /// interrupted store is discarded (the slot is left empty) rather than resumed.
 /// The `ActivePluginCall` frame refuels the store and exposes the phase's
 /// config/secrets for the call, then clears that transient view on drop.
+///
+/// `$body` returns the export's own Wasmtime result. `Err` means the call
+/// failed inside Wasmtime: a guest trap, exhausted fuel, a failed host import,
+/// or a result that could not be lifted. Wasmtime refuses every later call
+/// into a store after the first three, and the last skips the export's
+/// post-return cleanup, so the store is discarded as an interrupted one is,
+/// and the error is reported with `$context`. An error the export itself
+/// returns arrives inside `Ok`, and the store goes back to its slot. Return a
+/// host-side failure inside `Ok` as well: `?` turns any `std::error::Error`
+/// into a Wasmtime error, which would discard a healthy store.
 macro_rules! call_plugin_frame {
-    ($self:expr, $constructor:ident, $body:expr) => {{
+    ($self:expr, $constructor:ident, $context:expr, $body:expr) => {{
         let mut guard = $self.state.lock().await;
         match guard.take() {
             None => Err(crate::component::unavailable_instance_error()),
@@ -612,18 +864,17 @@ macro_rules! call_plugin_frame {
                 let deadline = store.data().call_timeout();
                 let mut active_call = crate::component::ActivePluginCall::$constructor(&mut store);
                 let f = $body;
-                match ::tokio::time::timeout(deadline, f(active_call.store_mut(), &mut bindings))
-                    .await
-                {
-                    Ok(result) => {
-                        drop(active_call);
+                let outcome =
+                    ::tokio::time::timeout(deadline, f(active_call.store_mut(), &mut bindings))
+                        .await;
+                drop(active_call);
+                match outcome {
+                    Ok(Ok(value)) => {
                         *guard = Some((store, bindings));
-                        result
+                        Ok(value)
                     }
-                    Err(_) => {
-                        drop(active_call);
-                        Err(crate::component::call_timeout_error(deadline))
-                    }
+                    Ok(Err(error)) => crate::component::wt(Err(error), $context),
+                    Err(_) => Err(crate::component::call_timeout_error(deadline)),
                 }
             }
         }
@@ -632,21 +883,34 @@ macro_rules! call_plugin_frame {
 pub(crate) use call_plugin_frame;
 
 macro_rules! call_plugin {
-    ($self:expr, $body:expr) => {{ crate::component::call_plugin_frame!($self, new, $body) }};
+    ($self:expr, $context:expr, $body:expr) => {{ crate::component::call_plugin_frame!($self, new, $context, $body) }};
 }
 pub(crate) use call_plugin;
 
 macro_rules! call_tool_execute {
-    ($self:expr, $body:expr) => {{ crate::component::call_plugin_frame!($self, tool_execute, $body) }};
+    ($self:expr, $context:expr, $body:expr) => {{ crate::component::call_plugin_frame!($self, tool_execute, $context, $body) }};
 }
 pub(crate) use call_tool_execute;
 
-/// Warm channel calls reinstantiate from host-owned inputs when the previous
-/// call was interrupted and discarded, then run under the same
-/// discard-on-interruption rule as other warm instances, inside the
-/// channel-service frame.
+/// Run one warm channel export inside the channel-service frame, bounded by
+/// the wall-clock deadline, first rebuilding the instance from host-owned
+/// inputs when an earlier call discarded it.
+///
+/// `$body` returns the export's own Wasmtime result. `Err` means the call
+/// failed inside Wasmtime: a guest trap, exhausted fuel, a failed host import,
+/// or a result that could not be lifted. Wasmtime refuses every later call
+/// into a store after the first three, and the last skips the export's
+/// post-return cleanup, so the instance is discarded, as it is after a missed
+/// deadline, and the error is reported with `$context`. An error the export
+/// itself returns arrives inside `Ok`, and the instance goes back to its slot.
+///
+/// Both kinds of discard count against the channel's rebuild budget, so a
+/// hung export cannot reconnect the plugin at every deadline. The
+/// `waits_on_person` form leaves missed deadlines out, for an export that
+/// waits for a person to answer, such as an approval prompt: a slow answer
+/// is not a broken plugin.
 macro_rules! call_channel {
-    ($self:expr, $body:expr) => {{
+    (@call $self:expr, $count_missed_deadline:expr, $context:expr, $body:expr) => {{
         'plugin_call: {
             let mut guard = $self.state.lock().await;
             if guard.is_none() {
@@ -661,19 +925,32 @@ macro_rules! call_channel {
             let deadline = store.data().call_timeout();
             let mut active_call = crate::component::ActivePluginCall::channel_service(&mut store);
             let f = $body;
-            match ::tokio::time::timeout(deadline, f(active_call.store_mut(), &mut bindings)).await
-            {
-                Ok(result) => {
-                    drop(active_call);
+            let outcome =
+                ::tokio::time::timeout(deadline, f(active_call.store_mut(), &mut bindings)).await;
+            drop(active_call);
+            match outcome {
+                Ok(Ok(value)) => {
                     *guard = Some((store, bindings));
-                    break 'plugin_call result;
+                    Ok(value)
+                }
+                Ok(Err(error)) => {
+                    $self.instance_failed();
+                    crate::component::wt(Err(error), $context)
                 }
                 Err(_) => {
-                    drop(active_call);
-                    break 'plugin_call Err(crate::component::call_timeout_error(deadline));
+                    if $count_missed_deadline {
+                        $self.instance_failed();
+                    }
+                    Err(crate::component::call_timeout_error(deadline))
                 }
             }
         }
+    }};
+    ($self:expr, waits_on_person, $context:expr, $body:expr) => {{
+        crate::component::call_channel!(@call $self, false, $context, $body)
+    }};
+    ($self:expr, $context:expr, $body:expr) => {{
+        crate::component::call_channel!(@call $self, true, $context, $body)
     }};
 }
 pub(crate) use call_channel;
@@ -745,6 +1022,7 @@ mod tests {
             wasm_path: Some("fixture.wasm".to_string()),
             wasm_sha256: None,
             capabilities: vec![capability],
+            provides: None,
             permissions: vec![PluginPermission::ConfigRead],
             config_schema: Some(serde_json::json!({
                 "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -788,7 +1066,7 @@ mod tests {
         manifest: PluginManifest,
         values: HashMap<String, String>,
     ) -> PluginHostServices {
-        PluginHostServices::new(PluginConfigResolver::new(move |scope| {
+        crate::services::test_services(PluginConfigResolver::new(move |scope| {
             resolve_plugin_config(&manifest, scope, Some(&values))
         }))
     }
@@ -803,7 +1081,7 @@ mod tests {
             let denied = secret_scope(&manifest, capability, "main", false);
             let calls = Arc::new(AtomicUsize::new(0));
             let resolver_calls = Arc::clone(&calls);
-            let services = PluginHostServices::new(PluginConfigResolver::new(move |_| {
+            let services = crate::services::test_services(PluginConfigResolver::new(move |_| {
                 resolver_calls.fetch_add(1, Ordering::SeqCst);
                 panic!("denied lookup must not invoke config resolution")
             }));
@@ -832,7 +1110,7 @@ mod tests {
         let scope = secret_scope(&manifest, PluginCapability::Channel, "main", true);
         let calls = Arc::new(AtomicUsize::new(0));
         let resolver_calls = Arc::clone(&calls);
-        let services = PluginHostServices::new(PluginConfigResolver::new(move |_| {
+        let services = crate::services::test_services(PluginConfigResolver::new(move |_| {
             resolver_calls.fetch_add(1, Ordering::SeqCst);
             panic!("disabled secret frame must not invoke config resolution")
         }));
@@ -858,7 +1136,7 @@ mod tests {
             let scope = secret_scope(&manifest, capability, "main", true);
             let calls = Arc::new(AtomicUsize::new(0));
             let resolver_calls = Arc::clone(&calls);
-            let services = PluginHostServices::new(PluginConfigResolver::new(move |_| {
+            let services = crate::services::test_services(PluginConfigResolver::new(move |_| {
                 resolver_calls.fetch_add(1, Ordering::SeqCst);
                 panic!("a mismatched call phase must not resolve secrets")
             }));
@@ -870,6 +1148,32 @@ mod tests {
             state.finish_call();
             assert_eq!(calls.load(Ordering::SeqCst), 0);
         }
+    }
+
+    #[test]
+    fn guest_cannot_read_a_secret_reserved_for_the_host() {
+        let manifest = secret_manifest(PluginCapability::Tool);
+        let scope = secret_scope(&manifest, PluginCapability::Tool, "main", true);
+        let values = configured("one", "private-key-pem");
+        let services = crate::services::test_services(PluginConfigResolver::new(move |scope| {
+            resolve_plugin_config(&manifest, scope, Some(&values)).map(|config| {
+                config.reserve_for_host([zeroclaw_api::plugin_key::SecretPropertyRef::parse(
+                    "api_key",
+                )
+                .expect("portable")])
+            })
+        }));
+        let mut state = PluginState::new(PluginStoreSpec::new(scope, services, test_limits(1_000)));
+
+        state.start_call(PluginCallPhase::ToolExecute);
+        assert_eq!(
+            state.secret("api_key"),
+            Err(SecretLookupError::AccessDenied)
+        );
+        let host_view = state
+            .with_call_config(|config| config.secret("api_key").map(ToOwned::to_owned))
+            .expect("resolved config");
+        assert_eq!(host_view.as_deref(), Some("private-key-pem"));
     }
 
     #[test]
@@ -900,7 +1204,7 @@ mod tests {
         let requested = secret_scope(&manifest, PluginCapability::Tool, "main", true);
         let issued = secret_scope(&manifest, PluginCapability::Tool, "backup", true);
         let resolver_manifest = Arc::clone(&manifest);
-        let services = PluginHostServices::new(PluginConfigResolver::new(move |_| {
+        let services = crate::services::test_services(PluginConfigResolver::new(move |_| {
             let values = configured("one", "backup-token");
             resolve_plugin_config(&resolver_manifest, &issued, Some(&values))
         }));
@@ -915,6 +1219,347 @@ mod tests {
         state.finish_call();
     }
 
+    /// A socket-capable tool manifest whose `ca_pem` secret a TLS profile
+    /// references.
+    fn tls_manifest() -> PluginManifest {
+        PluginManifest {
+            permissions: vec![PluginPermission::ConfigRead, PluginPermission::SocketClient],
+            config_schema: Some(serde_json::json!({
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "type": "object",
+                "properties": {
+                    "ca_pem": {"type": "string", "x-secret": true}
+                },
+                "additionalProperties": false
+            })),
+            ..secret_manifest(PluginCapability::Tool)
+        }
+    }
+
+    fn tls_scope(
+        manifest: &PluginManifest,
+        grants: impl IntoIterator<Item = PluginPermission>,
+    ) -> PluginInstanceScope {
+        PluginInstanceScope::from_manifest(manifest, PluginCapability::Tool, "main", grants)
+            .expect("valid TLS test scope")
+    }
+
+    /// An egress authority granting `service.example`, with a `private-ca`
+    /// profile that trusts only the instance's `ca_pem` secret.
+    fn tls_egress() -> EgressHostService {
+        use crate::egress::{EgressPolicy, EgressPolicyResolver, TlsProfile, TlsProfileName};
+
+        EgressHostService::with_private_connection_accounting(EgressPolicyResolver::new(|_| {
+            let hosts = ["service.example".to_string()];
+            EgressPolicy::new(&hosts, &[], &[], 4)?
+                .with_tls_profiles([TlsProfile::new(
+                    TlsProfileName::new("private-ca")?,
+                    &hosts,
+                    false,
+                    Some(
+                        zeroclaw_api::plugin_key::SecretPropertyRef::parse("ca_pem")
+                            .expect("portable"),
+                    ),
+                    None,
+                )?])
+                .map(|policy| {
+                    policy.with_tls_config_witness(crate::egress::TlsConfigWitness::new([0; 32]))
+                })
+        }))
+    }
+
+    /// Authorize one TLS connection to `service.example` under `scope`.
+    fn authorize_tls(egress: &EgressHostService, scope: &PluginInstanceScope) -> AuthorizedEgress {
+        use crate::egress::{EgressRequest, EgressTransport};
+
+        let request =
+            EgressRequest::new(scope.clone(), EgressTransport::Tls, "service.example", 443)
+                .and_then(|request| request.with_tls_profile("private-ca"))
+                .expect("valid TLS request");
+        egress
+            .authorize_addresses(request, [std::net::SocketAddr::from(([1, 1, 1, 1], 443))])
+            .expect("the grant and the profile cover the destination")
+    }
+
+    /// A private CA and a `service.example` server identity it signed.
+    struct TestCa {
+        pem: String,
+        server: Arc<rustls::ServerConfig>,
+    }
+
+    impl TestCa {
+        fn new(name: &str) -> Self {
+            let ca_key = rcgen::KeyPair::generate().expect("CA key");
+            let mut ca_params =
+                rcgen::CertificateParams::new(vec![name.to_string()]).expect("CA parameters");
+            ca_params
+                .distinguished_name
+                .push(rcgen::DnType::CommonName, name);
+            ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+            let ca = ca_params.self_signed(&ca_key).expect("self-sign CA");
+            let server_key = rcgen::KeyPair::generate().expect("server key");
+            let server = rcgen::CertificateParams::new(vec!["service.example".to_string()])
+                .expect("server parameters")
+                .signed_by(&server_key, &ca, &ca_key)
+                .expect("sign server certificate");
+            let server = rustls::ServerConfig::builder_with_provider(Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .expect("ring offers the default protocol versions")
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![server.der().clone()],
+                rustls::pki_types::PrivateKeyDer::Pkcs8(server_key.serialize_der().into()),
+            )
+            .expect("server configuration");
+            Self {
+                pem: ca.pem(),
+                server: Arc::new(server),
+            }
+        }
+
+        /// Whether `client` completes an in-memory handshake with this CA's
+        /// server. Bounded, so a stalled handshake fails instead of hanging.
+        async fn verifies(&self, client: Arc<rustls::ClientConfig>) -> bool {
+            let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+            let name =
+                rustls::pki_types::ServerName::try_from("service.example").expect("server name");
+            let handshake = async {
+                tokio::join!(
+                    tokio_rustls::TlsConnector::from(client).connect(name, client_io),
+                    tokio_rustls::TlsAcceptor::from(Arc::clone(&self.server)).accept(server_io),
+                )
+            };
+            matches!(
+                tokio::time::timeout(Duration::from_secs(10), handshake).await,
+                Ok((Ok(_), _))
+            )
+        }
+    }
+
+    #[tokio::test]
+    async fn tls_config_rejects_same_id_different_grants_before_any_secret_read() {
+        let manifest = tls_manifest();
+        let issued = tls_scope(
+            &manifest,
+            [PluginPermission::ConfigRead, PluginPermission::SocketClient],
+        );
+        let config_only = tls_scope(&manifest, [PluginPermission::ConfigRead]);
+        assert_eq!(
+            issued.id(),
+            config_only.id(),
+            "both admissions share one logical instance ID"
+        );
+        let calls = Arc::new(AtomicUsize::new(0));
+        let resolver_calls = Arc::clone(&calls);
+        let services = crate::services::test_services(PluginConfigResolver::new(move |_| {
+            resolver_calls.fetch_add(1, Ordering::SeqCst);
+            panic!("a foreign authorization must not resolve config or secrets")
+        }));
+        let mut state = PluginState::new(PluginStoreSpec::new(
+            config_only,
+            services,
+            test_limits(1_000),
+        ));
+        let authorized = authorize_tls(&tls_egress(), &issued);
+
+        state.start_call(PluginCallPhase::ToolExecute);
+        let result = state.tls_client_config(&authorized).await;
+        state.finish_call();
+
+        assert!(
+            matches!(result, Err(EgressError::AuthorizationScopeMismatch)),
+            "{result:?}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn tls_config_is_rebuilt_per_connection() {
+        let manifest = Arc::new(tls_manifest());
+        let scope = tls_scope(
+            &manifest,
+            [PluginPermission::ConfigRead, PluginPermission::SocketClient],
+        );
+        let first_ca = TestCa::new("First Plugin Test CA");
+        let second_ca = TestCa::new("Second Plugin Test CA");
+        let ca_pem = Arc::new(std::sync::RwLock::new(first_ca.pem.clone()));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let resolver_manifest = Arc::clone(&manifest);
+        let resolver_ca_pem = Arc::clone(&ca_pem);
+        let resolver_calls = Arc::clone(&calls);
+        let services = crate::services::test_services(PluginConfigResolver::new(move |scope| {
+            resolver_calls.fetch_add(1, Ordering::SeqCst);
+            let ca_pem = resolver_ca_pem
+                .read()
+                .unwrap_or_else(|error| error.into_inner())
+                .clone();
+            let values = HashMap::from([("ca_pem".to_string(), ca_pem)]);
+            resolve_plugin_config(&resolver_manifest, scope, Some(&values)).map(|config| {
+                config.with_tls_config_witness(crate::egress::TlsConfigWitness::new([0; 32]))
+            })
+        }));
+        let mut state = PluginState::new(PluginStoreSpec::new(
+            scope.clone(),
+            services,
+            test_limits(1_000),
+        ));
+        let egress = tls_egress();
+
+        state.start_call(PluginCallPhase::ToolExecute);
+        let first = state
+            .tls_client_config(&authorize_tls(&egress, &scope))
+            .await
+            .expect("first connection's configuration");
+        state.finish_call();
+
+        *ca_pem.write().unwrap_or_else(|error| error.into_inner()) = second_ca.pem.clone();
+
+        state.start_call(PluginCallPhase::ToolExecute);
+        let second = state
+            .tls_client_config(&authorize_tls(&egress, &scope))
+            .await
+            .expect("second connection's configuration");
+        state.finish_call();
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "each connection resolves the canonical config again"
+        );
+        assert!(
+            !Arc::ptr_eq(&first, &second),
+            "each connection owns its own configuration"
+        );
+        assert!(
+            first_ca.verifies(Arc::clone(&first)).await,
+            "the first connection trusts the CA it was built from"
+        );
+        assert!(
+            second_ca.verifies(Arc::clone(&second)).await,
+            "the rotated CA reaches the next connection"
+        );
+        assert!(
+            !first_ca.verifies(second).await,
+            "the replaced CA is no longer trusted by the next connection"
+        );
+    }
+
+    #[tokio::test]
+    async fn tls_unresolved_frame_rejects_policy_captured_before_dns_wait() {
+        use crate::egress::{
+            EgressPolicy, EgressPolicyResolver, EgressRequest, EgressTransport, TlsConfigWitness,
+            TlsProfile, TlsProfileName,
+        };
+        let manifest = Arc::new(tls_manifest());
+        let scope = tls_scope(
+            &manifest,
+            [PluginPermission::ConfigRead, PluginPermission::SocketClient],
+        );
+        let ca = TestCa::new("dns-race");
+        // One canonical test config supplies both views; change it at the DNS wait.
+        let source = Arc::new(std::sync::RwLock::new((0_u8, ca.pem.clone())));
+        let policy_source = source.clone();
+        let arrived = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let egress = EgressHostService::with_test_resolver(
+            EgressPolicyResolver::new(move |_| {
+                let source = policy_source.read().unwrap();
+                let hosts = ["service.example".to_string()];
+                EgressPolicy::new(&hosts, &[], &[], 4)?
+                    .with_tls_profiles([TlsProfile::new(
+                        TlsProfileName::new("private-ca")?,
+                        &hosts,
+                        false,
+                        Some(zeroclaw_api::plugin_key::SecretPropertyRef::parse("ca_pem").unwrap()),
+                        None,
+                    )?])
+                    .map(|policy| {
+                        policy.with_tls_config_witness(TlsConfigWitness::new([source.0; 32]))
+                    })
+            }),
+            |_, port| vec![std::net::SocketAddr::from(([1, 1, 1, 1], port))],
+        )
+        .with_test_dns_pause(arrived.clone(), release.clone());
+        let config_source = source.clone();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let config_calls = calls.clone();
+        let services = crate::services::test_services(PluginConfigResolver::new(move |scope| {
+            config_calls.fetch_add(1, Ordering::SeqCst);
+            let source = config_source.read().unwrap();
+            resolve_plugin_config(
+                &manifest,
+                scope,
+                Some(&HashMap::from([("ca_pem".into(), source.1.clone())])),
+            )
+            .map(|config| config.with_tls_config_witness(TlsConfigWitness::new([source.0; 32])))
+        }));
+        let mut state = PluginState::new(PluginStoreSpec::new(
+            scope.clone(),
+            services,
+            test_limits(1_000),
+        ));
+        state.start_call(PluginCallPhase::ToolExecute);
+        let request =
+            EgressRequest::new(scope.clone(), EgressTransport::Tls, "service.example", 443)
+                .unwrap()
+                .with_tls_profile("private-ca")
+                .unwrap();
+        let authorization = egress.authorize(request.clone());
+        tokio::pin!(authorization);
+        tokio::select! { biased;
+            result = &mut authorization => panic!("DNS must be paused: {result:?}"),
+            () = arrived.notified() => {}
+        }
+        source.write().unwrap().0 = 1;
+        release.notify_one();
+        let old = authorization.await.unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "frame was still unresolved at the DNS wait"
+        );
+        assert!(matches!(
+            state.tls_client_config(&old).await,
+            Err(EgressError::TlsConfigMismatch)
+        ));
+        drop(old);
+        // Denied authorization relinquishes its budget; a coherent request succeeds.
+        let current = egress
+            .authorize_addresses(
+                request.clone(),
+                [std::net::SocketAddr::from(([1, 1, 1, 1], 443))],
+            )
+            .unwrap();
+        assert!(
+            ca.verifies(state.tls_client_config(&current).await.unwrap())
+                .await
+        );
+        drop(current);
+        state.finish_call();
+        // Cancellation while DNS is queued must not reserve a connection lease.
+        {
+            let pending = egress.authorize(request.clone());
+            tokio::pin!(pending);
+            tokio::select! { biased;
+                result = &mut pending => panic!("DNS must be paused: {result:?}"),
+                () = arrived.notified() => {}
+            }
+        }
+        let leases = (0..4)
+            .map(|_| {
+                egress
+                    .authorize_addresses(
+                        request.clone(),
+                        [std::net::SocketAddr::from(([1, 1, 1, 1], 443))],
+                    )
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(leases.len(), 4);
+    }
+
     #[test]
     fn one_frame_shares_one_live_revision_and_next_frame_refreshes() {
         let manifest = Arc::new(secret_manifest(PluginCapability::Tool));
@@ -924,7 +1569,7 @@ mod tests {
         let resolver_manifest = Arc::clone(&manifest);
         let resolver_values = Arc::clone(&values);
         let resolver_calls = Arc::clone(&calls);
-        let services = PluginHostServices::new(PluginConfigResolver::new(move |scope| {
+        let services = crate::services::test_services(PluginConfigResolver::new(move |scope| {
             resolver_calls.fetch_add(1, Ordering::SeqCst);
             let values = resolver_values
                 .read()
@@ -960,7 +1605,7 @@ mod tests {
         let scope = secret_scope(&manifest, PluginCapability::Tool, "main", true);
         let calls = Arc::new(AtomicUsize::new(0));
         let resolver_calls = Arc::clone(&calls);
-        let services = PluginHostServices::new(PluginConfigResolver::new(move |_| {
+        let services = crate::services::test_services(PluginConfigResolver::new(move |_| {
             resolver_calls.fetch_add(1, Ordering::SeqCst);
             Err(PluginError::InvalidConfig("resolver detail".to_string()))
         }));
@@ -1144,6 +1789,44 @@ mod tests {
         assert!(
             ensure_http_coherent(&plain, true).is_err(),
             "plain store with an http linker would panic on first outbound call"
+        );
+    }
+
+    #[test]
+    fn socket_imports_follow_the_admitted_grant() {
+        let granted = new_store(spec([PluginPermission::SocketClient], 0));
+        let imports = OptionalImports::for_store(granted.data());
+        assert!(imports.sockets && !imports.http);
+        assert!(ensure_imports_coherent(&granted, imports).is_ok());
+        assert!(
+            ensure_imports_coherent(
+                &granted,
+                OptionalImports {
+                    sockets: false,
+                    ..imports
+                }
+            )
+            .is_err(),
+            "a granted store must not be paired with a linker missing its import"
+        );
+
+        let plain = new_store(spec([], 0));
+        assert!(!OptionalImports::for_store(plain.data()).sockets);
+        assert!(
+            ensure_imports_coherent(
+                &plain,
+                OptionalImports {
+                    http: false,
+                    sockets: true,
+                    websocket: false,
+                }
+            )
+            .is_err(),
+            "an ungranted store must never be linked with the socket import"
+        );
+        assert!(
+            plain.data().egress_service().is_none(),
+            "a store built without an egress authority has no reach"
         );
     }
 

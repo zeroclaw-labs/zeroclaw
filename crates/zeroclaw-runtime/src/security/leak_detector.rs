@@ -409,7 +409,8 @@ impl LeakDetector {
         static JWT_PATTERN: OnceLock<Regex> = OnceLock::new();
         let regex = JWT_PATTERN.get_or_init(|| {
             // JWT: three base64url-encoded parts separated by dots
-            Regex::new(r"eyJ[a-zA-Z0-9_-]*\.eyJ[a-zA-Z0-9_-]*\.[a-zA-Z0-9_-]*").unwrap()
+            Regex::new(r"eyJ[a-zA-Z0-9_-]*\.eyJ[a-zA-Z0-9_-]*\.[a-zA-Z0-9_-]*")
+                .expect("static JWT regex must compile")
         });
 
         collect_regex_redactions(
@@ -474,8 +475,9 @@ impl LeakDetector {
         redactions: &mut Vec<Redaction>,
     ) {
         static BOT_TOKEN_PATTERN: OnceLock<Regex> = OnceLock::new();
-        let regex =
-            BOT_TOKEN_PATTERN.get_or_init(|| Regex::new(r"/bot[0-9]+:[A-Za-z0-9_-]+").unwrap());
+        let regex = BOT_TOKEN_PATTERN.get_or_init(|| {
+            Regex::new(r"/bot[0-9]+:[A-Za-z0-9_-]+").expect("static bot-token regex must compile")
+        });
 
         collect_regex_redactions(
             content,
@@ -499,17 +501,20 @@ impl LeakDetector {
         let entropy_threshold = 3.5 + self.sensitivity * 1.25;
 
         static URL_PATTERN: OnceLock<Regex> = OnceLock::new();
-        let url_re = URL_PATTERN.get_or_init(|| Regex::new(r"https?://\S+").unwrap());
+        let url_re = URL_PATTERN
+            .get_or_init(|| Regex::new(r"https?://\S+").expect("static URL regex must compile"));
         static MEDIA_MARKER_PATTERN: OnceLock<Regex> = OnceLock::new();
         let media_re = MEDIA_MARKER_PATTERN.get_or_init(|| {
-            Regex::new(r"\[(IMAGE|VIDEO|VOICE|AUDIO|DOCUMENT|FILE):[^\]]*\]").unwrap()
+            Regex::new(r"\[(IMAGE|VIDEO|VOICE|AUDIO|DOCUMENT|FILE):[^\]]*\]")
+                .expect("static media-marker regex must compile")
         });
         // Tool receipts (zc-receipt-...) are runtime-generated HMAC tokens that
         // intentionally appear in output. Strip them before entropy scanning so
         // they are not redacted as leaked credentials.
         static RECEIPT_PATTERN: OnceLock<Regex> = OnceLock::new();
-        let receipt_re =
-            RECEIPT_PATTERN.get_or_init(|| Regex::new(r"zc-receipt-\d+-[A-Za-z0-9_-]+").unwrap());
+        let receipt_re = RECEIPT_PATTERN.get_or_init(|| {
+            Regex::new(r"zc-receipt-\d+-[A-Za-z0-9_-]+").expect("static receipt regex must compile")
+        });
         let mut entropy_protected = protected_spans.to_vec();
         collect_regex_spans(content, url_re, &mut entropy_protected);
         collect_regex_spans(content, media_re, &mut entropy_protected);

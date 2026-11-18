@@ -18,6 +18,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+
+use crate::secure_file::{sync_dir_where_supported, write_durable};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -97,6 +99,20 @@ pub async fn enroll_via_relay(relay: &crate::client::RelayDial, config_dir: &Pat
         .context("relay enrollment request failed")?;
 
     cache_confirmed_response(config_dir, &trust.ca_chain_pem, &resp, &key_pem)
+}
+
+/// Bootstrap device admission after OIDC sign-in. The already-verified gateway
+/// HTTPS transport (not a pairing code or provisional enrollment TLS) conveys
+/// the daemon CA and signs this device's locally generated CSR.
+pub(crate) async fn enroll_with_oidc(
+    gateway: &crate::oidc_enroll::GatewayEnrollment,
+    alias: &str,
+    token: &str,
+    config_dir: &Path,
+) -> Result<()> {
+    let (csr, key) = software_csr("zerocode")?;
+    let response: EnrollResponse = gateway.certificate(alias, token, &csr).await?;
+    cache_materials(config_dir, &response, &key)
 }
 
 fn prepare_enrollment_request() -> Result<(String, String, zeroize::Zeroizing<String>)> {
@@ -1111,54 +1127,6 @@ fn cache_materials(config_dir: &Path, resp: &EnrollResponse, key_pem: &str) -> R
     )?;
     mark_generation(&staged)?;
     finish_pending_publish_locked(&tls_dir)
-}
-
-/// Write `bytes` to `path` and fsync them, so the content survives power loss
-/// before anything claims it. `private` writes `0600` on Unix, with no
-/// world-readable window.
-fn write_durable(path: &Path, bytes: &[u8], private: bool) -> Result<()> {
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        if private {
-            options.mode(0o600);
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        // No mode bits here; the tls directory ACL is the guard.
-        let _ = private;
-    }
-    let mut f = options
-        .open(path)
-        .with_context(|| format!("creating {}", path.display()))?;
-    f.write_all(bytes)
-        .with_context(|| format!("writing {}", path.display()))?;
-    f.sync_all()
-        .with_context(|| format!("syncing {}", path.display()))?;
-    Ok(())
-}
-
-/// fsync a directory so the entries created, renamed, or removed inside it are
-/// durable, not just the file contents. Unix opens the directory and syncs the
-/// handle. No other platform offers a portable equivalent, so this is a
-/// documented no-op there and the publication relies on the marker alone.
-fn sync_dir_where_supported(dir: &Path) -> Result<()> {
-    #[cfg(unix)]
-    {
-        let handle = std::fs::File::open(dir)
-            .with_context(|| format!("opening {} to sync it", dir.display()))?;
-        handle
-            .sync_all()
-            .with_context(|| format!("syncing {}", dir.display()))?;
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = dir;
-    }
-    Ok(())
 }
 
 /// Leave `<config_dir>/tls` in the state a crash leaves after `renames` of the

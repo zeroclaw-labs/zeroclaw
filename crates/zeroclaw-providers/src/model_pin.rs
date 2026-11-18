@@ -77,8 +77,17 @@ impl ModelPinnedProvider {
 
 #[async_trait]
 impl ModelProvider for ModelPinnedProvider {
+    fn supports_exact_request_replay(&self, request: ChatRequest<'_>, _model: &str) -> bool {
+        self.inner
+            .supports_exact_request_replay(request, &self.pinned_model)
+    }
+
     fn has_stable_request_identity(&self, model: &str) -> bool {
         model == self.pinned_model && self.inner.has_stable_request_identity(&self.pinned_model)
+    }
+
+    fn supports_single_tool_rounds(&self, _model: &str) -> bool {
+        self.inner.supports_single_tool_rounds(&self.pinned_model)
     }
 
     fn capabilities(&self) -> super::traits::ProviderCapabilities {
@@ -177,9 +186,25 @@ impl ModelProvider for ModelPinnedProvider {
         _model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<ChatResponse> {
+        self.chat_with_tool_round_policy(
+            request,
+            _model,
+            temperature,
+            zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
+        )
+        .await
+    }
+
+    async fn chat_with_tool_round_policy(
+        &self,
+        request: ChatRequest<'_>,
+        _model: &str,
+        temperature: Option<f64>,
+        policy: zeroclaw_api::model_provider::ToolRoundPolicy,
+    ) -> anyhow::Result<ChatResponse> {
         mark_current_dispatch_composite();
         ProviderDispatch::from_ref(&*self.inner)
-            .chat(request, &self.pinned_model, temperature)
+            .chat_with_tool_round_policy(request, &self.pinned_model, temperature, policy)
             .await
     }
 
@@ -239,12 +264,32 @@ impl ModelProvider for ModelPinnedProvider {
         temperature: Option<f64>,
         options: StreamOptions,
     ) -> BoxStream<'static, StreamResult<StreamEvent>> {
-        stream_as_dispatch_composite(ProviderDispatch::from_ref(&*self.inner).stream_chat(
+        self.stream_chat_with_tool_round_policy(
             request,
-            &self.pinned_model,
+            _model,
             temperature,
             options,
-        ))
+            zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
+        )
+    }
+
+    fn stream_chat_with_tool_round_policy(
+        &self,
+        request: ChatRequest<'_>,
+        _model: &str,
+        temperature: Option<f64>,
+        options: StreamOptions,
+        policy: zeroclaw_api::model_provider::ToolRoundPolicy,
+    ) -> BoxStream<'static, StreamResult<StreamEvent>> {
+        stream_as_dispatch_composite(
+            ProviderDispatch::from_ref(&*self.inner).stream_chat_with_tool_round_policy(
+                request,
+                &self.pinned_model,
+                temperature,
+                options,
+                policy,
+            ),
+        )
     }
 }
 
@@ -280,6 +325,10 @@ mod tests {
 
     #[async_trait]
     impl ModelProvider for ModelAwareCapabilityProvider {
+        fn supports_exact_request_replay(&self, request: ChatRequest<'_>, model: &str) -> bool {
+            model == "pinned-model" && request.tools.is_none()
+        }
+
         fn capabilities_for_model(&self, model: &str) -> ProviderCapabilities {
             ProviderCapabilities {
                 native_tool_calling: model == "pinned-model",
@@ -333,6 +382,32 @@ mod tests {
     }
 
     struct AccountedLeaf;
+
+    #[test]
+    fn exact_replay_uses_pinned_model_and_preserves_request_restrictions() {
+        let request = ChatRequest {
+            messages: &[],
+            tools: None,
+            thinking: None,
+        };
+        for (pin, expected) in [("pinned-model", true), ("other-model", false)] {
+            let provider = ModelPinnedProvider::builder("pinned")
+                .pinned_model(pin)
+                .inner(Box::new(ModelAwareCapabilityProvider))
+                .build();
+            assert_eq!(
+                provider.supports_exact_request_replay(request, "ignored-model"),
+                expected
+            );
+            assert!(!provider.supports_exact_request_replay(
+                ChatRequest {
+                    tools: Some(&[]),
+                    ..request
+                },
+                "pinned-model"
+            ));
+        }
+    }
 
     impl zeroclaw_api::attribution::Attributable for AccountedLeaf {
         fn role(&self) -> zeroclaw_api::attribution::Role {

@@ -135,6 +135,7 @@ mod tests {
     fn find_text_conflicts_filters_correctly() {
         let entries = vec![
             MemoryEntry {
+                principal_id: None,
                 id: "1".into(),
                 key: "pref".into(),
                 content: "User prefers Rust for systems work".into(),
@@ -152,6 +153,7 @@ mod tests {
                 agent_id: None,
             },
             MemoryEntry {
+                principal_id: None,
                 id: "2".into(),
                 key: "daily1".into(),
                 content: "User prefers Rust for systems work".into(),
@@ -187,6 +189,7 @@ mod tests {
     #[test]
     fn find_text_conflicts_skips_superseded_and_identical() {
         let entry = |id: &str, content: &str, superseded: Option<String>| MemoryEntry {
+            principal_id: None,
             id: id.into(),
             key: "k".into(),
             content: content.into(),

@@ -472,6 +472,53 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    #[cfg(feature = "agent-runtime")]
+    #[tokio::test]
+    async fn list_does_not_run_hygiene_on_retention_protected_row() {
+        use rusqlite::params;
+        use zeroclaw_memory::SqliteMemory;
+
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config::default();
+        config.data_dir = tmp.path().to_path_buf();
+        config.memory.backend = "sqlite".into();
+        config.memory.hygiene_enabled = true;
+        config.memory.conversation_retention_days = 30;
+        config
+            .memory
+            .policy
+            .retention_days_by_category
+            .insert("conversation".into(), 0);
+
+        let seed = SqliteMemory::new("sqlite", tmp.path()).unwrap();
+        seed.store(
+            "protected",
+            "an old conversation",
+            MemoryCategory::Conversation,
+            None,
+        )
+        .await
+        .unwrap();
+        drop(seed);
+        let db_path = tmp.path().join("memory/brain.db");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute(
+            "UPDATE memories SET updated_at = ?1 WHERE key = ?2",
+            params!["2020-01-01T00:00:00+00:00", "protected"],
+        )
+        .unwrap();
+        drop(conn);
+
+        handle_list(&config, None, None, 10, 0).await.unwrap();
+
+        let reopened = SqliteMemory::new("sqlite", tmp.path()).unwrap();
+        assert!(reopened.get("protected").await.unwrap().is_some());
+        assert!(
+            !tmp.path().join("state/memory_hygiene_state.json").exists(),
+            "CLI inspection must not start runtime hygiene"
+        );
+    }
+
     #[test]
     fn parse_category_known_variants() {
         assert_eq!(parse_category("core"), MemoryCategory::Core);

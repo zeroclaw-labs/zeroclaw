@@ -334,12 +334,15 @@ impl V2Config {
         rename_route_provider_field(&mut passthrough, "model_routes");
         rename_route_provider_field(&mut passthrough, "embedding_routes");
 
-        // Promote V2 [tts.<type>] / [transcription.<family>] sub-blocks
-        // into V3 [<kind>_providers.<type>.default]. Global
-        // default_provider keys are dropped — V3 has no such concept;
-        // each agent declares its own provider.
+        // Promote V2 [tts.<type>] sub-blocks into V3
+        // [providers.tts.<type>.<alias>]; the global tts default_provider is
+        // dropped — V3 has no such concept; each agent declares its own
+        // provider. V2's [transcription] settings stay where they are: the
+        // current schema still reads them there, spelled as V2 spelled them,
+        // while its provider aliases spell some differently (`uri` for local
+        // Whisper's `url`, no endpoint for Groq). The transcription
+        // default-provider keys are retired by `RETIRED_KEYS`.
         fold_v2_tts_into_providers(&mut passthrough, &mut new_providers);
-        fold_v2_transcription_into_providers(&mut passthrough, &mut new_providers);
 
         // V3 collapses model/tts/transcription providers under a single
         // top-level `[providers]` table, with one sub-key per category.
@@ -860,6 +863,51 @@ fn normalize_provider_type(
 /// rewrite of a vision reference needs that provenance so it cannot infer
 /// source selection from the post-canonicalization alias count (variants such
 /// as `qwen-code` collapse onto the same `qwen.default` slot).
+/// Rewrite one V2 profile, keyed `provider_id`, in place into its V3 alias
+/// entry. Returns the canonical family and the alias it is filed under.
+fn rewrite_v2_profile(provider_id: &str, config: &mut toml::Value) -> (String, String) {
+    // Colon-URL form like `"anthropic-custom:https://..."`: split the URL
+    // out into `uri` and use only the prefix as the seed for normalization.
+    let (raw_type, url) = split_colon_url_provider(provider_id);
+    if let Some(url) = url
+        && let toml::Value::Table(t) = &mut *config
+    {
+        t.entry("uri".to_string())
+            .or_insert(toml::Value::String(url));
+    }
+
+    if let toml::Value::Table(t) = &mut *config {
+        fold_base_url_api_path_into_uri(t);
+    }
+
+    let (provider_type, alias, extras) = normalize_provider_type(&raw_type, "default");
+
+    // Inject family-specific extras (endpoint, auth_mode, wire_api,
+    // requires_openai_auth, uri) onto the alias entry table — overrides
+    // by the operator's own config win via .or_insert.
+    if let toml::Value::Table(t) = config {
+        for (field, value) in extras {
+            t.entry(field.to_string()).or_insert(value);
+        }
+    }
+    (provider_type, alias)
+}
+
+/// A V2 `[providers.models.<provider_id>]` profile as the V2 -> V3 step
+/// files it: the canonical family (`grok` is `xai`, a `custom:` URL is
+/// `custom`) and the fields of the alias it becomes.
+pub(crate) fn v2_profile_as_v3_entry(
+    provider_id: &str,
+    profile: &toml::Table,
+) -> (String, toml::Table) {
+    let mut config = toml::Value::Table(profile.clone());
+    let (family, _) = rewrite_v2_profile(provider_id, &mut config);
+    match config {
+        toml::Value::Table(entry) => (family, entry),
+        _ => (family, toml::Table::new()),
+    }
+}
+
 fn alias_provider_models(
     models: Option<toml::Value>,
 ) -> (
@@ -876,31 +924,7 @@ fn alias_provider_models(
         std::collections::BTreeSet<String>,
     > = std::collections::HashMap::new();
     for (provider_id, mut config) in flat {
-        // Colon-URL form like `"anthropic-custom:https://..."`: split the URL
-        // out into `uri` and use only the prefix as the seed for normalization.
-        let (raw_type, url) = split_colon_url_provider(&provider_id);
-        if let Some(url) = url
-            && let toml::Value::Table(t) = &mut config
-        {
-            t.entry("uri".to_string())
-                .or_insert(toml::Value::String(url));
-        }
-
-        if let toml::Value::Table(t) = &mut config {
-            fold_base_url_api_path_into_uri(t);
-        }
-
-        let (provider_type, alias, extras) = normalize_provider_type(&raw_type, "default");
-
-        // Inject family-specific extras (endpoint, auth_mode, wire_api,
-        // requires_openai_auth, uri) onto the alias entry table — overrides
-        // by the operator's own config win via .or_insert.
-        if let toml::Value::Table(t) = &mut config {
-            for (field, value) in extras {
-                t.entry(field.to_string()).or_insert(value);
-            }
-        }
-
+        let (provider_type, alias) = rewrite_v2_profile(&provider_id, &mut config);
         let entry = aliased
             .entry(provider_type.clone())
             .or_insert_with(|| toml::Value::Table(toml::Table::new()));
@@ -2550,93 +2574,31 @@ fn fold_v2_tts_into_providers(passthrough: &mut toml::Table, new_providers: &mut
     }
 
     if !tts_aliased.is_empty() {
-        new_providers.insert("tts".to_string(), toml::Value::Table(tts_aliased));
-        ::zeroclaw_log::record!(
-            INFO,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-            "[tts.<type>] sub-blocks promoted to [tts_providers.<type>.default]"
-        );
-    }
-}
-
-fn fold_v2_transcription_into_providers(
-    passthrough: &mut toml::Table,
-    new_providers: &mut toml::Table,
-) {
-    let Some(toml::Value::Table(transcription_table)) = passthrough.get_mut("transcription") else {
-        return;
-    };
-
-    let mut transcription_aliased = toml::Table::new();
-
-    // Per-family sub-blocks: move to transcription_providers.<family>.default.
-    const V3_TRANSCRIPTION_FAMILIES: &[&str] = &[
-        "openai",
-        "deepgram",
-        "assemblyai",
-        "google",
-        "local_whisper",
-    ];
-    for family in V3_TRANSCRIPTION_FAMILIES {
-        if let Some(value) = transcription_table.remove(*family) {
-            let mut wrapped = toml::Table::new();
-            wrapped.insert("default".to_string(), value);
-            transcription_aliased.insert((*family).to_string(), toml::Value::Table(wrapped));
-        }
-    }
-
-    let mut groq_entry = toml::Table::new();
-    for groq_field in &["api_key", "api_url", "model", "language", "initial_prompt"] {
-        if let Some(v) = transcription_table.remove(*groq_field) {
-            groq_entry.insert((*groq_field).to_string(), v);
-        }
-    }
-    if !groq_entry.is_empty() {
-        let mut wrapped = toml::Table::new();
-        wrapped.insert("default".to_string(), toml::Value::Table(groq_entry));
-        transcription_aliased.insert("groq".to_string(), toml::Value::Table(wrapped));
-        ::zeroclaw_log::record!(
-            INFO,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-            "[transcription] Groq fields promoted to [transcription_providers.groq.default]"
-        );
-    }
-
-    // Drop legacy default-provider keys — V3 has no global default-provider
-    // field. Operators select transcription per agent
-    // (`agent.<X>.transcription_provider`).
-    for legacy_default in &[
-        "default_provider",
-        "default_model_provider",
-        "default_transcription_provider",
-    ] {
-        if transcription_table.remove(*legacy_default).is_some() {
-            ::zeroclaw_log::record!(
-                INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_attrs(::serde_json::json!({"legacy_default": legacy_default})),
-                &format!(
-                    "[transcription].{legacy_default} dropped (V3 has no global default-provider; set agent.<X>.transcription_provider instead)"
-                )
-            );
-        }
-    }
-
-    if !transcription_aliased.is_empty() {
-        // Merge into existing providers.transcription if any (operator may
-        // have written V3-style entries already).
-        let providers_transcription = new_providers
-            .entry("transcription".to_string())
+        // Into any `[providers.tts]` the file already holds, never over it:
+        // an alias already named `default` keeps its name, and the V2 block
+        // takes the next free one.
+        let providers_tts = new_providers
+            .entry("tts".to_string())
             .or_insert_with(|| toml::Value::Table(toml::Table::new()));
-        if let Some(existing) = providers_transcription.as_table_mut() {
-            for (family, value) in transcription_aliased {
-                existing.entry(family).or_insert(value);
+        if let Some(existing) = providers_tts.as_table_mut() {
+            for (ty, wrapped) in tts_aliased {
+                let family = existing
+                    .entry(ty)
+                    .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+                if let (Some(family), toml::Value::Table(wrapped)) =
+                    (family.as_table_mut(), wrapped)
+                {
+                    for (alias, value) in wrapped {
+                        let alias = ensure_unique_key(family, alias);
+                        family.insert(alias, value);
+                    }
+                }
             }
         }
         ::zeroclaw_log::record!(
             INFO,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-            "[transcription.<family>] sub-blocks promoted to [transcription_providers.<family>.default]"
+            "[tts.<type>] sub-blocks promoted to [tts_providers.<type>.default]"
         );
     }
 }
@@ -3074,6 +3036,9 @@ pub const V2_WORKSPACE_TOPLEVEL_DISPATCH: &[(&str, V2WorkspaceDest)] = &[
     ("memory", V2WorkspaceDest::MemorySubentryDispatch),
     ("sessions", V2WorkspaceDest::DataDir),
     ("state", V2WorkspaceDest::DataDir),
+    // Installed packages belong to host data, not the agent's writable
+    // workspace. Existing legacy discovery already searches data/plugins.
+    ("plugins", V2WorkspaceDest::DataDir),
     ("skills", V2WorkspaceDest::SharedDir),
     // Top-level instance-state file. The DeviceRegistry reader at
     // `api_pairing.rs:40` opens `<data_dir>/devices.db`, so unlike
@@ -3108,7 +3073,7 @@ pub fn v2_workspace_toplevel_dest(name: &str) -> V2WorkspaceDest {
 pub fn workspace_toplevel_v3_path(install: &Path, name: &str) -> PathBuf {
     match v2_workspace_toplevel_dest(name) {
         V2WorkspaceDest::DataDir | V2WorkspaceDest::MemorySubentryDispatch => {
-            install.join("data").join(name)
+            super::install_data_dir(install).join(name)
         }
         V2WorkspaceDest::SharedDir => install.join("shared").join(name),
         V2WorkspaceDest::AgentDefault => install
@@ -3122,7 +3087,9 @@ pub fn workspace_toplevel_v3_path(install: &Path, name: &str) -> PathBuf {
 /// V3 destination path for a subentry under legacy `workspace/memory/`.
 pub fn memory_subentry_v3_path(install: &Path, sub_name: &str) -> PathBuf {
     if V2_MEMORY_DATA_NAMES.contains(&sub_name) {
-        install.join("data").join("memory").join(sub_name)
+        super::install_data_dir(install)
+            .join("memory")
+            .join(sub_name)
     } else {
         install
             .join("agents")
@@ -3160,29 +3127,46 @@ pub fn migrate_v2_to_v3_install_filesystem(
         });
     }
 
-    let data_target = install_root.join("data");
-    let data_populated = data_target
-        .is_dir()
-        .then(|| std::fs::read_dir(&data_target).ok())
-        .flatten()
-        .is_some_and(|mut it| it.next().is_some());
-    let agent_populated = agent_default
-        .is_dir()
-        .then(|| std::fs::read_dir(&agent_default).ok())
-        .flatten()
-        .is_some_and(|mut it| it.next().is_some());
-    if data_populated && agent_populated {
+    // The split is done only when nothing in the legacy workspace is left to
+    // move. Whether the V3 targets already hold *something* is no evidence:
+    // startup creates and locks `data/.lifecycle/config-lifecycle.lock`
+    // before the config is loaded, and a split interrupted part way leaves
+    // both targets partly filled with entries still waiting in `workspace/`.
+    // Those must move now, or the databases among them are stranded.
+    let entries = legacy_split_entries(&legacy, install_root)?;
+    if entries.iter().all(|(_, target)| target.exists()) {
+        // Nothing to move, but anything still here was refused because its
+        // destination exists. Name each one: it may be a database stranded
+        // by an earlier skipped split that the operator has to merge.
+        for (source, target) in &entries {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "source": source.display().to_string(),
+                        "target": target.display().to_string(),
+                    })),
+                "[system] filesystem migration: target already exists; legacy entry left in place"
+            );
+        }
         ::zeroclaw_log::record!(
             INFO,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
                 ::serde_json::json!({
-                    "data_target": data_target.display().to_string(),
                     "agent_target": agent_default.display().to_string(),
                     "legacy": legacy.display().to_string(),
+                    "left_in_place": entries.len(),
                 })
             ),
-            "[system] filesystem migration: targets already populated; skipping split"
+            "[system] filesystem migration: nothing left to move; skipping split"
         );
+        if std::fs::read_dir(&legacy)
+            .map(|mut it| it.next().is_none())
+            .unwrap_or(false)
+        {
+            let _ = std::fs::remove_dir(&legacy);
+        }
         relocate_default_agent_skills_to_shared(install_root)?;
         return Ok(FilesystemMigrationReport {
             backup_dir: None,
@@ -3249,6 +3233,49 @@ pub fn migrate_v2_to_v3_install_filesystem(
         backup_dir: Some(backup_dir.parent().unwrap_or(&backup_dir).to_path_buf()),
         entries_relocated,
     })
+}
+
+/// Every legacy entry the split routes, with its V3 destination: each
+/// top-level entry, and each child of `memory/` in place of `memory/` itself.
+/// Non-UTF-8 names are left out, as the split skips them. An entry whose
+/// destination is missing is one the split would move; one whose destination
+/// exists is refused (refuse-to-clobber) and stays in `legacy/`.
+fn legacy_split_entries(legacy: &Path, install_root: &Path) -> MigResult<Vec<(PathBuf, PathBuf)>> {
+    let mut entries = Vec::new();
+    for entry in std::fs::read_dir(legacy).with_context(|| {
+        format!(
+            "[system] failed to enumerate legacy workspace at {}",
+            legacy.display()
+        )
+    })? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        match v2_workspace_toplevel_dest(name) {
+            V2WorkspaceDest::MemorySubentryDispatch => {
+                let memory = entry.path();
+                if !memory.is_dir() {
+                    continue;
+                }
+                for child in std::fs::read_dir(&memory)
+                    .with_context(|| format!("[system] failed to enumerate {}", memory.display()))?
+                {
+                    let child = child?;
+                    let child_name = child.file_name();
+                    if let Some(child_name) = child_name.to_str() {
+                        entries.push((
+                            child.path(),
+                            memory_subentry_v3_path(install_root, child_name),
+                        ));
+                    }
+                }
+            }
+            _ => entries.push((entry.path(), workspace_toplevel_v3_path(install_root, name))),
+        }
+    }
+    Ok(entries)
 }
 
 /// Iterate `legacy/` top-level entries and relocate each via the
@@ -4385,6 +4412,132 @@ mod fs_db_migration_tests {
         assert!(
             legacy_still || in_backup,
             "legacy devices.db must be preserved (in legacy/ or backup/)"
+        );
+    }
+    /// A split interrupted after moving an identity file and the sessions
+    /// directory, with startup's `.lifecycle/config-lifecycle.lock` already
+    /// in `data/`, still has `devices.db` and the memory databases waiting in
+    /// the legacy workspace. Both targets hold entries, but the split must
+    /// resume.
+    #[test]
+    fn an_interrupted_split_resumes_even_when_both_targets_hold_entries() {
+        let tmp = TempDir::new().unwrap();
+        let install = tmp.path();
+        seed_v2_install(install);
+        let agent = install.join("agents/default/workspace");
+        fs::create_dir_all(&agent).unwrap();
+        fs::rename(
+            install.join("workspace/IDENTITY.md"),
+            agent.join("IDENTITY.md"),
+        )
+        .unwrap();
+        fs::create_dir_all(install.join("data")).unwrap();
+        fs::rename(
+            install.join("workspace/sessions"),
+            install.join("data/sessions"),
+        )
+        .unwrap();
+        fs::create_dir(install.join("data/.lifecycle")).unwrap();
+        fs::write(install.join("data/.lifecycle/config-lifecycle.lock"), b"").unwrap();
+
+        let report = migrate_v2_to_v3_install_filesystem(install).expect("resume must succeed");
+
+        assert!(
+            report.backup_dir.is_some(),
+            "the resumed split backs up first"
+        );
+        assert_eq!(
+            fs::read(install.join("data/devices.db")).unwrap(),
+            b"pretend-paired-devices-blob"
+        );
+        assert!(install.join("data/memory/brain.db").is_file());
+        assert!(agent.join("SOUL.md").is_file());
+        assert!(
+            !install.join("workspace").exists(),
+            "nothing is left behind"
+        );
+        assert_eq!(
+            fs::read(install.join("data/sessions/sessions.db")).unwrap(),
+            b"sessions"
+        );
+    }
+
+    /// When every entry left in the legacy workspace was refused because its
+    /// destination exists, there is nothing to move and the split is not
+    /// redone (no new backup).
+    #[test]
+    fn a_split_with_only_refused_leftovers_is_not_redone() {
+        let tmp = TempDir::new().unwrap();
+        let install = tmp.path();
+        seed_v2_install(install);
+        fs::create_dir_all(install.join("data")).unwrap();
+        fs::write(
+            workspace_toplevel_v3_path(install, "devices.db"),
+            b"operator-owned",
+        )
+        .unwrap();
+        migrate_v2_to_v3_install_filesystem(install).expect("first split");
+        assert!(
+            install.join("workspace/devices.db").is_file(),
+            "refused, left in place"
+        );
+
+        let mut events = crate::capture_log_events();
+        let again = migrate_v2_to_v3_install_filesystem(install).expect("second run");
+
+        assert!(again.backup_dir.is_none(), "{again:?}");
+        assert_eq!(again.entries_relocated, 0);
+        assert!(install.join("workspace/devices.db").is_file());
+
+        // The leftover is named at WARN, so an operator can find and merge it.
+        let mut logs = String::new();
+        loop {
+            match events.try_recv() {
+                Ok(event) => {
+                    logs.push_str(&event.to_string());
+                    logs.push('\n');
+                }
+                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {}
+                Err(_) => break,
+            }
+        }
+        let install_name = install.file_name().unwrap().to_string_lossy().to_string();
+        assert!(
+            logs.lines().any(|line| {
+                line.contains("legacy entry left in place")
+                    && line.contains(&install_name)
+                    && line.contains("devices.db")
+            }),
+            "no WARN names the refused devices.db:\n{logs}"
+        );
+    }
+
+    /// After a complete split, `brain.db` alone reappears under the legacy
+    /// `memory/` while `data/memory/` still holds the other shared files.
+    /// The only pending entry is that `memory/` child, and it must move.
+    #[test]
+    fn a_pending_memory_subentry_alone_resumes_the_split() {
+        let tmp = TempDir::new().unwrap();
+        let install = tmp.path();
+        seed_v2_install(install);
+        migrate_v2_to_v3_install_filesystem(install).expect("first split");
+        assert!(!install.join("workspace").exists());
+        assert!(install.join("data/memory/audit.db").is_file());
+
+        fs::remove_file(install.join("data/memory/brain.db")).unwrap();
+        fs::create_dir_all(install.join("workspace/memory")).unwrap();
+        fs::write(install.join("workspace/memory/brain.db"), b"restored").unwrap();
+
+        let report = migrate_v2_to_v3_install_filesystem(install).expect("resume");
+
+        assert_eq!(report.entries_relocated, 1, "{report:?}");
+        assert_eq!(
+            fs::read(install.join("data/memory/brain.db")).unwrap(),
+            b"restored"
+        );
+        assert!(
+            !install.join("workspace").exists(),
+            "nothing is left behind"
         );
     }
 }

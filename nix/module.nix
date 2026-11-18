@@ -31,12 +31,23 @@
 #   services.zeroclaw.instances.me = {
 #     environmentFile = "/run/agenix/zeroclaw-bot-token";
 #     settings = {
-#       default_provider = "anthropic";
-#       default_model = "claude-sonnet-4-6";
-#       channels.telegram = {
+#       schema_version = 4;   # always set it; see the `settings` option
+#       providers.models.anthropic.default.model = "claude-sonnet-4-6";
+#       agents.default = {
+#         model_provider = "anthropic.default";
+#         risk_profile = "default";
+#         runtime_profile = "default";
+#       };
+#       risk_profiles.default = { };
+#       runtime_profiles.default = { };
+#       channels.telegram.default = {
 #         enabled = true;
 #         bot_token = "$BOT_TOKEN";   # systemd $VAR — substituted at load
-#         allowed_users = [ "12345" ];
+#       };
+#       peer_groups.telegram_default = {
+#         channel = "telegram";
+#         agents = [ "default" ];
+#         external_peers = [ "12345" ];
 #       };
 #     };
 #   };
@@ -85,6 +96,29 @@ let
     {
       options = {
         package = mkPackageOption pkgs "zeroclaw" { };
+
+        webUiPackage = mkOption {
+          type = types.nullOr types.package;
+          # `or null` keeps plain-nixpkgs evaluation (where neither package
+          # exists yet) on the API-only path instead of failing. Flake users
+          # wire `webUiPackage = self.packages.${system}.zeroclaw-web`, or
+          # overlay `zeroclaw-web` into `pkgs` and inherit this default.
+          default = pkgs.zeroclaw-web or null;
+          defaultText = literalExpression "pkgs.zeroclaw-web";
+          example = literalExpression "pkgs.zeroclaw-web";
+          description = ''
+            Web dashboard bundle serving the gateway UI. When set, the module
+            defaults `settings.gateway.web_dist_dir` to
+            `''${webUiPackage}/share/zeroclaw-web` (the `static_files.rs`
+            bundle layout) unless `settings.gateway.web_dist_dir` is set
+            explicitly, which always wins. Set to `null` to skip the
+            package-derived default (explicit `settings.gateway.web_dist_dir`
+            still applies; the gateway may still auto-detect existing assets).
+
+            A raw `[gateway]` table in {option}`extraConfig` merges with this
+            default into a single table instead of conflicting.
+          '';
+        };
 
         user = mkOption {
           type = types.str;
@@ -144,17 +178,34 @@ let
           default = { };
           example = literalExpression ''
             {
-              default_provider = "anthropic";
-              default_model = "claude-sonnet-4-6";
-              channels.telegram = {
+              schema_version = 4;
+              providers.models.anthropic.default.model = "claude-sonnet-4-6";
+              agents.default = {
+                model_provider = "anthropic.default";
+                risk_profile = "default";
+                runtime_profile = "default";
+              };
+              risk_profiles.default = { };
+              runtime_profiles.default = { };
+              channels.telegram.default = {
                 enabled = true;
                 bot_token = "$BOT_TOKEN";
-                allowed_users = [ "12345" ];
+              };
+              peer_groups.telegram_default = {
+                channel = "telegram";
+                agents = [ "default" ];
+                external_peers = [ "12345" ];
               };
             }
           '';
           description = ''
-            ZeroClaw configuration as a Nix attrset. Rendered to TOML in the
+            ZeroClaw configuration as a Nix attrset. Set `schema_version` to
+            the version the attrset is written for (`4` for the current
+            shape). The module renders the attrset as written and does not add
+            it: a file without it is read as the oldest schema and migrated,
+            unless its sections are plainly in the current shape.
+
+            Rendered to TOML in the
             Nix store at build time, then `envsubst`'d into
             `''${dataDir}/config.toml` (mode `0600`) by the unit's
             `ExecStartPre`.
@@ -208,10 +259,18 @@ let
             new_knob = true
           '';
           description = ''
-            Raw TOML appended verbatim after the rendered {option}`settings`
-            block. Documented escape hatch (per RFC-42) for ZeroClaw config
-            keys whose shape isn't yet covered by the typed `settings`
+            Raw TOML merged as values over the rendered {option}`settings`
+            block (parsed with `builtins.fromTOML`, deep-merged, then rendered
+            as one document). Documented escape hatch (per RFC-42) for ZeroClaw
+            config keys whose shape isn't yet covered by the typed `settings`
             surface — most things should go through `settings` instead.
+
+            Tables compose: a raw `[gateway]` table here merges with the
+            `[gateway]` table from `settings` or the {option}`webUiPackage`
+            default into a single valid table. On conflicting scalars
+            (lists are replaced, not appended), `extraConfig` wins.
+            Malformed TOML fails evaluation. Comments inside `extraConfig`
+            are not preserved in the rendered output.
           '';
         };
 
@@ -243,22 +302,37 @@ let
   # adds a second way to do the same thing (which always invites
   # contradictions) and isn't standard nixpkgs shape.
 
-  # Render config.toml = formats.toml.generate settings (+ optional extraConfig).
+  # Render config.toml = formats.toml.generate (settings + webUiPackage default
+  # + extraConfig merged as TOML values).
+  # `gateway.web_dist_dir` is the canonical dashboard knob (see
+  # `crates/zeroclaw-config/src/schema.rs`); the module only supplies its
+  # default from `webUiPackage`. An explicit
+  # `settings.gateway.web_dist_dir` always wins over the bundle default, and
+  # `webUiPackage = null` leaves the key unset.
+  #
+  # `extraConfig` is parsed with `builtins.fromTOML` (malformed TOML fails
+  # the evaluation instead of degrading at runtime) and deep-merged over the
+  # rendered settings, so a raw `[gateway]` table composes with the bundle's
+  # `web_dist_dir` into a single valid table. On conflicting scalars —
+  # including lists, which are replaced, not appended — `extraConfig` wins.
+  # Comments inside `extraConfig` are not preserved in the rendered output.
   renderConfigFile =
     name: instanceCfg:
     let
-      base = tomlFormat.generate "zeroclaw-${name}-config.toml" instanceCfg.settings;
+      effectiveSettings =
+        if instanceCfg.webUiPackage == null
+          || lib.hasAttrByPath [ "gateway" "web_dist_dir" ] instanceCfg.settings
+        then
+          instanceCfg.settings
+        else
+          lib.recursiveUpdate instanceCfg.settings {
+            gateway.web_dist_dir = "${instanceCfg.webUiPackage}/share/zeroclaw-web";
+          };
+      mergedSettings = lib.recursiveUpdate effectiveSettings (
+        if instanceCfg.extraConfig == "" then { } else builtins.fromTOML instanceCfg.extraConfig
+      );
     in
-    if instanceCfg.extraConfig == "" then
-      base
-    else
-      pkgs.runCommand "zeroclaw-${name}-config.toml" { } ''
-        cat ${base} > $out
-        cat <<'ZEROCLAW_EXTRA_CONFIG_EOF' >> $out
-
-        ${instanceCfg.extraConfig}
-        ZEROCLAW_EXTRA_CONFIG_EOF
-      '';
+    tomlFormat.generate "zeroclaw-${name}-config.toml" mergedSettings;
 
   # Build one systemd service from one instance entry. Mirrors the shape of
   # `services.restic.backups`'s mapAttrs' generator.
@@ -362,8 +436,17 @@ let
         ProtectHostname = true;
         ProtectProc = "invisible";
         ProcSubset = "pid";
-        # MemoryDenyWriteExecute=yes blocks W+X mappings; safe for a
-        # Rust binary with no JIT. ZeroClaw 0.7.x has no JIT path.
+        # MemoryDenyWriteExecute=yes forbids memory that becomes executable
+        # after it is written. The package built from the distribution
+        # feature list carries the WASM plugin host, whose compiler writes
+        # code into memory and then marks it executable, so under this unit
+        # every plugin load fails with a memory-protection error while the
+        # rest of the daemon, which needs no such transition, runs normally.
+        # That is the intended default:
+        # plugins are off unless the operator enables them. An instance that
+        # runs plugins must override this setting on its own unit:
+        #   systemd.services."zeroclaw-<name>".serviceConfig.MemoryDenyWriteExecute =
+        #     lib.mkForce false;
         MemoryDenyWriteExecute = true;
         # PrivateUsers=yes runs the unit in its own user namespace. The
         # StateDirectory= bind-mount happens in the host namespace

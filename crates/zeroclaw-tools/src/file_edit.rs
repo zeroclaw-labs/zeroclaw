@@ -64,7 +64,7 @@ impl Tool for FileEditTool {
         // A successful edit on an ephemeral runtime rewrites a file that never
         // reaches the host and is lost at session end; warn loudly
         if !self.persistent_writes && result.success {
-            result.output = with_ephemeral_workspace_warning(&result.output).into();
+            result.output.map_text(with_ephemeral_workspace_warning);
         }
         Ok(result)
     }

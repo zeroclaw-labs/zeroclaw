@@ -14,7 +14,7 @@ Last verified against the `v0.8.2` release cycle.
 
 ## The process in seven steps
 
-1. [Generate `CHANGELOG-next.md` using the changelog skill](#step-1-generate-changelog-nextmd)
+1. [Generate `CHANGELOG-next.md` using the changelog skill, with the binary size table](#step-1-generate-changelog-nextmd)
 2. [Open and merge a version bump PR](#step-2-bump-and-merge-the-version-pr)
 3. [Dry-run the release workflows locally with `act`](#step-3-dry-run-the-release-workflows-locally-with-act)
 4. [Trigger the `Release Stable` workflow via manual dispatch](#step-4-trigger-the-release)
@@ -59,6 +59,100 @@ gh workflow run discord-release.yml -f release_tag=vX.Y.Z -f dry_run=true
 ```
 
 The composed text appears in the run's job summary.
+
+### Record the binary size change
+
+Before the version bump, measure the release binary of the previous release
+and of current `master`, then paste the `compare` table into
+`CHANGELOG-next.md` as a `## Binary size` section before Contributors, inside
+a `text` code block. `CHANGELOG-next.md` becomes the release body, so the table
+ships with the release. The table reports local builds of the two source
+revisions on one machine. It does not measure the published archives, which
+the release workflow builds per target with its pinned toolchain and target
+flags, so state the measuring target triple next to the table.
+
+`scripts/ci/binary_size_report.sh` runs on Linux or macOS and needs Python 3.11
+or newer. Its `measure` command builds the `zeroclaw` binary of each `zeroclaw`
+policy profile in `dev/ci/dependency-footprint.toml` with the `release` Cargo
+profile. For each policy profile the report records the binary's bytes,
+SHA-256, and path, the target triple, and the resolved features. The report
+also records the `release` Cargo profile settings from `Cargo.toml`, the Cargo
+and rustc versions, the build variables that change code generation
+(`RUSTFLAGS`, `CARGO_ENCODED_RUSTFLAGS`, `CARGO_BUILD_RUSTFLAGS`, the
+target's `RUSTFLAGS` and linker variables, and `ZEROCLAW_BUILD_ID`), the
+source revision with a worktree digest, and the `Cargo.lock` digest.
+
+Measure each side from its own clean checkout on the same machine and user
+account, and keep the reports outside both checkouts, because an untracked
+file inside a checkout marks its next measurement as dirty:
+
+```sh
+git worktree add ../zeroclaw-vPREV vPREV
+./scripts/ci/binary_size_report.sh measure --repo-root ../zeroclaw-vPREV \
+  --profile foundation --profile agent-runtime \
+  --profile root-default --profile standard-distribution \
+  --target-dir ../zeroclaw-vPREV/target-size --output ../size-vPREV.json
+./scripts/ci/binary_size_report.sh measure \
+  --profile foundation --profile agent-runtime \
+  --profile root-default --profile standard-distribution \
+  --target-dir target-size --output ../size-next.json
+./scripts/ci/binary_size_report.sh compare ../size-vPREV.json ../size-next.json \
+  --output ../size-compare.json
+```
+
+These commands measure the four policy profiles that describe what users run:
+`foundation` (`--no-default-features`), `agent-runtime`, `root-default` (the
+Cargo defaults a source build gets), and `standard-distribution` (the feature
+set of the release archives). Without `--profile`, `measure` builds every
+`zeroclaw` policy profile, including `ci-all` and `hardware-probe`, which are
+CI and hardware aggregates rather than shipped builds. Pass `--target <triple>`
+to build for another target. Without it, `measure` resolves the
+`standard-distribution` features for the host triple, so the per-target
+exclusions in `Cargo.toml` apply as they do for that target's release
+archive.
+
+`compare` prints the table, headed by each side's revision and whether it was
+dirty, and writes the JSON result to the file named by `--output`, or to
+stdout without it.
+
+The binary embeds registry source paths under `CARGO_HOME` and a build stamp
+from `git describe` or `ZEROCLAW_BUILD_ID`. The same source measured on
+another machine or user account can therefore produce different bytes, and
+`compare` cannot detect such a pair. Other inputs change the binary without
+being recorded either: C compiler variables such as `CC` and `CFLAGS`, the
+macOS SDK and deployment target, and Cargo settings in a user-level
+`~/.cargo/config.toml`. Measure both sides on the same machine and user
+account, from the same shell environment.
+
+`measure` refuses to start a build when `RUSTC` or `CARGO_BUILD_RUSTC` is set,
+when a `CARGO_PROFILE_RELEASE_*` variable overrides the `release` Cargo
+profile, when a selected policy profile does not build the `zeroclaw`
+package, or when a policy profile's target directory is inside the checkout
+but not ignored by Git. After each build it refuses a binary that Cargo reports
+at a different path than expected, for example when `CARGO_BUILD_TARGET` or a
+`build.target` setting applies without `--target`. `compare` refuses reports
+that differ in Cargo or rustc version, host, target, `release` Cargo profile
+settings, recorded build variables, policy, or set of policy profiles. A policy
+profile whose resolved features or binary path changed between the reports is
+listed as not comparable, with its added and removed features, instead of
+getting a delta.
+
+Each policy profile builds in its own target directory,
+`<target-dir>/<profile-id>`, which repeats the dependency build per policy
+profile. On macOS arm64 these directories took 0.8 GB for `foundation`,
+1.2 GB for `agent-runtime`, 1.4 GB for `root-default`, and 2.5 GB for
+`standard-distribution`. The first build of a policy profile is a full
+fat-LTO release build that takes several minutes; a repeat run on unchanged
+sources finishes without rebuilding. Clean up when the table is in the
+changelog:
+
+```sh
+rm -rf target-size
+git worktree remove ../zeroclaw-vPREV
+```
+
+For the full target matrix, the job summary of the Cross-Platform Build
+workflow lists each binary's bytes and SHA-256.
 
 ---
 
@@ -157,6 +251,8 @@ Open a PR. Label it `type:ci`, `size:XS`, and any path labels the PR labeler add
 Two independent Core Team approvals are the default. Toolchain-floor and release changes may be considered under the [expedited second-review lane](./pr-workflow.md#expedited-second-review-lane) only with its complete evidence and an explicit justification for this normally two-review category. A timeout never clears an unresolved compatibility or release-safety concern. Merge only when required CI is green.
 
 The **Installer Drift** gate in CI fails the PR if a generated surface is out of sync with the spec, so a missed regeneration cannot land. The **Validate Translations Pin** gate resolves the submodule at the pinned commit and validates catalogue format and msgid parity, so a bad pin cannot land either. See [Docs & Translations](../maintainers/docs-and-translations.md#filling-doc-translations-gettext) for translation pipeline details.
+
+The **crates.io Package Preflight** gate runs whenever a PR changes `[workspace.package] version` to a stable `X.Y.Z`. It packages every crate in the release set and compiles each one from its own tarball, with no registry token, so a bump whose crates cannot publish cannot merge. Expect it to add about half an hour to the bump PR. It also runs again in the merge queue. If it fails, read the Preflight step first. A packaging or compile error is real and must be fixed in the bump PR. A crates.io API error, an npm install failure, or a runner timeout is infrastructure. Re-run only the failed jobs rather than pushing again. If the outage persists, keep the bump unmerged until required CI is green. The release run independently repeats the same preflight before the GitHub Release.
 
 **Confirm the merge landed correctly:**
 
@@ -415,8 +511,14 @@ re-trigger. Do not try to work around it.
 Three jobs are gated by GitHub environment protection rules. When each becomes
 pending you will see a **"Waiting for review"** banner in the workflow run.
 
-Approve all three when they appear. Approve `crates-io` only after its tokenless
-package preflight is green:
+Approve all three when they appear. The `github-releases` gate appears only
+after the tokenless crates.io preflight, `Preflight crates.io Workspace`, has
+packaged and compiled every crate, and after every `Plugin Smoke <target>` leg
+has installed and executed a plugin from the archive built for that target.
+The preflight runs beside the binary builds and the smoke legs right after
+them, so a release whose crates cannot publish, or whose archives cannot run a
+plugin, stops before the GitHub Release becomes public. The
+later `crates-io` job uploads what that preflight verified without repeating it:
 
 | Environment | Job | What it does |
 |---|---|---|
@@ -441,7 +543,9 @@ Once `publish` completes, confirm:
 [ ] Exactly one zeroclaw-vX.Y.Z-verification.tar.gz asset is present
 [ ] No loose *.bundle, *.attestation.jsonl, or *.intoto.jsonl assets are present
 [ ] At least one binary archive is downloadable (spot-check linux x86_64)
+[ ] Every Plugin Smoke leg is green; each step summary carries its check table
 [ ] Prebuilt Docker and generated Docker matrix jobs are green
+[ ] Release notes contain the binary size table from step 1
 ```
 
 `CHANGELOG-next.md` is intentionally left on `master` after the release: the
@@ -495,11 +599,59 @@ recreate `gh-pages` or change the supported-version window.
 ### What happens automatically
 
 - The `deploy-docs` job dispatches a build that lands in `/vX.Y.Z/`.
-- "Stable" is a pointer, not a copy. The release tag deploy (e.g., `v0.8.0`) is what builds and publishes that version's docs directory. `bump-version.sh` writes the released version to `docs/book/stable-version.txt`; landing that change on master refreshes the stable metadata only. The master deploy does not rebuild or republish the release tag's docs; it copies `stable-version.txt` to the `gh-pages` root and regenerates the root `/` redirect and the version-selector's "Stable (latest release)" entry so both resolve to that release's already-published version dir. The deploy fails loudly if the named version dir is not present on `gh-pages`. There is no duplicate `/stable/` tree.
-- **Ordering matters:** the tag deploy must land `/vX.Y.Z/` on `gh-pages` *before* a master deploy can flip the stable pointer to it. In the normal release sequence the version-bump PR merges first (Step 2), so its `master` docs deploy typically runs *before* `Release Stable` creates and deploys the tag. That earlier master deploy finds `/vX.Y.Z/` absent and deliberately retains the previous pointer; the flip is deferred (see the deferred-flip logic in `docs-deploy.yml`). The `deploy-docs` job then creates `/vX.Y.Z/`, and the flip publishes on the *next* master deploy after the dir is live. Note that `deploy-docs` only dispatches the tag build and does not wait for it: a green `deploy-docs` job means the dispatch was accepted, not that the docs run finished. After `/vX.Y.Z/` is live, dispatch `docs-deploy.yml` with `tag=master` to publish the stable-pointer flip (and confirm the dispatched runs actually succeeded in the Actions tab).
-- `gh-pages` is ephemeral: every deploy force-pushes a single orphan commit (no accumulating history) and enforces retention via `DOCS_KEEP_VERSIONS` (master plus the newest N final releases; pre-releases and older finals are pruned). This keeps clone size bounded.
+- "Stable" is a pointer to the release's existing docs directory. `bump-version.sh` writes `docs/book/stable-version.txt`; only a master run publishes that pointer to `gh-pages` and refreshes the root redirect and version selector. A normal master deploy builds development docs and shared assets as well. Every build deploy also writes `/stable/`, a copy of the pointer's release directory: canonical, language-alternate and sitemap URLs name `/stable/`, so they stay the same when a new release becomes Stable.
+- **Ordering matters:** the version-bump master deploy usually precedes the release tag deploy. It retains the previous live pointer until `/vX.Y.Z/` exists. The release's `deploy-docs` job only dispatches the tag build: a green dispatch job does not prove the docs build finished. Once that run succeeds, use the promotion mode below to publish the stable pointer, then run the master build that promotion requires.
+- `gh-pages` is ephemeral: publication replaces it with a single orphan commit. Normal builds enforce retention via `DOCS_KEEP_VERSIONS` (master, the stable pointer target, and the newest N final releases). Promotion preserves all existing version directories.
 - The `_shared/` directory (containing UI CSS, JS, and favicons) is updated from the build so the theme cascades to all deployed versions.
 - Translated locales (`es`, `fr`, `ja`, `zh-CN`) render from the `docs/book/po` submodule, which the deploy resolves via `submodules: recursive` at whatever commit the deployed ref pins. That pin is set during the version bump; see [Step 2](#step-2-bump-and-merge-the-version-pr) for the refresh, tag, and pin procedure. English needs no submodule.
+
+### Promote an already deployed release
+
+Dispatch **Deploy mdBook docs to Pages** from branch **master**, set **mode** to
+`promote-stable`, and set **tag** to the exact final tag, for example `v0.8.5`.
+The default `build` mode retains the normal build behavior.
+
+Promotion updates `stable-version.txt`, `index.html`, `versions.json`,
+`sitemap.xml`, and the root `llms.txt` / `llms-full.txt` pair at the site
+root, and replaces `stable/` with a copy of the promoted release's
+directory. The llms pair mirrors the promoted release's English copy, and is
+withdrawn when the release doesn't carry both files, so the fixed LLM URLs
+always describe the release `/` redirects to.
+In the root `404.html`, promotion rewrites the two lines that set the
+redirect's `target` and `locales`, so links to pruned releases reach the
+promoted release's languages.
+It installs no Rust or mdBook tools and preserves every locale, the API
+reference, shared chrome, and retention state. The workflow's existing
+`gh-pages` concurrency group serializes both modes; promotion also uses an exact
+push lease so it cannot replace a site changed by another writer.
+
+The helper requires the dispatch commit to remain protected master's current
+head, its committed pointer to match the requested tag, and GitHub Latest to name
+that same public final release. It resolves the tag to a commit and compares it
+with the deployed version's `.docs-source-commit` receipt. Every locale listed in
+that release's `locales.toml` must have a nonempty landing page. Missing or
+inconsistent metadata, API errors, prereleases, versions below the docs floor,
+and numeric version downgrades fail before publication. The live checks repeat
+immediately before the push. If master advances while the run waits, dispatch a
+fresh run. Repeating a successful promotion is safe.
+
+Deployments made before source receipts were introduced need one normal `build`
+dispatch for that release tag before promotion can verify their source. Do not
+create a receipt by hand.
+
+**After a promotion, run a normal master build:** dispatch **Deploy mdBook docs
+to Pages** from branch **master** with **mode** `build` and **tag** `master`.
+This is a required step. Promotion copies the release's pages to `stable/` with
+the SEO tags they were deployed with, while the release was not yet Stable, and
+it does not rerun `gen-seo`. Until the master build runs, pages new in the
+promoted release, and every page of a locale it adds, are served under
+`/stable/` with `noindex` and a canonical to `/vX.Y.Z/`, and no stable page
+carries language-alternate (`hreflang`) links. Promotion does rewrite
+`sitemap.xml` for the promoted release.
+
+A downgrade requires a separately reviewed manual rollback; this mode has
+no rollback override. Reverting the workflow change removes the manual mode but
+does not change the already published pointer.
 
 ### Bootstrapping `gh-pages`
 
@@ -549,6 +701,33 @@ policy instead.
 **validate failed: version mismatch:** The version bump PR was not merged, or
 you typed the wrong version. Fix the mismatch and re-trigger.
 
+**The crates.io preflight failed:** Nothing was published. The GitHub Release
+waits for this job, and the job holds no registry token. On a dispatched
+release the tag does not exist yet either. Fix the packaging problem on
+`master`, then dispatch Release Stable again for the same version. Run
+`scripts/release/publish-crates.sh` locally first to confirm the fix; without
+`--execute` it only packages and verifies.
+
+**A Plugin Smoke leg failed:** On a dispatched release nothing was published:
+the GitHub Release and the release workflow's own image pushes wait for every
+leg. A release started by a tag push also triggers Docker Publish on its own,
+and that run does not wait for the smoke, so check it as well. Open the leg's
+step summary: the
+report names the check that failed and quotes the command output, and the
+`plugin-smoke-<target>` artifact holds the same report. A failure at `plugin
+install` or at the tool result means the archive built for that target cannot
+run a plugin; fix it on `master` and dispatch Release Stable again. Rehearse
+the fix first with the Cross-Platform Build workflow, which runs the same legs
+against the binaries it builds. A failure that names the provider or the
+scratch directory is a runner problem: re-run only the failed leg. Re-run a
+timeout once as well; a repeat timeout is a defect, since a binary that hangs
+on plugin load times out the same way.
+
+**A build leg failed the binary size check:** The cap is 80 MiB, set as
+`BINARY_SIZE_HARD_LIMIT` on the `Check binary size` step of the build job.
+Measure the binary sizes with the Cross-Platform Build workflow before
+raising it, and record the per-target sizes in the pull request that does.
+
 **An environment gate timed out:** Re-run only the timed-out job. No need to
 restart the workflow.
 
@@ -566,7 +745,19 @@ deleted. Fix the failing crate at the same release commit, then re-run
 `Pub crates.io` for the same tag with `dry_run: false`; the publisher queries
 every `<crate>@<version>` first and skips versions that already landed. Read the
 Publish step for the last successful crate. If preflight failed, no upload was
-attempted and the problem is still reversible.
+attempted and the problem is still reversible. If the publish job reports that
+`web/dist` does not match the bundle preflight verified, or that the tag does
+not resolve to the release commit, nothing was uploaded; dispatch
+`Pub crates.io` again so a fresh preflight rebuilds and re-verifies it.
+
+**The failure is in the publisher scripts, not the crates:** Both v0.8.5
+failures were of this kind. Do not move the tag and do not publish by hand. Fix
+the script on `master`, then dispatch `Pub crates.io` from `master` for the same
+tag. The crates are still packaged from the tag, but the scripts under
+`scripts/release/` come from `master`. The run summary shows both commits as
+`commit` and `release tooling`. The resolver accepts newer tooling only from a
+`master` commit that already contains the release commit, and only on a manual
+dispatch. A release run always uses the scripts it was tagged with.
 
 **The `scoop` job failed with `remote: Permission ... denied to <account>` (403):**
 A permissions problem, not a manifest problem: the bucket token is dead or

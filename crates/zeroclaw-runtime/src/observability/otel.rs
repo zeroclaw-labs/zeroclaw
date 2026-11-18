@@ -913,6 +913,7 @@ impl Observer for OtelObserver {
                 "OTel metric flush failed"
             );
         }
+        zeroclaw_log::flush_log_exporter();
     }
 
     fn name(&self) -> &str {
@@ -972,12 +973,13 @@ fn clean_for_display(content: &str) -> String {
     // Preserve the pre-existing cleanup for bare timestamps. The labeled
     // runtime envelope is removed only at the role-aware agent-message export
     // boundary so user-authored examples later in the message remain intact.
-    let timestamp_regex =
-        regex::Regex::new(r"\[\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\s+\S+\]").unwrap();
+    let timestamp_regex = regex::Regex::new(r"\[\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\s+\S+\]")
+        .expect("static OTel timestamp regex must compile");
     cleaned = timestamp_regex.replace_all(&cleaned, "").to_string();
 
     // Remove tool results prefix
-    let tool_results_prefix_regex = regex::Regex::new(r"(?m)^\[Tool results\]\s*\n?").unwrap();
+    let tool_results_prefix_regex = regex::Regex::new(r"(?m)^\[Tool results\]\s*\n?")
+        .expect("static OTel tool-result prefix regex must compile");
     cleaned = tool_results_prefix_regex
         .replace_all(&cleaned, "")
         .to_string();

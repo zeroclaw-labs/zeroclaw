@@ -285,6 +285,7 @@ fn test_manifest(
         wasm_path: Some("plugin.wasm".to_string()),
         wasm_sha256: None,
         capabilities: vec![capability],
+        provides: None,
         permissions,
         config_schema: None,
         signature: None,

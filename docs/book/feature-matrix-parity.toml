@@ -29,8 +29,33 @@
 # A cell is `supported` when the upstream tree ships a first-class module for it,
 # `none` when the tree has no equivalent, and `partial` where support is indirect
 # (e.g. reachable only through a generic gateway rather than a dedicated module).
-# A cell is `planned` when the tree has no module yet but an open upstream feature
-# request tracks it (checked against each repo's issue tracker on 2026-07-06).
+# A cell is `planned` only with an accepted maintainer commitment or maintained
+# roadmap entry, not an open request alone. Use `unknown` for unverified support.
+#
+# Scoped Hermes refresh, checked 2026-09-19: doubao, deepinfra, venice,
+# cloudflare, vllm, and litellm below. Neighboring ollama, sglang, llamacpp, and
+# lmstudio checked at the same revision on 2026-09-21; other cells retain July.
+#   https://github.com/NousResearch/hermes-agent
+#     @ a51143fbbe6ddbc0c7f403d0579c4d75504c6793
+#   deepinfra: plugins/model-providers/deepinfra/__init__.py registers its profile;
+#     providers/__init__.py discovers bundled profiles; hermes_cli/auth.py and
+#     hermes_cli/runtime_provider.py resolve its credentials and runtime.
+#   vllm/litellm: website/docs/integrations/providers.md documents custom-endpoint
+#     integration; plugins/model-providers/custom/__init__.py and
+#     hermes_cli/runtime_provider_custom.py wire that generic route (partial).
+#   ollama/sglang/llamacpp: the same providers guide documents custom-endpoint
+#     setup; hermes_cli/runtime_provider_backends.py resolves the generic route
+#     (partial). plugins/model-providers/custom/__init__.py also registers
+#     ollama and llamacpp aliases, not dedicated providers.
+#   lmstudio: remains supported; the providers guide has a named LM Studio flow,
+#     hermes_cli/providers.py defines its provider overlay, and
+#     hermes_cli/runtime_provider.py applies its dedicated runtime handling.
+#   doubao: https://github.com/NousResearch/hermes-agent/issues/51319 has no
+#     maintainer commitment; custom-route reports/config fixtures are not proof.
+#   venice: https://github.com/NousResearch/hermes-agent/issues/14102#issuecomment-4951894849
+#   cloudflare: https://github.com/NousResearch/hermes-agent/issues/52543#issuecomment-4976572735
+#     Both requests were closed as not planned. This bounded walk did not verify
+#     inference support through generic routes or external plugins; unknown, not none.
 
 # ── Channels ────────────────────────────────────────────────────────────────
 
@@ -173,8 +198,9 @@ hermes = "supported"
 # ── Provider slots ──────────────────────────────────────────────────────────
 # Source-walked from each upstream tree: OpenClaw extensions/ provider plugins
 # (litellm covers the custom passthrough), Hermes agent adapters + the
-# providers.md first-class list + hermes_cli model-setup provider branches. A
-# slot with no dedicated upstream module is `none`, not a guess.
+# providers.md first-class list + hermes_cli model-setup provider branches.
+# Verified absence is `none`; a verified generic route is `partial`.
+# An incomplete walk is `unknown`, not proof of absence.
 
 [providers.openai]
 openclaw = "supported"
@@ -210,7 +236,7 @@ hermes = "supported"
 
 [providers.doubao]
 openclaw = "supported"
-hermes = "planned"
+hermes = "unknown"
 
 [providers.yi]
 openclaw = "none"
@@ -234,7 +260,7 @@ hermes = "supported"
 
 [providers.ollama]
 openclaw = "supported"
-hermes = "supported"
+hermes = "partial"
 
 [providers.gemini]
 openclaw = "supported"
@@ -306,7 +332,7 @@ hermes = "none"
 
 [providers.deepinfra]
 openclaw = "supported"
-hermes = "planned"
+hermes = "supported"
 
 [providers.huggingface]
 openclaw = "supported"
@@ -366,7 +392,7 @@ hermes = "none"
 
 [providers.venice]
 openclaw = "supported"
-hermes = "planned"
+hermes = "unknown"
 
 [providers.nearai]
 openclaw = "none"
@@ -386,7 +412,7 @@ hermes = "none"
 
 [providers.cloudflare]
 openclaw = "supported"
-hermes = "planned"
+hermes = "unknown"
 
 [providers.ovh]
 openclaw = "none"
@@ -402,15 +428,15 @@ hermes = "supported"
 
 [providers.llamacpp]
 openclaw = "supported"
-hermes = "none"
+hermes = "partial"
 
 [providers.sglang]
 openclaw = "supported"
-hermes = "none"
+hermes = "partial"
 
 [providers.vllm]
 openclaw = "supported"
-hermes = "planned"
+hermes = "partial"
 
 [providers.osaurus]
 openclaw = "none"
@@ -418,7 +444,7 @@ hermes = "none"
 
 [providers.litellm]
 openclaw = "supported"
-hermes = "planned"
+hermes = "partial"
 
 [providers.lepton]
 openclaw = "none"

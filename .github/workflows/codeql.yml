@@ -14,7 +14,8 @@ name: CodeQL
 # keeps it from rendering as a permanently skipped check on every PR.
 #
 # Triggers:
-#   push to master     — immediate feedback on merged code
+#   push to master     — immediate feedback on merged code, for pushes that
+#                        change analyzed code (see `paths` below)
 #   schedule           — daily catch for new queries (query packs update
 #                        independently of the codebase)
 #   workflow_dispatch  — manual re-run after a config change, or an
@@ -23,6 +24,36 @@ name: CodeQL
 on:
   push:
     branches: [master]
+    # Only pushes that change code this workflow analyzes. CodeQL's result
+    # depends only on these files, so a docs-, skills-, or policy-only push
+    # would reproduce the previous analysis exactly, and under the
+    # cancel-in-progress policy below it would also cancel the in-flight
+    # analysis of the last real code push. Extensions are matched anywhere
+    # because the javascript-typescript extractor scans every JS/TS/HTML file
+    # in the repository, not only web/. The daily schedule still analyzes the
+    # full tree, so anything outside this list is covered within a day.
+    paths:
+      - '**/*.rs'
+      - '**/Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain*'
+      - '.cargo/**'
+      - '**/*.js'
+      - '**/*.jsx'
+      - '**/*.mjs'
+      - '**/*.cjs'
+      - '**/*.ts'
+      - '**/*.tsx'
+      - '**/*.mts'
+      - '**/*.cts'
+      - '**/*.html'
+      - '**/*.htm'
+      - '**/*.vue'
+      - '**/package.json'
+      - '**/package-lock.json'
+      - '**/tsconfig*.json'
+      - '.github/codeql/**'
+      - '.github/workflows/codeql.yml'
   schedule:
     - cron: '37 5 * * *'   # daily at 05:37 UTC — random offset to spread load
   workflow_dispatch:
@@ -44,8 +75,11 @@ jobs:
     # Results upload to this repo's Security tab; skip on forks.
     if: github.repository == 'zeroclaw-labs/zeroclaw'
     # Keep the fast interpreted-language scan on GitHub; give only Rust the
-    # existing closed Blacksmith toggle used by compile-heavy CI jobs.
-    runs-on: ${{ matrix.language == 'rust' && vars.CI_USE_BLACKSMITH == 'true' && 'blacksmith-8vcpu-ubuntu-2404' || 'ubuntu-latest' }}
+    # Blacksmith label the compile-heavy ci.yml jobs pin directly. The label
+    # is a checked-in constant rather than a repository variable, matching
+    # ci.yml, so moving the Rust scan back to GitHub-hosted is one reviewed
+    # edit here and no workflow depends on an Actions variable for runners.
+    runs-on: ${{ matrix.language == 'rust' && 'blacksmith-8vcpu-ubuntu-2404' || 'ubuntu-latest' }}
     timeout-minutes: 60
     strategy:
       fail-fast: false

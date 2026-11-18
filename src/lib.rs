@@ -199,6 +199,11 @@ Examples:
         /// Host of the running gateway to query; defaults to config gateway.host
         #[arg(long)]
         host: Option<String>,
+
+        /// Print one JSON object (`pairing_code`, `message`) instead of text,
+        /// for programs such as the desktop app
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -220,6 +225,9 @@ pub enum ServiceCommands {
         #[arg(long, hide = true)]
         port: u16,
     },
+    /// Internal Windows task runner that owns bounded daemon output capture
+    #[command(hide = true)]
+    RunWindowsDaemon,
     /// Internal OpenRC logger that drains one daemon stream into bounded storage
     #[command(hide = true)]
     RunOpenrcLogWriter {
@@ -347,6 +355,17 @@ pub enum AgentsCommands {
     Create {
         /// New agent alias (lowercase alphanumeric + single underscore)
         alias: String,
+    },
+    /// Export an agent and the config closure it needs to a portable bundle
+    Export {
+        /// Agent alias to export
+        alias: String,
+        /// Destination bundle directory (created if it does not exist)
+        #[arg(long, short)]
+        out: std::path::PathBuf,
+        /// Replace the contents of a destination directory that already has files
+        #[arg(long)]
+        force: bool,
     },
     /// Rename an agent alias, rewriting every reference to it
     Rename {
@@ -528,9 +547,13 @@ Examples:
         /// progress output (resolving, installed, audited) is unaffected.
         #[arg(long)]
         no_tier_banner: bool,
-        /// Install a single named skill from a git catalog repo (its `skills/<name>/` directory).
+        /// Install a single named skill from a git catalog repo (its `skills/<name>/` directory),
+        /// or from an HTTPS well-known index when used with --well-known.
         #[arg(long)]
         skill: Option<String>,
+        /// Discover and install one selected skill from an HTTPS well-known index.
+        #[arg(long)]
+        well_known: bool,
     },
     /// Remove an installed skill
     Remove {
@@ -1087,6 +1110,17 @@ pub enum SopCommands {
     },
     /// List SOP runs currently waiting for approval (talks to the running daemon)
     Pending,
+    /// Show persisted logs for one SOP run (talks to the running daemon)
+    Logs {
+        /// The run ID to inspect
+        run_id: String,
+        /// Maximum number of newest matching events to return
+        #[arg(long, default_value_t = 200)]
+        limit: usize,
+        /// Print the complete gateway response as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Render an SOP's node graph as text
     Graph {
         /// Name of the SOP to render
@@ -1099,6 +1133,13 @@ pub enum SopCommands {
     Delete {
         /// Name of the SOP to delete
         name: String,
+    },
+    /// Rename an SOP definition on disk
+    Rename {
+        /// Name the SOP is stored under today
+        from: String,
+        /// Name to move it to (must not already be taken)
+        to: String,
     },
 }
 

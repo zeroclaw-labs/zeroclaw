@@ -133,7 +133,7 @@ struct InlineData {
 /// multimodal pipeline), they are extracted as inline_data parts. The remaining
 /// text becomes a text part. Falls back to a single text part if no markers.
 fn build_parts(content: &str) -> Vec<Part> {
-    let (text, image_refs) = crate::multimodal::parse_image_markers(content);
+    let (text, image_refs) = crate::multimodal::parse_user_message_image_refs(content);
     let mut parts = Vec::new();
     let trimmed = text.trim();
     if !trimmed.is_empty() {
@@ -2654,7 +2654,7 @@ mod tests {
 
     #[test]
     fn build_parts_extracts_data_uri_as_inline_part() {
-        let content = "Check this [IMAGE:data:image/png;base64,iVBORw0KGgo=]";
+        let content = "Check this [IMAGE:data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC]";
         let parts = build_parts(content);
         assert_eq!(parts.len(), 2);
         // First part is text
@@ -2665,7 +2665,7 @@ mod tests {
         // Second part is inline image
         assert_eq!(
             serde_json::to_value(&parts[1]).unwrap(),
-            serde_json::json!({"inline_data": {"mime_type": "image/png", "data": "iVBORw0KGgo="}})
+            serde_json::json!({"inline_data": {"mime_type": "image/png", "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC"}})
         );
     }
 

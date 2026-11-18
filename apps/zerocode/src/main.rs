@@ -14,7 +14,7 @@ use std::sync::{
 };
 use std::time::Duration;
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 
 mod acp;
 mod agent_sidebar;
@@ -26,6 +26,7 @@ mod client_crypto;
 mod clipboard;
 mod color_depth;
 mod config;
+mod config_application;
 mod config_manager;
 mod dashboard;
 mod diff;
@@ -39,11 +40,14 @@ mod i18n;
 mod input_bar;
 mod jsonrpc;
 mod keymap;
+mod login;
 mod logs;
 mod mouse;
+mod oidc_enroll;
 mod osc_status;
 mod quickstart_pane;
 mod relay_proto;
+mod secure_file;
 mod sop_pane;
 mod terminal_backend;
 #[cfg(test)]
@@ -53,6 +57,7 @@ mod text_selection;
 mod theme;
 mod todo_tracker;
 mod turn_status;
+mod url_open;
 mod widgets;
 mod wire;
 mod zerocode_pane;
@@ -109,8 +114,10 @@ impl ShutdownSignals {
     )
 )]
 struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
     /// Path to the ZeroClaw config directory
-    #[arg(long)]
+    #[arg(long, global = true)]
     config_dir: Option<PathBuf>,
 
     /// Start in chat mode with this agent alias.
@@ -123,21 +130,21 @@ struct Cli {
     #[arg(long)]
     connect: Option<String>,
 
-    /// Skip TLS certificate verification for WSS connections.
-    /// Required for self-signed certificates. Only used with --connect.
-    #[arg(long)]
+    /// Skip TLS certificate verification (explicit confirmation required).
+    /// Applies to --connect, or both transports of login.
+    #[arg(long, global = true)]
     tls_skip_verify: bool,
 
-    /// PEM CA certificate to verify the daemon (mutual TLS). Only used with --connect.
-    #[arg(long)]
+    /// PEM CA certificate to verify the daemon for --connect or login.
+    #[arg(long, global = true)]
     tls_ca_cert: Option<String>,
 
     /// PEM client certificate to present to the daemon (mutual TLS).
-    #[arg(long, requires = "tls_client_key")]
+    #[arg(long, global = true, requires = "tls_client_key")]
     tls_client_cert: Option<String>,
 
     /// PEM client private key for --tls-client-cert.
-    #[arg(long, requires = "tls_client_cert")]
+    #[arg(long, global = true, requires = "tls_client_cert")]
     tls_client_key: Option<String>,
 
     /// Reach the daemon through a nominated relay at this `host:port`
@@ -186,18 +193,24 @@ struct Cli {
 
     /// Enroll for a client certificate before connecting: prompt for the daemon
     /// pairing code, generate a key + CSR locally, fetch the signed cert, and
-    /// cache it under <config-dir>/tls. The host defaults to --connect's host; the
-    /// port defaults to the daemon's enrollment port (9782).
-    #[arg(long)]
+    /// cache it under <config-dir>/tls (URL-scoped for login). The host defaults
+    /// to the connection target; the port defaults to 9782.
+    #[arg(long, global = true)]
     enroll: bool,
 
-    /// Host of the daemon enrollment endpoint (defaults to --connect's host).
-    #[arg(long)]
+    /// Host of the daemon enrollment endpoint (defaults to the connection target).
+    #[arg(long, global = true)]
     enroll_host: Option<String>,
 
     /// Port of the daemon enrollment endpoint (default 9782).
-    #[arg(long)]
+    #[arg(long, global = true)]
     enroll_port: Option<u16>,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Sign in through the remote gateway and save a URL-scoped OIDC login.
+    Login(login::LoginArgs),
 }
 
 /// Map an empty path string to `None`.
@@ -231,6 +244,13 @@ pub(crate) struct WssRoute {
     pub(crate) relay: Option<client::RelayDial>,
     /// TLS verification + mutual-TLS client identity, shared by both legs.
     pub(crate) tls: client::ClientTls,
+    /// Bearer presented as `auth_token` in the initialize handshake (a gateway
+    /// pairing token, or an OIDC access token with `auth_provider`), shared by
+    /// both legs. The mTLS cert is transport/device admission; this is
+    /// principal authentication.
+    pub(crate) auth_token: Option<String>,
+    /// Provider selection for `auth_token` (e.g. `oidc.corp`); `native` default.
+    pub(crate) auth_provider: Option<String>,
     /// How many direct attempts before falling back to the relay (min 1).
     pub(crate) direct_attempts: u32,
     /// Per-attempt direct-connect timeout, in seconds (min 1).
@@ -259,7 +279,14 @@ impl WssRoute {
         if let Some(url) = &self.direct_url {
             let mut last_err: Option<anyhow::Error> = None;
             for _ in 0..self.direct_attempts.max(1) {
-                let fut = client::RpcClient::connect_wss_direct(url, prev_id, prev_sig, &self.tls);
+                let fut = client::RpcClient::connect_wss_direct(
+                    url,
+                    prev_id,
+                    prev_sig,
+                    &self.tls,
+                    self.auth_token.as_deref(),
+                    self.auth_provider.as_deref(),
+                );
                 match tokio::time::timeout(
                     Duration::from_secs(self.direct_timeout_secs.max(1)),
                     fut,
@@ -267,6 +294,9 @@ impl WssRoute {
                 .await
                 {
                     Ok(Ok(client)) => return Ok((client, ActiveLeg::WssDirect)),
+                    Ok(Err(e)) if e.downcast_ref::<client::AuthenticationRequired>().is_some() => {
+                        return Err(e);
+                    }
                     Ok(Err(e)) => last_err = Some(e),
                     Err(_) => {
                         last_err = Some(anyhow::Error::msg(format!(
@@ -284,6 +314,8 @@ impl WssRoute {
                     prev_sig,
                     &self.tls,
                     relay,
+                    self.auth_token.as_deref(),
+                    self.auth_provider.as_deref(),
                 )
                 .await?;
                 return Ok((client, ActiveLeg::WssRelay));
@@ -302,6 +334,8 @@ impl WssRoute {
             prev_sig,
             &self.tls,
             relay,
+            self.auth_token.as_deref(),
+            self.auth_provider.as_deref(),
         )
         .await?;
         Ok((client, ActiveLeg::WssRelay))
@@ -319,7 +353,14 @@ impl WssRoute {
             .direct_url
             .as_ref()
             .ok_or_else(|| anyhow::Error::msg("no direct address to re-probe"))?;
-        let fut = client::RpcClient::connect_wss_direct(url, prev_id, prev_sig, &self.tls);
+        let fut = client::RpcClient::connect_wss_direct(
+            url,
+            prev_id,
+            prev_sig,
+            &self.tls,
+            self.auth_token.as_deref(),
+            self.auth_provider.as_deref(),
+        );
         match tokio::time::timeout(Duration::from_secs(self.direct_timeout_secs.max(1)), fut).await
         {
             Ok(r) => r,
@@ -397,6 +438,71 @@ fn resolve_direct_url(cli_connect: Option<String>, cfg_wss: &config::WssSection)
 /// Server verification is skipped when either the flag or the config asks.
 fn resolve_skip_verify(cli_skip_verify: bool, cfg_wss: &config::WssSection) -> bool {
     cli_skip_verify || cfg_wss.tls.skip_verify
+}
+
+/// The credential presented in the initialize handshake, in precedence
+/// order: `ZEROCLAW_AUTH_TOKEN`, then `[wss].auth_token_file`, then
+/// `[wss].auth_token`. The provider selection comes from config. The mTLS
+/// client cert is transport/device admission; this is the principal.
+fn resolve_auth(cfg_wss: &config::WssSection) -> (Option<String>, Option<String>) {
+    let env_token = std::env::var("ZEROCLAW_AUTH_TOKEN")
+        .ok()
+        .filter(|t| !t.is_empty());
+    auth_from(cfg_wss, env_token)
+}
+
+/// Testable core of [`resolve_auth`]. Split so unit tests inject the env value
+/// rather than mutate process environment.
+fn auth_from(
+    cfg_wss: &config::WssSection,
+    env_token: Option<String>,
+) -> (Option<String>, Option<String>) {
+    let auth_token = env_token
+        .or_else(|| cfg_wss.auth_token_file.as_deref().and_then(read_token_file))
+        .or_else(|| cfg_wss.auth_token.clone());
+    (auth_token, cfg_wss.auth_provider.clone())
+}
+
+/// Read a bearer from a referenced file, refusing one any other account can
+/// read. A referenced secret that is world-readable is worse than the inline
+/// value it replaces, so it is reported and ignored rather than used.
+fn read_token_file(path: &str) -> Option<String> {
+    let path = std::path::Path::new(path.trim());
+    if path.as_os_str().is_empty() {
+        return None;
+    }
+    let metadata = match std::fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(e) => {
+            eprintln!("auth_token_file {}: {e}", path.display());
+            return None;
+        }
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            eprintln!(
+                "auth_token_file {} is readable beyond its owner; refusing to use it",
+                path.display()
+            );
+            return None;
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+    }
+    match std::fs::read_to_string(path) {
+        Ok(body) => {
+            let token = body.trim().to_string();
+            (!token.is_empty()).then_some(token)
+        }
+        Err(e) => {
+            eprintln!("auth_token_file {}: {e}", path.display());
+            None
+        }
+    }
 }
 
 fn should_enroll_via_relay(cli: &Cli, cfg_wss: &config::WssSection, relay_available: bool) -> bool {
@@ -600,6 +706,7 @@ fn force_restore_terminal() {
         let _ = crossterm::execute!(
             std::io::stdout(),
             crossterm::event::DisableBracketedPaste,
+            crossterm::style::Print(config_manager::mouse_shift_capture_sequence(false)),
             crossterm::event::DisableMouseCapture,
             crossterm::terminal::LeaveAlternateScreen
         );
@@ -789,11 +896,58 @@ async fn run() -> anyhow::Result<()> {
     let local_config_dir = client::resolve_config_dir(cli.config_dir.as_deref())?;
     let loaded_config = match config::ensure_and_load(&local_config_dir) {
         Ok(cfg) => cfg,
+        Err(e) if e.downcast_ref::<config::InvalidSavedLogin>().is_some() => {
+            i18n::init_from_config_dir(&local_config_dir);
+            return Err(e);
+        }
         Err(e) => {
             eprintln!("zerocode: config load failed ({e:#}); starting with defaults");
             config::ZerocodeConfig::default()
         }
     };
+    let resolved_locale = loaded_config
+        .resolve_locale()
+        .unwrap_or_else(i18n::detect_locale);
+    i18n::init(&resolved_locale, &local_config_dir);
+    config::emit_startup_notices();
+    if let Some(Command::Login(args)) = &cli.command {
+        return login::run(args, &cli, &local_config_dir).await;
+    }
+    // Resolve credentials by the exact canonical URL, not by hostname. An
+    // explicit --connect never picks up another saved login's bearer or CA.
+    let selected_uri = cli
+        .connect
+        .as_deref()
+        .or(loaded_config.connection.wss.uri.as_deref());
+    let selected_uri = selected_uri
+        .map(|uri| {
+            if loaded_config.connection.logins.is_empty() {
+                Ok(uri.to_string())
+            } else {
+                login::normalize_target(uri)
+            }
+        })
+        .transpose()?;
+    let scoped_credentials = loaded_config
+        .connection
+        .uses_scoped_credentials(selected_uri.as_deref());
+    let mut loaded_config = loaded_config;
+    loaded_config.connection.wss = loaded_config.connection.wss_for(selected_uri.as_deref());
+    if loaded_config
+        .connection
+        .logins
+        .contains_key(selected_uri.as_deref().unwrap_or(""))
+    {
+        login::renew_expired(&local_config_dir, &mut loaded_config, false, &cli).await?;
+    }
+    let credential_config_dir = selected_uri
+        .as_deref()
+        .filter(|_| scoped_credentials)
+        .map(|uri| {
+            login::active_credential_dir(&local_config_dir, uri, &loaded_config.connection.wss.tls)
+        })
+        .transpose()?
+        .unwrap_or_else(|| local_config_dir.clone());
     let active_theme = loaded_config.resolve_theme().unwrap_or_else(|e| {
         let path = config::config_path(&local_config_dir);
         eprintln!("zerocode: {e:#}");
@@ -804,11 +958,6 @@ async fn run() -> anyhow::Result<()> {
         std::process::exit(1);
     });
     theme::set_active(active_theme);
-
-    let resolved_locale = loaded_config
-        .resolve_locale()
-        .unwrap_or_else(i18n::detect_locale);
-    i18n::init(&resolved_locale, &local_config_dir);
 
     // Apply persisted keybinding overrides into the keymap. A bad table
     // fails loud (same posture as an unknown theme) rather than silently
@@ -833,7 +982,7 @@ async fn run() -> anyhow::Result<()> {
     // target block below picks it up with no --tls-* flags.
     {
         use std::io::IsTerminal as _;
-        let config_dir = client::resolve_config_dir(cli.config_dir.as_deref())?;
+        let config_dir = credential_config_dir.clone();
         let cfg_wss = &loaded_config.connection.wss;
         // Recovery runs before the first credential read of the process, so no
         // decision below observes a half-published generation.
@@ -842,7 +991,12 @@ async fn run() -> anyhow::Result<()> {
             cli.tls_client_cert.as_deref(),
             &cfg_wss.tls.client_cert_path,
         )?;
-        let cached_relay = credentials.profile.as_ref().map(|p| &p.relay);
+        let cached_relay = credentials.profile.as_ref().map(|p| &p.relay).filter(|_| {
+            !loaded_config
+                .connection
+                .logins
+                .contains_key(selected_uri.as_deref().unwrap_or(""))
+        });
         let relay = resolve_relay_dial(&cli, cfg_wss, cached_relay, &config_dir).await?;
         let wss_intended = cli.connect.is_some()
             || cfg_wss.uri.is_some()
@@ -876,9 +1030,9 @@ async fn run() -> anyhow::Result<()> {
         }
     }
 
-    let target = {
+    let mut target = {
         let cfg_wss = &loaded_config.connection.wss;
-        let config_dir = client::resolve_config_dir(cli.config_dir.as_deref())?;
+        let config_dir = credential_config_dir.clone();
         // The cached enrollment profile supplies the relay coordinates so a bare
         // `zerocode` after enrollment still reaches the daemon through its relay.
         // Enrollment above may have published a new generation, so recover and
@@ -890,10 +1044,15 @@ async fn run() -> anyhow::Result<()> {
             cli.tls_client_cert.as_deref(),
             &cfg_wss.tls.client_cert_path,
         )?;
-        let cached_relay = credentials.profile.as_ref().map(|p| &p.relay);
+        let cached_relay = credentials.profile.as_ref().map(|p| &p.relay).filter(|_| {
+            !loaded_config
+                .connection
+                .logins
+                .contains_key(selected_uri.as_deref().unwrap_or(""))
+        });
 
         // Direct daemon address (CLI overrides config). `None` => relay-only.
-        let direct_url = resolve_direct_url(cli.connect.clone(), cfg_wss);
+        let direct_url = resolve_direct_url(selected_uri.clone(), cfg_wss);
         let skip_verify = resolve_skip_verify(cli.tls_skip_verify, cfg_wss);
 
         let relay = resolve_relay_dial(&cli, cfg_wss, cached_relay, &config_dir).await?;
@@ -921,6 +1080,69 @@ async fn run() -> anyhow::Result<()> {
                     .or_else(|| opt_path(&cfg_wss.tls.client_key_path))
                     .or_else(|| default_tls_path(&config_dir, "client.key")),
             };
+            let (mut auth_token, auth_provider) = resolve_auth(cfg_wss);
+            // An OIDC provider with no token means "enroll first": run the
+            // device grant through the gateway enrollment API and hold the
+            // token for this session only.
+            if auth_token.is_none()
+                && let Some(alias) = auth_provider
+                    .as_deref()
+                    .and_then(|p| p.strip_prefix("oidc."))
+            {
+                let Some(enroll_url) = cfg_wss.enroll_url.as_deref() else {
+                    anyhow::bail!(i18n::t_args(
+                        "zc-oidc-enroll-missing-url",
+                        &[("provider", auth_provider.as_deref().unwrap_or(""))],
+                    ));
+                };
+                // `tls` is borrowed here and moved into the WssRoute below: the
+                // enrollment leg runs on exactly the trust material the WSS
+                // connection is about to use.
+                let token = oidc_enroll::run_device_flow(
+                    enroll_url,
+                    &tls,
+                    alias,
+                    |start| {
+                        let uri = start
+                            .verification_uri_complete
+                            .as_deref()
+                            .unwrap_or(&start.verification_uri);
+                        eprintln!(
+                            "{}",
+                            i18n::t_args(
+                                "zc-oidc-enroll-visit",
+                                &[("uri", uri), ("code", &start.user_code)],
+                            )
+                        );
+                        eprintln!(
+                            "{}",
+                            i18n::t_args(
+                                "zc-oidc-enroll-waiting",
+                                &[("seconds", &start.expires_in.to_string())],
+                            )
+                        );
+                    },
+                    // The enrollment origin is its own peer: it may not be the
+                    // daemon this run connects to afterwards, so it is
+                    // acknowledged under its own URL rather than the WSS
+                    // route's. A non-interactive run reads EOF, which the
+                    // prompt maps to abort, so enrollment refuses instead of
+                    // proceeding unverified.
+                    |origin| {
+                        if cfg_wss.tls.route_acked(origin) {
+                            return Ok(());
+                        }
+                        apply_insecure_tls_choice(
+                            confirm_insecure_tls(origin)?,
+                            &local_config_dir,
+                            origin,
+                        )
+                    },
+                )
+                .await?;
+                eprintln!("{}", i18n::t("zc-oidc-enroll-done"));
+                auth_token = Some(token.access_token);
+            }
             ConnectTarget::Wss(Box::new(WssRoute {
                 direct_url,
                 relay_inner_url: DEFAULT_RELAY_INNER_URL.to_string(),
@@ -931,6 +1153,8 @@ async fn run() -> anyhow::Result<()> {
                     .direct_timeout_secs
                     .unwrap_or(DEFAULT_DIRECT_TIMEOUT_SECS),
                 reprobe_secs: cfg_wss.reprobe_secs.unwrap_or(DEFAULT_REPROBE_SECS),
+                auth_token,
+                auth_provider,
             }))
         } else {
             let socket = client::resolve_socket_path(&config_dir)?;
@@ -947,7 +1171,7 @@ async fn run() -> anyhow::Result<()> {
     // ephemeral daemon may be respawned on disconnect, and then exactly once,
     // gated on the liveness/grace check in app.rs.
     let mut owned_daemon_pid: Option<u32> = None;
-    let (rpc, initial_leg) = match &target {
+    let (rpc, initial_leg) = match &mut target {
         ConnectTarget::LocalSocket(socket) => {
             #[cfg(unix)]
             let shutdown_signals = shutdown_signals.insert(ShutdownSignals::new()?);
@@ -997,6 +1221,9 @@ async fn run() -> anyhow::Result<()> {
             let ack_key = route.ack_key();
             let requires_confirmation =
                 route.tls.skip_verify && !loaded_config.connection.wss.tls.route_acked(&ack_key);
+            let saved_login = selected_uri
+                .as_deref()
+                .is_some_and(|uri| loaded_config.connection.logins.contains_key(uri));
             #[cfg(not(unix))]
             if requires_confirmation {
                 apply_insecure_tls_choice(
@@ -1005,25 +1232,50 @@ async fn run() -> anyhow::Result<()> {
                     &ack_key,
                 )?;
             }
+            // A saved login may need another browser sign-in and synchronous
+            // TLS consent. Keep the default signals until those prompts finish,
+            // as on first login, instead of swallowing Ctrl+C while blocked.
             #[cfg(unix)]
-            let shutdown_signals = shutdown_signals.insert(prepare_wss_shutdown_signals(
-                requires_confirmation,
-                &local_config_dir,
-                &ack_key,
-            )?);
-            // Signal-aware like the local leg: `connect_preferred` can spend the
-            // full direct-attempt budget before falling back to the relay, so a
-            // SIGTERM during that window must still exit cleanly.
-            #[cfg(unix)]
-            let connect_result = tokio::select! {
-                result = route.connect_preferred(None, None) => result,
-                _ = shutdown_signals.recv() => return Ok(()),
+            let connect_result = if saved_login {
+                if requires_confirmation {
+                    apply_insecure_tls_choice(
+                        confirm_insecure_tls(&ack_key)?,
+                        &local_config_dir,
+                        &ack_key,
+                    )?;
+                }
+                route.connect_preferred(None, None).await
+            } else {
+                let signals = shutdown_signals.insert(prepare_wss_shutdown_signals(
+                    requires_confirmation,
+                    &local_config_dir,
+                    &ack_key,
+                )?);
+                tokio::select! {
+                    result = route.connect_preferred(None, None) => result,
+                    _ = signals.recv() => return Ok(()),
+                }
             };
             #[cfg(not(unix))]
             let connect_result = route.connect_preferred(None, None).await;
 
             match connect_result {
                 Ok(pair) => pair,
+                Err(e)
+                    if e.downcast_ref::<client::AuthenticationRequired>().is_some()
+                        && saved_login
+                        && !std::env::var("ZEROCLAW_AUTH_TOKEN")
+                            .is_ok_and(|token| !token.is_empty()) =>
+                {
+                    // The issuer can revoke before expires_in, or omit it. A
+                    // structured auth refusal permits one interactive sign-in,
+                    // not a retry loop and never a TLS/transport downgrade.
+                    login::renew_expired(&local_config_dir, &mut loaded_config, true, &cli).await?;
+                    route.auth_token = loaded_config.connection.wss.auth_token.clone();
+                    route.auth_provider = loaded_config.connection.wss.auth_provider.clone();
+                    route.tls = login::tls_from(&loaded_config.connection.wss.tls);
+                    route.connect_preferred(None, None).await?
+                }
                 // A certless client cannot complete the mutually-authenticated WSS
                 // handshake. Give an actionable enroll hint instead of a bare TLS
                 // error (no silent failure for an un-migrated client).
@@ -1040,11 +1292,23 @@ async fn run() -> anyhow::Result<()> {
         }
     };
 
+    #[cfg(unix)]
+    if shutdown_signals.is_none() {
+        shutdown_signals = Some(ShutdownSignals::new()?);
+    }
+
     // On the mTLS plane, renew the cached client cert if it is past ~50% of its
     // TTL (before the terminal is taken over, so any output is visible). No-op
     // when the client never enrolled here.
     if matches!(target, ConnectTarget::Wss(_)) {
-        enroll::maybe_renew(&rpc, &local_config_dir).await;
+        let active_credentials = if let Some(uri) =
+            selected_uri.as_deref().filter(|_| scoped_credentials)
+        {
+            login::active_credential_dir(&local_config_dir, uri, &loaded_config.connection.wss.tls)?
+        } else {
+            credential_config_dir.clone()
+        };
+        enroll::maybe_renew(&rpc, &active_credentials).await;
     }
 
     let mut term = config_manager::init_terminal()?;
@@ -2180,6 +2444,63 @@ mod connection_tests {
     }
 
     #[test]
+    fn auth_env_token_overrides_config() {
+        let cfg = WssSection {
+            auth_token: Some("cfg_token".to_string()),
+            auth_provider: Some("oidc.corp".to_string()),
+            ..Default::default()
+        };
+        // Env wins over config.
+        assert_eq!(
+            auth_from(&cfg, Some("env_token".to_string())),
+            (Some("env_token".to_string()), Some("oidc.corp".to_string()))
+        );
+        // No env falls back to config.
+        assert_eq!(
+            auth_from(&cfg, None),
+            (Some("cfg_token".to_string()), Some("oidc.corp".to_string()))
+        );
+        // Neither: no token, provider still passes through if set.
+        assert_eq!(auth_from(&WssSection::default(), None), (None, None));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auth_token_file_wins_over_the_inline_token_and_loses_to_env() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let token_path = tmp.path().join("bearer");
+        std::fs::write(&token_path, "file_token\n").unwrap();
+        std::fs::set_permissions(&token_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let cfg = WssSection {
+            auth_token: Some("cfg_token".to_string()),
+            auth_token_file: Some(token_path.to_string_lossy().into_owned()),
+            auth_provider: Some("oidc.corp".to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            auth_from(&cfg, None).0,
+            Some("file_token".to_string()),
+            "the referenced file beats the inline token"
+        );
+        assert_eq!(
+            auth_from(&cfg, Some("env_token".to_string())).0,
+            Some("env_token".to_string()),
+            "the environment still wins"
+        );
+
+        // A file any other account can read is refused, not used.
+        std::fs::set_permissions(&token_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            auth_from(&cfg, None).0,
+            Some("cfg_token".to_string()),
+            "a group- or world-readable file must be ignored"
+        );
+    }
+
+    #[test]
     fn relay_only_route_still_chooses_wss() {
         // A relay configured with no direct address must NOT collapse to the
         // local socket: the route is WSS-over-relay (direct_url stays None).
@@ -2190,6 +2511,274 @@ mod connection_tests {
         };
         assert_eq!(resolve_direct_url(None, &cfg), None);
         assert!(cfg.relay_url.is_some() && cfg.relay_node.is_some());
+    }
+
+    /// A keybinding migration that cannot take the config lock must keep the
+    /// saved remote target. Falling back to defaults is what selects the local
+    /// socket and then spawns a daemon. That arm is `ConnectTarget::LocalSocket`
+    /// and is taken only when this direct URL is absent.
+    #[test]
+    fn migration_lock_failure_keeps_the_saved_wss_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = "wss://daemon.example:9781/";
+        std::fs::write(
+            crate::config::config_path(dir.path()),
+            format!(
+                "[connection.wss]\nuri = \"{uri}\"\n\n[connection.logins.\"{uri}\"]\nauth_provider = \"oidc.corp\"\nauth_token = \"saved-token\"\nenroll_url = \"https://gateway.example\"\n\n[keybindings]\n\"input_bar.clear_input\" = \"ctrl+u\"\n"
+            ),
+        )
+        .unwrap();
+        let before = std::fs::read(crate::config::config_path(dir.path())).unwrap();
+        let _held = crate::config::hold_config_lock_for_test(dir.path()).unwrap();
+        struct ResetWait;
+        impl Drop for ResetWait {
+            fn drop(&mut self) {
+                crate::config::set_migration_lock_wait_for_test(None);
+            }
+        }
+        let _reset = ResetWait;
+        crate::config::set_migration_lock_wait_for_test(Some(std::time::Duration::from_millis(80)));
+
+        assert_ne!(
+            crate::i18n::t_args(
+                "zc-config-migration-lock-skipped",
+                &[("path", "config"), ("error", "busy")],
+            ),
+            "{zc-config-migration-lock-skipped}"
+        );
+        let loaded = crate::config::ensure_and_load(dir.path())
+            .expect("a lock failure must not fail the load");
+        assert_eq!(loaded.connection.wss.uri.as_deref(), Some(uri));
+        assert_eq!(
+            loaded.connection.logins[uri].auth_token.as_str(),
+            "saved-token"
+        );
+        assert_eq!(
+            resolve_direct_url(None, &loaded.connection.wss).as_deref(),
+            Some(uri),
+            "startup must select the saved WSS target, not the local socket or a spawned daemon"
+        );
+        assert_eq!(
+            std::fs::read(crate::config::config_path(dir.path())).unwrap(),
+            before,
+            "the migration rewrite must be skipped"
+        );
+
+        // A filesystem that refuses the lock file fails at once, not after the wait.
+        drop(_held);
+        let lock_path = dir.path().join(".zerocode-config.lock");
+        std::fs::remove_file(&lock_path).unwrap();
+        std::fs::create_dir(&lock_path).unwrap();
+        let started = std::time::Instant::now();
+        let loaded = crate::config::ensure_and_load(dir.path())
+            .expect("a refused lock must not fail the load");
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert_eq!(
+            resolve_direct_url(None, &loaded.connection.wss).as_deref(),
+            Some(uri)
+        );
+        assert_eq!(
+            std::fs::read(crate::config::config_path(dir.path())).unwrap(),
+            before
+        );
+    }
+
+    /// The migration warning runs before startup's `i18n::init`. It must still
+    /// use the saved language and downloaded catalogue from this config
+    /// directory. A fresh process proves the cache was not already set.
+    #[test]
+    fn migration_lock_warning_uses_the_saved_language() {
+        if std::env::var_os("ZEROCODE_MIGRATION_LOCALE_CHILD").is_some() {
+            let dir = std::path::PathBuf::from(
+                std::env::var("ZEROCODE_MIGRATION_LOCALE_DIR").expect("child config dir"),
+            );
+            let loaded = crate::config::ensure_and_load(&dir).expect("migration load");
+            let locale = loaded
+                .resolve_locale()
+                .unwrap_or_else(crate::i18n::detect_locale);
+            crate::i18n::init(&locale, &dir);
+            crate::config::emit_startup_notices();
+            println!("{}", crate::i18n::t("zc-config-invalid-saved-login"));
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            crate::config::config_path(dir.path()),
+            "locale = \"fr\"\n\n[keybindings]\n\"input_bar.clear_input\" = \"ctrl+u\"\n",
+        )
+        .unwrap();
+        let catalogue = dir.path().join("data/ftl/fr");
+        std::fs::create_dir_all(&catalogue).unwrap();
+        std::fs::write(
+            catalogue.join("zerocode.ftl"),
+            "zc-config-migration-lock-skipped = SAVED-LOCALE-MARKER { $path }\nzc-config-invalid-saved-login = SAVED-LATER-MARKER\nzc-config-lock-not-regular = SAVED-LOCK-MARKER { $path }\n",
+        )
+        .unwrap();
+        std::fs::create_dir(dir.path().join(".zerocode-config.lock")).unwrap();
+
+        let output = std::process::Command::new(
+            std::env::current_exe().expect("current zerocode test binary path"),
+        )
+        .args([
+            "connection_tests::migration_lock_warning_uses_the_saved_language",
+            "--exact",
+            "--nocapture",
+        ])
+        .env("ZEROCODE_MIGRATION_LOCALE_CHILD", "1")
+        .env("ZEROCODE_MIGRATION_LOCALE_DIR", dir.path())
+        .env_remove("ZEROCLAW_CONFIG_DIR")
+        .env_remove("ZEROCODE_LOCALE_DIR")
+        .output()
+        .expect("spawn locale child");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "child failed: {stderr}\n{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stderr.contains("SAVED-LOCALE-MARKER"),
+            "the warning must use the saved config directory's language, got: {stderr}"
+        );
+        assert!(
+            stdout.contains("SAVED-LATER-MARKER"),
+            "a later message must use the same saved language, got: {stdout}"
+        );
+        assert!(
+            !stderr.contains("Could not lock"),
+            "the English warning must not replace the saved language: {stderr}"
+        );
+    }
+
+    /// A successful migration also initializes translations, and that cache
+    /// cannot be replaced. `ZEROCODE_locale` must win over the saved locale,
+    /// or the rest of the session stays in the file's language.
+    #[test]
+    fn migration_uses_the_locale_override() {
+        if std::env::var_os("ZEROCODE_MIGRATION_OVERRIDE_CHILD").is_some() {
+            let dir = std::path::PathBuf::from(
+                std::env::var("ZEROCODE_MIGRATION_LOCALE_DIR").expect("child config dir"),
+            );
+            let loaded = crate::config::ensure_and_load(&dir).expect("migration load");
+            let locale = loaded
+                .resolve_locale()
+                .unwrap_or_else(crate::i18n::detect_locale);
+            crate::i18n::init(&locale, &dir);
+            println!("{}", crate::i18n::t("zc-config-invalid-saved-login"));
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            crate::config::config_path(dir.path()),
+            "locale = \"en\"\n\n[keybindings]\n\"input_bar.clear_input\" = \"ctrl+u\"\n",
+        )
+        .unwrap();
+        let catalogue = dir.path().join("data/ftl/fr");
+        std::fs::create_dir_all(&catalogue).unwrap();
+        std::fs::write(
+            catalogue.join("zerocode.ftl"),
+            "zc-config-invalid-saved-login = OVERRIDE-LOCALE-MARKER\n",
+        )
+        .unwrap();
+
+        let output = std::process::Command::new(
+            std::env::current_exe().expect("current zerocode test binary path"),
+        )
+        .args([
+            "connection_tests::migration_uses_the_locale_override",
+            "--exact",
+            "--nocapture",
+        ])
+        .env("ZEROCODE_MIGRATION_OVERRIDE_CHILD", "1")
+        .env("ZEROCODE_MIGRATION_LOCALE_DIR", dir.path())
+        .env("ZEROCODE_locale", "fr")
+        .env_remove("ZEROCLAW_CONFIG_DIR")
+        .env_remove("ZEROCODE_LOCALE_DIR")
+        .output()
+        .expect("spawn override child");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "child failed: {stderr}\n{stdout}");
+        assert!(
+            stdout.contains("OVERRIDE-LOCALE-MARKER"),
+            "a successful migration must keep ZEROCODE_locale, got: {stdout}{stderr}"
+        );
+    }
+
+    /// Startup drains the notice queue once. A later read that still cannot
+    /// migrate must print then, not leave the warning queued forever.
+    #[test]
+    fn later_migration_lock_failure_is_reported_immediately() {
+        if std::env::var_os("ZEROCODE_MIGRATION_LATER_CHILD").is_some() {
+            let dir = std::path::PathBuf::from(
+                std::env::var("ZEROCODE_MIGRATION_LOCALE_DIR").expect("child config dir"),
+            );
+            crate::i18n::init("fr", &dir);
+            crate::config::ensure_and_load(&dir).expect("later migration load");
+            eprintln!("BEFORE-EMIT");
+            crate::config::emit_startup_notices();
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::config::config_path(dir.path());
+        std::fs::write(
+            &config,
+            "locale = \"fr\"\n\n[keybindings]\n\"input_bar.clear_input\" = \"ctrl+u\"\n",
+        )
+        .unwrap();
+        let before = std::fs::read(&config).unwrap();
+        let catalogue = dir.path().join("data/ftl/fr");
+        std::fs::create_dir_all(&catalogue).unwrap();
+        std::fs::write(
+            catalogue.join("zerocode.ftl"),
+            "zc-config-migration-lock-skipped = LATER-MIGRATION-MARKER { $path }\nzc-config-lock-not-regular = LATER-LOCK-MARKER { $path }\n",
+        )
+        .unwrap();
+        std::fs::create_dir(dir.path().join(".zerocode-config.lock")).unwrap();
+
+        let output = std::process::Command::new(
+            std::env::current_exe().expect("current zerocode test binary path"),
+        )
+        .args([
+            "connection_tests::later_migration_lock_failure_is_reported_immediately",
+            "--exact",
+            "--nocapture",
+        ])
+        .env("ZEROCODE_MIGRATION_LATER_CHILD", "1")
+        .env("ZEROCODE_MIGRATION_LOCALE_DIR", dir.path())
+        .env_remove("ZEROCLAW_CONFIG_DIR")
+        .env_remove("ZEROCODE_LOCALE_DIR")
+        .env_remove("ZEROCODE_locale")
+        .output()
+        .expect("spawn later-migration child");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success(), "child failed: {stderr}\n{stdout}");
+        let (printed, drained) = stderr
+            .split_once("BEFORE-EMIT")
+            .expect("child must mark the startup drain");
+        assert!(
+            printed.contains("LATER-MIGRATION-MARKER"),
+            "a load after i18n::init must print the skipped migration, got: {stderr}"
+        );
+        assert_eq!(
+            printed.matches("LATER-MIGRATION-MARKER").count(),
+            1,
+            "one load must not print the warning twice: {printed}"
+        );
+        assert!(
+            !drained.contains("LATER-MIGRATION-MARKER"),
+            "the warning must not also be left for emit_startup_notices: {drained}"
+        );
+        assert_eq!(
+            std::fs::read(&config).unwrap(),
+            before,
+            "a refused lock must leave the file unchanged"
+        );
     }
 
     #[test]

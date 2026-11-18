@@ -1,0 +1,4057 @@
+//! Cross-surface OIDC enrollment API.
+//!
+//! Design: `docs/security/oidc-browser-pkce-design-8289.md`. These routes
+//! are unauthenticated by necessity (enrollment precedes authentication),
+//! rate limited, and grant nothing: they relay what the IdP grants after
+//! the user approves. The gateway holds the `[oidc.<alias>]` client
+//! credentials so browsers and zerocode need none.
+//!
+//! - `GET  /api/oidc/providers` lists configured aliases.
+//! - `POST /api/oidc/{alias}/device/start` proxies the RFC 8628 start.
+//! - `POST /api/oidc/{alias}/device/poll` proxies one token poll. Its
+//!   statuses are a contract a polling client reads: 403 is the
+//!   authorization server's refusal and ends the flow, while 429 and
+//!   503 (both with `Retry-After`) and 502 are "not now" and are
+//!   retryable for as long as the device code lives.
+//! - `GET  /oidc/login/{alias}` starts Authorization Code + PKCE (302).
+//! - `GET  /oidc/callback` finishes it: the one-time page hands the token
+//!   to `window.opener` via `postMessage` (gateway origin only) with a
+//!   manual copy fallback. A short-lived cookie binds this flow to its
+//!   initiating browser; it grants no session. Clients keep
+//!   authenticating per request with the route-layer headers.
+//!
+//! Opt-in dashboard sign-in (`[gateway.dashboard_sign_in]`) reuses the same
+//! flow store, limits and callback, and ends in a session instead of a
+//! token page (see `dashboard_session`):
+//!
+//! - `GET  /api/auth/methods` lists the providers the dashboard offers.
+//! - `GET  /auth/sign-in/{alias}` starts a dashboard sign-in bound to the
+//!   starting browser by a short-lived cookie; `/oidc/callback` finishes
+//!   it with a session cookie, the token staying in the gateway.
+//! - `GET  /api/auth/session` says who the browser is signed in as.
+//! - `POST /auth/sign-out` ends the session.
+//!
+//! Because nothing here is authenticated, every route is bounded *before*
+//! it can cause outbound work, by four independent limits held in
+//! `OidcEnrollmentState`: an attempt limiter refuses clients that are
+//! already locked out, a per-client sliding-window budget caps relay
+//! requests per minute, a process-wide semaphore caps how many IdP round
+//! trips can be in flight at once, and the pending-flow store bounds both
+//! its own size and how much of it one client can hold. Every response from these routes
+//! is `Cache-Control: no-store`: each one carries, or is one step from, a
+//! device code or an access token.
+//!
+//! The attempt limiter is this surface's own, not the gateway-wide
+//! `auth_limiter` that `POST /pair` and webhook auth share. Those two
+//! count only failures, so billing enrollment traffic to the same counter
+//! would let a browser sign-in loop lock a client out of pairing, and a
+//! wrong pairing code shorten the enrollment budget. Both limiters are
+//! built from the same thresholds and share the loopback exemption.
+
+use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use axum::{
+    Extension, Json, Router,
+    extract::{ConnectInfo, Path, Query, Request, State},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
+    middleware::Next,
+    response::{Html, IntoResponse, Redirect, Response},
+    routing::{get, post},
+};
+use rand::TryRng as _;
+use serde::Deserialize;
+use sha2::{Digest, Sha256};
+use tokio::sync::{Semaphore, SemaphorePermit};
+use zeroclaw_runtime::i18n::get_required_cli_string;
+use zeroclaw_runtime::security::auth_provider::{DevicePollOutcome, Enrollment, PkceFlow};
+
+use crate::dashboard_session::{
+    self, CookieScope, DashboardAuth, DashboardCaller, ProviderPin, SessionRejection, SignInRefusal,
+};
+use crate::relay_ingress::ViaRelay;
+use crate::{AppState, SlidingWindowRateLimiter};
+
+const FLOW_TTL: Duration = Duration::from_secs(600);
+const FLOW_CAP: usize = 32;
+
+/// Pending flows one remote client may hold at once. The store is shared,
+/// so a process-wide cap alone lets one caller park every slot for the
+/// whole TTL and refuse browser sign-ins to everyone else, at a request
+/// rate low enough that the attempt limiter never locks it out. A browser
+/// needs one flow, or a few across tabs and retries, so a quarter of the
+/// store bounds one caller while leaving the rest available.
+///
+/// Loopback is exempt on the same terms as the other per-client limits:
+/// those callers are the host's own dashboard and zerocode, they share one
+/// key, and a share would throttle the local surface rather than protect
+/// it. A deployment behind a reverse proxy wants `trust_forwarded_headers`
+/// so its callers are told apart here as well.
+const PER_CLIENT_FLOW_CAP: usize = 8;
+
+/// Refusal when the pending-flow store cannot take another flow, either
+/// because the shared store is full or because this client already holds
+/// its share. Raised twice: once before the IdP round trip that starts a
+/// flow, and once on the insert that follows it, so a burst that passes
+/// the first check still cannot push the store past its caps.
+const FLOW_STORE_FULL: &str = "too many in-flight sign-ins; retry shortly";
+
+/// Relay requests one client may spend per minute across the enrollment
+/// surface. RFC 8628 puts the default minimum polling interval at five
+/// seconds, so a device-flow client that honours it spends twelve polls a
+/// minute; twenty leaves headroom for interval jitter and for the provider
+/// listing the same client fetches alongside its polls.
+pub(crate) const POLL_BUDGET_PER_MINUTE: u32 = 20;
+
+/// Window the budget above is measured over.
+const POLL_BUDGET_WINDOW: Duration = Duration::from_secs(60);
+
+/// Distinct client keys the budget tracks before it starts evicting the
+/// least recently seen one. Bounds the map a spray of source addresses (or
+/// of forwarded headers, where those are trusted) can grow.
+const POLL_BUDGET_MAX_KEYS: usize = 4096;
+
+/// Enrollment requests to an identity provider allowed in flight at once,
+/// across all clients. This is the bound that still applies where the
+/// per-client budget does not: a loopback caller, or a reverse proxy that
+/// collapses every client onto one address because forwarded headers are
+/// not trusted. Exceeding it refuses the request instead of queueing it.
+pub(crate) const OUTBOUND_RELAY_CAP: usize = 16;
+
+/// `Retry-After` for the two capacity refusals (outbound cap reached,
+/// pending-flow store full). Both clear as soon as an in-flight enrollment
+/// finishes, so the hint is short.
+const CAPACITY_RETRY_AFTER_SECS: u64 = 5;
+
+struct PendingPkce {
+    alias: String,
+    flow: PkceFlow,
+    created: Instant,
+    /// The client this flow was started for, under the same key the
+    /// limiters bill, so one caller's share can be counted.
+    client: String,
+    /// What the callback does with the token: hand it over (enrollment) or
+    /// keep it behind a dashboard session. Stored here, never read from the
+    /// callback's query, so a callback cannot choose its own mode.
+    mode: FlowMode,
+}
+
+enum FlowMode {
+    /// `GET /oidc/login/{alias}`: the one-time token page.
+    Enrollment {
+        /// A fresh browser secret, hashed before storage; never sent to the IdP.
+        binding_hash: String,
+        /// Transport scope chosen at flow start, unchanged by a capacity retry.
+        secure_cookie: bool,
+    },
+    /// `GET /auth/sign-in/{alias}`: a dashboard session.
+    Dashboard {
+        /// SHA-256 of the binding cookie set on the browser that started
+        /// the flow. The callback must present the cookie.
+        binding_hash: [u8; 32],
+        /// Where to land afterwards, below the gateway's path prefix.
+        return_to: String,
+        /// Re-authentication in a popup: answer with a page that tells the
+        /// opener's other tabs and closes, instead of a redirect.
+        popup: bool,
+        /// The store key of the session this browser held when it started
+        /// the flow. The start is a navigation from the dashboard, so the
+        /// `SameSite=Strict` session cookie comes with it; the callback
+        /// arrives from the identity provider's site and usually does not.
+        /// A sign-in that succeeds ends that session.
+        replaces: Option<[u8; 32]>,
+    },
+}
+
+fn binding_hash(value: &str) -> String {
+    hex::encode(Sha256::digest(value.as_bytes()))
+}
+
+fn binding_cookie_name(state_key: &str, secure: bool) -> String {
+    let prefix = if secure { "__Host-" } else { "" };
+    format!("{prefix}zc_oidc_{}", binding_hash(state_key))
+}
+
+fn binding_cookie(
+    state_key: &str,
+    value: &str,
+    secure: bool,
+    max_age: u64,
+) -> Result<HeaderValue, axum::http::header::InvalidHeaderValue> {
+    // Root scope permits __Host- even for a gateway mounted under a prefix.
+    // The per-flow name keeps parallel tabs independent. Lax admits the IdP's
+    // top-level GET redirect; this cookie is never an API credential.
+    let secure_attribute = if secure { "; Secure" } else { "" };
+    HeaderValue::from_str(&format!(
+        "{}={value}; Path=/; HttpOnly; SameSite=Lax; Max-Age={max_age}{secure_attribute}",
+        binding_cookie_name(state_key, secure)
+    ))
+}
+
+fn browser_matches(headers: &HeaderMap, pending: &PendingPkce) -> bool {
+    let FlowMode::Enrollment {
+        binding_hash: expected_hash,
+        secure_cookie,
+    } = &pending.mode
+    else {
+        // Dashboard flows retain their own CookieScope check before exchange.
+        return false;
+    };
+    let name = binding_cookie_name(&pending.flow.state, *secure_cookie);
+    let mut found = None;
+    for header in headers.get_all(header::COOKIE) {
+        let Ok(cookies) = header.to_str() else {
+            return false;
+        };
+        for cookie in cookies.split(';') {
+            let Some((key, value)) = cookie.trim().split_once('=') else {
+                continue;
+            };
+            // Ambiguous cookies fail closed, including across Cookie headers.
+            if key == name && found.replace(value).is_some() {
+                return false;
+            }
+        }
+    }
+    found.is_some_and(|value| crate::constant_time_eq(&binding_hash(value), expected_hash))
+}
+
+/// In-flight PKCE flows keyed by `state`, following the pairing-store
+/// posture: in-memory, single-use consume-on-arrival, short TTL, capped.
+struct OidcFlowStore {
+    flows: parking_lot::Mutex<HashMap<String, PendingPkce>>,
+    ttl: Duration,
+}
+
+impl Default for OidcFlowStore {
+    fn default() -> Self {
+        Self {
+            flows: parking_lot::Mutex::new(HashMap::new()),
+            ttl: FLOW_TTL,
+        }
+    }
+}
+
+impl OidcFlowStore {
+    /// Whether a flow started now by `client` would have somewhere to land,
+    /// counting only entries still inside the TTL. Both the shared cap and
+    /// this client's share are checked *before* the IdP round trip so a
+    /// refusal costs no outbound request; [`Self::insert`] repeats them for
+    /// the flows that start between this answer and their own insert.
+    fn has_capacity(&self, client: &str) -> bool {
+        let mut flows = self.flows.lock();
+        flows.retain(|_, p| p.created.elapsed() < self.ttl);
+        Self::has_room(&flows, client)
+    }
+
+    fn has_room(flows: &HashMap<String, PendingPkce>, client: &str) -> bool {
+        if flows.len() >= FLOW_CAP {
+            return false;
+        }
+        if crate::auth_rate_limit::is_loopback_key(client) {
+            return true;
+        }
+        flows.values().filter(|p| p.client == client).count() < PER_CLIENT_FLOW_CAP
+    }
+
+    fn insert(&self, pending: PendingPkce) -> Result<(), &'static str> {
+        let mut flows = self.flows.lock();
+        flows.retain(|_, p| p.created.elapsed() < self.ttl);
+        if !Self::has_room(&flows, &pending.client) {
+            return Err(FLOW_STORE_FULL);
+        }
+        flows.insert(pending.flow.state.clone(), pending);
+        Ok(())
+    }
+
+    fn consume(&self, state_key: &str) -> Option<PendingPkce> {
+        let mut flows = self.flows.lock();
+        flows.retain(|_, p| p.created.elapsed() < self.ttl);
+        flows.remove(state_key)
+    }
+
+    /// Put a consumed flow back when the callback holding it was turned
+    /// away for the gateway's own capacity, so the retry its `Retry-After`
+    /// invites still has a flow to finish. Nothing about the flow was
+    /// spent: no code reached the IdP.
+    ///
+    /// Neither cap is re-checked. This entry held a slot moments earlier
+    /// and the path that returns it here has no await between the consume
+    /// and this call, so the only way to land above [`FLOW_CAP`] or a
+    /// client's share is a login that took the freed slot on another worker
+    /// thread in that window:
+    /// bounded, transient, and still swept by the TTL pass above. Refusing
+    /// the restore instead would drop a live sign-in to keep a soft bound
+    /// exact.
+    ///
+    /// `created` rides back untouched, so a retry inherits what is left of
+    /// the original deadline rather than a fresh TTL; a flow that expired
+    /// while the callback was in the handler is dropped, not revived.
+    fn restore(&self, pending: PendingPkce) {
+        let mut flows = self.flows.lock();
+        flows.retain(|_, p| p.created.elapsed() < self.ttl);
+        if pending.created.elapsed() >= self.ttl {
+            return;
+        }
+        flows.insert(pending.flow.state.clone(), pending);
+    }
+}
+
+/// Everything the enrollment routes need beyond [`AppState`]: the pending
+/// browser flows plus the three limits that bound what an unauthenticated
+/// caller can make this gateway do.
+pub(crate) struct OidcEnrollmentState {
+    flows: OidcFlowStore,
+    /// This surface's own attempt counter, deliberately separate from
+    /// `AppState::auth_limiter`: a lockout earned here must not reach
+    /// pairing or webhook auth, nor theirs reach enrollment.
+    pub(crate) attempts: crate::auth_rate_limit::AuthRateLimiter,
+    poll_budget: SlidingWindowRateLimiter,
+    pub(crate) outbound: Semaphore,
+}
+
+impl Default for OidcEnrollmentState {
+    fn default() -> Self {
+        Self {
+            flows: OidcFlowStore::default(),
+            attempts: crate::auth_rate_limit::AuthRateLimiter::new(),
+            poll_budget: SlidingWindowRateLimiter::new(
+                POLL_BUDGET_PER_MINUTE,
+                POLL_BUDGET_WINDOW,
+                POLL_BUDGET_MAX_KEYS,
+            ),
+            outbound: Semaphore::new(OUTBOUND_RELAY_CAP),
+        }
+    }
+}
+
+pub fn routes() -> Router<AppState> {
+    routes_with(Arc::new(OidcEnrollmentState::default()))
+}
+
+/// Same routes over a caller-supplied state, so a test can hold the budget
+/// and semaphore handles the routes are enforcing.
+pub(crate) fn routes_with(enrollment_state: Arc<OidcEnrollmentState>) -> Router<AppState> {
+    // Enrollment hands its token to the page or the poller, which a relay
+    // serving the dashboard would read: refused there, before any flow.
+    let no_relayed_enrollment =
+        axum::middleware::from_fn(crate::relay_ingress::no_enrollment_through_a_relay);
+    Router::new()
+        .route("/api/oidc/providers", get(handle_providers))
+        .route(
+            "/api/oidc/{alias}/device/start",
+            post(handle_device_start).layer(no_relayed_enrollment.clone()),
+        )
+        .route(
+            "/api/oidc/{alias}/device/poll",
+            post(handle_device_poll).layer(no_relayed_enrollment.clone()),
+        )
+        .route(
+            "/oidc/login/{alias}",
+            get(handle_pkce_login).layer(no_relayed_enrollment),
+        )
+        .route("/oidc/callback", get(handle_pkce_callback))
+        .route("/auth/sign-in/{alias}", get(handle_dashboard_sign_in))
+        .route("/api/auth/methods", get(handle_auth_methods))
+        .route("/api/auth/session", get(handle_auth_session))
+        .route("/auth/sign-out", post(handle_sign_out))
+        .layer(axum::middleware::from_fn(no_store))
+        .layer(Extension(enrollment_state))
+}
+
+/// Keep enrollment responses out of caches, back/forward restores and
+/// proxies: the callback page embeds an access token, the device start
+/// returns a device code, and a granted poll returns the token itself.
+/// Attached inside [`routes_with`] so the production router gets it by
+/// merging these routes, next to (not instead of) the gateway-wide
+/// security headers, which set `no-referrer` and COOP but no cache policy.
+pub(crate) async fn no_store(request: Request, next: Next) -> Response {
+    let mut response = next.run(request).await;
+    let headers = response.headers_mut();
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    headers.insert(header::PRAGMA, HeaderValue::from_static("no-cache"));
+    response
+}
+
+/// The client this request is billed to: the forwarded address only where
+/// the deployment trusts its proxy, the peer address otherwise. Same
+/// derivation as every other rate-limited gateway surface.
+pub(crate) fn client_key(state: &AppState, peer: SocketAddr, headers: &HeaderMap) -> String {
+    crate::client_key_from_request(Some(peer), headers, state.trust_forwarded_headers)
+}
+
+fn set_retry_after(response: &mut Response, secs: u64) {
+    if let Ok(value) = HeaderValue::from_str(&secs.to_string()) {
+        response.headers_mut().insert(header::RETRY_AFTER, value);
+    }
+}
+
+fn too_many_requests(message: &str, retry_after_secs: u64) -> Response {
+    let mut response = (
+        StatusCode::TOO_MANY_REQUESTS,
+        Json(serde_json::json!({
+            "error": message,
+            "retry_after": retry_after_secs,
+        })),
+    )
+        .into_response();
+    set_retry_after(&mut response, retry_after_secs);
+    response
+}
+
+/// Brute-force gate: refuse a client this surface's limiter has locked
+/// out. `record` distinguishes the flow-starting requests (counted on
+/// arrival, because each one commits the gateway to an IdP round trip)
+/// from the routes counted by outcome: a poll is counted once the IdP's
+/// answer shows the caller is polling too fast or feeding the relay
+/// invalid device codes, and a callback once it turns out not to have
+/// finished a sign-in.
+pub(crate) fn auth_gate(
+    enrollment_state: &OidcEnrollmentState,
+    key: &str,
+    record: bool,
+) -> Result<(), Box<Response>> {
+    if let Err(e) = enrollment_state.attempts.check_rate_limit(key) {
+        return Err(Box::new(too_many_requests(
+            &format!(
+                "Too many enrollment attempts. Try again in {}s.",
+                e.retry_after_secs
+            ),
+            e.retry_after_secs,
+        )));
+    }
+    if record {
+        enrollment_state.attempts.record_attempt(key);
+    }
+    Ok(())
+}
+
+/// Per-client request budget for the relay routes, consumed before any
+/// outbound work. Loopback is exempt on exactly the terms the auth limiter
+/// exempts it on, so a local dashboard and a local zerocode keep working
+/// while a remote caller stays bounded.
+pub(crate) fn budget_gate(
+    enrollment_state: &OidcEnrollmentState,
+    key: &str,
+) -> Result<(), Box<Response>> {
+    if crate::auth_rate_limit::is_loopback_key(key) {
+        return Ok(());
+    }
+    enrollment_state
+        .poll_budget
+        .allow_or_retry_after(key)
+        .map_err(|retry_after_secs| {
+            Box::new(too_many_requests(
+                &format!("Too many enrollment requests. Try again in {retry_after_secs}s."),
+                retry_after_secs,
+            ))
+        })
+}
+
+/// Reserve one of the outbound slots. The permit is held for the whole IdP
+/// round trip, so the cap counts requests in flight rather than started.
+pub(crate) fn outbound_permit(
+    enrollment_state: &OidcEnrollmentState,
+) -> Option<SemaphorePermit<'_>> {
+    enrollment_state.outbound.try_acquire().ok()
+}
+
+/// Refusal when the outbound cap is reached: nothing is sent to the IdP.
+pub(crate) fn relay_busy() -> Response {
+    let mut response = error_json(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "enrollment relay is busy; retry shortly",
+    );
+    set_retry_after(&mut response, CAPACITY_RETRY_AFTER_SECS);
+    response
+}
+
+/// The same refusal for the browser callback, which answers in HTML.
+fn relay_busy_page() -> Response {
+    let mut response = failure_page(StatusCode::SERVICE_UNAVAILABLE);
+    set_retry_after(&mut response, CAPACITY_RETRY_AFTER_SECS);
+    response
+}
+
+pub(crate) fn error_json(status: StatusCode, message: &str) -> Response {
+    (status, Json(serde_json::json!({ "error": message }))).into_response()
+}
+
+/// Test seam: a step a test installs for one flow (by its `state`), run in
+/// the callback just before the code-exchange client is built, so a test can
+/// publish configuration exactly there.
+#[cfg(test)]
+pub(crate) type CallbackStep = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
+
+#[cfg(test)]
+pub(crate) static BEFORE_EXCHANGE_CLIENT: parking_lot::Mutex<Option<(String, CallbackStep)>> =
+    parking_lot::Mutex::new(None);
+
+#[cfg(test)]
+async fn before_exchange_client(flow_state: &str) {
+    let step = {
+        let mut slot = BEFORE_EXCHANGE_CLIENT.lock();
+        if slot.as_ref().is_some_and(|(state, _)| state == flow_state) {
+            slot.take()
+        } else {
+            None
+        }
+    };
+    if let Some((_, step)) = step {
+        step.await;
+    }
+}
+
+/// Build the enrollment client for a configured alias.
+fn enrollment_for(state: &AppState, alias: &str) -> Result<Enrollment, Box<Response>> {
+    let entry = {
+        let config = state.config.read();
+        config.oidc.get(alias).cloned()
+    };
+    let Some(entry) = entry else {
+        return Err(Box::new(error_json(
+            StatusCode::NOT_FOUND,
+            "unknown oidc provider alias",
+        )));
+    };
+    enrollment_from(alias, entry)
+}
+
+/// Build the enrollment client for `alias` from an entry already read.
+fn enrollment_from(
+    alias: &str,
+    entry: zeroclaw_config::schema::OidcConfig,
+) -> Result<Enrollment, Box<Response>> {
+    Enrollment::new(alias, entry).map_err(|_| {
+        Box::new(error_json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "enrollment client construction failed",
+        ))
+    })
+}
+
+async fn handle_providers(
+    State(state): State<AppState>,
+    Extension(relay): Extension<Arc<OidcEnrollmentState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Response {
+    let key = client_key(&state, peer, &headers);
+    if let Err(denied) = auth_gate(&relay, &key, false) {
+        return *denied;
+    }
+    if let Err(denied) = budget_gate(&relay, &key) {
+        return *denied;
+    }
+    let mut aliases: Vec<String> = state.config.read().oidc.keys().cloned().collect();
+    aliases.sort();
+    let providers: Vec<serde_json::Value> = aliases
+        .iter()
+        .map(|alias| {
+            serde_json::json!({
+                "alias": alias,
+                "provider": format!("oidc.{alias}"),
+            })
+        })
+        .collect();
+    Json(serde_json::json!({ "providers": providers })).into_response()
+}
+
+#[derive(Default, Deserialize)]
+struct DeviceStartBody {
+    #[serde(default)]
+    code_challenge: Option<String>,
+}
+
+async fn handle_device_start(
+    State(state): State<AppState>,
+    Extension(relay): Extension<Arc<OidcEnrollmentState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Path(alias): Path<String>,
+    headers: HeaderMap,
+    body: Option<Json<DeviceStartBody>>,
+) -> Response {
+    let key = client_key(&state, peer, &headers);
+    if let Err(denied) = auth_gate(&relay, &key, true) {
+        return *denied;
+    }
+    let enrollment = match enrollment_for(&state, &alias) {
+        Ok(enrollment) => enrollment,
+        Err(response) => return *response,
+    };
+    let Some(_permit) = outbound_permit(&relay) else {
+        return relay_busy();
+    };
+    let body = body.map(|Json(body)| body).unwrap_or_default();
+    match enrollment
+        .device_grant_start_s256(body.code_challenge.as_deref())
+        .await
+    {
+        Ok(start) => Json(start).into_response(),
+        Err(e) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"alias": alias, "error": format!("{e}")})),
+                "oidc device enrollment start failed"
+            );
+            error_json(StatusCode::BAD_GATEWAY, &format!("{e}"))
+        }
+    }
+}
+
+/// No `Debug`: the one field is a device code, one successful poll away
+/// from an access token. Anything that needs to name this body writes a
+/// redacting impl rather than deriving one.
+#[derive(Deserialize)]
+struct DevicePollBody {
+    device_code: String,
+    #[serde(default)]
+    code_verifier: Option<String>,
+}
+
+async fn handle_device_poll(
+    State(state): State<AppState>,
+    Extension(relay): Extension<Arc<OidcEnrollmentState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Path(alias): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<DevicePollBody>,
+) -> Response {
+    let key = client_key(&state, peer, &headers);
+    if let Err(denied) = auth_gate(&relay, &key, false) {
+        return *denied;
+    }
+    if let Err(denied) = budget_gate(&relay, &key) {
+        return *denied;
+    }
+    let enrollment = match enrollment_for(&state, &alias) {
+        Ok(enrollment) => enrollment,
+        Err(response) => return *response,
+    };
+    let Some(_permit) = outbound_permit(&relay) else {
+        return relay_busy();
+    };
+    match enrollment
+        .device_grant_poll_s256(&body.device_code, body.code_verifier.as_deref())
+        .await
+    {
+        Ok(DevicePollOutcome::Pending) => {
+            Json(serde_json::json!({ "status": "pending" })).into_response()
+        }
+        Ok(DevicePollOutcome::SlowDown) => {
+            // The IdP says this caller is polling faster than the grant
+            // allows. Count it: a caller that ignores back-off walks into
+            // the same lockout a password guesser does.
+            relay.attempts.record_attempt(&key);
+            Json(serde_json::json!({ "status": "slow_down" })).into_response()
+        }
+        // Only what the enrolling client needs to authenticate: the access
+        // token and its lifetime. A refresh token the IdP may have issued
+        // is not relayed; renewal is out of scope here, and a long-lived
+        // credential nobody consumes has no business in a browser tab or a
+        // terminal.
+        Ok(DevicePollOutcome::Token(token)) => Json(serde_json::json!({
+            "status": "granted",
+            "provider": format!("oidc.{alias}"),
+            "token": {
+                "access_token": token.access_token,
+                "expires_in": token.expires_in,
+            },
+        }))
+        .into_response(),
+        Ok(DevicePollOutcome::Denied(reason)) => {
+            // The IdP rejected the device code outright: what a caller
+            // relaying guesses produces, so it counts as an attempt too.
+            relay.attempts.record_attempt(&key);
+            // Not 502: the round trip succeeded and the authorization server
+            // made a decision, so this is a refusal rather than a relay
+            // failure. Sharing a status with the `Err` arm below would leave
+            // a polling client unable to tell "the user said no" from "try
+            // again", and it can only treat one of the two as retryable.
+            error_json(
+                StatusCode::FORBIDDEN,
+                &format!("device grant failed: {reason}"),
+            )
+        }
+        // A transport or parse failure on the way to the IdP says nothing
+        // about the caller, so it is not billed to them. 502 is reserved for
+        // exactly this: the relay could not complete the round trip, which a
+        // client may retry while the grant is still alive.
+        Err(e) => error_json(StatusCode::BAD_GATEWAY, &format!("{e}")),
+    }
+}
+
+/// The scheme the browser used to reach this gateway: HTTPS for a request
+/// a relay-served dashboard forwarded (the browser's TLS ended at the
+/// relay), else a forwarded proto only where the deployment trusts its
+/// proxy, else the listener's own. The forwarded value counts only as
+/// `http` or `https` (the first of a chained list); anything else is
+/// ignored rather than pasted into a URL.
+fn request_scheme(
+    state: &AppState,
+    headers: &HeaderMap,
+    via_relay: Option<&ViaRelay>,
+) -> &'static str {
+    if via_relay.is_some() {
+        return "https";
+    }
+    let forwarded_proto = state
+        .trust_forwarded_headers
+        .then(|| headers.get("x-forwarded-proto"))
+        .flatten()
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(',').next())
+        .map(str::trim)
+        .and_then(|proto| {
+            if proto.eq_ignore_ascii_case("https") {
+                Some("https")
+            } else if proto.eq_ignore_ascii_case("http") {
+                Some("http")
+            } else {
+                None
+            }
+        });
+    match forwarded_proto {
+        Some(proto) => proto,
+        None => {
+            // A `[gateway.tls]` block that is present but not enabled is
+            // the schema default, and the server it configures listens in
+            // plain HTTP. Read `enabled`, exactly as the listener setup
+            // and the HSTS decision do: a `https://` redirect URI against
+            // an HTTP listener is one the browser can never come back to.
+            let tls_on = state
+                .config
+                .read()
+                .gateway
+                .tls
+                .as_ref()
+                .is_some_and(|tls| tls.enabled);
+            if tls_on { "https" } else { "http" }
+        }
+    }
+}
+
+/// Whether the browser reached this gateway over HTTPS, by the same rule
+/// the callback URI uses. Decides `Secure` cookies and the dashboard's
+/// own origin.
+pub(crate) fn request_is_https(
+    state: &AppState,
+    headers: &HeaderMap,
+    via_relay: Option<&ViaRelay>,
+) -> bool {
+    request_scheme(state, headers, via_relay) == "https"
+}
+
+/// The authority a request named in `Host`, if it is a plain one: a host
+/// name, an IPv4 address or a bracketed IPv6 address, with an optional
+/// numeric port, and nothing else. Sign-in builds its callback URI, its
+/// loopback decision and its own origin from it, so anything else (a
+/// userinfo `@`, a path, a query) is refused rather than guessed at.
+pub(crate) fn request_authority(headers: &HeaderMap) -> Option<&str> {
+    let host = headers.get(header::HOST)?.to_str().ok()?;
+    is_authority(host).then_some(host)
+}
+
+/// Whether `authority` is `host[:port]`, with a host name or an IPv4
+/// address, or `[ipv6][:port]`. A host name is dot-separated labels of
+/// letters, digits, `-` and `_`.
+fn is_authority(authority: &str) -> bool {
+    let (host_ok, port) = match authority.strip_prefix('[') {
+        Some(bracketed) => {
+            let Some((address, rest)) = bracketed.split_once(']') else {
+                return false;
+            };
+            let port = match rest {
+                "" => None,
+                rest => match rest.strip_prefix(':') {
+                    Some(port) => Some(port),
+                    None => return false,
+                },
+            };
+            (address.parse::<std::net::Ipv6Addr>().is_ok(), port)
+        }
+        None => match authority.split_once(':') {
+            Some((name, port)) => (is_host_name(name), Some(port)),
+            None => (is_host_name(authority), None),
+        },
+    };
+    host_ok
+        && port.is_none_or(|port| {
+            port.bytes().all(|b| b.is_ascii_digit()) && port.parse::<u16>().is_ok()
+        })
+}
+
+fn is_host_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 253
+        && name.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        })
+}
+
+/// The callback URI this deployment's browser flow lands on.
+///
+/// Through a relay-served dashboard it is that dashboard's fixed origin,
+/// never the request's `Host`: the relay routes by the TLS server name, so a
+/// request can name another host than the one it was routed for, and a
+/// callback built from it would send the sign-in code there.
+///
+/// Otherwise it is derived from the request the user's browser just made.
+/// Only a plain `Host` authority is used, so the URI can't name another
+/// site; past that, the IdP accepts only registered redirect URIs, and the
+/// exchange later uses the exact URI stored at flow start.
+fn callback_uri(
+    state: &AppState,
+    headers: &HeaderMap,
+    via_relay: Option<&ViaRelay>,
+) -> Result<String, Box<Response>> {
+    if let Some(via_relay) = via_relay {
+        return Ok(format!(
+            "{}{}/oidc/callback",
+            via_relay.origin(),
+            state.path_prefix
+        ));
+    }
+    let scheme = request_scheme(state, headers, None);
+    let host = request_authority(headers).ok_or_else(|| {
+        Box::new(error_json(
+            StatusCode::BAD_REQUEST,
+            "the Host header must be a plain host name or address, with an optional port",
+        ))
+    })?;
+    Ok(format!(
+        "{scheme}://{host}{}/oidc/callback",
+        state.path_prefix
+    ))
+}
+
+async fn handle_pkce_login(
+    State(state): State<AppState>,
+    Extension(relay): Extension<Arc<OidcEnrollmentState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    via_relay: Option<Extension<ViaRelay>>,
+    Path(alias): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let via_relay = via_relay.as_deref();
+    let key = client_key(&state, peer, &headers);
+    if let Err(denied) = auth_gate(&relay, &key, false) {
+        return *denied;
+    }
+    // The budget is what bounds this route's request rate now that a
+    // capacity refusal is free: without it a client parked at its share
+    // could ask forever at no cost.
+    if let Err(denied) = budget_gate(&relay, &key) {
+        return *denied;
+    }
+    let enrollment = match enrollment_for(&state, &alias) {
+        Ok(enrollment) => enrollment,
+        Err(response) => return *response,
+    };
+    let redirect_uri = match callback_uri(&state, &headers, via_relay) {
+        Ok(uri) => uri,
+        Err(response) => return *response,
+    };
+    // Refuse before the discovery round trip, not after it: otherwise every
+    // login past a cap still costs the gateway an outbound request to the
+    // IdP to produce a flow with nowhere to go. The refusal is the
+    // gateway's capacity, not a failed authentication, so it is not billed
+    // as an attempt; the login that goes on to commit an outbound round
+    // trip is.
+    if !relay.flows.has_capacity(&key) {
+        return too_many_requests(FLOW_STORE_FULL, CAPACITY_RETRY_AFTER_SECS);
+    }
+    relay.attempts.record_attempt(&key);
+    let flow = {
+        let Some(_permit) = outbound_permit(&relay) else {
+            return relay_busy();
+        };
+        match enrollment.pkce_start(&redirect_uri).await {
+            Ok(flow) => flow,
+            Err(e) => return error_json(StatusCode::BAD_GATEWAY, &format!("{e}")),
+        }
+    };
+    let mut secret = [0_u8; 32];
+    if rand::rngs::SysRng.try_fill_bytes(&mut secret).is_err() {
+        return error_json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &get_required_cli_string("cli-oidc-browser-start-failed"),
+        );
+    }
+    let secret = hex::encode(secret);
+    let secure_cookie = redirect_uri
+        .get(..8)
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("https://"));
+    let cookie = match binding_cookie(&flow.state, &secret, secure_cookie, FLOW_TTL.as_secs()) {
+        Ok(cookie) => cookie,
+        Err(_) => {
+            return error_json(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &get_required_cli_string("cli-oidc-browser-start-failed"),
+            );
+        }
+    };
+    let authorize_url = flow.authorize_url.clone();
+    if let Err(full) = relay.flows.insert(PendingPkce {
+        alias,
+        flow,
+        created: Instant::now(),
+        client: key,
+        mode: FlowMode::Enrollment {
+            binding_hash: binding_hash(&secret),
+            secure_cookie,
+        },
+    }) {
+        return too_many_requests(full, CAPACITY_RETRY_AFTER_SECS);
+    }
+    let mut response = Redirect::temporary(&authorize_url).into_response();
+    response.headers_mut().insert(header::SET_COOKIE, cookie);
+    response
+}
+
+/// Longest `return` path a dashboard sign-in accepts.
+const MAX_RETURN_PATH_BYTES: usize = 512;
+
+#[derive(Deserialize)]
+struct SignInQuery {
+    #[serde(default, rename = "return")]
+    return_to: Option<String>,
+    #[serde(default)]
+    popup: Option<String>,
+}
+
+/// Where a sign-in may land: a path on this dashboard, never another site.
+/// Anything else lands on the dashboard's root.
+fn safe_return_path(raw: Option<&str>) -> String {
+    match raw {
+        Some(path)
+            if path.starts_with('/')
+                && !path.starts_with("//")
+                && path.len() <= MAX_RETURN_PATH_BYTES
+                && path
+                    .bytes()
+                    .all(|b| (0x21..=0x7e).contains(&b) && b != b'\\')
+                && !has_dot_segment(path) =>
+        {
+            path.to_string()
+        }
+        _ => "/".to_string(),
+    }
+}
+
+/// Whether the path part of `path` has a `.` or `..` segment, literal or
+/// percent-encoded. The browser resolves those away, so `/zc/../x` would
+/// leave the dashboard's path prefix and `/.//evil.example` would land on
+/// the path `//evil.example`.
+fn has_dot_segment(path: &str) -> bool {
+    let path = path.split(['?', '#']).next().unwrap_or_default();
+    path.split('/').any(|segment| {
+        let segment = segment.to_ascii_lowercase().replace("%2e", ".");
+        segment == "." || segment == ".."
+    })
+}
+
+/// Whether the request reached this gateway on the machine it runs on: a
+/// loopback peer that also named a loopback host.
+pub(crate) fn is_loopback_request(peer: SocketAddr, headers: &HeaderMap) -> bool {
+    if !peer.ip().is_loopback() {
+        return false;
+    }
+    let Some(host) = request_authority(headers) else {
+        return false;
+    };
+    let name = match host.strip_prefix('[') {
+        Some(bracketed) => bracketed.split(']').next().unwrap_or_default(),
+        None => host.split_once(':').map_or(host, |(name, _)| name),
+    };
+    name.eq_ignore_ascii_case("localhost")
+        || name
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
+/// Fixed page for a dashboard sign-in that cannot start here.
+fn sign_in_unavailable_page(status: StatusCode, explanation: &'static str) -> Response {
+    (
+        status,
+        Html(format!(
+            "<!doctype html><meta charset=\"utf-8\"><title>Sign-in unavailable</title>\
+             <body style=\"font-family:system-ui;margin:3rem\"><h1>Sign-in unavailable</h1>\
+             <p>{explanation}</p>"
+        )),
+    )
+        .into_response()
+}
+
+/// `GET /auth/sign-in/{alias}`: start a dashboard sign-in. The same
+/// Authorization Code + PKCE flow, store, limits and redirect URI as
+/// `GET /oidc/login/{alias}`, with two differences: the flow is bound to
+/// this browser by a short-lived cookie, and the callback ends in a
+/// dashboard session instead of a token page.
+async fn handle_dashboard_sign_in(
+    State(state): State<AppState>,
+    Extension(relay): Extension<Arc<OidcEnrollmentState>>,
+    Extension(dashboard): Extension<Arc<DashboardAuth>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    via_relay: Option<Extension<ViaRelay>>,
+    Path(alias): Path<String>,
+    Query(query): Query<SignInQuery>,
+    headers: HeaderMap,
+) -> Response {
+    let via_relay = via_relay.as_deref();
+    let key = client_key(&state, peer, &headers);
+    if let Err(denied) = auth_gate(&relay, &key, false) {
+        return *denied;
+    }
+    if let Err(denied) = budget_gate(&relay, &key) {
+        return *denied;
+    }
+    let offered = {
+        let config = state.config.read();
+        config.gateway.dashboard_sign_in.offers(&alias) && config.oidc.contains_key(&alias)
+    };
+    if !offered {
+        return sign_in_unavailable_page(
+            StatusCode::NOT_FOUND,
+            "This dashboard does not offer that sign-in. Go back and choose another, or pair \
+             this browser.",
+        );
+    }
+    // The HTTPS rule's loopback exception, the callback URI and the cookies
+    // all build on the Host this browser named: one that isn't a plain host
+    // name or address is refused (400, as HTTP asks of an invalid Host).
+    if request_authority(&headers).is_none() {
+        return sign_in_unavailable_page(
+            StatusCode::BAD_REQUEST,
+            "This request's Host header isn't a plain host name or address, so sign-in can't \
+             build the address to come back to. Open the dashboard at its usual address.",
+        );
+    }
+    let https = request_is_https(&state, &headers, via_relay);
+    if !https && !is_loopback_request(peer, &headers) {
+        return sign_in_unavailable_page(
+            StatusCode::BAD_REQUEST,
+            "Dashboard sign-in needs HTTPS. Pair this browser instead, or ask the operator \
+             to enable TLS on the gateway.",
+        );
+    }
+    if !dashboard.sessions.has_room() {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({"alias": alias})),
+            "dashboard sign-in refused: session store is full"
+        );
+        return sessions_full_page();
+    }
+    let enrollment = match enrollment_for(&state, &alias) {
+        Ok(enrollment) => enrollment,
+        Err(response) => return *response,
+    };
+    let redirect_uri = match callback_uri(&state, &headers, via_relay) {
+        Ok(uri) => uri,
+        Err(response) => return *response,
+    };
+    if !relay.flows.has_capacity(&key) {
+        return too_many_requests(FLOW_STORE_FULL, CAPACITY_RETRY_AFTER_SECS);
+    }
+    relay.attempts.record_attempt(&key);
+    let flow = {
+        let Some(_permit) = outbound_permit(&relay) else {
+            return relay_busy();
+        };
+        match enrollment.pkce_start(&redirect_uri).await {
+            Ok(flow) => flow,
+            Err(e) => return error_json(StatusCode::BAD_GATEWAY, &format!("{e}")),
+        }
+    };
+    let binding = dashboard_session::random_token();
+    let authorize_url = flow.authorize_url.clone();
+    let flow_state = flow.state.clone();
+    let scope = CookieScope {
+        https,
+        path_prefix: &state.path_prefix,
+    };
+    if let Err(full) = relay.flows.insert(PendingPkce {
+        alias,
+        flow,
+        created: Instant::now(),
+        client: key,
+        mode: FlowMode::Dashboard {
+            binding_hash: dashboard_session::session_key(&binding),
+            return_to: safe_return_path(query.return_to.as_deref()),
+            popup: query.popup.as_deref() == Some("1"),
+            replaces: scope
+                .session_value(&headers)
+                .map(|value| dashboard_session::session_key(&value)),
+        },
+    }) {
+        return too_many_requests(full, CAPACITY_RETRY_AFTER_SECS);
+    }
+    let mut response = Redirect::temporary(&authorize_url).into_response();
+    response.headers_mut().append(
+        header::SET_COOKIE,
+        scope.binding_cookie(&flow_state, &binding, FLOW_TTL.as_secs()),
+    );
+    // A browser without a marker gets one, under a name of its own. Two
+    // starts that race each give one and the browser keeps both, also when
+    // one answer lands after the other sign-in has finished, so every later
+    // callback still carries the first marker this browser was given.
+    if scope.browser_keys(&headers).is_empty() {
+        response.headers_mut().append(
+            header::SET_COOKIE,
+            scope.browser_cookie(&dashboard_session::random_token()),
+        );
+    }
+    response
+}
+
+/// `GET /api/auth/methods`: how this dashboard can be signed in to. Public,
+/// because the sign-in screen needs it before any credential exists; it
+/// names only providers the operator chose to offer.
+async fn handle_auth_methods(
+    State(state): State<AppState>,
+    Extension(relay): Extension<Arc<OidcEnrollmentState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    via_relay: Option<Extension<ViaRelay>>,
+    headers: HeaderMap,
+) -> Response {
+    let key = client_key(&state, peer, &headers);
+    if let Err(denied) = auth_gate(&relay, &key, false) {
+        return *denied;
+    }
+    if let Err(denied) = budget_gate(&relay, &key) {
+        return *denied;
+    }
+    let oidc: Vec<serde_json::Value> = {
+        let config = state.config.read();
+        config
+            .gateway
+            .dashboard_sign_in
+            .oidc
+            .iter()
+            .filter(|alias| config.oidc.contains_key(*alias))
+            .map(|alias| serde_json::json!({"alias": alias, "provider": format!("oidc.{alias}")}))
+            .collect()
+    };
+    let mut methods = serde_json::json!({
+        "pairing_required": state.pairing.require_pairing(),
+        "oidc": oidc,
+    });
+    // The sign-in screen tells the user that a relay can read this
+    // session. Only present when true, so other answers are unchanged.
+    if via_relay.is_some() {
+        methods["via_relay"] = serde_json::Value::Bool(true);
+    }
+    Json(methods).into_response()
+}
+
+/// The pairing prompt, unchanged from the gateway's existing denial.
+fn pair_first() -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(serde_json::json!({
+            "error": "Unauthorized — pair first via POST /pair, then send Authorization: Bearer <token>"
+        })),
+    )
+        .into_response()
+}
+
+/// `GET /api/auth/session`: who this browser is signed in as. For a
+/// session this carries the CSRF token the dashboard sends on requests that
+/// change state; `no-store` keeps it out of caches.
+async fn handle_auth_session(
+    State(state): State<AppState>,
+    caller: Option<Extension<DashboardCaller>>,
+    core: Option<Extension<crate::core_rpc::CoreRpc>>,
+    headers: HeaderMap,
+) -> Response {
+    if let Some(token) = crate::api::extract_bearer_token(&headers).filter(|t| !t.is_empty()) {
+        return if state.pairing.is_authenticated(token) {
+            Json(serde_json::json!({"kind": "pairing"})).into_response()
+        } else {
+            pair_first()
+        };
+    }
+    match caller {
+        Some(Extension(DashboardCaller::Session(session))) => {
+            let admin = session.is_admin();
+            // Inside the daemon a scoped account's chat and conversations go
+            // through the core, which applies its grants. An administrator
+            // keeps the in-process chat and its history, which is also the
+            // only chat outside the daemon, where there is no core to reach.
+            let core_sessions = !admin
+                && core
+                    .as_ref()
+                    .is_some_and(|Extension(core)| core.connector().is_some());
+            // Chat through the core also needs the grants to use and close a
+            // conversation; see `dashboard_core::may_chat`.
+            let chat = admin || (core_sessions && crate::dashboard_core::may_chat(&session.grants));
+            // On the core path the session ends a little before its token
+            // expires, while its conversations can still be closed.
+            let expires_at = if core_sessions {
+                session
+                    .expires_at
+                    .saturating_sub(crate::dashboard_core::CLOSE_BEFORE_EXPIRY.as_secs())
+            } else {
+                session.expires_at
+            };
+            Json(serde_json::json!({
+                "kind": "oidc",
+                "provider": format!("oidc.{}", session.alias),
+                "principal_id": session.principal().id.as_str(),
+                "display_name": session.display_name,
+                "admin": admin,
+                "expires_at": expires_at,
+                "csrf_token": session.csrf,
+                "features": {
+                    "chat": chat,
+                    "core_sessions": core_sessions,
+                    "operator_pages": admin,
+                    // The config routes' own read rule; an administrator's
+                    // grants permit everything, so it covers them too.
+                    "config": crate::principal_gate::may_read_config(&session.grants),
+                },
+            }))
+            .into_response()
+        }
+        Some(Extension(DashboardCaller::Rejected(rejection))) => {
+            dashboard_session::rejection_response(rejection)
+        }
+        None => pair_first(),
+    }
+}
+
+/// `POST /auth/sign-out`: end this browser's dashboard session. The session
+/// layer has already required the CSRF token and the dashboard's origin.
+/// Signing out of ZeroClaw does not sign the user out of the identity
+/// provider.
+async fn handle_sign_out(
+    State(state): State<AppState>,
+    dashboard: Option<Extension<Arc<DashboardAuth>>>,
+    caller: Option<Extension<DashboardCaller>>,
+    via_relay: Option<Extension<ViaRelay>>,
+    headers: HeaderMap,
+) -> Response {
+    let scope = CookieScope {
+        https: request_is_https(&state, &headers, via_relay.as_deref()),
+        path_prefix: &state.path_prefix,
+    };
+    let (Some(Extension(dashboard)), Some(Extension(caller))) = (dashboard, caller) else {
+        return dashboard_session::rejection_response(SessionRejection::Invalid);
+    };
+    // Every session that shares a marker with this browser ends too: one that
+    // an overlapping sign-in left behind holds no cookie this request carries.
+    let end_browser = || {
+        dashboard.end_browser(&scope.browser_keys(&headers));
+    };
+    let session = match caller {
+        DashboardCaller::Session(session) => session,
+        DashboardCaller::Rejected(rejection) => {
+            let mut response = dashboard_session::rejection_response(rejection);
+            // An ended session's cookie is kept so every tab hears why it
+            // ended; signing out is when it goes. The layer has already
+            // refused a request from another origin.
+            if matches!(
+                rejection,
+                SessionRejection::Expired | SessionRejection::Invalid
+            ) {
+                end_browser();
+                for value in scope.clear_session_cookies() {
+                    response.headers_mut().append(header::SET_COOKIE, value);
+                }
+            }
+            return response;
+        }
+    };
+    dashboard.end(&session);
+    end_browser();
+    ::zeroclaw_log::record!(
+        INFO,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Disconnect)
+            .with_outcome(::zeroclaw_log::EventOutcome::Success)
+            .with_attrs(::serde_json::json!({
+                "alias": session.alias,
+                "principal_id": session.principal().id.as_str(),
+            })),
+        "dashboard sign-out"
+    );
+    let mut response = StatusCode::NO_CONTENT.into_response();
+    for value in scope.clear_session_cookies() {
+        response.headers_mut().append(header::SET_COOKIE, value);
+    }
+    response
+}
+
+/// No `Debug`: `code` is an authorization code, redeemable for an access
+/// token until it is spent. Anything that needs to name this query writes
+/// a redacting impl rather than deriving one.
+#[derive(Deserialize)]
+struct CallbackQuery {
+    #[serde(default)]
+    state: Option<String>,
+    #[serde(default)]
+    code: Option<String>,
+    #[serde(default)]
+    error: Option<String>,
+    #[serde(default)]
+    error_description: Option<String>,
+    /// RFC 9207 issuer identification. Checked against the issuer this
+    /// flow was started for before the response is acted on either way.
+    #[serde(default)]
+    iss: Option<String>,
+}
+
+/// A callback that did not finish a sign-in: no live flow for the state,
+/// a mix-up, an IdP refusal, a code that would not exchange. Each one is
+/// billed to the caller before the fixed page goes out — sprayed `state`
+/// values and replayed codes are exactly what this route has to bound —
+/// while the callback that completes an enrollment costs nothing. A
+/// callback turned away because every outbound relay slot is taken is not
+/// routed here either: the refusal is the gateway's capacity limit, not a
+/// failure on the caller's side, so it answers with the busy page unbilled
+/// and puts the untouched flow back for the retry it asks for.
+fn unproductive_callback(
+    enrollment_state: &OidcEnrollmentState,
+    key: &str,
+    status: StatusCode,
+) -> Response {
+    enrollment_state.attempts.record_attempt(key);
+    failure_page(status)
+}
+
+/// Fixed failure page: never echoes request content. Details go to the
+/// server log only.
+fn failure_page(status: StatusCode) -> Response {
+    (
+        status,
+        Html(
+            "<!doctype html><meta charset=\"utf-8\"><title>Sign-in not completed</title>\
+             <body style=\"font-family:system-ui;margin:3rem\"><h1>Sign-in not completed</h1>\
+             <p>This request did not complete an enrollment. Start again from the \
+             application, or check the gateway log for details.</p>",
+        ),
+    )
+        .into_response()
+}
+
+/// One-time success page (decision 4 of the design note): hands the
+/// token to `window.opener` via `postMessage` with this page's own
+/// origin as the target, plus a manual copy fallback. The token reaches
+/// the page only as a JSON string literal inside the inline script.
+fn success_page(provider: &str, access_token: &str, expires_in: Option<u64>) -> Response {
+    // `</` cannot appear inside the script element, whatever the IdP
+    // returned; JSON string escaping handles the rest.
+    let token_json = serde_json::to_string(access_token)
+        .unwrap_or_else(|_| "\"\"".into())
+        .replace("</", "<\\/");
+    let provider_json = serde_json::to_string(provider)
+        .unwrap_or_else(|_| "\"\"".into())
+        .replace("</", "<\\/");
+    let expires_note = expires_in
+        .map(|secs| format!("<p>The token expires in {secs} seconds.</p>"))
+        .unwrap_or_default();
+    Html(format!(
+        "<!doctype html><meta charset=\"utf-8\"><title>Signed in</title>\
+         <body style=\"font-family:system-ui;margin:3rem\">\
+         <h1>Signed in</h1>\
+         <p>Enrollment is complete. If the application does not pick the token up \
+         automatically, copy it below and close this tab.</p>{expires_note}\
+         <p><code id=\"token\" style=\"word-break:break-all\"></code></p>\
+         <script>(function () {{\
+           var token = {token_json};\
+           var provider = {provider_json};\
+           document.getElementById(\"token\").textContent = token;\
+           try {{\
+             if (window.opener) {{\
+               window.opener.postMessage(\
+                 {{ type: \"zeroclaw-oidc-token\", provider: provider, access_token: token }},\
+                 window.location.origin\
+               );\
+             }}\
+           }} catch (e) {{}}\
+         }})();</script>",
+    ))
+    .into_response()
+}
+
+async fn handle_pkce_callback(
+    State(state): State<AppState>,
+    Extension(relay): Extension<Arc<OidcEnrollmentState>>,
+    dashboard_ext: Option<Extension<Arc<DashboardAuth>>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    via_relay: Option<Extension<ViaRelay>>,
+    headers: HeaderMap,
+    Query(query): Query<CallbackQuery>,
+) -> Response {
+    let via_relay = via_relay.as_deref();
+    let key = client_key(&state, peer, &headers);
+    // Counted by outcome, not on arrival: the callback that finishes a
+    // browser sign-in is the successful end of a flow this gateway itself
+    // started, and charging it would halve how many sign-ins a shared
+    // address gets. Every other way out of this handler records below,
+    // except a refusal for relay capacity: that limit is the gateway's own,
+    // and the caller did nothing wrong by arriving while it was reached.
+    if let Err(denied) = auth_gate(&relay, &key, false) {
+        return *denied;
+    }
+    // State gates everything: without a live matching flow there is
+    // nothing to fail, let alone finish.
+    let Some(pending) = query.state.as_deref().and_then(|s| relay.flows.consume(s)) else {
+        return unproductive_callback(&relay, &key, StatusCode::BAD_REQUEST);
+    };
+    // An enrollment flow can't start through a relay, but its callback could
+    // still arrive through one. Its token page would then reach the relay, so
+    // the flow ends here, spent, with its code never exchanged.
+    if via_relay.is_some() && matches!(pending.mode, FlowMode::Enrollment { .. }) {
+        return crate::relay_ingress::enrollment_refused();
+    }
+    // Each mode owns its binding evidence and cookie scope. Enrollment uses
+    // the root-scoped per-flow cookie; dashboard sign-in keeps CookieScope's
+    // existing binding, session and browser-marker lifecycle.
+    let clear_cookie = match &pending.mode {
+        FlowMode::Enrollment { secure_cookie, .. } => {
+            let cookie = match binding_cookie(&pending.flow.state, "", *secure_cookie, 0) {
+                Ok(cookie) => cookie,
+                Err(_) => {
+                    return unproductive_callback(&relay, &key, StatusCode::INTERNAL_SERVER_ERROR);
+                }
+            };
+            if !browser_matches(&headers, &pending) {
+                let mut response = unproductive_callback(&relay, &key, StatusCode::BAD_REQUEST);
+                response.headers_mut().append(header::SET_COOKIE, cookie);
+                return response;
+            }
+            Some(cookie)
+        }
+        FlowMode::Dashboard { .. } => None,
+    };
+    let mut response = finish_pkce_callback(
+        &state,
+        &relay,
+        &key,
+        pending,
+        query,
+        dashboard_ext,
+        &headers,
+        via_relay,
+    )
+    .await;
+    if response.status() != StatusCode::SERVICE_UNAVAILABLE
+        && let Some(cookie) = clear_cookie
+    {
+        // A capacity retry retains the same flow and cookie until the original TTL.
+        response.headers_mut().append(header::SET_COOKIE, cookie);
+    }
+    response
+}
+
+async fn finish_pkce_callback(
+    state: &AppState,
+    relay: &OidcEnrollmentState,
+    key: &str,
+    pending: PendingPkce,
+    query: CallbackQuery,
+    dashboard_ext: Option<Extension<Arc<DashboardAuth>>>,
+    headers: &HeaderMap,
+    via_relay: Option<&ViaRelay>,
+) -> Response {
+    // RFC 9207: a response that names another issuer is a mix-up, and is
+    // not acted on either way — neither its code nor its error verdict.
+    if let Err(e) = pending.flow.check_callback_issuer(query.iss.as_deref()) {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({
+                    "alias": pending.alias,
+                    "error": format!("{e}"),
+                })),
+            "oidc browser sign-in response names a different issuer"
+        );
+        return unproductive_callback(relay, key, StatusCode::BAD_REQUEST);
+    }
+    if let Some(error) = query.error {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({
+                    "alias": pending.alias,
+                    "error": error,
+                    "error_description": query.error_description,
+                })),
+            "oidc browser sign-in denied by the identity provider"
+        );
+        return unproductive_callback(relay, key, StatusCode::BAD_REQUEST);
+    }
+    let Some(code) = query.code else {
+        return unproductive_callback(relay, key, StatusCode::BAD_REQUEST);
+    };
+    // A dashboard sign-in must finish in the browser that started it.
+    // Without this check a sign-in someone else started, as themselves,
+    // could be completed here, leaving this browser signed in to their
+    // account. Checked before any outbound work.
+    let binding_hash = match &pending.mode {
+        FlowMode::Enrollment { .. } => None,
+        FlowMode::Dashboard { binding_hash, .. } => Some(*binding_hash),
+    };
+    let dashboard = match binding_hash {
+        None => None,
+        Some(binding_hash) => {
+            let scope = CookieScope {
+                https: request_is_https(state, headers, via_relay),
+                path_prefix: &state.path_prefix,
+            };
+            let bound = scope
+                .binding_value(headers, &pending.flow.state)
+                .is_some_and(|value| dashboard_session::session_key(&value) == binding_hash);
+            if !bound {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"alias": pending.alias})),
+                    "dashboard sign-in callback did not come from the browser that started it"
+                );
+                return unproductive_callback(relay, key, StatusCode::BAD_REQUEST);
+            }
+            let Some(Extension(dashboard)) = dashboard_ext else {
+                return unproductive_callback(relay, key, StatusCode::BAD_REQUEST);
+            };
+            // The provider as configured now, and whether it is still
+            // offered: a sign-in whose provider was taken off the screen
+            // while it was pending is refused before its code is spent.
+            let offered = {
+                let config = state.config.read();
+                let sign_in = &config.gateway.dashboard_sign_in;
+                sign_in
+                    .offers(&pending.alias)
+                    .then(|| config.oidc.get(&pending.alias))
+                    .flatten()
+                    .map(|entry| (entry.clone(), sign_in.session_lifetime_secs))
+            };
+            let Some((entry, lifetime_secs)) = offered else {
+                return sign_in_refused_page();
+            };
+            // Refused before the code exchange, so the refusal costs the
+            // identity provider nothing and the unused code can be retried.
+            if !dashboard.sessions.has_room() {
+                relay.flows.restore(pending);
+                return sessions_full_page();
+            }
+            Some((dashboard, entry, lifetime_secs))
+        }
+    };
+    #[cfg(test)]
+    before_exchange_client(&pending.flow.state).await;
+    // A dashboard sign-in takes its pin and its exchange client from the one
+    // reading above. The exchange checks that configuration against the
+    // flow, so a successful exchange vouches for the pin as well.
+    let built = match &dashboard {
+        Some((_, entry, _)) => enrollment_from(&pending.alias, entry.clone()),
+        None => enrollment_for(state, &pending.alias),
+    };
+    let enrollment = match built {
+        Ok(enrollment) => enrollment,
+        // The alias was removed while the flow was in flight: fail closed.
+        Err(_) => return unproductive_callback(relay, key, StatusCode::BAD_REQUEST),
+    };
+    let dashboard = dashboard.map(|(dashboard, entry, lifetime_secs)| {
+        (dashboard, ProviderPin::of(&entry), lifetime_secs)
+    });
+    let Some(_permit) = outbound_permit(relay) else {
+        // The busy page carries a short `Retry-After`. That invitation is
+        // only honest if the retry can still finish the sign-in: the state
+        // is single-use and this attempt used none of it, so hand the flow
+        // back. Without this the retry finds nothing pending, is billed as
+        // an unproductive callback, and walks the caller toward a lockout
+        // for a refusal the gateway itself issued.
+        relay.flows.restore(pending);
+        return relay_busy_page();
+    };
+    let PendingPkce {
+        alias, flow, mode, ..
+    } = pending;
+    let exchanged = match mode {
+        FlowMode::Enrollment { .. } => enrollment.pkce_exchange(&flow, &code).await,
+        FlowMode::Dashboard { .. } => {
+            enrollment
+                .pkce_exchange_requiring_id_token(&flow, &code)
+                .await
+        }
+    };
+    let token = match exchanged {
+        Ok(token) => token,
+        Err(e) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "alias": alias,
+                        "error": format!("{e}"),
+                    })),
+                "oidc browser sign-in code exchange failed"
+            );
+            return unproductive_callback(relay, key, StatusCode::BAD_GATEWAY);
+        }
+    };
+    match (mode, dashboard) {
+        (FlowMode::Enrollment { .. }, _) => success_page(
+            &format!("oidc.{alias}"),
+            &token.access_token,
+            token.expires_in,
+        ),
+        (
+            FlowMode::Dashboard {
+                return_to,
+                popup,
+                replaces,
+                ..
+            },
+            Some((dashboard, provider, lifetime_secs)),
+        ) => {
+            // The dashboard never refreshes: a refresh token the provider
+            // returned anyway is wiped here rather than merely dropped.
+            drop(token.refresh_token.map(zeroize::Zeroizing::new));
+            let landing = DashboardLanding {
+                alias,
+                provider,
+                lifetime_secs,
+                flow_state: flow.state.clone(),
+                client: key.to_owned(),
+                return_to,
+                popup,
+                replaces,
+            };
+            finish_dashboard_sign_in(
+                state,
+                &dashboard,
+                headers,
+                via_relay,
+                landing,
+                token.access_token,
+            )
+            .await
+        }
+        // A dashboard flow always has its session state by now (it returned
+        // above otherwise); never fall through to the token page.
+        (FlowMode::Dashboard { .. }, None) => failure_page(StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+/// A completed dashboard sign-in: what it was for and where it lands.
+struct DashboardLanding {
+    alias: String,
+    /// The issuer and client the alias named when the callback arrived.
+    provider: ProviderPin,
+    lifetime_secs: u64,
+    /// The flow's `state`, which names its binding cookie.
+    flow_state: String,
+    /// The client key the limiters bill, for the audit event.
+    client: String,
+    return_to: String,
+    popup: bool,
+    /// The session the browser held when it started the flow, if any.
+    replaces: Option<[u8; 32]>,
+}
+
+/// Turn a dashboard sign-in the identity provider completed into a session:
+/// the core's provider verifies the access token, and only then is a cookie
+/// set. A refusal here is policy (no mapped profile, a service client, a
+/// full store), not a failed authentication, so it is not billed.
+async fn finish_dashboard_sign_in(
+    state: &AppState,
+    dashboard: &DashboardAuth,
+    headers: &HeaderMap,
+    via_relay: Option<&ViaRelay>,
+    landing: DashboardLanding,
+    access_token: String,
+) -> Response {
+    let DashboardLanding {
+        alias,
+        provider,
+        lifetime_secs,
+        flow_state,
+        client,
+        return_to,
+        popup,
+        replaces,
+    } = landing;
+    let scope = CookieScope {
+        https: request_is_https(state, headers, via_relay),
+        path_prefix: &state.path_prefix,
+    };
+    // The callback is a navigation from the identity provider's site, so the
+    // `SameSite=Lax` browser markers come with it. Sessions sharing one, from
+    // another tab's sign-in that overlapped this one, end as this one is
+    // stored.
+    match dashboard
+        .sign_in_browser(
+            &alias,
+            provider,
+            access_token,
+            lifetime_secs,
+            scope.browser_keys(headers),
+        )
+        .await
+    {
+        Ok((cookie, session)) => {
+            // The browser now holds only the new session. The one it held
+            // before ends, whoever it belonged to, and so do the sockets it
+            // opened, so a later sign-out leaves nothing of this browser
+            // signed in. A callback from an identity provider on the
+            // dashboard's own site also carries the session cookie, which
+            // can name a session another tab signed in meanwhile. A key that
+            // names no session ends nothing.
+            let replaced = replaces
+                .into_iter()
+                .chain(
+                    scope
+                        .session_value(headers)
+                        .map(|value| dashboard_session::session_key(&value)),
+                )
+                .filter(|key| dashboard.end_key(key))
+                .count();
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Connect)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                    .with_attrs(::serde_json::json!({
+                        "alias": alias,
+                        "principal_id": session.principal().id.as_str(),
+                        "admin": session.is_admin(),
+                        "client": client,
+                        "replaced_sessions": replaced,
+                    })),
+                "dashboard sign-in"
+            );
+            let mut response = if popup {
+                signed_in_popup_page(session.principal().id.as_str())
+            } else {
+                Redirect::to(&format!("{}{return_to}", state.path_prefix)).into_response()
+            };
+            let response_headers = response.headers_mut();
+            response_headers.append(header::SET_COOKIE, scope.session_cookie(&cookie));
+            response_headers.append(header::SET_COOKIE, scope.clear_binding_cookie(&flow_state));
+            response
+        }
+        Err(refusal) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "alias": alias,
+                        "reason": format!("{refusal:?}"),
+                        "client": client,
+                    })),
+                "dashboard sign-in refused"
+            );
+            match refusal {
+                SignInRefusal::Full => sessions_full_page(),
+                SignInRefusal::Denied | SignInRefusal::Service => sign_in_refused_page(),
+            }
+        }
+    }
+}
+
+/// Fixed page for a sign-in the identity provider completed but this
+/// ZeroClaw does not accept.
+fn sign_in_refused_page() -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        Html(
+            "<!doctype html><meta charset=\"utf-8\"><title>Sign-in not accepted</title>\
+             <body style=\"font-family:system-ui;margin:3rem\"><h1>Sign-in not accepted</h1>\
+             <p>Your identity provider signed you in, but this account can't use this \
+             ZeroClaw dashboard. Ask its operator to grant your account access, or pair \
+             this browser instead.</p>",
+        ),
+    )
+        .into_response()
+}
+
+/// Fixed page when the session store is at its cap. The retry it invites
+/// finds the flow still pending when the refusal came before the exchange.
+fn sessions_full_page() -> Response {
+    let mut response = (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Html(
+            "<!doctype html><meta charset=\"utf-8\"><title>Sign-in busy</title>\
+             <body style=\"font-family:system-ui;margin:3rem\"><h1>Too many signed-in browsers</h1>\
+             <p>This ZeroClaw has reached its limit of dashboard sign-ins. Try again shortly, \
+             or ask its operator to sign out unused browsers.</p>",
+        ),
+    )
+        .into_response();
+    set_retry_after(&mut response, CAPACITY_RETRY_AFTER_SECS);
+    response
+}
+
+/// Re-authentication in a popup ends here: tell the dashboard's other tabs
+/// on a same-origin channel (which, unlike `window.opener`, survives the
+/// opener policy) and close. The page carries no token; `principal` is a
+/// digest the tabs compare to see whether the same account signed in again.
+fn signed_in_popup_page(principal_id: &str) -> Response {
+    let digest = hex::encode(&Sha256::digest(principal_id.as_bytes())[..8]);
+    Html(format!(
+        "<!doctype html><meta charset=\"utf-8\"><title>Signed in</title>\
+         <body style=\"font-family:system-ui;margin:3rem\"><h1>Signed in</h1>\
+         <p>You can close this window.</p>\
+         <script>(function () {{\
+           try {{\
+             var channel = new BroadcastChannel(\"zeroclaw-auth\");\
+             channel.postMessage({{ type: \"signed-in\", principal: \"{digest}\" }});\
+             channel.close();\
+           }} catch (e) {{}}\
+           window.close();\
+         }})();</script>"
+    ))
+    .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request as HttpRequest;
+    use http_body_util::BodyExt as _;
+    use tower::ServiceExt as _;
+    use wiremock::matchers::{body_string_contains, method as http_method, path as http_path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    use zeroclaw_config::schema::{Config, GatewayTlsConfig, OidcConfig, OidcValidation};
+
+    use crate::auth_rate_limit::MAX_ATTEMPTS;
+
+    async fn idp() -> MockServer {
+        let server = MockServer::start().await;
+        let issuer = server.uri();
+        Mock::given(http_method("GET"))
+            .and(http_path("/.well-known/openid-configuration"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "issuer": issuer,
+                "authorization_endpoint": format!("{issuer}/authorize"),
+                "token_endpoint": format!("{issuer}/token"),
+                "device_authorization_endpoint": format!("{issuer}/device"),
+                "code_challenge_methods_supported": ["S256"],
+            })))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    fn config_with_alias(issuer: &str, alias: &str) -> Config {
+        let mut config = Config::default();
+        config.oidc.insert(
+            alias.to_string(),
+            OidcConfig {
+                issuer: issuer.to_string(),
+                audience: "zeroclaw".into(),
+                client_id: "gw".into(),
+                client_secret: Some("s3cret".into()),
+                validation: OidcValidation::Introspection,
+                claim_path: "groups".into(),
+                profile_map: HashMap::from([("ops".to_string(), "operator".to_string())]),
+                ..OidcConfig::default()
+            },
+        );
+        config
+    }
+
+    fn router_for(config: Config) -> Router {
+        routes().with_state(crate::api::tests::test_state(config))
+    }
+
+    /// The default test peer: loopback, exempt from the per-client budget.
+    fn loopback() -> SocketAddr {
+        SocketAddr::from(([127, 0, 0, 1], 39999))
+    }
+
+    /// A remote caller, which every per-client limit applies to.
+    fn remote() -> SocketAddr {
+        SocketAddr::from(([203, 0, 113, 7], 40000))
+    }
+
+    /// A second remote caller, for the limits that have to keep one client
+    /// from spending what another one needs.
+    fn other_remote() -> SocketAddr {
+        SocketAddr::from(([198, 51, 100, 9], 40001))
+    }
+
+    /// The key every limiter bills [`remote`] under: the peer IP, no port.
+    fn remote_key() -> String {
+        remote().ip().to_string()
+    }
+
+    /// How many requests the IdP mock has seen in total — the count that
+    /// says whether a refusal happened before or after any outbound call.
+    async fn total_requests(server: &MockServer) -> usize {
+        server.received_requests().await.unwrap_or_default().len()
+    }
+
+    fn build_request(
+        http_method: &str,
+        path: &str,
+        host: &str,
+        body: Option<serde_json::Value>,
+        peer: SocketAddr,
+        extra_headers: &[(&str, &str)],
+    ) -> HttpRequest<Body> {
+        let mut builder = HttpRequest::builder()
+            .method(http_method)
+            .uri(path)
+            .header("host", host);
+        for (name, value) in extra_headers {
+            builder = builder.header(*name, *value);
+        }
+        let payload = body.map(|json| json.to_string());
+        if let Some(payload) = payload.as_deref() {
+            builder = builder
+                .header("content-type", "application/json")
+                .header("content-length", payload.len().to_string());
+        }
+        let mut request = match payload {
+            Some(payload) => builder.body(Body::from(payload)).unwrap(),
+            None => builder.body(Body::empty()).unwrap(),
+        };
+        request.extensions_mut().insert(ConnectInfo(peer));
+        request
+    }
+
+    async fn send(
+        router: &Router,
+        http_method: &str,
+        path: &str,
+        host: &str,
+        body: Option<serde_json::Value>,
+    ) -> axum::response::Response {
+        let request = build_request(http_method, path, host, body, loopback(), &[]);
+        router.clone().oneshot(request).await.unwrap()
+    }
+
+    async fn send_as(
+        router: &Router,
+        peer: SocketAddr,
+        http_method: &str,
+        path: &str,
+        host: &str,
+        body: Option<serde_json::Value>,
+        extra_headers: &[(&str, &str)],
+    ) -> axum::response::Response {
+        let request = build_request(http_method, path, host, body, peer, extra_headers);
+        router.clone().oneshot(request).await.unwrap()
+    }
+
+    async fn body_text(response: axum::response::Response) -> String {
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    async fn body_json(response: axum::response::Response) -> serde_json::Value {
+        serde_json::from_str(&body_text(response).await).unwrap()
+    }
+
+    /// How many requests the IdP saw on one path — the count that says
+    /// whether a refusal happened before or after the outbound call.
+    async fn requests_to(server: &MockServer, path: &str) -> usize {
+        server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|request| request.url.path() == path)
+            .count()
+    }
+
+    fn header_value(response: &axum::response::Response, name: &str) -> String {
+        response
+            .headers()
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    fn poll_body() -> Option<serde_json::Value> {
+        Some(serde_json::json!({"device_code": "dev-relayed"}))
+    }
+
+    fn assert_no_store(label: &str, response: &axum::response::Response, status: StatusCode) {
+        assert_eq!(response.status(), status, "{label}");
+        assert_eq!(
+            header_value(response, "cache-control"),
+            "no-store",
+            "{label}"
+        );
+        assert_eq!(header_value(response, "pragma"), "no-cache", "{label}");
+    }
+
+    /// Percent-encode a URL so it survives as one query-parameter value.
+    fn query_escape(value: &str) -> String {
+        value
+            .replace('%', "%25")
+            .replace(':', "%3A")
+            .replace('/', "%2F")
+    }
+
+    #[tokio::test]
+    async fn providers_lists_configured_aliases_sorted() {
+        let mut config = config_with_alias("https://a.example.com", "zeta");
+        config
+            .oidc
+            .insert("alpha".into(), config.oidc.get("zeta").cloned().unwrap());
+        let router = router_for(config);
+        let response = send(&router, "GET", "/api/oidc/providers", "gw.local", None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
+        assert_eq!(json["providers"][0]["alias"], "alpha");
+        assert_eq!(json["providers"][1]["provider"], "oidc.zeta");
+    }
+
+    #[tokio::test]
+    async fn unknown_alias_is_a_404() {
+        let router = router_for(Config::default());
+        let response = send(
+            &router,
+            "POST",
+            "/api/oidc/nope/device/start",
+            "gw.local",
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn device_proxy_start_and_poll_round_trip() {
+        let server = idp().await;
+        Mock::given(http_method("POST"))
+            .and(http_path("/device"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "device_code": "dev-9",
+                "user_code": "WXYZ-1234",
+                "verification_uri": "https://sso.example.com/activate",
+                "expires_in": 600,
+                "interval": 5,
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(http_method("POST"))
+            .and(http_path("/token"))
+            .and(body_string_contains("device_code=still-pending"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "error": "authorization_pending",
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(http_method("POST"))
+            .and(http_path("/token"))
+            .and(body_string_contains("device_code=dev-9"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "at-device",
+                "token_type": "Bearer",
+                "refresh_token": "rt-never-relayed",
+                "expires_in": 3600,
+            })))
+            .mount(&server)
+            .await;
+        let router = router_for(config_with_alias(&server.uri(), "corp"));
+
+        let response = send(
+            &router,
+            "POST",
+            "/api/oidc/corp/device/start",
+            "gw.local",
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let start: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
+        assert_eq!(start["user_code"], "WXYZ-1234");
+
+        let response = send(
+            &router,
+            "POST",
+            "/api/oidc/corp/device/poll",
+            "gw.local",
+            Some(serde_json::json!({"device_code": "still-pending"})),
+        )
+        .await;
+        let poll: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
+        assert_eq!(poll["status"], "pending");
+
+        let response = send(
+            &router,
+            "POST",
+            "/api/oidc/corp/device/poll",
+            "gw.local",
+            Some(serde_json::json!({"device_code": "dev-9"})),
+        )
+        .await;
+        let poll: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
+        assert_eq!(poll["status"], "granted");
+        assert_eq!(poll["provider"], "oidc.corp");
+        assert_eq!(poll["token"]["access_token"], "at-device");
+        assert_eq!(poll["token"]["expires_in"], 3600);
+        assert!(
+            poll["token"].get("refresh_token").is_none(),
+            "the relay hands out only the access token and its lifetime: {poll}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pkce_login_redirects_to_the_idp_with_s256_and_our_callback() {
+        let server = idp().await;
+        let router = router_for(config_with_alias(&server.uri(), "corp"));
+        let response = send(&router, "GET", "/oidc/login/corp", "gw.local:9443", None).await;
+        assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+        let location = response
+            .headers()
+            .get("location")
+            .and_then(|v| v.to_str().ok())
+            .unwrap()
+            .to_string();
+        assert!(location.starts_with(&format!("{}/authorize", server.uri())));
+        assert!(location.contains("code_challenge_method=S256"));
+        assert!(
+            location.contains("gw.local%3A9443%2Foidc%2Fcallback"),
+            "redirect_uri derives from the request Host: {location}"
+        );
+    }
+
+    /// The `redirect_uri` the login redirect sent the browser off with,
+    /// still percent-encoded as the authorize URL carries it.
+    async fn login_redirect_uri(
+        config: Config,
+        trust_forwarded_headers: bool,
+        extra_headers: &[(&str, &str)],
+    ) -> String {
+        let mut state = crate::api::tests::test_state(config);
+        state.trust_forwarded_headers = trust_forwarded_headers;
+        let router = routes().with_state(state);
+        let response = send_as(
+            &router,
+            loopback(),
+            "GET",
+            "/oidc/login/corp",
+            "gw.local",
+            None,
+            extra_headers,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+        header_value(&response, "location")
+            .split('&')
+            .find_map(|pair| pair.strip_prefix("redirect_uri="))
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn the_login_redirect_uri_scheme_follows_the_effective_tls_setting() {
+        let server = idp().await;
+        let base = config_with_alias(&server.uri(), "corp");
+        let tls_block = |enabled: bool| {
+            Some(GatewayTlsConfig {
+                enabled,
+                cert_path: "/etc/zeroclaw/cert.pem".into(),
+                key_path: "/etc/zeroclaw/key.pem".into(),
+                client_auth: None,
+            })
+        };
+        let http_uri = query_escape("http://gw.local/oidc/callback");
+        let https_uri = query_escape("https://gw.local/oidc/callback");
+
+        // No `[gateway.tls]` block at all: a plain HTTP listener.
+        assert_eq!(
+            login_redirect_uri(base.clone(), false, &[]).await,
+            http_uri,
+            "no TLS configured"
+        );
+
+        // Present but disabled — the schema default for the block, and
+        // still a plain HTTP listener. An `https://` redirect URI here is
+        // one the browser could never come back to.
+        let mut disabled = base.clone();
+        disabled.gateway.tls = tls_block(false);
+        assert_eq!(
+            login_redirect_uri(disabled, false, &[]).await,
+            http_uri,
+            "[gateway.tls] present with enabled = false"
+        );
+
+        // Enabled: the listener really is HTTPS.
+        let mut enabled = base.clone();
+        enabled.gateway.tls = tls_block(true);
+        assert_eq!(
+            login_redirect_uri(enabled, false, &[]).await,
+            https_uri,
+            "[gateway.tls] present with enabled = true"
+        );
+
+        // A TLS-terminating proxy the deployment trusts outranks both:
+        // the browser's origin is the proxy's, not this listener's.
+        let forwarded = [("x-forwarded-proto", "https")];
+        assert_eq!(
+            login_redirect_uri(base.clone(), true, &forwarded).await,
+            https_uri,
+            "trusted X-Forwarded-Proto"
+        );
+
+        // A trusted proxy's value counts only as `http` or `https` (the
+        // first of a chained list); anything else is ignored rather than
+        // pasted into the redirect URI.
+        for (proto, expected) in [
+            ("HTTPS", &https_uri),
+            ("https, http", &https_uri),
+            ("https://evil.example/#", &http_uri),
+            ("javascript", &http_uri),
+        ] {
+            assert_eq!(
+                &login_redirect_uri(base.clone(), true, &[("x-forwarded-proto", proto)]).await,
+                expected,
+                "X-Forwarded-Proto: {proto}"
+            );
+        }
+
+        // The same header from a hop the deployment does not trust says
+        // nothing, and cannot talk the gateway into a foreign scheme.
+        assert_eq!(
+            login_redirect_uri(base, false, &forwarded).await,
+            http_uri,
+            "untrusted X-Forwarded-Proto is ignored"
+        );
+    }
+
+    /// `request`, admitted as the accept loop admits a connection a relay
+    /// forwarded for the dashboard at `abc.relay.example`.
+    fn relayed(mut request: HttpRequest<Body>) -> HttpRequest<Body> {
+        crate::relay_ingress::RelayConnection::new(
+            zeroclaw_runtime::relay_dashboard::DashboardOrigin::new("abc.relay.example", 443)
+                .unwrap(),
+        )
+        .admit(&mut request)
+        .unwrap();
+        request
+    }
+
+    #[test]
+    fn a_relay_forwarded_sign_in_calls_back_to_the_dashboard_origin_never_the_host() {
+        let mut state = crate::api::tests::test_state(Config::default());
+        // A proxy in front of the listener is trusted; the relay path must
+        // not be steered by what that trust would otherwise accept.
+        state.trust_forwarded_headers = true;
+        let request = relayed(build_request(
+            "GET",
+            "/auth/sign-in/corp",
+            "abc.relay.example",
+            None,
+            remote(),
+            &[],
+        ));
+        let via_relay = request.extensions().get::<ViaRelay>().cloned();
+        // Whatever Host and scheme the request then claims, the callback is
+        // the dashboard's origin: the relay routes by the TLS server name,
+        // so the Host is not what decided where this request went.
+        let mut headers = request.headers().clone();
+        headers.insert(header::HOST, HeaderValue::from_static("evil.example"));
+        headers.insert("x-forwarded-proto", HeaderValue::from_static("http"));
+        assert_eq!(
+            callback_uri(&state, &headers, via_relay.as_ref()).unwrap(),
+            "https://abc.relay.example/oidc/callback"
+        );
+    }
+
+    #[tokio::test]
+    async fn enrollment_is_refused_through_a_relay_before_any_flow_starts() {
+        let server = idp().await;
+        let router = router_for(config_with_alias(&server.uri(), "corp"));
+        for (method, path) in [
+            ("GET", "/oidc/login/corp"),
+            ("POST", "/api/oidc/corp/device/start"),
+            ("POST", "/api/oidc/corp/device/poll"),
+        ] {
+            let request = relayed(build_request(
+                method,
+                path,
+                "abc.relay.example",
+                None,
+                remote(),
+                &[],
+            ));
+            let response = router.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{path}");
+            let body = body_text(response).await;
+            assert!(
+                body.contains("Enrollment isn't available through a relay"),
+                "{path}: {body}"
+            );
+        }
+        assert_eq!(total_requests(&server).await, 0, "no discovery, no flow");
+    }
+
+    #[tokio::test]
+    async fn an_enrollment_callback_through_a_relay_never_exchanges_its_code() {
+        let server = idp().await;
+        let router = router_for(config_with_alias(&server.uri(), "corp"));
+        // Started directly; its callback then arrives through the relay,
+        // carrying the flow's own binding cookie, so the browser check alone
+        // would let it through.
+        let flow_state = start_login(&router).await;
+        let request = relayed(build_request(
+            "GET",
+            &format!("/oidc/callback?code=auth-1&state={flow_state}"),
+            "abc.relay.example",
+            None,
+            remote(),
+            &[("cookie", &flow_state.cookie)],
+        ));
+        let response = router.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(!body_text(response).await.contains("zeroclaw-oidc-token"));
+        assert_eq!(requests_to(&server, "/token").await, 0, "no code exchange");
+        // And the flow is spent.
+        let response = send(
+            &router,
+            "GET",
+            &format!("/oidc/callback?code=auth-1&state={flow_state}"),
+            "gw.local",
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn the_sign_in_methods_say_when_a_relay_carries_the_dashboard() {
+        let router = router_for(config_with_alias("https://idp.example", "corp"));
+        let direct = send(&router, "GET", "/api/auth/methods", "gw.local", None).await;
+        assert_eq!(direct.status(), StatusCode::OK);
+        assert!(
+            body_json(direct).await.get("via_relay").is_none(),
+            "a direct answer is unchanged"
+        );
+
+        let mut request = build_request(
+            "GET",
+            "/api/auth/methods",
+            "abc.relay.example",
+            None,
+            remote(),
+            &[],
+        );
+        crate::relay_ingress::RelayConnection::new(
+            zeroclaw_runtime::relay_dashboard::DashboardOrigin::new("abc.relay.example", 443)
+                .unwrap(),
+        )
+        .admit(&mut request)
+        .unwrap();
+        let relayed = router.oneshot(request).await.unwrap();
+        assert_eq!(relayed.status(), StatusCode::OK);
+        assert_eq!(body_json(relayed).await["via_relay"], true);
+    }
+
+    #[tokio::test]
+    async fn callback_without_a_live_flow_is_refused() {
+        let router = router_for(Config::default());
+        let response = send(
+            &router,
+            "GET",
+            "/oidc/callback?code=x&state=never-issued",
+            "gw.local",
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(body_text(response).await.contains("Sign-in not completed"));
+    }
+
+    fn state_from_location(location: &str) -> String {
+        let query = location.split('?').nth(1).unwrap();
+        query
+            .split('&')
+            .find_map(|pair| pair.strip_prefix("state="))
+            .unwrap()
+            .to_string()
+    }
+
+    struct BrowserFlow {
+        state: String,
+        cookie: String,
+    }
+
+    impl std::ops::Deref for BrowserFlow {
+        type Target = str;
+        fn deref(&self) -> &str {
+            &self.state
+        }
+    }
+
+    impl std::fmt::Display for BrowserFlow {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(&self.state)
+        }
+    }
+
+    fn browser_flow(response: &Response) -> BrowserFlow {
+        BrowserFlow {
+            state: state_from_location(&header_value(response, "location")),
+            cookie: header_value(response, "set-cookie")
+                .split(';')
+                .next()
+                .unwrap()
+                .into(),
+        }
+    }
+
+    /// Start a browser flow and preserve its emitted state and cookie.
+    async fn start_login(router: &Router) -> BrowserFlow {
+        start_login_as(router, loopback()).await
+    }
+
+    /// The same, from a chosen peer, for the tests that care which client
+    /// the flow is billed to.
+    async fn start_login_as(router: &Router, peer: SocketAddr) -> BrowserFlow {
+        let response = send_as(
+            router,
+            peer,
+            "GET",
+            "/oidc/login/corp",
+            "gw.local",
+            None,
+            &[],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+        browser_flow(&response)
+    }
+
+    #[tokio::test]
+    async fn pkce_callback_exchanges_once_and_only_once() {
+        let server = idp().await;
+        // The exchange must present the redirect URI stored when the flow
+        // started, byte for byte: RFC 6749 section 4.1.3 makes the IdP
+        // compare it against the one the authorize request carried, and a
+        // mock that does not see it answers 404 instead of a token.
+        Mock::given(http_method("POST"))
+            .and(http_path("/token"))
+            .and(body_string_contains("grant_type=authorization_code"))
+            .and(body_string_contains("code_verifier="))
+            .and(body_string_contains(format!(
+                "redirect_uri={}",
+                query_escape("http://gw.local/oidc/callback")
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "at-browser",
+                "token_type": "Bearer",
+                "expires_in": 3600,
+            })))
+            .mount(&server)
+            .await;
+        let router = router_for(config_with_alias(&server.uri(), "corp"));
+
+        let flow_state = start_login(&router).await;
+
+        let response = send_as(
+            &router,
+            loopback(),
+            "GET",
+            &format!("/oidc/callback?code=auth-1&state={flow_state}"),
+            "gw.local",
+            None,
+            &[("cookie", &flow_state.cookie)],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let page = body_text(response).await;
+        assert!(page.contains("zeroclaw-oidc-token"), "postMessage handoff");
+        assert!(page.contains("\"at-browser\""), "token as a JSON literal");
+        assert!(page.contains("oidc.corp"));
+
+        // Single use: the same state cannot be redeemed twice.
+        let response = send_as(
+            &router,
+            loopback(),
+            "GET",
+            &format!("/oidc/callback?code=auth-1&state={flow_state}"),
+            "gw.local",
+            None,
+            &[("cookie", &flow_state.cookie)],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn idp_error_on_callback_consumes_the_flow_and_shows_the_fixed_page() {
+        let server = idp().await;
+        let router = router_for(config_with_alias(&server.uri(), "corp"));
+        let flow_state = start_login(&router).await;
+        let response = send_as(
+            &router,
+            loopback(),
+            "GET",
+            &format!(
+                "/oidc/callback?error=access_denied&error_description=nope&state={flow_state}"
+            ),
+            "gw.local",
+            None,
+            &[("cookie", &flow_state.cookie)],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let page = body_text(response).await;
+        assert!(page.contains("Sign-in not completed"));
+        assert!(
+            !page.contains("access_denied") && !page.contains("nope"),
+            "the failure page never echoes request content"
+        );
+    }
+
+    #[tokio::test]
+    async fn device_polls_consume_a_bounded_per_client_budget() {
+        let server = idp().await;
+        Mock::given(http_method("POST"))
+            .and(http_path("/token"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "error": "authorization_pending",
+            })))
+            .mount(&server)
+            .await;
+        let router = router_for(config_with_alias(&server.uri(), "corp"));
+
+        // A remote caller that never started a flow still pays for every
+        // poll it makes, because each one costs the gateway an IdP round
+        // trip carrying this deployment's client credentials.
+        for attempt in 0..POLL_BUDGET_PER_MINUTE {
+            let response = send_as(
+                &router,
+                remote(),
+                "POST",
+                "/api/oidc/corp/device/poll",
+                "gw.local",
+                poll_body(),
+                &[],
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK, "poll {attempt}");
+        }
+        let response = send_as(
+            &router,
+            remote(),
+            "POST",
+            "/api/oidc/corp/device/poll",
+            "gw.local",
+            poll_body(),
+            &[],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        let retry_header = header_value(&response, "retry-after");
+        let retry_after = body_json(response).await["retry_after"].as_u64().unwrap();
+        assert!(
+            (1..=POLL_BUDGET_WINDOW.as_secs()).contains(&retry_after),
+            "retry_after names when the window frees a slot: {retry_after}"
+        );
+        assert_eq!(retry_header, retry_after.to_string());
+
+        assert_eq!(
+            requests_to(&server, "/token").await,
+            POLL_BUDGET_PER_MINUTE as usize,
+            "the refused poll never reached the identity provider"
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_slow_down_walks_the_caller_into_the_lockout() {
+        let server = idp().await;
+        Mock::given(http_method("POST"))
+            .and(http_path("/token"))
+            .respond_with(
+                ResponseTemplate::new(400)
+                    .set_body_json(serde_json::json!({ "error": "slow_down" })),
+            )
+            .mount(&server)
+            .await;
+        let state = crate::api::tests::test_state(config_with_alias(&server.uri(), "corp"));
+        // The limiter `POST /pair` and webhook auth share, kept to check
+        // that this surface's lockout does not spill onto them.
+        let shared_auth = Arc::clone(&state.auth_limiter);
+        let router = routes().with_state(state);
+
+        for attempt in 0..MAX_ATTEMPTS {
+            let response = send_as(
+                &router,
+                remote(),
+                "POST",
+                "/api/oidc/corp/device/poll",
+                "gw.local",
+                poll_body(),
+                &[],
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK, "poll {attempt}");
+            assert_eq!(body_json(response).await["status"], "slow_down");
+        }
+        let outbound = requests_to(&server, "/token").await;
+        assert_eq!(outbound, MAX_ATTEMPTS as usize);
+
+        let response = send_as(
+            &router,
+            remote(),
+            "POST",
+            "/api/oidc/corp/device/poll",
+            "gw.local",
+            poll_body(),
+            &[],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            requests_to(&server, "/token").await,
+            outbound,
+            "the locked-out caller caused no further outbound work"
+        );
+        assert!(
+            !shared_auth.is_locked_out(&remote_key()),
+            "an enrollment lockout must not reach /pair or webhook auth for \
+             the same client address"
+        );
+        // What `POST /pair` and webhook auth actually ask on arrival. The
+        // shared limiter holds no record of this client, so its next
+        // pairing attempt is served rather than refused for polls it never
+        // made — and `is_locked_out` alone would not notice, since only a
+        // check registers the lockout a recorded attempt earns.
+        assert!(
+            shared_auth.check_rate_limit(&remote_key()).is_ok(),
+            "pairing from the same address is still allowed"
+        );
+    }
+
+    #[tokio::test]
+    async fn relayed_garbage_device_codes_run_into_the_lockout() {
+        let server = idp().await;
+        Mock::given(http_method("POST"))
+            .and(http_path("/token"))
+            .respond_with(
+                ResponseTemplate::new(400)
+                    .set_body_json(serde_json::json!({ "error": "expired_token" })),
+            )
+            .mount(&server)
+            .await;
+        let router = router_for(config_with_alias(&server.uri(), "corp"));
+
+        for attempt in 0..MAX_ATTEMPTS {
+            let response = send_as(
+                &router,
+                remote(),
+                "POST",
+                "/api/oidc/corp/device/poll",
+                "gw.local",
+                poll_body(),
+                &[],
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "poll {attempt}");
+        }
+        let outbound = requests_to(&server, "/token").await;
+        assert_eq!(outbound, MAX_ATTEMPTS as usize);
+
+        let response = send_as(
+            &router,
+            remote(),
+            "POST",
+            "/api/oidc/corp/device/poll",
+            "gw.local",
+            poll_body(),
+            &[],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(!header_value(&response, "retry-after").is_empty());
+        assert_eq!(requests_to(&server, "/token").await, outbound);
+    }
+
+    #[tokio::test]
+    async fn completed_browser_sign_ins_are_not_billed_as_attempts() {
+        let server = idp().await;
+        Mock::given(http_method("POST"))
+            .and(http_path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "at-browser",
+                "token_type": "Bearer",
+                "expires_in": 3600,
+            })))
+            .mount(&server)
+            .await;
+        let relay = Arc::new(OidcEnrollmentState::default());
+        let router = routes_with(Arc::clone(&relay)).with_state(crate::api::tests::test_state(
+            config_with_alias(&server.uri(), "corp"),
+        ));
+
+        // Five sign-ins in a row from one remote address — a shared office
+        // egress, or one user retrying. Each is a login (one attempt) plus
+        // the callback that finishes it (none): a completed enrollment is
+        // not a failed authentication and must not spend the budget.
+        for round in 0..5 {
+            let flow_state = start_login_as(&router, remote()).await;
+            let response = send_as(
+                &router,
+                remote(),
+                "GET",
+                &format!("/oidc/callback?code=auth-{round}&state={flow_state}"),
+                "gw.local",
+                None,
+                &[("cookie", &flow_state.cookie)],
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK, "sign-in {round}");
+            assert!(body_text(response).await.contains("\"at-browser\""));
+        }
+        assert!(!relay.attempts.is_locked_out(&remote_key()));
+
+        // Ten recorded attempts is already the lockout; five is not, so
+        // the next login is still served.
+        let response = send_as(
+            &router,
+            remote(),
+            "GET",
+            "/oidc/login/corp",
+            "gw.local",
+            None,
+            &[],
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::TEMPORARY_REDIRECT,
+            "only the five logins were recorded, not the five callbacks"
+        );
+    }
+
+    #[tokio::test]
+    async fn callbacks_without_a_live_flow_run_the_caller_into_the_lockout() {
+        let router = router_for(Config::default());
+
+        // A caller spraying `state` values at the callback is guessing at
+        // flows it did not start: each dead callback is an attempt.
+        for attempt in 0..MAX_ATTEMPTS {
+            let response = send_as(
+                &router,
+                remote(),
+                "GET",
+                "/oidc/callback?code=x&state=never-issued",
+                "gw.local",
+                None,
+                &[],
+            )
+            .await;
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "callback {attempt}"
+            );
+        }
+        let response = send_as(
+            &router,
+            remote(),
+            "GET",
+            "/oidc/callback?code=x&state=never-issued",
+            "gw.local",
+            None,
+            &[],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(!header_value(&response, "retry-after").is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_relay_failure_reaching_the_idp_is_not_billed_to_the_caller() {
+        // An alias pointed at a closed loopback port: every poll fails in
+        // transport, before the IdP has said anything about the device
+        // code. That is the deployment's problem, not the caller's, so it
+        // must not walk a blameless client into a five-minute lockout.
+        let router = router_for(config_with_alias("http://127.0.0.1:1", "corp"));
+
+        // One more than the lockout threshold, and well inside the poll
+        // budget, so a 429 here could only come from a recorded attempt.
+        for attempt in 0..=MAX_ATTEMPTS {
+            let response = send_as(
+                &router,
+                remote(),
+                "POST",
+                "/api/oidc/corp/device/poll",
+                "gw.local",
+                poll_body(),
+                &[],
+            )
+            .await;
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_GATEWAY,
+                "poll {attempt} is a relay failure, not an attempt"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_provider_listing_is_budgeted_for_remote_callers_only() {
+        let router = router_for(config_with_alias("https://idp.example.com", "corp"));
+
+        for attempt in 0..POLL_BUDGET_PER_MINUTE {
+            let response = send_as(
+                &router,
+                remote(),
+                "GET",
+                "/api/oidc/providers",
+                "gw.local",
+                None,
+                &[],
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK, "listing {attempt}");
+        }
+        let response = send_as(
+            &router,
+            remote(),
+            "GET",
+            "/api/oidc/providers",
+            "gw.local",
+            None,
+            &[],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        // Loopback keeps the exemption the auth limiter already grants it.
+        for _ in 0..(POLL_BUDGET_PER_MINUTE * 2) {
+            let response = send(&router, "GET", "/api/oidc/providers", "gw.local", None).await;
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_trusted_forwarded_address_is_the_budgeted_identity() {
+        let mut state = crate::api::tests::test_state(Config::default());
+        state.trust_forwarded_headers = true;
+        let router = routes().with_state(state);
+        let forwarded = [("x-forwarded-for", "198.51.100.4")];
+
+        // The peer is loopback, but the deployment trusts its proxy, so the
+        // budget follows the forwarded client, not the proxy.
+        for attempt in 0..POLL_BUDGET_PER_MINUTE {
+            let response = send_as(
+                &router,
+                loopback(),
+                "GET",
+                "/api/oidc/providers",
+                "gw.local",
+                None,
+                &forwarded,
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK, "listing {attempt}");
+        }
+        let response = send_as(
+            &router,
+            loopback(),
+            "GET",
+            "/api/oidc/providers",
+            "gw.local",
+            None,
+            &forwarded,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        // The same loopback peer without the header is a local client.
+        for _ in 0..(POLL_BUDGET_PER_MINUTE + 1) {
+            let response = send(&router, "GET", "/api/oidc/providers", "gw.local", None).await;
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+    }
+
+    #[tokio::test]
+    async fn the_outbound_cap_refuses_relaying_before_contacting_the_idp() {
+        let server = idp().await;
+        Mock::given(http_method("POST"))
+            .and(http_path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "never-relayed",
+                "token_type": "Bearer",
+            })))
+            .mount(&server)
+            .await;
+        let relay = Arc::new(OidcEnrollmentState::default());
+        let router = routes_with(relay.clone()).with_state(crate::api::tests::test_state(
+            config_with_alias(&server.uri(), "corp"),
+        ));
+
+        // A live flow, started while the relay still had capacity.
+        let flow_state = start_login(&router).await;
+
+        // Every outbound slot is taken; nothing may reach the IdP now.
+        let _permits = relay
+            .outbound
+            .try_acquire_many(OUTBOUND_RELAY_CAP as u32)
+            .unwrap();
+
+        let response = send(
+            &router,
+            "POST",
+            "/api/oidc/corp/device/poll",
+            "gw.local",
+            poll_body(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(header_value(&response, "retry-after"), "5");
+        assert_eq!(requests_to(&server, "/token").await, 0);
+
+        let response = send_as(
+            &router,
+            loopback(),
+            "GET",
+            &format!("/oidc/callback?code=auth-1&state={flow_state}"),
+            "gw.local",
+            None,
+            &[("cookie", &flow_state.cookie)],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(body_text(response).await.contains("Sign-in not completed"));
+        assert_eq!(
+            requests_to(&server, "/token").await,
+            0,
+            "no code was exchanged while the relay was saturated"
+        );
+    }
+
+    #[tokio::test]
+    async fn callbacks_the_relay_turns_away_are_not_billed_as_attempts() {
+        let server = idp().await;
+        Mock::given(http_method("POST"))
+            .and(http_path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "never-relayed",
+                "token_type": "Bearer",
+            })))
+            .mount(&server)
+            .await;
+        let relay = Arc::new(OidcEnrollmentState::default());
+        let router = routes_with(Arc::clone(&relay)).with_state(crate::api::tests::test_state(
+            config_with_alias(&server.uri(), "corp"),
+        ));
+
+        // Enough live flows for a lockout's worth of callbacks, started from
+        // loopback so starting them bills nothing to the remote caller.
+        let mut flow_states = Vec::new();
+        for _ in 0..MAX_ATTEMPTS {
+            flow_states.push(start_login(&router).await);
+        }
+
+        // Every outbound slot is taken while the remote caller's browsers
+        // come back from the IdP.
+        let permits = relay
+            .outbound
+            .try_acquire_many(OUTBOUND_RELAY_CAP as u32)
+            .unwrap();
+        for (round, flow_state) in flow_states.iter().enumerate() {
+            let response = send_as(
+                &router,
+                remote(),
+                "GET",
+                &format!("/oidc/callback?code=auth-{round}&state={flow_state}"),
+                "gw.local",
+                None,
+                &[("cookie", &flow_state.cookie)],
+            )
+            .await;
+            assert_eq!(
+                response.status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "callback {round}"
+            );
+        }
+        assert_eq!(requests_to(&server, "/token").await, 0);
+        drop(permits);
+
+        // Billing each of those would have put the caller at the lockout
+        // threshold, and this login would be refused with 429.
+        let response = send_as(
+            &router,
+            remote(),
+            "GET",
+            "/oidc/login/corp",
+            "gw.local",
+            None,
+            &[],
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::TEMPORARY_REDIRECT,
+            "a callback refused for relay capacity is not the caller's failed attempt"
+        );
+    }
+
+    #[tokio::test]
+    async fn every_enrollment_response_forbids_caching() {
+        let server = idp().await;
+        Mock::given(http_method("POST"))
+            .and(http_path("/device"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "device_code": "dev-9",
+                "user_code": "WXYZ-1234",
+                "verification_uri": "https://sso.example.com/activate",
+                "expires_in": 600,
+                "interval": 5,
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(http_method("POST"))
+            .and(http_path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "at-cacheable-never",
+                "token_type": "Bearer",
+                "expires_in": 3600,
+            })))
+            .mount(&server)
+            .await;
+        let router = router_for(config_with_alias(&server.uri(), "corp"));
+        let flow_state = start_login(&router).await;
+
+        assert_no_store(
+            "providers",
+            &send(&router, "GET", "/api/oidc/providers", "gw.local", None).await,
+            StatusCode::OK,
+        );
+        assert_no_store(
+            "unknown alias",
+            &send(
+                &router,
+                "POST",
+                "/api/oidc/nope/device/start",
+                "gw.local",
+                None,
+            )
+            .await,
+            StatusCode::NOT_FOUND,
+        );
+        assert_no_store(
+            "device start",
+            &send(
+                &router,
+                "POST",
+                "/api/oidc/corp/device/start",
+                "gw.local",
+                None,
+            )
+            .await,
+            StatusCode::OK,
+        );
+        assert_no_store(
+            "granted poll",
+            &send(
+                &router,
+                "POST",
+                "/api/oidc/corp/device/poll",
+                "gw.local",
+                poll_body(),
+            )
+            .await,
+            StatusCode::OK,
+        );
+        assert_no_store(
+            "callback success page",
+            &send_as(
+                &router,
+                loopback(),
+                "GET",
+                &format!("/oidc/callback?code=auth-1&state={flow_state}"),
+                "gw.local",
+                None,
+                &[("cookie", &flow_state.cookie)],
+            )
+            .await,
+            StatusCode::OK,
+        );
+        assert_no_store(
+            "callback failure page",
+            &send(
+                &router,
+                "GET",
+                "/oidc/callback?code=x&state=never-issued",
+                "gw.local",
+                None,
+            )
+            .await,
+            StatusCode::BAD_REQUEST,
+        );
+    }
+
+    #[tokio::test]
+    async fn the_callback_refuses_a_response_from_another_issuer() {
+        let server = idp().await;
+        Mock::given(http_method("POST"))
+            .and(http_path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "at-browser",
+                "token_type": "Bearer",
+                "expires_in": 3600,
+            })))
+            .mount(&server)
+            .await;
+        let router = router_for(config_with_alias(&server.uri(), "corp"));
+        let foreign = query_escape("https://different.example");
+
+        // A matching state carrying a foreign `iss` is a mix-up: refused
+        // before the code is exchanged.
+        let flow_state = start_login(&router).await;
+        let response = send_as(
+            &router,
+            loopback(),
+            "GET",
+            &format!("/oidc/callback?code=auth-1&state={flow_state}&iss={foreign}"),
+            "gw.local",
+            None,
+            &[("cookie", &flow_state.cookie)],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(body_text(response).await.contains("Sign-in not completed"));
+        assert_eq!(requests_to(&server, "/token").await, 0);
+
+        // An IdP error from a foreign issuer is not a verdict on this flow
+        // either, and the state is spent regardless.
+        let flow_state = start_login(&router).await;
+        let response = send_as(
+            &router,
+            loopback(),
+            "GET",
+            &format!("/oidc/callback?error=access_denied&state={flow_state}&iss={foreign}"),
+            "gw.local",
+            None,
+            &[("cookie", &flow_state.cookie)],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let response = send_as(
+            &router,
+            loopback(),
+            "GET",
+            &format!("/oidc/callback?code=auth-1&state={flow_state}"),
+            "gw.local",
+            None,
+            &[("cookie", &flow_state.cookie)],
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "the refused response consumed the state"
+        );
+        assert_eq!(requests_to(&server, "/token").await, 0);
+
+        // The issuer this flow was started for is accepted.
+        let flow_state = start_login(&router).await;
+        let matching = query_escape(&server.uri());
+        let response = send_as(
+            &router,
+            loopback(),
+            "GET",
+            &format!("/oidc/callback?code=auth-1&state={flow_state}&iss={matching}"),
+            "gw.local",
+            None,
+            &[("cookie", &flow_state.cookie)],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(body_text(response).await.contains("\"at-browser\""));
+        assert_eq!(requests_to(&server, "/token").await, 1);
+    }
+
+    #[tokio::test]
+    async fn the_production_assembly_keeps_every_boundary() {
+        let server = idp().await;
+        Mock::given(http_method("POST"))
+            .and(http_path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "at-browser",
+                "token_type": "Bearer",
+                "expires_in": 3600,
+            })))
+            .mount(&server)
+            .await;
+        let mut config = config_with_alias(&server.uri(), "corp");
+        config.gateway.require_pairing = true;
+        config.gateway.paired_tokens = vec!["zc_paired".into()];
+        let mut state = AppState {
+            pairing: Arc::new(zeroclaw_runtime::security::pairing::PairingGuard::new(
+                config.gateway.require_pairing,
+                &config.gateway.paired_tokens,
+                zeroclaw_config::pairing::PairingCodePolicy::default(),
+            )),
+            ..crate::api::tests::test_state(config.clone())
+        };
+        state.path_prefix = "/gw".to_string();
+        let inbound_auth = Arc::new(
+            crate::principal_gate::GatewayInboundAuth::from_config(
+                &config,
+                Arc::clone(&state.pairing),
+            )
+            .unwrap(),
+        );
+        // The real assembly: the authenticated config group and the
+        // deliberately unauthenticated enrollment group in one router,
+        // nested under the deployment's path prefix, under the gateway
+        // body cap and the gateway security headers.
+        let app = Router::new()
+            .nest(
+                "/gw",
+                Router::new()
+                    .merge(crate::config_admin_router(
+                        crate::principal_gate::ConfigRouteAuth::new(&inbound_auth, &state.config),
+                    ))
+                    .merge(routes())
+                    .with_state(state)
+                    .layer(tower_http::limit::RequestBodyLimitLayer::new(
+                        crate::MAX_BODY_SIZE,
+                    )),
+            )
+            .layer(axum::middleware::from_fn(crate::security_headers::apply));
+
+        // The config group's route layer still gates config, and does not
+        // reach across the merge to the enrollment routes, which have to
+        // answer before anyone can enroll a credential.
+        let response = send(&app, "GET", "/gw/api/config", "gw.local", None).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let response = send(&app, "GET", "/gw/api/oidc/providers", "gw.local", None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // The redirect_uri the browser is sent with carries the prefix the
+        // deployment is nested under.
+        let response = send(&app, "GET", "/gw/oidc/login/corp", "gw.local", None).await;
+        assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+        let location = response
+            .headers()
+            .get("location")
+            .and_then(|v| v.to_str().ok())
+            .unwrap()
+            .to_string();
+        assert!(
+            location.contains("%2Fgw%2Foidc%2Fcallback"),
+            "redirect_uri keeps the path prefix: {location}"
+        );
+        let flow_state = browser_flow(&response);
+
+        // The binding cookie is not a credential for authenticated API routes.
+        let denied = send_as(
+            &app,
+            loopback(),
+            "GET",
+            "/gw/api/config",
+            "gw.local",
+            None,
+            &[("cookie", &flow_state.cookie)],
+        )
+        .await;
+        assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+
+        // The token-bearing page carries both the gateway security headers
+        // and this surface's cache policy.
+        let response = send_as(
+            &app,
+            loopback(),
+            "GET",
+            &format!("/gw/oidc/callback?code=auth-1&state={flow_state}"),
+            "gw.local",
+            None,
+            &[("cookie", &flow_state.cookie)],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            header_value(&response, "cross-origin-opener-policy"),
+            "same-origin"
+        );
+        assert_eq!(header_value(&response, "referrer-policy"), "no-referrer");
+        assert_eq!(header_value(&response, "x-frame-options"), "DENY");
+        assert_eq!(header_value(&response, "cache-control"), "no-store");
+        assert_eq!(header_value(&response, "pragma"), "no-cache");
+
+        // The gateway body cap applies to the enrollment routes too.
+        let oversized = "d".repeat(70 * 1024);
+        let response = send(
+            &app,
+            "POST",
+            "/gw/api/oidc/corp/device/poll",
+            "gw.local",
+            Some(serde_json::json!({ "device_code": oversized })),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        // And a remote identity is still budgeted through the whole stack.
+        for attempt in 0..POLL_BUDGET_PER_MINUTE {
+            let response = send_as(
+                &app,
+                remote(),
+                "POST",
+                "/gw/api/oidc/corp/device/poll",
+                "gw.local",
+                poll_body(),
+                &[],
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK, "poll {attempt}");
+        }
+        let response = send_as(
+            &app,
+            remote(),
+            "POST",
+            "/gw/api/oidc/corp/device/poll",
+            "gw.local",
+            poll_body(),
+            &[],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn a_pending_flow_past_its_ttl_is_gone_when_the_callback_arrives() {
+        let server = idp().await;
+        Mock::given(http_method("POST"))
+            .and(http_path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "never-exchanged",
+            })))
+            .mount(&server)
+            .await;
+        // A store whose entries are stale the moment they land: the retain
+        // pass that guards insert and consume must drop the pending flow
+        // rather than let a late callback finish it.
+        let relay = Arc::new(OidcEnrollmentState {
+            flows: OidcFlowStore {
+                flows: parking_lot::Mutex::new(HashMap::new()),
+                ttl: Duration::ZERO,
+            },
+            ..OidcEnrollmentState::default()
+        });
+        let router = routes_with(relay).with_state(crate::api::tests::test_state(
+            config_with_alias(&server.uri(), "corp"),
+        ));
+
+        let flow_state = start_login(&router).await;
+        let response = send_as(
+            &router,
+            loopback(),
+            "GET",
+            &format!("/oidc/callback?code=auth-1&state={flow_state}"),
+            "gw.local",
+            None,
+            &[("cookie", &flow_state.cookie)],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(body_text(response).await.contains("Sign-in not completed"));
+        assert_eq!(requests_to(&server, "/token").await, 0);
+    }
+
+    #[tokio::test]
+    async fn the_pending_flow_store_is_capped_before_the_idp_is_contacted() {
+        let server = idp().await;
+        let router = router_for(config_with_alias(&server.uri(), "corp"));
+        for attempt in 0..FLOW_CAP {
+            let response = send(&router, "GET", "/oidc/login/corp", "gw.local", None).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::TEMPORARY_REDIRECT,
+                "login {attempt}"
+            );
+        }
+        let outbound = total_requests(&server).await;
+
+        let response = send(&router, "GET", "/oidc/login/corp", "gw.local", None).await;
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(!header_value(&response, "retry-after").is_empty());
+        let json = body_json(response).await;
+        assert!(
+            json["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("too many in-flight"),
+            "{json}"
+        );
+        assert_eq!(
+            total_requests(&server).await,
+            outbound,
+            "a full store refuses without spending a discovery round trip \
+             on a flow that would have nowhere to land"
+        );
+    }
+
+    #[tokio::test]
+    async fn removing_the_alias_mid_flow_fails_the_callback_closed() {
+        let server = idp().await;
+        Mock::given(http_method("POST"))
+            .and(http_path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "never-exchanged",
+            })))
+            .mount(&server)
+            .await;
+        let state = crate::api::tests::test_state(config_with_alias(&server.uri(), "corp"));
+        let authority = state.config_authority.clone();
+        let router = routes().with_state(state);
+
+        let flow_state = start_login(&router).await;
+        let commit = authority.begin_config_commit().await.unwrap();
+        let mut config = commit.current_config();
+        config.oidc.clear();
+        commit
+            .publish(commit.next_revision().unwrap(), config)
+            .unwrap();
+        drop(commit);
+
+        let response = send_as(
+            &router,
+            loopback(),
+            "GET",
+            &format!("/oidc/callback?code=auth-1&state={flow_state}"),
+            "gw.local",
+            None,
+            &[("cookie", &flow_state.cookie)],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(body_text(response).await.contains("Sign-in not completed"));
+        assert_eq!(requests_to(&server, "/token").await, 0);
+    }
+
+    #[tokio::test]
+    async fn a_callback_refused_for_relay_capacity_can_still_be_retried() {
+        let server = idp().await;
+        Mock::given(http_method("POST"))
+            .and(http_path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "at-after-retry",
+                "token_type": "Bearer",
+                "expires_in": 3600,
+            })))
+            .mount(&server)
+            .await;
+        let relay = Arc::new(OidcEnrollmentState::default());
+        let router = routes_with(Arc::clone(&relay)).with_state(crate::api::tests::test_state(
+            config_with_alias(&server.uri(), "corp"),
+        ));
+
+        let flow_state = start_login(&router).await;
+
+        // The browser comes back while every outbound slot is taken.
+        let permits = relay
+            .outbound
+            .try_acquire_many(OUTBOUND_RELAY_CAP as u32)
+            .unwrap();
+        let response = send_as(
+            &router,
+            loopback(),
+            "GET",
+            &format!("/oidc/callback?code=auth-1&state={flow_state}"),
+            "gw.local",
+            None,
+            &[("cookie", &flow_state.cookie)],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(header_value(&response, "retry-after"), "5");
+        assert!(
+            !response.headers().contains_key(header::SET_COOKIE),
+            "a valid retry keeps its cookie"
+        );
+        assert_eq!(requests_to(&server, "/token").await, 0);
+        drop(permits);
+
+        // The retry that `Retry-After` invited finishes the sign-in: the
+        // refusal spent nothing, so it must not have spent the flow.
+        let response = send_as(
+            &router,
+            loopback(),
+            "GET",
+            &format!("/oidc/callback?code=auth-1&state={flow_state}"),
+            "gw.local",
+            None,
+            &[("cookie", &flow_state.cookie)],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let page = body_text(response).await;
+        assert!(page.contains("\"at-after-retry\""), "{page}");
+        assert_eq!(requests_to(&server, "/token").await, 1);
+
+        // Single use survives the round trip: the flow is spent now.
+        let response = send_as(
+            &router,
+            loopback(),
+            "GET",
+            &format!("/oidc/callback?code=auth-1&state={flow_state}"),
+            "gw.local",
+            None,
+            &[("cookie", &flow_state.cookie)],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(requests_to(&server, "/token").await, 1);
+    }
+
+    #[tokio::test]
+    async fn one_client_cannot_park_the_shared_flow_store() {
+        let server = idp().await;
+        let relay = Arc::new(OidcEnrollmentState::default());
+        let router = routes_with(Arc::clone(&relay)).with_state(crate::api::tests::test_state(
+            config_with_alias(&server.uri(), "corp"),
+        ));
+
+        // One caller starts sign-ins and never finishes them. Its share of
+        // the store is all it gets: the flows live for the whole TTL, and
+        // the request rate that parks them is far below the lockout.
+        for round in 0..PER_CLIENT_FLOW_CAP {
+            let response = send_as(
+                &router,
+                remote(),
+                "GET",
+                "/oidc/login/corp",
+                "gw.local",
+                None,
+                &[],
+            )
+            .await;
+            assert_eq!(
+                response.status(),
+                StatusCode::TEMPORARY_REDIRECT,
+                "login {round}"
+            );
+        }
+        let response = send_as(
+            &router,
+            remote(),
+            "GET",
+            "/oidc/login/corp",
+            "gw.local",
+            None,
+            &[],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(header_value(&response, "retry-after"), "5");
+        assert!(body_text(response).await.contains("in-flight sign-ins"));
+
+        // Everyone else still gets to sign in, which is the point.
+        let response = send_as(
+            &router,
+            other_remote(),
+            "GET",
+            "/oidc/login/corp",
+            "gw.local",
+            None,
+            &[],
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::TEMPORARY_REDIRECT,
+            "another client must not pay for the first one's parked flows"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_flow_store_refusal_is_not_billed_to_the_caller() {
+        let server = idp().await;
+        let relay = Arc::new(OidcEnrollmentState::default());
+        let router = routes_with(Arc::clone(&relay)).with_state(crate::api::tests::test_state(
+            config_with_alias(&server.uri(), "corp"),
+        ));
+
+        // Fill this client's share, then keep asking. The refusals are the
+        // gateway's capacity, not failed authentications, so they cost the
+        // caller nothing: billing them would let a user who retries a busy
+        // surface lock themselves out of enrollment entirely.
+        for _ in 0..PER_CLIENT_FLOW_CAP {
+            assert!(
+                !start_login_as(&router, remote()).await.is_empty(),
+                "a login within the share is served"
+            );
+        }
+        for round in 0..5 {
+            let response = send_as(
+                &router,
+                remote(),
+                "GET",
+                "/oidc/login/corp",
+                "gw.local",
+                None,
+                &[],
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS, "{round}");
+            assert!(
+                body_text(response).await.contains("in-flight sign-ins"),
+                "refusal {round} must be the capacity one, not a lockout"
+            );
+        }
+        assert!(!relay.attempts.is_locked_out(&remote_key()));
+    }
+
+    #[tokio::test]
+    async fn a_restored_flow_keeps_the_deadline_it_started_with() {
+        let server = idp().await;
+        let relay = Arc::new(OidcEnrollmentState::default());
+        let router = routes_with(Arc::clone(&relay)).with_state(crate::api::tests::test_state(
+            config_with_alias(&server.uri(), "corp"),
+        ));
+
+        // A flow that has spent almost all of its TTL, handed back the way
+        // a capacity refusal hands one back. The retry inherits what is
+        // left of the original deadline: stamping a fresh `created` here
+        // would let a caller hold a slot indefinitely by bouncing off the
+        // relay cap once per TTL.
+        let nearly_spent = start_login(&router).await;
+        let pending = relay.flows.consume(&nearly_spent).expect("flow pending");
+        let aged = FLOW_TTL - Duration::from_secs(1);
+        relay.flows.restore(PendingPkce {
+            created: Instant::now() - aged,
+            ..pending
+        });
+        let back = relay.flows.consume(&nearly_spent).expect("still live");
+        assert!(
+            back.created.elapsed() >= aged,
+            "the restore must not restart the TTL"
+        );
+
+        // And a flow whose deadline passed while the callback was in the
+        // handler is dropped rather than revived.
+        let expired = start_login(&router).await;
+        let pending = relay.flows.consume(&expired).expect("flow pending");
+        relay.flows.restore(PendingPkce {
+            created: Instant::now() - FLOW_TTL - Duration::from_secs(1),
+            ..pending
+        });
+        assert!(relay.flows.consume(&expired).is_none());
+    }
+
+    #[tokio::test]
+    async fn enrollment_binding_refuses_other_browsers_before_exchange_and_consumes_the_flow() {
+        let server = idp().await;
+        Mock::given(http_method("POST"))
+            .and(http_path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "synthetic-browser-token", "token_type": "Bearer"
+            })))
+            .mount(&server)
+            .await;
+        let router = router_for(config_with_alias(&server.uri(), "corp"));
+        for case in [
+            "missing",
+            "wrong",
+            "another_flow",
+            "duplicate",
+            "duplicate_headers",
+        ] {
+            let flow = start_login(&router).await;
+            let another = start_login(&router).await;
+            let name = flow.cookie.split_once('=').unwrap().0;
+            let wrong = format!("{name}=not-this-browser");
+            let duplicate = format!("{}; {wrong}", flow.cookie);
+            let headers: Vec<(&str, &str)> = match case {
+                "missing" => vec![],
+                "wrong" => vec![("cookie", &wrong)],
+                "another_flow" => vec![("cookie", &another.cookie)],
+                "duplicate" => vec![("cookie", &duplicate)],
+                "duplicate_headers" => vec![("cookie", &flow.cookie), ("cookie", &wrong)],
+                _ => unreachable!(),
+            };
+            let uri = format!("/oidc/callback?code=auth&state={flow}");
+            let response =
+                send_as(&router, loopback(), "GET", &uri, "gw.local", None, &headers).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{case}");
+            assert!(header_value(&response, "set-cookie").contains("Max-Age=0"));
+            assert!(
+                !body_text(response)
+                    .await
+                    .contains("synthetic-browser-token")
+            );
+            assert_eq!(requests_to(&server, "/token").await, 0, "{case}");
+            let retry = send_as(
+                &router,
+                loopback(),
+                "GET",
+                &uri,
+                "gw.local",
+                None,
+                &[("cookie", &flow.cookie)],
+            )
+            .await;
+            assert_eq!(
+                retry.status(),
+                StatusCode::BAD_REQUEST,
+                "spent flow: {case}"
+            );
+            assert_eq!(requests_to(&server, "/token").await, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn enrollment_binding_keeps_two_tabs_independent_and_clears_only_the_finished_cookie() {
+        let server = idp().await;
+        Mock::given(http_method("POST"))
+            .and(http_path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "synthetic-browser-token", "token_type": "Bearer"
+            })))
+            .mount(&server)
+            .await;
+        let relay = Arc::new(OidcEnrollmentState::default());
+        let router = routes_with(relay.clone()).with_state(crate::api::tests::test_state(
+            config_with_alias(&server.uri(), "corp"),
+        ));
+        let first = start_login(&router).await;
+        let second = start_login(&router).await;
+        assert_ne!(first.cookie, second.cookie);
+        let cookies = format!("{}; {}", first.cookie, second.cookie);
+        for flow in [&first, &second] {
+            let (name, value) = flow.cookie.split_once('=').unwrap();
+            {
+                let flows = relay.flows.flows.lock();
+                let pending = flows.get(&flow.state).unwrap();
+                let FlowMode::Enrollment {
+                    binding_hash: stored_hash,
+                    ..
+                } = &pending.mode
+                else {
+                    panic!("enrollment route stored a dashboard flow");
+                };
+                assert_eq!(*stored_hash, binding_hash(value));
+                assert_ne!(stored_hash, value);
+                assert!(!pending.flow.authorize_url.contains(value));
+            }
+            let response = send_as(
+                &router,
+                loopback(),
+                "GET",
+                &format!("/oidc/callback?code=auth&state={flow}"),
+                "gw.local",
+                None,
+                &[("cookie", &cookies)],
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let cleared = header_value(&response, "set-cookie");
+            assert!(cleared.starts_with(&format!("{name}=;")));
+            assert!(cleared.contains("Max-Age=0"));
+            assert!(
+                body_text(response)
+                    .await
+                    .contains("synthetic-browser-token")
+            );
+        }
+        assert_eq!(requests_to(&server, "/token").await, 2);
+    }
+
+    #[tokio::test]
+    async fn enrollment_binding_refuses_a_foreign_browser_even_when_relay_capacity_is_full() {
+        let server = idp().await;
+        let relay = Arc::new(OidcEnrollmentState::default());
+        let router = routes_with(relay.clone()).with_state(crate::api::tests::test_state(
+            config_with_alias(&server.uri(), "corp"),
+        ));
+        let flow = start_login(&router).await;
+        let _permits = relay
+            .outbound
+            .acquire_many(OUTBOUND_RELAY_CAP as u32)
+            .await
+            .unwrap();
+        let response = send(
+            &router,
+            "GET",
+            &format!("/oidc/callback?code=auth&state={flow}"),
+            "gw.local",
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(relay.flows.consume(&flow.state).is_none());
+        assert_eq!(requests_to(&server, "/token").await, 0);
+    }
+
+    #[tokio::test]
+    async fn enrollment_binding_cookie_scope_covers_https_prefixes_and_plain_http() {
+        let server = idp().await;
+        Mock::given(http_method("POST"))
+            .and(http_path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "synthetic-browser-token", "token_type": "Bearer"
+            })))
+            .mount(&server)
+            .await;
+        for (tls, prefix) in [(false, ""), (true, ""), (true, "/gw")] {
+            let mut config = config_with_alias(&server.uri(), "corp");
+            config.gateway.tls = Some(GatewayTlsConfig {
+                enabled: tls,
+                ..Default::default()
+            });
+            let mut state = crate::api::tests::test_state(config);
+            state.path_prefix = prefix.into();
+            let inner = routes().with_state(state);
+            let router = if prefix.is_empty() {
+                inner
+            } else {
+                Router::new().nest(prefix, inner)
+            };
+            let response = send(
+                &router,
+                "GET",
+                &format!("{prefix}/oidc/login/corp"),
+                "gw.local",
+                None,
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+            let cookie = header_value(&response, "set-cookie");
+            assert_eq!(cookie.starts_with("__Host-"), tls);
+            assert_eq!(cookie.contains("; Secure"), tls);
+            assert!(cookie.contains("; Path=/; HttpOnly; SameSite=Lax; Max-Age=600"));
+            assert!(!cookie.contains("Domain="));
+            assert_no_store("bound login", &response, StatusCode::TEMPORARY_REDIRECT);
+            let flow = browser_flow(&response);
+            let response = send_as(
+                &router,
+                loopback(),
+                "GET",
+                &format!("{prefix}/oidc/callback?error=access_denied&state={flow}"),
+                "gw.local",
+                None,
+                &[("cookie", &flow.cookie)],
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let cleared = header_value(&response, "set-cookie");
+            assert_eq!(cleared.starts_with("__Host-"), tls);
+            assert!(cleared.contains("Max-Age=0"));
+            if tls {
+                let response = send(
+                    &router,
+                    "GET",
+                    &format!("{prefix}/oidc/login/corp"),
+                    "gw.local",
+                    None,
+                )
+                .await;
+                let flow = browser_flow(&response);
+                let unprefixed = flow.cookie.strip_prefix("__Host-").unwrap();
+                let response = send_as(
+                    &router,
+                    loopback(),
+                    "GET",
+                    &format!("{prefix}/oidc/callback?code=auth&state={flow}"),
+                    "gw.local",
+                    None,
+                    &[("cookie", unprefixed)],
+                )
+                .await;
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+                assert_eq!(requests_to(&server, "/token").await, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn a_dashboard_return_path_stays_on_this_dashboard() {
+        for (raw, landing) in [
+            (Some("/chat"), "/chat"),
+            (
+                Some("/sessions/abc?tab=history"),
+                "/sessions/abc?tab=history",
+            ),
+            (None, "/"),
+            (Some(""), "/"),
+            (Some("chat"), "/"),
+            (Some("//evil.example"), "/"),
+            (Some("https://evil.example"), "/"),
+            (Some("/\\evil.example"), "/"),
+            (Some("/a b"), "/"),
+            (Some("/a\r\nSet-Cookie: x=y"), "/"),
+            (Some("/\u{e9}"), "/"),
+            // Dot segments, which the browser resolves away: they could land
+            // outside the path prefix or on a `//host`-looking path.
+            (Some("/.//evil.example"), "/"),
+            (Some("/a/..//evil.example"), "/"),
+            (Some("/%2e//evil.example"), "/"),
+            (Some("/../x"), "/"),
+            (Some("/%2E%2e/x"), "/"),
+            (Some("/chat/."), "/"),
+            (Some("/a.b/c..d"), "/a.b/c..d"),
+            (Some("/chat?next=../x"), "/chat?next=../x"),
+        ] {
+            assert_eq!(safe_return_path(raw), landing, "{raw:?}");
+        }
+        let long = format!("/{}", "a".repeat(MAX_RETURN_PATH_BYTES));
+        assert_eq!(safe_return_path(Some(&long)), "/");
+    }
+
+    #[test]
+    fn plain_http_sign_in_is_for_the_machine_the_gateway_runs_on() {
+        let with_host = |host: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::HOST, HeaderValue::from_str(host).unwrap());
+            headers
+        };
+        for host in [
+            "localhost:42617",
+            "LOCALHOST",
+            "127.0.0.1:42617",
+            "[::1]:42617",
+        ] {
+            assert!(is_loopback_request(loopback(), &with_host(host)), "{host}");
+        }
+        assert!(!is_loopback_request(
+            loopback(),
+            &with_host("zc.example.com")
+        ));
+        assert!(!is_loopback_request(
+            loopback(),
+            &with_host("192.168.1.5:42617")
+        ));
+        // A loopback name from a remote peer is not the local machine.
+        assert!(!is_loopback_request(
+            remote(),
+            &with_host("localhost:42617")
+        ));
+        assert!(!is_loopback_request(loopback(), &HeaderMap::new()));
+        // A Host that only starts like a loopback name names another site.
+        for host in [
+            "localhost:1@evil.example",
+            "127.0.0.1:1@evil.example",
+            "localhost/evil.example",
+            "[::1]@evil.example",
+        ] {
+            assert!(!is_loopback_request(loopback(), &with_host(host)), "{host}");
+        }
+    }
+
+    #[test]
+    fn only_a_plain_authority_counts_as_a_host() {
+        for host in [
+            "zc.example.com",
+            "zc.example.com:8443",
+            "ZC.Example.com",
+            "localhost",
+            "127.0.0.1:42617",
+            "[::1]",
+            "[::1]:42617",
+            "my_gateway:42617",
+        ] {
+            assert!(is_authority(host), "{host}");
+        }
+        for host in [
+            "",
+            "zc.example.com@evil.example",
+            "localhost:1@evil.example",
+            "user@zc.example.com",
+            "zc.example.com/evil",
+            "zc.example.com?x",
+            "zc.example.com#x",
+            "zc.example.com:",
+            "zc.example.com:80x",
+            "zc.example.com:99999",
+            ":42617",
+            "zc..example.com",
+            "zc example.com",
+            "[::1",
+            "[evil.example]:80",
+            "[::1]x",
+            "zc.example.com:80:81",
+        ] {
+            assert!(!is_authority(host), "{host:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_login_whose_host_is_not_a_plain_authority_is_refused() {
+        let server = idp().await;
+        let router = router_for(config_with_alias(&server.uri(), "corp"));
+        for host in [
+            "gw.local@evil.example",
+            "localhost:1@evil.example",
+            "gw.local/evil.example",
+            "gw.local:80x",
+        ] {
+            let response = send_as(
+                &router,
+                loopback(),
+                "GET",
+                "/oidc/login/corp",
+                host,
+                None,
+                &[],
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{host}");
+            assert!(header_value(&response, "location").is_empty(), "{host}");
+        }
+        assert_eq!(
+            total_requests(&server).await,
+            0,
+            "nothing reached the identity provider"
+        );
+    }
+    #[tokio::test]
+    async fn device_proxy_relays_s256_without_returning_the_verifier() {
+        let server = idp().await;
+        Mock::given(http_method("POST")).and(http_path("/device"))
+            .and(body_string_contains("code_challenge_method=S256"))
+            .and(body_string_contains("code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"device_code":"dev-s256","user_code":"ABCD","verification_uri":"https://idp.example/activate","expires_in":600})))
+            .expect(1).mount(&server).await;
+        Mock::given(http_method("POST"))
+            .and(http_path("/token"))
+            .and(body_string_contains(
+                "code_verifier=dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"access_token":"synthetic-token","token_type":"Bearer"}),
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let router = router_for(config_with_alias(&server.uri(), "corp"));
+        let response = send(
+            &router,
+            "POST",
+            "/api/oidc/corp/device/start",
+            "gw.local",
+            Some(
+                serde_json::json!({"code_challenge":"E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"}),
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_text(response).await;
+        assert!(!body.contains("code_verifier"));
+        let response = send(&router,"POST","/api/oidc/corp/device/poll","gw.local",Some(serde_json::json!({"device_code":"dev-s256","code_verifier":"dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"}))).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(body_text(response).await.contains("synthetic-token"));
+    }
+}

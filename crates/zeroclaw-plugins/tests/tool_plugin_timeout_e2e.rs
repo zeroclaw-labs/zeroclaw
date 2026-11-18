@@ -2,12 +2,16 @@
 
 #![cfg(feature = "plugins-wasm-cranelift")]
 
+#[path = "support/state.rs"]
+mod state_support;
+
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
+use state_support::state_service;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
@@ -120,9 +124,10 @@ async fn plugin_with_fuel(call_timeout: Duration, call_fuel: u64) -> Fixture {
     // the guest expects.
     let services = {
         let manifest = manifest.clone();
-        PluginHostServices::new(PluginConfigResolver::new(move |scope| {
-            resolve_plugin_config(&manifest, scope, None)
-        }))
+        PluginHostServices::new(
+            PluginConfigResolver::new(move |scope| resolve_plugin_config(&manifest, scope, None)),
+            state_service(),
+        )
     };
     let plugin = runtime::create_plugin_with_egress(
         path,

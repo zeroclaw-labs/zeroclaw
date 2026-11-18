@@ -168,8 +168,14 @@ async fn serve_stub_conn(
         return;
     }
 
+    // A CONFORMING nonce: the daemon refuses to sign a challenge of any other
+    // size, because the registration key also signs its relay-claim ownership
+    // proof (see `REGISTRATION_NONCE_LEN`). This stub previously sent 27 bytes,
+    // which a real relay never does.
+    let mut nonce = [0u8; zeroclaw_relay_proto::REGISTRATION_NONCE_LEN];
+    nonce[..b"relay-bridge-liveness-nonce".len()].copy_from_slice(b"relay-bridge-liveness-nonce");
     let challenge = Control::Challenge {
-        nonce: B64.encode(b"relay-bridge-liveness-nonce"),
+        nonce: B64.encode(nonce),
     };
     if ws.send(Message::text(challenge.to_json())).await.is_err() {
         return;
@@ -298,6 +304,7 @@ where
     let open_wedged = Control::Open {
         conn_id: WEDGED_CONN,
         peer_hint: None,
+        client_addr: None,
     };
     if ws.send(Message::text(open_wedged.to_json())).await.is_err() {
         return;
@@ -324,6 +331,7 @@ where
         let open = Control::Open {
             conn_id: 100 + offset,
             peer_hint: None,
+            client_addr: None,
         };
         if ws.send(Message::text(open.to_json())).await.is_err() {
             return;
@@ -413,6 +421,7 @@ where
     let open_sibling = Control::Open {
         conn_id: SIBLING_CONN,
         peer_hint: Some(PEER_HINT_ENROLL.to_string()),
+        client_addr: None,
     };
     ws.send(Message::text(open_sibling.to_json()))
         .await
@@ -538,6 +547,7 @@ fn bridge_config(
         data_dir: data_dir.to_path_buf(),
         node_id_rotation_days: 0,
         rotation_allowed: false,
+        dashboard: None,
     }
 }
 

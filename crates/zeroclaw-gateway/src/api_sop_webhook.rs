@@ -12,7 +12,7 @@ use super::{
     require_sop_dispatch_credentials,
 };
 use zeroclaw_runtime::sop::dispatch::{DispatchResult, dispatch_untrusted_fan_in};
-use zeroclaw_runtime::sop::{SopEvent, SopTriggerSource};
+use zeroclaw_runtime::sop::{SopEvent, SopRunAction, SopTriggerSource};
 
 pub(super) enum SopWebhookOutcome {
     NoMatch,
@@ -77,6 +77,37 @@ pub(super) async fn dispatch_webhook_sop(
         .all(|result| matches!(result, DispatchResult::NoMatch))
     {
         return SopWebhookOutcome::NoMatch;
+    }
+
+    // An agent step has no loop to run it on this path, so drive it headlessly,
+    // like an approved gate or an editor-started run. Deterministic steps are
+    // already executed by dispatch; parked runs are driven when approved. The
+    // driver is admitted into the daemon generation like every other surface,
+    // so a reload drains it; only a standalone gateway with no generation
+    // detaches it.
+    for result in &results {
+        if let DispatchResult::Started { action, .. } = result
+            && matches!(action.as_ref(), SopRunAction::ExecuteStep { .. })
+        {
+            let config = state.config.read().clone();
+            match state.sop_driver_handles.as_ref() {
+                Some(handles) => {
+                    zeroclaw_runtime::sop::spawn_and_register_sop_driver(
+                        handles,
+                        config,
+                        std::sync::Arc::clone(engine),
+                        Some(std::sync::Arc::clone(audit)),
+                        action.as_ref().clone(),
+                    );
+                }
+                None => drop(zeroclaw_runtime::sop::spawn_headless_run_driver(
+                    config,
+                    std::sync::Arc::clone(engine),
+                    Some(std::sync::Arc::clone(audit)),
+                    action.as_ref().clone(),
+                )),
+            }
+        }
     }
 
     let blocked_only = results.iter().all(|result| {

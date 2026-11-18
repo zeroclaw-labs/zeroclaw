@@ -19,7 +19,7 @@ The control loop that delivers this is layered on purpose:
 - **Risk-based review depth**: high-risk consequences and security boundaries get deep review, while low-risk work stays fast.
 - **Rollback-first merge contract**: every merge path includes a concrete recovery story.
 
-Automation handles path/scope labels, manual issue-dashboard planning reports, and CI gating. Risk, size, type, and contributor-tier labels are maintainer intake decisions unless a maintained workflow explicitly owns them. Final merge accountability stays with human maintainers and PR authors. A PR carrying either `risk:high` or `domain:security` requires deep review and defaults to two independent Core Team approvals; automated review does not count as a Core Team approval. The only standing exception is the [expedited second-review lane](#expedited-second-review-lane).
+Automation handles path/scope labels, report-only risk evidence, manual issue-dashboard planning reports, and CI gating. Risk, size, type, and contributor-tier labels are maintainer intake decisions unless a maintained workflow explicitly owns them; Phase 2 risk reporting does not mutate them. Final merge accountability stays with human maintainers and PR authors. A PR carrying either `risk:high` or `domain:security` requires deep review and defaults to two independent Core Team approvals; automated reporting and automated review do not count as Core Team approvals. The only standing exception is the [expedited second-review lane](#expedited-second-review-lane).
 
 ## Expedited second-review lane
 
@@ -62,7 +62,7 @@ Do not mirror native PR review state into manual board lanes. GitHub PR state ow
 
 This keeps the board useful without asking maintainers to update it after every push, review, or CI run.
 
-Size and risk auto-labeling are separate workflow questions. #9345 may recalculate deterministic size labels on PR updates. Its risk classifier remains report-only until maintainers review the evidence and separately enable risk-label mutation. Risk automation must honor `risk:manual` until a maintainer removes that override. The issue-dashboard planner does not apply or recalculate PR risk, size, or type labels.
+Size and risk automation are separate workflow questions. #9345 may recalculate deterministic size labels on PR updates, while `pr-risk-labeler.yml` currently reports proposed risk evidence only. A later mutation phase needs a separate maintainer decision and must honor `risk:manual` until a maintainer removes that override. The issue-dashboard planner does not apply or recalculate PR risk, size, or type labels.
 
 ### Issue routing evidence
 

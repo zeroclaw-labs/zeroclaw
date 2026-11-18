@@ -41,6 +41,18 @@ world tool-plugin {
     import logging;
     /// Read schema-designated secrets for this admitted tool instance.
     import secrets;
+    /// Read and update encrypted durable state for this admitted tool instance.
+    import state;
+    /// Host-mediated TCP, direct TLS, and STARTTLS. Linked only for an
+    /// instance holding the `socket_client` grant; every connection passes the
+    /// instance's egress grant first.
+    @unstable(feature = plugins-wit-v0-sockets)
+    import sockets;
+    /// Host-mediated outbound WebSocket. Linked only for an instance holding
+    /// the `websocket_client` grant; every upgrade passes the instance's
+    /// egress grant first.
+    @unstable(feature = plugins-wit-v0-websocket)
+    import websocket;
     export plugin-info;
     export tool;
 }

@@ -21,6 +21,14 @@ let
         chmod +x $out/bin/zeroclaw
       '';
 
+  # Minimal stand-in for `packages.zeroclaw-web`: only the bundle layout
+  # (`share/zeroclaw-web/index.html`) matters to the module, which references
+  # it via `gateway.web_dist_dir`.
+  stubWebPackage = pkgs.runCommand "zeroclaw-web-eval-stub" { } ''
+    mkdir -p $out/share/zeroclaw-web
+    echo '<html></html>' > $out/share/zeroclaw-web/index.html
+  '';
+
   mkInstance =
     attrs:
     {
@@ -106,4 +114,49 @@ in
       group = "zeroclaw-shared-group";
     };
   };
+
+  # Without an overlay providing `zeroclaw-web`, plain nixpkgs evaluates the
+  # `webUiPackage` default to null (API-only) instead of failing.
+  webUiDefaultsToNullWithoutOverlay =
+    let
+      cfg = evalConfig {
+        only = mkInstance { };
+      };
+    in
+    if cfg.services.zeroclaw.instances.only.webUiPackage == null then
+      true
+    else
+      throw "webUiPackage: expected null default without overlay";
+
+  # An explicit bundle evaluates (exercises the `gateway.web_dist_dir`
+  # default merge through `tomlFormat.generate`).
+  explicitWebUiPackagePasses = assertPasses "explicit web UI package" {
+    web = mkInstance {
+      webUiPackage = stubWebPackage;
+    };
+  };
+
+  # An explicit `settings.gateway.web_dist_dir` wins over the bundle default.
+  explicitWebDistDirPasses = assertPasses "explicit web_dist_dir wins" {
+    web = mkInstance {
+      webUiPackage = stubWebPackage;
+      settings.gateway.web_dist_dir = "/srv/custom-dist";
+    };
+  };
+
+  # A raw `[gateway]` table in `extraConfig` merges with the bundle's
+  # injected `gateway.web_dist_dir` into a single valid table.
+  # Smoke-only: eval passes. Merged content
+  # (`port` + `web_dist_dir` coexist, extraConfig wins) is asserted in
+  # `nix/test.nix`, which can read the built output.
+  gatewayExtraConfigWithBundlePasses = assertPasses "gateway extraConfig with bundle" {
+    web = mkInstance {
+      webUiPackage = stubWebPackage;
+      extraConfig = ''
+        [gateway]
+        port = 42618
+      '';
+    };
+  };
+
 }

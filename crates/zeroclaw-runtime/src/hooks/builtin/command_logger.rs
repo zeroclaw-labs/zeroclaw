@@ -53,7 +53,10 @@ impl HookHandler for CommandLoggerHook {
                 .with_attrs(::serde_json::json!({"hook": "command-logger"})),
             &format!("{}", entry)
         );
-        self.log.lock().unwrap().push(entry);
+        match self.log.lock() {
+            Ok(mut log) => log.push(entry),
+            Err(poisoned) => poisoned.into_inner().push(entry),
+        }
     }
 }
 

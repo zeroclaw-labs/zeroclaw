@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
@@ -14,6 +14,13 @@ pub struct SessionActorQueue {
     max_queue_depth: usize,
     lock_timeout: Duration,
     idle_ttl: Duration,
+    /// Per-session transcript generation. Every gateway write to a session's
+    /// transcript, and its deletion, advances it, so a connection holding
+    /// history can tell that the transcript changed under it even when the
+    /// message count did not. Not subject to idle eviction: dropping an entry
+    /// would let a stale holder match again.
+    generations: std::sync::Mutex<HashMap<String, u64>>,
+    next_generation: AtomicU64,
     #[cfg(test)]
     registration_hook: std::sync::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
@@ -86,9 +93,31 @@ impl SessionActorQueue {
             max_queue_depth,
             lock_timeout: Duration::from_secs(lock_timeout_secs),
             idle_ttl: Duration::from_secs(idle_ttl_secs),
+            generations: std::sync::Mutex::new(HashMap::new()),
+            next_generation: AtomicU64::new(0),
             #[cfg(test)]
             registration_hook: std::sync::Mutex::new(None),
         }
+    }
+
+    /// The session's current transcript generation; `0` until first written
+    /// through [`Self::advance_generation`].
+    pub fn generation(&self, session_id: &str) -> u64 {
+        self.generations
+            .lock()
+            .map(|map| map.get(session_id).copied().unwrap_or(0))
+            .unwrap_or(0)
+    }
+
+    /// Record a write to, or deletion of, a session's transcript and return
+    /// the new generation. Values are unique across the queue, so a
+    /// generation never recurs for a key once superseded.
+    pub fn advance_generation(&self, session_id: &str) -> u64 {
+        let next = self.next_generation.fetch_add(1, Ordering::Relaxed) + 1;
+        if let Ok(mut map) = self.generations.lock() {
+            map.insert(session_id.to_string(), next);
+        }
+        next
     }
 
     /// Acquire exclusive access to a session. Blocks until the session is free
@@ -237,6 +266,17 @@ mod tests {
         let result = queue.acquire("s1").await;
         assert!(matches!(result, Err(SessionQueueError::Timeout { .. })));
         assert!(start.elapsed() >= Duration::from_millis(900));
+    }
+
+    #[test]
+    fn transcript_generation_advances_uniquely_per_session() {
+        let queue = SessionActorQueue::new(8, 30, 600);
+        assert_eq!(queue.generation("gw_a"), 0);
+        let first = queue.advance_generation("gw_a");
+        assert_eq!(queue.generation("gw_a"), first);
+        let second = queue.advance_generation("gw_a");
+        assert!(second > first, "a superseded generation never recurs");
+        assert_eq!(queue.generation("gw_b"), 0, "generations are per session");
     }
 
     #[tokio::test]

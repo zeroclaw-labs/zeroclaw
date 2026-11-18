@@ -1,8 +1,9 @@
 //! Reusable input bar widget with text editing, file attachments,
 //! file explorer, and clipboard paste support.
 
+use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use directories::UserDirs;
 
@@ -27,6 +28,11 @@ use crate::turn_status::TurnStatus;
 /// Maximum number of visible content rows before the input bar scrolls.
 const MAX_INPUT_ROWS: u16 = 5;
 
+const MAX_EDIT_HISTORY: usize = 100;
+
+/// Spaces stay in a typing run; pausing to think starts a fresh undo group.
+const TYPING_GROUP_IDLE: Duration = Duration::from_secs(2);
+
 /// Maximum number of attachment rows visible in the manager before it scrolls.
 const MAX_ATTACHMENT_MANAGER_ROWS: usize = 8;
 
@@ -37,9 +43,11 @@ enum SlashCommandId {
     Attach,
     ListAttachments,
     Detach,
+    ChangeDirectory,
     ClearQueue,
     Browse,
     Help,
+    LoadSession,
     Model,
     ModelProvider,
     RestartSession,
@@ -73,6 +81,11 @@ const LOCAL_COMMANDS: &[LocalCommandDescriptor] = &[
         aliases: &[],
     },
     LocalCommandDescriptor {
+        id: SlashCommandId::ChangeDirectory,
+        name: "change-directory",
+        aliases: &[],
+    },
+    LocalCommandDescriptor {
         id: SlashCommandId::ClearQueue,
         name: "clear-queue",
         aliases: &[],
@@ -80,6 +93,11 @@ const LOCAL_COMMANDS: &[LocalCommandDescriptor] = &[
     LocalCommandDescriptor {
         id: SlashCommandId::Detach,
         name: "detach",
+        aliases: &[],
+    },
+    LocalCommandDescriptor {
+        id: SlashCommandId::LoadSession,
+        name: "load-session",
         aliases: &[],
     },
     LocalCommandDescriptor {
@@ -172,6 +190,11 @@ impl SlashCommandRegistry {
                 // clear-all, so a typo cannot wipe the whole queue.
                 SlashCommand::ClearQueue(Some(argument.parse().unwrap_or(0)))
             }
+            (SlashCommandId::ChangeDirectory, None) => SlashCommand::ChangeDirectory,
+            // The new root is always chosen in the picker, so a path argument
+            // would be a second, conflicting source of truth. Reject it as a
+            // non-command instead of silently ignoring the text the user typed.
+            (SlashCommandId::ChangeDirectory, Some(_)) => SlashCommand::NotACommand,
             (SlashCommandId::RestartSession, None) => SlashCommand::RestartSession,
             (SlashCommandId::ToggleThinking, None) => SlashCommand::ToggleThinking,
             (SlashCommandId::Browse, None) => SlashCommand::EnterBrowseMode,
@@ -180,9 +203,17 @@ impl SlashCommandRegistry {
             (SlashCommandId::ModelProvider, Some(name)) => SlashCommand::ModelProvider(name),
             (SlashCommandId::Model, None | Some("")) => SlashCommand::ModelPicker,
             (SlashCommandId::Model, Some(name)) => SlashCommand::Model(name),
+            (SlashCommandId::LoadSession, None | Some("")) => SlashCommand::LoadSessionPicker,
+            (SlashCommandId::LoadSession, Some(query)) => SlashCommand::LoadSession(query),
             _ => SlashCommand::NotACommand,
         }
     }
+}
+
+/// Commands whose completion fills `"<command> "` and waits for an argument
+/// instead of submitting.
+fn command_takes_argument(choice: &str) -> bool {
+    matches!(choice, "/model" | "/model-provider" | "/load-session")
 }
 
 fn shared_command_id(id: &str) -> Option<SlashCommandId> {
@@ -217,6 +248,14 @@ pub(crate) enum InputBarAction {
     /// User typed `/restart-session`, `/new-session`, or `/new` — parent should close
     /// the current session and open a fresh one for the same agent/workspace.
     RestartSession,
+    /// User typed `/change-directory` — parent should open a directory picker
+    /// and start a new session in the selected directory. Takes no argument:
+    /// the root is always chosen interactively.
+    ChangeDirectory,
+    /// `/load-session` with no argument — open the pane's session picker.
+    OpenSessionPicker,
+    /// `/load-session <query>` — resolve and resume a saved session.
+    LoadSession(String),
     /// User typed `/clear-queue [N]`. The input bar doesn't own the queue, so
     /// it hands removal up to the parent. None = clear all; Some(N) = the
     /// 1-based queue position (Some(0) is an invalid-index sentinel).
@@ -265,8 +304,14 @@ enum SlashCommand<'a> {
     /// `/model-provider` (no arg) — open the two-stage model_provider picker.
     ModelProviderPicker,
     RestartSession,
+    /// `/change-directory` — open the directory picker for a new session.
+    ChangeDirectory,
     EnterBrowseMode,
     OpenHelp,
+    /// `/load-session <query>` — resume a saved session by name or id.
+    LoadSession(&'a str),
+    /// `/load-session` (no arg) — open the session picker.
+    LoadSessionPicker,
     NotACommand,
 }
 
@@ -661,6 +706,16 @@ fn attachment_manager_key_labels() -> (Vec<String>, Vec<String>, Vec<String>) {
 
 // ── State ────────────────────────────────────────────────────────
 
+/// Historical text only: attachments and their temporary files keep their
+/// existing owner and are never restored by undo.
+#[derive(Debug)]
+struct EditSnapshot {
+    input: String,
+    cursor: usize,
+    selection: Option<(usize, usize)>,
+    selection_anchor: Option<usize>,
+}
+
 /// Input bar state. Each pane (Chat, ACP) owns its own instance.
 #[derive(Debug)]
 pub(crate) struct InputBarState {
@@ -669,6 +724,10 @@ pub(crate) struct InputBarState {
     /// Byte offset of the editing cursor within `input`.
     /// Kept on a grapheme boundary after each completed edit operation.
     cursor: usize,
+    undo: VecDeque<EditSnapshot>,
+    redo: Vec<EditSnapshot>,
+    /// Only consecutive typing may extend the latest undo transaction.
+    last_typing_at: Option<Instant>,
     pending_attachments: Vec<PendingAttachment>,
     attachment_manager: Option<AttachmentManagerState>,
     /// Latest composer and modal list geometry for mouse hit-testing.
@@ -685,6 +744,12 @@ pub(crate) struct InputBarState {
     last_input_area: Rect,
     /// Cached inner width from the most recent render.
     last_inner_width: u16,
+    /// Rect of the autocomplete popup from the most recent render, for
+    /// mouse hit-testing. `None` when the popup was not drawn.
+    last_autocomplete_area: Option<Rect>,
+    /// Index of the first match drawn in the popup. The popup can be shorter
+    /// than the match list; render scrolls this to keep the highlight visible.
+    autocomplete_scroll: usize,
 
     // Phase 4: Text selection
     /// Text selection range as byte offsets (start, end) where start <= end.
@@ -741,6 +806,9 @@ impl InputBarState {
             command_registry: SlashCommandRegistry::new(shared),
             input: String::new(),
             cursor: 0,
+            undo: VecDeque::new(),
+            redo: Vec::new(),
+            last_typing_at: None,
             pending_attachments: Vec::new(),
             attachment_manager: None,
             last_attachment_area: None,
@@ -751,6 +819,8 @@ impl InputBarState {
             scroll_offset: 0,
             last_input_area: Rect::default(),
             last_inner_width: 0,
+            last_autocomplete_area: None,
+            autocomplete_scroll: 0,
             selection: None,
             selection_anchor: None,
             autocomplete_matches: Vec::new(),
@@ -833,7 +903,77 @@ impl InputBarState {
 
     // ── Selection helpers ────────────────────────────────────
 
+    pub(crate) fn has_selection(&self) -> bool {
+        self.selection.is_some_and(|(start, end)| start < end)
+    }
+
+    /// Purely local clipboard output; safe without a daemon connection.
+    pub(crate) fn copy_selection(&self) -> bool {
+        if let Some((start, end)) = self.selection.filter(|(start, end)| start < end) {
+            mouse::copy_osc52(&self.input[start..end]);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Resolve ownership through the same configured action table as dispatch.
+    pub(crate) fn claims_edit_key(&self, key: &KeyEvent) -> bool {
+        use crate::keymap::InputBarAction as A;
+        match A::from_chord(key) {
+            Some(A::CopySelection | A::Cut) => self.has_selection(),
+            Some(A::HistoryPrev | A::HistoryNext) => !self.input.is_empty(),
+            // Tab and Esc are completion keys while the popup is open. Esc is
+            // also a chat browse chord, and non-character chords otherwise
+            // bypass the composer.
+            Some(A::AutocompleteAccept | A::AutocompleteCancel) => self.autocomplete_active,
+            Some(
+                A::Undo
+                | A::Redo
+                | A::SelectAll
+                | A::SelectLeft
+                | A::SelectRight
+                | A::SelectUp
+                | A::SelectDown
+                | A::SelectStart
+                | A::SelectEnd
+                | A::SelectWordLeft
+                | A::SelectWordRight
+                | A::DeleteNextWord,
+            ) => true,
+            _ => false,
+        }
+    }
+
+    fn select_to(&mut self, cursor: usize) {
+        self.last_typing_at = None;
+        let anchor = *self.selection_anchor.get_or_insert(self.cursor);
+        self.cursor = cursor;
+        self.selection = (anchor != cursor).then_some((anchor.min(cursor), anchor.max(cursor)));
+    }
+
+    fn select_vertical(&mut self, delta: i32) {
+        self.last_typing_at = None;
+        let width = self.last_inner_width;
+        if width > 0 {
+            let (row, col) = cursor_to_visual(&self.input, self.cursor, width);
+            let last = wrapped_line_count(&self.input, width).saturating_sub(1);
+            let row = (i32::from(row) + delta).clamp(0, i32::from(last)) as u16;
+            self.select_to(visual_to_cursor(&self.input, row, col, width));
+        }
+    }
+
+    fn line_edge(&self, end: bool) -> usize {
+        let width = self.last_inner_width;
+        if width == 0 {
+            return if end { self.input.len() } else { 0 };
+        }
+        let (row, _) = cursor_to_visual(&self.input, self.cursor, width);
+        visual_to_cursor(&self.input, row, if end { width } else { 0 }, width)
+    }
+
     fn clear_selection(&mut self) {
+        self.last_typing_at = None;
         self.selection = None;
         self.selection_anchor = None;
     }
@@ -949,34 +1089,92 @@ impl InputBarState {
         self.provider_catalog = providers;
     }
 
+    /// Popup state for tests outside this module: (entry count, highlighted
+    /// index, open).
+    #[cfg(test)]
+    pub(crate) fn autocomplete_snapshot(&self) -> (usize, Option<usize>, bool) {
+        (
+            self.autocomplete_matches.len(),
+            self.autocomplete_index,
+            self.autocomplete_active,
+        )
+    }
+
     fn dismiss_autocomplete(&mut self) {
+        self.autocomplete_scroll = 0;
         self.autocomplete_active = false;
         self.autocomplete_matches.clear();
         self.autocomplete_index = None;
     }
 
     /// Apply a chosen popup entry to the input. A command choice replaces the
-    /// whole line (and, for the model commands, appends a space so argument
-    /// autocomplete kicks in immediately). An argument choice rewrites only the
-    /// value after the command prefix.
+    /// whole line (and, for commands that take an argument, appends a space so
+    /// argument autocomplete, where the command has any, kicks in immediately).
+    /// An argument choice rewrites only the value after the command prefix.
     fn apply_autocomplete_choice(&mut self, choice: &str) {
-        match self.autocomplete_target {
-            AutocompleteTarget::Command => {
-                let takes_arg = choice == "/model" || choice == "/model-provider";
-                self.input = if takes_arg {
-                    format!("{choice} ")
-                } else {
-                    choice.to_string()
-                };
+        self.edit(|state| {
+            match state.autocomplete_target {
+                AutocompleteTarget::Command => {
+                    let takes_arg = command_takes_argument(choice);
+                    state.input = if takes_arg {
+                        format!("{choice} ")
+                    } else {
+                        choice.to_string()
+                    };
+                }
+                AutocompleteTarget::ModelArg => {
+                    state.input = format!("/model {choice}");
+                }
+                AutocompleteTarget::ModelProviderArg => {
+                    state.input = format!("/model-provider {choice}");
+                }
             }
-            AutocompleteTarget::ModelArg => {
-                self.input = format!("/model {choice}");
-            }
-            AutocompleteTarget::ModelProviderArg => {
-                self.input = format!("/model-provider {choice}");
-            }
+            state.cursor = state.input.len();
+        });
+    }
+
+    /// Mouse over the completion popup: a left click on a row fills the
+    /// input with that entry (like Tab), the wheel moves the highlight, and
+    /// anything else inside the popup is swallowed so it can't reach the
+    /// transcript underneath. Returns false when the event is outside it.
+    fn handle_autocomplete_mouse(&mut self, mouse: MouseEvent) -> bool {
+        if !self.autocomplete_active {
+            return false;
         }
-        self.cursor = self.input.len();
+        let Some(area) = self.last_autocomplete_area else {
+            return false;
+        };
+        if !mouse::in_rect(mouse.column, mouse.row, area) {
+            return false;
+        }
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                // Row 0 and the last row are the borders.
+                let inner_top = area.y + 1;
+                let inner_bottom = area.y + area.height.saturating_sub(1);
+                if mouse.row >= inner_top && mouse.row < inner_bottom {
+                    let index = self.autocomplete_scroll + usize::from(mouse.row - inner_top);
+                    if let Some(choice) = self.autocomplete_matches.get(index).cloned() {
+                        self.autocomplete_index = Some(index);
+                        self.apply_autocomplete_choice(&choice);
+                        self.dismiss_autocomplete();
+                    }
+                }
+            }
+            MouseEventKind::ScrollUp => {
+                if let Some(idx) = self.autocomplete_index {
+                    self.autocomplete_index = Some(idx.saturating_sub(1));
+                }
+            }
+            MouseEventKind::ScrollDown => {
+                if let Some(idx) = self.autocomplete_index {
+                    let max = self.autocomplete_matches.len().saturating_sub(1);
+                    self.autocomplete_index = Some((idx + 1).min(max));
+                }
+            }
+            _ => {}
+        }
+        true
     }
 
     fn accept_completion_on_submit(&mut self) -> InputBarAction {
@@ -989,8 +1187,7 @@ impl InputBarState {
         let target = self.autocomplete_target;
         self.apply_autocomplete_choice(&choice);
         self.dismiss_autocomplete();
-        let fills_only = target == AutocompleteTarget::Command
-            && (choice == "/model" || choice == "/model-provider");
+        let fills_only = target == AutocompleteTarget::Command && command_takes_argument(&choice);
         if fills_only {
             return InputBarAction::Consumed;
         }
@@ -999,32 +1196,110 @@ impl InputBarState {
 
     // ── Text editing ─────────────────────────────────────────
 
+    fn snapshot(&self) -> EditSnapshot {
+        EditSnapshot {
+            input: self.input.clone(),
+            cursor: self.cursor,
+            selection: self.selection,
+            selection_anchor: self.selection_anchor,
+        }
+    }
+
+    /// Every semantic text mutation enters here, including non-key callers.
+    /// A replacement's deletion and insertion are one undo transaction.
+    fn edit(&mut self, change: impl FnOnce(&mut Self)) {
+        self.edit_grouped(false, change);
+    }
+
+    fn edit_grouped(&mut self, extend_typing: bool, change: impl FnOnce(&mut Self)) -> bool {
+        // Only a plain character insertion can extend typing. It always changes
+        // text, and the group's initial snapshot already owns its undo point.
+        let before = (!extend_typing).then(|| self.snapshot());
+        let replaced_selection = self.has_selection();
+        change(self);
+        self.cursor = crate::text_navigation::normalize_grapheme_cursor(&self.input, self.cursor);
+        self.clear_selection();
+        self.update_autocomplete();
+        let changed = before
+            .as_ref()
+            .is_none_or(|before| before.input != self.input);
+        if changed || replaced_selection {
+            self.redo.clear();
+        }
+        if changed && let Some(before) = before {
+            self.undo.push_back(before);
+            if self.undo.len() > MAX_EDIT_HISTORY {
+                self.undo.pop_front();
+            }
+        }
+        changed
+    }
+
+    fn restore(&mut self, snapshot: EditSnapshot) {
+        self.input = snapshot.input;
+        self.cursor = snapshot.cursor;
+        self.selection = snapshot.selection;
+        self.selection_anchor = snapshot.selection_anchor;
+        self.scroll_offset = 0;
+        self.update_autocomplete();
+    }
+
+    fn undo(&mut self) {
+        self.last_typing_at = None;
+        if let Some(previous) = self.undo.pop_back() {
+            self.redo.push(self.snapshot());
+            self.restore(previous);
+        }
+    }
+
+    fn redo(&mut self) {
+        self.last_typing_at = None;
+        if let Some(next) = self.redo.pop() {
+            self.undo.push_back(self.snapshot());
+            self.restore(next);
+        }
+    }
+
+    fn reset_edit_history(&mut self) {
+        self.last_typing_at = None;
+        self.undo.clear();
+        self.redo.clear();
+    }
+
     /// Insert `c` at the cursor position and advance the cursor.
     pub fn push_input_char(&mut self, c: char) {
-        self.delete_selection();
-        self.input.insert(self.cursor, c);
-        self.cursor += c.len_utf8();
-        self.cursor = crate::text_navigation::normalize_grapheme_cursor(&self.input, self.cursor);
-        self.update_autocomplete();
+        let now = Instant::now();
+        let typing = c != '\n';
+        let extend_typing = typing
+            && !self.has_selection()
+            && self
+                .last_typing_at
+                .is_some_and(|previous| now.duration_since(previous) < TYPING_GROUP_IDLE);
+        let changed = self.edit_grouped(extend_typing, |state| {
+            state.delete_selection();
+            state.input.insert(state.cursor, c);
+            state.cursor += c.len_utf8();
+        });
+        // No-op replacement must not make later typing reuse an older entry.
+        if typing && changed {
+            self.last_typing_at = Some(now);
+        }
     }
 
     /// Delete the grapheme cluster immediately before the cursor (backspace).
     pub fn pop_input_char(&mut self) {
-        if self.selection.is_some() {
-            self.delete_selection();
-            self.cursor =
-                crate::text_navigation::normalize_grapheme_cursor(&self.input, self.cursor);
-            self.update_autocomplete();
+        self.last_typing_at = None;
+        if self.cursor == 0 && !self.has_selection() {
             return;
         }
-        if self.cursor > 0 {
-            let prev_start =
-                crate::text_navigation::previous_grapheme_boundary(&self.input, self.cursor);
-            self.input.replace_range(prev_start..self.cursor, "");
-            self.cursor =
-                crate::text_navigation::normalize_grapheme_cursor(&self.input, prev_start);
-            self.update_autocomplete();
-        }
+        self.edit(|state| {
+            if state.delete_selection().is_none() && state.cursor > 0 {
+                let prev_start =
+                    crate::text_navigation::previous_grapheme_boundary(&state.input, state.cursor);
+                state.input.replace_range(prev_start..state.cursor, "");
+                state.cursor = prev_start;
+            }
+        });
     }
 
     /// Delete the grapheme cluster immediately after the cursor (forward
@@ -1032,37 +1307,45 @@ impl InputBarState {
     /// input there is nothing after the cursor, so it is a no-op rather than a
     /// cursor move.
     pub fn delete_next_char(&mut self) {
-        if self.selection.is_some() {
-            self.delete_selection();
-            self.cursor =
-                crate::text_navigation::normalize_grapheme_cursor(&self.input, self.cursor);
-            self.update_autocomplete();
+        self.last_typing_at = None;
+        if self.cursor == self.input.len() && !self.has_selection() {
             return;
         }
-        if self.cursor < self.input.len() {
-            let next_end = crate::text_navigation::next_grapheme_boundary(&self.input, self.cursor);
-            self.input.replace_range(self.cursor..next_end, "");
-            self.cursor =
-                crate::text_navigation::normalize_grapheme_cursor(&self.input, self.cursor);
-            self.update_autocomplete();
-        }
+        self.edit(|state| {
+            if state.delete_selection().is_none() && state.cursor < state.input.len() {
+                let next_end =
+                    crate::text_navigation::next_grapheme_boundary(&state.input, state.cursor);
+                state.input.replace_range(state.cursor..next_end, "");
+            }
+        });
     }
 
     pub fn delete_previous_word(&mut self) {
-        if self.selection.is_some() {
-            self.delete_selection();
-            self.cursor =
-                crate::text_navigation::normalize_grapheme_cursor(&self.input, self.cursor);
-            self.update_autocomplete();
+        self.last_typing_at = None;
+        if self.cursor == 0 && !self.has_selection() {
             return;
         }
-        if self.cursor == 0 {
+        self.edit(|state| {
+            if state.delete_selection().is_none() {
+                let start =
+                    crate::text_navigation::previous_word_boundary(&state.input, state.cursor);
+                state.input.replace_range(start..state.cursor, "");
+                state.cursor = start;
+            }
+        });
+    }
+
+    fn delete_next_word(&mut self) {
+        self.last_typing_at = None;
+        if self.cursor == self.input.len() && !self.has_selection() {
             return;
         }
-        let delete_from = crate::text_navigation::previous_word_boundary(&self.input, self.cursor);
-        self.input.replace_range(delete_from..self.cursor, "");
-        self.cursor = crate::text_navigation::normalize_grapheme_cursor(&self.input, delete_from);
-        self.update_autocomplete();
+        self.edit(|state| {
+            if state.delete_selection().is_none() {
+                let end = crate::text_navigation::next_word_boundary(&state.input, state.cursor);
+                state.input.replace_range(state.cursor..end, "");
+            }
+        });
     }
 
     pub fn move_cursor_left(&mut self) {
@@ -1118,6 +1401,7 @@ impl InputBarState {
 
     /// Extract the input text and reset the cursor.
     pub fn take_input(&mut self) -> String {
+        self.reset_edit_history();
         self.cursor = 0;
         self.scroll_offset = 0;
         self.clear_selection();
@@ -1127,11 +1411,29 @@ impl InputBarState {
 
     /// Insert a string at the cursor position (bulk paste).
     pub fn insert_text(&mut self, text: &str) {
-        self.delete_selection();
-        self.input.insert_str(self.cursor, text);
-        self.cursor += text.len();
-        self.cursor = crate::text_navigation::normalize_grapheme_cursor(&self.input, self.cursor);
-        self.update_autocomplete();
+        self.edit(|state| {
+            state.delete_selection();
+            state.input.insert_str(state.cursor, text);
+            state.cursor += text.len();
+        });
+    }
+
+    /// Append text to the composer without replacing or inserting into the
+    /// user's current draft selection. This is used for transcript context,
+    /// which must preserve the draft and leave the cursor at the end.
+    pub(crate) fn append_text_at_end(&mut self, text: &str) -> bool {
+        if text.is_empty() {
+            return false;
+        }
+        self.edit(|state| {
+            if !state.input.is_empty() {
+                state.input.push_str("\n\n");
+            }
+            state.input.push_str(text);
+            state.cursor = state.input.len();
+        });
+        self.dismiss_autocomplete();
+        true
     }
 
     pub fn claims_pane_navigation(&self, key: &KeyEvent) -> bool {
@@ -1147,6 +1449,7 @@ impl InputBarState {
     }
 
     pub fn load_for_edit(&mut self, text: String, attachments: Vec<PendingAttachment>) {
+        self.reset_edit_history();
         self.input = text;
         self.cursor = self.input.len();
         self.scroll_offset = 0;
@@ -1209,6 +1512,7 @@ impl InputBarState {
 
     /// Reset all input state (called when switching sessions).
     pub fn reset(&mut self) {
+        self.reset_edit_history();
         self.input.clear();
         self.cursor = 0;
         self.scroll_offset = 0;
@@ -1222,14 +1526,14 @@ impl InputBarState {
         self.cleanup_temps();
     }
 
-    /// Clear the typed text without disturbing pending attachments, history,
+    /// Clear text as one undoable edit without disturbing pending attachments
     /// or clipboard temps. Bound to the ClearInput action.
     pub fn clear_input(&mut self) {
-        self.input.clear();
-        self.cursor = 0;
-        self.scroll_offset = 0;
-        self.clear_selection();
-        self.dismiss_autocomplete();
+        self.edit(|state| {
+            state.input.clear();
+            state.cursor = 0;
+            state.scroll_offset = 0;
+        });
     }
 
     /// Remove clipboard temp files (called after turn completes).
@@ -1249,6 +1553,21 @@ impl InputBarState {
 
     /// Process a key event. Returns an action for the parent pane.
     pub fn handle_key(&mut self, key: KeyEvent) -> InputBarAction {
+        use crate::keymap::{GlobalAction, InputBarAction as IbWidgetAction};
+        let action = IbWidgetAction::from_chord(&key);
+
+        // Even a consumed/no-op command ends typing (for example Left at the
+        // start or a completion-popup navigation key).
+        if !matches!(key.code, KeyCode::Char(_))
+            || key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER)
+            || action.is_some()
+            || self.file_explorer.is_some()
+            || self.attachment_manager.is_some()
+        {
+            self.last_typing_at = None;
+        }
         // File explorer overlay intercepts all keys when open.
         if let Some(explorer) = &mut self.file_explorer {
             match explorer.handle_key(key) {
@@ -1289,19 +1608,80 @@ impl InputBarState {
             return self.handle_attachment_manager_key(key);
         }
 
-        use crate::keymap::{GlobalAction, InputBarAction as IbWidgetAction};
-        let action = IbWidgetAction::from_chord(&key);
-
-        if GlobalAction::from_chord(&key) == Some(GlobalAction::Quit) {
-            if let Some((start, end)) = self.selection {
-                let selected = &self.input[start..end];
-                mouse::copy_osc52(selected);
-                return InputBarAction::Consumed;
-            }
+        if GlobalAction::from_chord(&key) == Some(GlobalAction::Quit) && !self.claims_edit_key(&key)
+        {
             return InputBarAction::NotHandled;
         }
 
         match action {
+            Some(IbWidgetAction::Undo) => {
+                self.undo();
+                return InputBarAction::Consumed;
+            }
+            Some(IbWidgetAction::Redo) => {
+                self.redo();
+                return InputBarAction::Consumed;
+            }
+            Some(IbWidgetAction::CopySelection | IbWidgetAction::Cut) => {
+                if self.copy_selection() {
+                    if action == Some(IbWidgetAction::Cut) {
+                        self.edit(|state| {
+                            state.delete_selection();
+                        });
+                    }
+                    return InputBarAction::Consumed;
+                }
+                return InputBarAction::NotHandled;
+            }
+            Some(IbWidgetAction::SelectAll) => {
+                self.selection_anchor = Some(0);
+                self.select_to(self.input.len());
+                return InputBarAction::Consumed;
+            }
+            Some(IbWidgetAction::SelectLeft) => {
+                self.select_to(crate::text_navigation::previous_grapheme_boundary(
+                    &self.input,
+                    self.cursor,
+                ));
+                return InputBarAction::Consumed;
+            }
+            Some(IbWidgetAction::SelectRight) => {
+                self.select_to(crate::text_navigation::next_grapheme_boundary(
+                    &self.input,
+                    self.cursor,
+                ));
+                return InputBarAction::Consumed;
+            }
+            Some(IbWidgetAction::SelectWordLeft) => {
+                self.select_to(crate::text_navigation::previous_word_boundary(
+                    &self.input,
+                    self.cursor,
+                ));
+                return InputBarAction::Consumed;
+            }
+            Some(IbWidgetAction::SelectWordRight) => {
+                self.select_to(crate::text_navigation::next_word_boundary(
+                    &self.input,
+                    self.cursor,
+                ));
+                return InputBarAction::Consumed;
+            }
+            Some(IbWidgetAction::SelectUp | IbWidgetAction::SelectDown) => {
+                self.select_vertical(if action == Some(IbWidgetAction::SelectUp) {
+                    -1
+                } else {
+                    1
+                });
+                return InputBarAction::Consumed;
+            }
+            Some(IbWidgetAction::SelectStart | IbWidgetAction::SelectEnd) => {
+                self.select_to(self.line_edge(action == Some(IbWidgetAction::SelectEnd)));
+                return InputBarAction::Consumed;
+            }
+            Some(IbWidgetAction::DeleteNextWord) => {
+                self.delete_next_word();
+                return InputBarAction::Consumed;
+            }
             Some(IbWidgetAction::Paste) => {
                 return self.handle_clipboard_image();
             }
@@ -1367,22 +1747,13 @@ impl InputBarState {
                 return InputBarAction::Consumed;
             }
             Some(IbWidgetAction::CursorStart) => {
-                let width = self.last_inner_width;
-                if width > 0 {
-                    let (row, _) = cursor_to_visual(&self.input, self.cursor, width);
-                    self.cursor = visual_to_cursor(&self.input, row, 0, width);
-                    self.clear_selection();
-                }
+                self.cursor = self.line_edge(false);
+                self.clear_selection();
                 return InputBarAction::Consumed;
             }
             Some(IbWidgetAction::CursorEnd) => {
-                let width = self.last_inner_width;
-                if width > 0 {
-                    let (row, _) = cursor_to_visual(&self.input, self.cursor, width);
-                    // Move to the end of this visual row by targeting max col.
-                    self.cursor = visual_to_cursor(&self.input, row, width, width);
-                    self.clear_selection();
-                }
+                self.cursor = self.line_edge(true);
+                self.clear_selection();
                 return InputBarAction::Consumed;
             }
             Some(IbWidgetAction::CursorLeft) => {
@@ -1434,6 +1805,7 @@ impl InputBarState {
 
     /// Handle bracketed paste event.
     pub fn handle_paste(&mut self, text: &str) -> InputBarAction {
+        self.last_typing_at = None;
         let trimmed = text.trim();
         if clipboard::looks_like_file_path(trimmed)
             && let Ok(att) = PendingAttachment::from_path(trimmed)
@@ -1452,6 +1824,12 @@ impl InputBarState {
     /// Handle mouse events for the input bar.
     /// Returns `true` if the event was consumed.
     pub fn handle_mouse(&mut self, mouse: MouseEvent) -> bool {
+        if matches!(
+            mouse.kind,
+            MouseEventKind::Down(_) | MouseEventKind::Drag(_)
+        ) {
+            self.last_typing_at = None;
+        }
         // File explorer overlay takes priority.
         if let Some(explorer) = &mut self.file_explorer {
             let action = explorer.handle_mouse(mouse);
@@ -1519,6 +1897,10 @@ impl InputBarState {
             )
         {
             self.remove_attachment(index);
+            return true;
+        }
+
+        if self.handle_autocomplete_mouse(mouse) {
             return true;
         }
 
@@ -1648,6 +2030,9 @@ impl InputBarState {
                 }
                 SlashCommand::ClearQueue(idx) => InputBarAction::ClearQueue(idx),
                 SlashCommand::RestartSession => InputBarAction::RestartSession,
+                SlashCommand::ChangeDirectory => InputBarAction::ChangeDirectory,
+                SlashCommand::LoadSession(query) => InputBarAction::LoadSession(query.to_string()),
+                SlashCommand::LoadSessionPicker => InputBarAction::OpenSessionPicker,
                 SlashCommand::ToggleThinking => InputBarAction::ToggleThinking,
                 SlashCommand::EnterBrowseMode => InputBarAction::EnterBrowseMode,
                 SlashCommand::OpenHelp => InputBarAction::OpenHelp,
@@ -2124,7 +2509,8 @@ impl InputBarState {
     }
 
     /// Render the auto-complete popup above the input bar if active.
-    pub fn render_autocomplete_popup(&self, f: &mut Frame) {
+    pub fn render_autocomplete_popup(&mut self, f: &mut Frame) {
+        self.last_autocomplete_area = None;
         if !self.autocomplete_active || self.autocomplete_matches.is_empty() {
             return;
         }
@@ -2153,11 +2539,27 @@ impl InputBarState {
         }
 
         f.render_widget(Clear, popup_rect);
+        self.last_autocomplete_area = Some(popup_rect);
+
+        // A short terminal clips the popup. Scroll so the highlighted entry
+        // stays in view, and draw only the visible slice.
+        let visible = usize::from(popup_rect.height.saturating_sub(2)).max(1);
+        let max_scroll = self.autocomplete_matches.len().saturating_sub(visible);
+        if let Some(idx) = self.autocomplete_index {
+            if idx < self.autocomplete_scroll {
+                self.autocomplete_scroll = idx;
+            } else if idx >= self.autocomplete_scroll + visible {
+                self.autocomplete_scroll = idx + 1 - visible;
+            }
+        }
+        self.autocomplete_scroll = self.autocomplete_scroll.min(max_scroll);
 
         let items: Vec<ListItem> = self
             .autocomplete_matches
             .iter()
             .enumerate()
+            .skip(self.autocomplete_scroll)
+            .take(visible)
             .map(|(i, cmd)| {
                 let style = if Some(i) == self.autocomplete_index {
                     theme::selected_style()
@@ -2315,6 +2717,322 @@ mod tests {
 
     fn input_bar_with_shared_commands() -> InputBarState {
         InputBarState::with_shared_commands(&shared_commands())
+    }
+
+    #[test]
+    fn replacement_undo_restores_graphemes_cursor_and_selection() {
+        let mut bar = input_bar_with_shared_commands();
+        let original = "a e\u{301}👩‍💻 z";
+        bar.load_for_edit(original.into(), vec![test_attachment("image.png")]);
+        bar.cursor = 2;
+        bar.select_to(original.len() - 2);
+        let selection = bar.selection;
+        let cursor = bar.cursor;
+        bar.handle_paste("replacement");
+        assert_eq!(bar.input(), "a replacement z");
+        bar.undo();
+        assert_eq!(bar.input(), original);
+        assert_eq!(bar.selection, selection);
+        assert_eq!(bar.selection_anchor, Some(2));
+        assert_eq!(bar.cursor, cursor);
+        bar.redo();
+        assert_eq!(bar.input(), "a replacement z");
+        assert_eq!(bar.selection, None);
+        assert_eq!(bar.pending_attachments().len(), 1);
+        bar.undo();
+        bar.clear_input();
+        bar.undo();
+        assert_eq!(bar.input(), original);
+        assert_eq!(bar.pending_attachments().len(), 1);
+    }
+
+    #[test]
+    fn typing_groups_keep_prior_text_and_break_after_idle() {
+        let _guard = crate::keymap::overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::keymap::overrides::reset();
+        let mut bar = input_bar_with_shared_commands();
+        bar.load_for_edit("existing ".into(), Vec::new());
+        for c in "several new words e\u{301}👩‍💻".chars() {
+            bar.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        let typed = bar.input().to_owned();
+        bar.handle_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL));
+        assert_eq!(bar.input(), "existing ");
+        bar.redo();
+        assert_eq!(bar.input(), typed);
+
+        bar.push_input_char('!');
+        bar.last_typing_at = Some(Instant::now() - TYPING_GROUP_IDLE);
+        bar.push_input_char('?');
+        bar.undo();
+        assert_eq!(bar.input(), format!("{typed}!"));
+        bar.undo();
+        assert_eq!(bar.input(), typed, "typing after redo starts a new group");
+    }
+
+    #[test]
+    fn typing_groups_end_on_navigation_and_atomic_edits() {
+        let mut bar = input_bar_with_shared_commands();
+        bar.load_for_edit("original ".into(), Vec::new());
+        for c in "first run".chars() {
+            bar.push_input_char(c);
+        }
+        bar.move_cursor_left();
+        bar.move_cursor_right();
+        for c in " second run".chars() {
+            bar.push_input_char(c);
+        }
+        bar.undo();
+        assert_eq!(bar.input(), "original first run");
+        bar.push_input_char('!');
+        bar.redo();
+        assert_eq!(bar.input(), "original first run!");
+        bar.undo();
+        assert_eq!(bar.input(), "original first run");
+
+        bar.insert_text(" pasted");
+        bar.push_input_char('x');
+        bar.pop_input_char();
+        bar.push_input_char('y');
+        bar.undo();
+        assert_eq!(bar.input(), "original first run pasted");
+        bar.undo();
+        assert_eq!(bar.input(), "original first run pastedx");
+        bar.undo();
+        assert_eq!(bar.input(), "original first run pasted");
+        bar.undo();
+        assert_eq!(bar.input(), "original first run");
+        bar.undo();
+        assert_eq!(bar.input(), "original ");
+    }
+
+    #[test]
+    fn typed_replacement_groups_restore_selection_without_reusing_noop_history() {
+        let mut bar = input_bar_with_shared_commands();
+        bar.load_for_edit("old e\u{301}👩‍💻".into(), Vec::new());
+        bar.select_to(0);
+        let original_selection = bar.selection;
+        for c in "new words".chars() {
+            bar.push_input_char(c);
+        }
+        bar.undo();
+        assert_eq!(bar.input(), "old e\u{301}👩‍💻");
+        assert_eq!(bar.selection, original_selection);
+        bar.redo();
+        assert_eq!(bar.input(), "new words");
+
+        bar.select_to(bar.input.len() - 1);
+        bar.push_input_char('s'); // Same text, but the selection is consumed.
+        bar.push_input_char('!');
+        bar.undo();
+        assert_eq!(
+            bar.input(),
+            "new words",
+            "do not undo the older replacement"
+        );
+        bar.select_to(bar.input.len() - 1);
+        bar.push_input_char('s');
+        bar.redo();
+        assert_eq!(
+            bar.input(),
+            "new words",
+            "same-text replacement discards redo"
+        );
+    }
+
+    #[test]
+    fn mouse_click_at_cursor_ends_typing_group() {
+        let mut bar = input_bar_with_shared_commands();
+        bar.load_for_edit("old ".into(), Vec::new());
+        bar.push_input_char('x');
+        render_input_bar(&mut bar, 40, 12);
+        let area = bar.last_input_area;
+        assert!(bar.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: area.x + 1 + bar.cursor() as u16,
+            row: area.y + 1,
+            modifiers: KeyModifiers::NONE,
+        }));
+        bar.push_input_char('y');
+        bar.undo();
+        assert_eq!(bar.input(), "old x");
+        bar.undo();
+        assert_eq!(bar.input(), "old ");
+    }
+
+    #[test]
+    fn history_is_bounded_and_movement_does_not_invalidate_redo() {
+        let mut bar = input_bar_with_shared_commands();
+        for _ in 0..MAX_EDIT_HISTORY + 1 {
+            bar.insert_text("x");
+        }
+        for _ in 0..MAX_EDIT_HISTORY + 1 {
+            bar.undo();
+        }
+        assert_eq!(bar.input(), "x", "evict only complete oldest edits");
+        bar.move_cursor_left();
+        bar.redo();
+        assert_eq!(bar.input(), "xx");
+        bar.undo();
+        bar.push_input_char('y');
+        let edited = bar.input().to_owned();
+        bar.redo();
+        assert_eq!(
+            bar.input(),
+            edited,
+            "a new edit discards the old redo branch"
+        );
+        assert_eq!(bar.undo.len() + bar.redo.len(), 1);
+    }
+
+    #[test]
+    fn draft_boundaries_do_not_resurrect_previous_text() {
+        let mut bar = input_bar_with_shared_commands();
+        bar.insert_text("submitted");
+        assert_eq!(bar.take_input(), "submitted");
+        bar.undo();
+        assert!(bar.input().is_empty());
+        bar.insert_text("discarded");
+        bar.reset();
+        bar.undo();
+        assert!(bar.input().is_empty());
+        bar.insert_text("previous draft");
+        bar.undo();
+        bar.load_for_edit("queued draft".into(), Vec::new());
+        bar.undo();
+        bar.redo();
+        assert_eq!(bar.input(), "queued draft");
+    }
+
+    #[test]
+    fn completion_is_atomic_but_submitting_completion_resets_history() {
+        let mut bar = input_bar_with_shared_commands();
+        bar.insert_text("/mod");
+        assert!(matches!(
+            bar.accept_completion_on_submit(),
+            InputBarAction::Consumed
+        ));
+        assert_eq!(bar.input(), "/model ");
+        bar.undo();
+        assert_eq!(bar.input(), "/mod");
+        assert!(bar.autocomplete_active);
+        bar.redo();
+        assert_eq!(bar.input(), "/model ");
+        bar.load_for_edit("/hel".into(), Vec::new());
+        bar.update_autocomplete();
+        assert!(matches!(
+            bar.accept_completion_on_submit(),
+            InputBarAction::OpenHelp
+        ));
+        bar.undo();
+        assert!(bar.input().is_empty());
+    }
+
+    #[test]
+    fn keyboard_selection_cut_and_undo_use_resolved_actions() {
+        let _guard = crate::keymap::overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::keymap::overrides::reset();
+        let mut bar = input_bar_with_shared_commands();
+        bar.load_for_edit("e\u{301}👩‍💻".into(), Vec::new());
+        bar.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT));
+        assert_eq!(bar.selection, Some((3, bar.input.len())));
+        bar.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::SHIFT));
+        assert!(!bar.has_selection());
+        bar.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        assert_eq!(bar.selection, Some((0, bar.input.len())));
+        assert!(!bar.has_file_explorer());
+        bar.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL));
+        assert_eq!(bar.input(), "");
+        bar.handle_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL));
+        assert_eq!(bar.input(), "e\u{301}👩‍💻");
+        assert!(bar.has_selection());
+        bar.handle_key(KeyEvent::new(
+            KeyCode::Char('Z'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ));
+        assert_eq!(bar.input(), "");
+        bar.undo();
+        bar.handle_key(KeyEvent::new(
+            KeyCode::Char('z'),
+            crate::keymap::Chord::primary('z').effective_modifiers() | KeyModifiers::SHIFT,
+        ));
+        assert_eq!(
+            bar.input(),
+            "",
+            "enhanced lowercase shifted events also redo"
+        );
+    }
+
+    #[test]
+    fn explicit_input_binding_replaces_selection_default_and_claim() {
+        use crate::keymap::{Chord, InputBarAction as KeymapInputBarAction, overrides};
+
+        let _guard = overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        overrides::reset();
+        let key = KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT);
+        overrides::set_row(
+            KeymapInputBarAction::TAG,
+            "cursor_left",
+            vec![Chord::shift(KeyCode::Left)],
+        );
+        let mut bar = InputBarState::with_shared_commands(&[]);
+        bar.insert_text("draft");
+        assert_eq!(
+            KeymapInputBarAction::from_chord(&key),
+            Some(KeymapInputBarAction::CursorLeft)
+        );
+        assert!(!bar.claims_edit_key(&key));
+
+        overrides::reset();
+        overrides::set_row(KeymapInputBarAction::TAG, "copy_selection", Vec::new());
+        let mut bar = InputBarState::with_shared_commands(&[]);
+        bar.insert_text("draft");
+        bar.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        assert!(bar.has_selection());
+        let copy = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(!bar.claims_edit_key(&copy));
+        assert!(matches!(bar.handle_key(copy), InputBarAction::NotHandled));
+        overrides::reset();
+    }
+
+    #[test]
+    fn keyboard_selection_uses_visual_rows_and_word_boundaries() {
+        let _guard = crate::keymap::overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::keymap::overrides::reset();
+        let mut bar = input_bar_with_shared_commands();
+        bar.load_for_edit("hello world\nnext".into(), Vec::new());
+        bar.last_inner_width = 20;
+        bar.handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::SHIFT));
+        assert_eq!(bar.selection, Some((12, 16)));
+        bar.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT));
+        assert_eq!(bar.selection, Some((0, 16)));
+        bar.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT));
+        assert_eq!(bar.selection, Some((12, 16)));
+        bar.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::SHIFT));
+        assert!(!bar.has_selection());
+        bar.move_cursor_word_left();
+        bar.handle_key(KeyEvent::new(
+            KeyCode::Left,
+            KeyModifiers::ALT | KeyModifiers::SHIFT,
+        ));
+        assert_eq!(
+            &bar.input[bar.selection.unwrap().0..bar.selection.unwrap().1],
+            "world\n"
+        );
+        bar.move_cursor_left();
+        let original = bar.input.clone();
+        bar.handle_key(KeyEvent::new(KeyCode::Delete, KeyModifiers::ALT));
+        assert_ne!(bar.input(), original);
+        bar.undo();
+        assert_eq!(bar.input(), original);
     }
 
     #[test]
@@ -2730,6 +3448,75 @@ mod tests {
     }
 
     #[test]
+    fn append_text_at_end_populates_empty_draft_without_separator() {
+        let mut bar = input_bar_with_shared_commands();
+
+        assert!(bar.append_text_at_end("> selected"));
+        assert_eq!(bar.input(), "> selected");
+        assert_eq!(bar.cursor(), bar.input().len());
+    }
+
+    #[test]
+    fn append_text_at_end_preserves_draft_selection_attachments_and_unicode_cursor() {
+        let mut bar = input_bar_with_shared_commands();
+        bar.insert_text("draft 世界");
+        bar.move_cursor_left();
+        bar.selection = Some((0, "draft".len()));
+        bar.add_attachment(PendingAttachment {
+            path: PathBuf::from("keep.png"),
+            mime_type: "image/png".to_string(),
+            filename: "keep.png".to_string(),
+            size_bytes: 4,
+            source: crate::attachment::AttachmentSource::File,
+        });
+
+        assert!(bar.append_text_at_end("> 引用\n> \n> é"));
+        assert_eq!(bar.input(), "draft 世界\n\n> 引用\n> \n> é");
+        assert_eq!(bar.cursor(), bar.input().len());
+        assert!(bar.selection.is_none());
+        assert_eq!(bar.pending_attachments().len(), 1);
+        assert_eq!(bar.pending_attachments()[0].filename, "keep.png");
+    }
+
+    #[test]
+    fn append_text_at_end_is_separate_from_typing_in_undo_history() {
+        let mut bar = input_bar_with_shared_commands();
+        bar.load_for_edit("saved ".into(), Vec::new());
+        for c in "draft".chars() {
+            bar.push_input_char(c);
+        }
+
+        assert!(bar.append_text_at_end("> selected"));
+        bar.push_input_char('!');
+        bar.undo();
+        assert_eq!(bar.input(), "saved draft\n\n> selected");
+        bar.undo();
+        assert_eq!(bar.input(), "saved draft");
+        bar.redo();
+        assert_eq!(bar.input(), "saved draft\n\n> selected");
+        bar.undo();
+        bar.undo();
+        assert_eq!(bar.input(), "saved ");
+    }
+
+    #[test]
+    fn append_text_at_end_invalidates_stale_redo() {
+        let mut bar = input_bar_with_shared_commands();
+        bar.insert_text("draft");
+        bar.insert_text(" abandoned");
+        bar.undo();
+        assert_eq!(bar.input(), "draft");
+
+        assert!(bar.append_text_at_end("> selected"));
+        bar.redo();
+        assert_eq!(bar.input(), "draft\n\n> selected");
+        bar.undo();
+        assert_eq!(bar.input(), "draft");
+        bar.redo();
+        assert_eq!(bar.input(), "draft\n\n> selected");
+    }
+
+    #[test]
     fn wants_text_input_when_typing() {
         let mut bar = input_bar_with_shared_commands();
         assert!(!bar.wants_text_input());
@@ -3074,6 +3861,14 @@ mod tests {
             SlashCommand::RestartSession
         ));
         assert!(matches!(
+            parse_slash_command("/change-directory"),
+            SlashCommand::ChangeDirectory
+        ));
+        assert!(matches!(
+            parse_slash_command("/change-directory /tmp/project"),
+            SlashCommand::NotACommand
+        ));
+        assert!(matches!(
             parse_slash_command("/toggle-thinking"),
             SlashCommand::ToggleThinking
         ));
@@ -3121,14 +3916,16 @@ mod tests {
     }
 
     #[test]
-    fn derived_slash_command_set_matches_expected_twelve_entries() {
+    fn derived_slash_command_set_matches_expected_entries() {
         let expected: Vec<&str> = vec![
             "/attach",
             "/attachments",
             "/browse",
+            "/change-directory",
             "/clear-queue",
             "/detach",
             "/help",
+            "/load-session",
             "/model",
             "/model-provider",
             "/new",
@@ -3332,6 +4129,69 @@ mod tests {
         // picker or submit.
         assert!(matches!(action, InputBarAction::Consumed));
         assert_eq!(bar.input(), "/model ");
+    }
+
+    #[test]
+    fn parse_load_session_with_and_without_argument() {
+        assert!(matches!(
+            parse_slash_command("/load-session"),
+            SlashCommand::LoadSessionPicker
+        ));
+        assert!(matches!(
+            parse_slash_command("/load-session   "),
+            SlashCommand::LoadSessionPicker
+        ));
+        assert!(matches!(
+            parse_slash_command("/load-session 9f3a"),
+            SlashCommand::LoadSession("9f3a")
+        ));
+        assert!(matches!(
+            parse_slash_command("/load-session   my  session  "),
+            SlashCommand::LoadSession("my  session")
+        ));
+    }
+
+    #[test]
+    fn load_session_submit_maps_to_actions() {
+        let mut bar = input_bar_with_shared_commands();
+        bar.load_for_edit("/load-session release notes".into(), Vec::new());
+        bar.dismiss_autocomplete();
+        let action = bar.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert!(matches!(action, InputBarAction::LoadSession(q) if q == "release notes"));
+
+        bar.load_for_edit("/load-session".into(), Vec::new());
+        bar.dismiss_autocomplete();
+        let action = bar.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert!(matches!(action, InputBarAction::OpenSessionPicker));
+    }
+
+    #[test]
+    fn enter_on_load_session_completion_fills_without_submitting() {
+        let mut bar = input_bar_with_shared_commands();
+        bar.insert_text("/load-s");
+        assert!(bar.autocomplete_active);
+        let action = bar.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert!(matches!(action, InputBarAction::Consumed));
+        assert_eq!(bar.input(), "/load-session ");
+        assert!(
+            !bar.autocomplete_active,
+            "/load-session has no argument completion"
+        );
+    }
+
+    #[test]
+    fn second_enter_after_load_session_completion_opens_the_picker() {
+        let mut bar = input_bar_with_shared_commands();
+        bar.insert_text("/load-s");
+        assert!(matches!(
+            bar.handle_key(KeyEvent::from(KeyCode::Enter)),
+            InputBarAction::Consumed
+        ));
+        assert_eq!(bar.input(), "/load-session ");
+        assert!(matches!(
+            bar.handle_key(KeyEvent::from(KeyCode::Enter)),
+            InputBarAction::OpenSessionPicker
+        ));
     }
 
     #[test]
@@ -3657,6 +4517,182 @@ mod tests {
 
     // ── Auto-complete tests ──────────────────────────────────
 
+    /// Draw the bar in the lower rows of a terminal and the completion popup
+    /// above it, the way the chat pane does.
+    fn render_bar_with_popup(bar: &mut InputBarState) {
+        let backend = TestBackend::new(60, 20);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                let area = Rect::new(0, 16, 60, 4);
+                bar.render(
+                    frame,
+                    area,
+                    false,
+                    false,
+                    &TurnStatus::Idle,
+                    Instant::now(),
+                    None,
+                );
+                bar.render_autocomplete_popup(frame);
+            })
+            .expect("draw input bar");
+    }
+
+    fn left_click(column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn composer_claims_completion_keys_only_while_the_popup_is_open() {
+        let mut bar = input_bar_with_shared_commands();
+        let tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+
+        bar.insert_text("hello");
+        assert!(!bar.autocomplete_active);
+        assert!(!bar.claims_edit_key(&tab));
+        assert!(!bar.claims_edit_key(&esc));
+
+        bar.clear_input();
+        bar.insert_text("/");
+        assert!(bar.autocomplete_active);
+        assert!(bar.claims_edit_key(&tab));
+        assert!(bar.claims_edit_key(&esc));
+    }
+
+    #[test]
+    fn clicking_an_autocomplete_row_fills_that_command() {
+        let mut bar = input_bar_with_shared_commands();
+        bar.insert_text("/");
+        assert!(bar.autocomplete_matches.len() >= 2);
+        let second = bar.autocomplete_matches[1].clone();
+        render_bar_with_popup(&mut bar);
+        let area = bar.last_autocomplete_area.expect("popup rendered");
+
+        // Row 0 is the top border; row 2 is the second entry.
+        assert!(bar.handle_mouse(left_click(area.x + 2, area.y + 2)));
+
+        assert_eq!(bar.input(), second);
+        assert!(!bar.autocomplete_active);
+    }
+
+    #[test]
+    fn clicking_the_autocomplete_border_keeps_the_popup_open() {
+        let mut bar = input_bar_with_shared_commands();
+        bar.insert_text("/");
+        render_bar_with_popup(&mut bar);
+        let area = bar.last_autocomplete_area.expect("popup rendered");
+
+        assert!(bar.handle_mouse(left_click(area.x + 2, area.y)));
+
+        assert_eq!(bar.input(), "/");
+        assert!(bar.autocomplete_active);
+    }
+
+    #[test]
+    fn scrolling_over_autocomplete_moves_the_highlight() {
+        let mut bar = input_bar_with_shared_commands();
+        bar.insert_text("/");
+        render_bar_with_popup(&mut bar);
+        let area = bar.last_autocomplete_area.expect("popup rendered");
+        let scroll = |kind| MouseEvent {
+            kind,
+            column: area.x + 2,
+            row: area.y + 1,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        assert!(bar.handle_mouse(scroll(MouseEventKind::ScrollDown)));
+        assert_eq!(bar.autocomplete_index, Some(1));
+        assert!(bar.handle_mouse(scroll(MouseEventKind::ScrollUp)));
+        assert_eq!(bar.autocomplete_index, Some(0));
+    }
+
+    /// Draw the bar at the bottom of a short terminal, so the popup is
+    /// clipped to fewer rows than there are matches, and return the buffer.
+    fn render_short_popup(bar: &mut InputBarState) -> ratatui::buffer::Buffer {
+        let backend = TestBackend::new(60, 8);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                bar.render(
+                    frame,
+                    Rect::new(0, 4, 60, 4),
+                    false,
+                    false,
+                    &TurnStatus::Idle,
+                    Instant::now(),
+                    None,
+                );
+                bar.render_autocomplete_popup(frame);
+            })
+            .expect("draw input bar");
+        terminal.backend().buffer().clone()
+    }
+
+    fn row_text(buffer: &ratatui::buffer::Buffer, area: Rect, row: u16) -> String {
+        (area.x..area.right())
+            .map(|x| buffer[(x, row)].symbol().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn clipped_autocomplete_scrolls_to_keep_the_highlight_visible() {
+        let mut bar = input_bar_with_shared_commands();
+        bar.insert_text("/");
+        let count = bar.autocomplete_matches.len();
+        render_short_popup(&mut bar);
+        let area = bar.last_autocomplete_area.expect("popup rendered");
+        let visible = usize::from(area.height - 2);
+        assert!(
+            visible >= 2 && count > visible + 1,
+            "need a clipped popup: {visible} rows for {count} matches"
+        );
+
+        // Move the highlight one past the last row the popup can show.
+        let target = visible;
+        let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+        for _ in 0..target {
+            bar.handle_key(down);
+        }
+        assert_eq!(bar.autocomplete_index, Some(target));
+        let buffer = render_short_popup(&mut bar);
+        let selected = bar.autocomplete_matches[target].clone();
+        let last_row = area.y + area.height - 2;
+        let shown = row_text(&buffer, area, last_row);
+        assert!(
+            shown.contains(&format!("{selected} ")) || shown.trim_end().ends_with(&selected),
+            "highlighted {selected:?} must be on the last visible row, got {shown:?}"
+        );
+
+        // A click on the first visible row picks the scrolled-to entry,
+        // not the first match.
+        let first_visible = bar.autocomplete_matches[1].clone();
+        assert!(bar.handle_mouse(left_click(area.x + 2, area.y + 1)));
+        assert_eq!(bar.input(), first_visible);
+    }
+
+    #[test]
+    fn closed_autocomplete_does_not_capture_clicks() {
+        let mut bar = input_bar_with_shared_commands();
+        bar.insert_text("/");
+        render_bar_with_popup(&mut bar);
+        let area = bar.last_autocomplete_area.expect("popup rendered");
+        bar.insert_text(" ");
+        assert!(!bar.autocomplete_active);
+        render_bar_with_popup(&mut bar);
+        assert_eq!(bar.last_autocomplete_area, None);
+
+        assert!(!bar.handle_mouse(left_click(area.x + 2, area.y + 2)));
+        assert_eq!(bar.input(), "/ ");
+    }
+
     #[test]
     fn autocomplete_triggers_on_slash() {
         let mut bar = input_bar_with_shared_commands();
@@ -3748,6 +4784,17 @@ mod tests {
         bar.insert_text("/restart-session");
         let action = bar.handle_enter();
         assert!(matches!(action, InputBarAction::RestartSession));
+        assert_eq!(bar.input(), "");
+    }
+
+    #[test]
+    fn slash_change_directory_returns_action() {
+        let mut bar = input_bar_with_shared_commands();
+        bar.insert_text("/change-directory");
+        assert!(matches!(
+            bar.handle_enter(),
+            InputBarAction::ChangeDirectory
+        ));
         assert_eq!(bar.input(), "");
     }
 

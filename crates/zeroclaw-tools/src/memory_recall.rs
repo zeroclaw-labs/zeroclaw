@@ -180,6 +180,7 @@ mod tests {
             *self.last_query.lock().unwrap() = Some(query.to_string());
             if is_recent_recall_query(query) {
                 Ok(vec![MemoryEntry {
+                    principal_id: None,
                     id: "recent".into(),
                     key: "recent".into(),
                     content: "recent memory".into(),

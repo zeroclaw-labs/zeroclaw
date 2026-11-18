@@ -55,6 +55,7 @@ mod tests {
 
     fn entry(id: &str, content: &str) -> MemoryEntry {
         MemoryEntry {
+            principal_id: None,
             id: id.into(),
             key: id.into(),
             content: content.into(),

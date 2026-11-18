@@ -2,14 +2,61 @@
 //! that fit the token budget, drop the rest, never cut a turn in half.
 
 use crate::agent::history::estimate_history_tokens;
+use std::collections::HashSet;
 use zeroclaw_api::model_provider::ConversationMessage;
 use zeroclaw_providers::ChatMessage;
 
-/// Prefix the tool loop puts on the user-role message that carries prompt-mode
-/// tool results (see `history_append::append_tool_round_to_history`). Typed
-/// replay preserves that carrier as an ordinary user chat, so span selectors
-/// must not mistake it for the user prompt that opened a turn.
-pub(crate) const TOOL_RESULTS_PREFIX: &str = "[Tool results]";
+/// Prefixes of the user-role rows the tool loop itself appends mid-turn to give
+/// the model feedback on its own output (see the malformed-protocol retry in
+/// `turn/mod.rs`). They are user-role only because no `tool_call_id` exists to
+/// attach them to, and they belong to the turn they interrupt.
+pub(crate) const RUNTIME_FEEDBACK_PREFIXES: &[&str] = &["[Tool call parse error]"];
+
+/// Prefix of the prompt a live SOP step appends to the caller's history
+/// (`format_step_context` in the SOP engine). A step runs inside the caller's
+/// turn, so its prompt row belongs to that turn for retention: otherwise each
+/// step would age the running turn by one, and with a small window the caller
+/// would resume without the tool results it still needs.
+pub(crate) const SOP_STEP_PROMPT_PREFIX: &str = "[SOP: ";
+
+/// The fixed last line of every step prompt the SOP engine writes.
+pub(crate) const SOP_STEP_PROMPT_TRAILER: &str = "When done, report your result.";
+
+/// Whether `content` is the prompt a live SOP step appends, judged by the
+/// shape the engine writes around the SOP's name rather than by the prefix
+/// alone: the header `[SOP: <name> (run <id>) — Step <n> of <m>]` closing a
+/// line, and the fixed last line. The name is not parsed, since a SOP name
+/// is free text and may hold newlines or brackets of its own; the step
+/// numbers after it and the trailer are what a user message does not carry.
+pub(crate) fn is_sop_step_prompt(content: &str) -> bool {
+    let Some(after_prefix) = content.strip_prefix(SOP_STEP_PROMPT_PREFIX) else {
+        return false;
+    };
+    let Some((_, after_step)) = after_prefix.split_once(") — Step ") else {
+        return false;
+    };
+    let Some((n, after_n)) = after_step.split_once(" of ") else {
+        return false;
+    };
+    let Some((m, _)) = after_n.split_once("]\n") else {
+        return false;
+    };
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    digits(n) && digits(m) && content.trim_end().ends_with(SOP_STEP_PROMPT_TRAILER)
+}
+
+/// A user row that opens a turn for tool-context retention: a turn boundary
+/// that is neither runtime feedback nor a live SOP step prompt. Whole-turn
+/// trimming keeps its own boundary rule; retention must not let a row the
+/// loop itself appended mid-turn push the running turn's tool rows out of the
+/// retained window.
+fn opens_retention_turn(msg: &ChatMessage) -> bool {
+    is_turn_boundary(msg)
+        && !RUNTIME_FEEDBACK_PREFIXES
+            .iter()
+            .any(|prefix| msg.content.starts_with(prefix))
+        && !is_sop_step_prompt(&msg.content)
+}
 
 /// Outcome of a trim pass. `trimmed` is true only when at least one whole turn
 /// was dropped, in which case the caller emits a user-visible event and injects
@@ -26,8 +73,8 @@ pub struct TrimResult {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct MessageCountTrimResult {
-    pub history: Vec<ConversationMessage>,
+pub(crate) struct TurnCountTrimResult<T> {
+    pub history: Vec<T>,
     pub dropped_messages: usize,
     pub dropped_turns: usize,
     pub kept_turns: usize,
@@ -42,53 +89,23 @@ fn is_conversation_turn_boundary(msg: &ConversationMessage, is_breadcrumb: bool)
     matches!(
         msg,
         ConversationMessage::Chat(chat)
-            if chat.role == "user" && !is_breadcrumb
+            if chat.role == "user"
+                && !chat
+                    .content
+                    .starts_with(zeroclaw_api::tool_carrier::TOOL_RESULTS_PREFIX)
+                && !is_breadcrumb
     )
 }
 
-/// The pair of policy values a whole-turn trim resolves at use time: the
-/// effective message cap and the low-water fraction applied to it. Resolved
-/// together from one config read so a concurrent profile edit cannot mix
-/// revisions of the two halves of the same trim decision.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct HistoryTrimLimits {
-    pub max_messages: usize,
-    pub low_water: f32,
-}
-
-/// Compute the hysteresis low-water target for a whole-turn trim: the
-/// largest number of non-system messages a trim should leave behind.
-/// `low_water` of 1.0 (or anything non-finite, zero, or negative) keeps the
-/// no-hysteresis behavior of trimming straight back to the cap; a fractional
-/// value floors to at least 1 so a trim never aims at an empty history.
-#[must_use]
-pub(crate) fn history_trim_target(max_messages: usize, low_water: f32) -> usize {
-    if !(low_water > 0.0 && low_water < 1.0) {
-        return max_messages;
-    }
-    // Evaluated in f32, the field's own type: the product rounds to the
-    // value a reader of the fraction expects (10 * 0.7 floors to 7, not to
-    // the 6 an exact f64 promotion of 0.7f32 would produce).
-    let scaled = (max_messages as f32 * low_water).floor();
-    if scaled < 1.0 {
-        1
-    } else {
-        // Float-to-int casts saturate, which is the right behavior for
-        // degenerate caps close to usize::MAX.
-        scaled as usize
-    }
-}
-
-/// Drop the oldest whole conversation turns until the non-system body fits
-/// `max_messages`, trimming down to `target` messages (the caller computes
-/// it from the hysteresis low-water fraction) while always retaining the
-/// newest complete turn.
+/// Keep at most `max_turns` recent structured conversation turns, while always
+/// retaining the newest complete turn. The legacy config key is named
+/// `max_history_messages`, but tool-call and tool-result rows do not consume
+/// independent slots.
 pub(crate) fn trim_conversation_to_recent_turns(
     history: Vec<ConversationMessage>,
-    max_messages: usize,
-    target: usize,
+    max_turns: usize,
     has_leading_breadcrumb: bool,
-) -> MessageCountTrimResult {
+) -> TurnCountTrimResult<ConversationMessage> {
     let first_non_system = history
         .iter()
         .position(|message| !is_conversation_system(message));
@@ -101,13 +118,8 @@ pub(crate) fn trim_conversation_to_recent_turns(
             is_conversation_turn_boundary(message, Some(*index) == breadcrumb_index)
         })
         .count();
-    let counted_messages = history
-        .iter()
-        .filter(|message| !is_conversation_system(message))
-        .count()
-        - synthetic_messages;
-    if counted_messages <= max_messages || total_turns <= 1 {
-        return MessageCountTrimResult {
+    if total_turns <= max_turns || total_turns <= 1 {
+        return TurnCountTrimResult {
             history,
             dropped_messages: 0,
             dropped_turns: 0,
@@ -135,29 +147,26 @@ pub(crate) fn trim_conversation_to_recent_turns(
         })
         .collect();
 
-    let mut first_kept = boundaries[1];
-    let mut dropped_turns = 1;
-    for (turn_index, &boundary) in boundaries.iter().enumerate().skip(1) {
-        first_kept = boundary;
-        dropped_turns = turn_index;
-        if body.len() - boundary <= target || turn_index == boundaries.len() - 1 {
-            break;
-        }
-    }
+    let kept_turns = max_turns.max(1).min(boundaries.len());
+    let dropped_turns = boundaries.len() - kept_turns;
+    let first_kept = boundaries[dropped_turns];
 
     let dropped_messages = first_kept - synthetic_messages;
     system.extend(body.into_iter().skip(first_kept));
-    MessageCountTrimResult {
+    TurnCountTrimResult {
         history: system,
         dropped_messages,
         dropped_turns,
-        kept_turns: boundaries.len() - dropped_turns,
+        kept_turns,
         trimmed: true,
     }
 }
 
 fn is_turn_boundary(msg: &ChatMessage) -> bool {
-    msg.role == "user" && !msg.content.starts_with(TOOL_RESULTS_PREFIX)
+    msg.role == "user"
+        && !msg
+            .content
+            .starts_with(zeroclaw_api::tool_carrier::TOOL_RESULTS_PREFIX)
 }
 
 fn is_system(msg: &ChatMessage) -> bool {
@@ -211,7 +220,7 @@ pub fn trim_to_recent_turns_with_crumb(
     let boundaries: Vec<usize> = body
         .iter()
         .enumerate()
-        .filter(|(_, m)| is_turn_boundary(m))
+        .filter(|(_, message)| is_turn_boundary(message))
         .map(|(i, _)| i)
         .collect();
 
@@ -264,6 +273,57 @@ pub fn trim_to_recent_turns_with_crumb(
         kept_turns,
         tokens_before,
         tokens_after,
+        trimmed: true,
+    }
+}
+
+/// Keep at most `max_turns` recent provider-facing turns. This is the
+/// count-based companion to [`trim_to_recent_turns`]; both use identical turn
+/// boundaries and always retain the newest complete turn.
+pub(crate) fn trim_to_recent_turn_count(
+    history: Vec<ChatMessage>,
+    max_turns: usize,
+    has_leading_breadcrumb: bool,
+) -> TurnCountTrimResult<ChatMessage> {
+    let total_turns = count_turns(&history).saturating_sub(usize::from(has_leading_breadcrumb));
+    if total_turns <= max_turns || total_turns <= 1 {
+        return TurnCountTrimResult {
+            history,
+            dropped_messages: 0,
+            dropped_turns: 0,
+            kept_turns: total_turns,
+            trimmed: false,
+        };
+    }
+
+    let leading_system = history
+        .iter()
+        .take_while(|message| is_system(message))
+        .count();
+    let system = history[..leading_system].to_vec();
+    let body = &history[leading_system..];
+    let breadcrumb_index = has_leading_breadcrumb.then_some(0);
+    let boundaries: Vec<usize> = body
+        .iter()
+        .enumerate()
+        .filter_map(|(index, message)| {
+            (is_turn_boundary(message) && Some(index) != breadcrumb_index).then_some(index)
+        })
+        .collect();
+    let kept_turns = max_turns.max(1).min(boundaries.len());
+    let dropped_turns = boundaries.len() - kept_turns;
+    let first_kept = boundaries[dropped_turns];
+
+    let mut kept = system;
+    if has_leading_breadcrumb {
+        kept.push(body[0].clone());
+    }
+    kept.extend_from_slice(&body[first_kept..]);
+    TurnCountTrimResult {
+        history: kept,
+        dropped_messages: first_kept - usize::from(has_leading_breadcrumb),
+        dropped_turns,
+        kept_turns,
         trimmed: true,
     }
 }
@@ -345,6 +405,177 @@ pub(crate) fn count_turns(history: &[ChatMessage]) -> usize {
     history.iter().filter(|m| is_turn_boundary(m)).count()
 }
 
+/// Provider-facing population derived from a history whose older turns lost
+/// their tool context. `source_rows[i]` is the index, in the input history, of
+/// the row `messages[i]` stands for; a tool-exchange summary stands for the
+/// assistant row that issued the calls it summarises. The input is never
+/// modified, so the working history and every transcript an owner persists
+/// from it keep all their rows.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct CollapsedToolContext {
+    pub messages: Vec<ChatMessage>,
+    pub source_rows: Vec<usize>,
+    /// Tool-call and tool-result rows that `messages` leaves out.
+    pub dropped_messages: usize,
+    pub collapsed_turns: usize,
+}
+
+impl CollapsedToolContext {
+    fn keep(&mut self, source_row: usize, message: ChatMessage) {
+        self.messages.push(message);
+        self.source_rows.push(source_row);
+    }
+
+    fn identity(history: &[ChatMessage]) -> Self {
+        Self {
+            messages: history.to_vec(),
+            source_rows: (0..history.len()).collect(),
+            dropped_messages: 0,
+            collapsed_turns: 0,
+        }
+    }
+}
+
+/// Whether an assistant row is a tool-call carrier the runtime issued, as
+/// opposed to an ordinary reply whose JSON merely contains a `tool_calls`
+/// array. Flat provider JSON cannot tell the two apart by shape, so the rule
+/// is what the loop itself applies when it parses a response: a call is
+/// executed only when it names a tool the loop can execute. A row naming one
+/// is a carrier, answered or not (an unanswered one is an interrupted
+/// exchange); a row naming none executed nothing and is the turn's reply.
+/// `known_tools` holds the lower-cased names of the loop's registered tools.
+fn is_tool_call_carrier(message: &ChatMessage, known_tools: &HashSet<String>) -> bool {
+    message.role == "assistant"
+        && crate::agent::history_pruner::extract_assistant_tool_call_ids(&message.content).is_some()
+        && assistant_tool_call_names(&message.content)
+            .iter()
+            .any(|name| known_tools.contains(&name.to_ascii_lowercase()))
+}
+
+/// The tool names an assistant row's `tool_calls` array carries, in either
+/// the flat (`name`) or the OpenAI (`function.name`) layout.
+fn assistant_tool_call_names(content: &str) -> Vec<String> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(content) else {
+        return Vec::new();
+    };
+    value
+        .get("tool_calls")
+        .and_then(serde_json::Value::as_array)
+        .map(|calls| {
+            calls
+                .iter()
+                .filter_map(|call| {
+                    call.get("name")
+                        .or_else(|| call.get("function").and_then(|f| f.get("name")))
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// A closing reply is a turn's last assistant row when it is not a tool-call
+/// carrier; a carrier there is an exchange whose results never arrived.
+fn is_closing_reply(message: &ChatMessage, known_tools: &HashSet<String>) -> bool {
+    message.role == "assistant" && !is_tool_call_carrier(message, known_tools)
+}
+
+fn count_tool_calls(rows: &[ChatMessage], known_tools: &HashSet<String>) -> usize {
+    let from_carriers: usize = rows
+        .iter()
+        .filter(|m| is_tool_call_carrier(m, known_tools))
+        .filter_map(|m| crate::agent::history_pruner::extract_assistant_tool_call_ids(&m.content))
+        .map(|ids| ids.len())
+        .sum();
+    if from_carriers > 0 {
+        return from_carriers;
+    }
+    rows.iter()
+        .filter(|m| {
+            m.role == "tool"
+                || (m.role == "user"
+                    && m.content
+                        .starts_with(zeroclaw_api::tool_carrier::TOOL_RESULTS_PREFIX))
+        })
+        .count()
+        .max(1)
+}
+
+/// Build the provider-facing population in which every turn older than the
+/// newest `keep_prior_turns + 1` turns keeps its user prompt and closing
+/// assistant reply but loses its tool-call and tool-result rows. The running
+/// turn is always sent whole because the model needs its own results, so `0`
+/// keeps tool context for the running turn only. Leading system messages and
+/// the breadcrumb are copied through. A turn collapses as a unit: the assistant
+/// row that issued the calls is replaced by one `[Tool exchange: …]` summary
+/// row (the marker providers already recognise) and the rows that answered it
+/// are left out, so no orphan call or result is created. A turn that ended on a
+/// call or a result keeps only its prompt and the summary. `known_tools` holds
+/// the lower-cased names of the tools the loop can execute; it is how a call
+/// row is told apart from an ordinary reply whose JSON merely contains a
+/// `tool_calls` array (see [`is_tool_call_carrier`]).
+pub(crate) fn collapse_tool_context_older_than(
+    history: &[ChatMessage],
+    keep_prior_turns: usize,
+    crumb_present: bool,
+    known_tools: &HashSet<String>,
+) -> CollapsedToolContext {
+    let leading_system = history.iter().take_while(|m| is_system(m)).count();
+    let body_start = leading_system + usize::from(crumb_present);
+    let boundaries: Vec<usize> = history
+        .iter()
+        .enumerate()
+        .skip(body_start)
+        .filter(|(_, m)| opens_retention_turn(m))
+        .map(|(i, _)| i)
+        .collect();
+    let protected = keep_prior_turns.saturating_add(1);
+    if boundaries.len() <= protected {
+        return CollapsedToolContext::identity(history);
+    }
+    let mut out = CollapsedToolContext::default();
+    let mut cursor = 0;
+    for turn in 0..boundaries.len() - protected {
+        let boundary = boundaries[turn];
+        for (row, message) in history.iter().enumerate().take(boundary + 1).skip(cursor) {
+            out.keep(row, message.clone());
+        }
+        let span_start = boundary + 1;
+        let span_end = boundaries[turn + 1];
+        let closing = (span_end > span_start
+            && is_closing_reply(&history[span_end - 1], known_tools))
+        .then_some(span_end - 1);
+        let drain_end = closing.unwrap_or(span_end);
+        if drain_end > span_start {
+            let drained = &history[span_start..drain_end];
+            out.dropped_messages += drained.len();
+            out.collapsed_turns += 1;
+            // A turn with a closing reply is sent as prompt and reply alone:
+            // user and assistant rows that alternate on every provider. The
+            // summary stands in only where no reply closed the turn, so the
+            // model still sees that calls were made and the prompt is not
+            // left answered by nothing.
+            if closing.is_none() && history[span_start].role == "assistant" {
+                out.keep(
+                    span_start,
+                    ChatMessage::assistant(ChatMessage::pruned_tool_exchange_summary(
+                        count_tool_calls(drained, known_tools),
+                    )),
+                );
+            }
+        }
+        if let Some(row) = closing {
+            out.keep(row, history[row].clone());
+        }
+        cursor = span_end;
+    }
+    for (row, message) in history.iter().enumerate().skip(cursor) {
+        out.keep(row, message.clone());
+    }
+    out
+}
+
 /// Drop the oldest whole turn (after leading system messages and an optional
 /// breadcrumb), preserving the most recent whole turn and the system prefix.
 /// `crumb_present` is the OWNER's authoritative record that the population
@@ -421,6 +652,21 @@ mod tests {
         ChatMessage::tool(c)
     }
 
+    /// A declared native tool-result carrier for one image: the envelope the
+    /// runtime writes, with the attachment at the fixed position.
+    fn image_tool_carrier(target: &str) -> String {
+        let attachments = vec![zeroclaw_api::media::RenderedMarker {
+            target: target.to_string(),
+            kind: zeroclaw_api::media::MarkerKind::Image,
+        }];
+        serde_json::json!({
+            "tool_call_id": "call_image",
+            "content": "",
+            "attachments": zeroclaw_api::tool_carrier::render_native_attachments(&attachments),
+        })
+        .to_string()
+    }
+
     fn conversation_system(content: &str) -> ConversationMessage {
         ConversationMessage::Chat(ChatMessage::system(content))
     }
@@ -474,23 +720,6 @@ mod tests {
         }
     }
 
-    /// Pins the no-hysteresis identity: a low-water fraction of 1.0 must
-    /// reproduce the pre-hysteresis drop points exactly. All pre-existing
-    /// fixtures in this module run through this wrapper so the 1.0 case
-    /// stays exercised by every one of them.
-    fn trim_conversation_to_recent_turns_at_legacy_cap(
-        history: Vec<ConversationMessage>,
-        max_messages: usize,
-        has_leading_breadcrumb: bool,
-    ) -> MessageCountTrimResult {
-        trim_conversation_to_recent_turns(
-            history,
-            max_messages,
-            history_trim_target(max_messages, 1.0),
-            has_leading_breadcrumb,
-        )
-    }
-
     #[test]
     fn trim_conversation_to_recent_turns_keeps_single_tool_heavy_turn_over_cap() {
         let mut history = vec![conversation_user("run the workflow")];
@@ -500,7 +729,7 @@ mod tests {
         history.push(conversation_assistant("workflow complete"));
         assert_eq!(history.len(), 64);
 
-        let result = trim_conversation_to_recent_turns_at_legacy_cap(history, 50, false);
+        let result = trim_conversation_to_recent_turns(history, 50, false);
 
         assert!(!result.trimmed);
         assert_eq!(result.dropped_messages, 0);
@@ -521,7 +750,7 @@ mod tests {
     }
 
     #[test]
-    fn trim_conversation_to_recent_turns_drops_old_turn_and_keeps_tool_heavy_turn() {
+    fn trim_conversation_to_recent_turns_drops_old_turn_at_one_turn_limit() {
         let mut history = vec![
             conversation_user("old request"),
             conversation_assistant("old answer"),
@@ -532,7 +761,7 @@ mod tests {
         }
         history.push(conversation_assistant("new answer"));
 
-        let result = trim_conversation_to_recent_turns_at_legacy_cap(history, 50, false);
+        let result = trim_conversation_to_recent_turns(history, 1, false);
 
         assert!(result.trimmed);
         assert_eq!(result.dropped_turns, 1);
@@ -552,6 +781,35 @@ mod tests {
     }
 
     #[test]
+    fn trim_conversation_to_recent_turns_counts_turns_not_tool_rows() {
+        let mut history = vec![conversation_system("system")];
+        for turn in 0..60 {
+            history.push(conversation_user(&format!("request {turn}")));
+            for tool in 0..3 {
+                push_tool_exchange(&mut history, turn * 10 + tool);
+            }
+            history.push(conversation_assistant(&format!("answer {turn}")));
+        }
+
+        let result = trim_conversation_to_recent_turns(history, 50, false);
+
+        assert!(result.trimmed);
+        assert_eq!(result.dropped_turns, 10);
+        assert_eq!(result.kept_turns, 50);
+        assert!(matches!(
+            result.history.get(1),
+            Some(ConversationMessage::Chat(message))
+                if message.role == "user" && message.content == "request 10"
+        ));
+        assert!(matches!(
+            result.history.last(),
+            Some(ConversationMessage::Chat(message))
+                if message.role == "assistant" && message.content == "answer 59"
+        ));
+        assert_structural_tool_pairs(&result.history);
+    }
+
+    #[test]
     fn trim_conversation_to_recent_turns_zero_cap_preserves_newest_complete_turn() {
         let history = vec![
             conversation_user("old request"),
@@ -560,7 +818,7 @@ mod tests {
             conversation_assistant("new answer"),
         ];
 
-        let result = trim_conversation_to_recent_turns_at_legacy_cap(history, 0, false);
+        let result = trim_conversation_to_recent_turns(history, 0, false);
 
         assert!(result.trimmed);
         assert_eq!(result.dropped_messages, 2);
@@ -585,7 +843,7 @@ mod tests {
             conversation_assistant("new answer"),
         ];
 
-        let result = trim_conversation_to_recent_turns_at_legacy_cap(history, 2, false);
+        let result = trim_conversation_to_recent_turns(history, 1, false);
 
         assert!(result.trimmed);
         assert_eq!(result.dropped_messages, 2);
@@ -619,7 +877,7 @@ mod tests {
         ];
         let original = serde_json::to_value(&history).expect("fixture should serialize");
 
-        let result = trim_conversation_to_recent_turns_at_legacy_cap(history, 3, false);
+        let result = trim_conversation_to_recent_turns(history, 3, false);
 
         assert!(!result.trimmed);
         assert_eq!(result.dropped_messages, 0);
@@ -641,7 +899,7 @@ mod tests {
         ];
         let original = serde_json::to_value(&history).expect("fixture should serialize");
 
-        let result = trim_conversation_to_recent_turns_at_legacy_cap(history, 2, false);
+        let result = trim_conversation_to_recent_turns(history, 1, false);
 
         assert!(!result.trimmed);
         assert_eq!(result.dropped_messages, 0);
@@ -661,7 +919,7 @@ mod tests {
         history.push(conversation_assistant("done"));
         let original = serde_json::to_value(&history).expect("fixture should serialize");
 
-        let result = trim_conversation_to_recent_turns_at_legacy_cap(history, 1, false);
+        let result = trim_conversation_to_recent_turns(history, 1, false);
 
         assert!(!result.trimmed);
         assert_eq!(result.dropped_messages, 0);
@@ -685,7 +943,7 @@ mod tests {
             conversation_assistant("new answer"),
         ];
 
-        let result = trim_conversation_to_recent_turns_at_legacy_cap(history, 2, false);
+        let result = trim_conversation_to_recent_turns(history, 1, false);
 
         assert!(result.trimmed);
         assert_eq!(result.dropped_messages, 2);
@@ -716,7 +974,7 @@ mod tests {
             conversation_assistant("new answer"),
         ];
 
-        let result = trim_conversation_to_recent_turns_at_legacy_cap(history, 2, false);
+        let result = trim_conversation_to_recent_turns(history, 1, false);
 
         assert!(result.trimmed);
         assert_eq!(result.dropped_messages, 2);
@@ -737,7 +995,7 @@ mod tests {
     }
 
     #[test]
-    fn trim_conversation_to_recent_turns_drops_minimum_oldest_turns_for_exact_cap() {
+    fn trim_conversation_to_recent_turns_drops_minimum_oldest_turns_for_turn_cap() {
         let history = vec![
             conversation_user("old request"),
             conversation_assistant("old answer"),
@@ -747,7 +1005,7 @@ mod tests {
             conversation_assistant("new answer"),
         ];
 
-        let result = trim_conversation_to_recent_turns_at_legacy_cap(history, 4, false);
+        let result = trim_conversation_to_recent_turns(history, 2, false);
 
         assert!(result.trimmed);
         assert_eq!(result.dropped_messages, 2);
@@ -777,7 +1035,7 @@ mod tests {
             conversation_assistant("middle answer"),
         ];
 
-        let first = trim_conversation_to_recent_turns_at_legacy_cap(history, 4, true);
+        let first = trim_conversation_to_recent_turns(history, 2, true);
         assert!(
             !first.trimmed,
             "a synthetic breadcrumb must not push an exactly-at-cap body over the limit"
@@ -786,7 +1044,7 @@ mod tests {
         history = first.history;
         history.push(conversation_user("new request"));
         history.push(conversation_assistant("new answer"));
-        let mut second = trim_conversation_to_recent_turns_at_legacy_cap(history, 4, true);
+        let mut second = trim_conversation_to_recent_turns(history, 2, true);
 
         assert!(second.trimmed);
         assert_eq!(second.dropped_messages, 2);
@@ -820,232 +1078,10 @@ mod tests {
     }
 
     #[test]
-    fn history_trim_target_semantics() {
-        // 1.0 keeps the no-hysteresis identity exactly.
-        assert_eq!(history_trim_target(10, 1.0), 10);
-        assert_eq!(history_trim_target(1, 1.0), 1);
-        assert_eq!(history_trim_target(0, 1.0), 0);
-        // Fractional values floor toward the cap.
-        assert_eq!(history_trim_target(10, 0.7), 7);
-        assert_eq!(history_trim_target(5, 0.7), 3);
-        assert_eq!(history_trim_target(4, 0.7), 2);
-        // The target never aims below a single message.
-        assert_eq!(history_trim_target(1, 0.7), 1);
-        assert_eq!(history_trim_target(0, 0.7), 1);
-        // Out-of-range fractions (rejected by Config::validate, but
-        // persistable via boot-resilient load or RPC config/set) degrade to
-        // the legacy no-hysteresis target rather than something nonsensical.
-        assert_eq!(history_trim_target(10, 1.5), 10);
-        assert_eq!(history_trim_target(10, f32::NAN), 10);
-        assert_eq!(history_trim_target(10, 0.0), 10);
-    }
-
-    #[test]
-    fn trim_conversation_to_recent_turns_at_cap_does_not_trim_below_target() {
-        // The trigger stays on the cap: at or below max_messages the history
-        // is untouched even though the target is smaller.
-        let history = vec![
-            conversation_user("old request"),
-            conversation_assistant("old answer"),
-            conversation_user("new request"),
-            conversation_assistant("new answer"),
-        ];
-
-        let result =
-            trim_conversation_to_recent_turns(history, 4, history_trim_target(4, 0.7), false);
-
-        assert!(!result.trimmed);
-        assert_eq!(result.dropped_messages, 0);
-        assert_eq!(result.dropped_turns, 0);
-        assert_eq!(result.kept_turns, 2);
-        assert_eq!(result.history.len(), 4);
-    }
-
-    #[test]
-    fn trim_conversation_to_recent_turns_repeated_additions_after_trim_stay_under_cap() {
-        let cap = 10;
-        let target = history_trim_target(cap, 0.7);
-        assert_eq!(target, 7);
-
-        // Five complete turns fill the cap exactly and must not trim.
-        let at_cap = trim_conversation_to_recent_turns(
-            vec![
-                conversation_user("first request"),
-                conversation_assistant("first answer"),
-                conversation_user("second request"),
-                conversation_assistant("second answer"),
-                conversation_user("third request"),
-                conversation_assistant("third answer"),
-                conversation_user("fourth request"),
-                conversation_assistant("fourth answer"),
-                conversation_user("fifth request"),
-                conversation_assistant("fifth answer"),
-            ],
-            cap,
-            target,
-            false,
-        );
-        assert!(!at_cap.trimmed);
-        assert_eq!(at_cap.dropped_messages, 0);
-        assert_eq!(at_cap.history.len(), cap);
-
-        // One more in-flight request crosses the cap. The trim drops whole
-        // turns until the body is at or below the target: dropping one turn
-        // would leave 9 (still above 7), so two turns go and the body lands
-        // on exactly the target of 7.
-        let mut history = at_cap.history;
-        history.push(conversation_user("sixth request"));
-        let first = trim_conversation_to_recent_turns(history, cap, target, false);
-        assert!(first.trimmed);
-        assert_eq!(first.dropped_messages, 4);
-        assert_eq!(first.dropped_turns, 2);
-        assert_eq!(first.kept_turns, 4);
-        assert_eq!(first.history.len(), target);
-        assert!(first.history.iter().any(|message| matches!(
-            message,
-            ConversationMessage::Chat(chat) if chat.content == "third request"
-        )));
-        assert!(first.history.iter().any(|message| matches!(
-            message,
-            ConversationMessage::Chat(chat) if chat.content == "sixth request"
-        )));
-
-        // Small turns appended after the trim call the trimmer again: the
-        // first fits inside the headroom, the second crosses the cap and
-        // trims back down to the target rather than refilling to the cap.
-        let mut history = first.history;
-        let mut additions = 0;
-        loop {
-            additions += 1;
-            history.push(conversation_user(&format!("follow-up request {additions}")));
-            history.push(conversation_assistant(&format!(
-                "follow-up answer {additions}"
-            )));
-            let result = trim_conversation_to_recent_turns(history, cap, target, false);
-            history = result.history;
-            if !result.trimmed {
-                assert_eq!(
-                    result.dropped_messages, 0,
-                    "a below-cap addition must not drop anything"
-                );
-                assert_eq!(
-                    history.len(),
-                    9,
-                    "the first post-trim addition stays inside the headroom"
-                );
-                assert!(history.iter().any(|message| matches!(
-                    message,
-                    ConversationMessage::Chat(chat) if chat.content == "third request"
-                )));
-                continue;
-            }
-            assert_eq!(result.dropped_messages, 4, "second trim depth");
-            assert_eq!(result.dropped_turns, 2, "second trim drops whole turns");
-            assert_eq!(
-                history.len(),
-                target,
-                "the second trim lands on the target, not the cap of {cap}"
-            );
-            assert!(!history.iter().any(|message| matches!(
-                message,
-                ConversationMessage::Chat(chat) if chat.content == "third request"
-            )));
-            assert!(matches!(
-                history.last(),
-                Some(ConversationMessage::Chat(chat))
-                    if chat.role == "assistant" && chat.content == "follow-up answer 2"
-            ));
-            break;
-        }
-        assert_eq!(
-            additions, 2,
-            "one addition fits under the cap, the next one crosses it"
-        );
-    }
-
-    #[test]
-    fn trim_conversation_to_recent_turns_crossing_by_one_drops_to_target() {
-        let history = vec![
-            conversation_user("first request"),
-            conversation_user("second request"),
-            conversation_assistant("second answer"),
-            conversation_user("third request"),
-            conversation_assistant("third answer"),
-        ];
-        // 5 body messages over a cap of 4: the trim fires, but instead of
-        // refilling to the cap it drops to the low-water target (2), which
-        // here means two whole turns go instead of one.
-        let result = trim_conversation_to_recent_turns(history, 4, 2, false);
-
-        assert!(result.trimmed);
-        assert_eq!(result.dropped_turns, 2);
-        assert_eq!(result.dropped_messages, 3);
-        assert_eq!(result.kept_turns, 1);
-        assert_eq!(result.history.len(), 2);
-        assert!(matches!(
-            &result.history[..],
-            [
-                ConversationMessage::Chat(user),
-                ConversationMessage::Chat(assistant),
-            ] if user.role == "user" && user.content == "third request"
-                && assistant.role == "assistant" && assistant.content == "third answer"
-        ));
-
-        // The same fixture under a 1.0 low water mark keeps one more turn:
-        // hysteresis, not the cap change, is what drops the second turn.
-        let legacy = trim_conversation_to_recent_turns_at_legacy_cap(
-            vec![
-                conversation_user("first request"),
-                conversation_user("second request"),
-                conversation_assistant("second answer"),
-                conversation_user("third request"),
-                conversation_assistant("third answer"),
-            ],
-            4,
-            false,
-        );
-        assert_eq!(legacy.dropped_turns, 1);
-        assert_eq!(legacy.history.len(), 4);
-    }
-
-    #[test]
-    fn trim_conversation_to_recent_turns_newest_turn_alone_exceeds_target() {
-        let mut history = vec![
-            conversation_user("old request"),
-            conversation_assistant("old answer"),
-            conversation_user("new request"),
-        ];
-        for index in 0..25 {
-            push_tool_exchange(&mut history, index);
-        }
-        history.push(conversation_assistant("new answer"));
-
-        // Target 35 against a 52-message newest turn: the invariant wins,
-        // the newest complete turn is kept exactly.
-        let result = trim_conversation_to_recent_turns(history, 50, 35, false);
-
-        assert!(result.trimmed);
-        assert_eq!(result.dropped_turns, 1);
-        assert_eq!(result.dropped_messages, 2);
-        assert_eq!(result.kept_turns, 1);
-        assert!(matches!(
-            result.history.first(),
-            Some(ConversationMessage::Chat(message))
-                if message.role == "user" && message.content == "new request"
-        ));
-        assert!(matches!(
-            result.history.last(),
-            Some(ConversationMessage::Chat(message))
-                if message.role == "assistant" && message.content == "new answer"
-        ));
-        assert_structural_tool_pairs(&result.history);
-    }
-
-    #[test]
     fn under_budget_is_untouched() {
         let h = vec![sys("s"), user("hi"), asst("yo")];
         let n = h.len();
-        let r = trim_to_recent_turns(h, 1_000_000);
+        let r = trim_to_recent_turns_with_crumb(h, 1_000_000, false);
         assert!(!r.trimmed);
         assert_eq!(r.history.len(), n);
         assert_eq!(r.dropped_turns, 0);
@@ -1055,7 +1091,7 @@ mod tests {
     fn zero_budget_is_untouched() {
         let h = vec![sys("s"), user("hi"), asst("yo")];
         let n = h.len();
-        let r = trim_to_recent_turns(h, 0);
+        let r = trim_to_recent_turns_with_crumb(h, 0, false);
         assert!(!r.trimmed);
         assert_eq!(r.history.len(), n);
     }
@@ -1072,7 +1108,7 @@ mod tests {
             user("turn3 short"),
             asst("a3"),
         ];
-        let r = trim_to_recent_turns(h, 200);
+        let r = trim_to_recent_turns_with_crumb(h, 200, false);
         assert!(r.trimmed);
         assert_eq!(r.history[0].role, "system");
         assert!(r.dropped_turns >= 1);
@@ -1093,7 +1129,7 @@ mod tests {
             user("turn3 short"),
             asst("a3"),
         ];
-        let r = trim_to_recent_turns(h, 200);
+        let r = trim_to_recent_turns_with_crumb(h, 200, false);
         assert!(r.trimmed);
         // the sick-log fields must reflect a real reduction
         assert!(r.tokens_before > r.tokens_after);
@@ -1107,7 +1143,7 @@ mod tests {
     #[test]
     fn untouched_reports_equal_before_after() {
         let h = vec![sys("s"), user("hi"), asst("yo")];
-        let r = trim_to_recent_turns(h, 1_000_000);
+        let r = trim_to_recent_turns_with_crumb(h, 1_000_000, false);
         assert!(!r.trimmed);
         assert_eq!(r.tokens_before, r.tokens_after);
     }
@@ -1125,7 +1161,7 @@ mod tests {
             user("turn2 short"),
             asst("done2"),
         ];
-        let r = trim_to_recent_turns(h, 150);
+        let r = trim_to_recent_turns_with_crumb(h, 150, false);
         assert!(r.trimmed);
         // a tool row must never appear without its preceding assistant turn-head
         let mut seen_user = false;
@@ -1139,6 +1175,42 @@ mod tests {
         }
     }
 
+    /// Known limit of prefix provenance: the trimmer identifies a prompt-mode
+    /// tool-result row as a `user` row whose content starts with
+    /// `[Tool results]`, so a genuine user message that happens to begin with
+    /// that prefix is grouped with the preceding assistant turn instead of
+    /// opening a turn of its own. This pins that grouping: the row is dropped
+    /// together with that turn and never counted as an independent turn.
+    #[test]
+    fn user_text_matching_tool_results_prefix_is_dropped_with_its_turn() {
+        let history = vec![
+            sys("system"),
+            user("old request"),
+            asst("old answer"),
+            user("[Tool results]\nthis is literal user text"),
+            asst("middle answer"),
+            user("new request"),
+            asst("new answer"),
+        ];
+
+        let result = trim_to_recent_turn_count(history, 1, false);
+
+        assert!(result.trimmed);
+        assert_eq!(
+            result.dropped_turns, 1,
+            "the prefix-matching row must not count as a turn of its own"
+        );
+        assert_eq!(result.kept_turns, 1);
+        assert_eq!(result.dropped_messages, 4);
+        assert!(
+            !result
+                .history
+                .iter()
+                .any(|message| message.content == "[Tool results]\nthis is literal user text"),
+            "the prefix-matching row drops with its turn rather than surviving as its own"
+        );
+    }
+
     #[test]
     fn keeps_last_turn_even_if_over_budget() {
         let huge = "z".repeat(10_000);
@@ -1149,7 +1221,7 @@ mod tests {
             user(&format!("recent {huge}")),
             asst("a2"),
         ];
-        let r = trim_to_recent_turns(h, 50);
+        let r = trim_to_recent_turns_with_crumb(h, 50, false);
         // last turn alone exceeds budget; option a keeps it rather than nuking.
         assert!(r.kept_turns >= 1);
         assert!(r.history.iter().any(|m| m.content.contains("recent")));
@@ -1186,7 +1258,7 @@ mod tests {
             tool_res("call_2"),
             asst("summary2"),
         ];
-        let r = trim_to_recent_turns(h, 200);
+        let r = trim_to_recent_turns_with_crumb(h, 200, false);
         assert!(r.trimmed, "oversized history must trim");
         let mut kept = r.history.clone();
         let swept = remove_orphaned_tool_messages(&mut kept);
@@ -1215,7 +1287,7 @@ mod tests {
             asst("done"),
         ];
 
-        let r = trim_to_recent_turns(h, 200);
+        let r = trim_to_recent_turns_with_crumb(h, 200, false);
 
         assert!(r.trimmed, "oversized history must drop an old whole turn");
         assert_eq!(r.dropped_turns, 1);
@@ -1251,7 +1323,7 @@ mod tests {
             user("recent"),
             asst("a2"),
         ];
-        let r = trim_to_recent_turns(h, 120);
+        let r = trim_to_recent_turns_with_crumb(h, 120, false);
         assert!(r.trimmed);
         let mut trimmed = r.history;
         let system_count = trimmed.iter().take_while(|m| m.role == "system").count();
@@ -1262,6 +1334,47 @@ mod tests {
             trimmed[..system_count].iter().all(|m| m.role == "system"),
             "breadcrumb must sit after every leading system message"
         );
+    }
+
+    #[test]
+    fn second_budget_trim_excludes_explicit_leading_breadcrumb_from_turn_counts() {
+        let old = "old ".repeat(2_000);
+        let history = vec![
+            sys("system"),
+            breadcrumb(),
+            user(&old),
+            asst("old answer"),
+            user("new request"),
+            asst("new answer"),
+        ];
+
+        let result = trim_to_recent_turns_with_crumb(history, 200, true);
+
+        assert!(result.trimmed);
+        assert_eq!(result.dropped_messages, 2);
+        assert_eq!(result.dropped_turns, 1);
+        assert_eq!(result.kept_turns, 1);
+        assert!(result.history.iter().any(|m| m.content == "new request"));
+    }
+
+    #[test]
+    fn second_count_trim_excludes_explicit_leading_breadcrumb_from_turn_counts() {
+        let history = vec![
+            sys("system"),
+            breadcrumb(),
+            user("old request"),
+            asst("old answer"),
+            user("new request"),
+            asst("new answer"),
+        ];
+
+        let result = trim_to_recent_turn_count(history, 1, true);
+
+        assert!(result.trimmed);
+        assert_eq!(result.dropped_messages, 2);
+        assert_eq!(result.dropped_turns, 1);
+        assert_eq!(result.kept_turns, 1);
+        assert!(result.history.iter().any(|m| m.content == "new request"));
     }
 
     #[test]
@@ -1521,11 +1634,12 @@ mod tests {
     #[test]
     fn insert_breadcrumb_deduped_sits_after_leading_system() {
         let mut h = vec![sys("s1"), sys("s2"), user("turn1"), asst("a1")];
-        insert_breadcrumb_deduped(&mut h, false);
+        let has_breadcrumb = insert_breadcrumb_deduped(&mut h, false);
         assert_eq!(h[0].role, "system");
         assert_eq!(h[1].role, "system");
         assert_eq!(h[2].role, breadcrumb().role);
         assert_eq!(h[2].content, breadcrumb().content);
+        assert!(has_breadcrumb);
     }
 
     #[test]
@@ -1559,10 +1673,11 @@ mod tests {
             .collect::<Vec<ChatMessage>>()
         };
 
-        // Path markers: five images coming back in one native-tool round.
+        // Path targets: five images coming back in one native-tool round as
+        // declared carriers, the shape the runtime writes.
         let history = image_history(
             (0..5)
-                .map(|index| format!("[IMAGE:/tmp/slide-{index}.png]"))
+                .map(|index| image_tool_carrier(&format!("/tmp/slide-{index}.png")))
                 .collect(),
         );
         assert!(
@@ -1593,12 +1708,14 @@ mod tests {
             "the newest round must keep all five image results whole"
         );
 
-        // The same round as ~600 KB data URIs: per-image pricing keeps the
-        // history under a 20k budget, where per-byte pricing would see ~150k
-        // tokens per result and throw the old turn away.
+        // The same round as ~600 KB data-URI attachments: per-image pricing
+        // keeps the history under a 20k budget, where per-byte pricing would
+        // see ~150k tokens per result and throw the old turn away.
         let history = image_history(
             (0..5)
-                .map(|_| format!("[IMAGE:data:image/png;base64,{}]", "A".repeat(600_000)))
+                .map(|_| {
+                    image_tool_carrier(&format!("data:image/png;base64,{}", "A".repeat(600_000)))
+                })
                 .collect(),
         );
         let before = history.len();
@@ -1618,13 +1735,18 @@ mod tests {
         );
     }
 
+    // Legacy path markers are text under the attachment-identity contract,
+    // so a stale legacy carrier is delivered and priced as its bytes: the
+    // marker syntax stays in the body and nothing is stripped. Thirty short
+    // markers fit the 32k budget by bytes, so a tool round that only ever
+    // quoted markers cannot evict a turn that fits.
     #[test]
     fn stale_tool_images_do_not_force_a_trim() {
         let markers: Vec<String> = (0..30)
             .map(|index| format!("[IMAGE:/tmp/stale-{index}.png]"))
             .collect();
         // The latest message is a genuine user turn, so the whole tool run is
-        // stale and preparation strips every marker before dispatch.
+        // stale: replay delivers it verbatim, and its price is its bytes.
         let history = vec![
             sys("s"),
             user("u"),
@@ -1637,7 +1759,7 @@ mod tests {
 
         assert!(
             !result.trimmed,
-            "stale tool images are stripped before dispatch and must not force a trim"
+            "stale tool images are text, not per-image charges, and must not force a trim"
         );
         assert_eq!(result.dropped_turns, 0);
         assert_eq!(result.history.len(), 5);
@@ -1688,5 +1810,381 @@ mod tests {
             with_marker.get(2),
             Some(m) if m.role == "user" && m.content == "newest request"
         ));
+    }
+}
+
+#[cfg(test)]
+mod collapse_tests {
+    use super::*;
+
+    fn sys(c: &str) -> ChatMessage {
+        ChatMessage::system(c)
+    }
+    fn user(c: &str) -> ChatMessage {
+        ChatMessage::user(c)
+    }
+    fn asst(c: &str) -> ChatMessage {
+        ChatMessage::assistant(c)
+    }
+    fn tool(c: &str) -> ChatMessage {
+        ChatMessage::tool(c)
+    }
+    /// A runtime-issued carrier: every call names the `shell` tool the loop
+    /// can execute, as the runtime's own serialization does.
+    fn carrier(ids: &[&str]) -> ChatMessage {
+        let calls: Vec<String> = ids
+            .iter()
+            .map(|id| format!("{{\"id\":\"{id}\",\"name\":\"shell\",\"arguments\":\"{{}}\"}}"))
+            .collect();
+        asst(&format!("{{\"tool_calls\":[{}]}}", calls.join(",")))
+    }
+
+    /// The tools the loop can execute in these tests.
+    fn known() -> HashSet<String> {
+        HashSet::from(["shell".to_string()])
+    }
+
+    /// user → assistant(call) → tool → assistant(final)
+    fn native_turn(n: usize) -> Vec<ChatMessage> {
+        vec![
+            user(&format!("request {n}")),
+            carrier(&[&format!("call_{n}")]),
+            tool(&format!(
+                "{{\"tool_call_id\":\"call_{n}\",\"content\":\"result {n}\"}}"
+            )),
+            asst(&format!("answer {n}")),
+        ]
+    }
+
+    /// user → assistant(call) → user([Tool results]) → assistant(final)
+    fn prompt_mode_turn(n: usize) -> Vec<ChatMessage> {
+        vec![
+            user(&format!("request {n}")),
+            asst(&format!("[tool_call] shell {n}")),
+            user(&format!("[Tool results]\nresult {n}")),
+            asst(&format!("answer {n}")),
+        ]
+    }
+
+    fn rows(history: &[ChatMessage]) -> Vec<(String, String)> {
+        history
+            .iter()
+            .map(|m| (m.role.clone(), m.content.clone()))
+            .collect()
+    }
+
+    fn summary(calls: usize) -> String {
+        ChatMessage::pruned_tool_exchange_summary(calls)
+    }
+
+    fn assert_identity(c: &CollapsedToolContext, history: &[ChatMessage]) {
+        assert_eq!(rows(&c.messages), rows(history));
+        assert_eq!(c.source_rows, (0..history.len()).collect::<Vec<_>>());
+        assert_eq!(c.dropped_messages, 0);
+        assert_eq!(c.collapsed_turns, 0);
+    }
+
+    #[test]
+    fn keeps_running_turn_plus_prior_turns_and_summarises_older_ones() {
+        let mut h = vec![sys("s")];
+        for n in 1..=4 {
+            h.extend(native_turn(n));
+        }
+        let before = rows(&h);
+        let c = collapse_tool_context_older_than(&h, 1, false, &known());
+        assert_eq!(rows(&h), before, "input history is never modified");
+        assert_eq!(c.collapsed_turns, 2);
+        assert_eq!(c.dropped_messages, 4);
+        // A closed turn is sent as its prompt and its reply: no summary row,
+        // so roles alternate on every provider.
+        let expected: Vec<(String, String)> = [
+            ("system", "s"),
+            ("user", "request 1"),
+            ("assistant", "answer 1"),
+            ("user", "request 2"),
+            ("assistant", "answer 2"),
+        ]
+        .iter()
+        .map(|(r, t)| (r.to_string(), t.to_string()))
+        .chain(rows(&native_turn(3)))
+        .chain(rows(&native_turn(4)))
+        .collect();
+        assert_eq!(rows(&c.messages), expected);
+        assert!(
+            c.messages
+                .iter()
+                .all(|m| !m.is_pruned_tool_exchange_summary())
+        );
+        assert!(
+            c.messages
+                .windows(2)
+                .all(|pair| pair[0].role != pair[1].role || pair[0].role == "system"),
+            "roles alternate: {:?}",
+            rows(&c.messages)
+        );
+        // Every request row maps to the history row it stands for.
+        assert_eq!(
+            c.source_rows,
+            vec![0, 1, 4, 5, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+        );
+        assert_eq!(c.source_rows.len(), c.messages.len());
+    }
+
+    #[test]
+    fn prompt_mode_results_carrier_is_not_a_turn_boundary() {
+        let mut h = vec![sys("s")];
+        for n in 1..=3 {
+            h.extend(prompt_mode_turn(n));
+        }
+        let c = collapse_tool_context_older_than(&h, 0, false, &known());
+        assert_eq!(c.collapsed_turns, 2);
+        assert_eq!(c.dropped_messages, 4);
+        assert_eq!(count_turns(&c.messages), 3);
+        assert!(
+            !c.messages
+                .iter()
+                .any(|m| m.content == "[Tool results]\nresult 1")
+        );
+        assert!(
+            c.messages
+                .iter()
+                .any(|m| m.content == "[Tool results]\nresult 3")
+        );
+        assert_eq!(c.messages[2].content, "answer 1");
+    }
+
+    #[test]
+    fn zero_keeps_tool_context_for_the_running_turn_only() {
+        let mut h = native_turn(1);
+        h.extend(native_turn(2));
+        let c = collapse_tool_context_older_than(&h, 0, false, &known());
+        assert_eq!(c.collapsed_turns, 1);
+        let mut expected = vec![
+            ("user".to_string(), "request 1".to_string()),
+            ("assistant".to_string(), "answer 1".to_string()),
+        ];
+        expected.extend(rows(&native_turn(2)));
+        assert_eq!(rows(&c.messages), expected);
+    }
+
+    #[test]
+    fn breadcrumb_and_system_prefix_are_copied_and_not_counted() {
+        let mut h = vec![sys("a"), sys("b"), breadcrumb()];
+        h.extend(native_turn(1));
+        h.extend(native_turn(2));
+        let c = collapse_tool_context_older_than(&h, 0, true, &known());
+        assert_eq!(c.collapsed_turns, 1);
+        assert_eq!(rows(&c.messages[..3]), rows(&h[..3]));
+        assert_eq!(c.messages[3].content, "request 1");
+        assert_eq!(c.messages[4].content, "answer 1");
+        assert_eq!(&c.source_rows[..5], &[0, 1, 2, 3, 6]);
+    }
+
+    #[test]
+    fn aborted_turn_keeps_prompt_and_summary_but_never_a_dangling_carrier() {
+        let mut h = vec![
+            user("request 1"),
+            carrier(&["call_1"]),
+            tool("{\"tool_call_id\":\"call_1\",\"content\":\"done\"}"),
+            carrier(&["call_2", "call_3"]),
+        ];
+        h.extend(native_turn(2));
+        let c = collapse_tool_context_older_than(&h, 0, false, &known());
+        assert_eq!(c.dropped_messages, 3);
+        let mut expected = vec![
+            ("user".to_string(), "request 1".to_string()),
+            ("assistant".to_string(), summary(3)),
+        ];
+        expected.extend(rows(&native_turn(2)));
+        assert_eq!(rows(&c.messages), expected);
+    }
+
+    #[test]
+    fn runtime_feedback_rows_do_not_split_the_running_turn() {
+        // The running turn already holds a tool round when the loop appends
+        // its own feedback row (twice, the retry budget). With the smallest
+        // window the model must still see that round.
+        let mut h = native_turn(1);
+        h.extend(native_turn(2));
+        h.pop();
+        h.push(user(
+            "[Tool call parse error]\nYour previous response looked like...",
+        ));
+        h.push(user(
+            "[Tool call parse error]\nYour previous response looked like...",
+        ));
+        let c = collapse_tool_context_older_than(&h, 0, false, &known());
+        assert_eq!(c.collapsed_turns, 1, "only the prior turn collapses");
+        let mut expected = vec![
+            ("user".to_string(), "request 1".to_string()),
+            ("assistant".to_string(), "answer 1".to_string()),
+        ];
+        expected.extend(rows(&h[4..]));
+        assert_eq!(rows(&c.messages), expected);
+        assert!(
+            c.messages
+                .iter()
+                .any(|m| m.role == "tool" && m.content.contains("result 2")),
+            "the running turn keeps its own tool result"
+        );
+    }
+
+    #[test]
+    fn ordinary_json_reply_is_kept_as_the_closing_reply() {
+        // A final answer whose JSON merely contains a `tool_calls` array: it
+        // names no tool the loop can execute, so it executed nothing. It is
+        // the turn's reply and must survive collapse whole, exactly as the
+        // history-window preflight leaves it.
+        let json_reply =
+            r#"{"answer":"here","tool_calls":[{"id":"x","name":"noop","arguments":"{}"}]}"#;
+        let mut h = vec![user("request 1"), asst(json_reply)];
+        h.extend(native_turn(2));
+        let c = collapse_tool_context_older_than(&h, 0, false, &known());
+        assert_eq!(c.collapsed_turns, 0, "{:?}", rows(&c.messages));
+        assert_identity(&c, &h);
+
+        // The same reply after a real exchange: the exchange collapses, the
+        // reply is kept.
+        let mut h = vec![
+            user("request 1"),
+            carrier(&["call_1"]),
+            tool("{\"tool_call_id\":\"call_1\",\"content\":\"result 1\"}"),
+            asst(json_reply),
+        ];
+        h.extend(native_turn(2));
+        let c = collapse_tool_context_older_than(&h, 0, false, &known());
+        let mut expected = vec![
+            ("user".to_string(), "request 1".to_string()),
+            ("assistant".to_string(), json_reply.to_string()),
+        ];
+        expected.extend(rows(&native_turn(2)));
+        assert_eq!(rows(&c.messages), expected);
+    }
+
+    #[test]
+    fn an_unanswered_call_to_a_known_tool_is_still_summarised() {
+        // The interrupted exchange keeps its protection: the carrier names a
+        // tool the loop executes, so it is a call whose results never came,
+        // not a reply, and the turn keeps only its prompt and the summary.
+        let mut h = vec![user("request 1"), carrier(&["call_1"])];
+        h.extend(native_turn(2));
+        let c = collapse_tool_context_older_than(&h, 0, false, &known());
+        let mut expected = vec![
+            ("user".to_string(), "request 1".to_string()),
+            ("assistant".to_string(), summary(1)),
+        ];
+        expected.extend(rows(&native_turn(2)));
+        assert_eq!(rows(&c.messages), expected);
+
+        // The same row answered by its result is a carrier for the same
+        // reason: it names the tool the loop executed.
+        let mut h = native_turn(1);
+        h.extend(native_turn(2));
+        let c = collapse_tool_context_older_than(&h, 0, false, &known());
+        assert_eq!(c.collapsed_turns, 1, "{:?}", rows(&c.messages));
+    }
+
+    #[test]
+    fn sop_step_prompts_do_not_split_the_running_turn() {
+        // A live SOP step appends its prompt to the caller's history and runs
+        // on it; when the caller resumes, with the smallest window, the tool
+        // round that began its turn must still be in the request. Three steps
+        // would otherwise age the turn past the default window too.
+        let mut h = native_turn(1);
+        h.push(user("request 2"));
+        h.push(carrier(&["call_2"]));
+        h.push(tool(
+            "{\"tool_call_id\":\"call_2\",\"content\":\"result 2\"}",
+        ));
+        for step in 1..=3 {
+            h.push(user(&format!(
+                "[SOP: Deploy (run r1) — Step {step} of 3]\n\nCurrent step: **do it**\nWhen done, report your result.\n"
+            )));
+            h.push(asst(&format!("step {step} done")));
+        }
+        let c = collapse_tool_context_older_than(&h, 0, false, &known());
+        assert_eq!(c.collapsed_turns, 1, "only the prior turn collapses");
+        let mut expected = vec![
+            ("user".to_string(), "request 1".to_string()),
+            ("assistant".to_string(), "answer 1".to_string()),
+        ];
+        expected.extend(rows(&h[4..]));
+        assert_eq!(rows(&c.messages), expected);
+        assert!(
+            c.messages
+                .iter()
+                .any(|m| m.role == "tool" && m.content.contains("result 2")),
+            "the running turn keeps its own tool result across the step prompts"
+        );
+    }
+
+    #[test]
+    fn a_user_message_that_merely_starts_like_a_step_prompt_opens_a_turn() {
+        // Only the engine's full header marks a step prompt. A user who
+        // types `[SOP: ` opens a turn of their own, so neither their prompt
+        // nor the answer before it can be drained with a prior turn's tools.
+        assert!(!is_sop_step_prompt(
+            "[SOP: notes for today]\nplease summarise"
+        ));
+        assert!(!is_sop_step_prompt(
+            "[SOP: x (run 1) — Step one of 3]\n\nWhen done, report your result.\n"
+        ));
+        assert!(!is_sop_step_prompt(
+            "[SOP: Deploy (run r1) — Step 2 of 3]\n\nCurrent step: **do it**\n"
+        ));
+        assert!(is_sop_step_prompt(
+            "[SOP: Deploy (run r1) — Step 2 of 3]\n\nCurrent step: **do it**\n\nWhen done, report your result.\n"
+        ));
+        // A SOP name is free text: newlines and brackets inside it do not
+        // hide the step prompt, so the caller's turn is not aged by it.
+        assert!(is_sop_step_prompt(
+            "[SOP: Deploy\nproduction (run r1) — Step 2 of 3]\n\nCurrent step: **do it**\n\nWhen done, report your result.\n"
+        ));
+        assert!(is_sop_step_prompt(
+            "[SOP: Deploy [eu] (run r1) — Step 2 of 3]\n\nCurrent step: **do it**\n\nWhen done, report your result.\n"
+        ));
+
+        let mut h = native_turn(1);
+        h.push(user("[SOP: notes for today] what did we decide?"));
+        h.push(asst("we decided X"));
+        h.extend(native_turn(2));
+        let c = collapse_tool_context_older_than(&h, 0, false, &known());
+        assert!(
+            c.messages
+                .iter()
+                .any(|m| m.role == "user" && m.content.starts_with("[SOP: notes")),
+            "the user's own prompt is kept: {:?}",
+            rows(&c.messages)
+        );
+        assert!(
+            c.messages.iter().any(|m| m.content == "answer 1"),
+            "the answer before it is kept as its turn's closing reply: {:?}",
+            rows(&c.messages)
+        );
+    }
+
+    #[test]
+    fn text_only_turns_and_small_histories_pass_through_unchanged() {
+        let mut h = vec![
+            user("hi"),
+            asst("hello"),
+            user("again"),
+            asst("hello again"),
+        ];
+        h.extend(native_turn(3));
+        let c = collapse_tool_context_older_than(&h, 0, false, &known());
+        assert_identity(&c, &h);
+
+        let mut h2 = native_turn(1);
+        h2.extend(native_turn(2));
+        let c2 = collapse_tool_context_older_than(&h2, 1, false, &known());
+        assert_identity(&c2, &h2);
+
+        let mut h3 = vec![sys("s")];
+        for n in 1..=6 {
+            h3.extend(native_turn(n));
+        }
+        let c3 = collapse_tool_context_older_than(&h3, usize::MAX, false, &known());
+        assert_identity(&c3, &h3);
     }
 }

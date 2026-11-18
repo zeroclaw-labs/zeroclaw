@@ -11,7 +11,7 @@ use tokio::sync::mpsc;
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
 use zeroclaw_config::schema::FilesystemConfig;
 use zeroclaw_runtime::sop::audit::SopAuditLogger;
-use zeroclaw_runtime::sop::dispatch::dispatch_untrusted_fan_in;
+use zeroclaw_runtime::sop::dispatch::dispatch_untrusted_fan_in_driven;
 use zeroclaw_runtime::sop::engine::SopEngine;
 use zeroclaw_runtime::sop::types::{FilesystemEventKind, SopTriggerSource};
 
@@ -27,6 +27,7 @@ pub struct FilesystemChannel {
     alias: String,
     engine: Arc<Mutex<SopEngine>>,
     audit: Arc<SopAuditLogger>,
+    driver_sink: Option<zeroclaw_runtime::sop::SopDriverSink>,
 }
 
 /// Construction parameters for [`FilesystemChannel`].
@@ -35,6 +36,7 @@ pub struct FilesystemChannelConfig {
     pub alias: String,
     pub engine: Arc<Mutex<SopEngine>>,
     pub audit: Arc<SopAuditLogger>,
+    pub driver_sink: Option<zeroclaw_runtime::sop::SopDriverSink>,
 }
 
 impl FilesystemChannel {
@@ -44,6 +46,7 @@ impl FilesystemChannel {
             alias: cfg.alias,
             engine: cfg.engine,
             audit: cfg.audit,
+            driver_sink: cfg.driver_sink,
         }
     }
 
@@ -78,6 +81,12 @@ impl FilesystemChannel {
     ) -> anyhow::Result<()> {
         let config = &self.config;
         config.validate()?;
+        // `validate` reads each path as written. Also refuse one that resolves
+        // on disk to a broad root, but keep watching the path as written so
+        // event paths and trigger matching stay the same.
+        for path in &config.paths {
+            config.validate_resolved_path(path)?;
+        }
         let include = self.compile_globs_or_log(&config.include, "include")?;
         let exclude = self.compile_globs_or_log(&config.exclude, "exclude")?;
 
@@ -184,9 +193,10 @@ impl FilesystemChannel {
                 "Filesystem channel: dispatching '' ''"
             );
 
-            dispatch_untrusted_fan_in(
+            dispatch_untrusted_fan_in_driven(
                 &self.engine,
                 &self.audit,
+                self.driver_sink.as_ref(),
                 SopTriggerSource::Filesystem,
                 Some(&path_str),
                 Some(&payload.to_string()),
@@ -898,7 +908,35 @@ mod tests {
             alias: alias.into(),
             engine: Arc::new(Mutex::new(SopEngine::new(Default::default()))),
             audit: Arc::new(SopAuditLogger::new(memory)),
+            driver_sink: None,
         })
+    }
+
+    /// A configured path that reads as an ordinary folder but resolves on
+    /// disk to a broad root must stop the listener before it watches anything.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn listener_refuses_path_that_resolves_to_broad_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("whole-disk");
+        std::os::unix::fs::symlink("/", &link).unwrap();
+        let channel = test_channel(
+            FilesystemConfig {
+                paths: vec![link.to_string_lossy().to_string()],
+                ..FilesystemConfig::default()
+            },
+            "fs-resolved-root",
+        );
+
+        let (probe_tx, _probe_rx) = mpsc::channel(1);
+        let err = channel
+            .watch_and_dispatch(&probe_tx)
+            .await
+            .expect_err("a path that resolves to `/` must fail the listener closed");
+        assert!(
+            err.to_string().contains("resolves to broad system root"),
+            "got: {err}"
+        );
     }
 
     /// Regression for the blocking `std::sync::mpsc::Receiver::recv()` in the
@@ -988,6 +1026,7 @@ mod tests {
         };
         let memory = Arc::new(zeroclaw_memory::NoneMemory::new("fs-proof"));
         let channel = FilesystemChannel::new(FilesystemChannelConfig {
+            driver_sink: None,
             config,
             alias: "fs-proof".into(),
             engine: Arc::new(Mutex::new(SopEngine::new(Default::default()))),

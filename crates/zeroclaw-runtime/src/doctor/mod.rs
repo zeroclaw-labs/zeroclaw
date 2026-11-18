@@ -1,3 +1,7 @@
+use crate::agent::system_prompt::{
+    BOOTSTRAP_FILES, BOOTSTRAP_MAX_CHARS, COMPACT_BOOTSTRAP_MAX_CHARS, CONDITIONAL_BOOTSTRAP_FILES,
+    truncate_bootstrap_content,
+};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use std::io::Write;
@@ -532,19 +536,40 @@ pub fn persist_model_cache(
     // let two concurrent refreshes collide on the same inode, or let a
     // pre-existing symlink at that predictable path get followed and
     // truncated; `tempfile` picks a fresh random name each call and removes
-    // the file automatically if we return before `persist`.
+    // the file automatically if we return before the rename.
     let mut tmp = tempfile::Builder::new()
         .prefix(MODEL_CACHE_FILE)
         .suffix(".tmp")
-        .tempfile_in(&cache_dir)
+        .make_in(&cache_dir, create_staging_file)
         .context("Failed to create model cache temp file")?;
     tmp.write_all(json.as_bytes())
         .context("Failed to write model cache temp file")?;
-    tmp.persist(&cache_path)
-        .map_err(|e| e.error)
-        .context("Failed to rename model cache temp file")?;
+    let mut staged = tmp.into_temp_path();
+    // `std::fs::rename`, not `persist`: the channel reader behind `/model`
+    // opens this cache without the refresh lock, and on Windows `persist` is
+    // a bare `MoveFileExW`, which cannot replace a file that any reader holds
+    // open. `rename` retries that refusal with POSIX semantics, which swap the
+    // name while open readers keep the old contents, as long as they opened it
+    // with delete sharing (std's own opens do). On Unix both are rename(2).
+    std::fs::rename(&staged, &cache_path).context("Failed to rename model cache temp file")?;
+    // The staging name no longer exists, so there is nothing left to clean up.
+    staged.disable_cleanup(true);
 
     Ok(())
+}
+
+/// Create a staging file the way `NamedTempFile::new_in` does (exclusively,
+/// owner-only on Unix) but without the Windows temporary attribute: `persist`
+/// would clear that attribute, and the plain rename that publishes the file
+/// would carry it onto the cache.
+fn create_staging_file(path: &Path) -> std::io::Result<std::fs::File> {
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    options.open(path)
 }
 
 pub async fn run_models(
@@ -1449,10 +1474,9 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
     }
 
     // Delegate agents: model_provider validity (resolved from model_provider alias)
-    let mut agent_names: Vec<_> = config.agents.keys().collect();
-    agent_names.sort();
-    for name in agent_names {
-        let agent = config.agents.get(name).unwrap();
+    let mut agents: Vec<_> = config.agents.iter().collect();
+    agents.sort_by_key(|(name, _)| *name);
+    for (name, agent) in agents {
         let provider_ref = agent.model_provider.as_str();
         if provider_ref.is_empty() {
             continue;
@@ -1648,6 +1672,73 @@ fn check_workspace(config: &Config, items: &mut Vec<DiagItem>) {
         let agent_ws = config.agent_workspace_dir(alias);
         check_agent_file(&agent_ws, "SOUL.md", alias, cat, items);
         check_agent_file(&agent_ws, "AGENTS.md", alias, cat, items);
+        check_agent_bootstrap_truncation(config, alias, &agent_ws, cat, items);
+    }
+}
+
+/// Prospective check of the per-file bootstrap cap the agent-loop and
+/// channel prompt paths apply, not a record of what any one turn sent:
+/// ACP (`Agent`) sessions build their prompt through
+/// `personality::load_personality_files`, whose separate file list and
+/// 20000-character cap this check does not describe; AIEOS identities are
+/// skipped because they load no Markdown bootstrap file at all; and
+/// `BOOTSTRAP.md` and `MEMORY.md` are only injected on turns that include
+/// them. Warns once per over-cap file with the counts the per-file stage
+/// retains, measured through the same function prompt injection uses. Files
+/// that are missing, empty, or under the cap stay silent.
+fn check_agent_bootstrap_truncation(
+    config: &Config,
+    alias: &str,
+    workspace_dir: &Path,
+    cat: &'static str,
+    items: &mut Vec<DiagItem>,
+) {
+    // AIEOS identities return from `append_project_context` before any
+    // Markdown bootstrap file loads; a configured-but-unloadable AIEOS
+    // identity falls back to the Markdown files, which doctor then
+    // under-reports rather than misreports.
+    let Some(agent_cfg) = config.agents.get(alias) else {
+        return;
+    };
+    if crate::identity::is_aieos_configured(&agent_cfg.identity) {
+        return;
+    }
+    let compact = config.effective_compact_context(alias);
+    let limit = if compact {
+        COMPACT_BOOTSTRAP_MAX_CHARS
+    } else {
+        BOOTSTRAP_MAX_CHARS
+    };
+    let profile = agent_cfg.runtime_profile.trim();
+    for &name in BOOTSTRAP_FILES.iter().chain(CONDITIONAL_BOOTSTRAP_FILES) {
+        let Ok(content) = std::fs::read_to_string(workspace_dir.join(name)) else {
+            continue;
+        };
+        let (_, Some(truncation)) = truncate_bootstrap_content(&content, limit) else {
+            continue;
+        };
+        let retained = truncation.retained_chars.to_string();
+        let total = truncation.total_chars.to_string();
+        let discarded = truncation.discarded_chars().to_string();
+        let limit_arg = limit.to_string();
+        let mut args = vec![
+            ("alias", alias),
+            ("file", name),
+            ("retained", retained.as_str()),
+            ("total", total.as_str()),
+            ("discarded", discarded.as_str()),
+            ("limit", limit_arg.as_str()),
+        ];
+        let key = if !compact {
+            "cli-doctor-bootstrap-file-truncated"
+        } else if profile.is_empty() {
+            "cli-doctor-bootstrap-file-truncated-compact-no-profile"
+        } else {
+            args.push(("profile", profile));
+            "cli-doctor-bootstrap-file-truncated-compact"
+        };
+        let msg = crate::i18n::get_required_cli_string_with_args(key, &args);
+        items.push(DiagItem::warn(cat, msg));
     }
 }
 
@@ -2397,24 +2488,69 @@ mod tests {
         assert_eq!(ch_item.unwrap().severity, Severity::Warn);
     }
 
+    /// The Codex argument warning is raised where the tool is compiled in. In
+    /// a build without it, an enabled `[codex_cli]` is reported once, as
+    /// compiled out, and its arguments, which reach no process, are not.
     #[test]
-    fn diagnose_surfaces_codex_cli_security_boundary_warning() {
+    fn diagnose_surfaces_codex_cli_warnings_for_the_build() {
+        use zeroclaw_config::opt_in_tools::OptInTool;
         let mut config = Config::default();
+        config.codex_cli.enabled = true;
         config.codex_cli.extra_args =
             vec!["--sandbox".to_string(), "danger-full-access".to_string()];
 
         let results = diagnose(&config);
-        let warning = results.iter().find(|item| {
+        let argument_warning = results.iter().find(|item| {
             item.category == "config"
                 && item.severity == Severity::Warn
                 && item.message.contains("Codex CLI argument")
                 && item.message.contains("--sandbox")
                 && item.message.contains("codex_cli.extra_args[0]")
         });
-        assert!(
-            warning.is_some(),
-            "doctor should surface the canonical Codex CLI warning: {results:?}"
-        );
+        let compiled_out = results
+            .iter()
+            .filter(|item| item.message.contains("tool-codex-cli"))
+            .count();
+        if OptInTool::CodexCli.compiled() {
+            assert!(
+                argument_warning.is_some(),
+                "doctor should surface the canonical Codex CLI warning: {results:?}"
+            );
+            assert_eq!(compiled_out, 0, "{results:?}");
+        } else {
+            assert!(argument_warning.is_none(), "{results:?}");
+            assert_eq!(compiled_out, 1, "{results:?}");
+        }
+    }
+
+    /// A build without an opt-in tool reports an enabled section for it once,
+    /// as compiled out, and nothing about the tool's own settings; a build
+    /// with the tool reports no such line.
+    #[test]
+    fn diagnose_reports_an_enabled_tool_the_build_lacks_once() {
+        use zeroclaw_config::opt_in_tools::OptInTool;
+        let mut config = Config::default();
+        config.project_intel.enabled = true;
+        config.project_intel.templates_dir = Some("/nonexistent/zeroclaw-templates".into());
+
+        let results = diagnose(&config);
+        let compiled_out: Vec<_> = results
+            .iter()
+            .filter(|item| item.message.contains("tool-project-intel"))
+            .collect();
+        if OptInTool::ProjectIntel.compiled() {
+            assert!(compiled_out.is_empty(), "{results:?}");
+        } else {
+            assert_eq!(compiled_out.len(), 1, "{results:?}");
+            assert_eq!(compiled_out[0].severity, Severity::Warn);
+            assert!(compiled_out[0].message.contains("project_intel.enabled"));
+            assert!(
+                !results
+                    .iter()
+                    .any(|item| item.message.contains("templates_dir")),
+                "nothing about the settings of a tool the build lacks: {results:?}"
+            );
+        }
     }
 
     #[test]
@@ -2673,6 +2809,31 @@ mod tests {
         );
         let raw = std::fs::read_to_string(state_dir.join(MODEL_CACHE_FILE)).unwrap();
         assert!(raw.contains("openrouter"));
+    }
+
+    /// The channel reader behind `/model` opens the cache without the refresh
+    /// lock, so it can hold the file open while a refresh replaces it. That
+    /// must not stop the refresh, and the reader keeps the catalog it opened.
+    /// Windows refuses a plain replace of an open file, so this pins the
+    /// replace itself rather than leaving it to a race.
+    #[test]
+    fn persist_model_cache_replaces_a_cache_a_reader_holds_open() {
+        let tmp = TempDir::new().unwrap();
+        let config = config_with_install_root(&tmp);
+        persist_model_cache(&config, "openrouter", &["old-model".to_string()]).unwrap();
+        let cache_path = tmp.path().join("state").join(MODEL_CACHE_FILE);
+        let mut held = std::fs::File::open(&cache_path).unwrap();
+
+        persist_model_cache(&config, "openrouter", &["new-model".to_string()])
+            .expect("an open reader must not stop the refresh");
+
+        let held_cache = std::io::read_to_string(&mut held).unwrap();
+        assert!(held_cache.contains("old-model"), "{held_cache}");
+        let raw = std::fs::read_to_string(&cache_path).unwrap();
+        assert!(
+            raw.contains("new-model") && !raw.contains("old-model"),
+            "{raw}"
+        );
     }
 
     #[tokio::test]
@@ -3291,6 +3452,234 @@ mod tests {
                 "expected per-agent SOUL.md diagnostic for {alias}; got {messages:?}"
             );
         }
+    }
+
+    #[test]
+    fn check_workspace_reports_bootstrap_files_over_the_compact_cap() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = workspace_test_config(tmp.path());
+        // No runtime profile: compact_context defaults on, so the cap is 6000.
+        add_enabled_agent(&mut config, "alpha");
+
+        let ws = config.agent_workspace_dir("alpha");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(ws.join("AGENTS.md"), "a".repeat(7_000)).unwrap();
+        std::fs::write(ws.join("SOUL.md"), "s".repeat(100)).unwrap();
+        std::fs::write(ws.join("MEMORY.md"), "m".repeat(6_500)).unwrap();
+
+        let mut items = Vec::new();
+        check_workspace(&config, &mut items);
+
+        let warns: Vec<&DiagItem> = items
+            .iter()
+            .filter(|item| item.severity == Severity::Warn)
+            .collect();
+        let warn_messages: Vec<&str> = warns.iter().map(|i| i.message.as_str()).collect();
+        assert_eq!(
+            warns.len(),
+            2,
+            "only the two over-cap rows: {warn_messages:?}"
+        );
+        assert!(warns.iter().any(|item| {
+            item.message.contains("[alpha] AGENTS.md: ")
+                && item
+                    .message
+                    .contains("per-file cap retains 6000 of 7000 chars (1000 discarded")
+        }));
+        assert!(warns.iter().any(|item| {
+            item.message.contains("[alpha] MEMORY.md: ")
+                && item
+                    .message
+                    .contains("per-file cap retains 6000 of 6500 chars (500 discarded")
+        }));
+        assert!(
+            warns
+                .iter()
+                .all(|item| item.message.contains("runtime_profile = \"<name>\"")),
+            "the no-profile variant says to create and assign a profile: {warn_messages:?}"
+        );
+        assert!(
+            !warns
+                .iter()
+                .any(|item| item.message.contains("[runtime_profiles.<profile>]")),
+            "the no-profile variant must not point at an unassigned profile section: {warn_messages:?}"
+        );
+        assert!(
+            !items
+                .iter()
+                .any(|item| item.message.contains("SOUL.md: per-file cap")),
+            "SOUL.md is under the cap and must stay quiet"
+        );
+    }
+
+    #[test]
+    fn check_workspace_names_the_assigned_profile_when_one_is_set() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = workspace_test_config(tmp.path());
+        config.runtime_profiles.insert(
+            "nightly".to_string(),
+            zeroclaw_config::schema::RuntimeProfileConfig {
+                compact_context: None,
+                ..Default::default()
+            },
+        );
+        config.agents.insert(
+            "alpha".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: true,
+                runtime_profile: "nightly".into(),
+                ..Default::default()
+            },
+        );
+
+        let ws = config.agent_workspace_dir("alpha");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(ws.join("SOUL.md"), "s".repeat(100)).unwrap();
+        std::fs::write(ws.join("AGENTS.md"), "a".repeat(7_000)).unwrap();
+        std::fs::write(ws.join("MEMORY.md"), "m".repeat(6_500)).unwrap();
+
+        let mut items = Vec::new();
+        check_workspace(&config, &mut items);
+
+        let agents_row = items
+            .iter()
+            .find(|item| {
+                item.message.contains("[alpha] AGENTS.md: ")
+                    && item
+                        .message
+                        .contains("per-file cap retains 6000 of 7000 chars")
+            })
+            .expect("one over-cap AGENTS.md row");
+        assert!(
+            agents_row
+                .message
+                .contains("per-file cap retains 6000 of 7000 chars (1000 discarded"),
+            "counts come through the shared helper: {}",
+            agents_row.message
+        );
+        assert!(
+            agents_row.message.contains("[runtime_profiles.nightly]"),
+            "the compact variant names the assigned profile: {}",
+            agents_row.message
+        );
+        assert!(
+            !agents_row.message.contains("<name>"),
+            "an assigned profile replaces the <name> placeholder: {}",
+            agents_row.message
+        );
+    }
+
+    #[test]
+    fn check_workspace_skips_bootstrap_truncation_for_aieos_identities() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = workspace_test_config(tmp.path());
+        config.agents.insert(
+            "nova".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: true,
+                identity: zeroclaw_config::schema::IdentityConfig {
+                    format: "aieos".into(),
+                    aieos_inline: Some(r#"{"identity":{"names":{"first":"Nova"}}}"#.into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+
+        let ws = config.agent_workspace_dir("nova");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(ws.join("AGENTS.md"), "a".repeat(7_000)).unwrap();
+        std::fs::write(ws.join("SOUL.md"), "s".repeat(100)).unwrap();
+
+        let mut items = Vec::new();
+        check_workspace(&config, &mut items);
+
+        assert!(
+            !items
+                .iter()
+                .any(|item| item.message.contains("per-file cap")),
+            "an AIEOS identity loads no Markdown bootstrap file, so no truncation row: {:?}",
+            items.iter().map(|i| i.message.as_str()).collect::<Vec<_>>()
+        );
+        assert!(
+            items
+                .iter()
+                .any(|item| item.message.contains("[nova] SOUL.md present")),
+            "the SOUL.md presence row still appears"
+        );
+        assert!(
+            items
+                .iter()
+                .any(|item| item.message.contains("[nova] AGENTS.md present")),
+            "the AGENTS.md presence row still appears"
+        );
+    }
+
+    #[test]
+    fn check_workspace_uses_the_full_cap_when_compact_context_is_off() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = workspace_test_config(tmp.path());
+        config.runtime_profiles.insert(
+            "wide".to_string(),
+            zeroclaw_config::schema::RuntimeProfileConfig {
+                compact_context: Some(false),
+                ..Default::default()
+            },
+        );
+        config.agents.insert(
+            "alpha".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: true,
+                runtime_profile: "wide".into(),
+                ..Default::default()
+            },
+        );
+
+        let ws = config.agent_workspace_dir("alpha");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(ws.join("SOUL.md"), b"# soul").unwrap();
+
+        // Over the compact cap but far under the full cap: no truncation row.
+        std::fs::write(ws.join("AGENTS.md"), "a".repeat(7_000)).unwrap();
+        let mut items = Vec::new();
+        check_workspace(&config, &mut items);
+        assert!(
+            !items
+                .iter()
+                .any(|item| item.message.contains("per-file cap")),
+            "7000 chars is under the full cap and must stay quiet: {:?}",
+            items.iter().map(|i| &i.message).collect::<Vec<_>>()
+        );
+
+        // Over the 20000-char full cap: one row, without the compact knob.
+        std::fs::write(ws.join("AGENTS.md"), "a".repeat(20_500)).unwrap();
+        let mut items = Vec::new();
+        check_workspace(&config, &mut items);
+        let warns: Vec<&DiagItem> = items
+            .iter()
+            .filter(|item| item.severity == Severity::Warn)
+            .collect();
+        assert_eq!(
+            warns.len(),
+            1,
+            "only the over-cap AGENTS.md row: {}",
+            warns
+                .iter()
+                .map(|i| i.message.as_str())
+                .collect::<Vec<_>>()
+                .join(" | ")
+        );
+        assert!(
+            warns[0].message.contains("[alpha] AGENTS.md: ")
+                && warns[0]
+                    .message
+                    .contains("per-file cap retains 20000 of 20500 chars (500 discarded")
+        );
+        assert!(
+            !warns[0].message.contains("compact_context = false"),
+            "the non-compact variant must not name the knob: {}",
+            warns[0].message
+        );
     }
 
     /// `doctor` renders this warning through Fluent rather than printing the

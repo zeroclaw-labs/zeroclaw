@@ -47,12 +47,14 @@ omits the compiled component.
 - **Sandboxed by default.** The host loads each plugin into a WASI context with
   no filesystem preopens and no ambient network. A plugin cannot quietly reach
   the host; it gets exactly the host functions wired into its world and nothing
-  more. Outbound HTTP is the one network surface that can be opened, and it is
-  governed in two layers: the manifest's `http_client` grant selects whether
-  the adapter links the `wasi:http` *surface*, and the operator's per-instance
-  `plugins.entries.<key>.egress_hosts` grant selects the *reach*. The tool and
-  channel adapters link the surface; memory currently withholds it. With no
-  egress grant the reach is deny-all, so a linked surface alone sends nothing.
+  more. Outbound HTTP, raw sockets, and WebSocket are the network surfaces that
+  can be opened, and each is governed in two layers: the manifest grant
+  (`http_client`, `socket_client`, or `websocket_client`) selects whether the
+  adapter links that *surface*, and the operator's per-instance
+  `plugins.entries.<key>.egress_hosts` grant selects the *reach*, shared by all
+  three. The tool and channel adapters link the surfaces; memory currently
+  withholds them. With no egress grant the reach is deny-all, so a linked
+  surface alone sends nothing.
 - **Verifiable provenance.** Manifests can be Ed25519-signed, and an operator
   can require signatures from trusted publishers before any plugin loads.
 
@@ -61,26 +63,33 @@ omits the compiled component.
 These are real limits of the current host, not style preferences. Know them
 before you design around a capability that is not there.
 
-- **`logging`, typed config, instance-scoped secrets, `http_client`, and host-fed
-  inbound are wired.** Of the permissions a manifest can declare,
-  `config_read` exposes the plugin's own schema-validated public config. A tool
-  or channel schema can designate secrets withheld from public config and
-  resolved in authorized service calls. An `http_client` grant is necessary
-  for outbound `wasi:http`, but it is not sufficient: the capability adapter
-  must link that host surface (tool and channel do; memory intentionally
-  remains HTTP-free until its network boundary has component-level coverage),
-  and the operator must grant destinations through `egress_hosts`. Without
-  that grant every destination is refused before a packet leaves or a name is
-  resolved. Filesystem and
+- **`logging`, typed config, instance-scoped secrets and durable state,
+  `http_client`, and host-fed inbound are wired.** Of the permissions a
+  manifest can declare, `config_read` exposes the plugin's own schema-validated
+  public config. A tool or channel schema can designate secrets withheld from
+  public config and resolved in authorized service calls. `state_read` and
+  `state_write` gate encrypted, compare-and-swap state owned by the exact
+  admitted instance. An `http_client` grant is necessary for outbound
+  `wasi:http`, but it is not sufficient: the capability adapter must link that
+  host surface (tool and channel do; memory intentionally remains HTTP-free
+  until its network boundary has component-level coverage), and the operator
+  must grant destinations through `egress_hosts`. Without that grant every
+  destination is refused before a packet leaves or a name is resolved.
+  `socket_client` and `websocket_client` link the `sockets` and `websocket`
+  imports on the same terms: the same grant, address-class rules, and
+  per-instance connection budget. A grant names hosts, not ports: with
+  `socket_client`, a granted host is reachable over raw TCP on any port, so
+  grant only hosts the plugin may speak any protocol to. Filesystem and
   memory-access permissions are still accepted by the manifest schema but
   inert: their host functions are not yet registered in the linker. See
   Permissions and Host imports below.
 - **No ambient host network or filesystem.** The WASI context has no preopens and
   no ambient network, so a plugin cannot open raw sockets or read host files
   through ambient WASI. A tool or channel plugin with an `http_client` grant
-  gets outbound `wasi:http`, reaching only the destinations its operator
-  egress grant lists; memory plugins currently get no HTTP surface. No plugin
-  can listen.
+  gets outbound `wasi:http`, and one with `socket_client` or
+  `websocket_client` gets host-mediated TCP/TLS/STARTTLS or WebSocket
+  connections, all reaching only the destinations its operator egress grant
+  lists; memory plugins currently get none of these. No plugin can listen.
   Channel plugins that must receive inbound traffic do not open a listener
   themselves: the host runs the listener and feeds messages through the
   `inbound` import, which the plugin drains from its `poll-message` export.
@@ -182,8 +191,23 @@ or treating registry metadata as proof that code was installed.
 
 `zeroclaw plugin install <name>` resolves the name from the registry, downloads
 the selected zip archive, verifies the optional SHA-256 digest, safely extracts
-the archive, and then hands the extracted plugin directory to the existing
-`PluginHost::install` path. Local path installs are unchanged:
+the archive, and then hands the extracted plugin directory to the same
+admission path a local install uses. Admission (`PluginHost::admit_source`)
+parses and signature-checks the manifest, validates its shape and config,
+refuses a name that is already installed, and reads the component once: the
+path must stay inside the package with no symlink on it, the read is capped at
+64 MiB and refused from the file's metadata when it is larger, and the
+optional `wasm_sha256` digest is checked. The CLI then runs the install-time
+load check against those admitted bytes: the same instantiation the
+daemon performs at startup, so a component built against a drifted WIT fails
+at install with its full diagnostic instead of being skipped silently later.
+`plugin install --no-verify` skips the load check entirely (nothing is
+compiled) and prints a note; it does not bypass admission. A host built
+without a WASM backend has nothing to instantiate against and installs without
+the check. Installation (`PluginHost::install_admitted`) then persists the
+admitted manifest bytes and writes the admitted component bytes, so what
+was verified is byte for byte what the daemon will load. Local path installs
+follow the same sequence:
 
 When no version is pinned, ZeroClaw chooses the last matching entry in the
 registry index, so registry publishers should order repeated names
@@ -192,6 +216,22 @@ intentionally.
 ```bash
 zeroclaw plugin install ./my-plugin
 zeroclaw plugin install ./my-plugin/manifest.toml
+```
+
+`zeroclaw plugin update` replaces an installed package through the same
+admission (`PluginHost::admit_update`) with the identity decided the other way
+round: the named package must be installed, and the source must carry its
+name. The CLI refuses authority the new manifest adds unless `--allow` accepts
+it, runs the same load check with no way to skip it, and
+`PluginHost::update_admitted` builds the replacement in a staging directory
+before renaming it into the installed package's place. The operator-facing
+contract is in [Updating a plugin](../plugins/index.md#updating-a-plugin).
+
+```bash
+zeroclaw plugin update team-calendar
+zeroclaw plugin update team-calendar@0.2.0 --registry https://example.invalid/registry.json
+zeroclaw plugin update --all
+zeroclaw plugin update my-plugin --from ./my-plugin
 ```
 
 The default registry URL is:
@@ -210,7 +250,7 @@ Registry entries use this shape:
   "plugins": [
     {
       "name": "team-calendar",
-      "version": "0.8.5",
+      "version": "0.9.0",
       "description": "Schedule meetings on a team calendar",
       "author": "Example Team",
       "capabilities": ["tool"],
@@ -228,6 +268,15 @@ rejected before install. Downloads are capped while streaming, so a server
 without `Content-Length` cannot force ZeroClaw to buffer an oversized archive.
 Extraction is also capped, so a compressed archive cannot expand without bound
 in the temporary install area.
+
+Registry requests are bounded in time. Connecting to the registry or archive
+host may take at most 10 seconds, and a response may go at most 30 seconds
+without delivering data, both before its headers arrive and between reads of
+its body. Fetching the index must finish within 30 seconds, and downloading an
+archive within 30 minutes. A stalled registry or archive host therefore fails
+`zeroclaw plugin search` or `zeroclaw plugin install` instead of leaving it
+waiting, while a slow archive download that keeps delivering data is limited
+only by the 30-minute bound.
 
 Search is unauthenticated discovery. Install is the security boundary: registry
 installs use the configured plugin signature policy and trusted publisher keys,
@@ -286,7 +335,8 @@ bundle (`validate_manifest_shape` in `host.rs`).
 `crates/zeroclaw-plugins/src/lib.rs`. Read the enum for the canonical set.
 
 Be aware of the gap between declared and enforced: in the component host today
-`config_read` and `http_client` have behavioral effect. Requesting
+`config_read`, `http_client`, `state_read`, and `state_write` have behavioral
+effect. Requesting
 `config_read` requires a `config_schema`, and declaring that schema without the
 permission is also rejected. Before a tool or channel component is used, the
 host resolves its effective grant, materializes the plugin's operator values to
@@ -309,7 +359,10 @@ granted host that resolves to a loopback, private, or link-local address is
 still refused unless the operator also lists it under
 `plugins.entries.<key>.egress_allow_private`, a carveout that relaxes the
 address class for an already-granted destination and never grants one (see
-[Plugins](../plugins/index.md) for the operator side). The remaining variants
+[Plugins](../plugins/index.md) for the operator side). The state permissions
+independently gate the `state.get` and `state.put`/`delete` imports for tool
+and channel service frames. Package, capability, and binding come only from the
+admitted host scope; a guest supplies no namespace. The remaining variants
 (`file_read`, `file_write`, `memory_read`, `memory_write`) are accepted by the
 manifest schema but are not yet wired to a host import: declaring them grants
 nothing on its own. They reserve the names for the host functions that will
@@ -329,8 +382,13 @@ signatures.
 `wit/v0/` defines three worlds, bound by `bindgen!` in `component.rs`. Each
 imports `logging` (host) and exports `plugin-info` plus its primary interface:
 `tool-plugin` exports `tool`, `channel-plugin` exports `channel`, and
-`memory-plugin` exports `memory`. Tool also imports `secrets`; channel imports
-`config`, `secrets`, and `inbound`. The required (no-default) exports for each
+`memory-plugin` exports `memory`. Tool also imports `secrets` and `state`;
+channel imports `config`, `secrets`, `state`, and `inbound`. Tool and channel
+additionally import `sockets` and `websocket` behind their own features
+(`plugins-wit-v0-sockets`, `plugins-wit-v0-websocket`); the host links each only
+for an instance holding the matching grant, so a component that imports one
+without the grant fails to instantiate. The required
+(no-default) exports for each
 world are listed in the world's doc comment in its `.wit` file.
 
 ### `tool` interface
@@ -554,6 +612,101 @@ plugin **must** resolve secrets at each point of use and must not retain a secon
 copy in warm state. The host cannot enforce non-retention after returning the
 plaintext.
 
+Secret property names use the same portable plugin-local grammar as state keys:
+1–128 ASCII bytes containing only letters, digits, `_`, `-`, or `.`. URI, path,
+namespace, control, and non-ASCII syntax is rejected during manifest admission.
+
+### `state`
+
+`wit/v0/state.wit` is imported by the tool and channel worlds. It provides
+encrypted durable byte values owned by the exact admitted package, capability,
+and binding:
+
+```wit
+get: func(key: string) -> result<option<state-entry>, state-error>;
+put: func(key: string, value: list<u8>, expected-revision: option<u64>)
+    -> result<u64, state-error>;
+delete: func(key: string, expected-revision: u64) -> result<_, state-error>;
+```
+
+`state_read` permits `get`; `state_write` permits `put` and `delete`. `none` on
+`put` is an absent-key compare-and-swap, while `some(revision)` must match the
+current revision exactly. Writes return the new revision. Revisions are opaque
+and never reused within an instance, so a key deleted and recreated cannot
+satisfy a stale compare-and-swap. Keys use the portable
+plugin-local grammar above and cannot select another instance. State is
+available only during tool execution and channel service frames; static calls,
+host-call budget exhaustion, storage/key failures, and integrity failures return
+closed errors. Fixed per-instance entry, value, and total-size quotas return
+`quota-exceeded` rather than partially committing a write.
+
+The runtime stores one authenticated envelope per value in
+`data/plugin-state.db`, encrypted with the install's existing `.secret_key`.
+The database contains only keyed blind indexes and `enc2:` ciphertext. Missing
+or replaced install keys fail closed and are never silently regenerated while
+durable rows exist. Back up the database and `.secret_key` together.
+
+### `sockets`
+
+Host-mediated outbound TCP. `connect` takes a host, port, mode, and optional
+TLS profile, and returns a `connection` resource:
+
+- `plaintext`: raw TCP. Reachable wherever the operator granted the host;
+  there is no separate plaintext exception (ADR-014).
+- `direct-tls`: TLS is established before `connect` returns.
+- `start-tls`: the connection starts in a negotiation phase where only
+  `send-negotiation` and `receive-negotiation` work. `upgrade-tls` commits the
+  stream to TLS in place; failure closes it, and there is no plaintext retry.
+
+The host resolves the destination once, dials only the checked addresses, and
+holds the instance's connection lease until the resource is dropped. TLS
+verifies against the same roots as plugin HTTPS unless the request names a TLS
+profile. `receive` never blocks; it returns `idle` when nothing is buffered.
+Failures are the typed `socket-error` cases.
+
+### `websocket`
+
+Host-mediated outbound WebSocket. `connect` takes a plaintext (`ws`) or TLS
+(`wss`) WebSocket URL,
+extra headers, offered subprotocols, and an optional TLS profile, and returns a
+`connection` resource with `send`, `receive`, `close`, and
+`negotiated-subprotocol`. The host owns DNS, the destination decision, TLS, the
+upgrade handshake, and bounded queues; headers that belong to the handshake
+(`Host`, `Connection`, `Upgrade`, `Sec-WebSocket-*`) are refused. `receive`
+never blocks, and once the terminal `closed` or `failed` event has been
+drained it returns the `closed` error rather than `none`. Dropping the resource closes the socket and releases the
+connection lease.
+
+### TLS profiles
+
+A `sockets` or `websocket` request may name a TLS profile the operator
+configured on the instance (`[[plugins.entries.tls_profiles]]`). A profile
+selects which certificate authorities to trust and, optionally, a client
+certificate for mutual TLS, read from the instance's `x-secret` properties. It
+never grants a destination: the request must first pass `egress_hosts`, and
+the profile must also cover the host. Naming a profile on a plaintext
+connection is an invalid request. The properties a profile references are
+host-only: `secrets.get` returns `access-denied` for them, so the plugin never
+holds the private key it authenticates with.
+
+The host builds each connection's TLS configuration when that connection
+opens, from the configuration revision of the service frame that opens it, and
+the connection owns it. The frame's transient material is paired only with an
+authorization derived from matching canonical configuration inputs. If policy,
+profile references, or material changes between those views (including while
+DNS is pending), opening the connection fails closed rather than combining
+revisions. The comparison covers the instance's whole configuration entry (its
+grants, its TLS profiles, and every config value) and the deployment's NAT64
+prefixes and connection limit, so any such edit made while a frame runs fails
+that frame's later connections that use a custom CA or client identity. A
+later frame resolves rotated material; already-open connections are unchanged. Egress grants remain checked on each request, so a removed
+profile or grant refuses the next connection. System roots are the exception: a profile that keeps them,
+and a connection without a profile, use the roots plugin HTTPS trusts, which
+are read once per process. A connection that is already open keeps the
+identity it presented in its handshake until it is dropped or closed. Dropping
+it, or cancelling the call that is still opening it, releases the
+configuration together with the connection lease.
+
 ### Per-plugin config (`__config` and `config.get`)
 
 **Permission:** `config_read`
@@ -622,6 +775,66 @@ Tool and channel are the current config consumers. The memory world has no
 config import yet, so memory plugins must not request `config_read` until that
 ABI and runtime wiring land.
 
+### Declared egress (`[egress]`)
+
+**Applies to:** any plugin requesting a transport permission (`http_client`)
+
+A manifest may carry an optional `[egress]` table naming the destinations the
+plugin declares it needs:
+
+```toml
+[egress]
+hosts = ["api.example.com", "*.cdn.example.com"]
+```
+
+Entries use the strict egress grammar: exact hosts or explicit `*.suffix`
+patterns, with no allow-all form. Invalid grammar rejects the whole manifest at
+discovery and at install. The table is part of the canonical manifest bytes, so
+a signed manifest covers it and changing it requires re-signing.
+
+This is an attestation of intent, never a grant. The allowlist the host
+enforces is the operator's `plugins.entries.<instance-key>.egress_hosts`, on the
+same `zpi1_…` row that carries the instance's private `config` map, resolved
+from live config per request rather than snapshotted into the store. A
+component shipping its own `[egress]` table without an operator grant reaches
+nothing. On this release the grant alone governs that check: the declaration is
+not additionally intersected with it at request time, so declaring a host
+neither grants it nor bounds a grant the operator authored. Intersecting the
+two is later rollout work under
+[#8850](https://github.com/zeroclaw-labs/zeroclaw/issues/8850).
+
+What the declaration buys is the install ceremony. `zeroclaw plugin install`
+seeds it into the `[[plugins.entries]]` row it creates, so a first install of a
+plugin that declares its destinations works without the operator transcribing
+hosts, and the seeded values are printed. It never extends a row that already
+exists: an upgrade whose declaration grew prints the difference plus the exact
+`zeroclaw config set` command, and the operator applies it. `zeroclaw plugin
+update` seeds nothing at all, not even into a row it creates, and prints the
+same difference. `zeroclaw plugin list` reports the same gap as a standing
+diagnostic. Declare the destinations your code actually contacts, and treat a
+growing declaration as something every operator has to approve on every
+upgrade.
+
+A channel instance's row is created when an operator binds its alias, with
+`zeroclaw plugin bind <package> --channel-alias <alias>` or with
+`zeroclaw plugin install <source> --channel-alias <alias>`, and the declaration
+is seeded into it only on an explicit `--egress declared`. `--egress none`
+binds with an empty grant instead, and a bind that would create the row with
+neither flag refuses and lists your declared hosts. For a channel instance the
+declaration counts with `websocket_client` or `socket_client` as well as
+`http_client`.
+
+If reinstall finds an unsupported pre-typed-config row keyed by the package
+name, install refuses before creating the derived `zpi1_…` row and prints the
+same ordered update steps as `plugin list`. The package install rolls back and
+the old private config and both egress lists stay untouched until the operator
+updates the beta configuration and retries.
+
+Plugins whose destination is deployment configuration (a self-hosted Gitea, a
+LAN Nextcloud) should declare nothing here. The operator authors that grant
+directly on the instance row, and a manifest that declares nothing is never
+reported as having lost destinations.
+
 ## WASI Component Host
 
 The host (`crates/zeroclaw-plugins/src/component.rs`) compiles and instantiates
@@ -662,10 +875,18 @@ The five bounds are operator-tunable and every value is validated as non-zero:
 (default 100,000), and `plugins.limits.max_instances` (default 64). A store can
 only be built with explicit limits, so no load path can construct an
 unsandboxed plugin. Guest `wasi:http` request options may end a call sooner but
-cannot extend the host deadline. An interrupted warm store is never resumed:
-channels recreate it from host-owned inputs on the next call, while memory
-instances remain unavailable until their owner rebuilds them. The canonical
-fields and defaults live in the
+cannot extend the host deadline. An interrupted warm store is never resumed,
+and neither a channel nor a memory backend reuses a store whose call failed
+inside Wasmtime: after a guest trap, exhausted fuel, or a failed host import,
+Wasmtime refuses every later call into the store, and a result it could not
+lift skips the export's post-return cleanup. Channels recreate the instance
+from host-owned inputs on the next call, waiting when traps and missed
+deadlines, other than in approval and choice prompts, outrun a rebuild budget
+of three at once and one per five minutes after that. Memory instances remain
+unavailable until their owner rebuilds them, and later calls that reach the
+plugin fail with the error a missed deadline leaves. A rebuilt memory instance
+starts empty, because the memory world gives a plugin no storage outside its
+own instance. The canonical fields and defaults live in the
 [Config reference](../reference/index.md).
 
 ### 32-bit address space (wasip2 is wasm32)
@@ -773,23 +994,26 @@ cp -r my-plugin/ ~/.zeroclaw/plugins/my-plugin/
 ## Configuration
 
 Operator values currently enter through generic string-map storage: edit
-`[[plugins.entries]]` in TOML, or use `zeroclaw config set` after a tool install
-has seeded its default-binding entry. `zeroclaw plugin info <package>` prints
-the same tool key for migration and later edits. These automatic print and seed
-surfaces are tool-only. A channel key depends on its configured alias, which
-install and info do not own. The alias-aware construction that resolves a
-channel's typed config from that configured alias landed in
-[#10146](https://github.com/zeroclaw-labs/zeroclaw/pull/10146); automatic
-display and install-time seeding of the channel key remain manual until the
-grant ceremony in
-[#9584](https://github.com/zeroclaw-labs/zeroclaw/pull/9584), so a channel-only
-package still cannot complete this migration through install and info alone.
+`[[plugins.entries]]` in TOML, or use `zeroclaw config set` once the instance's
+entry exists. A tool install seeds its default-binding entry. A channel key
+depends on its configured alias, so a channel instance's entry is seeded when
+that alias is bound, by `zeroclaw plugin bind <package> --channel-alias <alias>`
+or by `zeroclaw plugin install <source> --channel-alias <alias>`. The
+alias-aware construction that resolves a channel's typed config from that
+configured alias landed in
+[#10146](https://github.com/zeroclaw-labs/zeroclaw/pull/10146).
+`zeroclaw plugin info <package>` prints every key the package owns, for
+migration and later edits: the tool binding's, and one per bound alias when the
+installed version owns instance state and an instance can be named by that
+alias. Each such bound alias also gets that instance's readiness, with or
+without a key line: required keys set or missing, the config and egress
+verdicts, and whether the runtime will admit it.
 Schema-driven forms and inline field help are not
 implemented yet. The current surfaces are:
 
 - **The CLI** handles plugin lifecycle with `list`, `search`, `install`,
-  `remove`, `info`, and `migrate`. `zeroclaw config set` writes individual raw
-  plugin values; it does not interpret the plugin's schema.
+  `bind`, `remove`, `info`, and `migrate`. `zeroclaw config set` writes
+  individual raw plugin values; it does not interpret the plugin's schema.
 - **zerocode** can edit ZeroClaw's static plugin-host settings, but does not yet
   generate per-plugin fields from `config_schema`.
 - **The web gateway** is read-only for plugins: `GET /api/plugins` reports the
@@ -827,13 +1051,122 @@ execution backend ships:
   only precompiled `.cwasm` components load.
 - `plugins-wasm-runtime-only` is the smallest and fastest to start: no JIT, so
   components are deserialized from a precompiled `.cwasm`.
-- `plugins-wasm-cranelift` adds the Cranelift JIT, so a `.wasm` component is
-  compiled on load.
-- `plugins-wasm-pulley` is the most portable, supporting compilation on targets
-  Cranelift does not cover.
+- `plugins-wasm-cranelift` adds the Cranelift compiler, so a `.wasm` component
+  is compiled on load. It is the only feature that includes a compiler, and
+  the only one that can load the `.wasm` components the plugin registry
+  publishes.
+- `plugins-wasm-pulley` compiles in wasmtime's Pulley interpreter. ZeroClaw
+  never selects Pulley as a compilation target, so on hosts with a native
+  Cranelift backend the feature changes nothing: alone it behaves like
+  `plugins-wasm-runtime-only`, and with `plugins-wasm-cranelift` it compiles
+  native code. On hosts without a native backend, such as 32-bit ARM,
+  wasmtime targets Pulley by itself.
 
 These delegate to the `zeroclaw-plugins` crate features
 (`plugins-wasmtime`, `plugins-wasm-cranelift`, `plugins-wasm-pulley`) that wire
 up `wasmtime`. The load path keys off whether the Cranelift compiler is in the
 build, as described under WASI Component Host. Read the feature comments in the
 workspace `Cargo.toml` for the authoritative descriptions.
+
+### Plugin support per release artifact
+
+The standard distribution feature set (`cargo generate features --selection
+dist`, resolved per target from the registry in the workspace `Cargo.toml`)
+carries `plugins-wasm-cranelift` on the seven 64-bit desktop and server targets
+and excludes it on 32-bit ARM and the experimental Android target. Which
+artifact carries the host, and what proves it:
+
+| Artifact | Plugin host | Accepted package | Proof |
+|---|---|---|---|
+| CLI archives for x86_64 and aarch64 Linux (glibc and musl), aarch64 and x86_64 macOS, x86_64 Windows | Cranelift compiler, `.wasm` compiled on load | `.wasm` component built against the release's `wit/v0` | the release executes a plugin from each archive on its own platform (the `plugin-smoke` job) before `publish` and `docker` run |
+| CLI archives for armv7 and arm (ARMv6) Linux | none: `plugin` is not a command | none | the registry's per-target policy, pinned by an xtask test |
+| CLI archive for aarch64-linux-android (experimental) | none | none | the same policy |
+| GHCR `latest`, versioned, and `debian` images | Cranelift: they repackage the x86_64 and aarch64 Linux glibc archives | `.wasm` | inherits the archive smoke; nothing runs inside the image |
+| GHCR `dist` variant, AUR package, Nix flake package, `setup.bat` source build | Cranelift: source builds from the generated distribution list | `.wasm` | none |
+| GHCR `all-features` image | Cranelift, Pulley, and runtime-only all compiled in | `.wasm` | none |
+| GHCR `minimal` and `default-features` images | none | none | |
+| Desktop bundles (dmg, deb, AppImage, msi, setup exe) | Cranelift: the standard sidecar build uses the target's generated `dist` features (plus `embedded-web` on macOS) | `.wasm` | source wiring in `scripts/desktop/prepare-kernel.sh`; desktop bundles have no plugin smoke gate |
+| `cargo install zeroclaw` and the `install.sh` source build | none by default; opt in with `--features plugins-wasm-cranelift` | `.wasm` with the opt-in | |
+| Homebrew core | formula-owned, outside this repository | | |
+
+Limits that hold for every artifact with the host:
+
+- `wit/v0` is unstable. A plugin must be built against the WIT shipped with
+  the release that runs it (`wit/VERSIONING.md`); the manifest carries no host
+  or WIT version, so a mismatch surfaces at the install-time load check.
+- Compiling a component needs memory that becomes executable after it is
+  written. Environments that forbid that, such as systemd units with
+  `MemoryDenyWriteExecute=yes` or SELinux `execmem` denials, refuse every
+  plugin load while the rest of the binary runs normally.
+- Official registry packages are unsigned today, so under
+  `signature_mode = "strict"` none of them install.
+- Every tool call compiles the component again; there is no compilation cache.
+- The runtime defaults stay closed. An installed tool or skill package
+  contributes nothing until the operator sets `plugins.enabled` and
+  `plugins.auto_discover`. Once both are set, every build of the tool
+  registry compiles and instantiates each admitted tool component and
+  queries its name, description, and parameter schema under the package's
+  declared permissions and egress policy; approval gates `execute` only. A
+  channel package runs once `plugins.enabled` is set, the operator declares
+  it under `[channels.plugin.<alias>]`, and an enabled agent lists
+  `plugin.<alias>` among its channels; for a package that mirrors a native
+  channel through `provides`, activation under `[channels.<provides>.<alias>]`
+  is recorded but not constructed yet. Each plugin tool call still needs
+  operator approval unless the agent's risk profile pre-approves it
+  (`auto_approve`, including the `*` wildcard, or `level = "full"`) or the
+  operator answered Always for that tool earlier in the same CLI session or
+  channel turn; tools in `always_ask` prompt every time.
+
+### Interrupted installation recovery
+
+`zeroclaw plugin remove <name>` can recover an unloaded, empty or structurally
+incomplete package directory that holds only what an install writes: a
+manifest naming that package, the component file at `wasm_path` with the
+folders on its way, and, for a skill plugin, a `skills/` tree of folders and
+files. Signature-policy refusals, healthy packages, loaded aliases, symlinks,
+uninspectable contents, and directories holding anything else remain
+protected. Recovery claims a single directory generation before admission and
+deletion; it never uses a stale verdict to recursively delete a replacement at
+the package name.
+
+Install and recovery coordinate through a persistent hidden OS lock under the
+plugins root. Only install, update, remove, and listing what an interrupted
+update displaced open that root and its lock, so a host that only discovers
+plugins, such as one the daemon keeps, holds nothing in the plugins directory. On Windows an open root pins the plugins directory and
+its ancestors against rename until its host drops. A process that cannot take
+the lock within 60 seconds gives up and names the lock file. Any account that
+can read that file can hold the lock, so the plugins directory is treated as
+one account's state: on Unix the lock and each transaction lease are created
+readable and writable by their owner only (mode `0600`). A lock another
+account created, for example with `sudo`, cannot be opened, so install,
+update and remove fail at once and name it; remove that file while nothing is
+installing. Where the operating
+system or filesystem offers no file locking, install, update and remove refuse. New
+staging directories use unique generations and an OS-held lease, rather than a
+PID as ownership evidence. Recovery cleans an abandoned protocol stage only
+while recovering an actual final package, or while finishing the delete of one
+an earlier remove had judged. An install cleans the abandoned protocol stages
+of the package it installs before it stages its own, skipping any it cannot
+clear. It first refuses a source that lies inside one of that package's
+stages, compared by directory identity rather than path spelling, because the
+source's `skills/` tree is copied after the clean; nothing is cleaned then.
+Legacy PID-only stages without proof of abandonment are retained, and
+`plugin remove` prints their paths; they do not prevent a new install from
+using fresh staging.
+
+A refused claimed package is restored without overwriting a concurrent
+occupant. If restoration cannot complete, the error names its retained hidden
+transaction location. Preserve that directory, resolve the reported conflict,
+and retry `plugin remove`: retry restores the package before applying normal
+admission policy. A claim whose delete had begun is marked, and a retry
+finishes that delete instead of restoring it. A hidden transaction is never, by its name alone, evidence
+that a healthy package can be deleted. Filesystem namespace changes and
+unsupported locking refuse recovery safely. Package moves require an atomic
+rename that refuses every existing destination, including an empty directory.
+Where the platform or filesystem cannot provide it (other Unix platforms such
+as FreeBSD, an NFS mount without no-replace support, or Linux before 3.15),
+installation and recovery refuse the move. A failed claim leaves the final
+entry unmoved. An install refused this way removes the copy it staged and
+says the move is unsupported; any other failed publication, and a failed
+restoration, retains the package in its hidden transaction and reports that
+path. No plain replacing rename is used.

@@ -212,10 +212,75 @@ for job_name in web build; do
     echo "cross-platform workflow must define $job_name" >&2
     exit 1
   }
-  grep -Fxq '    if: ${{ !inputs.release_tools_only }}' <<<"$job" || {
-    echo "release-tools-only dispatch must skip the $job_name job" >&2
+  grep -Fxq "    if: \${{ inputs.qualification_profile == 'normal' && !inputs.release_tools_only }}" <<<"$job" || {
+    echo "normal product job $job_name must reject tools-only and qualification dispatches" >&2
     exit 1
   }
 done
+
+qualification_input="$({
+  awk '
+    /^      qualification_profile:/ { capture = 1 }
+    capture && /^      release_tools_only:/ { exit }
+    capture { print }
+  ' "$cross_platform_workflow"
+})"
+[[ "$qualification_input" == $'      qualification_profile:\n        description: Normal matrix or nonpublishing Stable GNU Ubuntu22 qualification\n        required: true\n        type: choice\n        default: normal\n        options:\n          - normal\n          - stable-gnu-ubuntu22' ]] || {
+  echo "qualification profile must default to normal and expose only the finite GNU qualifier" >&2
+  exit 1
+}
+
+manual_guard="$({
+  awk '
+    /^      - name: Validate manual qualification inputs$/ { capture = 1; next }
+    capture && /^      - / { exit }
+    capture && /^        run: \|$/ { body = 1; next }
+    body { sub(/^          /, ""); print }
+  ' <<<"$smoke_job"
+})"
+[[ -n "$manual_guard" ]] || {
+  echo "manual qualification validation must precede release tool installation" >&2
+  exit 1
+}
+for binding in \
+  'QUALIFICATION_PROFILE: ${{ inputs.qualification_profile }}' \
+  'DISTRIBUTION: ${{ inputs.distribution }}' \
+  'RELEASE_TOOLS_ONLY: ${{ inputs.release_tools_only }}'; do
+  grep -Fq "$binding" <<<"$smoke_job" || {
+    echo "manual validation must bind actual dispatch input: $binding" >&2
+    exit 1
+  }
+done
+[[ "$smoke_job" == *'Validate manual qualification inputs'*'uses: dtolnay/rust-toolchain'* ]] || {
+  echo "manual input validation must run before toolchain setup" >&2
+  exit 1
+}
+
+assert_manual_admission() {
+  local expected="$1" profile="$2" distribution="$3" tools="$4" status=0
+  QUALIFICATION_PROFILE="$profile" DISTRIBUTION="$distribution" RELEASE_TOOLS_ONLY="$tools" \
+    bash --noprofile --norc -e -o pipefail -c "$manual_guard" >/dev/null 2>&1 || status="$?"
+  [[ "$status" -eq "$expected" ]] || {
+    echo "manual admission $profile/$distribution/$tools returned $status, expected $expected" >&2
+    exit 1
+  }
+}
+for distribution in dist dist-broad; do
+  for tools in false true; do
+    assert_manual_admission 0 normal "$distribution" "$tools"
+  done
+done
+assert_manual_admission 0 stable-gnu-ubuntu22 dist false
+for profile in '' unknown ' normal'; do
+  assert_manual_admission 2 "$profile" dist false
+done
+for distribution in '' unknown 'dist '; do
+  assert_manual_admission 2 normal "$distribution" false
+done
+for tools in '' False 1; do
+  assert_manual_admission 2 normal dist "$tools"
+done
+assert_manual_admission 2 stable-gnu-ubuntu22 dist-broad false
+assert_manual_admission 2 stable-gnu-ubuntu22 dist true
 
 echo "release tool manifest tests passed"

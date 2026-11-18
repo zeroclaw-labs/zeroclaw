@@ -1,5 +1,10 @@
 //! Shared baseline environment for shell child processes.
 
+/// One immutable, session-scoped client environment shared by shell execution
+/// and RPC admission. Only the handles are cloned; values are neither copied
+/// into admission state nor persisted. Eligibility is resolved from live grants.
+pub type ForwardedEnvironment = std::sync::Arc<std::collections::HashMap<String, String>>;
+
 /// Environment variables safe to copy into shell child processes after `env_clear`.
 /// Only functional variables are included — never API keys or secrets.
 #[cfg(not(target_os = "windows"))]

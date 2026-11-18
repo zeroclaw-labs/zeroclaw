@@ -26,16 +26,23 @@ for how a risk profile slots into the rest of the config.
 
 ## Auto-detection
 
-`sandbox_backend = "auto"` picks the best available backend at startup:
+`sandbox_backend = "auto"` resolves a backend when the sandbox is created. The order depends on the platform, on the sandbox features the binary was compiled with, and on the runtime kind:
 
-| Platform | Preferred order |
+| Platform | Order tried |
 |---|---|
-| Linux | Landlock (kernel 5.13+) → Bubblewrap → Firejail → Docker → none |
-| macOS | Seatbelt (`sandbox-exec`, native) → Docker → none |
-| Windows | AppContainer (experimental) → Docker → none |
-| Any | Docker (if daemon reachable) → none |
+| Linux | Landlock (only when compiled with `sandbox-landlock`) → Firejail |
+| macOS | Bubblewrap (only when compiled with `sandbox-bubblewrap`) → Seatbelt (`sandbox-exec`) |
+| Windows | No OS-level backend |
 
-To force a specific backend, set `sandbox_backend` to one of the literal values listed above.
+Bubblewrap is not in the Linux auto-detection chain; it is only reachable by naming it explicitly. Landlock and Bubblewrap are compile-time features, and a build that does not enable one skips that backend entirely. Neither feature is in the `default` feature set or in the `dist` set the release build uses, so a stock build starts the Linux list at Firejail and the macOS list at Seatbelt.
+
+After the platform list, `auto` tries Docker only when the runtime kind is neither `native` nor `docker`. Docker is not part of the native runtime's automatic fallback: with `[runtime] kind = "native"` (the default), `auto` never selects Docker even when the daemon is reachable. Docker is also skipped when the runtime is already `docker`, because the runtime container is the boundary. The only other runtime kind, `cloudflare`, is rejected by `create_runtime` in `crates/zeroclaw-config/src/platform/mod.rs` as not implemented, so on a runnable configuration `auto` never reaches the Docker backend.
+
+When nothing on the list is available, selection ends at `none` on the native runtime: no OS-level sandbox wraps tool calls, and only the application-layer security described above applies. On the Docker runtime it ends at `docker-runtime` instead, keeping the container boundary with no second sandbox wrapper.
+
+Naming a backend explicitly does not walk this list. If the requested backend is not compiled in, does not work on the platform, is not compatible with the runtime kind, or fails its availability probe, selection goes straight to `none` (native) or `docker-runtime` (Docker runtime), not to the next backend.
+
+To force a specific backend, set `sandbox_backend` to a backend name: `landlock`, `firejail`, `bubblewrap`, `docker`, `sandbox-exec`, or `none`.
 
 ## What the sandbox confines
 
@@ -50,11 +57,13 @@ To force a specific backend, set `sandbox_backend` to one of the literal values 
 
 ### Network
 
-By default, sandboxed tools have full network egress but no inbound listening. Per-backend caveats:
+Network access is per backend, and most of them leave it alone:
 
-- Landlock does not control network, it is filesystem-only.
-- Bubblewrap and Firejail can block network when configured.
-- Docker container network mode follows `[runtime.docker].network` when `[runtime].kind = "docker"`.
+- **Landlock** controls filesystem access only, so network egress is unchanged.
+- **Firejail** runs with `--noprofile` and no network flags, so it leaves network access unchanged too.
+- **Bubblewrap** runs with `--unshare-all` and never `--share-net`, so the sandbox gets no network.
+- **Seatbelt** denies outbound network by default and allows only DNS resolution through `/var/run/mDNSResponder` and connections to `localhost`.
+- **Docker** passes `--network none` for the `docker` sandbox backend; the Docker runtime passes `[runtime.docker].network`, which defaults to `none`.
 
 Tool-specific network gates (browser, HTTP, web_fetch) live on those tools' own config blocks (`[browser].allowed_domains`, `[http_request].allowed_domains`, `[web_fetch].allowed_domains`).
 
@@ -70,19 +79,18 @@ Per-tool wall-time timeouts live on the tool's own config block (`[shell_tool].t
 
 ### Shell binary
 
-When `[runtime].shell` is unset, the native runtime detects a platform default.
-Windows tries `pwsh`, then `powershell`, then `cmd.exe`. macOS first uses the
-current user's passwd login shell, then tries `zsh`, `bash`, and `/bin/sh`.
-Linux first uses the passwd login shell, then tries `bash`, `zsh`, and
-`/bin/sh`. Android remains pinned to `/system/bin/sh`. Set `[runtime].shell`
-to choose an interpreter explicitly:
+When `[runtime].shell` is unset, the native runtime detects a platform default. Windows tries `pwsh`, then `powershell`, then `cmd.exe`. macOS first uses the current user's passwd login shell, then tries `zsh`, `bash`, and `/bin/sh`. Linux first uses the passwd login shell, then tries `bash`, `zsh`, and `/bin/sh`. Android remains pinned to `/system/bin/sh`. Set `[runtime].shell` to choose an interpreter explicitly:
 
 ```toml
 [runtime]
 shell = "bash"      # resolves through PATH, or use an absolute path
 ```
 
-On Unix, POSIX-compatible shells are called as `<shell> -c "<command>"`. `powershell`/`pwsh` select PowerShell syntax and policy on every supported desktop host and run as `<interpreter> -NoProfile -NonInteractive -Command <command>`, so profile scripts cannot redefine commands behind policy's back and prompts cannot block execution. The value must be either a bare command name found on `PATH` (e.g. `"bash"` or `"pwsh"`) or an absolute path to an executable (e.g. `"/bin/bash"`); relative paths with separators (e.g. `"./sh"`, `"bin/sh"`) are rejected. It is validated when the runtime starts, so an empty, missing, non-executable, or malformed shell fails fast with a clear error instead of breaking the first command. Explicit configuration always takes precedence over detection. Unix login-shell lookup uses `getpwuid_r`; if it fails or names an unavailable executable, the platform fallback order is used.
+On Unix, POSIX-compatible shells are called as `<shell> -c "<command>"`. `powershell`/`pwsh` select PowerShell syntax and policy on every supported desktop host and run as `<interpreter> -NoProfile -NonInteractive -Command <command>`, so profile scripts cannot redefine commands behind policy's back and prompts cannot block execution. The value must be either a bare command name found on `PATH` (e.g. `"bash"` or `"pwsh"`) or an absolute path to an executable (e.g. `"/bin/bash"`); configuration validation rejects empty values and relative paths with separators (e.g. `"./sh"`, `"bin/sh"`). Before spawn, ZeroClaw canonicalizes an absolute shell path directly and resolves a bare name against the effective `PATH` when one is supplied; a runtime factory may resolve and retain that canonical launcher earlier, while other paths use the retained or ambient resolution during command preparation. The target must be a regular executable file, and failure returns from runtime construction or command preparation before execution. Explicit configuration takes precedence over default detection. Unix login-shell lookup uses `getpwuid_r`; if it fails or names an unavailable executable, the platform fallback order is used. If an injected `PATH` omits a selected bare default, preparation fails rather than switching interpreters.
+
+Firejail, Bubblewrap, and macOS Seatbelt replace the host command with a sandbox launcher. When the requested shell identity differs from the canonical executable path, the wrapper must preserve that identity (for example, `sh` selecting a BusyBox applet or Bash compatibility mode) while executing the validated canonical target. On Linux, Firejail and Bubblewrap require a GNU-compatible `env` or `genv` with `--argv0` support on the host process's absolute `PATH` entries. ZeroClaw probes each candidate for up to two seconds; the helper and its libraries must be accessible inside the sandbox. On macOS, Seatbelt uses the system `/bin/bash` with a fixed `exec -a` trampoline, so a separate GNU coreutils installation is not required. The trampoline passes the requested identity and command arguments as process arguments, not interpolated shell source. ZeroClaw does not widen filesystem access or fall back to an unsandboxed command when a required helper cannot execute. The Linux host-helper lookup does not use the TUI-only environment overlay.
+
+For these identity-preserving wrapped launches, canonical shell paths containing `=` remain rejected; on Linux, `env` would interpret such operands as environment assignments. Linux helper paths containing `=` are rejected for the same reason, and missing or unsupported helpers produce a preparation error. Direct native execution, Landlock, and Docker's separate in-container shell selection do not require a host identity helper.
 
 On **Windows**, the value selects the interpreter family by its file name:
 
@@ -118,7 +126,7 @@ Limitations:
 
 ### Bubblewrap (`bwrap`)
 
-User-namespace-based sandbox from Flatpak. Confines filesystem and can block network. Requires `bubblewrap` installed.
+User-namespace-based sandbox from Flatpak. Confines filesystem and runs without network access. Requires `bubblewrap` installed.
 
 <div class="os-tabs-src">
 
@@ -156,7 +164,7 @@ sudo apt install firejail
 
 </div>
 
-Firejail's default profile is fairly permissive; ZeroClaw applies a custom profile. Pass extra args with `firejail_args` on the risk profile.
+Firejail's default profile is fairly permissive, and ZeroClaw skips it with `--noprofile`, passing an explicit flag set instead.
 
 ### Docker
 
@@ -186,12 +194,12 @@ No sandboxing. Tools run with the full privileges of the ZeroClaw service user. 
 
 ## Troubleshooting
 
-- **"Sandbox backend unavailable"** on startup: check `zeroclaw service status` and the journal; the auto-detect logs which backends it tried.
+- **No sandbox is active**: check `zeroclaw service status` and the journal. Selection logs the backend it settled on ("Landlock sandbox enabled (Linux kernel 5.13+)", "No sandbox backend available, using application-layer security"), and a backend requested explicitly that isn't available warns with its name ("Firejail requested but not available, falling back to application-layer"). The log names the outcome, not every backend it tried.
 - **Tools working on dev, failing in service**: the service user often differs from the CLI user. Verify both have whatever sandbox-adjacent permissions are needed (Landlock: nothing; Bubblewrap: userns enabled; Docker: service user in `docker` group).
 - **Slow tool invocations** on the Docker runtime: first invocation pulls the image, subsequent are fast. Pre-pull with `docker pull <image>`.
 
 ## Code reference
 
 - Detection: `crates/zeroclaw-runtime/src/security/detect.rs`
-- Backends: `crates/zeroclaw-runtime/src/security/sandbox/` (one file per backend)
+- Backends: `crates/zeroclaw-runtime/src/security/` (`landlock.rs`, `firejail.rs`, `bubblewrap.rs`, `docker.rs`, `seatbelt.rs`)
 - Schema: `RiskProfileConfig` and `DockerRuntimeConfig` in `crates/zeroclaw-config/src/schema.rs`

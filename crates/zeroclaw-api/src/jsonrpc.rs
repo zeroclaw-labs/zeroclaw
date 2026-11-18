@@ -264,8 +264,15 @@ pub mod error_codes {
     pub const SESSION_LIMIT_REACHED: i32 = -32001;
     pub const SESSION_BUSY: i32 = -32002;
     pub const SESSION_NOT_OWNED: i32 = -32003;
+    /// The local IPC endpoint is at its connection ceiling.
+    ///
+    /// The gateway's A2A surface also answers `-32004`, meaning
+    /// `UnsupportedOperationError` in that protocol. The two never share a
+    /// connection; a client reads a code in the protocol it spoke.
+    pub const CONNECTION_LIMIT_REACHED: i32 = -32004;
     pub const AUTH_REQUIRED: i32 = -32010;
     pub const VERSION_MISMATCH: i32 = -32011;
+    pub const FORBIDDEN: i32 = -32012;
 
     // SOP authoring
     pub const SOP_ALREADY_EXISTS: i32 = -32020;
@@ -322,6 +329,12 @@ impl RpcOutbound {
         self.writer_tx.send(json).await.is_ok()
     }
 
+    /// Reserve frame capacity before a caller performs its final authorization.
+    /// Sending through the returned permit is synchronous.
+    pub async fn reserve_frame(&self) -> Option<mpsc::OwnedPermit<String>> {
+        self.writer_tx.clone().reserve_owned().await.ok()
+    }
+
     /// Resolve when the writer end is closed (peer dropped). Useful for
     /// long-lived forwarders that need to exit on disconnect even when
     /// there is no payload to send.
@@ -342,6 +355,18 @@ impl RpcOutbound {
         &self,
         method: &str,
         params: Value,
+    ) -> std::result::Result<Value, JsonRpcError> {
+        self.request_bounded(method, params, u64::MAX).await
+    }
+
+    /// Send a request only if its encoded NDJSON frame, including the
+    /// terminating newline, fits the transport's limit. An oversized
+    /// request is refused before enqueueing and leaves the writer usable.
+    pub async fn request_bounded(
+        &self,
+        method: &str,
+        params: Value,
+        max_frame_bytes: u64,
     ) -> std::result::Result<Value, JsonRpcError> {
         let n = self.next_id.fetch_add(1, Ordering::Relaxed);
         let id = format!("{OUTBOUND_ID_PREFIX}{n}");
@@ -365,6 +390,16 @@ impl RpcOutbound {
                 });
             }
         };
+        if (body.len() as u64).saturating_add(1) > max_frame_bytes {
+            return Err(JsonRpcError {
+                code: error_codes::INVALID_PARAMS,
+                message: "JSON-RPC request exceeds the frame size limit".to_string(),
+                data: Some(serde_json::json!({
+                    "reason": "frame_too_large",
+                    "limit_bytes": max_frame_bytes,
+                })),
+            });
+        }
         if self.writer_tx.send(body).await.is_err() {
             return Err(JsonRpcError {
                 code: error_codes::INTERNAL_ERROR,
@@ -501,6 +536,10 @@ pub struct SopRunRequest {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub payload: Option<String>,
+    /// Optional semantic work-item key shared with another trigger producer.
+    /// Dispatch coalesces matching keys only while the first run remains active.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dedup_key: Option<String>,
 }
 
 /// Response payload for `sops/run`: the id of the run that was started, which
@@ -533,6 +572,18 @@ pub struct SopSaveRequest {
     pub sop: serde_json::Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub original_name: Option<String>,
+}
+
+/// Request payload for `sops/rename`: move the SOP stored under `from` to
+/// `to`. Rename is its own operation rather than a side effect of `sops/save`
+/// because saving persists under the submitted SOP's name, so a name change
+/// smuggled through a save would fork the SOP or overwrite a different one.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SopRenameRequest {
+    /// Name the SOP is stored under today.
+    pub from: String,
+    /// Name to move it to. Must not already be taken.
+    pub to: String,
 }
 
 /// Request payload for `fs.list_dir`.
@@ -588,6 +639,54 @@ pub struct FsStatError {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn bounded_request_counts_escapes_envelope_and_newline_before_enqueueing() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let outbound = RpcOutbound::new(tx);
+        let params = json!({ "prompt": "\n\"\0" });
+        let encoded = serde_json::to_string(&JsonRpcRequest::new(
+            "echo",
+            params.clone(),
+            Value::String(format!("{OUTBOUND_ID_PREFIX}0")),
+        ))
+        .unwrap();
+        let limit = encoded.len() as u64;
+        // Bounded wait: if the frame check ever let this through, the
+        // request would sit queued with no reply and the test would hang.
+        let refused = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            outbound.request_bounded("echo", params.clone(), limit),
+        )
+        .await
+        .expect("an oversized request is refused at once, not queued")
+        .unwrap_err();
+        assert_eq!(refused.code, error_codes::INVALID_PARAMS);
+        assert_eq!(refused.data.unwrap()["reason"], "frame_too_large");
+        assert_eq!(outbound.pending_count(), 0);
+        assert!(matches!(
+            rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+
+        // The same escaped payload fits with the newline included. Its
+        // response still reaches the caller after the preceding refusal.
+        let (answer, ()) = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            tokio::join!(outbound.request_bounded("echo", params, limit + 1), async {
+                let body = rx.recv().await.unwrap();
+                assert_eq!(body.len() as u64 + 1, limit + 1);
+                let request: JsonRpcRequest = serde_json::from_str(&body).unwrap();
+                let id = request.id.unwrap();
+                assert!(
+                    outbound.dispatch_validated_response(id.as_str().unwrap(), Ok(json!("ok")))
+                );
+            })
+        })
+        .await
+        .unwrap();
+        assert_eq!(answer.unwrap(), json!("ok"));
+        assert_eq!(outbound.pending_count(), 0);
+    }
 
     #[test]
     fn frame_parses_success_response() {

@@ -1,4 +1,6 @@
+use crate::model_provider::ConversationMessage;
 use crate::plan::PlanEntry;
+use std::fmt;
 
 /// Structured metadata for a tool that produced a file artifact (e.g.
 /// `deliver_file`). Carried on [`TurnEvent::ToolResult`] so a channel attaches
@@ -60,6 +62,7 @@ impl ToolArtifact {
 /// provider-reported figure).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub enum TokenCountSource {
     /// Count comes from provider-reported usage.
     Provider,
@@ -79,6 +82,15 @@ impl TokenCountSource {
             TokenCountSource::Calibrated => "calibrated",
         }
     }
+}
+
+/// The cost-limit period a [`TurnEvent::BudgetWarning`] refers to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub enum BudgetWarningPeriod {
+    Day,
+    Month,
 }
 
 #[non_exhaustive]
@@ -125,10 +137,11 @@ pub enum TurnEvent {
         timeout_secs: u64,
     },
     /// Older whole turns were dropped to fit either the context token budget or
-    /// the configured message limit. Surfaces a user-visible "context was cut
+    /// the configured turn limit. Surfaces a user-visible "context was cut
     /// here" marker so trimming is never silent. Emitted whenever a trim occurs.
     HistoryTrimmed {
         dropped_messages: usize,
+        dropped_turns: usize,
         kept_turns: usize,
         reason: String,
         /// Configured context token budget in effect at trim time. `None` for
@@ -149,6 +162,21 @@ pub enum TurnEvent {
         /// authoritative "unsatisfiable" signal. `None`/absent for ordinary
         /// trims.
         unsatisfiable_floor: Option<bool>,
+        /// Native RPC-only provider context captured by the owning turn before
+        /// the trim is announced. Wire and observer adapters deliberately
+        /// ignore this field; it is never serialized as a turn event.
+        retained_context: Option<RetainedContextSnapshot>,
+    },
+    /// Recorded spend has reached `cost.warn_at_percent` of a shared daily or
+    /// monthly limit. Non-blocking: the turn continues. Emitted at most once
+    /// per turn, before the first provider call that sees the warning.
+    BudgetWarning {
+        /// Spend recorded in `period` before this turn's next call.
+        current_usd: f64,
+        /// Configured limit for `period`.
+        limit_usd: f64,
+        /// Which limit is near.
+        period: BudgetWarningPeriod,
     },
     /// Per-LLM-call token usage and cost; a turn may emit several, one per
     /// model call. `None` means "unavailable for this call", not zero.
@@ -190,7 +218,56 @@ pub enum TurnEvent {
         /// attempts are billing-only telemetry; they do not update the accepted
         /// context snapshot (ACP session token count, context-meter ceiling).
         accepted: bool,
+        /// Locally estimated prompt size, published **only** when the provider
+        /// omitted `input_tokens`. Local OpenAI-compatible servers (llama.cpp
+        /// and similar) routinely omit `usage`, which leaves a context meter
+        /// with a budget but no numerator.
+        ///
+        /// This is **not** measured usage and carries a different contract
+        /// from every other field on this event:
+        ///
+        /// - It must never be billed, summed into provider usage totals, or
+        ///   persisted as a provider token count.
+        ///   Accounting and persistence consumers read `input_tokens`, which
+        ///   stays `None` exactly when the provider reported nothing.
+        /// - A consumer rendering a context meter may use it as a display
+        ///   numerator, and must label it as an estimate
+        ///   (`TokenCountSource::Estimated`) rather than provider-reported.
+        /// - It is an approximation in both directions, not a bound. The
+        ///   history heuristic does not price separately supplied native tool
+        ///   schemas, so a tool-heavy request reads low; its byte-count and
+        ///   fixed-per-image costs can also read high against a provider's
+        ///   real tokenizer. That is acceptable for a labelled display value
+        ///   and is not acceptable for accounting — another reason it is kept
+        ///   off `input_tokens`.
+        /// - When the provider reported `cached_input_tokens` without a total,
+        ///   that subset is a known minimum for the prompt and the estimate is
+        ///   floored at it, so the meter cannot read near-zero for a prompt
+        ///   already known to be large.
+        ///
+        /// `None` means either the provider reported a real count (use
+        /// `input_tokens`) or no estimate could be formed.
+        estimated_input_tokens: Option<u64>,
     },
+}
+
+/// Provider-facing context captured at a trim boundary. This remains attached
+/// to the internal turn event so the serial RPC consumer can persist it before
+/// forwarding the public trim notice without borrowing the live agent again.
+#[derive(Clone)]
+pub struct RetainedContextSnapshot {
+    pub retained_messages: Vec<ConversationMessage>,
+    pub breadcrumb: bool,
+}
+
+impl fmt::Debug for RetainedContextSnapshot {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RetainedContextSnapshot")
+            .field("retained_messages", &self.retained_messages.len())
+            .field("breadcrumb", &self.breadcrumb)
+            .finish()
+    }
 }
 
 #[cfg(test)]

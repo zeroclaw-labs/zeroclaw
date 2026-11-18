@@ -165,6 +165,14 @@ keyactions! {
         PaneNavRight [Chord::with(KeyCode::Right, KeyModifiers::ALT), Chord::with(KeyCode::Char('f'), KeyModifiers::ALT)] => "next pane",
         ReloadDaemon [Chord::primary('r'), Chord::ctrl('r')]            => "reload daemon",
         ToggleSidebar [Chord::ctrl('b')]                                => "toggle sidebar",
+        FocusSession1 [Chord::with_primary(KeyCode::Char('1'), KeyModifiers::CONTROL)] => "focus session 1",
+        FocusSession2 [Chord::with_primary(KeyCode::Char('2'), KeyModifiers::CONTROL)] => "focus session 2",
+        FocusSession3 [Chord::with_primary(KeyCode::Char('3'), KeyModifiers::CONTROL)] => "focus session 3",
+        FocusSession4 [Chord::with_primary(KeyCode::Char('4'), KeyModifiers::CONTROL)] => "focus session 4",
+        FocusSession5 [Chord::with_primary(KeyCode::Char('5'), KeyModifiers::CONTROL)] => "focus session 5",
+        FocusSession6 [Chord::with_primary(KeyCode::Char('6'), KeyModifiers::CONTROL)] => "focus session 6",
+        FocusSession7 [Chord::with_primary(KeyCode::Char('7'), KeyModifiers::CONTROL)] => "focus session 7",
+        FocusSession8 [Chord::with_primary(KeyCode::Char('8'), KeyModifiers::CONTROL)] => "focus session 8",
         ConfirmYes   []                                                 => "confirm",
         ConfirmNo    []                                                 => "cancel",
     }
@@ -217,8 +225,6 @@ keyactions! {
         QueueCopy               [Chord::with(KeyCode::Char('c'), KeyModifiers::ALT)] => "copy queued",
         QueueDelete             [Chord::with(KeyCode::Char('x'), KeyModifiers::ALT)] => "delete queued",
         QueueEdit               [Chord::with(KeyCode::Char('e'), KeyModifiers::ALT)] => "edit queued",
-        QueueWiden              [Chord::shift(KeyCode::Left)] => "widen queue",
-        QueueNarrow             [Chord::shift(KeyCode::Right)] => "narrow queue",
         ErrorDismiss            [Chord::char('q')] => "dismiss error",
     }
 }
@@ -242,6 +248,8 @@ keyactions! {
         ToggleFollow     [Chord::char('f')] => "toggle follow",
         BeginSearch      [Chord::char('/')] => "search",
         ClearSearch      [Chord::char('c')] => "clear search",
+        BeginRunFilter   [Chord::char('r')] => "filter by SOP run",
+        ClearRunFilter   [Chord::char('R')] => "clear SOP run filter",
         CopyDetail       [Chord::char('y')] => "copy detail",
         CopySelection    [
             Chord::with(KeyCode::Char('c'), KeyModifiers::SUPER),
@@ -297,7 +305,13 @@ keyactions! {
         BeginSearch   [Chord::char('/')] => "search",
         ToggleSecret  [Chord::char('x')] => "toggle secret",
         DeleteRow     [Chord::char('d')] => "delete row",
+        RenameAlias   [Chord::char('e')] => "rename provider alias",
         ApplyTemplate [Chord::char('t')] => "apply template",
+        ApplicationStatus [Chord::char('s')] => "application status",
+        PageUp [Chord::key(KeyCode::PageUp)] => "page up",
+        PageDown [Chord::key(KeyCode::PageDown)] => "page down",
+        JumpStart [Chord::key(KeyCode::Home)] => "jump to start",
+        JumpEnd [Chord::key(KeyCode::End)] => "jump to end",
     }
 }
 
@@ -373,12 +387,30 @@ keyactions! {
         CursorWordRight    [Chord::with(KeyCode::Right, KeyModifiers::ALT), Chord::with(KeyCode::Char('f'), KeyModifiers::ALT)] => "word right",
         CursorStart        [Chord::key(KeyCode::Home)] => "line start",
         CursorEnd          [Chord::key(KeyCode::End), Chord::primary('e'), Chord::ctrl('e')] => "line end",
-        OpenFileBrowser    [Chord::primary('a'), Chord::ctrl('a')] => "browse files",
+        OpenFileBrowser    [] => "browse files",
         Backspace          [Chord::key(KeyCode::Backspace)] => "backspace",
         DeletePreviousWord [Chord::primary('w'), Chord::ctrl('w'), Chord::with(KeyCode::Backspace, KeyModifiers::ALT)] => "delete previous word",
         DeleteForward      [Chord::key(KeyCode::Delete)] => "delete next character",
+        DeleteNextWord     [Chord::with(KeyCode::Delete, KeyModifiers::ALT)] => "delete next word",
         ClearInput         [Chord::primary('u'), Chord::ctrl('u')] => "clear input",
-        SelectAll          [] => "select all",
+        SelectAll          [Chord::primary('a'), Chord::ctrl('a')] => "select all",
+        Undo               [Chord::primary('z'), Chord::ctrl('z')] => "undo",
+        Redo               [
+            Chord::with_primary(KeyCode::Char('Z'), KeyModifiers::SHIFT),
+            Chord::with(KeyCode::Char('Z'), KeyModifiers::CONTROL.union(KeyModifiers::SHIFT)),
+            Chord::with_primary(KeyCode::Char('z'), KeyModifiers::SHIFT),
+            Chord::with(KeyCode::Char('z'), KeyModifiers::CONTROL.union(KeyModifiers::SHIFT)),
+        ] => "redo",
+        Cut                [Chord::primary('x'), Chord::ctrl('x')] => "cut selection",
+        CopySelection      [Chord::primary('c'), Chord::ctrl('c')] => "copy selection",
+        SelectLeft         [Chord::shift(KeyCode::Left)] => "select left",
+        SelectRight        [Chord::shift(KeyCode::Right)] => "select right",
+        SelectUp           [Chord::shift(KeyCode::Up)] => "select up",
+        SelectDown         [Chord::shift(KeyCode::Down)] => "select down",
+        SelectStart        [Chord::shift(KeyCode::Home)] => "select to line start",
+        SelectEnd          [Chord::shift(KeyCode::End)] => "select to line end",
+        SelectWordLeft     [Chord::with(KeyCode::Left, KeyModifiers::ALT.union(KeyModifiers::SHIFT))] => "select previous word",
+        SelectWordRight    [Chord::with(KeyCode::Right, KeyModifiers::ALT.union(KeyModifiers::SHIFT))] => "select next word",
         Paste              [Chord::primary('v'), Chord::ctrl('v')] => "paste",
         HistoryPrev        [Chord::key(KeyCode::Up)] => "history prev",
         HistoryNext        [Chord::key(KeyCode::Down)] => "history next",
@@ -547,7 +579,7 @@ mod tests {
         for (code, expected) in [
             (KeyCode::Enter, InputBarAction::Inject),
             (KeyCode::Char('e'), InputBarAction::CursorEnd),
-            (KeyCode::Char('a'), InputBarAction::OpenFileBrowser),
+            (KeyCode::Char('a'), InputBarAction::SelectAll),
             (KeyCode::Char('w'), InputBarAction::DeletePreviousWord),
             (KeyCode::Char('u'), InputBarAction::ClearInput),
             (KeyCode::Char('v'), InputBarAction::Paste),
@@ -557,6 +589,40 @@ mod tests {
                 KeyModifiers::NONE,
                 InputBarAction::from_chord,
                 expected,
+            );
+        }
+    }
+
+    #[test]
+    fn session_shortcut_primary_digits_resolve_to_ordinals() {
+        let actions = [
+            GlobalAction::FocusSession1,
+            GlobalAction::FocusSession2,
+            GlobalAction::FocusSession3,
+            GlobalAction::FocusSession4,
+            GlobalAction::FocusSession5,
+            GlobalAction::FocusSession6,
+            GlobalAction::FocusSession7,
+            GlobalAction::FocusSession8,
+        ];
+        for (index, action) in actions.into_iter().enumerate() {
+            let digit = char::from_digit((index + 1) as u32, 10).unwrap();
+            let modifiers = if cfg!(target_os = "macos") {
+                KeyModifiers::CONTROL.union(KeyModifiers::SUPER)
+            } else {
+                KeyModifiers::CONTROL
+            };
+            assert_eq!(
+                GlobalAction::from_chord(&KeyEvent::new(KeyCode::Char(digit), modifiers)),
+                Some(action)
+            );
+            #[cfg(target_os = "macos")]
+            assert_eq!(
+                GlobalAction::from_chord(
+                    &KeyEvent::new(KeyCode::Char(digit), KeyModifiers::SUPER,)
+                ),
+                None,
+                "bare Command+{digit} remains available to the terminal host"
             );
         }
     }

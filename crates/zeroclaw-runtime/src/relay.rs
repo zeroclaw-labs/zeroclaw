@@ -32,9 +32,13 @@ use tokio_rustls::TlsConnector;
 use tokio_rustls::rustls;
 use tokio_util::sync::CancellationToken;
 use zeroclaw_relay_proto::{
-    ConnWindow, Control, INITIAL_WINDOW, MAX_CONTROL_FRAME, MAX_DATA_PAYLOAD, PEER_HINT_ENROLL,
-    SUBPROTOCOL, TokenBucket, decode_data, encode_data,
+    ConnWindow, Control, DASHBOARD_LABEL_CONTEXT, INITIAL_WINDOW, MAX_CONTROL_FRAME,
+    MAX_DATA_PAYLOAD, PEER_HINT_ENROLL, PEER_HINT_GATEWAY, SUBPROTOCOL, TokenBucket, decode_data,
+    encode_data,
 };
+/// The node-id rule a relay enforces at registration, for callers that persist a
+/// node-id (such as `relay claim`) and must not save one the relay refuses.
+pub use zeroclaw_relay_proto::{MAX_NODE_ID_LEN, is_valid_node_id};
 
 /// What the demux loop routes to a per-conn `bridge_conn` task: inbound inner
 /// bytes, plus the credit-window control frames (forwarded by the relay) that
@@ -174,6 +178,59 @@ pub struct RelayBridgeConfig {
     /// pin `[relay].node_id` (a pinned id is fixed). Gates both scheduled and
     /// on-demand rotation.
     pub rotation_allowed: bool,
+    /// The dashboard this daemon serves through the relay (`[relay.dashboard]`).
+    /// `None` refuses every [`PEER_HINT_GATEWAY`] route and does not offer the
+    /// relay one.
+    pub dashboard: Option<DashboardBridge>,
+}
+
+/// A dashboard served through the relay: where its browser connections go and
+/// the origin they are served under.
+///
+/// Those connections are the one route the relay does NOT forward blind. It
+/// ends the browser's TLS and sends plaintext HTTP, so they are handed to the
+/// gateway in process ([`crate::relay_dashboard`]) under the browser's own
+/// address - never dialled into a local port, where they would arrive as a
+/// loopback peer.
+#[derive(Clone)]
+pub struct DashboardBridge {
+    /// Where the gateway generation that is serving takes connections.
+    pub ingress: crate::relay_dashboard::DashboardIngress,
+    /// `https://<label>.<domain>[:port]`, the origin browsers reach it at.
+    pub origin: crate::relay_dashboard::DashboardOrigin,
+    /// Cap on simultaneously bridged dashboard connections, inside
+    /// `max_conns`, so browsers cannot take every slot native clients use.
+    pub max_conns: usize,
+}
+
+impl std::fmt::Debug for DashboardBridge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DashboardBridge")
+            .field("origin", &self.origin)
+            .field("max_conns", &self.max_conns)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The DNS label a relay serves this daemon's dashboard under: derived from
+/// its registration key, so it survives node-id rotation and only this daemon
+/// can be served under it (see [`zeroclaw_relay_proto::dashboard_label_from_digest`]).
+pub fn dashboard_label(signing_key_pkcs8: &[u8]) -> Result<String> {
+    let keypair = Ed25519KeyPair::from_pkcs8(signing_key_pkcs8)
+        .map_err(|_| anyhow::Error::msg("relay registration key is not a valid Ed25519 key"))?;
+    Ok(dashboard_label_for_pubkey(keypair.public_key().as_ref()))
+}
+
+/// [`dashboard_label`] from the raw 32-byte Ed25519 public key, as a relay
+/// computes it from `Hello.daemon_pubkey`.
+pub fn dashboard_label_for_pubkey(pubkey: &[u8]) -> String {
+    let mut hasher = ring::digest::Context::new(&ring::digest::SHA256);
+    hasher.update(DASHBOARD_LABEL_CONTEXT);
+    hasher.update(pubkey);
+    let mut digest = [0u8; 32];
+    // SHA-256 output is always 32 bytes.
+    digest.copy_from_slice(hasher.finish().as_ref());
+    zeroclaw_relay_proto::dashboard_label_from_digest(&digest)
 }
 
 /// Load (or create + persist) the daemon's Ed25519 relay-registration key.
@@ -182,6 +239,37 @@ pub struct RelayBridgeConfig {
 /// key 0600). This is the daemon's stable rendezvous identity, separate from the
 /// ZeroClaw CA: the relay binds the node-id to this key and an allowlist keys on
 /// its fingerprint.
+/// Decode a registration `Challenge.nonce`, refusing anything but a fixed-size
+/// nonce.
+///
+/// The registration key is NOT single-purpose: it also signs the
+/// `zeroclaw relay claim` ownership proof. A signer that will put its signature
+/// on arbitrary relay-supplied bytes is therefore a signing oracle - a hostile
+/// relay the daemon is configured to dial could send a complete tagged claim
+/// message as the challenge and collect a valid proof over its own token,
+/// having already learned the public key (and so the fingerprint) from `Hello`.
+///
+/// Pinning the length to [`zeroclaw_relay_proto::REGISTRATION_NONCE_LEN`] makes
+/// a challenge structurally incapable of being any longer tagged message, which
+/// is the cheap and compatible repair: a conforming relay already sends exactly
+/// this size. Note this protects THIS daemon version - proofs obtained from
+/// older, unrestricted daemons cannot be invalidated retroactively.
+fn decode_registration_challenge(nonce_b64: &str) -> Result<Vec<u8>> {
+    let nonce = B64
+        .decode(nonce_b64.as_bytes())
+        .context("relay challenge nonce not base64")?;
+    if nonce.len() != zeroclaw_relay_proto::REGISTRATION_NONCE_LEN {
+        anyhow::bail!(
+            "relay sent a {}-byte registration challenge; exactly {} bytes are required. \
+             Refusing to sign relay-chosen data with the registration key, which also signs \
+             this daemon's relay-claim ownership proof.",
+            nonce.len(),
+            zeroclaw_relay_proto::REGISTRATION_NONCE_LEN
+        );
+    }
+    Ok(nonce)
+}
+
 pub fn ensure_signing_key(data_dir: &std::path::Path) -> Result<Vec<u8>> {
     use std::io::Write;
 
@@ -564,6 +652,25 @@ async fn serve_once(
     serve_established(cfg, cancel, ws).await
 }
 
+/// Parse `relay_host` the way the connection path consumes it: as the outer
+/// TLS server name, and as the host of the `wss://` registration URI.
+///
+/// Enrollment calls this before persisting a claimed host, so a value either
+/// consumer would reject is refused up front instead of surfacing as
+/// `invalid relay host` at registration, after the claim reported success.
+pub fn relay_server_name(host: &str) -> Result<rustls::pki_types::ServerName<'static>> {
+    let invalid = || anyhow::Error::msg(format!("invalid relay host '{host}'"));
+    let name = rustls::pki_types::ServerName::try_from(host.to_string()).map_err(|_| invalid())?;
+    // A value such as `relay/evil` parses as a URI whose host is only `relay`,
+    // so a successful parse is not enough: the parsed host must be the input.
+    let uri: tokio_tungstenite::tungstenite::http::Uri =
+        format!("wss://{host}/").parse().map_err(|_| invalid())?;
+    if uri.host() != Some(host) {
+        return Err(invalid());
+    }
+    Ok(name)
+}
+
 /// The entire outbound setup for one link: TCP connect, outer TLS, the relay
 /// WebSocket upgrade, and the signed `Hello` -> `Challenge` -> `Register` ->
 /// `Registered` exchange. Kept as ONE future so the caller can impose a single
@@ -594,8 +701,7 @@ async fn connect_and_register(
     let tcp = TcpStream::connect(&cfg.relay_addr)
         .await
         .with_context(|| format!("connecting to relay {}", cfg.relay_addr))?;
-    let server_name = rustls::pki_types::ServerName::try_from(cfg.relay_host.clone())
-        .map_err(|_| anyhow::Error::msg(format!("invalid relay host '{}'", cfg.relay_host)))?;
+    let server_name = relay_server_name(&cfg.relay_host)?;
     let tls = connector
         .connect(server_name, tcp)
         .await
@@ -633,12 +739,11 @@ async fn connect_and_register(
         daemon_pubkey: B64.encode(&pubkey),
         node_id: cfg.node_id.clone(),
         relay_token: cfg.relay_token.clone(),
+        dashboard: cfg.dashboard.is_some(),
     }))
     .await?;
     let nonce = match next_control(&mut ws).await {
-        Some(Control::Challenge { nonce }) => B64
-            .decode(nonce.as_bytes())
-            .context("relay challenge nonce not base64")?,
+        Some(Control::Challenge { nonce }) => decode_registration_challenge(&nonce)?,
         Some(Control::Error { code, msg }) => {
             anyhow::bail!("relay refused registration: {code}: {msg}")
         }
@@ -694,6 +799,9 @@ async fn serve_established(
     // plain local bucket suffices (no lock). A flood of OPENs is fast-rejected
     // before any loopback mTLS handshake is dialed.
     let mut open_bucket = TokenBucket::new(cfg.open_burst, cfg.open_rate_per_sec);
+    // Dashboard conns live on this link. Only this reader admits one, so the
+    // check below and the increment that follows it cannot race.
+    let dashboard_live = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
     // Reader loop: react to Open/Close + demux DATA to per-conn loopback bridges.
     let result = loop {
@@ -706,7 +814,7 @@ async fn serve_established(
                 match msg {
                     Ok(tokio_tungstenite::tungstenite::Message::Text(t)) => {
                         match Control::from_json(t.as_str()) {
-                            Ok(Control::Open { conn_id, peer_hint }) => {
+                            Ok(Control::Open { conn_id, peer_hint, client_addr }) => {
                                 // Fast-reject an OPEN flood before allocating conn
                                 // state or dialing a loopback mTLS handshake (A6).
                                 if !open_bucket.try_take() {
@@ -721,11 +829,14 @@ async fn serve_established(
                                     );
                                     continue;
                                 }
-                                let (local, is_enroll) = match open_route_target(
+                                let local = match open_route_target(
                                     cfg,
                                     peer_hint.as_deref(),
-                                ) {
-                                    Ok((addr, is_enroll)) => (addr.to_string(), is_enroll),
+                                )
+                                .and_then(|target| {
+                                    local_target(target, client_addr.as_deref(), &dashboard_live)
+                                }) {
+                                    Ok(local) => local,
                                     Err(reason) => {
                                         // Refused before any conn state exists.
                                         notify_relay(
@@ -763,18 +874,36 @@ async fn serve_established(
                                     drop(cs);
                                     let to_relay = to_relay.clone();
                                     let conns = conns.clone();
-                                    // For enroll-routed conns, share the port set
-                                    // so the endpoint can classify the loopback
-                                    // peer as relay-routed.
-                                    let bridge_ports =
-                                        is_enroll.then(|| cfg.enroll_bridge_ports.clone()).flatten();
-                                    zeroclaw_spawn::spawn!(async move {
-                                        bridge_conn(
-                                            conn_id, &local, to_relay, rx, conn_cancel, conns,
-                                            bridge_ports,
-                                        )
-                                        .await;
-                                    });
+                                    match local {
+                                        LocalTarget::Loopback { addr, enroll } => {
+                                            // For enroll-routed conns, share the
+                                            // port set so the endpoint can classify
+                                            // the loopback peer as relay-routed.
+                                            let bridge_ports = enroll
+                                                .then(|| cfg.enroll_bridge_ports.clone())
+                                                .flatten();
+                                            zeroclaw_spawn::spawn!(async move {
+                                                bridge_conn(
+                                                    conn_id, &addr, to_relay, rx, conn_cancel,
+                                                    conns, bridge_ports,
+                                                )
+                                                .await;
+                                            });
+                                        }
+                                        LocalTarget::Dashboard { bridge, client_addr, live } => {
+                                            zeroclaw_spawn::spawn!(async move {
+                                                bridge_dashboard_conn(
+                                                    conn_id,
+                                                    DashboardRoute { bridge, client_addr, _live: live },
+                                                    to_relay,
+                                                    rx,
+                                                    conn_cancel,
+                                                    conns,
+                                                )
+                                                .await;
+                                            });
+                                        }
+                                    }
                                 }
                             }
                             // Dropping the handle cancels the conn, which reaches
@@ -910,18 +1039,107 @@ async fn keepalive_watchdog(
     }
 }
 
+/// Where an `Open` goes, from its peer hint.
+#[derive(Debug)]
+enum RouteTarget<'a> {
+    /// A local listener on loopback: the WSS listener, or the enrollment one.
+    Loopback { addr: &'a str, enroll: bool },
+    /// This daemon's own gateway, in process.
+    Dashboard(&'a DashboardBridge),
+}
+
 fn open_route_target<'a>(
     cfg: &'a RelayBridgeConfig,
     peer_hint: Option<&str>,
-) -> std::result::Result<(&'a str, bool), &'static str> {
+) -> std::result::Result<RouteTarget<'a>, &'static str> {
     match peer_hint {
         Some(PEER_HINT_ENROLL) => cfg
             .local_enroll_addr
             .as_deref()
-            .map(|a| (a, true))
+            .map(|addr| RouteTarget::Loopback { addr, enroll: true })
             .ok_or("enroll_unavailable"),
-        _ => Ok((&cfg.local_wss_addr, false)),
+        // Only when this daemon opted in, and never to a local port.
+        Some(PEER_HINT_GATEWAY) => cfg
+            .dashboard
+            .as_ref()
+            .map(RouteTarget::Dashboard)
+            .ok_or("gateway_unavailable"),
+        _ => Ok(RouteTarget::Loopback {
+            addr: &cfg.local_wss_addr,
+            enroll: false,
+        }),
     }
+}
+
+/// What a bridged conn is connected to, decided before it is admitted.
+enum LocalTarget {
+    Loopback {
+        addr: String,
+        enroll: bool,
+    },
+    Dashboard {
+        bridge: DashboardBridge,
+        client_addr: std::net::SocketAddr,
+        live: DashboardLive,
+    },
+}
+
+/// Admit `target` for an `Open` carrying `client_addr`: a dashboard route
+/// needs the browser's address, which must not be loopback, and room under the
+/// dashboard cap. Refusals are relay `Close` reasons.
+fn local_target(
+    target: RouteTarget<'_>,
+    client_addr: Option<&str>,
+    dashboard_live: &Arc<std::sync::atomic::AtomicUsize>,
+) -> std::result::Result<LocalTarget, &'static str> {
+    match target {
+        RouteTarget::Loopback { addr, enroll } => Ok(LocalTarget::Loopback {
+            addr: addr.to_string(),
+            enroll,
+        }),
+        RouteTarget::Dashboard(bridge) => {
+            let client_addr = dashboard_client_addr(client_addr).ok_or("bad_client_addr")?;
+            if dashboard_live.load(std::sync::atomic::Ordering::Relaxed) >= bridge.max_conns {
+                return Err("busy");
+            }
+            Ok(LocalTarget::Dashboard {
+                bridge: bridge.clone(),
+                client_addr,
+                live: DashboardLive::new(Arc::clone(dashboard_live)),
+            })
+        }
+    }
+}
+
+/// The browser address an `Open` for the dashboard names, if it is one a
+/// dashboard connection may be served under (see
+/// [`crate::relay_dashboard::dashboard_peer`]).
+fn dashboard_client_addr(client_addr: Option<&str>) -> Option<std::net::SocketAddr> {
+    let addr = client_addr?.parse::<std::net::SocketAddr>().ok()?;
+    crate::relay_dashboard::dashboard_peer(addr).ok()
+}
+
+/// Counts one dashboard conn against its link's cap for as long as it lives.
+struct DashboardLive(Arc<std::sync::atomic::AtomicUsize>);
+
+impl DashboardLive {
+    fn new(count: Arc<std::sync::atomic::AtomicUsize>) -> Self {
+        count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Self(count)
+    }
+}
+
+impl Drop for DashboardLive {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// One dashboard conn's handoff: where it goes and the cap slot it holds.
+struct DashboardRoute {
+    bridge: DashboardBridge,
+    client_addr: std::net::SocketAddr,
+    _live: DashboardLive,
 }
 
 /// Drop guard that removes a registered bridge source port from the shared set
@@ -1026,7 +1244,7 @@ async fn bridge_conn(
     conn_id: u64,
     local_addr: &str,
     to_relay: mpsc::Sender<tokio_tungstenite::tungstenite::Message>,
-    mut inbound: mpsc::Receiver<ConnMsg>,
+    inbound: mpsc::Receiver<ConnMsg>,
     // Retires THIS conn: a child of the link token, so it fires both when the
     // relay closes this route and when the whole link dies.
     cancel: CancellationToken,
@@ -1075,6 +1293,59 @@ async fn bridge_conn(
             return;
         }
     };
+    shuttle(conn_id, local, to_relay, inbound, cancel, conns).await;
+}
+
+/// Bridge one dashboard conn: hand the gateway its end of an in-memory stream,
+/// under the browser's address, then shuttle bytes exactly as for a dialled
+/// conn. Refused with the ingress's reason when no gateway takes it.
+async fn bridge_dashboard_conn(
+    conn_id: u64,
+    route: DashboardRoute,
+    to_relay: mpsc::Sender<tokio_tungstenite::tungstenite::Message>,
+    inbound: mpsc::Receiver<ConnMsg>,
+    cancel: CancellationToken,
+    conns: ConnMap,
+) {
+    let DashboardRoute {
+        bridge,
+        client_addr,
+        _live,
+    } = route;
+    // One credit window of buffering each way, so the duplex never becomes a
+    // second, unaccounted queue in front of the window granted below.
+    let (ours, gateways) = tokio::io::duplex(INITIAL_WINDOW as usize);
+    let delivered =
+        crate::relay_dashboard::DashboardConn::new(gateways, client_addr, bridge.origin)
+            .map_err(|_| "bad_client_addr")
+            .and_then(|conn| bridge.ingress.deliver(conn).map_err(|error| error.as_str()));
+    if let Err(reason) = delivered {
+        let _ = unless_cancelled(
+            &cancel,
+            to_relay.send(tungstenite_text(&Control::Close {
+                conn_id,
+                reason: reason.into(),
+            })),
+        )
+        .await;
+        conns.lock().await.remove(&conn_id);
+        return;
+    }
+    shuttle(conn_id, ours, to_relay, inbound, cancel, conns).await;
+}
+
+/// Accept a bridged conn to the relay and shuttle bytes between it and
+/// `local` until either side ends, under the per-conn credit window.
+async fn shuttle<S>(
+    conn_id: u64,
+    local: S,
+    to_relay: mpsc::Sender<tokio_tungstenite::tungstenite::Message>,
+    mut inbound: mpsc::Receiver<ConnMsg>,
+    cancel: CancellationToken,
+    conns: ConnMap,
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send,
+{
     // Accept the connection to the relay (it tells the waiting client).
     let _ = unless_cancelled(
         &cancel,
@@ -1098,7 +1369,7 @@ async fn bridge_conn(
     let mut send_window = ConnWindow::new(INITIAL_WINDOW);
     let mut recv_drained: u32 = 0;
 
-    let (mut lr, mut lw) = local.into_split();
+    let (mut lr, mut lw) = tokio::io::split(local);
     let mut buf = vec![0u8; MAX_DATA_PAYLOAD];
     loop {
         tokio::select! {
@@ -1369,6 +1640,58 @@ impl rustls::client::danger::ServerCertVerifier for NoVerify {
 }
 
 #[cfg(test)]
+mod registration_challenge_tests {
+    use super::*;
+
+    /// The normal handshake is unaffected: a conforming relay's 32-byte nonce
+    /// decodes and is signed as before.
+    #[test]
+    fn a_conforming_nonce_is_accepted() {
+        let nonce = [7u8; zeroclaw_relay_proto::REGISTRATION_NONCE_LEN];
+        let decoded = decode_registration_challenge(&B64.encode(nonce))
+            .expect("a conforming 32-byte nonce must be accepted");
+        assert_eq!(decoded, nonce);
+    }
+
+    /// The attack this bound exists to stop: a hostile relay sends a complete
+    /// tagged CLAIM message as the challenge, hoping the daemon signs it with
+    /// the same key and hands back a valid ownership proof for the relay's own
+    /// claim token. It must be refused before anything is signed.
+    #[test]
+    fn a_claim_shaped_challenge_is_refused() {
+        // Fixed claim wire fixture; runtime does not depend on the CLI's proof builder.
+        let hostile = b"zerorelay-claim-v1\nattacker-controlled-token\n0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        assert_ne!(
+            hostile.len(),
+            zeroclaw_relay_proto::REGISTRATION_NONCE_LEN,
+            "the attack payload must not coincidentally be nonce-sized"
+        );
+        let err = decode_registration_challenge(&B64.encode(hostile))
+            .expect_err("a claim-shaped challenge must never be signed");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("registration challenge") && msg.contains("Refusing to sign"),
+            "the refusal should explain what it is protecting: {msg}"
+        );
+    }
+
+    /// Any other length is refused too - the bound is exact, not a maximum, so
+    /// a shorter message cannot be smuggled either.
+    #[test]
+    fn off_size_challenges_are_refused() {
+        for len in [0usize, 1, 31, 33, 64, 128] {
+            let nonce = vec![0u8; len];
+            assert!(
+                decode_registration_challenge(&B64.encode(&nonce)).is_err(),
+                "a {len}-byte challenge must be refused"
+            );
+        }
+        // Still rejects non-base64 rather than silently signing garbage.
+        assert!(decode_registration_challenge("not base64!!").is_err());
+    }
+}
+
+#[cfg(test)]
 mod node_id_tests {
     use super::*;
 
@@ -1393,6 +1716,22 @@ mod node_id_tests {
             data_dir: std::path::PathBuf::from("/tmp"),
             node_id_rotation_days: 0,
             rotation_allowed: false,
+            dashboard: None,
+        }
+    }
+
+    fn dashboard_bridge(max_conns: usize) -> DashboardBridge {
+        DashboardBridge {
+            ingress: crate::relay_dashboard::DashboardIngress::new(),
+            origin: crate::relay_dashboard::DashboardOrigin::new("abc.relay.example", 443).unwrap(),
+            max_conns,
+        }
+    }
+
+    fn loopback_target(target: RouteTarget<'_>) -> (&str, bool) {
+        match target {
+            RouteTarget::Loopback { addr, enroll } => (addr, enroll),
+            RouteTarget::Dashboard(_) => panic!("expected a loopback target"),
         }
     }
 
@@ -1400,11 +1739,11 @@ mod node_id_tests {
     fn open_route_defaults_to_wss() {
         let cfg = route_test_config();
         assert_eq!(
-            open_route_target(&cfg, None).unwrap(),
+            loopback_target(open_route_target(&cfg, None).unwrap()),
             ("127.0.0.1:9781", false)
         );
         assert_eq!(
-            open_route_target(&cfg, Some("unknown")).unwrap(),
+            loopback_target(open_route_target(&cfg, Some("unknown")).unwrap()),
             ("127.0.0.1:9781", false)
         );
     }
@@ -1413,7 +1752,7 @@ mod node_id_tests {
     fn open_route_selects_enrollment_when_available() {
         let cfg = route_test_config();
         assert_eq!(
-            open_route_target(&cfg, Some(PEER_HINT_ENROLL)).unwrap(),
+            loopback_target(open_route_target(&cfg, Some(PEER_HINT_ENROLL)).unwrap()),
             ("127.0.0.1:9782", true)
         );
     }
@@ -1426,6 +1765,116 @@ mod node_id_tests {
             open_route_target(&cfg, Some(PEER_HINT_ENROLL)).unwrap_err(),
             "enroll_unavailable"
         );
+    }
+
+    #[test]
+    fn a_gateway_route_needs_the_dashboard_and_never_names_a_local_port() {
+        let mut cfg = route_test_config();
+        assert_eq!(
+            open_route_target(&cfg, Some(PEER_HINT_GATEWAY)).unwrap_err(),
+            "gateway_unavailable",
+            "a daemon that did not opt in refuses the route"
+        );
+        cfg.dashboard = Some(dashboard_bridge(4));
+        assert!(matches!(
+            open_route_target(&cfg, Some(PEER_HINT_GATEWAY)).unwrap(),
+            RouteTarget::Dashboard(_)
+        ));
+    }
+
+    #[test]
+    fn a_dashboard_route_needs_a_browser_address_that_is_not_this_machine() {
+        let bridge = dashboard_bridge(4);
+        let live = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        for refused in [
+            None,
+            Some(""),
+            Some("not-an-address"),
+            Some("203.0.113.7"),
+            Some("127.0.0.1:5000"),
+            Some("[::1]:5000"),
+            Some("[::ffff:127.0.0.1]:5000"),
+            Some("0.0.0.0:5000"),
+        ] {
+            assert_eq!(
+                local_target(RouteTarget::Dashboard(&bridge), refused, &live).err(),
+                Some("bad_client_addr"),
+                "{refused:?}"
+            );
+        }
+        let Ok(LocalTarget::Dashboard { client_addr, .. }) = local_target(
+            RouteTarget::Dashboard(&bridge),
+            Some("203.0.113.7:5000"),
+            &live,
+        ) else {
+            panic!("a public browser address is admitted");
+        };
+        assert_eq!(client_addr, "203.0.113.7:5000".parse().unwrap());
+    }
+
+    #[test]
+    fn dashboard_conns_have_their_own_cap() {
+        let bridge = dashboard_bridge(2);
+        let live = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let first = local_target(
+            RouteTarget::Dashboard(&bridge),
+            Some("203.0.113.7:1"),
+            &live,
+        )
+        .ok()
+        .unwrap();
+        let second = local_target(
+            RouteTarget::Dashboard(&bridge),
+            Some("203.0.113.7:2"),
+            &live,
+        )
+        .ok()
+        .unwrap();
+        assert_eq!(
+            local_target(
+                RouteTarget::Dashboard(&bridge),
+                Some("203.0.113.7:3"),
+                &live
+            )
+            .err(),
+            Some("busy")
+        );
+        drop(first);
+        assert!(
+            local_target(
+                RouteTarget::Dashboard(&bridge),
+                Some("203.0.113.7:3"),
+                &live
+            )
+            .is_ok(),
+            "an ended dashboard conn frees its slot"
+        );
+        drop(second);
+    }
+
+    #[test]
+    fn the_dashboard_label_is_the_registration_keys_and_survives_node_id_rotation() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = ensure_signing_key(dir.path()).unwrap();
+        let label = dashboard_label(&key).unwrap();
+        assert!(zeroclaw_relay_proto::is_dashboard_label(&label), "{label}");
+        // The same key gives the same label whatever node-id it registers.
+        assert_eq!(
+            dashboard_label(&ensure_signing_key(dir.path()).unwrap()).unwrap(),
+            label
+        );
+        let keypair = Ed25519KeyPair::from_pkcs8(&key).unwrap();
+        assert_eq!(
+            dashboard_label_for_pubkey(keypair.public_key().as_ref()),
+            label
+        );
+        // Another key, another label.
+        let other = tempfile::tempdir().unwrap();
+        assert_ne!(
+            dashboard_label(&ensure_signing_key(other.path()).unwrap()).unwrap(),
+            label
+        );
+        assert!(dashboard_label(b"not a key").is_err());
     }
 
     #[test]
@@ -1532,6 +1981,7 @@ mod control_frame_tests {
             daemon_pubkey: "a".repeat(MAX_CONTROL_FRAME),
             node_id: "node".into(),
             relay_token: None,
+            dashboard: false,
         }
         .to_json();
 
@@ -2155,5 +2605,188 @@ mod bridge_classification_race_tests {
         );
 
         let _held = dialer.await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod relay_server_name_tests {
+    use super::relay_server_name;
+
+    #[test]
+    fn accepts_hostnames_and_ipv4() {
+        for host in [
+            "relay.example",
+            "relay",
+            "192.0.2.10",
+            "relay-1.eu.example.com",
+        ] {
+            assert!(relay_server_name(host).is_ok(), "{host} should be accepted");
+        }
+    }
+
+    #[test]
+    fn rejects_hosts_either_consumer_would_refuse() {
+        for host in [
+            "",
+            "relay/evil",
+            "relay?x",
+            "relay#x",
+            "user@relay",
+            "[2001:db8::1]",
+            "relay example",
+            "relay..example",
+        ] {
+            assert!(
+                relay_server_name(host).is_err(),
+                "{host:?} should be refused"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+// Test code, not daemon-path: bare `tokio::spawn` is fine here.
+#[allow(clippy::disallowed_methods)]
+mod dashboard_bridge_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio_tungstenite::tungstenite::Message;
+
+    const BROWSER: &str = "203.0.113.7:51000";
+
+    fn bridge() -> DashboardBridge {
+        DashboardBridge {
+            ingress: crate::relay_dashboard::DashboardIngress::new(),
+            origin: crate::relay_dashboard::DashboardOrigin::new("abc.relay.example", 443).unwrap(),
+            max_conns: 4,
+        }
+    }
+
+    struct Harness {
+        to_relay: mpsc::Receiver<Message>,
+        inbound: mpsc::Sender<ConnMsg>,
+        conns: ConnMap,
+        live: Arc<AtomicUsize>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    async fn start(bridge: DashboardBridge) -> Harness {
+        let (to_relay_tx, to_relay) = mpsc::channel(64);
+        let (inbound, inbound_rx) = mpsc::channel::<ConnMsg>(8);
+        let conns: ConnMap = Arc::new(Mutex::new(HashMap::new()));
+        let cancel = CancellationToken::new().child_token();
+        conns.lock().await.insert(
+            9,
+            ConnHandle {
+                tx: inbound.clone(),
+                cancel: cancel.clone(),
+            },
+        );
+        let live = Arc::new(AtomicUsize::new(0));
+        let route = DashboardRoute {
+            bridge,
+            client_addr: BROWSER.parse().unwrap(),
+            _live: DashboardLive::new(Arc::clone(&live)),
+        };
+        let task = tokio::spawn(bridge_dashboard_conn(
+            9,
+            route,
+            to_relay_tx,
+            inbound_rx,
+            cancel,
+            conns.clone(),
+        ));
+        Harness {
+            to_relay,
+            inbound,
+            conns,
+            live,
+            task,
+        }
+    }
+
+    async fn next_frame(rx: &mut mpsc::Receiver<Message>) -> Message {
+        tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("a frame to the relay")
+            .expect("the relay queue is open")
+    }
+
+    fn control(frame: Message) -> Control {
+        match frame {
+            Message::Text(text) => Control::from_json(text.as_str()).unwrap(),
+            other => panic!("expected a control frame, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_dashboard_route_reaches_the_attached_gateway_as_the_browser() {
+        let bridge = bridge();
+        let mut gateway = bridge.ingress.attach();
+        let mut harness = start(bridge).await;
+
+        let conn = tokio::time::timeout(Duration::from_secs(2), gateway.recv())
+            .await
+            .unwrap()
+            .expect("the gateway receives the connection");
+        assert_eq!(conn.client_addr(), BROWSER.parse().unwrap());
+        assert_eq!(conn.origin().origin(), "https://abc.relay.example");
+        assert_eq!(
+            control(next_frame(&mut harness.to_relay).await),
+            Control::Opened { conn_id: 9 },
+            "accepted only once the gateway has it"
+        );
+        assert!(matches!(
+            control(next_frame(&mut harness.to_relay).await),
+            Control::Window { conn_id: 9, .. }
+        ));
+        assert_eq!(harness.live.load(Ordering::Relaxed), 1);
+
+        // Browser -> gateway.
+        let (mut stream, _, _) = conn.into_parts();
+        harness
+            .inbound
+            .send(ConnMsg::Data(b"GET / HTTP/1.1\r\n".to_vec()))
+            .await
+            .unwrap();
+        let mut got = [0u8; 16];
+        stream.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, b"GET / HTTP/1.1\r\n");
+
+        // Gateway -> browser.
+        stream.write_all(b"HTTP/1.1 200 OK\r\n").await.unwrap();
+        match next_frame(&mut harness.to_relay).await {
+            Message::Binary(bytes) => {
+                assert_eq!(decode_data(&bytes), Some((9, &b"HTTP/1.1 200 OK\r\n"[..])));
+            }
+            other => panic!("expected DATA, got {other:?}"),
+        }
+
+        // A relay `Close` retires the conn and frees its dashboard slot.
+        harness.conns.lock().await.remove(&9);
+        tokio::time::timeout(Duration::from_secs(2), harness.task)
+            .await
+            .expect("a route close retires the dashboard conn")
+            .unwrap();
+        assert_eq!(harness.live.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn a_dashboard_route_with_no_gateway_attached_is_refused() {
+        let mut harness = start(bridge()).await;
+        assert_eq!(
+            control(next_frame(&mut harness.to_relay).await),
+            Control::Close {
+                conn_id: 9,
+                reason: "gateway_unavailable".into(),
+            }
+        );
+        tokio::time::timeout(Duration::from_secs(2), harness.task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(harness.conns.lock().await.is_empty());
+        assert_eq!(harness.live.load(Ordering::Relaxed), 0);
     }
 }

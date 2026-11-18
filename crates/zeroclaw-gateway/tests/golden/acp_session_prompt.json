@@ -1,0 +1,217 @@
+{
+  "frames": [
+    {
+      "channel": "acp",
+      "dir": "send",
+      "payload": {
+        "connect": "/acp?agent=web",
+        "protocol": "zeroclaw.acp.v1"
+      }
+    },
+    {
+      "channel": "acp",
+      "dir": "send",
+      "payload": {
+        "id": 1,
+        "jsonrpc": "2.0",
+        "method": "initialize",
+        "params": {
+          "protocolVersion": 1
+        }
+      }
+    },
+    {
+      "channel": "acp",
+      "dir": "recv",
+      "payload": {
+        "id": 1,
+        "jsonrpc": "2.0",
+        "result": {
+          "_meta": {
+            "zeroclaw": {
+              "defaultModel": "fixture-model",
+              "maxSessions": 10,
+              "sessionTimeoutSecs": 3600
+            }
+          },
+          "agentCapabilities": {
+            "loadSession": true,
+            "mcpCapabilities": {
+              "http": false,
+              "sse": false
+            },
+            "promptCapabilities": {
+              "audio": false,
+              "embeddedContext": true,
+              "image": false
+            },
+            "sessionCapabilities": {
+              "close": {},
+              "resume": {}
+            }
+          },
+          "agentInfo": {
+            "name": "zeroclaw-acp",
+            "title": "ZeroClaw ACP",
+            "version": "<version>"
+          },
+          "authMethods": [],
+          "protocolVersion": 1
+        }
+      }
+    },
+    {
+      "channel": "acp",
+      "dir": "send",
+      "payload": {
+        "id": 2,
+        "jsonrpc": "2.0",
+        "method": "session/new",
+        "params": {
+          "agentAlias": "web"
+        }
+      }
+    },
+    {
+      "channel": "acp",
+      "dir": "recv",
+      "payload": {
+        "id": 2,
+        "jsonrpc": "2.0",
+        "result": {
+          "sessionId": "<uuid:1>",
+          "workspaceDir": "<root>/workspace"
+        }
+      }
+    },
+    {
+      "channel": "acp",
+      "dir": "send",
+      "payload": {
+        "id": 3,
+        "jsonrpc": "2.0",
+        "method": "session/prompt",
+        "params": {
+          "prompt": [
+            {
+              "text": "Say hello over ACP.",
+              "type": "text"
+            }
+          ],
+          "sessionId": "<uuid:1>"
+        }
+      }
+    },
+    {
+      "channel": "acp",
+      "dir": "recv",
+      "payload": {
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+          "sessionId": "<uuid:1>",
+          "update": {
+            "content": {
+              "text": "ACP ",
+              "type": "text"
+            },
+            "sessionUpdate": "agent_message_chunk"
+          }
+        }
+      }
+    },
+    {
+      "channel": "acp",
+      "dir": "recv",
+      "payload": {
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+          "sessionId": "<uuid:1>",
+          "update": {
+            "content": {
+              "text": "reply ",
+              "type": "text"
+            },
+            "sessionUpdate": "agent_message_chunk"
+          }
+        }
+      }
+    },
+    {
+      "channel": "acp",
+      "dir": "recv",
+      "payload": {
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+          "sessionId": "<uuid:1>",
+          "update": {
+            "content": {
+              "text": "from ",
+              "type": "text"
+            },
+            "sessionUpdate": "agent_message_chunk"
+          }
+        }
+      }
+    },
+    {
+      "channel": "acp",
+      "dir": "recv",
+      "payload": {
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+          "sessionId": "<uuid:1>",
+          "update": {
+            "content": {
+              "text": "the ",
+              "type": "text"
+            },
+            "sessionUpdate": "agent_message_chunk"
+          }
+        }
+      }
+    },
+    {
+      "channel": "acp",
+      "dir": "recv",
+      "payload": {
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+          "sessionId": "<uuid:1>",
+          "update": {
+            "content": {
+              "text": "fixture.",
+              "type": "text"
+            },
+            "sessionUpdate": "agent_message_chunk"
+          }
+        }
+      }
+    },
+    {
+      "channel": "acp",
+      "dir": "recv",
+      "payload": {
+        "id": 3,
+        "jsonrpc": "2.0",
+        "result": {
+          "content": "ACP reply from the fixture.",
+          "sessionId": "<uuid:1>",
+          "stopReason": "end_turn"
+        }
+      }
+    },
+    {
+      "channel": "provider",
+      "dir": "meta",
+      "payload": {
+        "requests": 1
+      }
+    }
+  ],
+  "scenario": "acp_session_prompt"
+}

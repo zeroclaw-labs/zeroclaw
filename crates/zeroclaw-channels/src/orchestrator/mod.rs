@@ -95,8 +95,9 @@ pub use zeroclaw_infra::session_sqlite::SqliteSessionBackend;
 pub use zeroclaw_infra::stall_watchdog::StallWatchdog;
 
 use anyhow::{Context, Result};
+use futures_util::FutureExt;
 use parking_lot::RwLock;
-use portable_atomic::{AtomicU64, AtomicUsize, Ordering};
+use portable_atomic::{AtomicU64, Ordering};
 use pulldown_cmark::{Event, Options as MarkdownOptions, Parser as MarkdownParser, Tag};
 
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -124,6 +125,7 @@ use zeroclaw_providers::{
     self, ChatMessage, ModelProvider, ProviderDispatch, SafeguardFallbackKind,
     SafeguardFallbackNotice, scope_safeguard_fallback, take_last_safeguard_fallback,
 };
+use zeroclaw_runtime::agent::execution_tree_budget::ExecutionTreeBudget;
 use zeroclaw_runtime::agent::loop_::{
     LoopKnobs, ResolvedAgentExecution, ResolvedIo, ResolvedModelAccess, ResolvedRuntimeKnobs,
     ToolLoop, append_pinned_mcp_section, apply_text_tool_prompt_policy,
@@ -146,6 +148,12 @@ type CronChannelRegistry = Arc<HashMap<String, Arc<dyn Channel>>>;
 /// Replaced wholesale by the active channel task and cleared when that task ends.
 static CRON_CHANNEL_REGISTRY: std::sync::RwLock<Option<CronChannelRegistry>> =
     std::sync::RwLock::new(None);
+
+pub fn prepare_live_channel_registry(expect_channels: bool) {
+    *CRON_CHANNEL_REGISTRY
+        .write()
+        .unwrap_or_else(|e| e.into_inner()) = expect_channels.then(|| Arc::new(HashMap::new()));
+}
 
 /// Owns one published registry generation for the lifetime of its channel task.
 /// A stale task must not clear a newer task's replacement when it finally exits.
@@ -254,12 +262,14 @@ const WHATSAPP_CURRENT_GROUP_MESSAGE_LABEL: &str = "Current WhatsApp group messa
 // System prompt functions live in `zeroclaw_runtime::agent::system_prompt`.
 #[allow(unused_imports)]
 pub use zeroclaw_runtime::agent::system_prompt::{
-    BOOTSTRAP_MAX_CHARS, build_system_prompt, build_system_prompt_with_mode,
-    build_system_prompt_with_mode_and_autonomy, build_system_prompt_with_mode_and_effective_tools,
+    BOOTSTRAP_MAX_CHARS, COMPACT_BOOTSTRAP_MAX_CHARS, build_system_prompt,
+    build_system_prompt_with_mode, build_system_prompt_with_mode_and_autonomy,
+    build_system_prompt_with_mode_and_effective_tools,
 };
 
 const DEFAULT_CHANNEL_INITIAL_BACKOFF_SECS: u64 = 2;
 const DEFAULT_CHANNEL_MAX_BACKOFF_SECS: u64 = 60;
+const CHANNEL_GENERATION_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 const MIN_CHANNEL_MESSAGE_TIMEOUT_SECS: u64 = 30;
 #[cfg(test)]
 const CHANNEL_MESSAGE_TIMEOUT_SECS: u64 = 300;
@@ -327,9 +337,37 @@ fn channel_message_timeout_budget_secs_with_cap(
 struct ChannelRouteSelection {
     model_provider: String,
     model: String,
+    /// True when this selection came from config and remains eligible for
+    /// automatic classification. Operator `/model` overrides set it false;
+    /// model-issued switches preserve the current mode.
+    automatic: bool,
     /// Route-specific API key override. When set, this credential is passed
     /// directly to the requested provider instead of the alias entry's key.
     api_key: Option<String>,
+}
+
+fn configured_provider_allowed_for_turn(
+    attempt_allowlist: Option<&HashSet<String>>,
+    provider_ref: &str,
+) -> bool {
+    let provider_ref = provider_ref.trim();
+    provider_ref.is_empty()
+        || attempt_allowlist.is_none_or(|allowed| allowed.contains(provider_ref))
+}
+
+fn effort_routing_classification_content(message: &str) -> String {
+    static ATTACHMENT_MARKER_RE: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| {
+            regex::Regex::new(
+                r"(?i)\[\s*(?:IMAGE|PHOTO|DOCUMENT|FILE|VIDEO|AUDIO|VOICE|LOCATION)\s*:[^\]]+\]",
+            )
+            .expect("attachment marker regex must compile")
+        });
+
+    ATTACHMENT_MARKER_RE
+        .replace_all(message, "")
+        .trim()
+        .to_string()
 }
 
 fn resolve_channel_context_limits(
@@ -368,6 +406,7 @@ fn append_provider_fallback_footer(
     mut response: String,
     fallback: Option<&ProviderFallbackInfo>,
     safeguard: Option<&SafeguardFallbackNotice>,
+    model_notice: zeroclaw_config::schema::ModelFallbackNotice,
 ) -> String {
     // The ordinary recovery leg comes first so the footers read in route
     // order: the provider fallback, then the safeguard switch the accepted
@@ -413,6 +452,27 @@ fn append_provider_fallback_footer(
                         ("model", fallback.actual_model.as_str()),
                     ],
                 ));
+            } else if fallback.requested_model != fallback.actual_model {
+                use zeroclaw_config::schema::ModelFallbackNotice;
+                let notice = match model_notice {
+                    ModelFallbackNotice::Off => None,
+                    ModelFallbackNotice::Redacted => Some(channel_runtime_cli_string(
+                        "channel-runtime-model-fallback-redacted",
+                    )),
+                    ModelFallbackNotice::Detailed => Some(channel_runtime_cli_string_with_args(
+                        "turn-model-fallback-notice",
+                        &[
+                            ("requested_model", fallback.requested_model.as_str()),
+                            ("requested_provider", fallback.requested_provider.as_str()),
+                            ("actual_model", fallback.actual_model.as_str()),
+                            ("actual_provider", fallback.actual_provider.as_str()),
+                        ],
+                    )),
+                };
+                if let Some(notice) = notice {
+                    response.push_str("\n\n---\n");
+                    response.push_str(&notice);
+                }
             }
         }
         _ => {}
@@ -632,6 +692,7 @@ struct ChannelRuntimeContext {
     /// channel.`<type>`.`<alias>`) is a follow-up.
     agent_cfg: Arc<zeroclaw_config::schema::AliasedAgentConfig>,
     prompt_config: Arc<zeroclaw_config::schema::Config>,
+    live_config: zeroclaw_config::live::LiveConfigHandle,
     memory: Arc<dyn Memory>,
     memory_strategy: Arc<dyn MemoryStrategy>,
     tools_registry: Arc<zeroclaw_runtime::tools::scoped::ScopedToolRegistry>,
@@ -676,9 +737,14 @@ struct ChannelRuntimeContext {
     session_store: Option<Arc<dyn zeroclaw_infra::session_backend::SessionBackend>>,
     /// Non-interactive approval manager for channel-driven runs.
     /// Enforces `auto_approve` / `always_ask` / supervised policy from
-    /// `[autonomy]` config; auto-denies tools that would need interactive
-    /// approval since no operator is present on channel runs.
+    /// `[risk_profiles]` config while preserving the initiating channel as a
+    /// backchannel for supervised shell approval.
     approval_manager: Arc<ApprovalManager>,
+    /// The agent's filesystem policy, built once per agent at channel start
+    /// (the same `Arc` the agent's tools were assembled with) and threaded
+    /// into each turn's execution context so the no-vision image-marker
+    /// gate applies the identical read ledger the file tools apply.
+    security: Arc<SecurityPolicy>,
     activated_tools:
         Option<std::sync::Arc<std::sync::Mutex<zeroclaw_runtime::tools::ActivatedToolSet>>>,
     cost_tracking: Option<ChannelCostTrackingState>,
@@ -702,6 +768,38 @@ struct ChannelRuntimeContext {
     persist_locks: Arc<std::sync::Mutex<HashMap<String, Arc<std::sync::Mutex<()>>>>>,
     sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
     sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
+    sop_driver_sink: Option<zeroclaw_runtime::sop::SopDriverSink>,
+}
+
+/// Build the channel turn's non-interactive manager while retaining the
+/// initiating channel as an approval backchannel for supervised shell calls.
+fn channel_approval_manager(
+    risk_profile: &zeroclaw_config::schema::RiskProfileConfig,
+) -> ApprovalManager {
+    ApprovalManager::for_non_interactive_backchannel(risk_profile)
+}
+
+/// Create the approval state and channel for one channel-originated turn.
+/// Mutable `Always` grants stay on this fresh manager; an explicit approval
+/// route wraps the initiating channel so only `inherit-originator` can fall
+/// back to it.
+fn channel_turn_approval(
+    manager: &ApprovalManager,
+    risk_profile: Option<&zeroclaw_config::schema::RiskProfileConfig>,
+    channels_by_name: &HashMap<String, Arc<dyn Channel>>,
+    origin: Option<Arc<dyn Channel>>,
+) -> (ApprovalManager, Option<Arc<dyn Channel>>) {
+    let approval_channel = match risk_profile.and_then(|profile| profile.approval_route.clone()) {
+        Some(route) => {
+            let handles = Arc::new(RwLock::new(channels_by_name.clone()));
+            Some(zeroclaw_runtime::agent::agent::routed_approval_channel(
+                handles, route, origin,
+            ))
+        }
+        None => origin,
+    };
+
+    (manager.for_new_turn(), approval_channel)
 }
 
 /// Acquire the per-conversation-history-key persistence lock so that
@@ -727,11 +825,16 @@ impl ModelPickerDispatchOwnership {
     fn hold(_message_id: &str) -> Self {
         Self
     }
+
+    /// Nothing to settle. Mirrors the Telegram token's `release` so callers
+    /// never `drop()` this type, which has no drop glue.
+    fn release(self) {}
 }
 
 /// A turn waiting for its conversation lane.
 struct PendingTurn {
     ctx: Arc<ChannelRuntimeContext>,
+    agent_generation: u64,
     msg: zeroclaw_api::channel::ChannelMessage,
     /// Immutable queue-ingress id used by picker delivery bookkeeping even
     /// when a modifying hook replaces `msg.id` before final lane admission.
@@ -942,51 +1045,50 @@ impl Drop for IngressOrderRegistration {
     }
 }
 
-/// Tracks detached post-hook routing tasks so shutdown cannot race a turn that
-/// has not reached its final lane yet.
+/// Owns detached channel-runtime tasks so shutdown can drain them or abort and
+/// join every remainder before the channel generation retires.
 struct IngressTaskTracker {
-    active: AtomicUsize,
-    drained: tokio::sync::Notify,
+    tasks: Mutex<tokio::task::JoinSet<()>>,
 }
 
 impl IngressTaskTracker {
     fn new() -> Arc<Self> {
         Arc::new(Self {
-            active: AtomicUsize::new(0),
-            drained: tokio::sync::Notify::new(),
+            tasks: Mutex::new(tokio::task::JoinSet::new()),
         })
     }
 
-    fn track(self: &Arc<Self>) -> IngressTaskRegistration {
-        self.active.fetch_add(1, Ordering::AcqRel);
-        IngressTaskRegistration {
-            tracker: Arc::clone(self),
+    fn spawn(&self, future: impl std::future::Future<Output = ()> + Send + 'static) {
+        let mut tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
+        while let Some(result) = tasks.try_join_next() {
+            log_worker_join_result(result);
         }
+        tasks.spawn(future);
     }
 
     async fn wait_drained(&self) {
-        loop {
-            let drained = self.drained.notified();
-            tokio::pin!(drained);
-            drained.as_mut().enable();
-
-            if self.active.load(Ordering::Acquire) == 0 {
-                return;
-            }
-            drained.await;
+        let mut tasks = std::mem::take(&mut *self.tasks.lock().unwrap_or_else(|e| e.into_inner()));
+        while let Some(result) = tasks.join_next().await {
+            log_worker_join_result(result);
         }
     }
-}
 
-struct IngressTaskRegistration {
-    tracker: Arc<IngressTaskTracker>,
-}
-
-impl Drop for IngressTaskRegistration {
-    fn drop(&mut self) {
-        if self.tracker.active.fetch_sub(1, Ordering::AcqRel) == 1 {
-            self.tracker.drained.notify_waiters();
+    async fn drain_until(&self, deadline: tokio::time::Instant) -> bool {
+        let mut tasks = std::mem::take(&mut *self.tasks.lock().unwrap_or_else(|e| e.into_inner()));
+        while !tasks.is_empty() {
+            match tokio::time::timeout_at(deadline, tasks.join_next()).await {
+                Ok(Some(result)) => log_worker_join_result(result),
+                Ok(None) => return true,
+                Err(_) => {
+                    tasks.abort_all();
+                    while let Some(result) = tasks.join_next().await {
+                        log_worker_join_result(result);
+                    }
+                    return false;
+                }
+            }
         }
+        true
     }
 }
 
@@ -1020,6 +1122,9 @@ struct ConversationLaneRegistry {
     lanes: std::sync::Mutex<HashMap<String, tokio::sync::mpsc::Sender<Box<PendingTurn>>>>,
     drained: tokio::sync::Notify,
     semaphore: Arc<tokio::sync::Semaphore>,
+    agent_lifecycle: zeroclaw_runtime::live_config_authority::AgentLifecycleCoordinator,
+    cancel: CancellationToken,
+    tasks: Arc<IngressTaskTracker>,
 }
 
 /// Maximum queued turns per conversation lane, excluding the one being
@@ -1092,11 +1197,18 @@ enum LaneAdmission {
 }
 
 impl ConversationLaneRegistry {
-    fn new(semaphore: Arc<tokio::sync::Semaphore>) -> Arc<Self> {
+    fn new(
+        semaphore: Arc<tokio::sync::Semaphore>,
+        agent_lifecycle: zeroclaw_runtime::live_config_authority::AgentLifecycleCoordinator,
+        cancel: CancellationToken,
+    ) -> Arc<Self> {
         Arc::new(Self {
             lanes: std::sync::Mutex::new(HashMap::new()),
             drained: tokio::sync::Notify::new(),
             semaphore,
+            agent_lifecycle,
+            cancel,
+            tasks: IngressTaskTracker::new(),
         })
     }
 
@@ -1123,10 +1235,11 @@ impl ConversationLaneRegistry {
         // *behind* a successor that waits on its completion at the head of
         // the same lane — the completion could then only be marked by a queue
         // position that never drains: a permanently wedged lane.
-        if turn
-            .registration
-            .as_ref()
-            .is_some_and(|registration| registration.cancellation.is_cancelled())
+        if self.cancel.is_cancelled()
+            || turn
+                .registration
+                .as_ref()
+                .is_some_and(|registration| registration.cancellation.is_cancelled())
         {
             return LaneAdmission::Canceled(turn);
         }
@@ -1148,7 +1261,7 @@ impl ConversationLaneRegistry {
         lanes.insert(key.to_string(), tx.clone());
         let registry = Arc::clone(self);
         let lane_key = key.to_string();
-        zeroclaw_spawn::spawn!(registry.run_lane(lane_key, rx));
+        self.tasks.spawn(registry.run_lane(lane_key, rx));
 
         // Re-send after the lane exists. A runner cannot retire while this
         // lock is held, so the only way this fails is a runtime already
@@ -1179,14 +1292,21 @@ impl ConversationLaneRegistry {
                 break;
             };
 
-            // Each slot is processed in its own task so a panic — in a hook,
-            // or anywhere down the processing path — is contained and logged:
-            // the lane keeps serving its queue and still retires through
-            // `next_slot`, instead of dying with its registration stuck in the
-            // registry and `wait_drained` hanging on shutdown.
+            // Contain a turn panic inside its lane without spawning an
+            // unowned descendant that could outlive generation shutdown.
             let registry = Arc::clone(&self);
-            let worker = zeroclaw_spawn::spawn!(registry.process_turn(turn));
-            log_worker_join_result(worker.await);
+            if std::panic::AssertUnwindSafe(registry.process_turn(turn))
+                .catch_unwind()
+                .await
+                .is_err()
+            {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                    "Channel message worker crashed"
+                );
+            }
         }
     }
 
@@ -1196,10 +1316,11 @@ impl ConversationLaneRegistry {
         // `/stop` or a superseding message may have cancelled this turn
         // while it waited in the queue; drop it before it waits for a
         // predecessor or takes an execution permit.
-        if turn
-            .registration
-            .as_ref()
-            .is_some_and(|registration| registration.cancellation.is_cancelled())
+        if self.cancel.is_cancelled()
+            || turn
+                .registration
+                .as_ref()
+                .is_some_and(|registration| registration.cancellation.is_cancelled())
         {
             return;
         }
@@ -1236,24 +1357,38 @@ impl ConversationLaneRegistry {
             }
         };
 
-        let PendingTurn {
-            ctx,
-            msg,
-            delivery_message_id,
-            dispatch_ownership,
-            registration,
-            pending_work,
-        } = *turn;
-        run_conversation_turn(
-            ctx,
-            msg,
-            delivery_message_id,
-            dispatch_ownership,
-            registration,
-            permit,
-            pending_work,
-        )
-        .await;
+        let Some(turn_lease) =
+            self.reserve_turn(turn.ctx.agent_alias.as_str(), turn.agent_generation)
+        else {
+            return;
+        };
+        run_conversation_turn(*turn, permit, self.cancel.clone(), Arc::new(turn_lease)).await;
+    }
+
+    fn reserve_turn(
+        &self,
+        alias: &str,
+        generation: u64,
+    ) -> Option<zeroclaw_runtime::live_config_authority::AgentTurnLease> {
+        if self.cancel.is_cancelled() {
+            return None;
+        }
+        match self.agent_lifecycle.reserve_turn_at(alias, generation) {
+            Ok(lease) => Some(lease),
+            Err(error) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "agent": alias,
+                            "error": error.to_string(),
+                        })),
+                    "dropping inbound message: agent lifecycle unavailable"
+                );
+                None
+            }
+        }
     }
 
     /// Take the next queued slot, retiring the lane when the queue is empty.
@@ -1290,23 +1425,14 @@ impl ConversationLaneRegistry {
 
     /// Wait until every lane has retired, so shutdown lets queued turns finish.
     async fn wait_drained(&self) {
-        loop {
-            // Register before re-reading the map: a lane retiring between the
-            // check and the registration would otherwise never wake this up.
-            let notified = self.drained.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
+        self.tasks.wait_drained().await;
+        self.lanes.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    }
 
-            if self
-                .lanes
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .is_empty()
-            {
-                return;
-            }
-            notified.await;
-        }
+    async fn drain_until(&self, deadline: tokio::time::Instant) -> bool {
+        let drained = self.tasks.drain_until(deadline).await;
+        self.lanes.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        drained
     }
 }
 
@@ -1342,8 +1468,7 @@ fn send_conversation_busy(
             zeroclaw_runtime::i18n::get_required_cli_string("channel-runtime-conversation-busy");
         let reply_target = msg.reply_target.clone();
         let thread_ts = msg.thread_ts.clone();
-        let tracked_task = busy_notice_tasks.track();
-        zeroclaw_spawn::spawn!(async move {
+        busy_notice_tasks.spawn(async move {
             let _notice_permit = notice_permit;
             send_notice_with_timeout(
                 channel,
@@ -1351,7 +1476,6 @@ fn send_conversation_busy(
                 "busy_notice",
             )
             .await;
-            drop(tracked_task);
         });
     }
 }
@@ -1385,7 +1509,16 @@ async fn route_inbound_slot(
     }
 
     let ctx = Arc::clone(&turn.ctx);
-    let Some(hooked) = run_inbound_message_hook(&ctx, turn.msg).await else {
+    // Hooks can execute agent-scoped work, but waiting for debounce or a lane
+    // must not pin a lifecycle lease. Revalidate again at model execution.
+    let hooked = {
+        let Some(_lease) = lanes.reserve_turn(ctx.agent_alias.as_str(), turn.agent_generation)
+        else {
+            return;
+        };
+        run_inbound_message_hook(&ctx, turn.msg).await
+    };
+    let Some(hooked) = hooked else {
         return;
     };
     turn.msg = hooked;
@@ -1424,17 +1557,12 @@ fn spawn_inbound_routing(
     busy_notice_tasks: Arc<IngressTaskTracker>,
     slot: InboundSlot,
 ) {
-    let tracked_task = tracker.track();
-    let worker = zeroclaw_spawn::spawn!(route_inbound_slot(
+    tracker.spawn(route_inbound_slot(
         lanes,
         busy_notice_budget,
         busy_notice_tasks,
-        slot
+        slot,
     ));
-    zeroclaw_spawn::spawn!(async move {
-        log_worker_join_result(worker.await);
-        drop(tracked_task);
-    });
 }
 
 /// Drive one debounce bucket into the lane slot reserved for it.
@@ -1484,6 +1612,7 @@ async fn retire_owned_bucket(
 
 fn spawn_debounce_forwarder(
     first: tokio::sync::oneshot::Receiver<String>,
+    tasks: &Arc<IngressTaskTracker>,
 ) -> (
     tokio::sync::oneshot::Receiver<String>,
     tokio::sync::mpsc::UnboundedSender<DebounceBucketExtension>,
@@ -1491,7 +1620,7 @@ fn spawn_debounce_forwarder(
     let (slot_tx, slot_rx) = tokio::sync::oneshot::channel();
     let (updates_tx, mut updates_rx) = tokio::sync::mpsc::unbounded_channel();
 
-    zeroclaw_spawn::spawn!(async move {
+    tasks.spawn(async move {
         let mut pending = first;
         // Admission permits of every follow-up retained in this bucket. They
         // are held until the bucket resolves either way — delivery (the
@@ -1999,6 +2128,13 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
              - Do not use http://, https://, data:, file:, or any other URL scheme in WhatsApp Web media markers.\n\
              - Keep normal text outside markers and never wrap markers in code fences.\n",
         ),
+        "signal" => Some(
+            "When responding on Signal:\n\
+             - For media attachments use markers: [IMAGE:<path>], [DOCUMENT:<path>], [VIDEO:<path>], [AUDIO:<path>], or [VOICE:<path>]\n\
+             - Marker paths must refer to local files inside the configured workspace directory. Absolute paths and workspace-relative paths are accepted when they stay inside that workspace.\n\
+             - Do not use http://, https://, data:, file:, or any other URL scheme in Signal media markers.\n\
+             - Keep normal text outside markers and never wrap markers in code fences.\n",
+        ),
         "lark" | "feishu" => Some(
             "When responding on Lark/Feishu:\n\
              - Be concise and direct\n\
@@ -2085,17 +2221,32 @@ fn build_channel_system_prompt(
 ) -> String {
     let mut prompt = base_prompt.to_string();
 
-    // Date refresh stays in the system prompt: the heading is date-only
-    // (no seconds), so within a single day the rendered value is stable and
-    // cache hits; it only changes once per day at midnight. Acceptable for
-    // a 99%+ intra-session cache-hit rate.
-    refresh_channel_prompt_date_section(&mut prompt);
+    // Strip volatile date sections: the per-turn
+    // [turn-context] preamble already carries time/date/weekday/tz, and a
+    // ## Current Date value that changes at midnight busts the prompt cache
+    // for every live channel session.
+    strip_channel_prompt_volatile_date_sections(&mut prompt);
 
     if let Some(instructions) = channel_delivery_instructions(channel_name) {
         if prompt.is_empty() {
             prompt = instructions.to_string();
         } else {
             prompt = format!("{prompt}\n\n{instructions}");
+        }
+        // Both WhatsApp backends share a name, but only Web delivers documents.
+        if instructions.contains("[DOCUMENT:")
+            && !matches!(channel_name, "whatsapp" | "whatsapp-web")
+        {
+            prompt.push_str(
+                "\n\nWhen generating large HTML, scripts, spreadsheets or exports, use available \
+                 file-writing tools to save the complete artifact at an absolute path inside the \
+                 configured workspace instead of pasting it into chat. After saving successfully, \
+                 send a short summary plus the document marker described above, using that same absolute path \
+                 and following this channel's path and URL restrictions. If file-writing tools \
+                 are unavailable or saving fails, explain the limitation and provide the content \
+                 in chat. Do not emit a document marker for an \
+                 unsaved file.",
+            );
         }
     }
 
@@ -2155,29 +2306,74 @@ fn build_channel_system_prompt_for_message_with_signal(
     }
 }
 
-fn current_date_section() -> String {
-    let now = chrono::Local::now();
-    format!(
-        "{CURRENT_DATE_HEADING}{} ({})",
-        now.format("%Y-%m-%d"),
-        now.format("%:z")
-    )
-}
-
-fn refresh_channel_prompt_date_section(prompt: &mut String) {
-    let runtime_start = prompt
-        .find("\n## Runtime")
-        .map(|i| i + 1)
-        .unwrap_or(prompt.len());
-
-    if let Some((start, heading_len)) = find_latest_date_heading_before(prompt, runtime_start) {
+fn strip_channel_prompt_volatile_date_sections(prompt: &mut String) {
+    // Walk repeatedly so both ## Current Date and ## Current Date & Time
+    // are removed even when both appear. Keep a ## Current Date section
+    // whose body is not a generated date line (e.g. a project note).
+    loop {
+        let runtime_start = prompt
+            .find("\n## Runtime")
+            .map(|i| i + 1)
+            .unwrap_or(prompt.len());
+        let Some((start, heading_len)) = find_latest_date_heading_before(prompt, runtime_start)
+        else {
+            break;
+        };
         let content_start = start + heading_len;
         let section_end = prompt[content_start..]
             .find("\n## ")
             .map(|i| content_start + i)
             .unwrap_or(prompt.len());
-        prompt.replace_range(start..section_end, &current_date_section());
+        let body = prompt[content_start..section_end].trim();
+        if !is_generated_date_line(body) {
+            // Non-date body under ## Current Date — leave it alone and stop
+            // scanning older headings so we do not remove project notes.
+            break;
+        }
+        // Remove the section with the newline that ends it, so the next
+        // heading keeps the blank line in front of it. A section at the end
+        // of the prompt takes the newlines before it instead. Only ASCII
+        // '\n' bytes are stepped over, so the range stays on char boundaries.
+        let (from, to) = if section_end < prompt.len() {
+            (start, section_end + 1)
+        } else {
+            let mut from = start;
+            while from > 0 && prompt.as_bytes()[from - 1] == b'\n' {
+                from -= 1;
+            }
+            (from, section_end)
+        };
+        prompt.replace_range(from..to, "");
     }
+}
+
+/// True when `body` is exactly one date line as the prompt builders used to
+/// emit it: `YYYY-MM-DD (+HH:MM)` or the legacy `YYYY-MM-DD HH:MM:SS (TZ)`.
+/// Anything else (e.g. a workspace note that merely starts with a date) is
+/// project context and must survive the strip.
+fn is_generated_date_line(body: &str) -> bool {
+    let bytes = body.as_bytes();
+    if body.contains('\n') || bytes.len() < 10 {
+        return false;
+    }
+    let date_ok = bytes[..10].iter().enumerate().all(|(i, b)| match i {
+        4 | 7 => *b == b'-',
+        _ => b.is_ascii_digit(),
+    });
+    if !date_ok {
+        return false;
+    }
+    let rest = &body[10..];
+    let Some(open) = rest.find(" (") else {
+        return false;
+    };
+    let time = &rest[..open];
+    let zone = &rest[open + 2..];
+    let time_ok = time.is_empty()
+        || (time.starts_with(' ')
+            && time.len() > 1
+            && time[1..].bytes().all(|b| b.is_ascii_digit() || b == b':'));
+    time_ok && zone.len() > 1 && zone.ends_with(')') && !zone[..zone.len() - 1].contains(['(', ')'])
 }
 
 fn find_latest_date_heading_before(prompt: &str, before: usize) -> Option<(usize, usize)> {
@@ -2355,7 +2551,14 @@ fn collapse_inline_image_payloads(turns: &mut [ChatMessage]) {
         return;
     }
     let last_idx = turns.len() - 1;
-    for turn in &mut turns[..last_idx] {
+    collapse_inline_image_payloads_in(&mut turns[..last_idx]);
+}
+
+/// Collapse inline `data:` image payloads in every one of `turns`. Callers
+/// whose slice ends with the turn being sent use
+/// [`collapse_inline_image_payloads`], which leaves that last turn intact.
+fn collapse_inline_image_payloads_in(turns: &mut [ChatMessage]) {
+    for turn in turns {
         if turn.role != "user" || !turn.content.contains("[IMAGE:data:") {
             continue;
         }
@@ -2427,6 +2630,35 @@ fn normalize_cached_channel_turns(turns: Vec<ChatMessage>) -> Vec<ChatMessage> {
     normalized
 }
 
+/// Cached conversation turns in the form a provider request carries them:
+/// alternation restored and internal markers stripped. Every reader that
+/// sends a sender's cached history to a model goes through this, so a channel
+/// turn and an internally initiated turn bound to the same conversation see
+/// the same thing. Inline image payloads are collapsed by the caller, which
+/// knows whether the last turn is the one being sent.
+fn provider_ready_cached_turns(turns: Vec<ChatMessage>) -> Vec<ChatMessage> {
+    let mut turns = normalize_cached_channel_turns(turns);
+
+    // Strip stale tool_result blocks from cached turns so the LLM never
+    // sees a `<tool_result>` without a preceding `<tool_call>`, which
+    // causes hallucinated output on subsequent heartbeat ticks or sessions.
+    for turn in &mut turns {
+        if turn.content.contains("<tool_result") {
+            turn.content = strip_tool_result_content(&turn.content);
+        }
+    }
+
+    // Strip [Used tools: ...] prefixes from cached assistant turns so the
+    // LLM never sees (and reproduces) this internal summary format.
+    for turn in &mut turns {
+        if turn.role == "assistant" && turn.content.starts_with("[Used tools:") {
+            turn.content = strip_tool_summary_prefix(&turn.content);
+        }
+    }
+
+    turns
+}
+
 /// Remove `<tool_result …>…</tool_result>` blocks (and a leading `[Tool results]`
 /// header, if present) from a conversation-history entry so that stale tool
 /// output is never presented to the LLM without the corresponding `<tool_call>`.
@@ -2436,7 +2668,19 @@ fn strip_tool_result_content(text: &str) -> String {
             .expect("TOOL_RESULT_RE regex must compile")
     });
 
-    let cleaned = TOOL_RESULT_RE.replace_all(text, "");
+    // A new-shape carrier opens with a results prefix, an attachments count
+    // line, and that many marker lines before the body. Parse the carrier so
+    // the fixed-position header and marker lines drop out exactly, and only
+    // the body's tool_result blocks are stripped below.
+    let body = if let Some(parts) = zeroclaw_api::tool_carrier::classify("user", text)
+        && parts.declared
+    {
+        parts.text
+    } else {
+        text.to_string()
+    };
+
+    let cleaned = TOOL_RESULT_RE.replace_all(&body, "");
     let cleaned = cleaned.trim();
 
     // If the only remaining content is the header, drop it entirely.
@@ -2838,6 +3082,9 @@ async fn load_runtime_config_and_defaults(
     let mut parsed: Config = zeroclaw_config::migration::migrate_to_current(&contents)
         .with_context(|| format!("Failed to migrate {}", path.display()))?;
     parsed.config_path = path.to_path_buf();
+    // This value was parsed from the file at `path`; it holds save-over
+    // provenance for the guard in `Config::save`.
+    parsed.loaded_from = Some(path.to_path_buf());
 
     if let Some(zeroclaw_dir) = path.parent() {
         let store =
@@ -2947,6 +3194,7 @@ fn default_route_selection_from_snapshot(
     ChannelRouteSelection {
         model_provider: defaults.default_model_provider,
         model: defaults.model,
+        automatic: true,
         api_key: None,
     }
 }
@@ -2981,16 +3229,29 @@ fn get_route_selection(
     sender_key: &str,
     defaults_snapshot: &ChannelRuntimeDefaultsSnapshot,
 ) -> ChannelRouteSelection {
+    get_route_selection_with_scope(ctx, msg, sender_key, defaults_snapshot).0
+}
+
+fn get_route_selection_with_scope(
+    ctx: &ChannelRuntimeContext,
+    msg: &zeroclaw_api::channel::ChannelMessage,
+    sender_key: &str,
+    defaults_snapshot: &ChannelRuntimeDefaultsSnapshot,
+) -> (ChannelRouteSelection, bool) {
     // Precedence (most specific wins): user > agent scope override,
     // then the per-sender route override, then the config default.
-    scope_override_lookup(ctx, msg).unwrap_or_else(|| {
+    if let Some(route) = scope_override_lookup(ctx, msg) {
+        return (route, true);
+    }
+    (
         ctx.route_overrides
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(sender_key)
             .cloned()
-            .unwrap_or_else(|| default_route_selection_from_snapshot(defaults_snapshot))
-    })
+            .unwrap_or_else(|| default_route_selection_from_snapshot(defaults_snapshot)),
+        false,
+    )
 }
 
 fn set_route_selection(
@@ -3016,6 +3277,7 @@ fn apply_model_ref(
     model_routes: &[zeroclaw_config::schema::ModelRouteConfig],
     model: &str,
 ) {
+    sel.automatic = false;
     if let Some(route) = model_routes
         .iter()
         .find(|r| r.model.eq_ignore_ascii_case(model) || r.hint.eq_ignore_ascii_case(model))
@@ -3026,6 +3288,17 @@ fn apply_model_ref(
     } else {
         sel.model = model.to_string();
     }
+}
+
+fn apply_model_issued_route_switch(
+    route: &mut ChannelRouteSelection,
+    model_provider: String,
+    model: String,
+    api_key: Option<String>,
+) {
+    route.model_provider = model_provider;
+    route.model = model;
+    route.api_key = api_key;
 }
 
 fn shadow_note(
@@ -3073,6 +3346,18 @@ fn set_scope_override(
     } else {
         overrides.insert(key, next);
     }
+}
+
+fn clear_scope_override(
+    ctx: &ChannelRuntimeContext,
+    scope: OverrideScope,
+    msg: &zeroclaw_api::channel::ChannelMessage,
+) {
+    let key = scope_override_key(scope, msg, ctx.agent_alias.as_str());
+    ctx.scope_overrides
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&key);
 }
 
 /// Per-sender authorization for `/model --agent <model>`. Resolves live
@@ -3326,15 +3611,19 @@ fn replace_available_skills_section(base_prompt: &str, refreshed_skills: &str) -
     format!("{base_prompt}\n\n{refreshed_skills}")
 }
 
-fn rendered_skills_prompt_mode(
-    prompt: &str,
-) -> Option<zeroclaw_config::schema::SkillsPromptInjectionMode> {
+fn rendered_skills_section(prompt: &str) -> Option<&str> {
     const SKILLS_HEADER: &str = "## Available Skills\n\n";
     const SKILLS_END: &str = "</available_skills>";
 
     let start = prompt.find(SKILLS_HEADER)?;
     let rel_end = prompt[start..].find(SKILLS_END)?;
-    let section = &prompt[start..start + rel_end + SKILLS_END.len()];
+    Some(&prompt[start..start + rel_end + SKILLS_END.len()])
+}
+
+fn rendered_skills_prompt_mode(
+    prompt: &str,
+) -> Option<zeroclaw_config::schema::SkillsPromptInjectionMode> {
+    let section = rendered_skills_section(prompt)?;
     let preamble = section.split_once("<available_skills>")?.0;
 
     if preamble.contains("Skill summaries are preloaded below") {
@@ -3521,8 +3810,15 @@ fn system_prompt_for_channel_turn(
     );
     let cached_mode_changed = rendered_skills_prompt_mode(base_prompt)
         .is_some_and(|cached_mode| cached_mode != desired_mode);
+    // Full mode can also load built-ins on demand. Its mode stays Full when
+    // the loader disappears or returns, but the cached instructions must change.
+    let cached_builtin_loading_changed =
+        rendered_skills_section(base_prompt).is_some_and(|section| {
+            section.contains("<location>builtin://")
+                && section.contains("<loading>on-demand</loading>") != read_skill_available
+        });
 
-    let prompt = if refresh_skills || cached_mode_changed {
+    let prompt = if refresh_skills || cached_mode_changed || cached_builtin_loading_changed {
         refreshed_skills_system_prompt(ctx, base_prompt, callable_protocol_exposed, excluded_tools)
     } else {
         base_prompt.to_string()
@@ -3661,39 +3957,15 @@ fn compact_sender_history(ctx: &ChannelRuntimeContext, sender_key: &str) -> bool
     true
 }
 
-/// Number of most-recent turns whose tool-result payloads are kept at full size
-/// when proactively trimming. The active exchange stays intact; only older
-/// tool results are shrunk to a bounded extract.
-///
-/// Returns `Some` with the resulting cached turns for `sender_key`, taken
-/// under the same lock that performed the append. A caller that needs to know
-/// exactly what its own turn observed (to reconcile a later wholesale
-/// replacement against concurrent same-sender writes, see
-/// `turns_appended_after`) must use this return value rather than a second,
-/// separately-locked read: a second read can observe another worker's write
-/// that raced in between, silently shifting what "this turn's own prefix"
-/// means.
-///
-/// Returns `None` when the durable transcript and its breadcrumb provenance
-/// could not both be verified (see `hydration_unavailable` below): the turn
-/// was deliberately NOT appended, persisted, or cached. A caller that treats
-/// `None` like a normal empty-history result would run the request with only
-/// this one message instead of the sender's real conversation; the caller
-/// must defer or refuse the turn instead.
-fn append_sender_turn(
-    ctx: &ChannelRuntimeContext,
-    sender_key: &str,
-    turn: ChatMessage,
-) -> Option<Vec<ChatMessage>> {
-    // Serialize per-sender persistence to prevent interleaving across concurrent
-    // workers that share the same conversation_history_key
-    let persist_lock = acquire_persist_lock(ctx, sender_key);
-    let _lock = persist_lock.lock().unwrap_or_else(|e| e.into_inner());
-
+/// Reload the durable transcript into the cache when it is missing, before
+/// anything is appended to it. Returns `false` when the transcript exists but
+/// cannot be verified, in which case nothing may be appended. The caller must
+/// hold the sender's persist lock.
+fn hydrate_sender_history_if_missing(ctx: &ChannelRuntimeContext, sender_key: &str) -> bool {
     // A failed trim resync evicts the cache so the next turn does not build
     // on unreconciled state. Reload the durable transcript here, on the next
-    // cache miss, before appending: otherwise `get_or_insert_mut` below would
-    // seed an empty history and the next provider request would contain only
+    // cache miss, before appending: otherwise the caller's `get_or_insert_mut`
+    // would seed an empty history and the next provider request would contain only
     // the new message while prior durable turns still exist on disk.
     // `hydrate_session_transcript` is the canonical reload (cap, orphan
     // closure, breadcrumb provenance), matching startup hydration.
@@ -3809,9 +4081,44 @@ fn append_sender_turn(
                 // is neither discarded nor replaced from an unverified state,
                 // the next turn retries hydration, and the caller does not
                 // mistake this for a genuine empty-history turn.
-                return None;
+                return false;
             }
         }
+    }
+    true
+}
+
+/// Number of most-recent turns whose tool-result payloads are kept at full size
+/// when proactively trimming. The active exchange stays intact; only older
+/// tool results are shrunk to a bounded extract.
+///
+/// Returns `Some` with the resulting cached turns for `sender_key`, taken
+/// under the same lock that performed the append. A caller that needs to know
+/// exactly what its own turn observed (to reconcile a later wholesale
+/// replacement against concurrent same-sender writes, see
+/// `turns_appended_after`) must use this return value rather than a second,
+/// separately-locked read: a second read can observe another worker's write
+/// that raced in between, silently shifting what "this turn's own prefix"
+/// means.
+///
+/// Returns `None` when the durable transcript and its breadcrumb provenance
+/// could not both be verified (see `hydration_unavailable` below): the turn
+/// was deliberately NOT appended, persisted, or cached. A caller that treats
+/// `None` like a normal empty-history result would run the request with only
+/// this one message instead of the sender's real conversation; the caller
+/// must defer or refuse the turn instead.
+fn append_sender_turn(
+    ctx: &ChannelRuntimeContext,
+    sender_key: &str,
+    turn: ChatMessage,
+) -> Option<Vec<ChatMessage>> {
+    // Serialize per-sender persistence to prevent interleaving across concurrent
+    // workers that share the same conversation_history_key
+    let persist_lock = acquire_persist_lock(ctx, sender_key);
+    let _lock = persist_lock.lock().unwrap_or_else(|e| e.into_inner());
+
+    if !hydrate_sender_history_if_missing(ctx, sender_key) {
+        return None;
     }
 
     // Persist to JSONL before adding to in-memory history.
@@ -3827,17 +4134,7 @@ fn append_sender_turn(
         );
     }
 
-    // Use the user-configured max_history_messages (fall back to
-    // MAX_CHANNEL_HISTORY when the config value is 0 or absent).
-    let max_history = {
-        let configured = ctx.agent_cfg.resolved.max_history_messages;
-        if configured > 0 {
-            configured
-        } else {
-            MAX_CHANNEL_HISTORY
-        }
-    };
-
+    let max_history = channel_history_cap(ctx);
     let mut histories = ctx
         .conversation_histories
         .lock()
@@ -3848,6 +4145,188 @@ fn append_sender_turn(
         turns.remove(0);
     }
     Some(turns.clone())
+}
+
+/// The user-configured max_history_messages, falling back to
+/// MAX_CHANNEL_HISTORY when the config value is 0 or absent.
+fn channel_history_cap(ctx: &ChannelRuntimeContext) -> usize {
+    let configured = ctx.agent_cfg.resolved.max_history_messages;
+    if configured > 0 {
+        configured
+    } else {
+        MAX_CHANNEL_HISTORY
+    }
+}
+
+/// Append an internally initiated exchange to a sender's history as one
+/// serialized write, so no concurrent turn lands between its messages.
+///
+/// Unlike [`append_sender_turn`], a failed durable write is an error: the
+/// caller records whether the exchange was persisted. The exchange lands
+/// whole or not at all: when the store rejects a message part-way, the
+/// messages it had already accepted are taken back, under the same lock,
+/// before anything reaches the cache. If even that fails, what the store
+/// kept is mirrored into the cache, so the two never disagree, and the error
+/// says how much of the exchange stayed behind.
+fn append_bound_exchange(
+    ctx: &ChannelRuntimeContext,
+    sender_key: &str,
+    messages: &[ChatMessage],
+) -> anyhow::Result<()> {
+    let persist_lock = acquire_persist_lock(ctx, sender_key);
+    let _lock = persist_lock.lock().unwrap_or_else(|e| e.into_inner());
+
+    if !hydrate_sender_history_if_missing(ctx, sender_key) {
+        anyhow::bail!("conversation history exists but could not be verified");
+    }
+
+    let mut kept = messages.len();
+    let mut failure = None;
+    if let Some(ref store) = ctx.session_store {
+        kept = 0;
+        for message in messages {
+            if let Err(e) = store.append(sender_key, message) {
+                failure = Some(e);
+                break;
+            }
+            kept += 1;
+        }
+        if failure.is_some() {
+            // The persist lock is held, so the rows just written are still
+            // the last ones of this history.
+            while kept > 0 && matches!(store.remove_last(sender_key), Ok(true)) {
+                kept -= 1;
+            }
+        }
+    }
+
+    if kept > 0 {
+        let max_history = channel_history_cap(ctx);
+        let mut histories = ctx
+            .conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let turns = histories.get_or_insert_mut(sender_key.to_string(), Vec::new);
+        turns.extend(messages[..kept].iter().cloned());
+        while turns.len() > max_history {
+            turns.remove(0);
+        }
+    }
+
+    match failure {
+        Some(e) if kept == 0 => {
+            Err(anyhow::Error::new(e).context("failed to persist bound exchange; nothing kept"))
+        }
+        Some(e) => Err(anyhow::Error::new(e).context(format!(
+            "failed to persist bound exchange; its first {kept} message(s) could not be taken back"
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// Serves an agent's channel conversations to internally initiated turns
+/// through the same cache, persist locks and store the channel turns use.
+struct ChannelConversationOwner {
+    ctx: Arc<ChannelRuntimeContext>,
+    /// Which agent serves each channel route: the map this instance's router
+    /// is built from. The session store is shared by every agent and its
+    /// keys name no agent, so the route recorded with a binding is what ties
+    /// a history to this owner.
+    owner_by_channel_key: Arc<HashMap<String, String>>,
+}
+
+impl ChannelConversationOwner {
+    /// The key of `binding`, once it is established that this agent serves
+    /// the route the conversation arrives on. A channel that has since been
+    /// handed to another agent is that agent's conversation now.
+    fn served_key<'a>(
+        &self,
+        binding: &'a zeroclaw_api::conversation_binding::ConversationBinding,
+    ) -> anyhow::Result<&'a str> {
+        if self.owner_by_channel_key.get(&binding.route) != Some(self.ctx.agent_alias.as_ref()) {
+            anyhow::bail!("this agent is not serving the conversation's channel");
+        }
+        Ok(&binding.key)
+    }
+}
+
+impl zeroclaw_api::conversation_binding::ConversationBindingOwner for ChannelConversationOwner {
+    fn load(
+        &self,
+        binding: &zeroclaw_api::conversation_binding::ConversationBinding,
+    ) -> anyhow::Result<Vec<ChatMessage>> {
+        let key = self.served_key(binding)?;
+        // The lock every writer of this history takes, so the read is of one
+        // consistent state.
+        let persist_lock = acquire_persist_lock(&self.ctx, key);
+        let _lock = persist_lock.lock().unwrap_or_else(|e| e.into_inner());
+
+        let cached = self
+            .ctx
+            .conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .peek(key)
+            .cloned();
+        let recorded = self
+            .ctx
+            .history_crumb_flags
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .peek(key)
+            .copied();
+        // A trim breadcrumb is the history's own bookkeeping, recorded beside
+        // it rather than inferred from text. The reader receives no such
+        // record, so it must not receive the breadcrumb as if it were a turn.
+        // Both the record and the text must agree before anything is dropped.
+        let (mut turns, crumb_recorded) = match (cached, self.ctx.session_store.as_deref()) {
+            (Some(turns), store) => {
+                let crumb_recorded =
+                    recorded.unwrap_or_else(|| resolve_cold_crumb_provenance(store, key, &turns));
+                (turns, crumb_recorded)
+            }
+            // Not in the cache: read the durable transcript as it stands.
+            // Reloading it into the cache is a writer's job, because that
+            // reconciliation can itself write (it closes a transcript that
+            // ends unanswered, and persists a cap). A reader must leave the
+            // conversation exactly as it found it.
+            (None, Some(store)) => {
+                let mut turns = store
+                    .try_load(key)
+                    .map_err(|_| anyhow::Error::msg("conversation history could not be read"))?;
+                let crumb_recorded = resolve_cold_crumb_provenance_result(Some(store), key, &turns)
+                    .map_err(|()| {
+                        anyhow::Error::msg("conversation history could not be verified")
+                    })?;
+                let cap = channel_history_cap(&self.ctx);
+                if turns.len() > cap {
+                    turns.drain(..turns.len() - cap);
+                }
+                (turns, crumb_recorded)
+            }
+            (None, None) => (Vec::new(), false),
+        };
+        let leads_with_crumb = turns.first().is_some_and(|first| {
+            first.role == "user"
+                && zeroclaw_runtime::agent::history::is_history_trim_breadcrumb_text(&first.content)
+        });
+        if crumb_recorded && leads_with_crumb {
+            turns.remove(0);
+        }
+        // None of these turns is the one being sent, so every inline image
+        // payload is collapsed, where a channel turn spares its newest.
+        let mut turns = provider_ready_cached_turns(turns);
+        collapse_inline_image_payloads_in(&mut turns);
+        Ok(turns)
+    }
+
+    fn append(
+        &self,
+        binding: &zeroclaw_api::conversation_binding::ConversationBinding,
+        messages: &[ChatMessage],
+    ) -> anyhow::Result<()> {
+        append_bound_exchange(&self.ctx, self.served_key(binding)?, messages)
+    }
 }
 
 /// Return `retained_turns` with its last message's content replaced by
@@ -4244,19 +4723,12 @@ fn channel_user_error_message(error: &anyhow::Error, safe_error: &str) -> String
 }
 
 fn is_context_window_overflow_error(err: &anyhow::Error) -> bool {
-    let lower = err.to_string().to_lowercase();
-    [
-        "exceeds the context window",
-        "context window of this model",
-        "maximum context length",
-        "context length exceeded",
-        "too many tokens",
-        "token limit exceeded",
-        "prompt is too long",
-        "input is too long",
-    ]
-    .iter()
-    .any(|hint| lower.contains(hint))
+    // The turn engine owns local capacity rejection. Keep its typed terminal
+    // reason even when an outer context includes a provider's overflow text.
+    if zeroclaw_runtime::agent::context_window_exceeded_from_error(err).is_some() {
+        return false;
+    }
+    zeroclaw_providers::reliable::is_context_window_exceeded(err)
 }
 
 fn load_cached_model_preview(
@@ -4807,6 +5279,10 @@ async fn handle_runtime_command_for_delivery(
     let sender_key = runtime_conversation_history_key(ctx, msg);
     let defaults_snapshot = runtime_defaults_snapshot(ctx);
     let mut current = get_route_selection(ctx, msg, &sender_key, &defaults_snapshot);
+    let effort_auto_reset_enabled = defaults_snapshot
+        .config
+        .resolved_agent_config(ctx.agent_alias.as_str())
+        .is_some_and(|agent| agent.resolved.effort_routing.is_some());
 
     if command == ChannelRuntimeCommand::ShowModel && is_bare_model_picker_command(&msg.content) {
         let request = zeroclaw_api::channel::ChannelModelPickerRequest {
@@ -4858,15 +5334,14 @@ async fn handle_runtime_command_for_delivery(
                     match get_or_create_provider(ctx, &provider_ref, None, &defaults_snapshot).await
                     {
                         Ok(_) => {
-                            if provider_ref != current.model_provider {
-                                current.model_provider = provider_ref.clone();
-                                set_route_selection(
-                                    ctx,
-                                    &sender_key,
-                                    current.clone(),
-                                    &defaults_snapshot,
-                                );
-                            }
+                            current.model_provider = provider_ref.clone();
+                            current.automatic = false;
+                            set_route_selection(
+                                ctx,
+                                &sender_key,
+                                current.clone(),
+                                &defaults_snapshot,
+                            );
 
                             channel_runtime_cli_string_with_args(
                                 "channel-runtime-set-provider-switched",
@@ -4951,6 +5426,17 @@ async fn handle_runtime_command_for_delivery(
                         ("model", model.as_str()),
                     ],
                 )
+            } else if effort_auto_reset_enabled && model.eq_ignore_ascii_case("auto") {
+                clear_scope_override(ctx, scope, msg);
+                let current = get_route_selection(ctx, msg, &sender_key, &defaults_snapshot);
+                channel_runtime_cli_string_with_args(
+                    "channel-runtime-scoped-model-switched",
+                    &[
+                        ("model", current.model.as_str()),
+                        ("provider", current.model_provider.as_str()),
+                        ("scope", channel_runtime_scope_label(scope).as_str()),
+                    ],
+                )
             } else {
                 // Resolve provider+model the same way bare `/model` does, then
                 // write it at the requested scope instead of the per-sender route.
@@ -4999,6 +5485,30 @@ async fn handle_runtime_command_for_delivery(
             let model = raw_model.trim().trim_matches('`').to_string();
             if model.is_empty() {
                 channel_runtime_cli_string("channel-runtime-model-empty")
+            } else if effort_auto_reset_enabled && model.eq_ignore_ascii_case("auto") {
+                #[cfg(feature = "channel-telegram")]
+                let picker_applied =
+                    crate::model_picker_delivery::apply_if_not_revoked(delivery_message_id, || {
+                        current = default_route_selection_from_snapshot(&defaults_snapshot);
+                        set_route_selection(ctx, &sender_key, current.clone(), &defaults_snapshot);
+                    });
+                #[cfg(not(feature = "channel-telegram"))]
+                {
+                    current = default_route_selection_from_snapshot(&defaults_snapshot);
+                    set_route_selection(ctx, &sender_key, current.clone(), &defaults_snapshot);
+                }
+                #[cfg(feature = "channel-telegram")]
+                if !picker_applied {
+                    return true;
+                }
+
+                channel_runtime_cli_string_with_args(
+                    "channel-runtime-model-switched",
+                    &[
+                        ("model", current.model.as_str()),
+                        ("provider", current.model_provider.as_str()),
+                    ],
+                )
             } else {
                 // Authoritative picker-revocation claim at the mutation
                 // point. The early dispatch gate in
@@ -5766,6 +6276,146 @@ fn truncate_at_unclosed_protocol_fence(s: &str, known_tool_names: &HashSet<Strin
     s.to_string()
 }
 
+/// Reconcile the canonical final response into the cumulative visible-stream
+/// byte coordinate system used by MultiMessage finalizers.
+///
+/// Discord and Matrix MultiMessage finalizers flush `final[sent_so_far..]`,
+/// where `sent_so_far` is the channel's confirmed-delivery byte offset into
+/// the cumulative visible text that `update_draft` received (`streamed_text`).
+/// The text handed to `finalize_draft` must therefore begin with exactly the
+/// confirmed bytes — otherwise the offset selects the wrong content: when the
+/// final text is shorter than `sent_so_far` the finalizer's
+/// `text.len() > sent_so_far` guard strands the tail entirely, and when it
+/// merely diverges the flush garbles it.
+///
+/// So keep the confirmed prefix `streamed_text[..sent_so_far]` as the
+/// coordinate base — those paragraphs are on the wire and cannot be unsent —
+/// and follow it with exactly the canonical content that has not been
+/// delivered yet:
+///   * nothing confirmed: the canonical response is the whole message;
+///   * the canonical response extends the confirmed paragraphs (a runtime stop
+///     reason or provider footer appended after streaming): only the unsent
+///     canonical tail follows the prefix;
+///   * final sanitization dropped an already-delivered leading paragraph (e.g.
+///     `strip_tool_narration`): the confirmed prefix stays, and the canonical
+///     response is aligned past any confirmed paragraphs it still contains so
+///     none of them is re-sent;
+///   * final sanitization rewrote the unsent tail (credential redaction, a
+///     terminal fallback replacing a malformed payload): the canonical tail is
+///     authoritative — the streamed unsent tail is never used as content, so
+///     redacted text cannot resurface on the transport;
+///   * trailing-whitespace-only divergence: every canonical byte is already
+///     confirmed, so the finalizer flushes nothing (no final-paragraph replay).
+///
+/// `sent_so_far` is clamped into `streamed_text` and floored to a UTF-8 char
+/// boundary, so a stale or misaligned offset degrades to re-sending a suffix
+/// instead of panicking mid-character.
+fn cumulative_multi_message_final_text(
+    streamed_text: &str,
+    delivered_response: &str,
+    sent_so_far: usize,
+) -> String {
+    let confirmed = streamed_text.floor_char_boundary(sent_so_far.min(streamed_text.len()));
+    let sent_prefix = &streamed_text[..confirmed];
+    if sent_prefix.is_empty() {
+        // Nothing was confirmed on the transport (draft suppressed, no
+        // paragraph boundary reached, or every send failed). The finalizer
+        // flushes from offset 0, so the canonical response is the whole
+        // message and any streamed-but-unconfirmed text is discarded in favor
+        // of the sanitized final content.
+        return delivered_response.to_string();
+    }
+    if sent_prefix.trim_end() == delivered_response.trim_end() {
+        // Trailing-whitespace-only divergence: the confirmed paragraphs
+        // already cover every canonical byte. Keep the confirmed coordinate so
+        // the finalizer flushes nothing rather than replaying the final
+        // paragraph.
+        return sent_prefix.to_string();
+    }
+    if delivered_response
+        .as_bytes()
+        .starts_with(sent_prefix.as_bytes())
+    {
+        // A stale offset may have been floored to a UTF-8 boundary inside the
+        // canonical leading paragraph. Preserve an exact byte-zero prefix;
+        // unlike suffix reconciliation, this cannot match inside a word.
+        return delivered_response.to_string();
+    }
+    // Align the canonical response past the confirmed paragraphs it still
+    // contains. `confirmed_canonical_prefix` verifies both ends of the match
+    // are paragraph boundaries so a coincidental mid-word overlap cannot
+    // garble the flush.
+    let already_delivered = confirmed_canonical_prefix(sent_prefix, delivered_response);
+    format!("{sent_prefix}{}", &delivered_response[already_delivered..])
+}
+
+/// Largest byte length `k` such that `delivered_response[..k]` is one or more
+/// complete paragraphs and the confirmed transport prefix ends with those
+/// same paragraphs at a paragraph boundary. Canonical paragraphs the final
+/// sanitizer preserved still match here when it dropped earlier narration
+/// paragraphs that the stream also delivered, which is what keeps a
+/// narration-stripped final response from re-sending the paragraphs after the
+/// narration. Requiring both boundaries prevents a canonical paragraph such
+/// as `base` from matching inside a confirmed `database` paragraph.
+fn confirmed_canonical_prefix(sent_prefix: &str, delivered_response: &str) -> usize {
+    let bytes = delivered_response.as_bytes();
+    for delimiter in (0..bytes.len().saturating_sub(1)).rev() {
+        if bytes[delimiter..delimiter + 2] != *b"\n\n" {
+            continue;
+        }
+        // `end` follows an ASCII newline, so it is always a UTF-8 boundary.
+        // Scanning every byte offset (rather than using non-overlapping string
+        // matches) also considers both delimiters in runs such as `\n\n\n`.
+        let end = delimiter + 2;
+        if end > sent_prefix.len() || !sent_prefix.ends_with(&delivered_response[..end]) {
+            continue;
+        }
+        let start = sent_prefix.len() - end;
+        if start == 0 || sent_prefix[..start].ends_with("\n\n") {
+            return end;
+        }
+    }
+    0
+}
+
+/// Remap a MultiMessage confirmed-delivery offset onto a rewritten frame.
+///
+/// `confirmed_prefix` is the exact frame prefix (in the coordinates of the
+/// frame it was captured from) whose paragraphs the transport already
+/// delivered; `frame` is the newest visible frame recomputed from the raw
+/// accumulation. When a later sanitizer pass — e.g. a streaming redaction
+/// span that only completes on a later delta — rewrites bytes inside the
+/// confirmed region, the stored byte offset no longer addresses the same
+/// content in `frame`, and slicing `frame` at it would corrupt everything
+/// sent afterwards (including the terminal stop-reason text).
+///
+/// The remapped offset is the longest byte-identical common prefix of the two
+/// strings, floored to the end of a paragraph delimiter (`\n\n`). Confirmed
+/// prefixes only ever grow in whole `\n\n`-terminated paragraphs, so every
+/// paragraph fully inside the common prefix was delivered verbatim and stays
+/// confirmed, while the first rewritten paragraph is re-emitted in its
+/// sanitized form instead of being sliced mid-way. A frame that still starts
+/// with the confirmed prefix (the overwhelmingly common case) keeps its
+/// offset unchanged. The result always lies on a UTF-8 char boundary of
+/// `frame`: it is either `confirmed_prefix.len()` (a byte-verified prefix of
+/// `frame`) or ends immediately after an ASCII `\n\n`.
+#[cfg(any(test, feature = "channel-discord", feature = "channel-matrix"))]
+pub(crate) fn remap_confirmed_offset(confirmed_prefix: &str, frame: &str) -> usize {
+    if frame.as_bytes().starts_with(confirmed_prefix.as_bytes()) {
+        return confirmed_prefix.len();
+    }
+    let common = confirmed_prefix
+        .as_bytes()
+        .iter()
+        .zip(frame.as_bytes())
+        .take_while(|(a, b)| a == b)
+        .count();
+    frame.as_bytes()[..common]
+        .windows(2)
+        .rposition(|w| w == b"\n\n")
+        .map_or(0, |i| i + 2)
+}
+
 /// Pump draft deltas to the channel transport, sanitizing every partial on the
 /// way out.
 ///
@@ -5782,19 +6432,48 @@ fn truncate_at_unclosed_protocol_fence(s: &str, known_tool_names: &HashSet<Strin
 ///
 /// `known_tool_names` comes from the same registry the final sanitizer reads,
 /// so both boundaries judge a protocol payload by the same tool inventory.
+#[cfg(test)]
 async fn run_draft_updater(
     channel: Arc<dyn Channel>,
     reply_target: String,
     draft_id: String,
     known_tool_names: HashSet<String>,
-    // When the channel opts into per-turn narration flushing (Telegram
-    // `multi_message`), each completed narration turn is published permanently
-    // and must cross the same outbound hook + leak-detection boundary as the
-    // final reply. These carry the policy inputs; they are unused when
-    // `turn_flush_narration` is false (every other draft-capable channel).
     turn_flush_narration: bool,
     outbound_hooks: Option<Arc<zeroclaw_runtime::hooks::HookRunner>>,
-    outbound_leak_detection: zeroclaw_config::schema::LeakDetectionConfig,
+    leak_detection: zeroclaw_config::schema::LeakDetectionConfig,
+    outbound_channel: String,
+    rx: tokio::sync::mpsc::Receiver<zeroclaw_runtime::agent::loop_::DraftEvent>,
+) {
+    let content_format = outbound_content_format_for_channel(&outbound_channel);
+    run_draft_updater_with_leak_detection(
+        channel,
+        reply_target,
+        draft_id,
+        known_tool_names,
+        Arc::new(Mutex::new(String::new())),
+        leak_detection,
+        content_format,
+        turn_flush_narration,
+        outbound_hooks,
+        outbound_channel,
+        rx,
+    )
+    .await;
+}
+
+/// Retain the visible frame for MultiMessage finalization while applying the
+/// channel's outbound policy to both drafts and permanent narration flushes.
+#[allow(clippy::too_many_arguments)]
+async fn run_draft_updater_with_leak_detection(
+    channel: Arc<dyn Channel>,
+    reply_target: String,
+    draft_id: String,
+    known_tool_names: HashSet<String>,
+    streamed_text: Arc<Mutex<String>>,
+    leak_detection: zeroclaw_config::schema::LeakDetectionConfig,
+    content_format: OutboundContentFormat,
+    turn_flush_narration: bool,
+    outbound_hooks: Option<Arc<zeroclaw_runtime::hooks::HookRunner>>,
     outbound_channel: String,
     mut rx: tokio::sync::mpsc::Receiver<zeroclaw_runtime::agent::loop_::DraftEvent>,
 ) {
@@ -5839,7 +6518,7 @@ async fn run_draft_updater(
                     flush_completed_narration_turn(
                         &channel,
                         outbound_hooks.as_deref(),
-                        &outbound_leak_detection,
+                        &leak_detection,
                         &outbound_channel,
                         &reply_target,
                         &draft_id,
@@ -5891,7 +6570,15 @@ async fn run_draft_updater(
             StreamDelta::Reasoning(_) => {}
             StreamDelta::Text(text) => {
                 accumulated.push_str(&text);
-                let visible = sanitize_streaming_draft_text(&accumulated, &known_tool_names);
+                let visible = redact_channel_outbound_leaks(
+                    &sanitize_streaming_draft_text(&accumulated, &known_tool_names),
+                    &leak_detection,
+                    content_format,
+                );
+                // Keep the exact visible frame used for MultiMessage offsets;
+                // retaining the raw accumulation here could reintroduce a
+                // protocol payload during finalization.
+                *streamed_text.lock().unwrap_or_else(|e| e.into_inner()) = visible.clone();
                 if let Err(e) = channel
                     .update_draft(&reply_target, &draft_id, &visible)
                     .await
@@ -5917,7 +6604,7 @@ async fn run_draft_updater(
                     flush_completed_narration_turn(
                         &channel,
                         outbound_hooks.as_deref(),
-                        &outbound_leak_detection,
+                        &leak_detection,
                         &outbound_channel,
                         &reply_target,
                         &draft_id,
@@ -6935,6 +7622,16 @@ fn strip_isolated_tool_json_artifacts(message: &str, known_tool_names: &HashSet<
     result.trim().to_string()
 }
 
+/// After a clean listener return (no error), decide whether the supervisor
+/// should restart. Cancellation means the operator asked for shutdown — the
+/// exit is expected and must not restart. Any other clean return is
+/// unexpected and must restart.
+fn should_restart_listener_after_clean_return(
+    cancel: &tokio_util::sync::CancellationToken,
+) -> bool {
+    !cancel.is_cancelled()
+}
+
 fn spawn_supervised_listener(
     ch: Arc<dyn Channel>,
     alias: Option<String>,
@@ -6952,6 +7649,10 @@ fn spawn_supervised_listener(
         Duration::from_secs(CHANNEL_HEALTH_HEARTBEAT_SECS),
         cancel,
     )
+}
+
+fn prepare_supervised_channel(ch: &Arc<dyn Channel>, cancel: &CancellationToken) {
+    ch.set_cancel_token(cancel.clone());
 }
 
 /// Record one health observation for a supervised listener.
@@ -7025,6 +7726,9 @@ fn spawn_supervised_listener_with_health_interval(
             let max_backoff = max_backoff_secs.max(backoff);
 
             loop {
+                if cancel.is_cancelled() {
+                    return;
+                }
                 mark_listener_health(&*ch, &component);
                 // First tick one interval out, not immediately: the observation
                 // above already covers this instant.
@@ -7038,18 +7742,45 @@ fn spawn_supervised_listener_with_health_interval(
                     tokio::pin!(listen_future);
 
                     loop {
+                        let mut shutdown = false;
                         tokio::select! {
-                            () = cancel.cancelled() => return,
+                            biased;
+                            () = cancel.cancelled() => {
+                                shutdown = true;
+                            }
                             _ = health.tick() => {
                                 mark_listener_health(&*ch, &component);
                             }
                             result = &mut listen_future => break result,
                         }
+                        if shutdown {
+                            if ch.uses_cancel_token() {
+                                // Wait for the listener to finish cleanup
+                                // so session teardown runs before exit.
+                                let _ = tokio::time::timeout(
+                                    CHANNEL_GENERATION_SHUTDOWN_GRACE,
+                                    listen_future,
+                                )
+                                .await;
+                            }
+                            return;
+                        }
+                        // Health tick fired; loop back.
                     }
                 };
 
+                // Cancellation owns the outcome even when it races the
+                // listener's return: do not publish a failure or restart a
+                // generation that is already retiring.
+                if cancel.is_cancelled() {
+                    return;
+                }
+
                 match result {
                     Ok(()) => {
+                        if !should_restart_listener_after_clean_return(&cancel) {
+                            return;
+                        }
                         ::zeroclaw_log::record!(
                             WARN,
                             ::zeroclaw_log::Event::new(
@@ -7444,7 +8175,9 @@ impl Channel for ApprovalTypingChannel {
             .request_approval_attributed(recipient, request)
             .await;
         if response.as_ref().is_ok_and(|response| {
-            response.as_ref().is_some_and(|response| {
+            // Unsupported approval is not a denial: the runtime may continue
+            // under ordinary shell policy without granting approval.
+            response.as_ref().is_none_or(|response| {
                 matches!(
                     response.response,
                     zeroclaw_api::channel::ChannelApprovalResponse::Approve
@@ -7548,8 +8281,14 @@ async fn process_channel_message(
     cancellation_token: CancellationToken,
 ) {
     let delivery_message_id = msg.id.clone();
-    process_channel_message_with_delivery_id(ctx, msg, cancellation_token, delivery_message_id)
-        .await;
+    process_channel_message_with_delivery_id(
+        ctx,
+        msg,
+        cancellation_token,
+        delivery_message_id,
+        None,
+    )
+    .await;
 }
 
 async fn process_channel_message_with_delivery_id(
@@ -7557,6 +8296,7 @@ async fn process_channel_message_with_delivery_id(
     msg: zeroclaw_api::channel::ChannelMessage,
     cancellation_token: CancellationToken,
     delivery_message_id: String,
+    turn_lease: Option<Arc<zeroclaw_runtime::live_config_authority::AgentTurnLease>>,
 ) {
     if cancellation_token.is_cancelled() {
         return;
@@ -7583,6 +8323,7 @@ async fn process_channel_message_with_delivery_id(
                 cancellation_token,
                 composite_for_body,
                 delivery_message_id,
+                turn_lease,
             )
             .await;
         }
@@ -8543,6 +9284,7 @@ async fn process_channel_message_body(
     cancellation_token: CancellationToken,
     channel_composite: String,
     delivery_message_id: String,
+    turn_lease: Option<Arc<zeroclaw_runtime::live_config_authority::AgentTurnLease>>,
 ) {
     ::zeroclaw_log::record!(
         INFO,
@@ -8598,10 +9340,16 @@ async fn process_channel_message_body(
             Some(alias) if !alias.is_empty() => format!("{}/{}", msg.channel, alias),
             _ => msg.channel.clone(),
         };
-        zeroclaw_runtime::sop::dispatch::SopIngress::new(
-            ctx.sop_engine.as_ref(),
-            ctx.sop_audit.as_deref(),
-        )
+        {
+            let mut ingress = zeroclaw_runtime::sop::dispatch::SopIngress::new(
+                ctx.sop_engine.as_ref(),
+                ctx.sop_audit.as_deref(),
+            );
+            if let Some(sink) = ctx.sop_driver_sink.as_ref() {
+                ingress = ingress.with_driver_sink(sink);
+            }
+            ingress
+        }
         .dispatch(
             zeroclaw_runtime::sop::types::SopTriggerSource::Channel,
             Some(&topic),
@@ -8644,6 +9392,7 @@ async fn process_channel_message_body(
             let sender = msg.sender.clone();
             let channel_label = channel.name().to_string();
             let span = ::zeroclaw_log::attribution_span!(&*channel);
+            let ack_lease = turn_lease.clone();
             Some(zeroclaw_spawn::spawn!(
             ::zeroclaw_log::scope!(
                 category: "channel",
@@ -8652,6 +9401,7 @@ async fn process_channel_message_body(
                 sender: sender.as_str(),
                 message_id: message_id_label.as_str(),
                 => async move {
+                    let _lease = ack_lease;
                     if let Err(e) = channel
                         .add_reaction(&reply_target, &message_id, "\u{1F440}")
                         .await
@@ -8692,6 +9442,10 @@ async fn process_channel_message_body(
         );
         msg.content = thinking.effective_content.clone();
     }
+
+    // Classify only the user's text. Media markers and later enrichment are
+    // transport context, not evidence that the request itself is complex.
+    let effort_routing_content = effort_routing_classification_content(&msg.content);
 
     // ── Media pipeline: enrich inbound message with media annotations ──
     if ctx.media_pipeline.enabled && !msg.attachments.is_empty() {
@@ -8776,9 +9530,68 @@ async fn process_channel_message_body(
     }
 
     let runtime_defaults = runtime_defaults_snapshot(ctx.as_ref());
-    let mut route = get_route_selection(ctx.as_ref(), &msg, &history_key, &runtime_defaults);
+    let (mut route, route_is_scoped) =
+        get_route_selection_with_scope(ctx.as_ref(), &msg, &history_key, &runtime_defaults);
+    let mut attempt_allowlist: Option<Arc<HashSet<String>>> = None;
 
-    if let Some(hint) =
+    let resolved_agent = runtime_defaults
+        .config
+        .resolved_agent_config(ctx.agent_alias.as_str());
+    let effort_policy = resolved_agent
+        .as_ref()
+        .and_then(|agent| agent.resolved.effort_routing.as_ref());
+
+    if let Some(policy) = effort_policy {
+        if route.automatic {
+            let Some(selection) = zeroclaw_runtime::agent::eval::resolve_effort_route(
+                policy,
+                &runtime_defaults.config.model_routes,
+                &effort_routing_content,
+            ) else {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_category(::zeroclaw_log::EventCategory::Provider)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                    "effort routing is enabled but its local/cloud hints are missing or ambiguous"
+                );
+                if let Some(channel) = target_channel.as_ref() {
+                    let _ = channel
+                        .send(
+                            &SendMessage::reply_to(
+                                &msg,
+                                channel_runtime_cli_string(
+                                    "channel-runtime-effort-routing-invalid",
+                                ),
+                            )
+                            .suppress_voice(),
+                        )
+                        .await;
+                }
+                reconcile_early_ack(
+                    ctx.as_ref(),
+                    &msg,
+                    target_channel.as_ref(),
+                    early_ack_task,
+                    Some("\u{26A0}\u{FE0F}"),
+                )
+                .await;
+                return;
+            };
+            attempt_allowlist = Some(Arc::new(selection.allowed_provider_refs.clone()));
+            route = ChannelRouteSelection {
+                model_provider: selection.route.model_provider.clone(),
+                model: selection.route.model.clone(),
+                automatic: true,
+                api_key: selection.route.api_key.clone(),
+            };
+            zeroclaw_runtime::agent::eval::log_effort_route_selection(
+                &selection,
+                effort_routing_content.len(),
+                "channel",
+            );
+        }
+    } else if let Some(hint) =
         zeroclaw_runtime::agent::classifier::classify(&ctx.query_classification, &msg.content)
         && let Some(matched_route) = ctx
             .model_routes
@@ -8789,6 +9602,7 @@ async fn process_channel_message_body(
         route = ChannelRouteSelection {
             model_provider: matched_route.model_provider.clone(),
             model: matched_route.model.clone(),
+            automatic: true,
             api_key: matched_route.api_key.clone(),
         };
     }
@@ -8922,24 +9736,7 @@ async fn process_channel_message_body(
     };
 
     // Build history from per-sender conversation cache.
-    let mut prior_turns = normalize_cached_channel_turns(known_prefix.clone());
-
-    // Strip stale tool_result blocks from cached turns so the LLM never
-    // sees a `<tool_result>` without a preceding `<tool_call>`, which
-    // causes hallucinated output on subsequent heartbeat ticks or sessions.
-    for turn in &mut prior_turns {
-        if turn.content.contains("<tool_result") {
-            turn.content = strip_tool_result_content(&turn.content);
-        }
-    }
-
-    // Strip [Used tools: ...] prefixes from cached assistant turns so the
-    // LLM never sees (and reproduces) this internal summary format.
-    for turn in &mut prior_turns {
-        if turn.role == "assistant" && turn.content.starts_with("[Used tools:") {
-            turn.content = strip_tool_summary_prefix(&turn.content);
-        }
-    }
+    let mut prior_turns = provider_ready_cached_turns(known_prefix.clone());
 
     // Collapse only heavy inline `data:` image payloads in older cached turns.
     // Re-loadable `[IMAGE:<path>]` references survive so a later turn can
@@ -9056,7 +9853,7 @@ async fn process_channel_message_body(
     // already captured and restored wholesale below (`outgoing_user_turn_raw_content`
     // / `strip_volatile_preamble_before_persist`), which covers the recalled-memory
     // preamble too, so there is no separate byte-length to record here.
-    let mut channel_injected_memory_preamble: Option<String> = None;
+    let mut channel_injected_memory_preamble = None;
 
     // Kept so a post-loop trim resync can restore the current turn to this
     // clean content before persisting; the durable transcript must never
@@ -9107,17 +9904,36 @@ async fn process_channel_message_body(
                 );
                 AssistantChannelOutcome::Reply(String::new())
             } else {
+                let configured_classifier_allowed = configured_provider_allowed_for_turn(
+                    attempt_allowlist.as_deref(),
+                    ctx.agent_cfg.classifier_provider.as_str(),
+                );
+                if !configured_classifier_allowed {
+                    ::zeroclaw_log::record!(
+                        INFO,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Skip)
+                            .with_attrs(::serde_json::json!({
+                                "phase": "precheck",
+                                "reason": "effort_routing_policy",
+                            })),
+                        "configured classifier_provider skipped by turn routing policy"
+                    );
+                }
+                let configured_classifier = if configured_classifier_allowed {
+                    resolve_classifier_route(
+                        ctx.as_ref(),
+                        &ctx.agent_cfg.classifier_provider,
+                        &runtime_defaults,
+                    )
+                    .await
+                } else {
+                    None
+                };
                 let (classifier_provider_arc, classifier_model_owned, classifier_temperature): (
                     Arc<dyn ModelProvider>,
                     String,
                     Option<f64>,
-                ) = resolve_classifier_route(
-                    ctx.as_ref(),
-                    &ctx.agent_cfg.classifier_provider,
-                    &runtime_defaults,
-                )
-                .await
-                .unwrap_or_else(|| {
+                ) = configured_classifier.unwrap_or_else(|| {
                     (
                         Arc::clone(&active_model_provider),
                         route.model.clone(),
@@ -9126,12 +9942,16 @@ async fn process_channel_message_body(
                 });
 
                 let started = Instant::now();
-                let precheck_future = classify_channel_reply_intent(
-                    classifier_provider_arc.as_ref(),
-                    history[0].content.as_str(),
-                    &history,
-                    classifier_model_owned.as_str(),
-                    classifier_temperature.or(runtime_defaults.defaults.temperature),
+                let precheck_future =
+                    zeroclaw_providers::reliable::scope_provider_attempt_allowlist(
+                        attempt_allowlist.clone(),
+                        classify_channel_reply_intent(
+                            classifier_provider_arc.as_ref(),
+                            history[0].content.as_str(),
+                            &history,
+                            classifier_model_owned.as_str(),
+                            classifier_temperature.or(runtime_defaults.defaults.temperature),
+                        ),
                 );
                 match tokio::time::timeout(Duration::from_secs(precheck.timeout_secs), precheck_future)
                     .await
@@ -9374,6 +10194,10 @@ async fn process_channel_message_body(
     };
 
     // Spawn the appropriate handler for the delta channel.
+    // Multi-message channels use the text accumulated by the draft updater to
+    // finalize the same cumulative stream they used for paragraph offsets.
+    // Other draft modes still finalize the canonical response unchanged.
+    let streamed_draft_text = Arc::new(Mutex::new(String::new()));
     let draft_updater = if use_draft_streaming {
         // Partial: accumulate text and edit a single draft message.
         if let (Some(rx), Some(draft_id_ref), Some(channel_ref)) = (
@@ -9384,12 +10208,14 @@ async fn process_channel_message_body(
             let channel = Arc::clone(channel_ref);
             let reply_target = msg.reply_target.clone();
             let draft_id = draft_id_ref.to_string();
+            let draft_lease = turn_lease.clone();
             if matrix_single_message_streaming {
                 let interval_ms = matrix_draft_update_interval_ms(ctx.as_ref(), &msg);
                 let stream_draft_lines = matrix_stream_draft_lines(ctx.as_ref(), &msg);
                 let matrix_config = Arc::clone(&ctx.prompt_config);
                 let matrix_alias = msg.channel_alias.clone().unwrap_or_default();
                 Some(zeroclaw_spawn::spawn!(async move {
+                    let _lease = draft_lease;
                     run_matrix_single_message_draft_updater(
                         rx,
                         channel,
@@ -9408,7 +10234,6 @@ async fn process_channel_message_body(
                 // leak-detection boundary as the final reply; capture the pieces the
                 // policy needs since `ctx`/`msg` are not moved into this task.
                 let outbound_hooks = ctx.hooks.clone();
-                let outbound_leak_detection = ctx.prompt_config.security.leak_detection.clone();
                 let outbound_channel = msg.channel.clone();
                 // Same registry the final sanitizer reads, resolved once per turn
                 // rather than per delta.
@@ -9417,15 +10242,21 @@ async fn process_channel_message_body(
                     .iter()
                     .map(|tool| tool.name().to_ascii_lowercase())
                     .collect();
+                let streamed_draft_text = Arc::clone(&streamed_draft_text);
+                let leak_detection = ctx.prompt_config.security.leak_detection.clone();
+                let content_format = outbound_content_format_for_channel(&msg.channel);
                 Some(zeroclaw_spawn::spawn!(async move {
-                    run_draft_updater(
+                    let _lease = draft_lease;
+                    run_draft_updater_with_leak_detection(
                         channel,
                         reply_target,
                         draft_id,
                         known_tool_names,
+                        streamed_draft_text,
+                        leak_detection,
+                        content_format,
                         turn_flush_narration,
                         outbound_hooks,
-                        outbound_leak_detection,
                         outbound_channel,
                         rx,
                     )
@@ -9484,6 +10315,15 @@ async fn process_channel_message_body(
             (Some(channel), None) => Some(Arc::clone(channel)),
             (None, _) => None,
         };
+    let active_risk_profile = ctx
+        .prompt_config
+        .risk_profile_for_agent(ctx.agent_alias.as_str());
+    let (approval_manager, approval_channel) = channel_turn_approval(
+        &ctx.approval_manager,
+        active_risk_profile,
+        ctx.channels_by_name.as_ref(),
+        approval_channel,
+    );
 
     // Wrap observer to forward tool events as live thread messages.
     // Bounded so a slow downstream channel cannot grow this queue
@@ -9496,12 +10336,15 @@ async fn process_channel_message_body(
         let notify_channel = target_channel.clone();
         let notify_reply_target = msg.reply_target.clone();
         let notify_thread_root = followup_thread_id(&msg);
+        let notify_lease = turn_lease.clone();
         let notify_task = if msg.channel == "cli" || !ctx.show_tool_calls || is_partial_draft {
             Some(zeroclaw_spawn::spawn!(async move {
+                let _lease = notify_lease;
                 while notify_rx.recv().await.is_some() {}
             }))
         } else {
             Some(zeroclaw_spawn::spawn!(async move {
+                let _lease = notify_lease;
                 let thread_ts = notify_thread_root;
                 while let Some(text) = notify_rx.recv().await {
                     if let Some(ref ch) = notify_channel {
@@ -9590,6 +10433,10 @@ async fn process_channel_message_body(
         Some(ctx.agent_alias.to_string()),
         Some(turn_id.clone()),
     );
+    let execution_tree_budget = ExecutionTreeBudget::from_limit(
+        ctx.prompt_config
+            .effective_max_execution_tree_iterations(&ctx.agent_alias),
+    );
     let scoped_turn = scope_provider_fallback(Box::pin(async {
         let llm_result = loop {
             let thread_scope_id = msg
@@ -9603,6 +10450,7 @@ async fn process_channel_message_body(
                 } else {
                     ctx.non_cli_excluded_tools.as_ref()
                 };
+            loop_knobs.provider_attempt_allowlist = attempt_allowlist.clone();
             let tool_loop = Box::pin(run_tool_call_loop(ToolLoop {
                 exec: ResolvedAgentExecution::resolve(
                     ResolvedModelAccess {
@@ -9616,7 +10464,10 @@ async fn process_channel_message_body(
                         tools_registry: ctx.tools_registry.as_ref(),
                         observer: notify_observer.as_ref() as &dyn Observer,
                         silent: true,
-                        approval: Some(&*ctx.approval_manager),
+                        approval: Some(&approval_manager),
+                        // The agent's own policy (built at channel start with
+                        // its tools) governs the no-vision marker gate.
+                        security: Some(ctx.security.as_ref()),
                         multimodal_config: &ctx.multimodal,
                         // Full config for the vision route to resolve the
                         // configured `vision_model_provider`'s alias options - the
@@ -9636,6 +10487,7 @@ async fn process_channel_message_body(
                         strict_tool_parsing: ctx.agent_cfg.resolved.strict_tool_parsing,
                         parallel_tools: ctx.agent_cfg.resolved.parallel_tools,
                         max_tool_result_chars: ctx.max_tool_result_chars,
+                        keep_tool_context_turns: ctx.agent_cfg.resolved.keep_tool_context_turns,
                         context_limits,
                         context_limits_resolver: None,
                         knobs: &loop_knobs,
@@ -9648,7 +10500,7 @@ async fn process_channel_message_body(
                 channel_reply_target: Some(msg.reply_target.as_str()),
                 cancellation_token: Some(cancellation_token.clone()),
                 on_delta: delta_tx.clone(),
-                shared_budget: None,
+                shared_budget: execution_tree_budget.clone(),
                 channel: approval_channel.as_deref(),
                 // Collector is meaningful only when the generator is active.
                 // Pass None when receipts are disabled so the call site
@@ -9685,8 +10537,15 @@ async fn process_channel_message_body(
                 // with that agent's own gated tools/policy/MCP scope rather than
                 // this turn's.
                 served_route_sink: None,
+                // The channels orchestrator builds its turns from config.
+                capability_binding: None,
                 sop_reassembly: Some(zeroclaw_runtime::agent::loop_::SopStepReassembly {
                     config: ctx.prompt_config.as_ref(),
+                    // The channels orchestrator builds its turns from config;
+                    // it binds capabilities once it moves onto the contract.
+                    capabilities: None,
+                    live_config: Some(ctx.live_config.clone()),
+                    memory_owner: ctx.memory.principal_scope(),
                 }),
             }));
             // Scope this turn's routing handle so concurrent same-agent turns,
@@ -9700,7 +10559,20 @@ async fn process_channel_message_body(
             let tool_loop = zeroclaw_runtime::agent::loop_::TOOL_LOOP_COST_TRACKING_CONTEXT
                 .scope(cost_tracking_context.clone(), tool_loop);
             let tool_loop = scope_session_key(Some(history_key.clone()), tool_loop);
+            let tool_loop = zeroclaw_api::TOOL_LOOP_ACTIVE_CONVERSATION.scope(
+                Some(zeroclaw_api::conversation_binding::ActiveConversation {
+                    surface: zeroclaw_api::conversation_binding::ConversationSurface::Channel,
+                    route: composite_channel_key(&msg.channel, msg.channel_alias.as_deref()),
+                    key: history_key.clone(),
+                    agent_alias: ctx.agent_alias.to_string(),
+                }),
+                tool_loop,
+            );
             let tool_loop = scope_thread_id(thread_scope_id, tool_loop);
+            let tool_loop = zeroclaw_providers::reliable::scope_provider_attempt_allowlist(
+                attempt_allowlist.clone(),
+                tool_loop,
+            );
             let timed_tool_loop =
                 tokio::time::timeout(Duration::from_secs(timeout_budget_secs), tool_loop);
 
@@ -9765,27 +10637,28 @@ async fn process_channel_message_body(
                         // original provider/model pair instead of a
                         // half-switched state.
                         active_model_provider = new_prov;
-                        route.model_provider = resolved_model_provider;
-                        route.model = new_model;
-                        route.api_key = resolved_api_key;
+                        apply_model_issued_route_switch(
+                            &mut route,
+                            resolved_model_provider,
+                            new_model,
+                            resolved_api_key,
+                        );
                         context_limits = resolve_channel_context_limits(
                             runtime_defaults.config.as_ref(),
                             ctx.agent_alias.as_str(),
                             &route,
                             ctx.context_token_budget,
                         );
-                        // Persist the route override so subsequent messages
-                        // from this sender continue using the switched model.
-                        set_route_selection(
-                            ctx.as_ref(),
-                            &history_key,
-                            ChannelRouteSelection {
-                                model_provider: route.model_provider.clone(),
-                                model: route.model.clone(),
-                                api_key: route.api_key.clone(),
-                            },
-                            &runtime_defaults,
-                        );
+                        // A scoped switch belongs to this turn, not the
+                        // hidden sender choice exposed when the scope clears.
+                        if !route_is_scoped {
+                            set_route_selection(
+                                ctx.as_ref(),
+                                &history_key,
+                                route.clone(),
+                                &runtime_defaults,
+                            );
+                        }
 
                         let switched_native_tool_specs_present =
                             ::zeroclaw_runtime::agent::loop_::native_tool_specs_present_for_turn(
@@ -10037,31 +10910,20 @@ async fn process_channel_message_body(
             // The runtime commits this candidate only after semantic acceptance.
             // This renderer must therefore receive only the final accepted route.
             let history_response = delivered_response.clone();
+            let model_notice = ctx.live_config.read().channels.model_fallback_notice;
             delivered_response = append_provider_fallback_footer(
                 delivered_response,
                 fallback_info.as_ref(),
                 safeguard_notice.as_ref(),
-            );
-
-            ::zeroclaw_log::record!(
-                INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Outbound)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Success)
-                    .with_duration(
-                        u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
-                    )
-                    .with_attrs(::serde_json::json!({
-                        "model_provider": route.model_provider,
-                        "model": route.model,
-                        "sender": msg.sender,
-                        "response": scrub_credentials(&delivered_response),
-                    })),
-                "channel_message_outbound"
+                model_notice,
             );
 
             // Persist intermediate tool-call/result messages from this turn
             // so the model retains concrete "I used tools" examples in
-            // context, preventing drift toward tool-less responses.
+            // context, preventing drift toward tool-less responses. How many
+            // turns keep those rows on the provider-facing history is decided
+            // per request by the tool loop (`keep_tool_context_turns` counts
+            // turns there); here the key only gates whether they are stored.
             //
             // Skipped when the pre-trim resync above could not confirm the
             // cache matches what's durable: appending onto an evicted cache
@@ -10099,7 +10961,9 @@ async fn process_channel_message_body(
                 let temperature = ctx.temperature;
                 let user_msg = msg.content.clone();
                 let assistant_resp = history_response.clone();
+                let autosave_lease = turn_lease.clone();
                 zeroclaw_spawn::spawn!(async move {
+                    let _lease = autosave_lease;
                     if let Err(e) = memory_strategy
                         .consolidate_turn(
                             &user_msg,
@@ -10123,22 +10987,6 @@ async fn process_channel_message_body(
                 });
             }
 
-            ::zeroclaw_log::record!(
-                INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Outbound)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Success)
-                    .with_duration(
-                        u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
-                    )
-                    .with_attrs(::serde_json::json!({
-                        "sender": msg.sender,
-                        "message_id": msg.id,
-                        "reply_target": msg.reply_target,
-                        "thread_ts": msg.thread_ts,
-                        "content": delivered_response,
-                    })),
-                "reply delivered"
-            );
             let receipts_block = if ctx.show_receipts_in_response {
                 let receipts = tool_receipts_collector
                     .lock()
@@ -10211,9 +11059,13 @@ async fn process_channel_message_body(
                     .as_ref()
                     .and_then(|r| r.channel.as_deref())
                     .is_some();
-                // Whether the agent's reply reached a channel — gates the
-                // `fire_message_sent` observer hook below.
-                let reply_delivered = if is_redirect {
+                // Preserve the transport result until delivery logging and hooks
+                // distinguish complete, partial, and failed delivery.
+                enum ReplyDelivery {
+                    Complete,
+                    Partial,
+                }
+                let delivery_result = if is_redirect {
                     // Routing redirects to a different channel: cancel any in-progress
                     // draft on the originating channel before delivering elsewhere.
                     if let (Some(orig_ch), Some(draft_id)) =
@@ -10229,7 +11081,10 @@ async fn process_channel_message_body(
                     } else if force_voice_override {
                         send_msg = send_msg.force_voice();
                     }
-                    channel.send_final(&send_msg).await.is_ok()
+                    channel
+                        .send_final(&send_msg)
+                        .await
+                        .map(|()| ReplyDelivery::Complete)
                 } else if let Some(ref draft_id) = draft_message_id {
                     // Same channel with draft. For force-voice routing: cancel the
                     // draft placeholder and deliver via send_final() so force_voice
@@ -10244,19 +11099,37 @@ async fn process_channel_message_body(
                                     .in_thread(msg.thread_ts.clone()),
                             )
                             .await
-                            .is_ok()
+                            .map(|()| ReplyDelivery::Complete)
                     } else {
                         let suppress = suppress_voice_override.unwrap_or(false);
+                        let draft_final_response = if channel.supports_multi_message_streaming() {
+                            // Ask the transport how much of the visible stream
+                            // is confirmed-delivered before reconciling the
+                            // sanitized final response against it.
+                            let confirmed_offset = channel
+                                .multi_message_confirmed_offset(&delivery_recipient, draft_id)
+                                .await;
+                            let streamed_text = streamed_draft_text
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner());
+                            cumulative_multi_message_final_text(
+                                &streamed_text,
+                                &delivered_response,
+                                confirmed_offset,
+                            )
+                        } else {
+                            delivered_response.clone()
+                        };
                         match channel
                             .finalize_draft(
                                 &delivery_recipient,
                                 draft_id,
-                                &delivered_response,
+                                &draft_final_response,
                                 suppress,
                             )
                             .await
                         {
-                            Ok(()) => true,
+                            Ok(()) => Ok(ReplyDelivery::Complete),
                             Err(e)
                                 if e
                                     .downcast_ref::<zeroclaw_api::channel::FinalizePartialDelivery>(
@@ -10283,7 +11156,28 @@ async fn process_channel_message_body(
                                     "Final answer partially delivered; not resending to avoid \
                                      duplicating the accepted prefix"
                                 );
-                                true
+                                Ok(ReplyDelivery::Partial)
+                            }
+                            Err(e)
+                                if e
+                                    .downcast_ref::<zeroclaw_api::channel::FinalizeUndelivered>()
+                                    .is_some() =>
+                            {
+                                // Nothing was delivered and the channel asked us
+                                // not to send again yet (e.g. a flood limit).
+                                // Resending would only extend the penalty, and
+                                // the reply must not be reported as sent.
+                                ::zeroclaw_log::record!(
+                                    WARN,
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Fail
+                                    )
+                                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                                    "Final answer not delivered; not resending"
+                                );
+                                Err(e)
                             }
                             Err(e) => {
                                 ::zeroclaw_log::record!(
@@ -10300,7 +11194,10 @@ async fn process_channel_message_body(
                                 if suppress {
                                     fallback = fallback.suppress_voice();
                                 }
-                                channel.send_final(&fallback).await.is_ok()
+                                channel
+                                    .send_final(&fallback)
+                                    .await
+                                    .map(|()| ReplyDelivery::Complete)
                             }
                         }
                     }
@@ -10315,7 +11212,7 @@ async fn process_channel_message_body(
                         send_msg = send_msg.force_voice();
                     }
                     match channel.send_final(&send_msg).await {
-                        Ok(()) => true,
+                        Ok(()) => Ok(ReplyDelivery::Complete),
                         Err(e) => {
                             ::zeroclaw_log::record!(
                                 ERROR,
@@ -10327,9 +11224,53 @@ async fn process_channel_message_body(
                                 .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
                                 "failed to reply"
                             );
-                            false
+                            Err(e)
                         }
                     }
+                };
+                let reply_delivered = match delivery_result {
+                    Ok(ReplyDelivery::Complete) => {
+                        ::zeroclaw_log::record!(
+                            INFO,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Outbound
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                            .with_duration(
+                                u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
+                            )
+                            .with_attrs(::serde_json::json!({
+                                "model_provider": route.model_provider,
+                                "model": route.model,
+                                "sender": msg.sender,
+                                "response": scrub_credentials(&delivered_response),
+                            })),
+                            "channel_message_outbound"
+                        );
+                        ::zeroclaw_log::record!(
+                            INFO,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Outbound
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                            .with_duration(
+                                u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
+                            )
+                            .with_attrs(::serde_json::json!({
+                                "sender": msg.sender,
+                                "message_id": msg.id,
+                                "reply_target": msg.reply_target,
+                                "thread_ts": msg.thread_ts,
+                                "content": delivered_response,
+                            })),
+                            "reply delivered"
+                        );
+                        true
+                    }
+                    Ok(ReplyDelivery::Partial) => true,
+                    Err(_) => false,
                 };
                 if reply_delivered && let Some(hooks) = ctx.hooks.as_ref() {
                     hooks
@@ -10432,15 +11373,28 @@ async fn process_channel_message_body(
                         .await;
                 }
             } else {
-                let safe_error = zeroclaw_providers::sanitize_api_error(&e.to_string());
+                let context_window_exceeded =
+                    zeroclaw_runtime::agent::context_window_exceeded_from_error(&e);
+                let safe_error = if context_window_exceeded.is_some() {
+                    String::new()
+                } else {
+                    zeroclaw_providers::sanitize_api_error(&e.to_string())
+                };
+                // `safe_error` is deliberately empty for a capacity failure, so
+                // the journal needs the typed breakdown instead: without it
+                // this line read "Turn error after Nms:" and nothing else.
+                let journal_error = context_window_exceeded
+                    .map_or_else(|| safe_error.clone(), |exceeded| exceeded.breakdown());
                 eprintln!(
-                    "  ❌ LLM error after {}ms: {safe_error}",
+                    "  ❌ Turn error after {}ms: {journal_error}",
                     started_at.elapsed().as_millis(),
                 );
 
                 // Evict cached model_provider on auth errors so the next request
                 // re-creates it with fresh OAuth credentials.
-                if zeroclaw_providers::reliable::is_auth_error(&e) {
+                if context_window_exceeded.is_none()
+                    && zeroclaw_providers::reliable::is_auth_error(&e)
+                {
                     let cache_key = provider_cache_key(
                         &route.model_provider,
                         route.api_key.as_deref(),
@@ -10461,6 +11415,23 @@ async fn process_channel_message_body(
                         );
                     }
                 }
+                let mut error_attributes = ::serde_json::json!({
+                    "model_provider": route.model_provider,
+                    "model": route.model,
+                    "sender": msg.sender,
+                });
+                if let Some(exceeded) = context_window_exceeded {
+                    error_attributes["error_kind"] = "context_window_exceeded".into();
+                    error_attributes["estimated_tokens"] = exceeded.estimated_tokens.into();
+                    error_attributes["model_context_window"] = exceeded.model_context_window.into();
+                    error_attributes["raw_estimated_tokens"] = exceeded.raw_estimated_tokens.into();
+                    error_attributes["system_tokens"] = exceeded.system_tokens.into();
+                    error_attributes["tool_schema_tokens"] = exceeded.tool_schema_tokens.into();
+                    error_attributes["provider_attempted"] = false.into();
+                } else {
+                    error_attributes["error_kind"] = "provider_error".into();
+                    error_attributes["error"] = safe_error.clone().into();
+                }
                 ::zeroclaw_log::record!(
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
@@ -10468,15 +11439,11 @@ async fn process_channel_message_body(
                         .with_duration(
                             u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
                         )
-                        .with_attrs(::serde_json::json!({
-                            "model_provider": route.model_provider,
-                            "model": route.model,
-                            "sender": msg.sender,
-                            "error": safe_error,
-                        })),
+                        .with_attrs(error_attributes),
                     "channel_message_error"
                 );
-                let should_rollback_user_turn = should_rollback_failed_user_turn(&e);
+                let should_rollback_user_turn =
+                    context_window_exceeded.is_none() && should_rollback_failed_user_turn(&e);
                 let rolled_back = should_rollback_user_turn
                     && rollback_orphan_user_turn(ctx.as_ref(), &history_key, &timestamped_content);
 
@@ -10595,6 +11562,7 @@ async fn register_inbound_turn(
     msg: &zeroclaw_api::channel::ChannelMessage,
     in_flight: &Arc<Mutex<HashMap<String, Vec<InFlightSenderTaskState>>>>,
     task_sequence: &Arc<AtomicU64>,
+    generation_cancel: &CancellationToken,
 ) -> Option<TurnRegistration> {
     if msg.channel == "cli" || msg.passive_context {
         return None;
@@ -10608,7 +11576,7 @@ async fn register_inbound_turn(
     // keys a different history.
     let debounce_key =
         message_debounce_key(runtime_conversation_history_key(ctx.as_ref(), msg), msg);
-    let cancellation = CancellationToken::new();
+    let cancellation = generation_cancel.child_token();
     let completion = Arc::new(InFlightTaskCompletion::new());
     let task_id = task_sequence.fetch_add(1, Ordering::Relaxed);
 
@@ -10710,25 +11678,32 @@ impl Drop for TurnRegistration {
 /// Run one turn to completion. The caller owns the execution permit and the
 /// conversation lane, so everything here is already exclusive for this history.
 async fn run_conversation_turn(
-    ctx: Arc<ChannelRuntimeContext>,
-    msg: zeroclaw_api::channel::ChannelMessage,
-    delivery_message_id: String,
-    dispatch_ownership: ModelPickerDispatchOwnership,
-    registration: Option<TurnRegistration>,
+    turn: PendingTurn,
     permit: tokio::sync::OwnedSemaphorePermit,
-    pending_work: tokio::sync::OwnedSemaphorePermit,
+    generation_cancel: CancellationToken,
+    turn_lease: Arc<zeroclaw_runtime::live_config_authority::AgentTurnLease>,
 ) {
+    let PendingTurn {
+        ctx,
+        msg,
+        delivery_message_id,
+        dispatch_ownership,
+        registration,
+        pending_work,
+        ..
+    } = turn;
     let execution_permit = permit;
 
     let Some(registration) = registration else {
         process_channel_message_with_delivery_id(
             ctx,
             msg,
-            CancellationToken::new(),
+            generation_cancel,
             delivery_message_id,
+            Some(Arc::clone(&turn_lease)),
         )
         .await;
-        drop(dispatch_ownership);
+        dispatch_ownership.release();
         drop(execution_permit);
         drop(pending_work);
         return;
@@ -10738,7 +11713,7 @@ async fn run_conversation_turn(
     // still queued; the slot is released without running it.
     if registration.cancellation.is_cancelled() {
         drop(registration);
-        drop(dispatch_ownership);
+        dispatch_ownership.release();
         drop(execution_permit);
         drop(pending_work);
         return;
@@ -10749,10 +11724,11 @@ async fn run_conversation_turn(
         msg,
         registration.cancellation.clone(),
         delivery_message_id,
+        Some(Arc::clone(&turn_lease)),
     )
     .await;
     drop(registration);
-    drop(dispatch_ownership);
+    dispatch_ownership.release();
     drop(execution_permit);
     drop(pending_work);
 }
@@ -10764,6 +11740,10 @@ struct AgentRouter {
     single_ctx: Option<Arc<ChannelRuntimeContext>>,
     sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
     sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
+    agent_lifecycle: zeroclaw_runtime::live_config_authority::AgentLifecycleCoordinator,
+    execution_capability: Option<zeroclaw_runtime::live_config_authority::AgentExecutionCapability>,
+    turn_generations: Arc<HashMap<String, u64>>,
+    sop_driver_sink: Option<zeroclaw_runtime::sop::SopDriverSink>,
 }
 
 impl AgentRouter {
@@ -10775,6 +11755,10 @@ impl AgentRouter {
             single_ctx: Some(ctx),
             sop_engine: None,
             sop_audit: None,
+            agent_lifecycle: Default::default(),
+            execution_capability: None,
+            turn_generations: Arc::new(HashMap::new()),
+            sop_driver_sink: None,
         }
     }
 
@@ -10783,6 +11767,7 @@ impl AgentRouter {
         owner_by_channel_key: HashMap<String, String>,
         sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
         sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
+        sop_driver_sink: Option<zeroclaw_runtime::sop::SopDriverSink>,
     ) -> Self {
         Self {
             by_agent: Arc::new(by_agent),
@@ -10790,7 +11775,34 @@ impl AgentRouter {
             single_ctx: None,
             sop_engine,
             sop_audit,
+            agent_lifecycle: Default::default(),
+            execution_capability: None,
+            turn_generations: Arc::new(HashMap::new()),
+            sop_driver_sink,
         }
+    }
+
+    fn with_agent_lifecycle(
+        mut self,
+        agent_lifecycle: zeroclaw_runtime::live_config_authority::AgentLifecycleCoordinator,
+    ) -> Self {
+        self.turn_generations = Arc::new(
+            self.by_agent
+                .keys()
+                .chain(self.single_ctx.iter().map(|ctx| ctx.agent_alias.as_ref()))
+                .map(|alias| (alias.clone(), agent_lifecycle.alias_generation(alias)))
+                .collect(),
+        );
+        self.agent_lifecycle = agent_lifecycle;
+        self
+    }
+
+    fn with_execution_capability(
+        mut self,
+        execution_capability: zeroclaw_runtime::live_config_authority::AgentExecutionCapability,
+    ) -> Self {
+        self.execution_capability = Some(execution_capability);
+        self
     }
 
     fn resolve(
@@ -11132,11 +12144,14 @@ async fn dispatch_channel_sop_gate(
     };
     match outcome {
         Ok(outcome) => {
-            zeroclaw_runtime::sop::drive_resumed_broker_action(
+            let driver_handles = router.sop_driver_sink.as_ref().map(|sink| sink.handles());
+            zeroclaw_runtime::sop::drive_resumed_broker_action_with_capability(
                 config,
                 Arc::clone(engine),
                 router.sop_audit.clone(),
+                driver_handles.as_ref(),
                 &outcome,
+                router.execution_capability.clone(),
             );
             ::zeroclaw_log::record!(
                 INFO,
@@ -11221,16 +12236,22 @@ async fn dispatch_channel_sop_event(
     };
 
     let target_sop = channel_sop_target(msg);
-    zeroclaw_runtime::sop::dispatch::SopIngress::new(
-        router.sop_engine.as_ref(),
-        router.sop_audit.as_deref(),
-    )
-    .dispatch(
+    {
+        let mut ingress = zeroclaw_runtime::sop::dispatch::SopIngress::new(
+            router.sop_engine.as_ref(),
+            router.sop_audit.as_deref(),
+        );
+        if let Some(sink) = router.sop_driver_sink.as_ref() {
+            ingress = ingress.with_driver_sink(sink);
+        }
+        ingress
+    }
+    .dispatch_deduplicated(
         zeroclaw_runtime::sop::types::SopTriggerSource::Channel,
         Some(topic),
         Some(&msg.content),
         target_sop.as_deref(),
-        None,
+        msg.id.clone(),
     )
     .await;
     true
@@ -11286,10 +12307,26 @@ impl Drop for ModelPickerAckCleanupGuard {
     }
 }
 
+#[cfg(test)]
 async fn run_message_dispatch_loop(
+    rx: tokio::sync::mpsc::Receiver<zeroclaw_api::channel::ChannelMessage>,
+    router: AgentRouter,
+    max_in_flight_messages: usize,
+) {
+    run_message_dispatch_loop_until_cancelled(
+        rx,
+        router,
+        max_in_flight_messages,
+        CancellationToken::new(),
+    )
+    .await;
+}
+
+async fn run_message_dispatch_loop_until_cancelled(
     mut rx: tokio::sync::mpsc::Receiver<zeroclaw_api::channel::ChannelMessage>,
     router: AgentRouter,
     max_in_flight_messages: usize,
+    cancel: CancellationToken,
 ) {
     let semaphore = Arc::new(tokio::sync::Semaphore::new(max_in_flight_messages));
     let pending_budget = Arc::new(tokio::sync::Semaphore::new(GLOBAL_PENDING_TURN_LIMIT));
@@ -11304,7 +12341,12 @@ async fn run_message_dispatch_loop(
     let task_sequence = Arc::new(AtomicU64::new(1));
     let ingress_order = IngressOrderRegistry::new();
     let ingress_tasks = IngressTaskTracker::new();
-    let lanes = ConversationLaneRegistry::new(Arc::clone(&semaphore));
+    let debounce_tasks = IngressTaskTracker::new();
+    let lanes = ConversationLaneRegistry::new(
+        Arc::clone(&semaphore),
+        router.agent_lifecycle.clone(),
+        cancel.clone(),
+    );
     // Open debounce buckets, keyed by debounce key: the channel that feeds the
     // lane position reserved by the bucket's first message.
     let mut debounce_buckets: HashMap<
@@ -11319,7 +12361,15 @@ async fn run_message_dispatch_loop(
     // bucket another, still-live turn is waiting in.
     let mut debounce_bucket_owners: HashMap<String, u64> = HashMap::new();
 
-    while let Some(msg) = rx.recv().await {
+    let cancelled = loop {
+        let msg = tokio::select! {
+            biased;
+            () = cancel.cancelled() => break true,
+            msg = rx.recv() => match msg {
+                Some(msg) => msg,
+                None => break false,
+            },
+        };
         // Acquire picker-delivery ownership at the first definitive queue
         // consumption boundary. Every `continue`, semaphore shutdown, debounce
         // cancellation, worker abort, and normal completion below then settles
@@ -11498,11 +12548,9 @@ async fn run_message_dispatch_loop(
                 match Arc::clone(&stop_reply_budget).try_acquire_owned() {
                     Ok(reply_permit) => {
                         let send_msg = stop_reply_message(&msg, reply);
-                        let tracked_task = notice_tasks.track();
-                        zeroclaw_spawn::spawn!(async move {
+                        notice_tasks.spawn(async move {
                             let _reply_permit = reply_permit;
                             send_notice_with_timeout(channel, send_msg, "stop_ack").await;
-                            drop(tracked_task);
                         });
                     }
                     Err(_) => {
@@ -11574,11 +12622,12 @@ async fn run_message_dispatch_loop(
                 &ctx.prompt_config.channels.telegram,
             );
 
-            match ctx
-                .debouncer
-                .debounce_with_window(&debounce_key, &msg.content, debounce_window)
-                .await
-            {
+            let debounce_result = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => break true,
+                result = ctx.debouncer.debounce_with_window(&debounce_key, &msg.content, debounce_window) => result,
+            };
+            match debounce_result {
                 zeroclaw_infra::debounce::DebounceResult::Pending { rx, extended } => {
                     // A follow-up that extended an open bucket hands the
                     // debouncer's replacement receiver to the lane position
@@ -11619,13 +12668,18 @@ async fn run_message_dispatch_loop(
                         _ => (rx, pending_work),
                     };
 
-                    let (content, bucket) = spawn_debounce_forwarder(rx);
+                    let (content, bucket) = spawn_debounce_forwarder(rx, &debounce_tasks);
                     debounce_buckets.retain(|_, open| !open.is_closed());
                     debounce_bucket_owners.retain(|key, _| debounce_buckets.contains_key(key));
                     debounce_buckets.insert(debounce_key.clone(), bucket);
-                    let registration =
-                        register_inbound_turn(&ctx, &msg, &in_flight_by_sender, &task_sequence)
-                            .await;
+                    let registration = register_inbound_turn(
+                        &ctx,
+                        &msg,
+                        &in_flight_by_sender,
+                        &task_sequence,
+                        &cancel,
+                    )
+                    .await;
                     // This turn owns the bucket it just opened: the reserved
                     // slot, and the queued position behind it, are its own, so
                     // only its own cancellation may retire the bucket.
@@ -11651,6 +12705,15 @@ async fn run_message_dispatch_loop(
                     let source_key = conversation_history_key(&msg);
                     let inbound = InboundTurn {
                         turn: Box::new(PendingTurn {
+                            agent_generation: router
+                                .turn_generations
+                                .get(ctx.agent_alias.as_str())
+                                .copied()
+                                .unwrap_or_else(|| {
+                                    router
+                                        .agent_lifecycle
+                                        .alias_generation(ctx.agent_alias.as_str())
+                                }),
                             ctx: Arc::clone(&ctx),
                             msg,
                             delivery_message_id,
@@ -11685,7 +12748,7 @@ async fn run_message_dispatch_loop(
         // Hook execution and final routing are detached and globally bounded,
         // so the loop remains free to receive `/stop` and interruptions.
         let registration =
-            register_inbound_turn(&ctx, &msg, &in_flight_by_sender, &task_sequence).await;
+            register_inbound_turn(&ctx, &msg, &in_flight_by_sender, &task_sequence, &cancel).await;
         // Registering with interruption enabled cancels the turn this one
         // supersedes. A message that bypasses debounce (a runtime command such
         // as `/new`, or a channel with no window) can supersede a turn that is
@@ -11714,6 +12777,15 @@ async fn run_message_dispatch_loop(
             Arc::clone(&notice_tasks),
             InboundSlot::Ready(InboundTurn {
                 turn: Box::new(PendingTurn {
+                    agent_generation: router
+                        .turn_generations
+                        .get(ctx.agent_alias.as_str())
+                        .copied()
+                        .unwrap_or_else(|| {
+                            router
+                                .agent_lifecycle
+                                .alias_generation(ctx.agent_alias.as_str())
+                        }),
                     ctx: Arc::clone(&ctx),
                     msg,
                     delivery_message_id,
@@ -11724,11 +12796,65 @@ async fn run_message_dispatch_loop(
                 order: ingress_order.register(&source_key),
             }),
         );
-    }
+    };
 
-    ingress_tasks.wait_drained().await;
-    lanes.wait_drained().await;
-    notice_tasks.wait_drained().await;
+    if cancelled {
+        // Stop admission first, then cancel every accepted turn. Closing the
+        // execution semaphore lets queued lane entries retire without starting
+        // new model work while active turns observe their own cancellation.
+        rx.close();
+        pending_budget.close();
+        semaphore.close();
+        busy_notice_budget.close();
+        stop_reply_budget.close();
+
+        let active_cancellations: Vec<CancellationToken> = in_flight_by_sender
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .flat_map(|states| states.iter().map(|state| state.cancellation.clone()))
+            .collect();
+        for turn_cancel in active_cancellations {
+            turn_cancel.cancel();
+        }
+
+        // Debounce timers live inside each agent runtime context. Retire every
+        // open key against every live context so its reserved routing slot is
+        // released before task draining begins.
+        let debounce_keys: Vec<String> = debounce_buckets.keys().cloned().collect();
+        for key in &debounce_keys {
+            if let Some(ctx) = &router.single_ctx {
+                let _ = ctx.debouncer.cancel(key).await;
+            }
+            for ctx in router.by_agent.values() {
+                let _ = ctx.debouncer.cancel(key).await;
+            }
+        }
+        debounce_buckets.clear();
+        debounce_bucket_owners.clear();
+
+        // One absolute generation deadline covers routing, debounce, lane,
+        // and notice ownership. Any remainder is aborted and joined by its
+        // owning task set before this dispatcher returns.
+        let deadline = tokio::time::Instant::now() + CHANNEL_GENERATION_SHUTDOWN_GRACE;
+        let ingress_clean = ingress_tasks.drain_until(deadline).await;
+        let debounce_clean = debounce_tasks.drain_until(deadline).await;
+        let lanes_clean = lanes.drain_until(deadline).await;
+        let notices_clean = notice_tasks.drain_until(deadline).await;
+        if !(ingress_clean && debounce_clean && lanes_clean && notices_clean) {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                "channel generation shutdown aborted unfinished message tasks"
+            );
+        }
+    } else {
+        ingress_tasks.wait_drained().await;
+        debounce_tasks.wait_drained().await;
+        lanes.wait_drained().await;
+        notice_tasks.wait_drained().await;
+    }
 }
 
 fn normalize_telegram_identity(value: &str) -> String {
@@ -12005,6 +13131,7 @@ fn maybe_restart_managed_daemon_service() -> Result<bool> {
     feature = "channel-discord",
     feature = "channel-lark",
     feature = "channel-matrix",
+    feature = "channel-signal",
     feature = "channel-slack",
     feature = "channel-telegram",
     feature = "channel-wechat",
@@ -12016,10 +13143,10 @@ fn one_shot_channel_workspace_dir(config: &Config, channel_type: &str, alias: &s
 
 #[cfg(feature = "channel-slack")]
 fn slack_thread_context_max_messages_resolver(
-    config_arc: &Arc<RwLock<Config>>,
+    config_arc: &zeroclaw_config::live::LiveConfigHandle,
     alias: &str,
 ) -> Arc<dyn Fn() -> usize + Send + Sync> {
-    let cfg_arc = Arc::clone(config_arc);
+    let cfg_arc = config_arc.clone();
     let alias = alias.to_string();
     Arc::new(move || {
         cfg_arc
@@ -12056,9 +13183,21 @@ impl std::error::Error for UnknownChannelId {}
 
 /// Build a single channel instance by config section name (e.g. "telegram").
 fn build_channel_by_id(
-    config_arc: &Arc<RwLock<Config>>,
+    config_arc: &zeroclaw_config::live::LiveConfigHandle,
     channel_id: &str,
 ) -> Result<Arc<dyn Channel>> {
+    // One-shot construction: a private, unsupervised authority seeded from
+    // the caller's own one-shot handle, matching that handle's semantics —
+    // a pairing write here would persist to disk but publish only into
+    // this throwaway storage, never entering a supervised publication
+    // domain (one-shot senders never pair).
+    #[cfg(any(
+        feature = "channel-telegram",
+        feature = "whatsapp-web",
+        feature = "channel-wechat",
+        feature = "channel-line"
+    ))]
+    let authority = zeroclaw_runtime::LiveConfigAuthority::new(config_arc.snapshot());
     #[allow(unused_variables)]
     let config = config_arc.read();
     match channel_id {
@@ -12090,7 +13229,7 @@ fn build_channel_by_id(
                     tg.mention_only,
                 )
                 .with_voice_peer_resolver(voice_peer_resolver)
-                .with_persistence(config_arc.clone())
+                .with_persistence_authority(authority.clone())
                 .with_api_base(tg.api_base_url.clone())
                 .with_ack_reactions(ack)
                 .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
@@ -12187,6 +13326,7 @@ fn build_channel_by_id(
                 .with_thread_context_max_messages_resolver(thread_context_max_messages_resolver)
                 .with_workspace_dir(workspace_dir)
                 .with_markdown_blocks(sl.use_markdown_blocks)
+                .with_allow_bot_messages(sl.allow_bot_messages)
                 .with_transcription_manager(
                     config.transcription.clone(),
                     resolved_transcription_manager(&config, &format!("slack.{alias}")),
@@ -12249,6 +13389,7 @@ fn build_channel_by_id(
                 let alias = alias.clone();
                 Arc::new(move || cfg_arc.read().channel_external_peers("signal", &alias))
             };
+            let workspace_dir = one_shot_channel_workspace_dir(&config, "signal", &alias);
             Ok(Arc::new(
                 SignalChannel::new(
                     sg.http_url.clone(),
@@ -12260,7 +13401,8 @@ fn build_channel_by_id(
                     sg.ignore_attachments,
                     sg.ignore_stories,
                 )
-                .with_approval_timeout_secs(sg.approval_timeout_secs),
+                .with_approval_timeout_secs(sg.approval_timeout_secs)
+                .with_workspace_dir(workspace_dir),
             ))
         }
         #[cfg(not(feature = "channel-signal"))]
@@ -12284,9 +13426,9 @@ fn build_channel_by_id(
                 };
                 let ack = mx.ack_reactions.unwrap_or(config.channels.ack_reactions);
                 let workspace_dir = one_shot_channel_workspace_dir(&config, "matrix", &alias);
-                let transcription_config_arc = Arc::clone(config_arc);
+                let transcription_config_arc = config_arc.clone();
                 let transcription_channel_key = format!("matrix.{alias}");
-                let tts_config_arc = Arc::clone(config_arc);
+                let tts_config_arc = config_arc.clone();
                 let tts_channel_key = format!("matrix.{alias}");
                 let voice_peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
                     let cfg_arc = config_arc.clone();
@@ -12364,7 +13506,7 @@ fn build_channel_by_id(
                 let workspace_dir = one_shot_channel_workspace_dir(&config, "whatsapp", &alias);
                 Ok(Arc::new(
                     WhatsAppWebChannel::new(wa, alias, peer_resolver, allowed_groups_resolver)
-                        .with_persistence(config_arc.clone())
+                        .with_persistence_authority(authority.clone())
                         .with_workspace_dir(workspace_dir),
                 ))
             }
@@ -12548,7 +13690,7 @@ fn build_channel_by_id(
                     wc.cdn_base_url.clone(),
                     Some(WeChatChannel::resolve_state_dir(wc.state_dir.as_deref())),
                 )?
-                .with_persistence(config_arc.clone())
+                .with_persistence_authority(authority.clone())
                 .with_workspace_dir(workspace_dir),
             ))
         }
@@ -12861,7 +14003,7 @@ fn build_channel_by_id(
                 };
                 Ok(Arc::new(
                     LineChannel::from_config(ln, alias, peer_resolver, sender_name_resolver)
-                        .with_persistence(config_arc.clone()),
+                        .with_persistence_authority(authority.clone()),
                 ))
             }
             #[cfg(not(feature = "channel-line"))]
@@ -12896,9 +14038,10 @@ pub async fn send_channel_message(
     recipient: &str,
     message: &str,
 ) -> Result<()> {
-    // Wrap into the canonical shared handle for the builder; this is a
-    // one-shot path so the snapshot is dropped immediately after send.
-    let config_arc = Arc::new(RwLock::new(config.clone()));
+    // Wrap into a private one-shot storage for the builder; the snapshot
+    // is dropped immediately after send and never enters a supervised
+    // publication domain.
+    let config_arc = zeroclaw_config::live::LiveConfig::new(config.clone()).handle();
     // The builder gets first refusal so families it already resolves natively
     // (notably `linq.<alias>`) keep their established route and their own
     // configuration errors. Only a dotted id the builder does not claim at all
@@ -13119,8 +14262,8 @@ fn channel_ref_matches_message_channel(channel_ref: &str, message_channel: &str)
             .is_some_and(|(channel_type, _)| channel_type == message_base)
 }
 
-/// Active `<type>.<alias>` channel references from enabled agents and SOP
-/// approval routes.
+/// Active `<type>.<alias>` channel references from enabled agents and approval
+/// routes (SOP gates plus risk profiles used by enabled agents).
 ///
 /// When no agent declares channel bindings, collection falls back to legacy
 /// behavior and accepts all enabled channels.
@@ -13131,9 +14274,10 @@ struct ActiveChannelAliases {
     /// Bindings declared by all agents, including disabled owners. Their
     /// presence prevents legacy fallback from activating disabled channels.
     all_known_bindings: HashSet<String>,
-    /// `<type>.<alias>` named by an approval request or escalation route.
-    /// These channels are live to deliver and receive SOP gate replies, but
-    /// they remain absent from the agent ownership map for ordinary traffic.
+    /// `<type>.<alias>` named by an approval request, escalation route, or an
+    /// active agent's risk-profile approval route. These channels are live to
+    /// deliver approval replies, but remain absent from the agent ownership map
+    /// for ordinary traffic.
     approval_route_bindings: HashSet<String>,
 }
 
@@ -13155,11 +14299,28 @@ impl ActiveChannelAliases {
 
     /// Computes the canonical channel-binding view used by collection and
     /// startup checks. Disabled owners never activate channels, while an
-    /// explicit SOP approval route keeps its delivery channel live without
+    /// explicit approval route keeps its delivery channel live without
     /// assigning it to an agent.
     fn compute(config: &Config) -> Self {
         let configured_channel_aliases = config.channels_by_alias();
-        let approval_route_bindings = config
+        let resolve_route_channel_key = |channel_key: &str| {
+            if channel_key.is_empty() {
+                return Vec::new();
+            }
+            if channel_key.contains('.') {
+                return vec![channel_key.to_string()];
+            }
+
+            let enabled_aliases: Vec<_> = configured_channel_aliases
+                .iter()
+                .filter(|channel| channel.enabled && channel.channel_type == channel_key)
+                .collect();
+            match enabled_aliases.as_slice() {
+                [channel] => vec![format!("{}.{}", channel.channel_type, channel.alias)],
+                _ => vec![channel_key.to_string()],
+            }
+        };
+        let sop_route_channel_keys = config
             .sop
             .approval
             .policies
@@ -13173,20 +14334,17 @@ impl ActiveChannelAliases {
             .filter_map(|route| {
                 route.and_then(zeroclaw_runtime::sop::approval::channel_route::parse_approval_route)
             })
-            .flat_map(|(channel_key, _)| {
-                if channel_key.contains('.') {
-                    return vec![channel_key.to_string()];
-                }
-
-                let enabled_aliases: Vec<_> = configured_channel_aliases
-                    .iter()
-                    .filter(|channel| channel.enabled && channel.channel_type == channel_key)
-                    .collect();
-                match enabled_aliases.as_slice() {
-                    [channel] => vec![format!("{}.{}", channel.channel_type, channel.alias)],
-                    _ => vec![channel_key.to_string()],
-                }
-            })
+            .map(|(channel_key, _)| channel_key);
+        let risk_profile_route_channel_keys = config
+            .agents
+            .values()
+            .filter(|agent| agent.enabled)
+            .filter_map(|agent| config.risk_profiles.get(agent.risk_profile.trim()))
+            .filter_map(|profile| profile.approval_route.as_ref())
+            .map(|route| route.approver_channel.as_str());
+        let approval_route_bindings = sop_route_channel_keys
+            .chain(risk_profile_route_channel_keys)
+            .flat_map(resolve_route_channel_key)
             .collect();
 
         Self {
@@ -13209,9 +14367,97 @@ impl ActiveChannelAliases {
 pub fn build_channel_map(
     config: &Config,
 ) -> HashMap<String, Arc<dyn zeroclaw_api::channel::Channel>> {
-    let config_arc = Arc::new(RwLock::new(config.clone()));
-    let configured = collect_configured_channels(&config_arc, "", &[], None, None);
+    let config_arc = zeroclaw_config::live::LiveConfig::new(config.clone()).handle();
+    let configured = collect_configured_channels(&config_arc, "", &[], None, None, None);
     configured_channel_map(&configured)
+}
+
+fn channel_map_for_agent(
+    config: &Config,
+    agent_alias: &str,
+    available: &HashMap<String, Arc<dyn Channel>>,
+) -> HashMap<String, Arc<dyn Channel>> {
+    let Some(agent) = config.agents.get(agent_alias).filter(|agent| agent.enabled) else {
+        return HashMap::new();
+    };
+    if config
+        .agents
+        .values()
+        .all(|agent| agent.channels.is_empty())
+    {
+        return available.clone();
+    }
+
+    let mut selected = HashMap::new();
+    for binding in &agent.channels {
+        let binding = binding.as_str();
+        for (key, channel) in available {
+            let matches = key == binding
+                || (!binding.contains('.')
+                    && key
+                        .strip_prefix(binding)
+                        .is_some_and(|suffix| suffix.starts_with('.')));
+            if matches {
+                selected.insert(key.clone(), Arc::clone(channel));
+            }
+        }
+    }
+
+    let mut singleton_by_type: HashMap<String, Option<Arc<dyn Channel>>> = HashMap::new();
+    for (key, channel) in &selected {
+        let Some((channel_type, _)) = key.split_once('.') else {
+            continue;
+        };
+        singleton_by_type
+            .entry(channel_type.to_string())
+            .and_modify(|singleton| *singleton = None)
+            .or_insert_with(|| Some(Arc::clone(channel)));
+    }
+    for (channel_type, channel) in singleton_by_type {
+        if let Some(channel) = channel {
+            selected.entry(channel_type).or_insert(channel);
+        }
+    }
+    selected
+}
+
+pub fn build_channel_map_for_agent(
+    config: &Config,
+    agent_alias: &str,
+) -> HashMap<String, Arc<dyn zeroclaw_api::channel::Channel>> {
+    let available = build_channel_map(config);
+    channel_map_for_agent(config, agent_alias, &available)
+}
+
+pub fn live_channel_map_for_agent(
+    config: &Config,
+    agent_alias: &str,
+) -> HashMap<String, Arc<dyn zeroclaw_api::channel::Channel>> {
+    CRON_CHANNEL_REGISTRY
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_deref()
+        .map(|available| channel_map_for_agent(config, agent_alias, available))
+        .unwrap_or_default()
+}
+
+pub fn live_channel_map() -> HashMap<String, Arc<dyn zeroclaw_api::channel::Channel>> {
+    CRON_CHANNEL_REGISTRY
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_deref()
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// Return the daemon-owned live channels visible to one trusted local RPC
+/// session. This clones channel `Arc`s and never constructs duplicate clients.
+pub fn build_local_rpc_session_channels(
+    config: zeroclaw_config::live::LiveConfigHandle,
+    agent_alias: String,
+) -> HashMap<String, Arc<dyn zeroclaw_api::channel::Channel>> {
+    let snapshot = config.read().clone();
+    live_channel_map_for_agent(&snapshot, &agent_alias)
 }
 
 pub fn register_channels_for_tools(
@@ -13222,8 +14468,8 @@ pub fn register_channels_for_tools(
     poll_handle: &Option<tools::PerToolChannelHandle>,
     escalate_handle: &Option<tools::PerToolChannelHandle>,
 ) -> Vec<String> {
-    let config_arc = Arc::new(RwLock::new(config.clone()));
-    let configured = collect_configured_channels(&config_arc, "", &[], None, None);
+    let config_arc = zeroclaw_config::live::LiveConfig::new(config.clone()).handle();
+    let configured = collect_configured_channels(&config_arc, "", &[], None, None, None);
 
     let handles = [
         ask_user_handle.as_ref(),
@@ -13332,7 +14578,7 @@ fn configure_discord_transcription(
 
 #[cfg(feature = "channel-discord")]
 fn build_configured_discord_channel(
-    config_arc: &Arc<RwLock<Config>>,
+    config_arc: &zeroclaw_config::live::LiveConfigHandle,
     config: &Config,
     alias: &str,
     dc: &zeroclaw_config::schema::DiscordConfig,
@@ -13402,7 +14648,7 @@ fn matrix_state_dir(config_path: &std::path::Path, alias: &str) -> std::path::Pa
 
 #[cfg(any(feature = "channel-bluesky", feature = "channel-reddit"))]
 fn live_external_peer_resolver(
-    config: Arc<RwLock<Config>>,
+    config: zeroclaw_config::live::LiveConfigHandle,
     channel_type: &'static str,
     alias: String,
 ) -> Arc<dyn Fn() -> Vec<String> + Send + Sync> {
@@ -13422,7 +14668,7 @@ fn live_external_peer_resolver(
 /// credential pair; the caller logs and skips the alias on `Err`.
 #[cfg(feature = "channel-matrix")]
 pub(crate) fn build_configured_matrix_channel(
-    config_arc: &Arc<RwLock<Config>>,
+    config_arc: &zeroclaw_config::live::LiveConfigHandle,
     config: &Config,
     alias: &str,
     mx: &zeroclaw_config::schema::MatrixConfig,
@@ -13434,9 +14680,9 @@ pub(crate) fn build_configured_matrix_channel(
         Arc::new(move || cfg_arc.read().channel_external_peers("matrix", &alias))
     };
     let ack = mx.ack_reactions.unwrap_or(config.channels.ack_reactions);
-    let transcription_config_arc = Arc::clone(config_arc);
+    let transcription_config_arc = config_arc.clone();
     let transcription_channel_key = format!("matrix.{alias}");
-    let tts_config_arc = Arc::clone(config_arc);
+    let tts_config_arc = config_arc.clone();
     let tts_channel_key = format!("matrix.{alias}");
     let voice_peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
         let cfg_arc = config_arc.clone();
@@ -13473,16 +14719,42 @@ pub(crate) fn build_configured_matrix_channel(
 }
 
 fn collect_configured_channels(
-    config_arc: &Arc<RwLock<Config>>,
+    config_arc: &zeroclaw_config::live::LiveConfigHandle,
     matrix_skip_context: &str,
     tool_specs: &[(String, String)],
     sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
     sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
+    sop_driver_sink: Option<zeroclaw_runtime::sop::SopDriverSink>,
 ) -> Vec<ConfiguredChannel> {
+    // One-shot construction from a static snapshot: a private,
+    // unsupervised storage that never enters a supervised publication
+    // domain (no supervised storage is ever exposed as a raw Arc).
+    let authority = zeroclaw_runtime::LiveConfigAuthority::new(config_arc.snapshot());
+    collect_configured_channels_with_authority(
+        config_arc,
+        &authority,
+        matrix_skip_context,
+        tool_specs,
+        sop_engine,
+        sop_audit,
+        sop_driver_sink,
+    )
+}
+
+fn collect_configured_channels_with_authority(
+    config_arc: &zeroclaw_config::live::LiveConfigHandle,
+    authority: &zeroclaw_runtime::LiveConfigAuthority,
+    matrix_skip_context: &str,
+    tool_specs: &[(String, String)],
+    sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
+    sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
+    sop_driver_sink: Option<zeroclaw_runtime::sop::SopDriverSink>,
+) -> Vec<ConfiguredChannel> {
+    let _ = authority;
     let _ = matrix_skip_context;
     let _ = tool_specs;
     #[cfg(not(feature = "channel-amqp"))]
-    let _ = (&sop_engine, &sop_audit);
+    let _ = (&sop_engine, &sop_audit, &sop_driver_sink);
     #[allow(unused_mut)]
     let mut channels = Vec::new();
 
@@ -13538,7 +14810,7 @@ fn collect_configured_channels(
                         tg.mention_only,
                     )
                     .with_voice_peer_resolver(voice_peer_resolver)
-                    .with_persistence(config_arc.clone())
+                    .with_persistence_authority(authority.clone())
                     .with_api_base(tg.api_base_url.clone())
                     .with_ack_reactions(ack)
                     .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
@@ -13678,6 +14950,7 @@ fn collect_configured_channels(
                     .with_strict_mention_in_thread(sl.strict_mention_in_thread)
                     .with_workspace_dir(config.channel_workspace_dir(&format!("slack.{alias}")))
                     .with_markdown_blocks(sl.use_markdown_blocks)
+                    .with_allow_bot_messages(sl.allow_bot_messages)
                     .with_proxy_url(sl.proxy_url.clone())
                     .with_transcription_manager(
                         config.transcription.clone(),
@@ -13877,7 +15150,8 @@ fn collect_configured_channels(
                         sig.ignore_stories,
                     )
                     .with_proxy_url(sig.proxy_url.clone())
-                    .with_approval_timeout_secs(sig.approval_timeout_secs),
+                    .with_approval_timeout_secs(sig.approval_timeout_secs)
+                    .with_workspace_dir(config.channel_workspace_dir(&format!("signal.{alias}"))),
                 ),
                 sig,
             ),
@@ -14003,7 +15277,7 @@ fn collect_configured_channels(
                                     peer_resolver,
                                     allowed_groups_resolver,
                                 )
-                                .with_persistence(config_arc.clone())
+                                .with_persistence_authority(authority.clone())
                                 .with_transcription_manager(
                                     config.transcription.clone(),
                                     resolved_transcription_manager(
@@ -14274,6 +15548,7 @@ fn collect_configured_channels(
             dispatch: amqp.dispatch,
             engine: sop_engine.clone(),
             audit: sop_audit.clone(),
+            driver_sink: sop_driver_sink.clone(),
             alias: alias.clone(),
             peer_resolver,
         }) {
@@ -14421,7 +15696,7 @@ fn collect_configured_channels(
             alias: Some(alias.clone()),
             channel: Arc::new(
                 LineChannel::from_config(ln, alias.clone(), peer_resolver, sender_name_resolver)
-                    .with_persistence(config_arc.clone())
+                    .with_persistence_authority(authority.clone())
                     .with_transcription_manager(
                         config.transcription.clone(),
                         resolved_transcription_manager(&config, &format!("line.{alias}")),
@@ -14765,7 +16040,7 @@ fn collect_configured_channels(
                     alias: Some(alias.clone()),
                     channel: Arc::new(
                         channel
-                            .with_persistence(config_arc.clone())
+                            .with_persistence_authority(authority.clone())
                             .with_workspace_dir(
                                 config.channel_workspace_dir(&format!("wechat.{alias}")),
                             ),
@@ -14868,7 +16143,7 @@ fn collect_configured_channels(
             continue;
         }
         let peer_resolver =
-            live_external_peer_resolver(Arc::clone(config_arc), "reddit", alias.clone());
+            live_external_peer_resolver(config_arc.clone(), "reddit", alias.clone());
         channels.push(ConfiguredChannel {
             display_name: "Reddit",
             alias: Some(alias.clone()),
@@ -14904,7 +16179,7 @@ fn collect_configured_channels(
             continue;
         }
         let peer_resolver =
-            live_external_peer_resolver(Arc::clone(config_arc), "bluesky", alias.clone());
+            live_external_peer_resolver(config_arc.clone(), "bluesky", alias.clone());
         channels.push(ConfiguredChannel {
             display_name: "Bluesky",
             alias: Some(alias.clone()),
@@ -14937,7 +16212,7 @@ fn collect_configured_channels(
             continue;
         }
         let channel_key = format!("voice_wake.{alias}");
-        let transcription_config_arc = Arc::clone(config_arc);
+        let transcription_config_arc = config_arc.clone();
         let transcription_channel_key = channel_key.clone();
         channels.push(ConfiguredChannel {
             display_name: "VoiceWake",
@@ -15087,16 +16362,17 @@ fn peer_group_dangling_warning_lines(config: &Config) -> Vec<String> {
 
 /// Run health checks for configured channels.
 pub async fn doctor_channels(config: Config) -> Result<()> {
-    let config_arc = Arc::new(RwLock::new(config));
+    let config_arc = zeroclaw_config::live::LiveConfig::new(config).handle();
     #[allow(unused_mut)]
-    let mut channels = collect_configured_channels(&config_arc, "health check", &[], None, None);
+    let mut channels =
+        collect_configured_channels(&config_arc, "health check", &[], None, None, None);
 
     // Take an owned snapshot before the `.await`: the parking_lot guard is not
     // Send and must not be held across the async constructor.
     let plugin_config = Arc::new(config_arc.read().clone());
     let plugin_channels = zeroclaw_runtime::plugin_runtime::configured_plugin_channels(
         plugin_config,
-        Some(Arc::clone(&config_arc)),
+        Some(config_arc.clone()),
     )
     .await;
     append_configured_plugin_channels(&mut channels, plugin_channels);
@@ -15660,21 +16936,45 @@ pub async fn start_channels(
     cancel: tokio_util::sync::CancellationToken,
     sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
     sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
+    sop_driver_sink: Option<zeroclaw_runtime::sop::SopDriverSink>,
 ) -> Result<()> {
-    Box::pin(start_channels_with_plugin_webhooks(
-        config,
+    let authority = zeroclaw_runtime::LiveConfigAuthority::new_owned(config)?;
+    start_channels_with_authority(
+        authority,
+        canvas_store,
+        cancel,
+        sop_engine,
+        sop_audit,
+        sop_driver_sink,
+    )
+    .await
+}
+
+/// Start all configured channels with the live config authority owned by the
+/// current daemon generation.
+#[allow(clippy::too_many_lines)]
+pub async fn start_channels_with_authority(
+    authority: zeroclaw_runtime::LiveConfigAuthority,
+    canvas_store: Option<zeroclaw_runtime::tools::CanvasStore>,
+    cancel: tokio_util::sync::CancellationToken,
+    sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
+    sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
+    sop_driver_sink: Option<zeroclaw_runtime::sop::SopDriverSink>,
+) -> Result<()> {
+    Box::pin(start_channels_with_authority_and_plugin_webhooks(
+        authority,
         canvas_store,
         cancel,
         sop_engine,
         sop_audit,
         None,
+        sop_driver_sink,
     ))
     .await
 }
 
-/// Start supervised channels with the daemon generation's plugin-webhook route
-/// registry. Standalone channel runs use [`start_channels`] because no gateway
-/// shares their lifecycle.
+/// Start supervised channels with an owned config snapshot and the daemon
+/// generation's plugin-webhook route registry.
 #[allow(clippy::too_many_lines)]
 pub async fn start_channels_with_plugin_webhooks(
     config: Config,
@@ -15683,11 +16983,53 @@ pub async fn start_channels_with_plugin_webhooks(
     sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
     sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
     plugin_webhooks: Option<Arc<zeroclaw_api::webhook::PluginWebhookRegistry>>,
+    // The daemon generation's driver sink: channel-started runs hand their first
+    // action to it, so one reload drains every driver the generation owns.
+    // `None` standalone, where the process bounds the run instead.
+    sop_driver_sink: Option<zeroclaw_runtime::sop::SopDriverSink>,
+) -> Result<()> {
+    let authority = zeroclaw_runtime::LiveConfigAuthority::new_owned(config)?;
+    start_channels_with_authority_and_plugin_webhooks(
+        authority,
+        canvas_store,
+        cancel,
+        sop_engine,
+        sop_audit,
+        plugin_webhooks,
+        sop_driver_sink,
+    )
+    .await
+}
+
+#[cfg(test)]
+struct ChannelStartupProbe {
+    channel: Arc<dyn Channel>,
+    prepared: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+    publishing: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    static CHANNEL_STARTUP_PROBE: Arc<ChannelStartupProbe>;
+}
+
+/// Start supervised channels with the shared live-config authority and the
+/// daemon generation's plugin-webhook route registry.
+#[allow(clippy::too_many_lines)]
+pub async fn start_channels_with_authority_and_plugin_webhooks(
+    authority: zeroclaw_runtime::LiveConfigAuthority,
+    canvas_store: Option<zeroclaw_runtime::tools::CanvasStore>,
+    cancel: tokio_util::sync::CancellationToken,
+    sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
+    sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
+    plugin_webhooks: Option<Arc<zeroclaw_api::webhook::PluginWebhookRegistry>>,
+    sop_driver_sink: Option<zeroclaw_runtime::sop::SopDriverSink>,
 ) -> Result<()> {
     let plugin_webhook_registry_lease = plugin_webhooks
         .as_ref()
         .map(|registry| registry.start_generation());
-    let config_arc = Arc::new(RwLock::new(config));
+    let config_arc = authority.live_handle();
     let config: Config = config_arc.read().clone();
     let any_agent_provider_resolves = config
         .agents
@@ -15706,8 +17048,6 @@ pub async fn start_channels_with_plugin_webhooks(
         cancel.cancelled().await;
         return Ok(());
     }
-
-    zeroclaw_providers::pricing::spawn_refresher(config_arc.clone());
 
     let enabled_agents = enabled_agent_aliases(&config);
     if enabled_agents.is_empty() {
@@ -15765,16 +17105,16 @@ pub async fn start_channels_with_plugin_webhooks(
         };
 
     let mut channels_by_name_shared: Option<Arc<HashMap<String, Arc<dyn Channel>>>> = None;
-    let mut cron_channel_registry_lease: Option<CronChannelRegistryLease> = None;
+    let mut prepared_channels = Vec::new();
     let mut collected_channel_keys: Vec<String> = Vec::new();
     let mut max_in_flight_messages: Option<usize> = None;
-    let mut listener_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
-    let mut rx_holder: Option<tokio::sync::mpsc::Receiver<zeroclaw_api::channel::ChannelMessage>> =
-        None;
 
     let mut agent_ctxs: HashMap<String, Arc<ChannelRuntimeContext>> = HashMap::new();
 
     for agent_alias in &enabled_agents {
+        if cancel.is_cancelled() {
+            return Ok(());
+        }
         let agent = config
             .resolved_agent_config(agent_alias)
             .with_context(|| format!("agents.{agent_alias} is not configured"))?;
@@ -15847,7 +17187,7 @@ pub async fn start_channels_with_plugin_webhooks(
         let skills =
             zeroclaw_runtime::skills::load_skills_for_agent(&workspace, &config, agent_alias);
 
-        let all_tools_result_ch = tools::all_tools_with_runtime(
+        let all_tools_result_ch = tools::all_tools_with_runtime_and_execution_capability(
             Arc::new(config.clone()),
             &security,
             &risk_profile,
@@ -15868,7 +17208,8 @@ pub async fn start_channels_with_plugin_webhooks(
             None,
             sop_engine.clone(),
             sop_audit.clone(),
-            Some(Arc::clone(&config_arc)),
+            Some(config_arc.clone()),
+            Some(authority.execution_capability()),
         )?;
         // Route the per-agent tool registry through the one gated seam - see
         // `assemble_channel_agent_tools` for the knobs and why. `mut` because the
@@ -15930,13 +17271,15 @@ pub async fn start_channels_with_plugin_webhooks(
             ),
         ];
 
-        if matches!(
+        if zeroclaw_runtime::skills::skills_require_read_tool(
+            &skills,
             config.effective_skills_prompt_mode(agent_alias),
-            zeroclaw_config::schema::SkillsPromptInjectionMode::Compact
         ) {
             tool_descs.push((
                 "read_skill",
-                "Load the full source for an available skill by name. Use when: compact mode only shows a summary and you need the complete skill instructions.",
+                zeroclaw_runtime::i18n::get_tool_description("read_skill").unwrap_or(
+                    "Load the full source for an available skill by name. Use when: its prompt entry marks the instructions as on-demand.",
+                ),
             ));
         }
         if config.browser.enabled {
@@ -15945,7 +17288,7 @@ pub async fn start_channels_with_plugin_webhooks(
                 "Open approved HTTPS URLs in system browser (allowlist-only, no scraping)",
             ));
         }
-        if config.composio.enabled {
+        if tools::composio_tool_available(&config) {
             tool_descs.push((
                 "composio",
                 "Execute actions on 1000+ apps via Composio (Gmail, Notion, GitHub, Slack, etc.). Use action='list' to discover actions, 'list_accounts' to retrieve connected account IDs, 'execute' to run (optionally with connected_account_id), and 'connect' for OAuth.",
@@ -15989,12 +17332,14 @@ pub async fn start_channels_with_plugin_webhooks(
                 tool_descs.retain(|(name, _)| !excluded.iter().any(|ex| ex == name));
             }
         }
-        let effective_tool_names =
+        let mut effective_tool_names =
             effective_non_cli_tool_names(tools_registry.as_ref(), &risk_profile);
+        let hidden_builtin_names = tools_registry.hidden_builtin_names();
+        effective_tool_names.retain(|name| !hidden_builtin_names.contains(*name));
         tool_descs.retain(|(name, _)| effective_tool_names.contains(name));
 
         let bootstrap_max_chars = if agent.resolved.compact_context {
-            Some(6000)
+            Some(COMPACT_BOOTSTRAP_MAX_CHARS)
         } else {
             None
         };
@@ -16010,6 +17355,18 @@ pub async fn start_channels_with_plugin_webhooks(
             startup_excluded_tools,
             ch_activated_handle.as_ref(),
         )?;
+        if let Some(state) = &ch_activated_handle {
+            let section = state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .deferred_builtin_prompt_section();
+            if !section.is_empty() {
+                if !deferred_section.is_empty() {
+                    deferred_section.push_str("\n\n");
+                }
+                deferred_section.push_str(&section);
+            }
+        }
         let expose_text_tool_protocol = compose_channel_mcp_prompt_sections(
             native_tools,
             agent.resolved.strict_tool_parsing,
@@ -16063,13 +17420,16 @@ pub async fn start_channels_with_plugin_webhooks(
             }
 
             #[allow(unused_mut)]
-            let mut configured_channels: Vec<ConfiguredChannel> = collect_configured_channels(
-                &config_arc,
-                "runtime startup",
-                &tool_specs,
-                sop_engine.clone(),
-                sop_audit.clone(),
-            );
+            let mut configured_channels: Vec<ConfiguredChannel> =
+                collect_configured_channels_with_authority(
+                    &config_arc,
+                    &authority,
+                    "runtime startup",
+                    &tool_specs,
+                    sop_engine.clone(),
+                    sop_audit.clone(),
+                    sop_driver_sink.clone(),
+                );
 
             #[cfg(feature = "channel-nostr")]
             {
@@ -16130,6 +17490,7 @@ pub async fn start_channels_with_plugin_webhooks(
                                 alias: alias.clone(),
                                 engine: engine.clone(),
                                 audit: audit.clone(),
+                                driver_sink: sop_driver_sink.clone(),
                             },
                         )),
                     });
@@ -16148,14 +17509,20 @@ pub async fn start_channels_with_plugin_webhooks(
             let plugin_channels =
                 zeroclaw_runtime::plugin_runtime::configured_plugin_channels_with_webhooks(
                     Arc::new(config.clone()),
-                    Some(Arc::clone(&config_arc)),
+                    Some(config_arc.clone()),
                     plugin_webhook_registry_lease.as_ref(),
                 )
                 .await;
             append_configured_plugin_channels(&mut configured_channels, plugin_channels);
-            let (channels_by_name, registry_lease) =
-                publish_cron_channel_registry(&configured_channels);
-            cron_channel_registry_lease = Some(registry_lease);
+            #[cfg(test)]
+            if let Ok(probe) = CHANNEL_STARTUP_PROBE.try_with(Arc::clone) {
+                configured_channels.push(ConfiguredChannel {
+                    display_name: "Startup probe",
+                    alias: Some("startup-probe".to_string()),
+                    channel: Arc::clone(&probe.channel),
+                });
+            }
+            let channels_by_name = Arc::new(configured_channel_map(&configured_channels));
             if configured_channels.is_empty() {
                 ::zeroclaw_log::record!(
                     INFO,
@@ -16183,41 +17550,13 @@ pub async fn start_channels_with_plugin_webhooks(
             println!("  📡 Channels: {}", channel_labels.join(", "));
             println!("  🤖 Agents:   {}", enabled_agents.join(", "));
             println!();
-            println!("  Listening for messages... (Ctrl+C to stop)");
-            println!();
-
-            zeroclaw_runtime::health::mark_component_ok("channels");
-
-            let initial_backoff_secs = config
-                .reliability
-                .channel_initial_backoff_secs
-                .max(DEFAULT_CHANNEL_INITIAL_BACKOFF_SECS);
-            let max_backoff_secs = config
-                .reliability
-                .channel_max_backoff_secs
-                .max(DEFAULT_CHANNEL_MAX_BACKOFF_SECS);
-
-            let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(100);
-
-            for cc in &configured_channels {
-                listener_handles.push(spawn_supervised_listener(
-                    cc.channel.clone(),
-                    cc.alias.clone(),
-                    tx.clone(),
-                    initial_backoff_secs,
-                    max_backoff_secs,
-                    cancel.clone(),
-                ));
-            }
-            drop(tx);
-
             let in_flight =
                 max_in_flight_messages_for_config(configured_channels.len(), &config.channels);
             println!("  🚦 In-flight message limit: {in_flight}");
 
             max_in_flight_messages = Some(in_flight);
             channels_by_name_shared = Some(channels_by_name);
-            rx_holder = Some(rx);
+            prepared_channels = configured_channels;
         }
 
         let channels_by_name = Arc::clone(
@@ -16280,6 +17619,7 @@ pub async fn start_channels_with_plugin_webhooks(
             agent_alias: Arc::new(agent_alias.clone()),
             agent_cfg: Arc::new(agent.clone()),
             prompt_config: Arc::new(config.clone()),
+            live_config: config_arc.clone(),
             memory: Arc::clone(&mem),
             memory_strategy,
             tools_registry: Arc::clone(&tools_registry),
@@ -16313,9 +17653,9 @@ pub async fn start_channels_with_plugin_webhooks(
             transcription_config: config.transcription.clone(),
             agent_transcription_provider: agent.transcription_provider.as_str().to_string(),
             hooks: if config.hooks.enabled {
-                Some(Arc::new(zeroclaw_runtime::hooks::HookRunner::from_config(
-                    &config.hooks,
-                )))
+                Some(Arc::new(
+                    zeroclaw_runtime::hooks::HookRunner::from_root_config(&config),
+                ))
             } else {
                 None
             },
@@ -16327,7 +17667,7 @@ pub async fn start_channels_with_plugin_webhooks(
             ack_reactions: config.channels.ack_reactions,
             show_tool_calls: config.channels.show_tool_calls,
             session_store: shared_session_store.clone(),
-            approval_manager: Arc::new(ApprovalManager::for_non_interactive(&risk_profile)),
+            approval_manager: Arc::new(channel_approval_manager(&risk_profile)),
             activated_tools: ch_activated_handle,
             cost_tracking: zeroclaw_runtime::cost::CostTracker::get_or_init_global(
                 config.cost.clone(),
@@ -16359,9 +17699,18 @@ pub async fn start_channels_with_plugin_webhooks(
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: sop_engine.clone(),
             sop_audit: sop_audit.clone(),
+            security: Arc::clone(&security),
+            sop_driver_sink: sop_driver_sink.clone(),
         });
 
         agent_ctxs.insert(agent_alias.clone(), runtime_ctx);
+        #[cfg(test)]
+        if agent_ctxs.len() == 1
+            && let Ok(probe) = CHANNEL_STARTUP_PROBE.try_with(Arc::clone)
+        {
+            probe.prepared.notify_one();
+            probe.release.notified().await;
+        }
     }
 
     let owner_by_channel_key =
@@ -16448,9 +17797,86 @@ pub async fn start_channels_with_plugin_webhooks(
         }
     }
 
-    let router = AgentRouter::multi(agent_ctxs, owner_by_channel_key, sop_engine, sop_audit);
+    // One conversation owner per agent, over the routes that agent serves.
+    // Built here, while the contexts and the route map are still in hand, and
+    // published below together with the rest of this instance.
+    let routes = Arc::new(owner_by_channel_key.clone());
+    let conversation_owners: Vec<(String, Arc<ChannelConversationOwner>)> = agent_ctxs
+        .iter()
+        .map(|(alias, ctx)| {
+            let owner = ChannelConversationOwner {
+                ctx: Arc::clone(ctx),
+                owner_by_channel_key: Arc::clone(&routes),
+            };
+            (alias.clone(), Arc::new(owner))
+        })
+        .collect();
 
-    let rx = rx_holder.expect("rx initialized by first agent's channel setup");
+    let router = AgentRouter::multi(
+        agent_ctxs,
+        owner_by_channel_key,
+        sop_engine,
+        sop_audit,
+        sop_driver_sink.clone(),
+    )
+    .with_agent_lifecycle(authority.agent_lifecycle())
+    .with_execution_capability(authority.execution_capability());
+
+    // Retirement holds this same lock while clearing the registry and draining
+    // startup. Cancellation must release this wait to avoid a lock/drain cycle.
+    let config_write_lock = zeroclaw_config::write_lock::shared_config_write_lock();
+    #[cfg(test)]
+    let _ = CHANNEL_STARTUP_PROBE.try_with(|probe| probe.publishing.notify_one());
+    let publication_guard = tokio::select! {
+        biased;
+        () = cancel.cancelled() => return Ok(()),
+        guard = config_write_lock.lock() => guard,
+    };
+    if cancel.is_cancelled() {
+        return Ok(());
+    }
+    let (_, cron_channel_registry_lease) = publish_cron_channel_registry(&prepared_channels);
+    // Published only now that this instance is committed: an instance that
+    // is cancelled before this point never replaces, and so never removes,
+    // the owners a still-serving predecessor published.
+    let conversation_owner_leases: Vec<_> = conversation_owners
+        .into_iter()
+        .map(|(alias, owner)| {
+            zeroclaw_infra::conversation_owners::publish_conversation_owner(
+                zeroclaw_api::conversation_binding::ConversationSurface::Channel,
+                &alias,
+                owner,
+            )
+        })
+        .collect();
+    for cc in &prepared_channels {
+        prepare_supervised_channel(&cc.channel, &cancel);
+    }
+    let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(100);
+    let listener_handles: Vec<_> = prepared_channels
+        .iter()
+        .map(|cc| {
+            spawn_supervised_listener(
+                Arc::clone(&cc.channel),
+                cc.alias.clone(),
+                tx.clone(),
+                config
+                    .reliability
+                    .channel_initial_backoff_secs
+                    .max(DEFAULT_CHANNEL_INITIAL_BACKOFF_SECS),
+                config
+                    .reliability
+                    .channel_max_backoff_secs
+                    .max(DEFAULT_CHANNEL_MAX_BACKOFF_SECS),
+                cancel.clone(),
+            )
+        })
+        .collect();
+    drop(tx);
+    drop(publication_guard);
+    zeroclaw_runtime::health::mark_component_ok("channels");
+    println!("  Listening for messages... (Ctrl+C to stop)");
+    println!();
     let max_in_flight =
         max_in_flight_messages.expect("max_in_flight initialized by first agent's channel setup");
     // Declared before the dispatch loop so it drops after it: on any
@@ -16458,12 +17884,13 @@ pub async fn start_channels_with_plugin_webhooks(
     // picker ack registrations are reclaimed.
     #[cfg(feature = "channel-telegram")]
     let _picker_ack_cleanup = ModelPickerAckCleanupGuard;
-    run_message_dispatch_loop(rx, router, max_in_flight).await;
+    run_message_dispatch_loop_until_cancelled(rx, router, max_in_flight, cancel.clone()).await;
 
     for h in listener_handles {
         let _ = h.await;
     }
     drop(cron_channel_registry_lease);
+    drop(conversation_owner_leases);
 
     Ok(())
 }
@@ -16612,7 +18039,8 @@ pub async fn deliver_announcement(
                 peer_resolver,
                 sg.ignore_attachments,
                 sg.ignore_stories,
-            );
+            )
+            .with_workspace_dir(config.channel_workspace_dir(channel));
             zeroclaw_api::channel::Channel::send(&ch, &make_msg(&safe_output)).await?;
         }
         #[cfg(not(feature = "channel-signal"))]
@@ -16870,6 +18298,7 @@ fn concurrent_persist_lock_serialization() {
     };
 
     let ctx = Arc::new(ChannelRuntimeContext {
+        sop_driver_sink: None,
         channels_by_name: Arc::new(HashMap::new()),
         model_provider: Arc::new(tests::DummyModelProvider),
         model_provider_ref: Arc::new("test".into()),
@@ -16922,6 +18351,10 @@ fn concurrent_persist_lock_serialization() {
         provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
         workspace_dir: Arc::new(std::env::temp_dir()),
         prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
+        live_config: zeroclaw_config::live::LiveConfig::new(
+            zeroclaw_config::schema::Config::default(),
+        )
+        .handle(),
         message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
         non_cli_excluded_tools: Arc::new(Vec::new()),
         autonomy_level: AutonomyLevel::default(),
@@ -16949,6 +18382,7 @@ fn concurrent_persist_lock_serialization() {
         persist_locks: Arc::new(Mutex::new(HashMap::new())),
         sop_engine: None,
         sop_audit: None,
+        security: Arc::new(SecurityPolicy::default()),
     });
     ctx.conversation_histories
         .lock()
@@ -17048,6 +18482,7 @@ fn test_channel_ctx_with_backend(
 ) -> Arc<ChannelRuntimeContext> {
     Arc::new(ChannelRuntimeContext {
         channels_by_name: Arc::new(HashMap::new()),
+        security: Arc::new(SecurityPolicy::default()),
         model_provider: Arc::new(tests::DummyModelProvider),
         model_provider_ref: Arc::new("test".into()),
         agent_alias: Arc::new("test".into()),
@@ -17099,6 +18534,10 @@ fn test_channel_ctx_with_backend(
         provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
         workspace_dir: Arc::new(std::env::temp_dir()),
         prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
+        live_config: zeroclaw_config::live::LiveConfig::new(
+            zeroclaw_config::schema::Config::default(),
+        )
+        .handle(),
         message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
         non_cli_excluded_tools: Arc::new(Vec::new()),
         autonomy_level: AutonomyLevel::default(),
@@ -17128,6 +18567,7 @@ fn test_channel_ctx_with_backend(
         persist_locks: Arc::new(Mutex::new(HashMap::new())),
         sop_engine: None,
         sop_audit: None,
+        sop_driver_sink: None,
     })
 }
 
@@ -17166,6 +18606,7 @@ fn test_channel_ctx_with_backend_channel_and_provider(
 
     Arc::new(ChannelRuntimeContext {
         channels_by_name: Arc::new(channels_by_name),
+        security: Arc::new(SecurityPolicy::default()),
         model_provider,
         model_provider_ref: Arc::new("test".into()),
         agent_alias: Arc::new("test".into()),
@@ -17216,7 +18657,8 @@ fn test_channel_ctx_with_backend_channel_and_provider(
         hooks: None,
         provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
         workspace_dir: Arc::new(std::env::temp_dir()),
-        prompt_config: Arc::new(prompt_config),
+        prompt_config: Arc::new(prompt_config.clone()),
+        live_config: zeroclaw_config::live::LiveConfig::new(prompt_config).handle(),
         message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
         non_cli_excluded_tools: Arc::new(Vec::new()),
         autonomy_level: AutonomyLevel::default(),
@@ -17246,6 +18688,7 @@ fn test_channel_ctx_with_backend_channel_and_provider(
         persist_locks: Arc::new(Mutex::new(HashMap::new())),
         sop_engine: None,
         sop_audit: None,
+        sop_driver_sink: None,
     })
 }
 
@@ -18170,6 +19613,590 @@ fn channel_trim_resync_preserves_a_concurrent_workers_later_turn() {
     );
 }
 
+/// The route the channel fixtures arrive on (`test-channel`, no alias).
+#[cfg(test)]
+const TEST_BOUND_ROUTE: &str = "test-channel";
+
+#[cfg(test)]
+fn test_conversation_owner(ctx: &Arc<ChannelRuntimeContext>) -> ChannelConversationOwner {
+    ChannelConversationOwner {
+        ctx: Arc::clone(ctx),
+        owner_by_channel_key: Arc::new(HashMap::from([(
+            TEST_BOUND_ROUTE.to_string(),
+            ctx.agent_alias.to_string(),
+        )])),
+    }
+}
+
+#[cfg(test)]
+fn test_conversation_binding(key: &str) -> zeroclaw_api::conversation_binding::ConversationBinding {
+    zeroclaw_api::conversation_binding::ConversationBinding {
+        surface: zeroclaw_api::conversation_binding::ConversationSurface::Channel,
+        route: TEST_BOUND_ROUTE.to_string(),
+        key: key.to_string(),
+    }
+}
+
+/// An internally initiated exchange appended while a channel turn is in
+/// flight is a concurrent worker's turn like any other: the channel turn's
+/// post-trim resync must keep it, and the cache and durable transcript must
+/// agree afterwards.
+#[cfg(test)]
+#[test]
+fn bound_exchange_survives_a_concurrent_channel_turns_trim_resync() {
+    use tempfile::TempDir;
+    use zeroclaw_infra::session_backend::SessionBackend;
+    use zeroclaw_infra::session_store::SessionStore;
+    use zeroclaw_providers::ChatMessage;
+
+    fn same(a: &ChatMessage, b: &ChatMessage) -> bool {
+        a.role == b.role && a.content == b.content
+    }
+
+    let tmp = TempDir::new().expect("tempdir");
+    let backend: Arc<dyn SessionBackend> =
+        Arc::new(SessionStore::new(tmp.path()).expect("session store"));
+    let sender = "bound_exchange_resync_key".to_string();
+
+    let dropped_turn = ChatMessage::user("old turn the channel turn trims away");
+    let retained_turn = ChatMessage::user("channel turn's inbound message");
+    backend.append(&sender, &dropped_turn).expect("seed append");
+    backend
+        .append(&sender, &retained_turn)
+        .expect("seed append");
+
+    let ctx = test_channel_ctx_with_backend(backend.clone());
+    ctx.conversation_histories
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(
+            sender.clone(),
+            vec![dropped_turn.clone(), retained_turn.clone()],
+        );
+    let known_prefix = [dropped_turn.clone(), retained_turn.clone()];
+
+    let job_prompt = ChatMessage::user("[cron:job-1 reminder] Remind me to call Sam");
+    let job_reply = ChatMessage::assistant("Reminder: call Sam.");
+    append_bound_exchange(
+        ctx.as_ref(),
+        &sender,
+        &[job_prompt.clone(), job_reply.clone()],
+    )
+    .expect("bound exchange persists");
+
+    let breadcrumb = ChatMessage::system("(earlier history was trimmed)");
+    let trimmed_turns = vec![breadcrumb.clone(), retained_turn.clone()];
+    assert!(resync_sender_history_after_trim(
+        ctx.as_ref(),
+        &sender,
+        &trimmed_turns,
+        true,
+        &known_prefix,
+        false,
+    ));
+
+    let expected = [breadcrumb, retained_turn, job_prompt, job_reply];
+    let cached = ctx
+        .conversation_histories
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .peek(&sender)
+        .expect("history must exist for sender")
+        .clone();
+    assert!(
+        cached.len() == expected.len() && cached.iter().zip(&expected).all(|(a, b)| same(a, b)),
+        "the channel turn's resync must keep the bound exchange: got {cached:?}"
+    );
+    let reloaded = backend.load(&sender);
+    assert!(
+        reloaded.len() == expected.len() && reloaded.iter().zip(&expected).all(|(a, b)| same(a, b)),
+        "the durable transcript must agree with the cache: got {reloaded:?}"
+    );
+}
+
+/// The bound exchange lands as one contiguous pair between a channel turn's
+/// inbound message and its reply, and the next channel turn sees it.
+#[cfg(test)]
+#[test]
+fn bound_exchange_is_contiguous_and_visible_to_the_next_channel_turn() {
+    use tempfile::TempDir;
+    use zeroclaw_api::conversation_binding::ConversationBindingOwner;
+    use zeroclaw_infra::session_backend::SessionBackend;
+    use zeroclaw_infra::session_store::SessionStore;
+    use zeroclaw_providers::ChatMessage;
+
+    let tmp = TempDir::new().expect("tempdir");
+    let backend: Arc<dyn SessionBackend> =
+        Arc::new(SessionStore::new(tmp.path()).expect("session store"));
+    let sender = "bound_exchange_visibility_key".to_string();
+    let ctx = test_channel_ctx_with_backend(backend.clone());
+    let owner = test_conversation_owner(&ctx);
+
+    append_sender_turn(ctx.as_ref(), &sender, ChatMessage::user("set a reminder"));
+    owner
+        .append(
+            &test_conversation_binding(&sender),
+            &[
+                ChatMessage::user("[cron:job-1 reminder] Remind me"),
+                ChatMessage::assistant("Reminder sent."),
+            ],
+        )
+        .expect("bound exchange persists");
+    append_sender_turn(ctx.as_ref(), &sender, ChatMessage::assistant("Scheduled."));
+
+    let expected = [
+        ("user", "set a reminder"),
+        ("user", "[cron:job-1 reminder] Remind me"),
+        ("assistant", "Reminder sent."),
+        ("assistant", "Scheduled."),
+    ];
+    let durable: Vec<_> = backend
+        .load(&sender)
+        .into_iter()
+        .map(|m| (m.role, m.content))
+        .collect();
+    assert_eq!(
+        durable,
+        expected
+            .iter()
+            .map(|(r, c)| (r.to_string(), c.to_string()))
+            .collect::<Vec<_>>()
+    );
+
+    let next_turn = append_sender_turn(
+        ctx.as_ref(),
+        &sender,
+        ChatMessage::user("did you remind me?"),
+    )
+    .expect("history available");
+    assert!(
+        next_turn
+            .iter()
+            .any(|m| m.role == "assistant" && m.content == "Reminder sent."),
+        "the next channel turn must see the bound reply: got {next_turn:?}"
+    );
+
+    // A fresh owner over an evicted cache reloads the same history from disk.
+    ctx.conversation_histories
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .pop(&sender);
+    let loaded = owner
+        .load(&test_conversation_binding(&sender))
+        .expect("load");
+    assert!(loaded.iter().all(|m| m.role != "system"));
+    assert!(
+        loaded
+            .iter()
+            .any(|m| m.content.contains("[cron:job-1 reminder] Remind me")),
+        "load must hydrate from the store on a cache miss: got {loaded:?}"
+    );
+}
+
+/// A bound run is handed the conversation the way a channel turn would send
+/// it: no trim breadcrumb posing as a turn, no internal tool markers, no
+/// inline image payloads.
+#[cfg(test)]
+#[test]
+fn bound_load_returns_the_history_a_channel_turn_would_send() {
+    use tempfile::TempDir;
+    use zeroclaw_api::conversation_binding::ConversationBindingOwner;
+    use zeroclaw_infra::session_backend::SessionBackend;
+    use zeroclaw_infra::session_store::SessionStore;
+    use zeroclaw_providers::ChatMessage;
+
+    let tmp = TempDir::new().expect("tempdir");
+    let backend: Arc<dyn SessionBackend> =
+        Arc::new(SessionStore::new(tmp.path()).expect("session store"));
+    let sender = "bound_load_prepared_key".to_string();
+    let ctx = test_channel_ctx_with_backend(backend);
+    let owner = test_conversation_owner(&ctx);
+
+    let cached = vec![
+        zeroclaw_runtime::agent::history_trim::breadcrumb(),
+        ChatMessage::user("what is in this picture? [IMAGE:data:image/png;base64,QUJDRA==]"),
+        ChatMessage::assistant("[Used tools: shell]\nA cat."),
+        ChatMessage::user("thanks"),
+        ChatMessage::assistant("You're welcome."),
+    ];
+    ctx.conversation_histories
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(sender.clone(), cached);
+    ctx.history_crumb_flags
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(sender.clone(), true);
+
+    let loaded: Vec<(String, String)> = owner
+        .load(&test_conversation_binding(&sender))
+        .expect("load")
+        .into_iter()
+        .map(|m| (m.role, m.content))
+        .collect();
+
+    assert_eq!(loaded.len(), 4, "the breadcrumb is not a turn: {loaded:?}");
+    assert_eq!(loaded[0].0, "user");
+    assert!(
+        loaded[0].1.starts_with("what is in this picture?") && !loaded[0].1.contains("base64"),
+        "inline image payloads are collapsed: {loaded:?}"
+    );
+    assert_eq!(loaded[1], ("assistant".to_string(), "A cat.".to_string()));
+    assert_eq!(loaded[3].1, "You're welcome.");
+}
+
+/// The session store is shared by every agent. An owner serves a binding
+/// only on a route its agent is serving, so a channel handed to another agent
+/// takes its conversations with it.
+#[cfg(test)]
+#[test]
+fn bound_conversation_on_a_route_this_agent_does_not_serve_is_refused() {
+    use tempfile::TempDir;
+    use zeroclaw_api::conversation_binding::ConversationBindingOwner;
+    use zeroclaw_infra::session_backend::SessionBackend;
+    use zeroclaw_infra::session_store::SessionStore;
+    use zeroclaw_providers::ChatMessage;
+
+    let tmp = TempDir::new().expect("tempdir");
+    let backend: Arc<dyn SessionBackend> =
+        Arc::new(SessionStore::new(tmp.path()).expect("session store"));
+    let sender = "bound_route_refusal_key".to_string();
+    // The transcript is in the shared store, written by whoever serves it.
+    backend
+        .append(&sender, &ChatMessage::user("a chat with another agent"))
+        .expect("seed append");
+    backend
+        .append(&sender, &ChatMessage::assistant("its reply"))
+        .expect("seed append");
+    let ctx = test_channel_ctx_with_backend(backend.clone());
+    let owner = test_conversation_owner(&ctx);
+    let elsewhere = zeroclaw_api::conversation_binding::ConversationBinding {
+        route: "telegram.other".to_string(),
+        ..test_conversation_binding(&sender)
+    };
+
+    assert!(owner.load(&elsewhere).is_err());
+    assert!(
+        owner
+            .append(
+                &elsewhere,
+                &[ChatMessage::user("[cron:job-1 reminder] Remind me")]
+            )
+            .is_err()
+    );
+    assert_eq!(backend.load(&sender).len(), 2, "nothing was written");
+    assert!(
+        ctx.conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .peek(&sender)
+            .is_none(),
+        "the refused conversation was not pulled into this agent's cache"
+    );
+    // The same key on the served route is this agent's to read.
+    assert_eq!(
+        owner
+            .load(&test_conversation_binding(&sender))
+            .expect("load")
+            .len(),
+        2
+    );
+}
+
+/// Messages nobody has answered yet are part of the conversation: context a
+/// channel records without replying, or a turn still in progress. A bound
+/// run is handed them, and joins its own message to the last one.
+#[cfg(test)]
+#[test]
+fn bound_load_keeps_messages_that_have_no_reply_yet() {
+    use tempfile::TempDir;
+    use zeroclaw_api::conversation_binding::ConversationBindingOwner;
+    use zeroclaw_infra::session_backend::SessionBackend;
+    use zeroclaw_infra::session_store::SessionStore;
+    use zeroclaw_providers::ChatMessage;
+
+    let tmp = TempDir::new().expect("tempdir");
+    let backend: Arc<dyn SessionBackend> =
+        Arc::new(SessionStore::new(tmp.path()).expect("session store"));
+    let sender = "bound_load_unanswered_key".to_string();
+    let ctx = test_channel_ctx_with_backend(backend);
+    let owner = test_conversation_owner(&ctx);
+
+    append_sender_turn(
+        ctx.as_ref(),
+        &sender,
+        ChatMessage::user("summarise this room at six"),
+    );
+    append_sender_turn(ctx.as_ref(), &sender, ChatMessage::assistant("Scheduled."));
+    append_sender_turn(ctx.as_ref(), &sender, ChatMessage::user("lunch was good"));
+    append_sender_turn(
+        ctx.as_ref(),
+        &sender,
+        ChatMessage::user("the release is on Friday"),
+    );
+
+    let loaded: Vec<(String, String)> = owner
+        .load(&test_conversation_binding(&sender))
+        .expect("load")
+        .into_iter()
+        .map(|m| (m.role, m.content))
+        .collect();
+    assert_eq!(
+        loaded,
+        vec![
+            ("user".to_string(), "summarise this room at six".to_string()),
+            ("assistant".to_string(), "Scheduled.".to_string()),
+            (
+                "user".to_string(),
+                "lunch was good\n\nthe release is on Friday".to_string()
+            ),
+        ]
+    );
+}
+
+/// The breadcrumb is dropped only when the cache's own record says one is
+/// there and the first turn is it. A real first turn survives a stale record,
+/// and breadcrumb-like text survives the absence of one.
+#[cfg(test)]
+#[test]
+fn bound_load_drops_a_breadcrumb_only_when_record_and_text_agree() {
+    use tempfile::TempDir;
+    use zeroclaw_api::conversation_binding::ConversationBindingOwner;
+    use zeroclaw_infra::session_backend::SessionBackend;
+    use zeroclaw_infra::session_store::SessionStore;
+    use zeroclaw_providers::ChatMessage;
+
+    let tmp = TempDir::new().expect("tempdir");
+    let backend: Arc<dyn SessionBackend> =
+        Arc::new(SessionStore::new(tmp.path()).expect("session store"));
+    let ctx = test_channel_ctx_with_backend(backend);
+    let owner = test_conversation_owner(&ctx);
+    let seed = |key: &str, first: ChatMessage, recorded: bool| {
+        ctx.conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(
+                key.to_string(),
+                vec![first, ChatMessage::assistant("a reply")],
+            );
+        ctx.history_crumb_flags
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(key.to_string(), recorded);
+    };
+    let first_loaded = |key: &str| {
+        owner
+            .load(&test_conversation_binding(key))
+            .expect("load")
+            .into_iter()
+            .map(|m| m.content)
+            .collect::<Vec<_>>()
+    };
+    let crumb = zeroclaw_runtime::agent::history_trim::breadcrumb();
+
+    // The record is stale: the breadcrumb it refers to has been evicted.
+    seed(
+        "bound_crumb_stale_record",
+        ChatMessage::user("a real question"),
+        true,
+    );
+    assert_eq!(
+        first_loaded("bound_crumb_stale_record"),
+        ["a real question", "a reply"]
+    );
+
+    // No breadcrumb is recorded: text that looks like one is the user's own.
+    seed("bound_crumb_unrecorded_text", crumb.clone(), false);
+    assert_eq!(
+        first_loaded("bound_crumb_unrecorded_text"),
+        [crumb.content.as_str(), "a reply"]
+    );
+}
+
+/// A history that exists on disk but cannot be verified is an error to the
+/// reader, never an empty conversation.
+#[cfg(test)]
+#[test]
+fn bound_load_reports_an_unverifiable_history() {
+    use zeroclaw_api::conversation_binding::ConversationBindingOwner;
+    use zeroclaw_infra::session_backend::SessionBackend;
+    use zeroclaw_providers::ChatMessage;
+
+    struct UnreadableTranscript;
+    impl SessionBackend for UnreadableTranscript {
+        fn load(&self, _key: &str) -> Vec<ChatMessage> {
+            Vec::new()
+        }
+        fn try_load(&self, _key: &str) -> std::io::Result<Vec<ChatMessage>> {
+            Err(std::io::Error::other("simulated transcript read failure"))
+        }
+        fn append(&self, _key: &str, _msg: &ChatMessage) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn remove_last(&self, _key: &str) -> std::io::Result<bool> {
+            Ok(false)
+        }
+        fn list_sessions(&self) -> Vec<String> {
+            Vec::new()
+        }
+    }
+
+    let ctx = test_channel_ctx_with_backend(Arc::new(UnreadableTranscript));
+    let owner = test_conversation_owner(&ctx);
+
+    let binding = test_conversation_binding("bound_load_unverifiable_key");
+    assert!(owner.load(&binding).is_err());
+    assert!(
+        owner
+            .append(
+                &binding,
+                &[ChatMessage::user("[cron:job-1 reminder] Remind me")],
+            )
+            .is_err(),
+        "nothing may be appended to a history that could not be verified"
+    );
+}
+
+/// An exchange lands whole or not at all. When the store rejects its second
+/// message, the first is taken back; when even that is impossible, the cache
+/// keeps exactly what the store kept. Either way the failure is reported.
+#[cfg(test)]
+#[test]
+fn bound_exchange_that_fails_part_way_is_taken_back() {
+    use std::sync::Mutex as StdMutex;
+    use zeroclaw_infra::session_backend::SessionBackend;
+    use zeroclaw_providers::ChatMessage;
+
+    struct SecondAppendFails {
+        messages: StdMutex<Vec<ChatMessage>>,
+        can_take_back: bool,
+    }
+    impl SessionBackend for SecondAppendFails {
+        fn load(&self, _key: &str) -> Vec<ChatMessage> {
+            self.messages.lock().unwrap().clone()
+        }
+        fn append(&self, _key: &str, msg: &ChatMessage) -> std::io::Result<()> {
+            let mut messages = self.messages.lock().unwrap();
+            if messages.len() == 1 {
+                return Err(std::io::Error::other("simulated durable write failure"));
+            }
+            messages.push(msg.clone());
+            Ok(())
+        }
+        fn remove_last(&self, _key: &str) -> std::io::Result<bool> {
+            if !self.can_take_back {
+                return Err(std::io::Error::other("simulated durable delete failure"));
+            }
+            Ok(self.messages.lock().unwrap().pop().is_some())
+        }
+        fn list_sessions(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn get_session_trim_breadcrumb(&self, _key: &str) -> std::io::Result<Option<bool>> {
+            Ok(Some(false))
+        }
+    }
+
+    for (can_take_back, left_behind) in [(true, 0), (false, 1)] {
+        let backend = Arc::new(SecondAppendFails {
+            messages: StdMutex::new(Vec::new()),
+            can_take_back,
+        });
+        let ctx = test_channel_ctx_with_backend(backend.clone());
+        let sender = "bound_exchange_failure_key";
+
+        let result = append_bound_exchange(
+            ctx.as_ref(),
+            sender,
+            &[
+                ChatMessage::user("[cron:job-1 reminder] Remind me"),
+                ChatMessage::assistant("Reminder sent."),
+            ],
+        );
+        assert!(result.is_err(), "a failed durable write must be reported");
+
+        let durable = backend.load(sender);
+        let cached = ctx
+            .conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .peek(sender)
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(durable.len(), left_behind, "can_take_back={can_take_back}");
+        assert_eq!(cached.len(), left_behind, "can_take_back={can_take_back}");
+        assert_eq!(
+            cached.first().map(|m| m.content.as_str()),
+            durable.first().map(|m| m.content.as_str())
+        );
+    }
+}
+
+/// Reading a history that is not in the cache changes nothing: the durable
+/// transcript is not closed, capped or rewritten, and nothing is installed
+/// in the cache. An unanswered last message is handed over as it is.
+#[cfg(test)]
+#[test]
+fn bound_load_of_an_uncached_history_writes_nothing() {
+    use tempfile::TempDir;
+    use zeroclaw_api::conversation_binding::ConversationBindingOwner;
+    use zeroclaw_infra::session_backend::SessionBackend;
+    use zeroclaw_infra::session_store::SessionStore;
+    use zeroclaw_providers::ChatMessage;
+
+    let tmp = TempDir::new().expect("tempdir");
+    let backend: Arc<dyn SessionBackend> =
+        Arc::new(SessionStore::new(tmp.path()).expect("session store"));
+    let sender = "bound_load_cold_read_key".to_string();
+    for message in [
+        ChatMessage::user("summarise this room at six"),
+        ChatMessage::assistant("Scheduled."),
+        ChatMessage::user("the release is on Friday"),
+    ] {
+        backend.append(&sender, &message).expect("seed append");
+    }
+    let ctx = test_channel_ctx_with_backend(backend.clone());
+    let owner = test_conversation_owner(&ctx);
+
+    let loaded: Vec<(String, String)> = owner
+        .load(&test_conversation_binding(&sender))
+        .expect("load")
+        .into_iter()
+        .map(|m| (m.role, m.content))
+        .collect();
+
+    assert_eq!(
+        loaded,
+        vec![
+            ("user".to_string(), "summarise this room at six".to_string()),
+            ("assistant".to_string(), "Scheduled.".to_string()),
+            ("user".to_string(), "the release is on Friday".to_string()),
+        ]
+    );
+    let durable: Vec<String> = backend
+        .load(&sender)
+        .into_iter()
+        .map(|m| m.content)
+        .collect();
+    assert_eq!(
+        durable,
+        [
+            "summarise this room at six",
+            "Scheduled.",
+            "the release is on Friday"
+        ],
+        "a read must not close or rewrite the transcript"
+    );
+    assert!(
+        ctx.conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .peek(&sender)
+            .is_none(),
+        "a read must not install the history in the cache"
+    );
+}
+
 /// A bounded cache (`max_history_messages`) evicts from the front, so a
 /// concurrent worker's turns can rotate worker A's own observed prefix out of
 /// the cache without growing it past `known_prefix.len()` — the exact case a
@@ -18275,6 +20302,33 @@ fn channel_trim_resync_preserves_a_concurrent_workers_later_turn_across_eviction
 pub(crate) mod tests {
     use super::*;
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn ingress_task_tracker_reaps_completed_tasks_before_spawning() {
+        let tracker = IngressTaskTracker::new();
+        let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
+        tracker.spawn(async move {
+            let _ = completed_tx.send(());
+        });
+        completed_rx.await.unwrap();
+
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        tracker.spawn(async move {
+            let _ = release_rx.await;
+        });
+        assert_eq!(
+            tracker
+                .tasks
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .len(),
+            1,
+            "a completed task must not remain alongside the live task"
+        );
+
+        release_tx.send(()).unwrap();
+        tracker.wait_drained().await;
+    }
+
     #[test]
     fn shared_room_history_keeps_the_speaker_for_any_channel() {
         let msg = ChannelMessage {
@@ -18374,8 +20428,11 @@ pub(crate) mod tests {
             "#,
         )
         .expect("peer-group config should parse");
-        let resolver =
-            live_external_peer_resolver(Arc::new(RwLock::new(config)), "reddit", "ops".to_string());
+        let resolver = live_external_peer_resolver(
+            zeroclaw_config::live::LiveConfig::new(config).handle(),
+            "reddit",
+            "ops".to_string(),
+        );
 
         assert_eq!(resolver(), vec!["authorized-redditor".to_string()]);
     }
@@ -18396,7 +20453,7 @@ pub(crate) mod tests {
         )
         .expect("peer-group config should parse");
         let resolver = live_external_peer_resolver(
-            Arc::new(RwLock::new(config)),
+            zeroclaw_config::live::LiveConfig::new(config).handle(),
             "bluesky",
             "work".to_string(),
         );
@@ -18493,6 +20550,67 @@ pub(crate) mod tests {
         }
     }
 
+    #[test]
+    fn channel_approval_manager_prompts_for_supervised_shell() {
+        let risk_profile = zeroclaw_config::schema::RiskProfileConfig {
+            level: AutonomyLevel::Supervised,
+            allowed_commands: vec!["rm".to_string()],
+            block_high_risk_commands: false,
+            ..Default::default()
+        };
+        let manager = channel_approval_manager(&risk_profile);
+
+        assert_eq!(
+            manager.approval_requirement("shell"),
+            zeroclaw_runtime::approval::ApprovalRequirement::Prompt
+        );
+        assert!(manager.needs_approval("shell"));
+    }
+
+    #[test]
+    fn channel_turn_approval_freshens_state_and_selects_configured_route() {
+        let risk_profile = zeroclaw_config::schema::RiskProfileConfig {
+            approval_route: Some(zeroclaw_config::autonomy::ApprovalRoute {
+                approver_channel: "ops.default".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let manager = channel_approval_manager(&risk_profile);
+        manager.record_decision(
+            "file_write",
+            &serde_json::json!({"path": "test.txt"}),
+            &zeroclaw_runtime::approval::ApprovalResponse::Always,
+            "origin",
+        );
+        let origin: Arc<dyn Channel> = Arc::new(RecordingChannel::default());
+
+        let (fresh, routed) = channel_turn_approval(
+            &manager,
+            Some(&risk_profile),
+            &HashMap::new(),
+            Some(Arc::clone(&origin)),
+        );
+
+        assert!(fresh.needs_approval("file_write"));
+        assert_eq!(
+            fresh.approval_requirement("shell"),
+            zeroclaw_runtime::approval::ApprovalRequirement::Prompt
+        );
+        assert!(fresh.session_allowlist().is_empty());
+        assert_eq!(
+            routed.expect("configured route wrapper").name(),
+            "approval-route"
+        );
+
+        let (_, origin_channel) =
+            channel_turn_approval(&manager, None, &HashMap::new(), Some(Arc::clone(&origin)));
+        assert!(
+            Arc::ptr_eq(&origin_channel.expect("origin approval channel"), &origin),
+            "without approval_route the initiating channel remains the approval surface"
+        );
+    }
+
     struct CountingObserver {
         events: Arc<AtomicUsize>,
     }
@@ -18523,16 +20641,77 @@ pub(crate) mod tests {
             actual_provider: "anthropic.backup".to_string(),
             actual_model: "model-b".to_string(),
         };
-        let delivered =
-            append_provider_fallback_footer("final response".to_string(), Some(&fallback), None);
+        let delivered = append_provider_fallback_footer(
+            "final response".to_string(),
+            Some(&fallback),
+            None,
+            zeroclaw_config::schema::ModelFallbackNotice::Off,
+        );
         assert!(delivered.starts_with("final response\n\n---\n"));
         assert!(delivered.contains("openai.primary"));
         assert!(delivered.contains("anthropic.backup"));
         assert_eq!(delivered.matches("---").count(), 1);
         assert_eq!(
-            append_provider_fallback_footer("primary final".to_string(), None, None),
+            append_provider_fallback_footer(
+                "primary final".to_string(),
+                None,
+                None,
+                zeroclaw_config::schema::ModelFallbackNotice::Off
+            ),
             "primary final"
         );
+    }
+
+    #[test]
+    fn model_fallback_notice_modes_preserve_existing_delivery_contracts() {
+        use zeroclaw_config::schema::ModelFallbackNotice::{Detailed, Off, Redacted};
+
+        let mut fallback = ProviderFallbackInfo {
+            requested_provider: "custom.private".into(),
+            requested_model: "model-a".into(),
+            actual_provider: "custom.private".into(),
+            actual_model: "model-b".into(),
+        };
+        for requested_provider in ["custom.private", "custom"] {
+            fallback.requested_provider = requested_provider.into();
+            assert_eq!(
+                append_provider_fallback_footer("answer".into(), Some(&fallback), None, Off),
+                "answer"
+            );
+            let redacted =
+                append_provider_fallback_footer("answer".into(), Some(&fallback), None, Redacted);
+            assert!(redacted.contains("fallback model"));
+            for identifier in [requested_provider, "custom.private", "model-a", "model-b"] {
+                assert!(!redacted.contains(identifier));
+            }
+            let detailed =
+                append_provider_fallback_footer("answer".into(), Some(&fallback), None, Detailed);
+            assert!(detailed.contains("model-a"));
+            assert!(detailed.contains("model-b"));
+            assert!(detailed.contains("custom.private"));
+            assert_eq!(detailed.matches("---").count(), 1);
+        }
+        fallback.requested_model = "model-b".into();
+        for mode in [Off, Redacted, Detailed] {
+            assert_eq!(
+                append_provider_fallback_footer("answer".into(), Some(&fallback), None, mode),
+                "answer",
+                "same-model retry must stay silent"
+            );
+            assert_eq!(
+                append_provider_fallback_footer("answer".into(), None, None, mode),
+                "answer"
+            );
+        }
+        fallback.actual_provider = "anthropic.backup".into();
+        let existing = append_provider_fallback_footer("answer".into(), Some(&fallback), None, Off);
+        for mode in [Redacted, Detailed] {
+            assert_eq!(
+                append_provider_fallback_footer("answer".into(), Some(&fallback), None, mode),
+                existing,
+                "cross-family notices are independent of the new opt-in"
+            );
+        }
     }
 
     #[test]
@@ -18554,6 +20733,7 @@ pub(crate) mod tests {
             "accepted response".to_string(),
             Some(&fallback),
             Some(&safeguard),
+            zeroclaw_config::schema::ModelFallbackNotice::Off,
         );
 
         assert_eq!(delivered.matches("---").count(), 1);
@@ -18586,6 +20766,7 @@ pub(crate) mod tests {
             "accepted response".to_string(),
             Some(&fallback),
             Some(&safeguard),
+            zeroclaw_config::schema::ModelFallbackNotice::Off,
         );
 
         assert!(delivered.starts_with("accepted response\n\n---\n"));
@@ -18613,7 +20794,12 @@ pub(crate) mod tests {
 
         // Without a safeguard leg the same-family switch stays silent as before.
         assert_eq!(
-            append_provider_fallback_footer("accepted response".to_string(), Some(&fallback), None),
+            append_provider_fallback_footer(
+                "accepted response".to_string(),
+                Some(&fallback),
+                None,
+                zeroclaw_config::schema::ModelFallbackNotice::Off
+            ),
             "accepted response"
         );
 
@@ -18628,6 +20814,7 @@ pub(crate) mod tests {
             "accepted response".to_string(),
             Some(&retry),
             Some(&safeguard),
+            zeroclaw_config::schema::ModelFallbackNotice::Off,
         );
         assert_eq!(delivered.matches("---").count(), 1, "{delivered}");
         assert_eq!(delivered.matches("🛡️").count(), 1);
@@ -18828,6 +21015,115 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn local_capacity_cause_is_not_a_provider_overflow() {
+        let error = anyhow::Error::new(zeroclaw_runtime::agent::ContextWindowExceeded {
+            estimated_tokens: 65_537,
+            model_context_window: 65_536,
+            raw_estimated_tokens: 65_537,
+            system_tokens: 0,
+            tool_schema_tokens: 0,
+        })
+        .context("maximum context length; private provider diagnostics");
+        assert!(!is_context_window_overflow_error(&error));
+        let message =
+            zeroclaw_runtime::i18n::get_required_cli_string("turn-context-window-exceeded-error");
+        assert_eq!(
+            channel_user_error_message(&error, "private fallback"),
+            format!("⚠️ Error: {message}")
+        );
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn matrix_context_window_failure_is_delivered_and_logged_before_provider_dispatch() {
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut rx = zeroclaw_log::subscribe_or_install();
+
+        while rx.try_recv().is_ok() {}
+        let channel_impl = Arc::new(DraftRecordingChannel::matrix(
+            zeroclaw_config::schema::MatrixStreamMode::SingleMessage,
+        ));
+        let provider = Arc::new(PrecheckProbeModelProvider::default());
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.channels.matrix.insert(
+            "private".to_string(),
+            zeroclaw_config::schema::MatrixConfig {
+                stream_mode: zeroclaw_config::schema::MatrixStreamMode::SingleMessage,
+                ..Default::default()
+            },
+        );
+        config.providers.models.custom.insert(
+            "capacity".to_string(),
+            zeroclaw_config::schema::CustomModelProviderConfig {
+                base: zeroclaw_config::schema::ModelProviderConfig {
+                    model: Some("test-model".to_string()),
+                    context_window: Some(64),
+                    ..Default::default()
+                },
+            },
+        );
+        let ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel_impl.clone(),
+            provider.clone(),
+            config,
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "custom.capacity",
+            None,
+        );
+        ctx.provider_cache
+            .lock()
+            .unwrap()
+            .insert("custom.capacity".to_string(), provider.clone());
+        let msg = ChannelMessage {
+            id: "matrix-capacity-error".to_string(),
+            explicitly_addressed: true,
+            sender: "capacity-sender".to_string(),
+            reply_target: "!private:example.com".to_string(),
+            content: "private-context-prompt ".repeat(256),
+            channel: "matrix".to_string(),
+            channel_alias: Some("private".to_string()),
+            timestamp: 1,
+            ..Default::default()
+        };
+        process_channel_message(ctx.clone(), msg, CancellationToken::new()).await;
+
+        let terminal =
+            zeroclaw_runtime::i18n::get_required_cli_string("turn-context-window-exceeded-error");
+        let expected = format!("⚠️ Error: {terminal}");
+        assert_eq!(
+            *channel_impl.sent_messages.lock().await,
+            [format!("!private:example.com:{expected}")]
+        );
+        assert_eq!(provider.main_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(provider.precheck_calls.load(Ordering::SeqCst), 0);
+        assert!(
+            ctx.provider_cache
+                .lock()
+                .unwrap()
+                .contains_key("custom.capacity")
+        );
+        assert!(!channel_impl.cancelled_drafts.lock().await.is_empty());
+
+        let event = std::iter::from_fn(|| rx.try_recv().ok())
+            .find(|value| {
+                value.get("message").and_then(|v| v.as_str()) == Some("channel_message_error")
+                    && value.pointer("/attributes/sender").and_then(|v| v.as_str())
+                        == Some("capacity-sender")
+            })
+            .expect("local capacity failure must emit a channel error event");
+        let attributes = &event["attributes"];
+        assert_eq!(attributes["error_kind"], "context_window_exceeded");
+        assert_eq!(attributes["provider_attempted"], false);
+        assert_eq!(attributes["model_context_window"], 64);
+        assert!(attributes["estimated_tokens"].as_u64().unwrap() > 64);
+        assert!(attributes.get("history_compacted").is_none());
+        assert!(attributes.get("error").is_none());
+        assert!(!event.to_string().contains("private-context-prompt"));
+    }
+
+    #[test]
     fn matrix_tool_argument_policy_keeps_safe_defaults_and_honors_explicit_opt_in() {
         use zeroclaw_config::schema::{
             StreamToolArgumentBase as Base, StreamToolArgumentEntry as Entry,
@@ -18932,8 +21228,41 @@ pub(crate) mod tests {
 
     #[test]
     fn matrix_safe_policy_fields_match_active_standard_tool_schemas() {
+        use zeroclaw_config::builtin_tools::EXTERNAL_TOOL_NAMES;
+        use zeroclaw_config::validation_warnings::TOOL_COMPILED_OUT;
+
         let temp = TempDir::new().expect("temporary workspace");
-        let config = Arc::new(Config::default());
+        let mut config = Config {
+            data_dir: temp.path().join("data"),
+            config_path: temp.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.tools.optional = vec!["*".into()];
+
+        // Config owns compile availability; channels has no tools-external feature of its own.
+        // Only named adapters are reported as compiled out, so probe with every one by name.
+        let mut probe = config.clone();
+        probe.tools.optional = EXTERNAL_TOOL_NAMES
+            .iter()
+            .map(|name| (*name).into())
+            .collect();
+        let compiled_out_external = probe
+            .collect_warnings()
+            .iter()
+            .filter(|warning| warning.code == TOOL_COMPILED_OUT && warning.path == "tools.optional")
+            .count();
+        assert!(
+            compiled_out_external == 0 || compiled_out_external == EXTERNAL_TOOL_NAMES.len(),
+            "naming every external adapter must report all of them or none as compiled out"
+        );
+        let mut expected_absent_required_tools: Vec<&str> = MATRIX_REQUIRED_SAFE_TOOL_ARGUMENTS
+            .iter()
+            .flat_map(|(tools, _)| tools.iter().copied())
+            .filter(|tool| compiled_out_external != 0 && EXTERNAL_TOOL_NAMES.contains(tool))
+            .collect();
+        expected_absent_required_tools.sort_unstable();
+
+        let config = Arc::new(config);
         let security = Arc::new(SecurityPolicy::default());
         let registry = tools::all_tools(
             Arc::clone(&config),
@@ -19002,10 +21331,61 @@ pub(crate) mod tests {
             checked_tools >= 20,
             "the standard registry unexpectedly exposed only {checked_tools} safe-policy tools"
         );
-        assert!(
-            absent_required_tools.is_empty(),
-            "required Matrix safe policy tools absent from the standard registry: {absent_required_tools:?}"
+        absent_required_tools.sort_unstable();
+        assert_eq!(
+            absent_required_tools, expected_absent_required_tools,
+            "required Matrix safe policy tool absences must exactly match this build's external adapters"
         );
+    }
+
+    #[test]
+    fn matrix_safe_policy_names_only_inventoried_tools() {
+        // First-party tools the built-in inventory deliberately leaves out that
+        // the Matrix safe policy still covers.
+        let outside_inventory = BTreeSet::from([
+            // Implemented, but the agent registry does not register them.
+            "sessions_reset",
+            "sessions_delete",
+            // Registered only by the opt-in background skill review.
+            "skills_list",
+            "skill_view",
+            "skill_manage",
+            // Peripheral tools, built by the hardware crate from configured boards.
+            "hardware_board_info",
+            "hardware_memory_map",
+            "hardware_memory_read",
+            // Withheld from the model-visible registry.
+            "vi_verify",
+        ]);
+        let policy_tools: BTreeSet<&str> = MATRIX_REQUIRED_SAFE_TOOL_ARGUMENTS
+            .iter()
+            .chain(MATRIX_OPTIONAL_SAFE_TOOL_ARGUMENTS)
+            .flat_map(|(tools, _)| tools.iter().copied())
+            .collect();
+
+        let uninventoried: Vec<&str> = policy_tools
+            .iter()
+            .copied()
+            .filter(|tool| {
+                !outside_inventory.contains(tool)
+                    && !zeroclaw_tools::inventory::is_builtin_tool_name(tool)
+            })
+            .collect();
+        assert!(
+            uninventoried.is_empty(),
+            "the Matrix safe policy names tools missing from the built-in inventory: {uninventoried:?}"
+        );
+
+        for tool in &outside_inventory {
+            assert!(
+                policy_tools.contains(tool),
+                "`{tool}` is no longer in the Matrix safe policy; drop it from this allowlist"
+            );
+            assert!(
+                !zeroclaw_tools::inventory::is_builtin_tool_name(tool),
+                "`{tool}` is now inventoried; drop it from this allowlist"
+            );
+        }
     }
 
     #[test]
@@ -19927,6 +22307,8 @@ temperature = 0.3
 
     struct CronChannelRegistryRestore(Option<CronChannelRegistry>);
 
+    static STARTUP_REGISTRY_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     impl Drop for CronChannelRegistryRestore {
         fn drop(&mut self) {
             *CRON_CHANNEL_REGISTRY
@@ -19937,6 +22319,7 @@ temperature = 0.3
 
     #[tokio::test]
     async fn ending_channel_task_clears_stale_delivery_handles() {
+        let _serial = STARTUP_REGISTRY_TEST_LOCK.lock().await;
         let previous = CRON_CHANNEL_REGISTRY
             .read()
             .unwrap_or_else(|e| e.into_inner())
@@ -19990,6 +22373,343 @@ temperature = 0.3
                 .contains("[channels.wecom_ws.removed] not configured"),
             "delivery must fall back to the current empty config: {err:#}"
         );
+    }
+
+    fn daemon_factory_agent(
+        bindings: &[&str],
+        enabled: bool,
+    ) -> zeroclaw_config::schema::AliasedAgentConfig {
+        zeroclaw_config::schema::AliasedAgentConfig {
+            enabled,
+            channels: bindings
+                .iter()
+                .map(|b| zeroclaw_config::providers::ChannelRef(b.to_string()))
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    fn daemon_factory_config(bindings: &[&str]) -> Config {
+        let mut config = Config::default();
+        config
+            .agents
+            .insert("sales".into(), daemon_factory_agent(bindings, true));
+        config
+    }
+
+    #[tokio::test]
+    async fn daemon_factory_resolves_the_running_instances_for_the_agent() {
+        let _serial = STARTUP_REGISTRY_TEST_LOCK.lock().await;
+        let previous = CRON_CHANNEL_REGISTRY
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let _restore = CronChannelRegistryRestore(previous);
+
+        let running = mock_channel("whatsapp");
+        let sibling = mock_channel("whatsapp");
+        let other = mock_channel("telegram");
+        let (_published, _lease) = publish_cron_channel_registry(&[
+            ConfiguredChannel {
+                display_name: "WhatsApp",
+                alias: Some("ventas".to_string()),
+                channel: Arc::clone(&running),
+            },
+            ConfiguredChannel {
+                display_name: "WhatsApp",
+                alias: Some("soporte".to_string()),
+                channel: Arc::clone(&sibling),
+            },
+            ConfiguredChannel {
+                display_name: "Telegram",
+                alias: Some("ops".to_string()),
+                channel: Arc::clone(&other),
+            },
+        ]);
+
+        let config = daemon_factory_config(&["whatsapp.ventas"]);
+        let map = live_channel_map_for_agent(&config, "sales");
+
+        assert!(
+            Arc::ptr_eq(map.get("whatsapp.ventas").unwrap(), &running),
+            "a daemon turn must get the instance the channel task is running"
+        );
+        assert!(
+            !map.contains_key("whatsapp.soporte"),
+            "an exact binding must not admit another alias of the same type"
+        );
+        // The bare key follows the agent's own bindings, so it stays
+        // unambiguous even though two WhatsApp aliases are running.
+        assert!(Arc::ptr_eq(map.get("whatsapp").unwrap(), &running));
+        assert!(
+            !map.contains_key("telegram.ops") && !map.contains_key("telegram"),
+            "channels the agent is not bound to stay out of its map"
+        );
+        assert!(live_channel_map_for_agent(&config, "unknown").is_empty());
+    }
+
+    #[tokio::test]
+    async fn daemon_factory_is_empty_until_a_channel_task_publishes() {
+        let _serial = STARTUP_REGISTRY_TEST_LOCK.lock().await;
+        let previous = CRON_CHANNEL_REGISTRY
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let _restore = CronChannelRegistryRestore(previous);
+        let config = daemon_factory_config(&["whatsapp.ventas"]);
+
+        prepare_live_channel_registry(true);
+        assert!(live_channel_map_for_agent(&config, "sales").is_empty());
+
+        let running = mock_channel("whatsapp");
+        let (_published, lease) = publish_cron_channel_registry(&[ConfiguredChannel {
+            display_name: "WhatsApp",
+            alias: Some("ventas".to_string()),
+            channel: Arc::clone(&running),
+        }]);
+        assert!(Arc::ptr_eq(
+            live_channel_map_for_agent(&config, "sales")
+                .get("whatsapp.ventas")
+                .unwrap(),
+            &running
+        ));
+
+        drop(lease);
+        assert!(
+            live_channel_map_for_agent(&config, "sales").is_empty(),
+            "a retired channel task must not stay reachable from daemon turns"
+        );
+    }
+
+    #[tokio::test]
+    async fn daemon_factory_applies_type_bindings_singleton_keys_and_fallbacks() {
+        let _serial = STARTUP_REGISTRY_TEST_LOCK.lock().await;
+        let previous = CRON_CHANNEL_REGISTRY
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let _restore = CronChannelRegistryRestore(previous);
+
+        let ops = mock_channel("telegram");
+        let alerts = mock_channel("telegram");
+        let ventas = mock_channel("whatsapp");
+        let (_published, _lease) = publish_cron_channel_registry(&[
+            ConfiguredChannel {
+                display_name: "Telegram",
+                alias: Some("ops".to_string()),
+                channel: Arc::clone(&ops),
+            },
+            ConfiguredChannel {
+                display_name: "Telegram",
+                alias: Some("alerts".to_string()),
+                channel: Arc::clone(&alerts),
+            },
+            ConfiguredChannel {
+                display_name: "WhatsApp",
+                alias: Some("ventas".to_string()),
+                channel: Arc::clone(&ventas),
+            },
+        ]);
+
+        let mut config = Config::default();
+        config
+            .agents
+            .insert("typed".into(), daemon_factory_agent(&["telegram"], true));
+        config.agents.insert(
+            "disabled".into(),
+            daemon_factory_agent(&["whatsapp.ventas"], false),
+        );
+
+        // A type-only binding takes every alias of that type, and two aliases
+        // leave no unambiguous bare key.
+        let map = live_channel_map_for_agent(&config, "typed");
+        assert!(Arc::ptr_eq(map.get("telegram.ops").unwrap(), &ops));
+        assert!(Arc::ptr_eq(map.get("telegram.alerts").unwrap(), &alerts));
+        assert!(
+            !map.contains_key("telegram"),
+            "a bare key would be ambiguous between two aliases"
+        );
+        assert!(!map.contains_key("whatsapp.ventas") && !map.contains_key("whatsapp"));
+
+        assert!(
+            live_channel_map_for_agent(&config, "disabled").is_empty(),
+            "a disabled agent gets no channels"
+        );
+
+        // When no agent binds any channel, an enabled agent sees all of them.
+        let mut unbound = Config::default();
+        unbound
+            .agents
+            .insert("any".into(), daemon_factory_agent(&[], true));
+        let mut keys: Vec<String> = live_channel_map_for_agent(&unbound, "any")
+            .into_keys()
+            .collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            [
+                "telegram.alerts",
+                "telegram.ops",
+                "whatsapp",
+                "whatsapp.ventas"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_rejects_retired_publication_and_starts_no_listeners_on_setup_failure() {
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, CustomModelProviderConfig, ModelProviderConfig,
+        };
+        use zeroclaw_runtime::LiveConfigAuthority;
+
+        let _serial = STARTUP_REGISTRY_TEST_LOCK.lock().await;
+        let previous = CRON_CHANNEL_REGISTRY.read().unwrap().clone();
+        let _restore = CronChannelRegistryRestore(previous);
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = Config {
+            config_path: temp.path().join("config.toml"),
+            data_dir: temp.path().join("data"),
+            ..Config::default()
+        };
+        config.memory.backend = "none".into();
+        config.channels.session_persistence = false;
+        config.providers.models.custom.insert(
+            "startup".into(),
+            CustomModelProviderConfig {
+                base: ModelProviderConfig {
+                    uri: Some("http://127.0.0.1:1/v1".into()),
+                    model: Some("startup-model".into()),
+                    ..Default::default()
+                },
+            },
+        );
+        config
+            .risk_profiles
+            .insert("default".into(), Default::default());
+        config
+            .runtime_profiles
+            .insert("default".into(), Default::default());
+        config.agents.insert(
+            "first".into(),
+            AliasedAgentConfig {
+                enabled: true,
+                model_provider: "custom.startup".into(),
+                risk_profile: "default".into(),
+                runtime_profile: "default".into(),
+                ..Default::default()
+            },
+        );
+
+        // Exercise preparation cancellation, cancellation at the writer wait,
+        // a later agent's failure, and a clean retry through the same entrypoint.
+        for scenario in ["preparing", "writer-wait", "later-agent-failure", "retry"] {
+            prepare_live_channel_registry(true);
+            let mut attempt_config = config.clone();
+            if scenario == "later-agent-failure" {
+                let mut invalid = attempt_config.agents["first"].clone();
+                invalid.model_provider = "custom.missing".into();
+                attempt_config.agents.insert("second".into(), invalid);
+            }
+            let authority = LiveConfigAuthority::new(attempt_config);
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let probe = Arc::new(ChannelStartupProbe {
+                channel: Arc::new(BlockUntilClosedChannel {
+                    name: "startup-probe".into(),
+                    calls: Arc::clone(&calls),
+                }),
+                prepared: tokio::sync::Notify::new(),
+                release: tokio::sync::Notify::new(),
+                publishing: tokio::sync::Notify::new(),
+            });
+            let scoped_probe = Arc::clone(&probe);
+            let startup_authority = authority.clone();
+            let startup_cancel = cancel.clone();
+            let mut task = zeroclaw_spawn::spawn!(async move {
+                CHANNEL_STARTUP_PROBE
+                    .scope(
+                        scoped_probe,
+                        Box::pin(start_channels_with_authority(
+                            startup_authority,
+                            None,
+                            startup_cancel,
+                            None,
+                            None,
+                            None,
+                        )),
+                    )
+                    .await
+            });
+            tokio::time::timeout(Duration::from_secs(15), async {
+                tokio::select! {
+                    () = probe.prepared.notified() => {}
+                    result = &mut task => panic!("{scenario}: startup ended before preparation: {result:?}"),
+                }
+            })
+                .await
+                .unwrap();
+            assert!(
+                live_channel_map().is_empty(),
+                "{scenario}: registry visible during preparation"
+            );
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                0,
+                "{scenario}: listener started during preparation"
+            );
+            if scenario == "preparing" || scenario == "writer-wait" {
+                let lock = zeroclaw_config::write_lock::shared_config_write_lock();
+                let guard = lock.lock().await;
+                if scenario == "writer-wait" {
+                    probe.release.notify_one();
+                    tokio::time::timeout(Duration::from_secs(5), probe.publishing.notified())
+                        .await
+                        .unwrap();
+                }
+                // The production retire path clears then cancels while holding
+                // the writer; drain must complete before that guard is released.
+                prepare_live_channel_registry(true);
+                cancel.cancel();
+                probe.release.notify_one();
+                tokio::time::timeout(Duration::from_secs(5), task)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+                assert!(live_channel_map().is_empty());
+                assert_eq!(calls.load(Ordering::SeqCst), 0);
+                drop(guard);
+            } else if scenario == "later-agent-failure" {
+                probe.release.notify_one();
+                let error = tokio::time::timeout(Duration::from_secs(5), task)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap_err();
+                assert!(format!("{error:#}").contains("second"));
+                assert!(live_channel_map().is_empty());
+                assert_eq!(calls.load(Ordering::SeqCst), 0);
+            } else {
+                probe.release.notify_one();
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while calls.load(Ordering::SeqCst) == 0 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                assert_eq!(calls.load(Ordering::SeqCst), 1);
+                assert!(live_channel_map().contains_key("startup-probe.startup-probe"));
+                cancel.cancel();
+                tokio::time::timeout(Duration::from_secs(5), task)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+                assert!(live_channel_map().is_empty());
+            }
+        }
     }
 
     #[test]
@@ -20168,6 +22888,10 @@ temperature = 0.3
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
+            live_config: zeroclaw_config::live::LiveConfig::new(
+                zeroclaw_config::schema::Config::default(),
+            )
+            .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             autonomy_level: AutonomyLevel::default(),
@@ -20195,6 +22919,8 @@ temperature = 0.3
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
+            sop_driver_sink: None,
         })
     }
 
@@ -20268,6 +22994,7 @@ temperature = 0.3
         let single_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::clone(&single_registry),
             session_store: Some(Arc::clone(&single_store)),
+            security: Arc::new(SecurityPolicy::default()),
             ..(*router_test_ctx()).clone()
         });
 
@@ -20337,12 +23064,14 @@ temperature = 0.3
             channels_by_name: Arc::clone(&multi_registry),
             agent_alias: Arc::new("alpha-agent".to_string()),
             session_store: Some(Arc::clone(&multi_store)),
+            security: Arc::new(SecurityPolicy::default()),
             ..(*router_test_ctx()).clone()
         });
         let beta_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::clone(&multi_registry),
             agent_alias: Arc::new("beta-agent".to_string()),
             session_store: Some(Arc::clone(&multi_store)),
+            security: Arc::new(SecurityPolicy::default()),
             ..(*router_test_ctx()).clone()
         });
         let mut config = Config::default();
@@ -20372,6 +23101,7 @@ temperature = 0.3
                 ("beta-agent".to_string(), Arc::clone(&beta_ctx)),
             ]),
             owners,
+            None,
             None,
             None,
         );
@@ -20456,6 +23186,7 @@ temperature = 0.3
             memory: memory_for_ctx,
             auto_save_memory: true,
             ack_reactions: false,
+            security: Arc::new(SecurityPolicy::default()),
             ..(*router_test_ctx()).clone()
         });
 
@@ -20477,6 +23208,7 @@ temperature = 0.3
         let router = AgentRouter::multi(
             HashMap::from([("shared-agent".to_string(), Arc::clone(&shared_ctx))]),
             owners,
+            None,
             None,
             None,
         );
@@ -20548,6 +23280,7 @@ temperature = 0.3
             Arc::new(SqliteSessionBackend::new(tmp.path()).unwrap());
         let ctx = ChannelRuntimeContext {
             session_store: Some(Arc::clone(&session_store)),
+            security: Arc::new(SecurityPolicy::default()),
             ..(*router_test_ctx()).clone()
         };
         let cases = [
@@ -20664,7 +23397,10 @@ temperature = 0.3
 
         let base_ctx = (*router_test_ctx()).clone();
         let ctx = Arc::new(ChannelRuntimeContext {
-            prompt_config: Arc::new(cfg),
+            sop_driver_sink: None,
+            prompt_config: Arc::new(cfg.clone()),
+            live_config: zeroclaw_config::live::LiveConfig::new(cfg).handle(),
+            security: Arc::new(SecurityPolicy::default()),
             ..base_ctx
         });
 
@@ -20694,7 +23430,7 @@ temperature = 0.3
         let mut owners: HashMap<String, String> = HashMap::new();
         owners.insert("discord.clamps".to_string(), "clamps".to_string());
         owners.insert("discord.glados".to_string(), "glados".to_string());
-        let router = AgentRouter::multi(by_agent, owners, None, None);
+        let router = AgentRouter::multi(by_agent, owners, None, None, None);
 
         let msg_clamps = channel_message("discord", Some("clamps"));
         let msg_glados = channel_message("discord", Some("glados"));
@@ -20717,7 +23453,7 @@ temperature = 0.3
         by_agent.insert("agent_a".to_string(), Arc::clone(&agent_a_ctx));
         let mut owners: HashMap<String, String> = HashMap::new();
         owners.insert("discord.bot_a".to_string(), "agent_a".to_string());
-        let router = AgentRouter::multi(by_agent, owners, None, None);
+        let router = AgentRouter::multi(by_agent, owners, None, None, None);
 
         let cli_msg = channel_message("cli", None);
         assert!(router.resolve(&cli_msg).is_none(), "cli has no owner");
@@ -20730,7 +23466,7 @@ temperature = 0.3
         by_agent.insert("ops".to_string(), Arc::clone(&notion_agent_ctx));
         let mut owners: HashMap<String, String> = HashMap::new();
         owners.insert("notion".to_string(), "ops".to_string());
-        let router = AgentRouter::multi(by_agent, owners, None, None);
+        let router = AgentRouter::multi(by_agent, owners, None, None, None);
 
         let msg = channel_message("notion", None);
         let resolved = router.resolve(&msg).expect("notion resolves");
@@ -20756,7 +23492,7 @@ temperature = 0.3
         let legacy_ctx = router_test_ctx();
         let mut by_agent: HashMap<String, Arc<ChannelRuntimeContext>> = HashMap::new();
         by_agent.insert("legacy".to_string(), Arc::clone(&legacy_ctx));
-        let router = AgentRouter::multi(by_agent, owners, None, None);
+        let router = AgentRouter::multi(by_agent, owners, None, None, None);
 
         let msg = channel_message("mattermost", Some("default"));
         let resolved = router.resolve(&msg).expect("fallback owner resolves");
@@ -21132,6 +23868,10 @@ temperature = 0.3
             },
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
+            live_config: zeroclaw_config::live::LiveConfig::new(
+                zeroclaw_config::schema::Config::default(),
+            )
+            .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             autonomy_level: AutonomyLevel::default(),
@@ -21159,6 +23899,8 @@ temperature = 0.3
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
+            sop_driver_sink: None,
         }
     }
 
@@ -21217,7 +23959,7 @@ temperature = 0.3
         tokio::fs::write(
             &config_path,
             r#"
-schema_version = 3
+schema_version = 4
 
 [agents.agent_a]
 model_provider = "openrouter.hot"
@@ -21610,6 +24352,10 @@ api_key = "anthropic-key"
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
+            live_config: zeroclaw_config::live::LiveConfig::new(
+                zeroclaw_config::schema::Config::default(),
+            )
+            .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             autonomy_level: AutonomyLevel::default(),
@@ -21637,6 +24383,8 @@ api_key = "anthropic-key"
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
+            sop_driver_sink: None,
         };
 
         assert!(compact_sender_history(&ctx, &sender));
@@ -21713,6 +24461,10 @@ api_key = "anthropic-key"
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
+            live_config: zeroclaw_config::live::LiveConfig::new(
+                zeroclaw_config::schema::Config::default(),
+            )
+            .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             autonomy_level: AutonomyLevel::default(),
@@ -21740,6 +24492,8 @@ api_key = "anthropic-key"
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
+            sop_driver_sink: None,
         };
 
         append_sender_turn(&ctx, &sender, ChatMessage::user("hello"));
@@ -21834,6 +24588,10 @@ api_key = "anthropic-key"
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
+            live_config: zeroclaw_config::live::LiveConfig::new(
+                zeroclaw_config::schema::Config::default(),
+            )
+            .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             autonomy_level: AutonomyLevel::default(),
@@ -21861,6 +24619,8 @@ api_key = "anthropic-key"
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
+            sop_driver_sink: None,
         };
 
         assert!(rollback_orphan_user_turn(&ctx, &sender, "pending"));
@@ -21959,6 +24719,10 @@ api_key = "anthropic-key"
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
+            live_config: zeroclaw_config::live::LiveConfig::new(
+                zeroclaw_config::schema::Config::default(),
+            )
+            .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             autonomy_level: AutonomyLevel::default(),
@@ -21986,6 +24750,8 @@ api_key = "anthropic-key"
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
+            sop_driver_sink: None,
         };
 
         assert!(rollback_orphan_user_turn(
@@ -22970,7 +25736,7 @@ api_key = "anthropic-key"
     fn email_wire(message: &SendMessage) -> String {
         let channel = EmailChannel::new(
             crate::email_channel::EmailConfig {
-                from_address: "bot@example.invalid".to_string(),
+                from_address: Some("bot@example.invalid".to_string()),
                 ..crate::email_channel::EmailConfig::default()
             },
             "test",
@@ -23034,6 +25800,20 @@ api_key = "anthropic-key"
         /// what the transport actually received rather than on a sanitizer it
         /// called itself. Progress text lands in `progress_messages`.
         draft_updates: tokio::sync::Mutex<Vec<String>>,
+        /// When set, `update_draft`/`finalize_draft` faithfully model the real
+        /// Discord/Matrix MultiMessage confirmed-prefix bookkeeping: each
+        /// `\n\n`-bounded paragraph is emitted as its own message, a frame that
+        /// no longer starts with the confirmed bytes is remapped through
+        /// [`remap_confirmed_offset`], and the final flush sends
+        /// `text[sent_so_far..]`. This lets a test exercise the exact
+        /// coordinate arithmetic under test rather than a simplified stand-in.
+        cumulative_offset: bool,
+        /// Exact confirmed frame prefix already emitted as paragraphs,
+        /// mirroring the adapters' `multi_message_confirmed_prefix`.
+        multi_confirmed_prefix: std::sync::Mutex<String>,
+        /// Paragraphs actually emitted to the room/channel, in order, including
+        /// the final flush — the messages a user would really receive.
+        emitted_paragraphs: tokio::sync::Mutex<Vec<String>>,
         /// Text handed to `flush_draft_turn`, i.e. every permanent multi-message
         /// narration turn the channel was asked to publish. A test can assert on
         /// what actually crossed the permanent send boundary.
@@ -23072,9 +25852,25 @@ api_key = "anthropic-key"
                 stall_start_typing: false,
                 stall_stop_typing: false,
                 draft_updates: tokio::sync::Mutex::new(Vec::new()),
+                cumulative_offset: false,
+                multi_confirmed_prefix: std::sync::Mutex::new(String::new()),
+                emitted_paragraphs: tokio::sync::Mutex::new(Vec::new()),
                 flushed_turns: tokio::sync::Mutex::new(Vec::new()),
                 turn_flush_capable: false,
                 discarded_turns: tokio::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        /// A MultiMessage channel that models the real adapters' cumulative
+        /// byte-offset paragraph delivery and final flush (see
+        /// [`Self::cumulative_offset`]). `name` selects the adapter identity
+        /// (`"discord"` or `"matrix"`); both share the same offset algorithm.
+        fn multi_message_cumulative(channel_name: &'static str) -> Self {
+            Self {
+                channel_name,
+                supports_multi_message_streaming: true,
+                cumulative_offset: true,
+                ..Self::new(false, false)
             }
         }
 
@@ -23538,6 +26334,17 @@ api_key = "anthropic-key"
             self.supports_multi_message_streaming
         }
 
+        async fn multi_message_confirmed_offset(
+            &self,
+            _recipient: &str,
+            _message_id: &str,
+        ) -> usize {
+            self.multi_confirmed_prefix
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .len()
+        }
+
         async fn update_draft(
             &self,
             _recipient: &str,
@@ -23545,6 +26352,64 @@ api_key = "anthropic-key"
             text: &str,
         ) -> anyhow::Result<()> {
             self.draft_updates.lock().await.push(text.to_string());
+            if self.cumulative_offset && self.supports_multi_message_streaming {
+                // Mirror the Discord/Matrix MultiMessage `update_draft`: emit
+                // every complete `\n\n`-bounded paragraph (fence-aware) from the
+                // cumulative visible text and advance the confirmed prefix
+                // exactly as the real adapters do.
+                let mut emitted = self.emitted_paragraphs.lock().await;
+                let mut confirmed = self
+                    .multi_confirmed_prefix
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                if !text.as_bytes().starts_with(confirmed.as_bytes()) {
+                    // The frame was rewritten before the confirmed offset (a
+                    // sanitizer rewrite or a Clear restart); remap onto the new
+                    // frame exactly as the real adapters do instead of slicing
+                    // at a stale coordinate.
+                    let remapped = remap_confirmed_offset(&confirmed, text);
+                    *confirmed = text[..remapped].to_string();
+                }
+                loop {
+                    let sent = confirmed.len();
+                    if text.len() <= sent {
+                        break;
+                    }
+                    let new_text = &text[sent..];
+                    let bytes = new_text.as_bytes();
+                    let mut scan_pos = 0;
+                    let mut in_fence = false;
+                    let mut found = false;
+                    while scan_pos < bytes.len() {
+                        let ch = bytes[scan_pos];
+                        if ch == b'`'
+                            && scan_pos + 2 < bytes.len()
+                            && bytes[scan_pos + 1] == b'`'
+                            && bytes[scan_pos + 2] == b'`'
+                            && (scan_pos == 0 || bytes[scan_pos - 1] == b'\n')
+                        {
+                            in_fence = !in_fence;
+                        }
+                        if !in_fence
+                            && ch == b'\n'
+                            && scan_pos + 1 < bytes.len()
+                            && bytes[scan_pos + 1] == b'\n'
+                        {
+                            let paragraph = new_text[..scan_pos].trim().to_string();
+                            *confirmed = text[..sent + scan_pos + 2].to_string();
+                            if !paragraph.is_empty() {
+                                emitted.push(paragraph);
+                            }
+                            found = true;
+                            break;
+                        }
+                        scan_pos += 1;
+                    }
+                    if !found {
+                        break;
+                    }
+                }
+            }
             Ok(())
         }
 
@@ -23587,6 +26452,27 @@ api_key = "anthropic-key"
                 .lock()
                 .await
                 .push(format!("{recipient}:{message_id}:{text}"));
+            if self.cumulative_offset && self.supports_multi_message_streaming {
+                // Mirror the Discord/Matrix MultiMessage `finalize_draft`:
+                // flush `text[sent_so_far..]` as the final message when
+                // non-empty, remapping a divergent frame first.
+                let confirmed = self
+                    .multi_confirmed_prefix
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
+                let sent = if text.as_bytes().starts_with(confirmed.as_bytes()) {
+                    confirmed.len()
+                } else {
+                    remap_confirmed_offset(&confirmed, text)
+                };
+                if text.len() > sent {
+                    let remaining = text[sent..].trim().to_string();
+                    if !remaining.is_empty() {
+                        self.emitted_paragraphs.lock().await.push(remaining);
+                    }
+                }
+            }
             Ok(())
         }
 
@@ -23857,7 +26743,8 @@ api_key = "anthropic-key"
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
-            prompt_config: Arc::new(prompt_config),
+            prompt_config: Arc::new(prompt_config.clone()),
+            live_config: zeroclaw_config::live::LiveConfig::new(prompt_config).handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message,
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
@@ -23889,6 +26776,8 @@ api_key = "anthropic-key"
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
+            sop_driver_sink: None,
         })
     }
 
@@ -23961,7 +26850,8 @@ api_key = "anthropic-key"
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
-            prompt_config: Arc::new(prompt_config),
+            prompt_config: Arc::new(prompt_config.clone()),
+            live_config: zeroclaw_config::live::LiveConfig::new(prompt_config).handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message,
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
@@ -23995,6 +26885,8 @@ api_key = "anthropic-key"
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
+            sop_driver_sink: None,
         })
     }
 
@@ -24223,6 +27115,288 @@ api_key = "anthropic-key"
             events.contains(&zeroclaw_runtime::agent::loop_::ProgressEvent::WaitingOnModel),
             "the failure happened at the provider, so the model wait must have been shown: {events:?}"
         );
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum DeliveryLogOutcome {
+        Delivered,
+        Denied,
+        Partial,
+        Undelivered,
+    }
+
+    struct DeliveryLogChannel {
+        outcome: DeliveryLogOutcome,
+        draft: bool,
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+        calls: AtomicUsize,
+    }
+
+    impl DeliveryLogChannel {
+        async fn complete_delivery(&self) -> anyhow::Result<()> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.entered.notify_one();
+            self.release.notified().await;
+            match self.outcome {
+                DeliveryLogOutcome::Delivered => Ok(()),
+                DeliveryLogOutcome::Denied => anyhow::bail!("HTTP 403: Missing Permissions"),
+                DeliveryLogOutcome::Partial => {
+                    Err(zeroclaw_api::channel::FinalizePartialDelivery { delivered: 1 }.into())
+                }
+                DeliveryLogOutcome::Undelivered => {
+                    Err(zeroclaw_api::channel::FinalizeUndelivered {
+                        reason: "synthetic flood limit".to_string(),
+                    }
+                    .into())
+                }
+            }
+        }
+    }
+
+    impl zeroclaw_api::attribution::Attributable for DeliveryLogChannel {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Channel(
+                zeroclaw_api::attribution::ChannelKind::Webhook,
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "delivery-log"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Channel for DeliveryLogChannel {
+        fn name(&self) -> &str {
+            "test-channel"
+        }
+
+        async fn send(&self, _message: &SendMessage) -> anyhow::Result<()> {
+            self.complete_delivery().await
+        }
+
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn supports_draft_updates(&self) -> bool {
+            self.draft
+        }
+
+        async fn send_draft(&self, _message: &SendMessage) -> anyhow::Result<Option<String>> {
+            Ok(Some("delivery-log-draft".to_string()))
+        }
+
+        async fn finalize_draft(
+            &self,
+            _recipient: &str,
+            _message_id: &str,
+            _text: &str,
+            _suppress_voice: bool,
+        ) -> anyhow::Result<()> {
+            self.complete_delivery().await
+        }
+    }
+
+    fn drain_delivery_log_events(
+        rx: &mut tokio::sync::broadcast::Receiver<serde_json::Value>,
+        message_id: &str,
+    ) -> Vec<serde_json::Value> {
+        let mut events = Vec::new();
+        loop {
+            match rx.try_recv() {
+                Ok(event) => {
+                    if event
+                        .pointer("/attributes/message_id")
+                        .and_then(|v| v.as_str())
+                        == Some(message_id)
+                    {
+                        events.push(event);
+                    }
+                }
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
+                Err(error) => panic!("delivery log capture lost evidence: {error}"),
+            }
+        }
+        events
+    }
+
+    fn is_reply_success_log(event: &serde_json::Value) -> bool {
+        matches!(
+            event["message"].as_str(),
+            Some("reply delivered" | "channel_message_outbound")
+        ) && event.pointer("/event/outcome").and_then(|v| v.as_str()) == Some("success")
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn process_channel_message_delivery_logs_wait_for_confirmed_delivery() {
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut rx = zeroclaw_log::subscribe_or_install();
+
+        for (index, (outcome, draft)) in [
+            (DeliveryLogOutcome::Denied, false),
+            (DeliveryLogOutcome::Delivered, false),
+            (DeliveryLogOutcome::Delivered, true),
+            (DeliveryLogOutcome::Partial, true),
+            (DeliveryLogOutcome::Partial, false),
+            (DeliveryLogOutcome::Undelivered, true),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let channel = Arc::new(DeliveryLogChannel {
+                outcome,
+                draft,
+                entered: tokio::sync::Notify::new(),
+                release: tokio::sync::Notify::new(),
+                calls: AtomicUsize::new(0),
+            });
+            let (hook_events, hook_runner) = recording_message_sent_runner();
+            let ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+                channel.clone(),
+                Arc::new(DummyModelProvider),
+                Config::default(),
+                zeroclaw_config::schema::AliasedAgentConfig::default(),
+                "test-provider",
+                Some(hook_runner),
+            );
+            let mut msg = message_sent_hook_test_message();
+            msg.id = format!("delivery-log-{index}");
+            msg.sender = "test_user".to_string();
+            let message_id = msg.id.clone();
+            let turn = tokio::time::timeout(
+                Duration::from_secs(5),
+                process_channel_message(ctx, msg, CancellationToken::new()),
+            );
+            tokio::pin!(turn);
+            tokio::select! {
+                () = channel.entered.notified() => {}
+                result = &mut turn => panic!("turn ended before delivery started: {result:?}"),
+            }
+
+            let before = drain_delivery_log_events(&mut rx, &message_id);
+            assert!(
+                before
+                    .iter()
+                    .any(|event| event["message"] == "channel inbound message")
+            );
+            assert!(
+                !before.iter().any(is_reply_success_log),
+                "pending delivery must not be logged as successful: {before:?}"
+            );
+            channel.release.notify_one();
+            turn.await.expect("delivery should complete after release");
+
+            let after = drain_delivery_log_events(&mut rx, &message_id);
+            let successes = after
+                .iter()
+                .filter(|event| is_reply_success_log(event))
+                .count();
+            assert_eq!(
+                successes,
+                if matches!(outcome, DeliveryLogOutcome::Delivered) {
+                    2
+                } else {
+                    0
+                },
+                "incorrect success records for {outcome:?}: {after:?}"
+            );
+            let expected_terminal = match (outcome, draft) {
+                (DeliveryLogOutcome::Delivered, _) => "reply delivered",
+                (DeliveryLogOutcome::Denied, _) | (DeliveryLogOutcome::Partial, false) => {
+                    "failed to reply"
+                }
+                (DeliveryLogOutcome::Partial, true) => {
+                    "Final answer partially delivered; not resending to avoid duplicating the accepted prefix"
+                }
+                (DeliveryLogOutcome::Undelivered, _) => "Final answer not delivered; not resending",
+            };
+            assert!(
+                after
+                    .iter()
+                    .any(|event| event["message"] == expected_terminal)
+            );
+            assert_eq!(channel.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                hook_events.lock().await.len(),
+                usize::from(
+                    matches!(outcome, DeliveryLogOutcome::Delivered)
+                        || (draft && matches!(outcome, DeliveryLogOutcome::Partial))
+                ),
+                "delivery logging must preserve the existing message-sent hook contract"
+            );
+        }
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn process_channel_message_delivery_logs_cover_fallback_and_suppressed_delivery() {
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut rx = zeroclaw_log::subscribe_or_install();
+
+        for (index, (fallback_fails, has_destination, no_reply)) in [
+            (false, true, false),
+            (true, true, false),
+            (false, false, false),
+            (false, true, true),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let channel = Arc::new(DraftRecordingChannel::new(true, fallback_fails));
+            let provider: Arc<dyn ModelProvider> = if no_reply {
+                Arc::new(NoReplyModelProvider)
+            } else {
+                Arc::new(DummyModelProvider)
+            };
+            let mut ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+                channel.clone(),
+                provider,
+                Config::default(),
+                zeroclaw_config::schema::AliasedAgentConfig::default(),
+                "test-provider",
+                None,
+            );
+            if !has_destination {
+                Arc::get_mut(&mut ctx).unwrap().channels_by_name = Arc::new(HashMap::new());
+            }
+            let mut msg = message_sent_hook_test_message();
+            msg.id = format!("delivery-log-fallback-{index}");
+            msg.sender = "test_user".to_string();
+            let message_id = msg.id.clone();
+            process_channel_message(ctx, msg, CancellationToken::new()).await;
+            let events = drain_delivery_log_events(&mut rx, &message_id);
+            assert!(
+                events
+                    .iter()
+                    .any(|event| event["message"] == "channel inbound message")
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| is_reply_success_log(event))
+                    .count(),
+                if has_destination && !fallback_fails && !no_reply {
+                    2
+                } else {
+                    0
+                },
+                "success must describe the fallback's actual delivery: {events:?}"
+            );
+            assert_eq!(
+                channel.final_send_calls.load(Ordering::SeqCst),
+                usize::from(has_destination && !no_reply)
+            );
+        }
     }
 
     #[tokio::test]
@@ -25511,6 +28685,136 @@ BTC is currently around $65,000 based on latest tool output."#
         }
     }
 
+    #[test]
+    fn process_channel_message_model_fallback_notices_are_live_and_delivery_only() {
+        run_channel_dispatch_test(|| async {
+            use zeroclaw_config::schema::ModelFallbackNotice::{Detailed, Off, Redacted};
+
+            #[derive(Default)]
+            struct PinnedFallbackProvider {
+                calls: std::sync::Mutex<Vec<Vec<ChatMessage>>>,
+            }
+
+            #[async_trait::async_trait]
+            impl ModelProvider for PinnedFallbackProvider {
+                async fn chat_with_system(
+                    &self,
+                    _system_prompt: Option<&str>,
+                    _message: &str,
+                    model: &str,
+                    _temperature: Option<f64>,
+                ) -> anyhow::Result<String> {
+                    if model == "model-a" {
+                        anyhow::bail!("primary model unavailable");
+                    }
+                    Ok("accepted answer".into())
+                }
+
+                async fn chat_with_history(
+                    &self,
+                    messages: &[ChatMessage],
+                    model: &str,
+                    temperature: Option<f64>,
+                ) -> anyhow::Result<String> {
+                    self.calls.lock().unwrap().push(messages.to_vec());
+                    self.chat_with_system(None, "", model, temperature).await
+                }
+            }
+            impl zeroclaw_api::attribution::Attributable for PinnedFallbackProvider {
+                fn role(&self) -> zeroclaw_api::attribution::Role {
+                    zeroclaw_api::attribution::Role::Provider(
+                        zeroclaw_api::attribution::ProviderKind::Model(
+                            zeroclaw_api::attribution::ModelProviderKind::Custom,
+                        ),
+                    )
+                }
+
+                fn alias(&self) -> &str {
+                    "notice"
+                }
+            }
+
+            let inner = Arc::new(PinnedFallbackProvider::default());
+            let reliable = zeroclaw_providers::reliable::ReliableModelProvider::new_pinned_for_test(
+                "custom.notice",
+                vec![
+                    ("custom.notice", "notice", "model-a", inner.clone()),
+                    ("custom.notice", "notice", "model-b", inner.clone()),
+                ],
+                0,
+                1,
+            );
+            let temp = tempfile::tempdir().unwrap();
+            let backend: Arc<dyn SessionBackend> =
+                Arc::new(zeroclaw_infra::session_store::SessionStore::new(temp.path()).unwrap());
+            let channel = Arc::new(RecordingChannel::default());
+            let mut ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+                channel.clone(),
+                Arc::new(reliable),
+                Config::default(),
+                Default::default(),
+                "custom.notice",
+                None,
+            );
+            Arc::make_mut(&mut ctx).session_store = Some(backend.clone());
+            Arc::make_mut(&mut ctx).workspace_dir = Arc::new(temp.path().to_path_buf());
+            Arc::make_mut(&mut ctx).model = Arc::new("model-a".into());
+            let live_config = zeroclaw_config::live::LiveConfig::new(ctx.live_config.snapshot());
+            Arc::make_mut(&mut ctx).live_config = live_config.handle();
+            for (index, mode) in [Off, Redacted, Detailed, Off].into_iter().enumerate() {
+                if index != 0 {
+                    let mut config = live_config.snapshot();
+                    config.channels.model_fallback_notice = mode;
+                    let revision = live_config.next_revision().unwrap();
+                    live_config.publish(revision, config).unwrap();
+                }
+                let msg = ChannelMessage {
+                    id: format!("notice-{index}"),
+                    sender: "test-sender".into(),
+                    reply_target: "test-room".into(),
+                    content: "hello".into(),
+                    channel: "test-channel".into(),
+                    explicitly_addressed: true,
+                    ..Default::default()
+                };
+                let history_key = runtime_conversation_history_key(ctx.as_ref(), &msg);
+                process_channel_message(ctx.clone(), msg, CancellationToken::new()).await;
+                let delivered = channel.sent_messages.lock().await.last().unwrap().clone();
+                match mode {
+                    Off => assert_eq!(delivered, "test-room:accepted answer"),
+                    Redacted => {
+                        assert!(delivered.contains("fallback model"));
+                        for identifier in ["custom.notice", "model-a", "model-b"] {
+                            assert!(!delivered.contains(identifier));
+                        }
+                    }
+                    Detailed => {
+                        assert!(delivered.contains("model-a"));
+                        assert!(delivered.contains("model-b"));
+                        assert_eq!(delivered.matches("---").count(), 1);
+                    }
+                }
+                let stored = backend.load(&history_key);
+                let assistant: Vec<_> = stored.iter().filter(|m| m.role == "assistant").collect();
+                assert_eq!(assistant.len(), index + 1);
+                assert!(assistant.iter().all(|m| m.content == "accepted answer"));
+            }
+            let calls = inner.calls.lock().unwrap();
+            assert!(
+                calls
+                    .iter()
+                    .any(|call| call.iter().any(|m| m.role == "assistant"))
+            );
+            assert!(
+                calls
+                    .iter()
+                    .flatten()
+                    .filter(|m| m.role == "assistant")
+                    .all(|m| m.content == "accepted answer")
+            );
+        });
+    }
+
     #[derive(Default)]
     struct HistoryCaptureModelProvider {
         calls: std::sync::Mutex<Vec<Vec<(String, String)>>>,
@@ -25684,6 +28988,7 @@ BTC is currently around $65,000 based on latest tool output."#
             admission_policy: SopAdmissionPolicy::Parallel,
             max_pending_approvals: 0,
             agent: None,
+            decision: None,
         };
         let mut engine =
             zeroclaw_runtime::sop::SopEngine::new(zeroclaw_config::schema::SopConfig::default());
@@ -25705,6 +29010,7 @@ BTC is currently around $65,000 based on latest tool output."#
             sop_audit: Some(Arc::new(zeroclaw_runtime::sop::SopAuditLogger::new(
                 Arc::new(NoopMemory),
             ))),
+            security: Arc::new(SecurityPolicy::default()),
             ..(*base).clone()
         });
 
@@ -25820,6 +29126,8 @@ BTC is currently around $65,000 based on latest tool output."#
     struct ModelCaptureModelProvider {
         call_count: AtomicUsize,
         models: std::sync::Mutex<Vec<String>>,
+        attempt_allowlists: std::sync::Mutex<Vec<(bool, bool)>>,
+        supports_vision: bool,
     }
 
     #[async_trait::async_trait]
@@ -25845,7 +29153,18 @@ BTC is currently around $65,000 based on latest tool output."#
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .push(model.to_string());
+            self.attempt_allowlists
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push((
+                    zeroclaw_providers::reliable::provider_ref_allowed_for_turn("custom.local"),
+                    zeroclaw_providers::reliable::provider_ref_allowed_for_turn("custom.cloud"),
+                ));
             Ok("ok".to_string())
+        }
+
+        fn supports_vision(&self) -> bool {
+            self.supports_vision
         }
     }
     impl ::zeroclaw_api::attribution::Attributable for ModelCaptureModelProvider {
@@ -26141,16 +29460,7 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     fn channel_all_tools_result(tools: Vec<Box<dyn Tool>>) -> tools::AllToolsResult {
-        tools::AllToolsResult {
-            tools,
-            delegate_handle: None,
-            ask_user_handle: None,
-            reaction_handle: Arc::new(parking_lot::RwLock::new(HashMap::new())),
-            poll_handle: None,
-            escalate_handle: None,
-            channel_room_handle: None,
-            unfiltered_tool_arcs: Vec::new(),
-        }
+        tools::AllToolsResult::from_prebuilt_tools(tools)
     }
 
     /// A mock HTTP MCP server that advertises `resources` support and serves one
@@ -26796,7 +30106,9 @@ BTC is currently around $65,000 based on latest tool output."#
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
-            prompt_config,
+            prompt_config: Arc::clone(&prompt_config),
+            live_config: zeroclaw_config::live::LiveConfig::new(prompt_config.as_ref().clone())
+                .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -26837,7 +30149,94 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
+            sop_driver_sink: None,
         })
+    }
+
+    /// Answers every request plainly and records the conversation the
+    /// surface declared around the turn it was called in.
+    #[derive(Default)]
+    struct DeclaredConversationProvider {
+        declared:
+            std::sync::Mutex<Vec<Option<zeroclaw_api::conversation_binding::ActiveConversation>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for DeclaredConversationProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("ok".to_string())
+        }
+
+        async fn chat_with_history(
+            &self,
+            _messages: &[ChatMessage],
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            self.declared.lock().unwrap().push(
+                zeroclaw_api::TOOL_LOOP_ACTIVE_CONVERSATION
+                    .try_with(Clone::clone)
+                    .ok()
+                    .flatten(),
+            );
+            Ok("ok".to_string())
+        }
+    }
+    impl ::zeroclaw_api::attribution::Attributable for DeclaredConversationProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "DeclaredConversationProvider"
+        }
+    }
+
+    /// A channel turn declares the conversation it is serving, under its own
+    /// history key and agent, for the whole tool loop.
+    #[tokio::test]
+    async fn channel_turn_declares_its_conversation_to_the_tool_loop() {
+        use zeroclaw_infra::session_backend::SessionBackend;
+        use zeroclaw_infra::session_store::SessionStore;
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let backend: Arc<dyn SessionBackend> =
+            Arc::new(SessionStore::new(tmp.path()).expect("session store"));
+        let provider = Arc::new(DeclaredConversationProvider::default());
+        let channel: Arc<dyn Channel> = Arc::new(RecordingChannel::default());
+        let runtime_ctx = test_channel_ctx_with_backend_channel_and_provider(
+            backend,
+            channel,
+            provider.clone(),
+            0,
+        );
+        let msg = message_sent_hook_test_message();
+        let history_key = conversation_history_key(&msg);
+
+        process_channel_message(runtime_ctx.clone(), msg, CancellationToken::new()).await;
+
+        let declared = provider.declared.lock().unwrap().clone();
+        assert_eq!(
+            declared,
+            vec![Some(
+                zeroclaw_api::conversation_binding::ActiveConversation {
+                    surface: zeroclaw_api::conversation_binding::ConversationSurface::Channel,
+                    route: TEST_BOUND_ROUTE.to_string(),
+                    key: history_key,
+                    agent_alias: runtime_ctx.agent_alias.to_string(),
+                }
+            )]
+        );
     }
 
     #[tokio::test]
@@ -26890,6 +30289,10 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
+            live_config: zeroclaw_config::live::LiveConfig::new(
+                zeroclaw_config::schema::Config::default(),
+            )
+            .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -26930,6 +30333,8 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
+            sop_driver_sink: None,
         });
 
         process_channel_message(
@@ -26989,7 +30394,6 @@ BTC is currently around $65,000 based on latest tool output."#
             .mount(&mock_server)
             .await;
 
-        use parking_lot::RwLock;
         use std::sync::Arc;
         use zeroclaw_config::schema::{Config, TelegramConfig};
 
@@ -27002,7 +30406,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 ..TelegramConfig::default()
             },
         );
-        let config_arc = Arc::new(RwLock::new(cfg));
+        let config_arc = zeroclaw_runtime::LiveConfigAuthority::new(cfg);
 
         let telegram: Arc<dyn Channel> = Arc::new(
             TelegramChannel::new(
@@ -27011,7 +30415,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 Arc::new(|| vec!["*".into()]),
                 false,
             )
-            .with_persistence(config_arc)
+            .with_persistence_authority(config_arc)
             .with_streaming(zeroclaw_config::schema::StreamMode::MultiMessage, 750)
             .with_api_base(mock_server.uri())
             .with_approval_timeout_secs(0),
@@ -27022,6 +30426,7 @@ BTC is currently around $65,000 based on latest tool output."#
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
+            security: Arc::new(SecurityPolicy::default()),
             model_provider: Arc::new(NarratingNativeToolProvider {
                 calls: AtomicUsize::new(0),
             }),
@@ -27064,6 +30469,10 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
+            live_config: zeroclaw_config::live::LiveConfig::new(
+                zeroclaw_config::schema::Config::default(),
+            )
+            .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -27104,6 +30513,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
         });
 
         process_channel_message(
@@ -27181,7 +30591,6 @@ BTC is currently around $65,000 based on latest tool output."#
             .mount(&mock_server)
             .await;
 
-        use parking_lot::RwLock;
         use std::sync::Arc;
         use zeroclaw_config::schema::{Config, TelegramConfig};
 
@@ -27194,7 +30603,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 ..TelegramConfig::default()
             },
         );
-        let config_arc = Arc::new(RwLock::new(cfg));
+        let config_arc = zeroclaw_runtime::LiveConfigAuthority::new(cfg);
 
         let telegram: Arc<dyn Channel> = Arc::new(
             TelegramChannel::new(
@@ -27203,7 +30612,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 Arc::new(|| vec!["*".into()]),
                 false,
             )
-            .with_persistence(config_arc)
+            .with_persistence_authority(config_arc)
             .with_streaming(zeroclaw_config::schema::StreamMode::MultiMessage, 750)
             .with_api_base(mock_server.uri())
             .with_approval_timeout_secs(0),
@@ -27226,6 +30635,7 @@ BTC is currently around $65,000 based on latest tool output."#
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
+            security: Arc::new(SecurityPolicy::default()),
             model_provider: Arc::new(LeakingNarratingToolProvider {
                 calls: AtomicUsize::new(0),
             }),
@@ -27267,7 +30677,8 @@ BTC is currently around $65,000 based on latest tool output."#
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
-            prompt_config: Arc::new(prompt_config),
+            prompt_config: Arc::new(prompt_config.clone()),
+            live_config: zeroclaw_config::live::LiveConfig::new(prompt_config).handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -27308,6 +30719,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
         });
 
         process_channel_message(
@@ -27377,7 +30789,6 @@ BTC is currently around $65,000 based on latest tool output."#
             .mount(&mock_server)
             .await;
 
-        use parking_lot::RwLock;
         use std::sync::Arc;
         use zeroclaw_config::schema::{Config, TelegramConfig};
 
@@ -27390,7 +30801,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 ..TelegramConfig::default()
             },
         );
-        let config_arc = Arc::new(RwLock::new(cfg));
+        let config_arc = zeroclaw_runtime::LiveConfigAuthority::new(cfg);
 
         let telegram: Arc<dyn Channel> = Arc::new(
             TelegramChannel::new(
@@ -27399,7 +30810,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 Arc::new(|| vec!["*".into()]),
                 false,
             )
-            .with_persistence(config_arc)
+            .with_persistence_authority(config_arc)
             .with_streaming(zeroclaw_config::schema::StreamMode::MultiMessage, 750)
             .with_api_base(mock_server.uri())
             .with_approval_timeout_secs(0),
@@ -27413,6 +30824,7 @@ BTC is currently around $65,000 based on latest tool output."#
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
+            security: Arc::new(SecurityPolicy::default()),
             model_provider: Arc::new(NarratingNativeToolProvider {
                 calls: AtomicUsize::new(0),
             }),
@@ -27455,6 +30867,10 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
+            live_config: zeroclaw_config::live::LiveConfig::new(
+                zeroclaw_config::schema::Config::default(),
+            )
+            .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -27495,6 +30911,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
         });
 
         process_channel_message(
@@ -27570,7 +30987,6 @@ BTC is currently around $65,000 based on latest tool output."#
             .mount(&mock_server)
             .await;
 
-        use parking_lot::RwLock;
         use std::sync::Arc;
         use zeroclaw_config::schema::{Config, TelegramConfig};
 
@@ -27583,7 +30999,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 ..TelegramConfig::default()
             },
         );
-        let config_arc = Arc::new(RwLock::new(cfg));
+        let config_arc = zeroclaw_runtime::LiveConfigAuthority::new(cfg);
 
         let telegram: Arc<dyn Channel> = Arc::new(
             TelegramChannel::new(
@@ -27592,7 +31008,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 Arc::new(|| vec!["*".into()]),
                 false,
             )
-            .with_persistence(config_arc)
+            .with_persistence_authority(config_arc)
             .with_streaming(zeroclaw_config::schema::StreamMode::MultiMessage, 750)
             .with_api_base(mock_server.uri())
             .with_approval_timeout_secs(0),
@@ -27609,6 +31025,7 @@ BTC is currently around $65,000 based on latest tool output."#
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
+            security: Arc::new(SecurityPolicy::default()),
             model_provider: Arc::new(NarratingNativeToolProvider {
                 calls: AtomicUsize::new(0),
             }),
@@ -27651,6 +31068,10 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
+            live_config: zeroclaw_config::live::LiveConfig::new(
+                zeroclaw_config::schema::Config::default(),
+            )
+            .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -27691,6 +31112,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
         });
 
         process_channel_message(
@@ -28141,7 +31563,6 @@ BTC is currently around $65,000 based on latest tool output."#
             .mount(&mock_server)
             .await;
 
-        use parking_lot::RwLock;
         use std::sync::Arc;
         use zeroclaw_config::schema::{Config, TelegramConfig};
 
@@ -28154,7 +31575,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 ..TelegramConfig::default()
             },
         );
-        let config_arc = Arc::new(RwLock::new(cfg));
+        let config_arc = zeroclaw_runtime::LiveConfigAuthority::new(cfg);
 
         let telegram: Arc<dyn Channel> = Arc::new(
             TelegramChannel::new(
@@ -28163,7 +31584,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 Arc::new(|| vec!["*".into()]),
                 false,
             )
-            .with_persistence(config_arc)
+            .with_persistence_authority(config_arc)
             .with_streaming(zeroclaw_config::schema::StreamMode::MultiMessage, 750)
             .with_api_base(mock_server.uri())
             .with_approval_timeout_secs(0),
@@ -28179,6 +31600,7 @@ BTC is currently around $65,000 based on latest tool output."#
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
+            security: Arc::new(SecurityPolicy::default()),
             model_provider: Arc::new(NarratingNativeToolProvider {
                 calls: AtomicUsize::new(0),
             }),
@@ -28221,6 +31643,10 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
+            live_config: zeroclaw_config::live::LiveConfig::new(
+                zeroclaw_config::schema::Config::default(),
+            )
+            .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -28261,6 +31687,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
         });
 
         process_channel_message(
@@ -28368,6 +31795,10 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
+            live_config: zeroclaw_config::live::LiveConfig::new(
+                zeroclaw_config::schema::Config::default(),
+            )
+            .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -28409,8 +31840,10 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             agent_transcription_provider: String::new(),
+            security: Arc::new(SecurityPolicy::default()),
         });
 
         process_channel_message(
@@ -28490,6 +31923,10 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
+            live_config: zeroclaw_config::live::LiveConfig::new(
+                zeroclaw_config::schema::Config::default(),
+            )
+            .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -28535,8 +31972,10 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             agent_transcription_provider: String::new(),
+            security: Arc::new(SecurityPolicy::default()),
         });
 
         process_channel_message(
@@ -28618,6 +32057,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 zeroclaw_runtime::agent::tool_receipts::ReceiptGenerator::new(),
             ),
             show_receipts_in_response: true,
+            security: Arc::new(SecurityPolicy::default()),
             ..(*base_ctx).clone()
         });
 
@@ -28717,6 +32157,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 ChannelRouteSelection {
                     model_provider: "no-such-provider".into(),
                     model: "route-model".to_string(),
+                    automatic: false,
                     api_key: None,
                 },
             );
@@ -28790,6 +32231,10 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
+            live_config: zeroclaw_config::live::LiveConfig::new(
+                zeroclaw_config::schema::Config::default(),
+            )
+            .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -28839,8 +32284,10 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             agent_transcription_provider: String::new(),
+            security: Arc::new(SecurityPolicy::default()),
         });
 
         process_channel_message(
@@ -28921,6 +32368,10 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
+            live_config: zeroclaw_config::live::LiveConfig::new(
+                zeroclaw_config::schema::Config::default(),
+            )
+            .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -28964,8 +32415,10 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             agent_transcription_provider: String::new(),
+            security: Arc::new(SecurityPolicy::default()),
         });
 
         process_channel_message(
@@ -29074,6 +32527,10 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
+            live_config: zeroclaw_config::live::LiveConfig::new(
+                zeroclaw_config::schema::Config::default(),
+            )
+            .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -29114,6 +32571,8 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
+            sop_driver_sink: None,
         });
 
         process_channel_message(
@@ -29210,6 +32669,10 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
+            live_config: zeroclaw_config::live::LiveConfig::new(
+                zeroclaw_config::schema::Config::default(),
+            )
+            .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -29250,6 +32713,8 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
+            sop_driver_sink: None,
         });
 
         process_channel_message(
@@ -29331,6 +32796,10 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
+            live_config: zeroclaw_config::live::LiveConfig::new(
+                zeroclaw_config::schema::Config::default(),
+            )
+            .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -29371,6 +32840,8 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
+            sop_driver_sink: None,
         });
 
         process_channel_message(
@@ -29469,7 +32940,8 @@ BTC is currently around $65,000 based on latest tool output."#
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
-            prompt_config: Arc::new(prompt_config),
+            prompt_config: Arc::new(prompt_config.clone()),
+            live_config: zeroclaw_config::live::LiveConfig::new(prompt_config).handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -29510,6 +32982,8 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
+            sop_driver_sink: None,
         });
 
         process_channel_message(
@@ -29589,6 +33063,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ChannelRouteSelection {
                 model_provider: "openrouter".into(),
                 model: "route-model".to_string(),
+                automatic: false,
                 api_key: None,
             },
         );
@@ -29633,6 +33108,10 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
+            live_config: zeroclaw_config::live::LiveConfig::new(
+                zeroclaw_config::schema::Config::default(),
+            )
+            .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -29673,6 +33152,8 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
+            sop_driver_sink: None,
         });
 
         process_channel_message(
@@ -29715,7 +33196,8 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[tokio::test]
-    async fn process_channel_message_persists_model_switch_with_route_credential() {
+    async fn process_channel_message_preserves_trim_provenance_and_route_credential_across_model_switch()
+     {
         let channel_impl = Arc::new(TelegramRecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
         let mut channels_by_name = HashMap::new();
@@ -29758,6 +33240,22 @@ BTC is currently around $65,000 based on latest tool output."#
         // later resolved by the channel switch handler.
         let prompt_config = {
             let mut cfg = zeroclaw_config::schema::Config::default();
+            cfg.runtime_profiles.insert(
+                "trim-switch".to_string(),
+                zeroclaw_config::schema::RuntimeProfileConfig {
+                    max_context_tokens: Some(8_000),
+                    ..Default::default()
+                },
+            );
+            cfg.agents.insert(
+                "test-agent".to_string(),
+                zeroclaw_config::schema::AliasedAgentConfig {
+                    runtime_profile: zeroclaw_config::providers::RuntimeProfileRef::from(
+                        "trim-switch",
+                    ),
+                    ..Default::default()
+                },
+            );
             {
                 let entry = cfg
                     .providers
@@ -29817,6 +33315,8 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::clone(&prompt_config),
+            live_config: zeroclaw_config::live::LiveConfig::new(prompt_config.as_ref().clone())
+                .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -29849,7 +33349,7 @@ BTC is currently around $65,000 based on latest tool output."#
             cost_tracking: None,
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
-            context_token_budget: 0,
+            context_token_budget: 8_000,
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
@@ -29860,7 +33360,22 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
+            sop_driver_sink: None,
         });
+
+        let route_key = "telegram_chat-1_alice";
+        runtime_ctx
+            .conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(
+                route_key.to_string(),
+                vec![
+                    ChatMessage::user("old request ".repeat(4_000)),
+                    ChatMessage::assistant("old response"),
+                ],
+            );
 
         process_channel_message(
             runtime_ctx.clone(),
@@ -29901,9 +33416,21 @@ BTC is currently around $65,000 based on latest tool output."#
             );
         }
 
+        let trim_events = observer
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| matches!(event, ObserverEvent::HistoryTrimmed { .. }))
+            .count();
+        assert_eq!(
+            trim_events, 1,
+            "the model-switch retry must preserve breadcrumb provenance instead of trimming \
+             the same synthetic row again"
+        );
+
         // After the switch handler runs, the route override must be
         // persisted for this sender with the resolved api_key.
-        let route_key = "telegram_chat-1_alice";
         let persisted = runtime_ctx
             .route_overrides
             .lock()
@@ -30309,6 +33836,10 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
+            live_config: zeroclaw_config::live::LiveConfig::new(
+                zeroclaw_config::schema::Config::default(),
+            )
+            .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -30349,6 +33880,8 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
+            sop_driver_sink: None,
         });
 
         process_channel_message(
@@ -30425,6 +33958,10 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
+            live_config: zeroclaw_config::live::LiveConfig::new(
+                zeroclaw_config::schema::Config::default(),
+            )
+            .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -30468,6 +34005,8 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
+            sop_driver_sink: None,
         });
 
         process_channel_message(
@@ -30551,6 +34090,10 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
+            live_config: zeroclaw_config::live::LiveConfig::new(
+                zeroclaw_config::schema::Config::default(),
+            )
+            .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -30594,6 +34137,8 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
+            sop_driver_sink: None,
         });
 
         process_channel_message(
@@ -30752,6 +34297,7 @@ BTC is currently around $65,000 based on latest tool output."#
             _until: Option<&str>,
         ) -> anyhow::Result<Vec<zeroclaw_memory::MemoryEntry>> {
             Ok(vec![zeroclaw_memory::MemoryEntry {
+                principal_id: None,
                 id: "entry-1".to_string(),
                 key: "memory_key_1".to_string(),
                 content: "Age is 45".to_string(),
@@ -30840,6 +34386,14 @@ BTC is currently around $65,000 based on latest tool output."#
         peak_in_flight: Arc<AtomicUsize>,
     }
 
+    struct InFlightGuard(Arc<AtomicUsize>);
+
+    impl Drop for InFlightGuard {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
     #[async_trait::async_trait]
     impl ModelProvider for ConcurrencyTrackingProvider {
         async fn chat_with_system(
@@ -30850,9 +34404,9 @@ BTC is currently around $65,000 based on latest tool output."#
             _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             let current = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            let _in_flight = InFlightGuard(Arc::clone(&self.in_flight));
             self.peak_in_flight.fetch_max(current, Ordering::SeqCst);
             tokio::time::sleep(self.delay).await;
-            self.in_flight.fetch_sub(1, Ordering::SeqCst);
             Ok(format!("echo: {message}"))
         }
     }
@@ -31972,8 +35526,7 @@ BTC is currently around $65,000 based on latest tool output."#
         );
     }
 
-    #[tokio::test]
-    async fn message_dispatch_processes_messages_in_parallel() {
+    async fn run_parallel_message_dispatch(cancel_generation: bool) {
         let channel_impl = Arc::new(RecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
 
@@ -32027,6 +35580,10 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
+            live_config: zeroclaw_config::live::LiveConfig::new(
+                zeroclaw_config::schema::Config::default(),
+            )
+            .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -32067,6 +35624,8 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
+            sop_driver_sink: None,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(4);
@@ -32104,9 +35663,46 @@ BTC is currently around $65,000 based on latest tool output."#
         })
         .await
         .unwrap();
-        drop(tx);
-
-        run_message_dispatch_loop(rx, AgentRouter::single(runtime_ctx), 2).await;
+        let agent_lifecycle =
+            zeroclaw_runtime::live_config_authority::AgentLifecycleCoordinator::default();
+        if cancel_generation {
+            let cancel = CancellationToken::new();
+            let dispatch_cancel = cancel.clone();
+            let router =
+                AgentRouter::single(runtime_ctx).with_agent_lifecycle(agent_lifecycle.clone());
+            let dispatch = ::zeroclaw_spawn::spawn!(run_message_dispatch_loop_until_cancelled(
+                rx,
+                router,
+                2,
+                dispatch_cancel,
+            ));
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while peak_in_flight.load(Ordering::SeqCst) < 2 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("both channel workers should enter the provider");
+            assert!(matches!(
+                agent_lifecycle.begin_delete("test-agent"),
+                Err(
+                    zeroclaw_runtime::live_config_authority::AgentDeleteBlocker::ActiveTurns {
+                        count: 2,
+                        ..
+                    }
+                )
+            ));
+            cancel.cancel();
+            drop(tx);
+            tokio::time::timeout(Duration::from_secs(1), dispatch)
+                .await
+                .expect("generation cancellation should drain channel workers promptly")
+                .expect("dispatch task should join cleanly");
+            assert_eq!(agent_lifecycle.active_turn_count("test-agent"), 0);
+        } else {
+            drop(tx);
+            run_message_dispatch_loop(rx, AgentRouter::single(runtime_ctx), 2).await;
+        }
 
         let peak = peak_in_flight.load(Ordering::SeqCst);
         assert!(
@@ -32121,7 +35717,24 @@ BTC is currently around $65,000 based on latest tool output."#
         );
 
         let sent_messages = channel_impl.sent_messages.lock().await;
-        assert_eq!(sent_messages.len(), 2);
+        if cancel_generation {
+            assert!(
+                sent_messages.is_empty(),
+                "cancelled generation workers must not publish old-channel replies"
+            );
+        } else {
+            assert_eq!(sent_messages.len(), 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn message_dispatch_processes_messages_in_parallel() {
+        run_parallel_message_dispatch(false).await;
+    }
+
+    #[tokio::test]
+    async fn message_dispatch_generation_cancel_drains_turns_and_drops_replies() {
+        run_parallel_message_dispatch(true).await;
     }
 
     #[tokio::test]
@@ -32177,6 +35790,10 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
+            live_config: zeroclaw_config::live::LiveConfig::new(
+                zeroclaw_config::schema::Config::default(),
+            )
+            .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: true,
@@ -32217,6 +35834,8 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
+            sop_driver_sink: None,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(8);
@@ -32342,6 +35961,10 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
+            live_config: zeroclaw_config::live::LiveConfig::new(
+                zeroclaw_config::schema::Config::default(),
+            )
+            .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -32382,6 +36005,8 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
+            sop_driver_sink: None,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(8);
@@ -32504,6 +36129,12 @@ BTC is currently around $65,000 based on latest tool output."#
                 cfg.channels.debounce_ms = 120;
                 cfg
             }),
+            live_config: zeroclaw_config::live::LiveConfig::new({
+                let mut cfg = zeroclaw_config::schema::Config::default();
+                cfg.channels.debounce_ms = 120;
+                cfg
+            })
+            .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -32544,6 +36175,8 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
+            sop_driver_sink: None,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(8);
@@ -32663,6 +36296,10 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
+            live_config: zeroclaw_config::live::LiveConfig::new(
+                zeroclaw_config::schema::Config::default(),
+            )
+            .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -32703,6 +36340,8 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
+            sop_driver_sink: None,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(8);
@@ -32875,7 +36514,9 @@ BTC is currently around $65,000 based on latest tool output."#
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
-            prompt_config,
+            prompt_config: Arc::clone(&prompt_config),
+            live_config: zeroclaw_config::live::LiveConfig::new(prompt_config.as_ref().clone())
+                .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: interrupt_on_new_message_config(&channel_config),
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
@@ -32909,6 +36550,8 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
+            sop_driver_sink: None,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(8);
@@ -33105,6 +36748,10 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
+            live_config: zeroclaw_config::live::LiveConfig::new(
+                zeroclaw_config::schema::Config::default(),
+            )
+            .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: true,
@@ -33145,6 +36792,8 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
+            sop_driver_sink: None,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(8);
@@ -33245,6 +36894,10 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
+            live_config: zeroclaw_config::live::LiveConfig::new(
+                zeroclaw_config::schema::Config::default(),
+            )
+            .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -33285,6 +36938,8 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
+            sop_driver_sink: None,
         });
 
         process_channel_message(
@@ -33611,7 +37266,7 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[tokio::test]
-    async fn approval_wait_pauses_typing_and_only_approval_resumes_it() {
+    async fn approval_wait_resumes_typing_for_approval_or_unsupported_response() {
         use zeroclaw_api::channel::{
             ApprovalSource, AttributedApprovalResponse, ChannelApprovalRequest,
             ChannelApprovalResponse,
@@ -33647,7 +37302,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 false,
                 false,
             ),
-            (PendingApprovalOutcome::Response(None), false, false),
+            (PendingApprovalOutcome::Response(None), true, false),
             (PendingApprovalOutcome::Error, false, true),
         ];
 
@@ -33714,7 +37369,7 @@ BTC is currently around $65,000 based on latest tool output."#
                     }
                 })
                 .await
-                .expect("approved work should resume typing");
+                .expect("continuing work should resume typing");
             } else {
                 tokio::task::yield_now().await;
                 assert_eq!(
@@ -33726,6 +37381,150 @@ BTC is currently around $65,000 based on latest tool output."#
 
             typing.pause().await;
         }
+    }
+
+    #[tokio::test]
+    async fn unsupported_approval_resumes_typing_through_shell_gate() {
+        struct ShellProvider(Arc<PendingApprovalChannel>);
+
+        impl zeroclaw_api::attribution::Attributable for ShellProvider {
+            fn role(&self) -> zeroclaw_api::attribution::Role {
+                ToolCallingModelProvider.role()
+            }
+            fn alias(&self) -> &str {
+                "shell-typing-test"
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl ModelProvider for ShellProvider {
+            async fn chat_with_system(
+                &self,
+                _system: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                tokio::time::timeout(Duration::from_secs(1), async {
+                    while self.0.start_typing_calls.load(Ordering::SeqCst) == 0 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("initial typing must start before the approval request");
+                Ok(
+                    r#"<tool_call>{"name":"shell","arguments":{"command":"pwd"}}</tool_call>"#
+                        .into(),
+                )
+            }
+
+            async fn chat_with_history(
+                &self,
+                messages: &[ChatMessage],
+                model: &str,
+                temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                if messages
+                    .iter()
+                    .any(|message| message.content.contains("[Tool results]"))
+                {
+                    Ok("done".into())
+                } else {
+                    self.chat_with_system(None, "", model, temperature).await
+                }
+            }
+        }
+
+        struct ShellProbe {
+            channel: Arc<PendingApprovalChannel>,
+            calls: Arc<AtomicUsize>,
+        }
+
+        impl zeroclaw_api::attribution::Attributable for ShellProbe {
+            fn role(&self) -> zeroclaw_api::attribution::Role {
+                NamedMockTool("shell").role()
+            }
+            fn alias(&self) -> &str {
+                "shell"
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl Tool for ShellProbe {
+            fn name(&self) -> &str {
+                "shell"
+            }
+            fn description(&self) -> &str {
+                "Observe approval and typing at execution"
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({"type":"object","properties":{"command":{"type":"string"}}})
+            }
+            async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+                assert_eq!(
+                    args["approved"], false,
+                    "unsupported must not grant approval"
+                );
+                tokio::time::timeout(Duration::from_secs(1), async {
+                    while self.channel.start_typing_calls.load(Ordering::SeqCst) < 2 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("typing must resume for the continuing shell call");
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                NamedMockTool("shell").execute(args).await
+            }
+        }
+
+        let channel = Arc::new(PendingApprovalChannel::new(
+            PendingApprovalOutcome::Response(None),
+        ));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut agent_cfg = zeroclaw_config::schema::AliasedAgentConfig::default();
+        agent_cfg.precheck.enabled = false;
+        let mut ctx = test_runtime_ctx_with_observer_and_tools(
+            channel.clone(),
+            Arc::new(ShellProvider(channel.clone())),
+            Default::default(),
+            agent_cfg,
+            "test-provider",
+            None,
+            Arc::new(NoopObserver),
+            vec![Box::new(ShellProbe {
+                channel: channel.clone(),
+                calls: calls.clone(),
+            })],
+        );
+        Arc::get_mut(&mut ctx)
+            .expect("unshared test context")
+            .approval_manager = Arc::new(channel_approval_manager(
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+        ));
+        let turn = process_channel_message(
+            ctx,
+            ChannelMessage {
+                id: "typing-fallback".into(),
+                sender: "test-user".into(),
+                reply_target: "test-room".into(),
+                content: "show the working directory".into(),
+                channel: "approval-test".into(),
+                timestamp: 1,
+                ..Default::default()
+            },
+            CancellationToken::new(),
+        );
+        let release = async {
+            channel.approval_started.notified().await;
+            assert_eq!(channel.stop_typing_calls.load(Ordering::SeqCst), 1);
+            channel.approval_release.notify_one();
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(turn, release);
+        })
+        .await
+        .expect("channel turn should complete");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -33778,6 +37577,10 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
+            live_config: zeroclaw_config::live::LiveConfig::new(
+                zeroclaw_config::schema::Config::default(),
+            )
+            .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -33818,6 +37621,8 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
+            sop_driver_sink: None,
         });
 
         process_channel_message(
@@ -33911,6 +37716,10 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
+            live_config: zeroclaw_config::live::LiveConfig::new(
+                zeroclaw_config::schema::Config::default(),
+            )
+            .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -33951,6 +37760,8 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
+            sop_driver_sink: None,
         });
 
         process_channel_message(
@@ -34048,6 +37859,10 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
+            live_config: zeroclaw_config::live::LiveConfig::new(
+                zeroclaw_config::schema::Config::default(),
+            )
+            .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -34088,6 +37903,8 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
+            sop_driver_sink: None,
         });
 
         process_channel_message(
@@ -34177,6 +37994,10 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
+            live_config: zeroclaw_config::live::LiveConfig::new(
+                zeroclaw_config::schema::Config::default(),
+            )
+            .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -34217,6 +38038,8 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
+            sop_driver_sink: None,
         });
 
         process_channel_message(
@@ -34306,6 +38129,10 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
+            live_config: zeroclaw_config::live::LiveConfig::new(
+                zeroclaw_config::schema::Config::default(),
+            )
+            .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -34346,6 +38173,8 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
+            sop_driver_sink: None,
         });
 
         process_channel_message(
@@ -34722,6 +38551,10 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
+            live_config: zeroclaw_config::live::LiveConfig::new(
+                zeroclaw_config::schema::Config::default(),
+            )
+            .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -34762,6 +38595,8 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
+            sop_driver_sink: None,
         });
 
         process_channel_message(
@@ -34811,10 +38646,13 @@ BTC is currently around $65,000 based on latest tool output."#
             prompt.contains("## Project Context"),
             "missing Project Context"
         );
-        assert!(prompt.contains("## Current Date"), "missing Date section");
+        assert!(
+            !prompt.contains("## Current Date"),
+            "system prompt must not carry wall-clock date (#11704)"
+        );
         assert!(
             !prompt.contains("## Current Date & Time"),
-            "prompt should use date-only context"
+            "prompt should not use datetime context"
         );
         assert!(prompt.contains("## Runtime"), "missing Runtime section");
     }
@@ -36247,7 +40085,8 @@ BTC is currently around $65,000 based on latest tool output."#
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
-            prompt_config: Arc::new(prompt_config),
+            prompt_config: Arc::new(prompt_config.clone()),
+            live_config: zeroclaw_config::live::LiveConfig::new(prompt_config).handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: true,
@@ -36288,6 +40127,8 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
+            sop_driver_sink: None,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(8);
@@ -36914,7 +40755,11 @@ BTC is currently around $65,000 based on latest tool output."#
             "test-provider",
             None,
         );
-        let lanes = ConversationLaneRegistry::new(Arc::new(tokio::sync::Semaphore::new(4)));
+        let lanes = ConversationLaneRegistry::new(
+            Arc::new(tokio::sync::Semaphore::new(4)),
+            Default::default(),
+            CancellationToken::new(),
+        );
         let budget = Arc::new(tokio::sync::Semaphore::new(4));
         let pending_work = Arc::clone(&budget).try_acquire_owned().unwrap();
 
@@ -36933,6 +40778,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let delivery_message_id = msg.id.clone();
         let turn = Box::new(PendingTurn {
             ctx,
+            agent_generation: 0,
             msg,
             dispatch_ownership: ModelPickerDispatchOwnership::hold(&delivery_message_id),
             delivery_message_id,
@@ -36957,6 +40803,120 @@ BTC is currently around $65,000 based on latest tool output."#
             4,
             "the canceled turn's admission permit must return to the budget"
         );
+    }
+
+    #[tokio::test]
+    #[cfg_attr(feature = "channel-telegram", allow(clippy::await_holding_lock))]
+    async fn queued_channel_turn_rejects_reused_alias_generation() {
+        #[cfg(feature = "channel-telegram")]
+        let _registry_guard = crate::model_picker_delivery::registry_test_lock();
+        let channel_impl = Arc::new(TelegramRecordingChannel::default());
+        let ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel_impl.clone(),
+            Arc::new(GatedModelProvider {
+                gate: Arc::new(tokio::sync::Semaphore::new(0)),
+            }),
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+        let lifecycle =
+            zeroclaw_runtime::live_config_authority::AgentLifecycleCoordinator::default();
+        let router = AgentRouter::single(Arc::clone(&ctx)).with_agent_lifecycle(lifecycle.clone());
+        let generation = router.turn_generations[ctx.agent_alias.as_str()];
+        let execution = Arc::new(tokio::sync::Semaphore::new(0));
+        let lanes = ConversationLaneRegistry::new(
+            Arc::clone(&execution),
+            lifecycle.clone(),
+            CancellationToken::new(),
+        );
+        let budget = Arc::new(tokio::sync::Semaphore::new(1));
+        let msg = shared_topic_message("alice", "stale", "must not run");
+        let delivery_message_id = msg.id.clone();
+        #[cfg(feature = "channel-telegram")]
+        let mut delivery_ack = {
+            let mut ack = crate::model_picker_delivery::register(&delivery_message_id);
+            ack.mark_enqueued();
+            ack
+        };
+        let turn = Box::new(PendingTurn {
+            ctx: Arc::clone(&ctx),
+            agent_generation: generation,
+            msg,
+            dispatch_ownership: ModelPickerDispatchOwnership::hold(&delivery_message_id),
+            delivery_message_id,
+            registration: None,
+            pending_work: Arc::clone(&budget).try_acquire_owned().unwrap(),
+        });
+        assert!(matches!(
+            lanes.enqueue("conversation", turn),
+            LaneAdmission::Enqueued
+        ));
+        assert_eq!(lifecycle.active_turn_count(ctx.agent_alias.as_str()), 0);
+        let mut deletion = lifecycle.begin_delete(ctx.agent_alias.as_str()).unwrap();
+        deletion.commit_destructive_mutation();
+        drop(deletion);
+        assert_ne!(
+            lifecycle.alias_generation(ctx.agent_alias.as_str()),
+            generation
+        );
+        execution.add_permits(1);
+        tokio::time::timeout(Duration::from_secs(1), lanes.wait_drained())
+            .await
+            .expect("stale queued work must retire without calling the gated provider");
+        assert_eq!(budget.available_permits(), 1);
+        assert_eq!(execution.available_permits(), 1);
+        assert_eq!(lifecycle.active_turn_count(ctx.agent_alias.as_str()), 0);
+        assert!(channel_impl.sent_messages.lock().await.is_empty());
+        assert!(ctx.route_overrides.lock().unwrap().is_empty());
+        #[cfg(feature = "channel-telegram")]
+        {
+            let result = tokio::time::timeout(Duration::from_secs(1), delivery_ack.wait()).await;
+            assert!(
+                matches!(result, Ok(Err(_))),
+                "stale-generation rejection must settle the delivery without confirming it"
+            );
+            assert!(matches!(
+                crate::model_picker_delivery::revoke("stale"),
+                crate::model_picker_delivery::RevokeOutcome::Won
+            ));
+            assert!(!crate::model_picker_delivery::is_registered("stale"));
+        }
+    }
+
+    #[tokio::test]
+    async fn forced_dispatch_task_retirement_preserves_child_lease_until_child_finishes() {
+        let tracker = IngressTaskTracker::new();
+        let lifecycle =
+            zeroclaw_runtime::live_config_authority::AgentLifecycleCoordinator::default();
+        let lease = Arc::new(lifecycle.reserve_turn("test-agent").unwrap());
+        let child_lease = Arc::clone(&lease);
+        let child = zeroclaw_spawn::spawn!(async move {
+            let _lease = child_lease;
+            std::future::pending::<()>().await;
+        });
+        let budget = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = Arc::clone(&budget).try_acquire_owned().unwrap();
+        let (started, ready) = tokio::sync::oneshot::channel();
+        tracker.spawn(async move {
+            let _lease = lease;
+            let _permit = permit;
+            let _ = started.send(());
+            std::future::pending::<()>().await;
+        });
+        ready.await.unwrap();
+        assert_eq!(lifecycle.active_turn_count("test-agent"), 1);
+        assert!(
+            !tracker
+                .drain_until(tokio::time::Instant::now() + Duration::from_millis(10))
+                .await
+        );
+        assert_eq!(lifecycle.active_turn_count("test-agent"), 1);
+        assert_eq!(budget.available_permits(), 1);
+        child.abort();
+        let _ = child.await;
+        assert_eq!(lifecycle.active_turn_count("test-agent"), 0);
     }
 
     /// Refusing a flood must not turn into an unbounded detached outbound
@@ -38720,6 +42680,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let sel = |m: &str| ChannelRouteSelection {
             model_provider: "openrouter.default".into(),
             model: m.into(),
+            automatic: false,
             api_key: None,
         };
 
@@ -38805,6 +42766,7 @@ BTC is currently around $65,000 based on latest tool output."#
             &ChannelRouteSelection {
                 model_provider: "custom.large".to_string(),
                 model: "large-model".to_string(),
+                automatic: true,
                 api_key: None,
             },
             0,
@@ -38815,6 +42777,7 @@ BTC is currently around $65,000 based on latest tool output."#
             &ChannelRouteSelection {
                 model_provider: "custom.small".to_string(),
                 model: "small-model".to_string(),
+                automatic: true,
                 api_key: None,
             },
             0,
@@ -38849,6 +42812,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ChannelRouteSelection {
                 model_provider: "openrouter.default".into(),
                 model: "other".into(),
+                automatic: false,
                 api_key: None,
             },
             &snapshot,
@@ -38857,6 +42821,509 @@ BTC is currently around $65,000 based on latest tool output."#
         // Setting it back to the config default clears the entry.
         set_scope_override(&ctx, OverrideScope::User, &msg, default, &snapshot);
         assert!(ctx.scope_overrides.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn manual_session_selection_survives_until_automatic_is_restored() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ctx = channel_runtime_context_for_defaults_test(
+            tmp.path(),
+            "agentX",
+            "openrouter.default",
+            "default-model",
+        );
+        let msg = scope_test_msg("alice", "chan", None);
+        let sender_key = conversation_history_key(&msg);
+        let snapshot = runtime_defaults_snapshot(&ctx);
+        let automatic = default_route_selection_from_snapshot(&snapshot);
+        let mut manual = automatic.clone();
+        manual.automatic = false;
+
+        set_route_selection(&ctx, &sender_key, manual, &snapshot);
+        let selected = get_route_selection(&ctx, &msg, &sender_key, &snapshot);
+        assert!(!selected.automatic);
+        assert_eq!(selected.model_provider, automatic.model_provider);
+        assert_eq!(selected.model, automatic.model);
+
+        set_route_selection(&ctx, &sender_key, automatic, &snapshot);
+        assert!(
+            get_route_selection(&ctx, &msg, &sender_key, &snapshot).automatic,
+            "restoring automatic selection should clear the session override"
+        );
+    }
+
+    #[test]
+    fn model_issued_switch_preserves_route_ownership_for_next_turn() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ctx = channel_runtime_context_for_defaults_test(
+            tmp.path(),
+            "agentX",
+            "openrouter.default",
+            "default-model",
+        );
+        let msg = scope_test_msg("alice", "chan", None);
+        let sender_key = conversation_history_key(&msg);
+        let snapshot = runtime_defaults_snapshot(&ctx);
+
+        let mut automatic = default_route_selection_from_snapshot(&snapshot);
+        apply_model_issued_route_switch(
+            &mut automatic,
+            "openrouter.default".into(),
+            "switched-model".into(),
+            None,
+        );
+        set_route_selection(&ctx, &sender_key, automatic, &snapshot);
+        assert!(
+            get_route_selection(&ctx, &msg, &sender_key, &snapshot).automatic,
+            "a model-issued switch during automatic routing must remain eligible for effort classification on the next turn"
+        );
+
+        let mut manual = default_route_selection_from_snapshot(&snapshot);
+        manual.automatic = false;
+        apply_model_issued_route_switch(
+            &mut manual,
+            "openrouter.default".into(),
+            "manual-switched-model".into(),
+            None,
+        );
+        set_route_selection(&ctx, &sender_key, manual, &snapshot);
+        assert!(
+            !get_route_selection(&ctx, &msg, &sender_key, &snapshot).automatic,
+            "a model-issued switch during an operator override must not restore automatic routing"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_session_auto_restores_automatic_route() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (ctx, _provider, _channel) = effort_routing_channel_context(tmp.path(), true);
+        let mut msg = scope_test_msg("alice", "chan", None);
+        let sender_key = conversation_history_key(&msg);
+        let snapshot = runtime_defaults_snapshot(&ctx);
+        set_route_selection(
+            &ctx,
+            &sender_key,
+            ChannelRouteSelection {
+                model_provider: "anthropic.work".into(),
+                model: "claude-sonnet".into(),
+                automatic: false,
+                api_key: None,
+            },
+            &snapshot,
+        );
+        msg.content = "/model auto".into();
+        let target: Arc<dyn Channel> = Arc::new(NamedMockChannel { name: "discord" });
+
+        assert!(handle_runtime_command_if_needed(ctx.as_ref(), &msg, Some(&target)).await);
+
+        let restored = get_route_selection(ctx.as_ref(), &msg, &sender_key, &snapshot);
+        assert!(restored.automatic);
+        assert_eq!(restored.model_provider, "custom.local");
+        assert_eq!(restored.model, "local-model");
+        assert!(
+            !ctx.route_overrides
+                .lock()
+                .unwrap()
+                .contains_key(&sender_key),
+            "restoring automatic routing should remove the per-sender override"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_session_auto_preserves_legacy_route_without_effort_routing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut ctx = channel_runtime_context_for_defaults_test(
+            tmp.path(),
+            "agentX",
+            "openrouter.default",
+            "default-model",
+        );
+        ctx.model_routes = Arc::new(vec![zeroclaw_config::schema::ModelRouteConfig {
+            hint: "auto".into(),
+            model_provider: "anthropic.work".into(),
+            model: "claude-sonnet".into(),
+            api_key: None,
+        }]);
+        let mut msg = scope_test_msg("alice", "chan", None);
+        msg.content = "/model auto".into();
+        let sender_key = conversation_history_key(&msg);
+        let snapshot = runtime_defaults_snapshot(&ctx);
+        let target: Arc<dyn Channel> = Arc::new(NamedMockChannel { name: "discord" });
+
+        assert!(handle_runtime_command_if_needed(&ctx, &msg, Some(&target)).await);
+
+        let selected = get_route_selection(&ctx, &msg, &sender_key, &snapshot);
+        assert!(!selected.automatic);
+        assert_eq!(selected.model_provider, "anthropic.work");
+        assert_eq!(selected.model, "claude-sonnet");
+    }
+
+    fn effort_routing_channel_context(
+        zeroclaw_dir: &std::path::Path,
+        include_cloud_route: bool,
+    ) -> (
+        Arc<ChannelRuntimeContext>,
+        Arc<ModelCaptureModelProvider>,
+        Arc<SendMessageRecordingChannel>,
+    ) {
+        use zeroclaw_config::scattered_types::{CloudEscalationPolicy, EffortRoutingConfig};
+
+        let mut groups = std::collections::HashMap::new();
+        groups.insert(
+            "discord_admins".into(),
+            peer_group("discord.clamps", &["alice"], true),
+        );
+        let mut ctx = channel_runtime_context_with_peer_groups(zeroclaw_dir, groups);
+        let channel_impl = Arc::new(SendMessageRecordingChannel {
+            channel_name: "discord",
+            ..Default::default()
+        });
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        ctx.channels_by_name = Arc::new(HashMap::from([(
+            channel.name().to_string(),
+            Arc::clone(&channel),
+        )]));
+
+        let mut routes = vec![zeroclaw_config::schema::ModelRouteConfig {
+            hint: "local".into(),
+            model_provider: "custom.local".into(),
+            model: "local-model".into(),
+            api_key: None,
+        }];
+        if include_cloud_route {
+            routes.push(zeroclaw_config::schema::ModelRouteConfig {
+                hint: "cloud".into(),
+                model_provider: "custom.cloud".into(),
+                model: "cloud-model".into(),
+                api_key: None,
+            });
+        }
+        let mut config = ctx.prompt_config.as_ref().clone();
+        config.model_routes = routes.clone();
+        config.runtime_profiles.insert(
+            "effort".into(),
+            zeroclaw_config::schema::RuntimeProfileConfig {
+                effort_routing: Some(EffortRoutingConfig {
+                    local_hint: "local".into(),
+                    cloud_hint: "cloud".into(),
+                    cloud_escalation: CloudEscalationPolicy::Auto,
+                }),
+                ..Default::default()
+            },
+        );
+        config.agents.insert(
+            "agentX".into(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                model_provider: "custom.local".into(),
+                runtime_profile: "effort".into(),
+                ..Default::default()
+            },
+        );
+        ctx.agent_cfg = Arc::new(
+            config
+                .resolved_agent_config("agentX")
+                .expect("effort agent must resolve"),
+        );
+        ctx.prompt_config = Arc::new(config.clone());
+        ctx.model_routes = Arc::new(routes);
+        ctx.model_provider_ref = Arc::new("custom.local".into());
+        ctx.model = Arc::new("local-model".into());
+
+        let provider_impl = Arc::new(ModelCaptureModelProvider {
+            supports_vision: true,
+            ..Default::default()
+        });
+        let provider: Arc<dyn ModelProvider> = provider_impl.clone();
+        ctx.model_provider = Arc::clone(&provider);
+        ctx.provider_cache = Arc::new(Mutex::new(HashMap::from([
+            ("custom.local".into(), Arc::clone(&provider)),
+            ("custom.cloud".into(), provider),
+        ])));
+
+        (Arc::new(ctx), provider_impl, channel_impl)
+    }
+
+    #[tokio::test]
+    async fn scoped_model_auto_resets_restore_effort_routing_for_real_channel_turn() {
+        for (scope_flag, scope) in [
+            ("--user", OverrideScope::User),
+            ("--agent", OverrideScope::Agent),
+        ] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let (ctx, provider, channel_impl) = effort_routing_channel_context(tmp.path(), true);
+            let channel: Arc<dyn Channel> = channel_impl;
+            let mut command = scope_test_msg("alice", "chan-1", None);
+            command.id = format!("set-{scope_flag}");
+            command.content = format!("/model {scope_flag} cloud");
+            assert!(handle_runtime_command_if_needed(ctx.as_ref(), &command, Some(&channel)).await);
+            assert!(
+                ctx.scope_overrides
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .contains_key(&scope_override_key(scope, &command, "agentX"))
+            );
+
+            let mut manual_turn = scope_test_msg("alice", "chan-1", None);
+            manual_turn.id = format!("manual-turn-{scope_flag}");
+            manual_turn.content = "hi".into();
+            process_channel_message(Arc::clone(&ctx), manual_turn, CancellationToken::new()).await;
+
+            command.id = format!("reset-{scope_flag}");
+            command.content = format!("/model {scope_flag} auto");
+            assert!(handle_runtime_command_if_needed(ctx.as_ref(), &command, Some(&channel)).await);
+            assert!(
+                !ctx.scope_overrides
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .contains_key(&scope_override_key(scope, &command, "agentX"))
+            );
+
+            let mut turn = scope_test_msg("alice", "chan-1", None);
+            turn.id = format!("turn-{scope_flag}");
+            turn.content = "hi".into();
+            process_channel_message(Arc::clone(&ctx), turn, CancellationToken::new()).await;
+
+            assert_eq!(provider.call_count.load(Ordering::SeqCst), 2);
+            assert_eq!(
+                provider
+                    .models
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .as_slice(),
+                &["cloud-model".to_string(), "local-model".to_string()]
+            );
+            assert_eq!(
+                provider
+                    .attempt_allowlists
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .as_slice(),
+                &[(true, true), (true, false)]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn scoped_model_auto_after_model_switch_restores_underlying_sender_route() {
+        for scope_flag in ["--user", "--agent"] {
+            for manual_sender in [false, true] {
+                let tmp = tempfile::TempDir::new().unwrap();
+                let (ctx, provider, channel_impl) =
+                    effort_routing_channel_context(tmp.path(), true);
+                let mut ctx = Arc::try_unwrap(ctx).ok().unwrap();
+                let mut config = ctx.prompt_config.as_ref().clone();
+                config
+                    .providers
+                    .models
+                    .ensure("openrouter", "default")
+                    .unwrap();
+                let config = Arc::new(config);
+                ctx.prompt_config = Arc::clone(&config);
+                ctx.tools_registry = Arc::new(
+                    zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![
+                        Box::new(zeroclaw_runtime::tools::ModelSwitchTool::new(
+                            Arc::clone(&ctx.security),
+                            config,
+                        )),
+                    ]),
+                );
+                ctx.approval_manager = Arc::new(ApprovalManager::for_non_interactive(
+                    &zeroclaw_config::schema::RiskProfileConfig {
+                        auto_approve: vec!["model_switch".into()],
+                        ..Default::default()
+                    },
+                ));
+                let switching = Arc::new(ModelSwitchRequestProvider::default());
+                ctx.provider_cache
+                    .lock()
+                    .unwrap()
+                    .insert("custom.cloud".into(), switching.clone());
+                ctx.provider_cache
+                    .lock()
+                    .unwrap()
+                    .insert("openrouter.default".into(), provider.clone());
+                let ctx = Arc::new(ctx);
+                let channel: Arc<dyn Channel> = channel_impl;
+                let mut command = scope_test_msg("alice", "chan-1", None);
+                if manual_sender {
+                    command.content = "/model local".into();
+                    assert!(handle_runtime_command_if_needed(&ctx, &command, Some(&channel)).await);
+                }
+                let sender_key = conversation_history_key(&command);
+                let snapshot = runtime_defaults_snapshot(&ctx);
+                let underlying = get_route_selection(&ctx, &command, &sender_key, &snapshot);
+
+                command.content = format!("/model {scope_flag} cloud");
+                assert!(handle_runtime_command_if_needed(&ctx, &command, Some(&channel)).await);
+                let mut turn = scope_test_msg("alice", "chan-1", None);
+                turn.id = "scoped-switch-turn".into();
+                turn.content = "hi".into();
+                process_channel_message(Arc::clone(&ctx), turn, CancellationToken::new()).await;
+                assert_eq!(switching.call_count.load(Ordering::SeqCst), 1);
+                assert_eq!(provider.call_count.load(Ordering::SeqCst), 1);
+
+                command.content = format!("/model {scope_flag} auto");
+                assert!(handle_runtime_command_if_needed(&ctx, &command, Some(&channel)).await);
+                assert_eq!(
+                    get_route_selection(&ctx, &command, &sender_key, &snapshot),
+                    underlying,
+                    "reset must expose the original sender choice, not the scoped switch: {scope_flag}, manual={manual_sender}"
+                );
+
+                let mut next = scope_test_msg("alice", "chan-1", None);
+                next.id = "after-scoped-switch-reset".into();
+                next.content = "hi".into();
+                process_channel_message(Arc::clone(&ctx), next, CancellationToken::new()).await;
+                assert_eq!(
+                    provider.models.lock().unwrap().as_slice(),
+                    &["switched-model".to_string(), "local-model".to_string()]
+                );
+                assert_eq!(
+                    provider.attempt_allowlists.lock().unwrap().as_slice(),
+                    &[(true, true), (true, manual_sender)]
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn effort_routing_manual_channel_overrides_bypass_automatic_classification() {
+        for (hint, content, expected_model) in [
+            ("cloud", "hi".to_string(), "cloud-model"),
+            ("local", "a".repeat(201), "local-model"),
+        ] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let (ctx, provider, channel_impl) = effort_routing_channel_context(tmp.path(), true);
+            let channel: Arc<dyn Channel> = channel_impl;
+            let mut command = scope_test_msg("alice", "chan-1", None);
+            command.id = format!("set-{hint}");
+            command.content = format!("/model {hint}");
+            assert!(handle_runtime_command_if_needed(ctx.as_ref(), &command, Some(&channel)).await);
+
+            let mut turn = scope_test_msg("alice", "chan-1", None);
+            turn.id = format!("manual-{hint}-turn");
+            turn.content = content;
+            process_channel_message(ctx, turn, CancellationToken::new()).await;
+
+            assert_eq!(provider.call_count.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                provider
+                    .models
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .as_slice(),
+                &[expected_model.to_string()]
+            );
+            assert_eq!(
+                provider
+                    .attempt_allowlists
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .as_slice(),
+                &[(true, true)]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn effort_routing_real_channel_turn_selects_cloud_for_complex_auto() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (ctx, provider, _channel) = effort_routing_channel_context(tmp.path(), true);
+        let mut turn = scope_test_msg("alice", "chan-1", None);
+        turn.id = "complex-auto-turn".into();
+        turn.content = "a".repeat(201);
+
+        process_channel_message(ctx, turn, CancellationToken::new()).await;
+
+        assert_eq!(provider.call_count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            provider
+                .models
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_slice(),
+            &["cloud-model".to_string()]
+        );
+        assert_eq!(
+            provider
+                .attempt_allowlists
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_slice(),
+            &[(true, true)]
+        );
+    }
+
+    #[tokio::test]
+    async fn effort_routing_real_channel_turn_fails_closed_when_hint_is_missing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (ctx, provider, channel) = effort_routing_channel_context(tmp.path(), false);
+        let mut turn = scope_test_msg("alice", "chan-1", None);
+        turn.id = "missing-cloud-hint-turn".into();
+        turn.content = "hi".into();
+
+        process_channel_message(ctx, turn, CancellationToken::new()).await;
+
+        assert_eq!(provider.call_count.load(Ordering::SeqCst), 0);
+        assert!(
+            provider
+                .models
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty()
+        );
+        let sent = channel.sent_messages.lock().await;
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0].content,
+            channel_runtime_cli_string("channel-runtime-effort-routing-invalid")
+        );
+    }
+
+    #[tokio::test]
+    async fn effort_routing_channel_classification_ignores_media_marker_bytes() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (ctx, provider, _channel) = effort_routing_channel_context(tmp.path(), true);
+        let mut turn = scope_test_msg("alice", "chan-1", None);
+        turn.id = "media-marker-turn".into();
+        turn.content = format!(
+            "what [ is this?\n[IMAGE:data:image/png;base64,{}]\n\nhi",
+            "a".repeat(256)
+        );
+
+        process_channel_message(ctx, turn, CancellationToken::new()).await;
+
+        assert_eq!(provider.call_count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            provider
+                .models
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_slice(),
+            &["local-model".to_string()]
+        );
+        assert_eq!(
+            provider
+                .attempt_allowlists
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_slice(),
+            &[(true, false)]
+        );
+    }
+
+    #[test]
+    fn effort_policy_excludes_cloud_reply_intent_classifier() {
+        let allowed = HashSet::from(["custom.local".to_string()]);
+        assert!(configured_provider_allowed_for_turn(
+            Some(&allowed),
+            "custom.local"
+        ));
+        assert!(!configured_provider_allowed_for_turn(
+            Some(&allowed),
+            "custom.cloud"
+        ));
+        assert!(configured_provider_allowed_for_turn(None, "custom.cloud"));
     }
 
     #[test]
@@ -38913,7 +43380,8 @@ BTC is currently around $65,000 based on latest tool output."#
             "openrouter.default",
             "config-default-model",
         );
-        ctx.prompt_config = Arc::new(prompt_config);
+        ctx.prompt_config = Arc::new(prompt_config.clone());
+        ctx.live_config = zeroclaw_config::live::LiveConfig::new(prompt_config).handle();
         ctx
     }
 
@@ -39500,6 +43968,87 @@ BTC is currently around $65,000 based on latest tool output."#
             reply.suppress_voice,
             "a text-origin mirror reply is an explicit suppression, got {reply:?}"
         );
+    }
+
+    /// Debouncing combines a sender's messages into one turn owned by the
+    /// first of them, so a mixed batch is answered in the first message's
+    /// modality, whatever the later ones were.
+    #[tokio::test]
+    async fn matrix_mirror_debounced_batch_answers_in_the_first_messages_modality() {
+        for (first_voice, second_voice) in [(true, false), (false, true)] {
+            let channel_impl = Arc::new(SendMessageRecordingChannel::matrix());
+            let mut peer_groups = HashMap::new();
+            peer_groups.insert(
+                "family".to_string(),
+                mirror_peer_group("matrix.default", &["@alice:server"]),
+            );
+            let ctx = test_runtime_ctx_with_observer_and_tools(
+                channel_impl.clone(),
+                Arc::new(DummyModelProvider),
+                zeroclaw_config::schema::Config {
+                    peer_groups,
+                    channels: zeroclaw_config::schema::ChannelsConfig {
+                        debounce_ms: 60,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                zeroclaw_config::schema::AliasedAgentConfig::default(),
+                "test-provider",
+                None,
+                Arc::new(NoopObserver),
+                Vec::new(),
+            );
+
+            let first = zeroclaw_api::channel::ChannelMessage {
+                content: "first part".to_string(),
+                ..matrix_room_message("@alice:server", first_voice)
+            };
+            let second = zeroclaw_api::channel::ChannelMessage {
+                id: "$event-2:server".to_string(),
+                content: "second part".to_string(),
+                ..matrix_room_message("@alice:server", second_voice)
+            };
+            let history_key = conversation_history_key(&first);
+
+            let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(8);
+            let send_task = zeroclaw_spawn::spawn!(async move {
+                tx.send(first).await.unwrap();
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                tx.send(second).await.unwrap();
+            });
+
+            run_message_dispatch_loop(rx, AgentRouter::single(Arc::clone(&ctx)), 4).await;
+            send_task.await.unwrap();
+
+            let sent = channel_impl.sent_messages.lock().await;
+            assert_eq!(
+                sent.len(),
+                1,
+                "both messages must be answered as one combined turn: {sent:?}"
+            );
+            let reply = delivered_reply(sent.as_slice(), "!room:server");
+            assert_eq!(
+                (reply.force_voice, reply.suppress_voice),
+                (first_voice, !first_voice),
+                "a batch opened by a {} message must be answered in that modality, got {reply:?}",
+                if first_voice { "voice" } else { "text" }
+            );
+            drop(sent);
+
+            let mut histories = ctx
+                .conversation_histories
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let turns = histories
+                .get(&history_key)
+                .expect("the combined turn must create history");
+            assert!(
+                turns[0].content.contains("first part") && turns[0].content.contains("second part"),
+                "the batch must dispatch as one combined turn: {}",
+                turns[0].content
+            );
+        }
     }
 
     #[tokio::test]
@@ -40261,6 +44810,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ChannelRouteSelection {
                 model_provider: "anthropic.work".into(),
                 model: "claude-sonnet-4-5".into(),
+                automatic: false,
                 api_key: None,
             },
         );
@@ -40643,13 +45193,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let (tx, rx) = tokio::sync::mpsc::channel(1);
         tx.send(selection.clone()).await.unwrap();
         drop(tx);
-        let router = AgentRouter {
-            by_agent: Arc::new(HashMap::new()),
-            owner_by_channel_key: Arc::new(HashMap::new()),
-            single_ctx: None,
-            sop_engine: None,
-            sop_audit: None,
-        };
+        let router = AgentRouter::multi(HashMap::new(), HashMap::new(), None, None, None);
         run_message_dispatch_loop(rx, router, 1).await;
 
         assert!(
@@ -40808,13 +45352,18 @@ BTC is currently around $65,000 based on latest tool output."#
         let delivery_message_id = selection.id.clone();
         let turn = Box::new(PendingTurn {
             ctx: Arc::clone(&runtime_ctx),
+            agent_generation: 0,
             msg: selection.clone(),
             dispatch_ownership: ModelPickerDispatchOwnership::hold(&delivery_message_id),
             delivery_message_id,
             registration: Some(registration),
             pending_work,
         });
-        let lanes = ConversationLaneRegistry::new(Arc::new(tokio::sync::Semaphore::new(1)));
+        let lanes = ConversationLaneRegistry::new(
+            Arc::new(tokio::sync::Semaphore::new(1)),
+            zeroclaw_runtime::live_config_authority::AgentLifecycleCoordinator::default(),
+            CancellationToken::new(),
+        );
         let worker = zeroclaw_spawn::spawn!(Arc::clone(&lanes).process_turn(turn));
 
         // A newer message interrupts this turn while its predecessor is still
@@ -40902,7 +45451,6 @@ BTC is currently around $65,000 based on latest tool output."#
         // Serialize on the crate-wide registry test lock: the picker
         // delivery-ack registry is process-global (see
         // `model_picker_delivery::registry_test_lock`).
-        #[cfg(feature = "channel-telegram")]
         let _registry_guard = crate::model_picker_delivery::registry_test_lock();
         let tmp = tempfile::TempDir::new().unwrap();
         let mut ctx = channel_runtime_context_for_defaults_test(
@@ -40946,6 +45494,66 @@ BTC is currently around $65,000 based on latest tool output."#
             ctx.route_overrides.lock().unwrap().is_empty(),
             "late-revoked selection must not write a route override"
         );
+        assert!(
+            channel_impl.sent_messages.lock().await.is_empty(),
+            "late-revoked selection must not produce a switch response"
+        );
+        assert!(
+            channel_impl.requests.lock().await.is_empty(),
+            "late-revoked selection must not re-open the picker"
+        );
+        // The authoritative check consumed the revoked marker exactly once.
+        assert!(!crate::model_picker_delivery::take_revoked(&msg.id));
+    }
+
+    #[cfg(feature = "channel-telegram")]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn runtime_command_late_revoked_model_picker_auto_does_not_mutate_route() {
+        // Serialize on the crate-wide registry test lock: the picker
+        // delivery-ack registry is process-global (see
+        // `model_picker_delivery::registry_test_lock`).
+        #[cfg(feature = "channel-telegram")]
+        let _registry_guard = crate::model_picker_delivery::registry_test_lock();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (ctx, _provider, _recording_channel) = effort_routing_channel_context(tmp.path(), true);
+        let msg = zeroclaw_api::channel::ChannelMessage {
+            id: "telegram_model_picker_selection_revoked_past_gate".into(),
+            sender: "test_user".into(),
+            reply_target: "chat-42".into(),
+            channel: "telegram".into(),
+            channel_alias: Some("main".into()),
+            content: "/model auto".into(),
+            ..Default::default()
+        };
+        let channel_impl = Arc::new(ModelPickerRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let sender_key = conversation_history_key(&msg);
+        let snapshot = runtime_defaults_snapshot(ctx.as_ref());
+        let manual = ChannelRouteSelection {
+            model_provider: "anthropic.work".into(),
+            model: "claude-sonnet-4-5".into(),
+            automatic: false,
+            api_key: None,
+        };
+        set_route_selection(ctx.as_ref(), &sender_key, manual.clone(), &snapshot);
+
+        // Past the early gate still registered (the gate leaves
+        // non-revoked entries in place); the ack timeout then fires before
+        // the command handler runs.
+        let _delivery_ack = crate::model_picker_delivery::register(&msg.id);
+        assert!(!crate::model_picker_delivery::take_revoked(&msg.id));
+        crate::model_picker_delivery::revoke(&msg.id);
+
+        let handled = handle_runtime_command_if_needed(ctx.as_ref(), &msg, Some(&channel)).await;
+
+        assert!(
+            handled,
+            "revoked selection must be reported handled so it is not re-dispatched to the agent"
+        );
+        let retained = get_route_selection(ctx.as_ref(), &msg, &sender_key, &snapshot);
+        assert_eq!(retained, manual);
+        assert!(!retained.automatic);
         assert!(
             channel_impl.sent_messages.lock().await.is_empty(),
             "late-revoked selection must not produce a switch response"
@@ -41165,7 +45773,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 Arc::new(|| vec!["123".into()]),
                 false,
             )
-            .with_persistence(Arc::new(RwLock::new(picker_config)))
+            .with_persistence_authority(zeroclaw_runtime::LiveConfigAuthority::new(picker_config))
             .with_api_base(server.uri()),
         );
         let picker_request = zeroclaw_api::channel::ChannelModelPickerRequest {
@@ -41267,6 +45875,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ChannelRouteSelection {
                 model_provider: "openrouter.default".into(),
                 model: "original-session-model".into(),
+                automatic: false,
                 api_key: None,
             },
         );
@@ -41340,6 +45949,36 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(
             overrides.is_empty(),
             "unauthorized sender must NOT write a scope override, got {overrides:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_agent_scope_rejects_unauthorized_auto_reset() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut groups = std::collections::HashMap::new();
+        groups.insert(
+            "discord_admins".into(),
+            peer_group("discord.clamps", &["alice"], true),
+        );
+        let ctx = Arc::new(channel_runtime_context_with_peer_groups(tmp.path(), groups));
+        let target: Arc<dyn Channel> = Arc::new(NamedMockChannel { name: "discord" });
+
+        assert!(
+            handle_runtime_command_if_needed(
+                ctx.as_ref(),
+                &scope_agent_msg("alice"),
+                Some(&target),
+            )
+            .await
+        );
+        let mut reset = scope_agent_msg("mallory");
+        reset.content = "/model --agent auto".into();
+        assert!(handle_runtime_command_if_needed(ctx.as_ref(), &reset, Some(&target)).await);
+
+        assert_eq!(
+            ctx.scope_overrides.lock().unwrap().len(),
+            1,
+            "an unauthorized sender must not clear the agent-scoped selection"
         );
     }
 
@@ -42148,6 +46787,10 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
+            live_config: zeroclaw_config::live::LiveConfig::new(
+                zeroclaw_config::schema::Config::default(),
+            )
+            .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -42188,6 +46831,8 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
+            sop_driver_sink: None,
         });
 
         process_channel_message(
@@ -42333,6 +46978,7 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(config.data_dir.clone()),
             prompt_config: Arc::new(config.clone()),
+            live_config: zeroclaw_config::live::LiveConfig::new(config.clone()).handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -42373,6 +47019,8 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
+            sop_driver_sink: None,
         });
 
         // Keep all three futures heap-backed to fit the Windows test-thread stack.
@@ -42473,6 +47121,31 @@ BTC is currently around $65,000 based on latest tool output."#
             "an established session must inline instructions when its active provider loses the loader protocol"
         );
         assert!(!provider_transition_prompt.contains("read_skill(name)"));
+        assert!(provider_transition_prompt.contains("# ZeroClaw self-knowledge and operation"));
+
+        let mut full_config = config.clone();
+        full_config.skills.prompt_injection_mode =
+            zeroclaw_config::schema::SkillsPromptInjectionMode::Full;
+        let full_ctx = ChannelRuntimeContext {
+            prompt_config: Arc::new(full_config),
+            ..runtime_ctx.as_ref().clone()
+        };
+        let cached_full = refreshed_skills_system_prompt(&full_ctx, "", true, &[]);
+        assert_eq!(
+            rendered_skills_prompt_mode(&cached_full),
+            Some(zeroclaw_config::schema::SkillsPromptInjectionMode::Full),
+        );
+        assert!(!cached_full.contains("# ZeroClaw self-knowledge and operation"));
+        let full_fallback =
+            system_prompt_for_channel_turn(&full_ctx, &cached_full, false, false, &[], None);
+        assert!(!full_fallback.contains("read_skill(name)"));
+        assert!(full_fallback.contains("# ZeroClaw self-knowledge and operation"));
+        assert!(full_fallback.contains("Expose this skill on fresh sessions."));
+        let full_restored =
+            system_prompt_for_channel_turn(&full_ctx, &full_fallback, false, true, &[], None);
+        assert!(full_restored.contains("<loading>on-demand</loading>"));
+        assert!(!full_restored.contains("# ZeroClaw self-knowledge and operation"));
+        assert!(full_restored.contains("Expose this skill on fresh sessions."));
 
         let full_callable_skills = build_skills_prompt_with_effective_tools(
             &refreshed_skills,
@@ -42812,6 +47485,27 @@ BTC is currently around $65,000 based on latest tool output."#
         provider_impl: Arc<HistoryCaptureModelProvider>,
         memory: Arc<dyn Memory>,
     ) -> Arc<ChannelRuntimeContext> {
+        let agent_alias = "test-agent";
+        let workspace_dir = std::env::temp_dir().join(format!(
+            "zeroclaw-cache-stability-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let prompt_config = Arc::new(zeroclaw_config::schema::Config::default());
+        let skills_prompt = zeroclaw_runtime::skills::skills_to_prompt(
+            &zeroclaw_runtime::skills::load_skills_for_agent(
+                &workspace_dir,
+                prompt_config.as_ref(),
+                agent_alias,
+            ),
+            &workspace_dir,
+        );
+        // Production contexts already contain the effective skills section.
+        // Keep this fixture faithful so a new-session refresh remains byte
+        // identical to subsequent turns.
+        let system_prompt = replace_available_skills_section(
+            "test-system-prompt\n\n## Workspace\n\nTest workspace.",
+            &skills_prompt,
+        );
         let channel_impl = Arc::new(RecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
         let mut channels_by_name = HashMap::new();
@@ -42821,7 +47515,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channels_by_name: Arc::new(channels_by_name),
             model_provider: provider_impl,
             model_provider_ref: Arc::new("test-provider".to_string()),
-            agent_alias: Arc::new("test-agent".to_string()),
+            agent_alias: Arc::new(agent_alias.to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             memory: memory.clone(),
             memory_strategy: Arc::new(
@@ -42835,7 +47529,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new()),
             ),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("test-system-prompt".to_string()),
+            system_prompt: Arc::new(system_prompt),
             model: Arc::new("test-model".to_string()),
             temperature: Some(0.0),
             auto_save_memory: false,
@@ -42855,8 +47549,12 @@ BTC is currently around $65,000 based on latest tool output."#
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
-            workspace_dir: Arc::new(std::env::temp_dir()),
-            prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
+            workspace_dir: Arc::new(workspace_dir),
+            prompt_config,
+            live_config: zeroclaw_config::live::LiveConfig::new(
+                zeroclaw_config::schema::Config::default(),
+            )
+            .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -42897,6 +47595,8 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
+            sop_driver_sink: None,
         })
     }
 
@@ -43029,6 +47729,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 _until: Option<&str>,
             ) -> anyhow::Result<Vec<zeroclaw_memory::MemoryEntry>> {
                 Ok(vec![zeroclaw_memory::MemoryEntry {
+                    principal_id: None,
                     id: "entry-x".to_string(),
                     key: format!("key-for-{}", query),
                     content: format!("memory-for-{}", query),
@@ -43348,6 +48049,10 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
+            live_config: zeroclaw_config::live::LiveConfig::new(
+                zeroclaw_config::schema::Config::default(),
+            )
+            .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -43391,6 +48096,8 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
+            sop_driver_sink: None,
         });
 
         process_channel_message(
@@ -43411,7 +48118,16 @@ BTC is currently around $65,000 based on latest tool output."#
                 interruption_scope_id: None,
                 attachments: vec![zeroclaw_api::media::MediaAttachment {
                     file_name: "sticker.png".to_string(),
-                    data: vec![1, 2, 3, 4],
+                    // A real 1x1 PNG: content validation drops undecodable
+                    // bytes, so a placeholder never survives to the provider.
+                    data: vec![
+                        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D,
+                        0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+                        0x08, 0x02, 0x00, 0x00, 0x00, 0x90, 0x77, 0x53, 0xDE, 0x00, 0x00, 0x00,
+                        0x0C, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0xF8, 0xCF, 0xC0, 0x00,
+                        0x00, 0x03, 0x01, 0x01, 0x00, 0xC9, 0xFE, 0x92, 0xEF, 0x00, 0x00, 0x00,
+                        0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+                    ],
                     mime_type: Some("image/png".to_string()),
                     marker: None,
                 }],
@@ -43450,7 +48166,7 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(turns[0].content.contains("[Image: sticker.png attached"));
         assert!(turns[0].content.contains("please inspect this"));
         assert!(turns[0].content.contains("[IMAGE:data:"));
-        assert!(turns[0].content.contains("AQIDBA"));
+        assert!(turns[0].content.contains("iVBORw0KGgoAAAANSUhEUg"));
     }
 
     #[tokio::test]
@@ -43511,6 +48227,10 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
+            live_config: zeroclaw_config::live::LiveConfig::new(
+                zeroclaw_config::schema::Config::default(),
+            )
+            .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -43551,6 +48271,8 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
+            sop_driver_sink: None,
         });
 
         process_channel_message(
@@ -43594,7 +48316,74 @@ BTC is currently around $65,000 based on latest tool output."#
             calls[0][0].1.contains("For media attachments use markers:"),
             "telegram media marker guidance should live in the system prompt"
         );
+        assert!(
+            calls[0][0].1.contains(
+                "save the complete artifact at an absolute path inside the configured workspace"
+            ),
+            "generated artifact guidance should reach the provider's system message"
+        );
+        assert!(
+            calls[0][0].1.contains("using that same absolute path"),
+            "generated artifact markers must use absolute paths in the provider's system message"
+        );
+        assert!(
+            calls[0][0]
+                .1
+                .contains("If file-writing tools are unavailable or saving fails")
+                && calls[0][0]
+                    .1
+                    .contains("explain the limitation and provide the content in chat")
+                && calls[0][0]
+                    .1
+                    .contains("Do not emit a document marker for an unsaved file"),
+            "the no-tools provider request must include an honest inline fallback"
+        );
         assert!(!calls[0].iter().skip(1).any(|(role, _)| role == "system"));
+    }
+
+    #[test]
+    fn build_channel_system_prompt_guides_large_artifacts_only_for_document_channels() {
+        let base = "Base prompt with literal marker syntax: [DOCUMENT:example.txt]";
+        for channel_name in [
+            "matrix", "discord", "lark", "feishu", "telegram", "qq", "wechat",
+        ] {
+            let prompt = build_channel_system_prompt(base, channel_name, None);
+            assert!(
+                prompt.contains(base),
+                "{channel_name} must retain the base prompt"
+            );
+            assert!(
+                prompt.contains(
+                    "save the complete artifact at an absolute path inside the configured workspace"
+                ) && prompt.contains("instead of pasting it into chat")
+                    && prompt.contains("short summary plus the document marker")
+                    && prompt.contains("using that same absolute path")
+                    && prompt.contains("following this channel's path and URL restrictions")
+                    && prompt.contains("After saving successfully")
+                    && prompt.contains("If file-writing tools are unavailable or saving fails")
+                    && prompt.contains("explain the limitation and provide the content in chat")
+                    && prompt.contains("Do not emit a document marker for an unsaved file"),
+                "{channel_name} must guide large artifacts through its existing document route"
+            );
+            assert_eq!(
+                prompt,
+                build_channel_system_prompt(base, channel_name, None),
+                "{channel_name} artifact guidance must remain byte-stable"
+            );
+        }
+        for channel_name in [
+            "whatsapp",
+            "whatsapp-web",
+            "wecom_ws",
+            "mattermost",
+            "unknown",
+        ] {
+            let prompt = build_channel_system_prompt(base, channel_name, None);
+            assert!(
+                !prompt.contains("short summary plus the document marker"),
+                "{channel_name} must not advertise document delivery from base-prompt marker text"
+            );
+        }
     }
 
     #[test]
@@ -43707,6 +48496,36 @@ BTC is currently around $65,000 based on latest tool output."#
             channel_delivery_instructions("whatsapp-web"),
             Some(block),
             "the compatibility alias should use the same WhatsApp Web guidance"
+        );
+    }
+
+    #[test]
+    fn channel_delivery_instructions_for_signal_match_local_marker_contract() {
+        let block = channel_delivery_instructions("signal")
+            .expect("signal channel must have a delivery-instructions block");
+        assert!(
+            block.contains("When responding on Signal:"),
+            "signal block must identify itself"
+        );
+        assert!(
+            block.contains("[IMAGE:<path>]") && block.contains("[DOCUMENT:<path>]"),
+            "signal block must describe marker syntax"
+        );
+        assert!(
+            block.contains("Absolute paths and workspace-relative paths are accepted"),
+            "signal block must match the outbound resolver's local path contract"
+        );
+        assert!(
+            block.contains("Do not use http://, https://, data:, file:"),
+            "signal block must say URL schemes are refused"
+        );
+        assert!(
+            !block.contains("[LOCATION:"),
+            "signal has no location message, so the block must not offer location markers"
+        );
+        assert!(
+            build_channel_system_prompt("base prompt", "signal", None).contains(block),
+            "signal guidance must reach the channel system prompt"
         );
     }
 
@@ -44144,7 +48963,7 @@ This is an example JSON object for profile settings."#;
                 "plugin" => source_segment_between(
                     async_assembly,
                     "zeroclaw_runtime::plugin_runtime::configured_plugin_channels_with_webhooks(",
-                    "publish_cron_channel_registry(&configured_channels)",
+                    "publish_cron_channel_registry(&prepared_channels)",
                 )
                 .is_some_and(|block| {
                     block.contains("append_configured_plugin_channels(")
@@ -44287,8 +49106,8 @@ This is an example JSON object for profile settings."#;
             },
         );
 
-        let config_arc = Arc::new(RwLock::new(config));
-        let channels = collect_configured_channels(&config_arc, "test", &[], None, None);
+        let config_arc = zeroclaw_config::live::LiveConfig::new(config).handle();
+        let channels = collect_configured_channels(&config_arc, "test", &[], None, None, None);
 
         assert!(
             channels
@@ -44339,8 +49158,8 @@ This is an example JSON object for profile settings."#;
             },
         );
 
-        let config_arc = Arc::new(RwLock::new(config));
-        let channels = collect_configured_channels(&config_arc, "test", &[], None, None);
+        let config_arc = zeroclaw_config::live::LiveConfig::new(config).handle();
+        let channels = collect_configured_channels(&config_arc, "test", &[], None, None, None);
 
         assert!(
             channels
@@ -44375,8 +49194,8 @@ This is an example JSON object for profile settings."#;
             },
         );
 
-        let config_arc = Arc::new(RwLock::new(config));
-        let channels = collect_configured_channels(&config_arc, "test", &[], None, None);
+        let config_arc = zeroclaw_config::live::LiveConfig::new(config).handle();
+        let channels = collect_configured_channels(&config_arc, "test", &[], None, None, None);
 
         assert!(
             !channels.iter().any(|entry| entry.display_name == "Discord"),
@@ -44406,8 +49225,8 @@ This is an example JSON object for profile settings."#;
             },
         );
 
-        let config_arc = Arc::new(RwLock::new(config));
-        let channels = collect_configured_channels(&config_arc, "test", &[], None, None);
+        let config_arc = zeroclaw_config::live::LiveConfig::new(config).handle();
+        let channels = collect_configured_channels(&config_arc, "test", &[], None, None, None);
 
         assert!(
             channels.iter().any(|entry| entry.display_name == "Discord"),
@@ -44456,8 +49275,8 @@ This is an example JSON object for profile settings."#;
             },
         );
 
-        let config_arc = Arc::new(RwLock::new(config));
-        let channels = collect_configured_channels(&config_arc, "test", &[], None, None);
+        let config_arc = zeroclaw_config::live::LiveConfig::new(config).handle();
+        let channels = collect_configured_channels(&config_arc, "test", &[], None, None, None);
 
         let discord_channels: Vec<_> = channels
             .iter()
@@ -44513,8 +49332,8 @@ This is an example JSON object for profile settings."#;
             },
         );
 
-        let config_arc = Arc::new(RwLock::new(config.clone()));
-        let configured = collect_configured_channels(&config_arc, "test", &[], None, None);
+        let config_arc = zeroclaw_config::live::LiveConfig::new(config.clone()).handle();
+        let configured = collect_configured_channels(&config_arc, "test", &[], None, None, None);
         let channel_map = configured_channel_map(&configured);
         assert!(
             channel_map.contains_key("discord.ops"),
@@ -44532,6 +49351,85 @@ This is an example JSON object for profile settings."#;
         let router = AgentRouter::multi(
             HashMap::from([("worker".to_string(), worker_ctx)]),
             owners,
+            None,
+            None,
+            None,
+        );
+        assert!(
+            router
+                .resolve(&channel_message("discord", Some("ops")))
+                .is_none(),
+            "ordinary traffic on the approval-only alias must not reach the worker"
+        );
+    }
+
+    #[cfg(feature = "channel-discord")]
+    #[test]
+    fn risk_profile_approval_route_collects_unowned_channel_without_agent_dispatch() {
+        let mut config = Config::default();
+        config.agents.clear();
+        config.agents.insert(
+            "worker".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: true,
+                channels: vec!["discord.worker".into()],
+                risk_profile: "supervised".into(),
+                ..Default::default()
+            },
+        );
+        config.channels.discord.insert(
+            "worker".to_string(),
+            zeroclaw_config::schema::DiscordConfig {
+                enabled: true,
+                bot_token: "worker-token".to_string(),
+                ..Default::default()
+            },
+        );
+        config.channels.discord.insert(
+            "ops".to_string(),
+            zeroclaw_config::schema::DiscordConfig {
+                enabled: true,
+                bot_token: "ops-token".to_string(),
+                ..Default::default()
+            },
+        );
+        config.risk_profiles.insert(
+            "supervised".to_string(),
+            zeroclaw_config::schema::RiskProfileConfig {
+                approval_route: Some(zeroclaw_config::autonomy::ApprovalRoute {
+                    approver_channel: "discord.ops".to_string(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
+
+        let active = ActiveChannelAliases::compute(&config);
+        assert!(
+            active.contains("discord.ops"),
+            "a risk-profile approval route must activate its unowned alias"
+        );
+
+        let config_arc = zeroclaw_config::live::LiveConfig::new(config.clone()).handle();
+        let configured = collect_configured_channels(&config_arc, "test", &[], None, None, None);
+        let channel_map = configured_channel_map(&configured);
+        assert!(
+            channel_map.contains_key("discord.ops"),
+            "the risk-profile approver must be available in the routed channel registry"
+        );
+
+        let collected_keys: Vec<String> = channel_map.keys().cloned().collect();
+        let owners = build_owner_by_channel_key(&config, &["worker".to_string()], &collected_keys);
+        assert!(
+            !owners.contains_key("discord.ops"),
+            "approval-route liveness must not create an agent owner"
+        );
+
+        let worker_ctx = router_test_ctx();
+        let router = AgentRouter::multi(
+            HashMap::from([("worker".to_string(), worker_ctx)]),
+            owners,
+            None,
             None,
             None,
         );
@@ -44580,8 +49478,8 @@ This is an example JSON object for profile settings."#;
             },
         );
 
-        let config_arc = Arc::new(RwLock::new(config));
-        let configured = collect_configured_channels(&config_arc, "test", &[], None, None);
+        let config_arc = zeroclaw_config::live::LiveConfig::new(config).handle();
+        let configured = collect_configured_channels(&config_arc, "test", &[], None, None, None);
         let channel_map = configured_channel_map(&configured);
         assert!(channel_map.contains_key("discord.ops"));
         assert!(
@@ -44744,8 +49642,8 @@ This is an example JSON object for profile settings."#;
             zeroclaw_config::scattered_types::EmailConfig::default(),
         );
 
-        let config_arc = Arc::new(RwLock::new(config));
-        let channels = collect_configured_channels(&config_arc, "test", &[], None, None);
+        let config_arc = zeroclaw_config::live::LiveConfig::new(config).handle();
+        let channels = collect_configured_channels(&config_arc, "test", &[], None, None, None);
         assert!(
             !channels.iter().any(|entry| entry.display_name == "Email"),
             "email with no agent reference should not be collected"
@@ -44761,8 +49659,8 @@ This is an example JSON object for profile settings."#;
             zeroclaw_config::scattered_types::VoiceCallConfig::default(),
         );
 
-        let config_arc = Arc::new(RwLock::new(config));
-        let channels = collect_configured_channels(&config_arc, "test", &[], None, None);
+        let config_arc = zeroclaw_config::live::LiveConfig::new(config).handle();
+        let channels = collect_configured_channels(&config_arc, "test", &[], None, None, None);
         assert!(
             !channels
                 .iter()
@@ -44790,8 +49688,8 @@ This is an example JSON object for profile settings."#;
             },
         );
 
-        let config_arc = Arc::new(RwLock::new(config));
-        let channels = collect_configured_channels(&config_arc, "test", &[], None, None);
+        let config_arc = zeroclaw_config::live::LiveConfig::new(config).handle();
+        let channels = collect_configured_channels(&config_arc, "test", &[], None, None, None);
         assert!(
             !channels.iter().any(|entry| entry.display_name == "Signal"),
             "enabled Signal without credentials must not be collected (would crashloop)"
@@ -44812,8 +49710,8 @@ This is an example JSON object for profile settings."#;
             },
         );
 
-        let config_arc = Arc::new(RwLock::new(config));
-        let channels = collect_configured_channels(&config_arc, "test", &[], None, None);
+        let config_arc = zeroclaw_config::live::LiveConfig::new(config).handle();
+        let channels = collect_configured_channels(&config_arc, "test", &[], None, None, None);
         assert!(
             channels.iter().any(|entry| entry.display_name == "Signal"),
             "enabled Signal with credentials must be collected"
@@ -44835,8 +49733,8 @@ This is an example JSON object for profile settings."#;
             },
         );
 
-        let config_arc = Arc::new(RwLock::new(config));
-        let channels = collect_configured_channels(&config_arc, "test", &[], None, None);
+        let config_arc = zeroclaw_config::live::LiveConfig::new(config).handle();
+        let channels = collect_configured_channels(&config_arc, "test", &[], None, None, None);
         assert!(
             channels
                 .iter()
@@ -44860,8 +49758,8 @@ This is an example JSON object for profile settings."#;
             },
         );
 
-        let config_arc = Arc::new(RwLock::new(config));
-        let channels = collect_configured_channels(&config_arc, "test", &[], None, None);
+        let config_arc = zeroclaw_config::live::LiveConfig::new(config).handle();
+        let channels = collect_configured_channels(&config_arc, "test", &[], None, None, None);
         assert!(
             !channels
                 .iter()
@@ -44949,7 +49847,7 @@ This is an example JSON object for profile settings."#;
             },
         );
 
-        let config_arc = Arc::new(RwLock::new(config));
+        let config_arc = zeroclaw_config::live::LiveConfig::new(config).handle();
         let channel = {
             let config = config_arc.read();
             build_configured_discord_channel(
@@ -45344,8 +50242,8 @@ This is an example JSON object for profile settings."#;
             },
         );
 
-        let config_arc = Arc::new(RwLock::new(config));
-        let channels = collect_configured_channels(&config_arc, "test", &[], None, None);
+        let config_arc = zeroclaw_config::live::LiveConfig::new(config).handle();
+        let channels = collect_configured_channels(&config_arc, "test", &[], None, None, None);
         let entry = channels
             .iter()
             .find(|entry| entry.display_name == "VoiceWake")
@@ -45367,6 +50265,31 @@ This is an example JSON object for profile settings."#;
         name: String,
         calls: Arc<AtomicUsize>,
         err: Mutex<Option<anyhow::Error>>,
+    }
+
+    /// A test channel that opts into the cooperative cancellation contract:
+    /// `uses_cancel_token()` returns `true`, `set_cancel_token` stores the
+    /// token, and `listen()` awaits cancellation before running a bounded,
+    /// probe-able cleanup phase. Used to prove the supervisor waits for
+    /// participating listeners to finish cleanup before exiting.
+    struct ParticipatingCancelChannel {
+        name: String,
+        calls: Arc<AtomicUsize>,
+        cleanups: Arc<AtomicUsize>,
+        token: Mutex<Option<CancellationToken>>,
+        cleanup_started: Arc<tokio::sync::Notify>,
+        cleanup_finish_allowed: Arc<tokio::sync::Notify>,
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for ParticipatingCancelChannel {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Channel(
+                ::zeroclaw_api::attribution::ChannelKind::Webhook,
+            )
+        }
+        fn alias(&self) -> &str {
+            "test"
+        }
     }
 
     /// A channel whose listener stays alive for as long as the supervisor
@@ -45412,6 +50335,42 @@ This is an example JSON object for profile settings."#;
         }
         fn alias(&self) -> &str {
             "test"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Channel for ParticipatingCancelChannel {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        async fn send(&self, _message: &SendMessage) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn set_cancel_token(&self, token: CancellationToken) {
+            *self.token.lock().unwrap() = Some(token);
+        }
+
+        fn uses_cancel_token(&self) -> bool {
+            true
+        }
+
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let token = self.token.lock().unwrap().clone();
+            if let Some(token) = token {
+                token.cancelled().await;
+            }
+            // Cleanup phase: signal start, then wait for the test to
+            // release it so the supervisor's grace period is observable.
+            self.cleanups.fetch_add(1, Ordering::SeqCst);
+            self.cleanup_started.notify_one();
+            self.cleanup_finish_allowed.notified().await;
+            Ok(())
         }
     }
 
@@ -45676,6 +50635,116 @@ This is an example JSON object for profile settings."#;
         );
     }
 
+    #[cfg(any(
+        feature = "channel-telegram",
+        feature = "channel-line",
+        feature = "channel-wechat",
+        feature = "whatsapp-web"
+    ))]
+    #[tokio::test]
+    async fn supervised_listener_cancels_identity_persistence_waiting_for_config_lock() {
+        use std::future::{Future, poll_fn};
+
+        struct PersistingChannel {
+            authority: zeroclaw_runtime::LiveConfigAuthority,
+            waiting: tokio::sync::Notify,
+            dropped: AtomicBool,
+        }
+
+        struct PersistenceDrop<'a>(&'a AtomicBool);
+
+        impl Drop for PersistenceDrop<'_> {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        impl zeroclaw_api::attribution::Attributable for PersistingChannel {
+            fn role(&self) -> zeroclaw_api::attribution::Role {
+                zeroclaw_api::attribution::Role::Channel(
+                    zeroclaw_api::attribution::ChannelKind::Plugin,
+                )
+            }
+
+            fn alias(&self) -> &str {
+                "identity-persistence-cancel"
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl Channel for PersistingChannel {
+            fn name(&self) -> &str {
+                "test-identity-persistence-cancel"
+            }
+
+            async fn send(&self, _message: &SendMessage) -> anyhow::Result<()> {
+                Ok(())
+            }
+
+            async fn listen(
+                &self,
+                _tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
+            ) -> anyhow::Result<()> {
+                let _drop = PersistenceDrop(&self.dropped);
+                let persistence = crate::identity_persist::persist_external_peer(
+                    Some(&self.authority),
+                    "wechat",
+                    "test",
+                    "test-peer",
+                    |entry, user| entry == user,
+                );
+                tokio::pin!(persistence);
+                // Signal only after the real persistence future has parked on
+                // the lock, not merely when the listener starts running.
+                poll_fn(|cx| {
+                    let result = persistence.as_mut().poll(cx);
+                    if result.is_pending() {
+                        self.waiting.notify_one();
+                    }
+                    result
+                })
+                .await
+            }
+        }
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = Config {
+            config_path: tmp.path().join("config.toml"),
+            data_dir: tmp.path().join("data"),
+            ..Config::default()
+        };
+        let authority = zeroclaw_runtime::LiveConfigAuthority::new(config);
+        let guard = authority.begin_config_commit().await.unwrap();
+        let channel = Arc::new(PersistingChannel {
+            authority: authority.clone(),
+            waiting: tokio::sync::Notify::new(),
+            dropped: AtomicBool::new(false),
+        });
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut handle = spawn_supervised_listener(channel.clone(), None, tx, 1, 1, cancel.clone());
+
+        let waiting =
+            tokio::time::timeout(Duration::from_secs(5), channel.waiting.notified()).await;
+        cancel.cancel();
+        let joined = tokio::time::timeout(Duration::from_secs(5), &mut handle).await;
+        if joined.is_err() {
+            handle.abort();
+            let _ = handle.await;
+        }
+        assert!(
+            waiting.is_ok(),
+            "identity persistence must reach the held lock"
+        );
+        joined
+            .expect("listener must exit while the config write guard is still held")
+            .expect("listener must join without panicking");
+        assert!(channel.dropped.load(Ordering::SeqCst));
+        assert!(authority.snapshot_config().peer_groups.is_empty());
+        assert!(!tmp.path().join("config.toml").exists());
+        drop(guard);
+    }
+
     #[tokio::test]
     async fn supervised_listener_marks_error_and_restarts_on_failures() {
         let calls = Arc::new(AtomicUsize::new(0));
@@ -45704,6 +50773,149 @@ This is an example JSON object for profile settings."#;
                 .contains("listen boom")
         );
         assert!(calls.load(Ordering::SeqCst) >= 1);
+    }
+
+    #[test]
+    fn should_restart_listener_after_clean_return_respects_cancellation() {
+        let cancel = tokio_util::sync::CancellationToken::new();
+        assert!(
+            should_restart_listener_after_clean_return(&cancel),
+            "must restart when cancellation has not been triggered"
+        );
+        cancel.cancel();
+        assert!(
+            !should_restart_listener_after_clean_return(&cancel),
+            "must not restart after cancellation was triggered"
+        );
+    }
+
+    /// A participating listener (via `PacedChannel`) must be allowed to
+    /// finish cleanup before the supervisor exits: cancellation while the
+    /// listener is mid-cleanup keeps the supervisor alive, then a clean
+    /// return yields one call, one cleanup, zero restarts, no error.
+    #[tokio::test]
+    async fn supervised_listener_waits_for_participating_cleanup_on_cancel() {
+        struct Pacing {
+            interval: u64,
+            depth: u16,
+        }
+        impl zeroclaw_config::schema::HasReplyPacing for Pacing {
+            fn reply_min_interval_secs(&self) -> u64 {
+                self.interval
+            }
+            fn reply_queue_depth_max(&self) -> u16 {
+                self.depth
+            }
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let cleanups = Arc::new(AtomicUsize::new(0));
+        let cleanup_started = Arc::new(tokio::sync::Notify::new());
+        let cleanup_finish_allowed = Arc::new(tokio::sync::Notify::new());
+        let channel_name = format!("test-cancel-participating-{}", uuid::Uuid::new_v4());
+        let component = format!("channel:{channel_name}");
+        let inner: Arc<dyn Channel> = Arc::new(ParticipatingCancelChannel {
+            name: channel_name,
+            calls: Arc::clone(&calls),
+            cleanups: Arc::clone(&cleanups),
+            token: Mutex::new(None),
+            cleanup_started: Arc::clone(&cleanup_started),
+            cleanup_finish_allowed: Arc::clone(&cleanup_finish_allowed),
+        });
+
+        // Wrap through the real PacedChannel with pacing enabled so the
+        // token forwards through the production wrapper boundary.
+        let channel = crate::paced_channel::PacedChannel::wrap(
+            inner,
+            &Pacing {
+                interval: 1,
+                depth: 16,
+            },
+        );
+
+        let (tx, _rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(1);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        // Use the same production helper as start_channels so this protects
+        // the real token-injection boundary rather than a test-only setup.
+        prepare_supervised_channel(&channel, &cancel);
+        let handle = spawn_supervised_listener(channel, None, tx, 1, 1, cancel.clone());
+
+        // Give the listener time to enter listen() and park on cancellation.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        cancel.cancel();
+        cleanup_started.notified().await;
+
+        assert_eq!(
+            cleanups.load(Ordering::SeqCst),
+            1,
+            "listener should enter cleanup exactly once"
+        );
+        assert!(
+            !handle.is_finished(),
+            "supervisor must wait for participating cleanup, not exit immediately"
+        );
+
+        // Release cleanup; the supervisor should then exit cleanly.
+        cleanup_finish_allowed.notify_one();
+
+        let result = tokio::time::timeout(Duration::from_millis(500), handle).await;
+        result
+            .expect("supervisor must exit after cleanup completes")
+            .expect("supervisor task must join cleanly after cleanup completes");
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "listener ran more than once"
+        );
+        assert_eq!(
+            cleanups.load(Ordering::SeqCst),
+            1,
+            "cleanup ran more than once"
+        );
+
+        let snapshot = zeroclaw_runtime::health::snapshot_json();
+        let c = &snapshot["components"][&component];
+        assert_eq!(
+            c["restart_count"].as_u64().unwrap_or(0),
+            0,
+            "must not restart on intentional shutdown"
+        );
+        assert!(
+            c["status"].is_null() || c["status"].as_str() != Some("error"),
+            "must not record component error on intentional shutdown"
+        );
+    }
+
+    #[tokio::test]
+    async fn supervised_listener_dispatch_loop_exits_with_sender_retained() {
+        let channel: Arc<dyn Channel> = Arc::new(RecordingChannel::default());
+        let ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            Arc::new(DummyModelProvider),
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let cancel = CancellationToken::new();
+        let dispatch_cancel = cancel.clone();
+        let handle = zeroclaw_spawn::spawn!(run_message_dispatch_loop_until_cancelled(
+            rx,
+            AgentRouter::single(ctx),
+            1,
+            dispatch_cancel,
+        ));
+
+        // Keep the sender alive exactly as a listener/router does. Generation
+        // cancellation, not channel closure, must retire the dispatcher.
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_millis(500), handle)
+            .await
+            .expect("dispatch loop must not wait for every sender to drop")
+            .expect("dispatch loop task must join cleanly");
+        drop(tx);
     }
 
     #[tokio::test]
@@ -46544,7 +51756,9 @@ This is an example JSON object for profile settings."#;
         let vision_server = MockServer::start().await;
         let _vision_mock = Mock::given(method("POST"))
             .and(path("/chat/completions"))
-            .and(body_string_contains("data:image/png;base64,AQIDBA=="))
+            .and(body_string_contains(
+                "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1Pe",
+            ))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "choices": [
                     {
@@ -46568,6 +51782,7 @@ This is an example JSON object for profile settings."#;
             ),
         );
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            sop_driver_sink: None,
             multimodal: zeroclaw_config::schema::MultimodalConfig {
                 vision_model_provider: Some(format!("custom:{}", vision_server.uri())),
                 vision_model: Some("test-vision-model".to_string()),
@@ -46578,6 +51793,7 @@ This is an example JSON object for profile settings."#;
                 describe_images: true,
                 ..Default::default()
             },
+            security: Arc::new(SecurityPolicy::default()),
             ..(*base_ctx).clone()
         });
 
@@ -46599,7 +51815,17 @@ This is an example JSON object for profile settings."#;
                 interruption_scope_id: None,
                 attachments: vec![zeroclaw_api::media::MediaAttachment {
                     file_name: "route.png".to_string(),
-                    data: vec![1, 2, 3, 4],
+                    // A real 1x1 PNG: content validation rejects bytes that are
+                    // not decodable, so a placeholder would never reach the
+                    // vision route this test exercises.
+                    data: vec![
+                        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D,
+                        0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+                        0x08, 0x02, 0x00, 0x00, 0x00, 0x90, 0x77, 0x53, 0xDE, 0x00, 0x00, 0x00,
+                        0x0C, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0xF8, 0xCF, 0xC0, 0x00,
+                        0x00, 0x03, 0x01, 0x01, 0x00, 0xC9, 0xFE, 0x92, 0xEF, 0x00, 0x00, 0x00,
+                        0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+                    ],
                     mime_type: Some("image/png".to_string()),
                     marker: None,
                 }],
@@ -46648,7 +51874,7 @@ This is an example JSON object for profile settings."#;
         assert!(
             vision_body
                 .to_string()
-                .contains("data:image/png;base64,AQIDBA=="),
+                .contains("data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1Pe"),
             "vision provider request must contain the preserved attachment bytes: {vision_body}"
         );
     }
@@ -46741,6 +51967,7 @@ This is an example JSON object for profile settings."#;
                 describe_images: true,
                 ..Default::default()
             },
+            security: Arc::new(SecurityPolicy::default()),
             ..(*base_ctx).clone()
         });
 
@@ -46906,6 +52133,7 @@ This is an example JSON object for profile settings."#;
                     describe_images: true,
                     ..Default::default()
                 },
+                security: Arc::new(SecurityPolicy::default()),
                 ..(*base_ctx).clone()
             });
 
@@ -46999,6 +52227,13 @@ This is an example JSON object for profile settings."#;
         channels_by_name.insert(channel.name().to_string(), channel);
 
         // DummyModelProvider has default capabilities (vision: false).
+        // The attachment must be a real file: the no-vision gate rejects only
+        // image markers that resolve, and treats a marker with nothing behind
+        // it as prose. Existence is all the gate checks.
+        let photo_dir = tempfile::tempdir().expect("temp dir");
+        let photo_path = photo_dir.path().join("photo_99_1.jpg");
+        std::fs::write(&photo_path, b"not a real jpeg, existence is enough").expect("write photo");
+
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
             model_provider: Arc::new(DummyModelProvider),
@@ -47039,6 +52274,10 @@ This is an example JSON object for profile settings."#;
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
+            live_config: zeroclaw_config::live::LiveConfig::new(
+                zeroclaw_config::schema::Config::default(),
+            )
+            .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -47079,6 +52318,11 @@ This is an example JSON object for profile settings."#;
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy {
+                workspace_dir: photo_dir.path().to_path_buf(),
+                ..SecurityPolicy::default()
+            }),
+            sop_driver_sink: None,
         });
 
         // Simulate a photo attachment message with [IMAGE:] marker.
@@ -47088,7 +52332,7 @@ This is an example JSON object for profile settings."#;
                 id: "msg-photo-1".to_string(),
                 sender: "zeroclaw_user".to_string(),
                 reply_target: "chat-photo".to_string(),
-                content: "[IMAGE:/tmp/workspace/photo_99_1.jpg]\n\nWhat is this?".to_string(),
+                content: format!("[IMAGE:{}]\n\nWhat is this?", photo_path.display()),
                 channel: "test-channel".into(),
                 channel_alias: None,
                 timestamp: 1,
@@ -47120,6 +52364,13 @@ This is an example JSON object for profile settings."#;
         let mut channels_by_name = HashMap::new();
         channels_by_name.insert(channel.name().to_string(), channel);
 
+        // The attachment must be a real file: the no-vision gate rejects only
+        // image markers that resolve, and treats a marker with nothing behind
+        // it as prose. Existence is all the gate checks.
+        let photo_dir = tempfile::tempdir().expect("temp dir");
+        let photo_path = photo_dir.path().join("photo_99_1.jpg");
+        std::fs::write(&photo_path, b"not a real jpeg, existence is enough").expect("write photo");
+
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
             model_provider: Arc::new(DummyModelProvider),
@@ -47160,6 +52411,10 @@ This is an example JSON object for profile settings."#;
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
+            live_config: zeroclaw_config::live::LiveConfig::new(
+                zeroclaw_config::schema::Config::default(),
+            )
+            .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -47200,6 +52455,11 @@ This is an example JSON object for profile settings."#;
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy {
+                workspace_dir: photo_dir.path().to_path_buf(),
+                ..SecurityPolicy::default()
+            }),
+            sop_driver_sink: None,
         });
 
         process_channel_message(
@@ -47208,7 +52468,7 @@ This is an example JSON object for profile settings."#;
                 id: "msg-photo-1".to_string(),
                 sender: "zeroclaw_user".to_string(),
                 reply_target: "chat-photo".to_string(),
-                content: "[IMAGE:/tmp/workspace/photo_99_1.jpg]\n\nWhat is this?".to_string(),
+                content: format!("[IMAGE:{}]\n\nWhat is this?", photo_path.display()),
                 channel: "test-channel".into(),
                 channel_alias: None,
                 timestamp: 1,
@@ -47328,6 +52588,10 @@ This is an example JSON object for profile settings."#;
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
+            live_config: zeroclaw_config::live::LiveConfig::new(
+                zeroclaw_config::schema::Config::default(),
+            )
+            .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -47365,9 +52629,11 @@ This is an example JSON object for profile settings."#;
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
             transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
             agent_transcription_provider: String::new(),
+            security: Arc::new(SecurityPolicy::default()),
         });
 
         process_channel_message(
@@ -47453,7 +52719,7 @@ This is an example JSON object for profile settings."#;
     #[test]
     fn build_channel_by_id_unknown_channel_returns_error() {
         let config = Config::default();
-        let config_arc = Arc::new(RwLock::new(config));
+        let config_arc = zeroclaw_config::live::LiveConfig::new(config).handle();
         match build_channel_by_id(&config_arc, "nonexistent") {
             Err(e) => {
                 let err_msg = e.to_string();
@@ -47468,7 +52734,7 @@ This is an example JSON object for profile settings."#;
 
     #[test]
     fn compiled_channel_keys_have_intentional_one_shot_builder_support() {
-        let config_arc = Arc::new(RwLock::new(Config::default()));
+        let config_arc = zeroclaw_config::live::LiveConfig::new(Config::default()).handle();
         let intentionally_unsupported = HashSet::from([
             "nextcloud",
             "feishu",
@@ -47547,17 +52813,19 @@ This is an example JSON object for profile settings."#;
                 ..Default::default()
             },
         );
-        let config_arc = Arc::new(RwLock::new(config));
-        let resolver = slack_thread_context_max_messages_resolver(&config_arc, "default");
+        let live = zeroclaw_config::live::LiveConfig::new(config);
+        let resolver = slack_thread_context_max_messages_resolver(&live.handle(), "default");
 
         assert_eq!(resolver(), 3);
-        config_arc
-            .write()
+        let mut updated = live.snapshot();
+        updated
             .channels
             .slack
             .get_mut("default")
             .unwrap()
             .thread_context_max_messages = Some(8);
+        live.publish(live.next_revision().unwrap(), updated)
+            .unwrap();
         assert_eq!(resolver(), 8);
     }
 
@@ -47639,6 +52907,10 @@ This is an example JSON object for profile settings."#;
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
+            live_config: zeroclaw_config::live::LiveConfig::new(
+                zeroclaw_config::schema::Config::default(),
+            )
+            .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -47679,6 +52951,8 @@ This is an example JSON object for profile settings."#;
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
+            sop_driver_sink: None,
         });
 
         process_channel_message(
@@ -47798,6 +53072,10 @@ This is an example JSON object for profile settings."#;
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
+            live_config: zeroclaw_config::live::LiveConfig::new(
+                zeroclaw_config::schema::Config::default(),
+            )
+            .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -47838,6 +53116,8 @@ This is an example JSON object for profile settings."#;
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
+            sop_driver_sink: None,
         });
 
         process_channel_message(
@@ -47949,6 +53229,10 @@ This is an example JSON object for profile settings."#;
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
+            live_config: zeroclaw_config::live::LiveConfig::new(
+                zeroclaw_config::schema::Config::default(),
+            )
+            .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -47989,6 +53273,8 @@ This is an example JSON object for profile settings."#;
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
+            sop_driver_sink: None,
         });
 
         process_channel_message(
@@ -48120,6 +53406,10 @@ This is an example JSON object for profile settings."#;
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
+            live_config: zeroclaw_config::live::LiveConfig::new(
+                zeroclaw_config::schema::Config::default(),
+            )
+            .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -48160,6 +53450,8 @@ This is an example JSON object for profile settings."#;
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
+            sop_driver_sink: None,
         });
 
         process_channel_message(
@@ -48210,7 +53502,7 @@ This is an example JSON object for profile settings."#;
     #[test]
     fn build_channel_by_id_unconfigured_telegram_returns_error() {
         let config = Config::default();
-        let config_arc = Arc::new(RwLock::new(config));
+        let config_arc = zeroclaw_config::live::LiveConfig::new(config).handle();
         match build_channel_by_id(&config_arc, "telegram") {
             Err(e) => {
                 let err_msg = e.to_string();
@@ -48238,6 +53530,7 @@ This is an example JSON object for profile settings."#;
                 multi_message_delay_ms: 800,
                 interrupt_on_new_message: false,
                 mention_only: false,
+                unauthorized_message: None,
                 per_user_session: true,
                 passive_group_context: false,
                 ack_reactions: None,
@@ -48249,7 +53542,7 @@ This is an example JSON object for profile settings."#;
                 debounce_ms: None,
             },
         );
-        let config_arc = Arc::new(RwLock::new(config));
+        let config_arc = zeroclaw_config::live::LiveConfig::new(config).handle();
         match build_channel_by_id(&config_arc, "telegram") {
             Ok(channel) => assert_eq!(channel.name(), "telegram"),
             Err(e) => panic!("should succeed when telegram is configured: {e}"),
@@ -48270,6 +53563,7 @@ This is an example JSON object for profile settings."#;
                 multi_message_delay_ms: 800,
                 interrupt_on_new_message: false,
                 mention_only: false,
+                unauthorized_message: None,
                 per_user_session: true,
                 passive_group_context: false,
                 ack_reactions: None,
@@ -48648,7 +53942,7 @@ This is an example JSON object for profile settings."#;
     #[test]
     fn build_channel_by_id_unconfigured_voice_call_returns_error() {
         let config = Config::default();
-        let config_arc = Arc::new(RwLock::new(config));
+        let config_arc = zeroclaw_config::live::LiveConfig::new(config).handle();
         match build_channel_by_id(&config_arc, "voice-call") {
             Err(e) => {
                 let err_msg = e.to_string();
@@ -48682,7 +53976,7 @@ This is an example JSON object for profile settings."#;
                 excluded_tools: vec![],
             },
         );
-        let config_arc = Arc::new(RwLock::new(config));
+        let config_arc = zeroclaw_config::live::LiveConfig::new(config).handle();
         match build_channel_by_id(&config_arc, "voice-call") {
             Ok(channel) => assert_eq!(channel.name(), "voice_call"),
             Err(e) => panic!("should succeed when voice-call is configured: {e}"),
@@ -49292,6 +54586,10 @@ This is an example JSON object for profile settings."#;
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
+            live_config: zeroclaw_config::live::LiveConfig::new(
+                zeroclaw_config::schema::Config::default(),
+            )
+            .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -49332,6 +54630,8 @@ This is an example JSON object for profile settings."#;
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
+            sop_driver_sink: None,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(8);
@@ -50375,6 +55675,985 @@ Done."#;
         );
     }
 
+    /// A final sanitizer is authoritative for everything not yet confirmed on
+    /// the transport: the streamed unsent tail must never be used as content
+    /// after final redaction, while the already-delivered prefix keeps its
+    /// coordinate so the flush cannot strand or garble the sanitized tail.
+    #[test]
+    fn multi_message_finalization_never_reintroduces_finally_sanitized_text() {
+        let leaked = "narration\n\nTemporary key: AKIAABCDEFGHIJKLMNOP"; // gitleaks:allow
+        let final_text = "Safe fallback.";
+        // The narration paragraph (11 bytes incl. its delimiter) is confirmed
+        // on the wire; the credential-bearing tail is not. The reconciled text
+        // keeps the confirmed coordinate and appends only the sanitized tail.
+        let reconciled = cumulative_multi_message_final_text(leaked, final_text, 11);
+        assert!(
+            !reconciled.contains("AKIAABCDEFGHIJKLMNOP"), // gitleaks:allow
+            "the streamed unsent tail must not resurface after final redaction: {reconciled:?}"
+        );
+        assert_eq!(
+            reconciled, "narration\n\nSafe fallback.",
+            "the confirmed prefix keeps its coordinate and the sanitized tail follows it"
+        );
+        // Nothing confirmed: the sanitized final response replaces the stream.
+        assert_eq!(
+            cumulative_multi_message_final_text(leaked, final_text, 0),
+            final_text,
+            "with nothing on the wire the streamed draft must not prefix the final response"
+        );
+        assert_eq!(
+            cumulative_multi_message_final_text("one\n\n ", "one", 5),
+            "one\n\n",
+            "trailing-whitespace-only divergence must flush nothing"
+        );
+    }
+
+    /// Unit coverage for the confirmed-delivery reconciliation branches of
+    /// [`cumulative_multi_message_final_text`]: identical, extending, dropped
+    /// leading narration, interior rewrite, unconfirmed rewrite, offset
+    /// clamping, and non-boundary offsets.
+    #[test]
+    fn cumulative_multi_message_final_text_reconciles_against_the_confirmed_prefix() {
+        // Empty stream / nothing confirmed: the canonical response is the
+        // whole message.
+        assert_eq!(
+            cumulative_multi_message_final_text("", "final answer", 0),
+            "final answer"
+        );
+        // Identical: the confirmed paragraph aligns and only the tail follows.
+        assert_eq!(
+            cumulative_multi_message_final_text("a\n\nb", "a\n\nb", 3),
+            "a\n\nb"
+        );
+        // Extends: append only the final-only tail (footer / stop reason).
+        assert_eq!(
+            cumulative_multi_message_final_text("a\n\nb", "a\n\nb\n\nc", 3),
+            "a\n\nb\n\nc"
+        );
+        // Leading narration stripped from the canonical response after being
+        // confirmed: the confirmed coordinate stays so the finalizer flushes
+        // the complete canonical tail once.
+        assert_eq!(
+            cumulative_multi_message_final_text("narration\n\nstop", "stop", 11),
+            "narration\n\nstop"
+        );
+        // Narration stripped while a later confirmed paragraph is preserved:
+        // the preserved paragraph aligns against the confirmed prefix and is
+        // not re-sent.
+        assert_eq!(
+            cumulative_multi_message_final_text(
+                "narration\n\nanswer\n\nstop",
+                "answer\n\nstop",
+                19
+            ),
+            "narration\n\nanswer\n\nstop"
+        );
+        // Divergent (terminal fallback replaced the payload) after a confirmed
+        // narration paragraph: the fallback is delivered exactly once after it.
+        assert_eq!(
+            cumulative_multi_message_final_text("narration\n\n", "fallback text", 11),
+            "narration\n\nfallback text"
+        );
+        // Divergent with nothing confirmed: the canonical response is
+        // authoritative and the streamed text is discarded entirely.
+        assert_eq!(
+            cumulative_multi_message_final_text("live XYZ", "XYZ done", 0),
+            "XYZ done"
+        );
+        // A final rewrite shorter than the confirmed offset must not strand
+        // the tail behind the finalizer's `text.len() > sent_so_far` guard.
+        assert_eq!(
+            cumulative_multi_message_final_text("one\n\ntwo\n\n", "done", 10),
+            "one\n\ntwo\n\ndone"
+        );
+        // Offsets beyond the stream clamp instead of panicking.
+        assert_eq!(
+            cumulative_multi_message_final_text("a\n\n", "a\n\nb", 100),
+            "a\n\nb"
+        );
+        // A non-boundary offset floors to the previous char boundary instead
+        // of panicking mid-character.
+        assert_eq!(
+            cumulative_multi_message_final_text("h\u{e9}llo\n\nworld", "h\u{e9}llo\n\nworld", 2),
+            "h\u{e9}llo\n\nworld"
+        );
+    }
+
+    /// Regression at the channel streaming/finalization boundary: malformed
+    /// protocol exhaustion. A tool narration and a display-safe terminal
+    /// fallback are streamed live as two MultiMessage paragraphs (the fallback
+    /// is what the stream shows once the malformed protocol payload has been
+    /// held back). MultiMessage confirms the narration paragraph live and keeps
+    /// the trailing fallback pending behind its confirmed-delivery byte offset.
+    /// Final sanitization then drops the leading narration line from the
+    /// canonical response, leaving only the fallback body. Because the
+    /// finalizer flushes `text[sent_so_far..]` against the confirmed
+    /// coordinate, the reconciled final text must keep that coordinate so the
+    /// complete fallback is delivered after the already-sent narration exactly
+    /// once: never merged into the narration paragraph, and never duplicated.
+    /// Feeding the narration-stripped canonical response in directly would
+    /// slice past the fallback with the confirmed offset and strand it.
+    #[tokio::test]
+    async fn multi_message_finalization_keeps_terminal_malformed_fallback_after_narration() {
+        use zeroclaw_runtime::agent::loop_::StreamDelta;
+
+        let channel_impl = Arc::new(DraftRecordingChannel::multi_message_cumulative("discord"));
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let narration = "Checking the requested records.\n\n";
+        let fallback = "I couldn't complete that response safely.";
+        // Final sanitization keeps only the fallback body after dropping the
+        // leading narration line that was already streamed live.
+        let delivered_response = fallback.to_string();
+
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        tx.send(StreamDelta::Text(narration.to_string()))
+            .await
+            .unwrap();
+        tx.send(StreamDelta::Text(fallback.to_string()))
+            .await
+            .unwrap();
+        drop(tx);
+
+        let streamed_text = Arc::new(Mutex::new(String::new()));
+        run_draft_updater_with_leak_detection(
+            channel,
+            "chat-1".to_string(),
+            "draft-1".to_string(),
+            no_tools(),
+            Arc::clone(&streamed_text),
+            zeroclaw_config::schema::LeakDetectionConfig::default(),
+            OutboundContentFormat::Markdown,
+            false,
+            None,
+            String::new(),
+            rx,
+        )
+        .await;
+
+        let sent_so_far = channel_impl
+            .multi_message_confirmed_offset("chat-1", "draft-1")
+            .await;
+        assert_eq!(
+            sent_so_far,
+            narration.len(),
+            "the narration paragraph (incl. its delimiter) must be the confirmed prefix"
+        );
+        let final_text = cumulative_multi_message_final_text(
+            &streamed_text.lock().unwrap_or_else(|e| e.into_inner()),
+            &delivered_response,
+            sent_so_far,
+        );
+        // The narration was already confirmed live; the reconciled text must
+        // leave the complete fallback as the unsent tail for finalization.
+        assert_eq!(
+            &final_text[sent_so_far..],
+            fallback,
+            "the confirmed offset must leave the complete fallback for finalization"
+        );
+        assert_eq!(final_text.matches(fallback).count(), 1);
+
+        channel_impl
+            .finalize_draft("chat-1", "draft-1", &final_text, false)
+            .await
+            .unwrap();
+
+        let emitted = channel_impl.emitted_paragraphs.lock().await;
+        assert_eq!(
+            emitted.as_slice(),
+            [narration.trim().to_string(), fallback.to_string()],
+            "the already-streamed narration stays put and the terminal fallback is flushed after it"
+        );
+        assert_eq!(
+            emitted.iter().filter(|m| m.as_str() == fallback).count(),
+            1,
+            "the complete terminal fallback must be delivered exactly once"
+        );
+    }
+
+    /// Regression at the channel streaming/finalization boundary: the
+    /// max-iteration path sends only its new summary segment after prior tool
+    /// narration. Once MultiMessage has confirmed that summary paragraph, the
+    /// stop reason must still be the unsent suffix, not be lost to the
+    /// confirmed-delivery offset.
+    #[tokio::test]
+    async fn multi_message_finalization_keeps_max_iteration_stop_reason_after_narration() {
+        use zeroclaw_runtime::agent::loop_::StreamDelta;
+
+        let channel_impl = Arc::new(DraftRecordingChannel::multi_message_cumulative("matrix"));
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let narration = "I checked the available sources.\n\n";
+        let summary = "Here is the best partial answer.";
+        let stop_reason = "Stopped after reaching the tool-call limit.";
+        let terminal_segment = format!("{summary}\n\n{stop_reason}");
+        let streamed_text = Arc::new(Mutex::new(String::new()));
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        tx.send(StreamDelta::Text(narration.to_string()))
+            .await
+            .unwrap();
+        tx.send(StreamDelta::Text(terminal_segment.clone()))
+            .await
+            .unwrap();
+        drop(tx);
+
+        run_draft_updater_with_leak_detection(
+            channel,
+            "chat-1".to_string(),
+            "draft-1".to_string(),
+            no_tools(),
+            Arc::clone(&streamed_text),
+            zeroclaw_config::schema::LeakDetectionConfig::default(),
+            OutboundContentFormat::Markdown,
+            false,
+            None,
+            String::new(),
+            rx,
+        )
+        .await;
+
+        let sent_so_far = channel_impl
+            .multi_message_confirmed_offset("chat-1", "draft-1")
+            .await;
+        assert_eq!(
+            sent_so_far,
+            narration.len() + summary.len() + "\n\n".len(),
+            "both live paragraphs (incl. delimiters) must be the confirmed prefix"
+        );
+        // The max-iteration final response carries only the terminal segment;
+        // the narration paragraph was dropped by final sanitization.
+        let final_text = cumulative_multi_message_final_text(
+            &streamed_text.lock().unwrap_or_else(|e| e.into_inner()),
+            &terminal_segment,
+            sent_so_far,
+        );
+        assert_eq!(
+            &final_text[sent_so_far..],
+            stop_reason,
+            "the finalizer must flush the stop reason after the confirmed paragraph offset"
+        );
+        assert_eq!(final_text.matches(summary).count(), 1);
+        assert_eq!(final_text.matches(stop_reason).count(), 1);
+        assert_eq!(
+            channel_impl.draft_updates.lock().await.last(),
+            Some(&final_text)
+        );
+
+        channel_impl
+            .finalize_draft("chat-1", "draft-1", &final_text, false)
+            .await
+            .unwrap();
+        let emitted = channel_impl.emitted_paragraphs.lock().await;
+        assert_eq!(
+            emitted.as_slice(),
+            [
+                narration.trim().to_string(),
+                summary.to_string(),
+                stop_reason.to_string(),
+            ],
+            "the confirmed paragraphs stay put and the stop reason is flushed last"
+        );
+    }
+
+    /// Real-adapter regression for the exact confirmed-delivery arithmetic:
+    /// a leading tool narration is streamed live as its own MultiMessage
+    /// paragraph, then final sanitization drops that narration line from the
+    /// canonical response. Because the finalizer flushes `text[sent_so_far..]`
+    /// against the confirmed coordinate, the reconciled final text must keep
+    /// that coordinate so the complete stop reason is delivered exactly once.
+    /// Feeding the canonical (narration-stripped) response directly would
+    /// slice past the stop reason and drop it.
+    #[tokio::test]
+    async fn multi_message_finalization_delivers_stop_reason_when_final_sanitizer_drops_narration_discord()
+     {
+        use zeroclaw_runtime::agent::loop_::StreamDelta;
+
+        let channel_impl = Arc::new(DraftRecordingChannel::multi_message_cumulative("discord"));
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let narration = "Looking through the available records.\n\n";
+        let answer = "Here is the best partial answer I have.";
+        let stop_reason = "Stopped after reaching the tool-call limit.";
+        let body = format!("{answer}\n\n{stop_reason}");
+        // The final sanitizer keeps only the body after dropping the leading
+        // narration line that was already streamed live.
+        let delivered_response = body.clone();
+
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        tx.send(StreamDelta::Text(narration.to_string()))
+            .await
+            .unwrap();
+        tx.send(StreamDelta::Text(body.clone())).await.unwrap();
+        drop(tx);
+
+        let streamed_text = Arc::new(Mutex::new(String::new()));
+        run_draft_updater_with_leak_detection(
+            channel,
+            "chat-1".to_string(),
+            "draft-1".to_string(),
+            no_tools(),
+            Arc::clone(&streamed_text),
+            zeroclaw_config::schema::LeakDetectionConfig::default(),
+            OutboundContentFormat::Markdown,
+            false,
+            None,
+            String::new(),
+            rx,
+        )
+        .await;
+
+        let sent_so_far = channel_impl
+            .multi_message_confirmed_offset("chat-1", "draft-1")
+            .await;
+        let final_text = cumulative_multi_message_final_text(
+            &streamed_text.lock().unwrap_or_else(|e| e.into_inner()),
+            &delivered_response,
+            sent_so_far,
+        );
+        channel_impl
+            .finalize_draft("chat-1", "draft-1", &final_text, false)
+            .await
+            .unwrap();
+
+        let emitted = channel_impl.emitted_paragraphs.lock().await;
+        assert_eq!(
+            emitted.as_slice(),
+            [
+                narration.trim().to_string(),
+                answer.to_string(),
+                stop_reason.to_string(),
+            ],
+            "the already-streamed narration and body stay put and the stop reason is flushed last"
+        );
+        assert_eq!(
+            emitted.iter().filter(|m| m.as_str() == stop_reason).count(),
+            1,
+            "the complete stop reason must be delivered exactly once"
+        );
+    }
+
+    /// The Matrix MultiMessage finalizer shares the same `text[sent_so_far..]`
+    /// confirmed-offset flush, so it needs the same guarantee: dropping a
+    /// streamed leading narration from the canonical response must not strand
+    /// the trailing stop reason.
+    #[tokio::test]
+    async fn multi_message_finalization_delivers_stop_reason_when_final_sanitizer_drops_narration_matrix()
+     {
+        use zeroclaw_runtime::agent::loop_::StreamDelta;
+
+        let channel_impl = Arc::new(DraftRecordingChannel::multi_message_cumulative("matrix"));
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let narration = "Checked the linked calendars.\n\n";
+        let answer = "You have two overlapping meetings on Tuesday.";
+        let stop_reason = "Stopped early because the tool budget was exhausted.";
+        let body = format!("{answer}\n\n{stop_reason}");
+        let delivered_response = body.clone();
+
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        tx.send(StreamDelta::Text(narration.to_string()))
+            .await
+            .unwrap();
+        tx.send(StreamDelta::Text(body.clone())).await.unwrap();
+        drop(tx);
+
+        let streamed_text = Arc::new(Mutex::new(String::new()));
+        run_draft_updater_with_leak_detection(
+            channel,
+            "chat-1".to_string(),
+            "draft-1".to_string(),
+            no_tools(),
+            Arc::clone(&streamed_text),
+            zeroclaw_config::schema::LeakDetectionConfig::default(),
+            OutboundContentFormat::Markdown,
+            false,
+            None,
+            String::new(),
+            rx,
+        )
+        .await;
+
+        let sent_so_far = channel_impl
+            .multi_message_confirmed_offset("chat-1", "draft-1")
+            .await;
+        let final_text = cumulative_multi_message_final_text(
+            &streamed_text.lock().unwrap_or_else(|e| e.into_inner()),
+            &delivered_response,
+            sent_so_far,
+        );
+        channel_impl
+            .finalize_draft("chat-1", "draft-1", &final_text, false)
+            .await
+            .unwrap();
+
+        let emitted = channel_impl.emitted_paragraphs.lock().await;
+        assert_eq!(
+            emitted.as_slice(),
+            [
+                narration.trim().to_string(),
+                answer.to_string(),
+                stop_reason.to_string(),
+            ],
+            "the already-streamed narration and body stay put and the stop reason is flushed last"
+        );
+        assert_eq!(
+            emitted.iter().filter(|m| m.as_str() == stop_reason).count(),
+            1,
+            "the complete stop reason must be delivered exactly once"
+        );
+    }
+
+    /// End-to-end held-paragraph credential regression through the REAL final
+    /// sanitizer and the cumulative finalization harness. A credential arrives
+    /// in the paragraph MultiMessage is still holding (no trailing `\n\n`), so
+    /// it was never confirmed live. The production updater redacts every draft
+    /// frame (leak detection on the streaming boundary), the production final
+    /// sanitizer redacts the canonical response, and finalization must deliver
+    /// the redacted held paragraph exactly once — never the raw credential and
+    /// never a duplicated intro.
+    #[tokio::test]
+    async fn multi_message_finalization_delivers_redacted_held_paragraph_from_real_sanitizer() {
+        use zeroclaw_runtime::agent::loop_::StreamDelta;
+
+        let leaked = "Temporary key: AKIAABCDEFGHIJKLMNOP"; // gitleaks:allow
+        let raw_response = format!("Safe intro.\n\n{leaked} Rotate it later.");
+        for channel_name in ["discord", "matrix"] {
+            let channel_impl = Arc::new(DraftRecordingChannel::multi_message_cumulative(
+                channel_name,
+            ));
+            let channel: Arc<dyn Channel> = channel_impl.clone();
+            let (tx, rx) = tokio::sync::mpsc::channel(4);
+            tx.send(StreamDelta::Text(raw_response.clone()))
+                .await
+                .unwrap();
+            drop(tx);
+
+            let streamed = Arc::new(Mutex::new(String::new()));
+            run_draft_updater_with_leak_detection(
+                channel,
+                "chat-1".to_string(),
+                "draft-1".to_string(),
+                no_tools(),
+                Arc::clone(&streamed),
+                zeroclaw_config::schema::LeakDetectionConfig::default(),
+                OutboundContentFormat::Markdown,
+                false,
+                None,
+                String::new(),
+                rx,
+            )
+            .await;
+
+            let frames = channel_impl.draft_updates.lock().await;
+            assert!(
+                frames.iter().all(|frame| !frame.contains(leaked)),
+                "{channel_name} transport received a credential-bearing draft: {frames:?}"
+            );
+            drop(frames);
+
+            // The REAL final sanitizer produces the canonical response — no
+            // manually supplied canonical string.
+            let delivered_response = sanitize_channel_response_with_leak_detection(
+                &raw_response,
+                &[],
+                &zeroclaw_config::schema::LeakDetectionConfig::default(),
+            );
+            assert!(
+                !delivered_response.contains(leaked),
+                "{channel_name}: the final sanitizer must redact the credential"
+            );
+            let intro = "Safe intro.\n\n";
+            assert!(
+                delivered_response.starts_with(intro),
+                "{channel_name}: sanitizer unexpectedly rewrote the confirmed intro: {delivered_response:?}"
+            );
+
+            let sent_so_far = channel_impl
+                .multi_message_confirmed_offset("chat-1", "draft-1")
+                .await;
+            assert_eq!(
+                sent_so_far,
+                intro.len(),
+                "{channel_name}: only the intro paragraph is confirmed; the credential paragraph is held"
+            );
+            let final_text = cumulative_multi_message_final_text(
+                &streamed.lock().unwrap_or_else(|e| e.into_inner()),
+                &delivered_response,
+                sent_so_far,
+            );
+            assert!(
+                !final_text.contains(leaked),
+                "{channel_name}: reconciliation must not resurrect the redacted credential"
+            );
+
+            channel_impl
+                .finalize_draft("chat-1", "draft-1", &final_text, false)
+                .await
+                .unwrap();
+
+            let emitted = channel_impl.emitted_paragraphs.lock().await;
+            assert_eq!(
+                emitted.len(),
+                2,
+                "{channel_name}: intro plus redacted held paragraph, exactly once each: {emitted:?}"
+            );
+            assert_eq!(emitted[0], "Safe intro.");
+            assert_eq!(
+                emitted[1],
+                delivered_response[intro.len()..].trim(),
+                "{channel_name}: the held paragraph must be delivered in its finally-sanitized form"
+            );
+            assert!(
+                emitted[1].contains("[REDACTED"),
+                "{channel_name}: the held paragraph must carry the redaction marker: {:?}",
+                emitted[1]
+            );
+            assert!(
+                emitted.iter().all(|m| !m.contains(leaked)),
+                "{channel_name}: the raw credential must never reach the transport: {emitted:?}"
+            );
+        }
+    }
+
+    /// End-to-end trailing-newline regression through the REAL final sanitizer
+    /// and the cumulative finalization harness. The stream ends on a paragraph
+    /// delimiter, so every paragraph is confirmed live; the final sanitizer
+    /// trims that trailing whitespace from the canonical response. That
+    /// coordinate-only divergence must not replay the final paragraph at
+    /// finalization.
+    #[tokio::test]
+    async fn multi_message_finalization_does_not_replay_final_paragraph_after_trailing_newline() {
+        use zeroclaw_runtime::agent::loop_::StreamDelta;
+
+        let raw_response = "First point.\n\nSecond point.\n\n";
+        for channel_name in ["discord", "matrix"] {
+            let channel_impl = Arc::new(DraftRecordingChannel::multi_message_cumulative(
+                channel_name,
+            ));
+            let channel: Arc<dyn Channel> = channel_impl.clone();
+            let (tx, rx) = tokio::sync::mpsc::channel(4);
+            tx.send(StreamDelta::Text("First point.\n\n".to_string()))
+                .await
+                .unwrap();
+            tx.send(StreamDelta::Text("Second point.\n\n".to_string()))
+                .await
+                .unwrap();
+            drop(tx);
+
+            let streamed = Arc::new(Mutex::new(String::new()));
+            run_draft_updater_with_leak_detection(
+                channel,
+                "chat-1".to_string(),
+                "draft-1".to_string(),
+                no_tools(),
+                Arc::clone(&streamed),
+                zeroclaw_config::schema::LeakDetectionConfig::default(),
+                OutboundContentFormat::Markdown,
+                false,
+                None,
+                String::new(),
+                rx,
+            )
+            .await;
+
+            // The REAL final sanitizer trims the trailing paragraph delimiter
+            // from the canonical response.
+            let delivered_response = sanitize_channel_response(raw_response, &[]);
+            assert_eq!(
+                delivered_response, "First point.\n\nSecond point.",
+                "precondition: final sanitization trims only trailing whitespace here"
+            );
+
+            let sent_so_far = channel_impl
+                .multi_message_confirmed_offset("chat-1", "draft-1")
+                .await;
+            let final_text = cumulative_multi_message_final_text(
+                &streamed.lock().unwrap_or_else(|e| e.into_inner()),
+                &delivered_response,
+                sent_so_far,
+            );
+            channel_impl
+                .finalize_draft("chat-1", "draft-1", &final_text, false)
+                .await
+                .unwrap();
+
+            let emitted = channel_impl.emitted_paragraphs.lock().await;
+            assert_eq!(
+                emitted.as_slice(),
+                ["First point.".to_string(), "Second point.".to_string()],
+                "{channel_name}: trailing-newline divergence must not replay the final paragraph"
+            );
+        }
+    }
+
+    /// Coordinate contract of the confirmed-offset remap: verified prefixes
+    /// keep their offset, a rewrite floors to the last delivered paragraph
+    /// boundary, and the result always lands on a char boundary of the frame.
+    #[test]
+    fn remap_confirmed_offset_floors_rewrites_to_delivered_paragraph_boundaries() {
+        // A frame that still starts with the confirmed bytes keeps the offset.
+        assert_eq!(remap_confirmed_offset("a\n\nb\n\n", "a\n\nb\n\ncc"), 6);
+        // A rewrite inside the second confirmed paragraph floors to the end
+        // of the first: the rewritten paragraph is re-emitted, the intact one
+        // is not replayed.
+        assert_eq!(
+            remap_confirmed_offset("a\n\nSECRET\n\n", "a\n\n[REDACTED]\n\nrest"),
+            3
+        );
+        // A rewrite inside the first paragraph remaps to the frame start.
+        assert_eq!(
+            remap_confirmed_offset("SECRET\n\n", "[REDACTED]\n\nrest"),
+            0
+        );
+        // A restarted accumulation (DraftEvent::Clear) remaps to the start.
+        assert_eq!(remap_confirmed_offset("old text\n\n", "new"), 0);
+        // Multibyte text before the rewrite: the remap lands on the paragraph
+        // delimiter, which is always a char boundary.
+        let confirmed = "héllo\n\nSECRET\n\n";
+        let frame = "héllo\n\n[REDACTED]\n\n";
+        let remapped = remap_confirmed_offset(confirmed, frame);
+        assert_eq!(remapped, "héllo\n\n".len());
+        assert!(frame.is_char_boundary(remapped));
+    }
+
+    /// Cross-delta redaction regression for the confirmed-offset bookkeeping
+    /// (reviewer-blocking finding on the MultiMessage adapters): a
+    /// private-key-shaped secret spans two deltas. The first delta ends
+    /// mid-key after the adapter has already confirmed paragraphs — including
+    /// one inside the not-yet-redactable key region — so when the second
+    /// delta completes the key, the streaming redactor rewrites bytes BEFORE
+    /// the confirmed offset while the redacted frame stays LONGER than that
+    /// stale offset. A byte-count coordinate never notices (the old
+    /// `text.len() < sent_so_far` reset cannot fire) and slices the terminal
+    /// text at a dead coordinate; the confirmed-prefix bookkeeping must remap
+    /// and deliver the complete stop reason exactly once, with no replay of
+    /// confirmed paragraphs and no key material on the transport.
+    async fn assert_multi_message_cross_delta_redaction_remaps_confirmed_offset(
+        channel_name: &'static str,
+    ) {
+        use zeroclaw_runtime::agent::loop_::StreamDelta;
+
+        let intro = "Checked the requested deployment records.\n\n";
+        let key_body = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQ"; // gitleaks:allow
+        let summary = "The stored credential is ready to rotate.";
+        let stop_reason = "Stopped after reaching the tool-call limit.";
+        let key_marker = "-----BEGIN PRIVATE KEY-----";
+        // Keep content after the marker paragraph so streaming sanitization
+        // does not trim its `\n\n` delimiter before the adapter sees it. That
+        // makes the incomplete-key paragraph genuinely confirmed on the first
+        // frame; the later closing marker then redacts across that coordinate.
+        let delta_one = format!("{intro}{key_marker}\n\nKey bytes continue:");
+        let delta_two =
+            format!("\n{key_body}\n-----END PRIVATE KEY-----\n\n{summary}\n\n{stop_reason}");
+        let raw_response = format!("{delta_one}{delta_two}");
+
+        let channel_impl = Arc::new(DraftRecordingChannel::multi_message_cumulative(
+            channel_name,
+        ));
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        tx.send(StreamDelta::Text(delta_one.clone())).await.unwrap();
+        tx.send(StreamDelta::Text(delta_two)).await.unwrap();
+        drop(tx);
+
+        let streamed = Arc::new(Mutex::new(String::new()));
+        run_draft_updater_with_leak_detection(
+            channel,
+            "chat-1".to_string(),
+            "draft-1".to_string(),
+            no_tools(),
+            Arc::clone(&streamed),
+            zeroclaw_config::schema::LeakDetectionConfig::default(),
+            OutboundContentFormat::Markdown,
+            false,
+            None,
+            String::new(),
+            rx,
+        )
+        .await;
+
+        // Scenario preconditions: the first frame still carries the incomplete
+        // key marker (an incomplete key is not yet redactable), no frame ever
+        // carries key material, and the redaction on the second frame rewrote
+        // bytes before the previously confirmed offset while leaving the frame
+        // longer than that stale offset.
+        {
+            let frames = channel_impl.draft_updates.lock().await;
+            assert_eq!(
+                frames.first().map(String::as_str),
+                Some(delta_one.as_str()),
+                "{channel_name}: the first frame must pass through unredacted mid-key"
+            );
+            assert!(
+                frames.iter().all(|f| !f.contains(key_body)),
+                "{channel_name}: no draft frame may carry key material: {frames:?}"
+            );
+        }
+        let stale_offset = intro.len() + key_marker.len() + "\n\n".len();
+        let redacted_frame = streamed.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        assert!(
+            !redacted_frame.contains(key_body) && redacted_frame.contains("[REDACTED"),
+            "{channel_name}: the completed key must be redacted on the second frame: {redacted_frame:?}"
+        );
+        assert!(
+            !redacted_frame.as_bytes().starts_with(delta_one.as_bytes()),
+            "{channel_name}: the redaction must rewrite bytes before the confirmed offset"
+        );
+        assert!(
+            redacted_frame.len() > stale_offset,
+            "{channel_name}: the redacted frame must stay longer than the stale offset — a \
+             length-based reset never fires in this scenario"
+        );
+
+        // The confirmed offset must have been remapped onto the redacted
+        // frame: the intro stays confirmed, the rewritten paragraph was
+        // re-emitted in redacted form, and only the held stop reason remains.
+        let sent_so_far = channel_impl
+            .multi_message_confirmed_offset("chat-1", "draft-1")
+            .await;
+        assert_eq!(
+            &redacted_frame[sent_so_far..],
+            stop_reason,
+            "{channel_name}: after the remap, exactly the stop reason must remain unconfirmed"
+        );
+
+        // Finalize through the REAL final sanitizer and the production
+        // reconciliation, exactly as the neighboring regressions do.
+        let delivered_response = sanitize_channel_response_with_leak_detection(
+            &raw_response,
+            &[],
+            &zeroclaw_config::schema::LeakDetectionConfig::default(),
+        );
+        assert!(
+            !delivered_response.contains(key_body),
+            "{channel_name}: the final sanitizer must redact the credential"
+        );
+        let final_text =
+            cumulative_multi_message_final_text(&redacted_frame, &delivered_response, sent_so_far);
+        assert!(
+            !final_text.contains(key_body),
+            "{channel_name}: reconciliation must not resurrect the redacted key"
+        );
+        channel_impl
+            .finalize_draft("chat-1", "draft-1", &final_text, false)
+            .await
+            .unwrap();
+
+        let redacted_paragraph = redacted_frame[intro.len()..]
+            .split("\n\n")
+            .next()
+            .expect("the redacted frame keeps a paragraph where the key started")
+            .to_string();
+        let emitted = channel_impl.emitted_paragraphs.lock().await;
+        assert_eq!(
+            emitted.as_slice(),
+            [
+                intro.trim().to_string(),
+                key_marker.to_string(),
+                redacted_paragraph,
+                summary.to_string(),
+                stop_reason.to_string(),
+            ],
+            "{channel_name}: confirmed paragraphs stay put, the rewritten paragraph is re-sent \
+             in redacted form, and the complete stop reason arrives last untruncated"
+        );
+        assert_eq!(
+            emitted.iter().filter(|m| m.as_str() == stop_reason).count(),
+            1,
+            "{channel_name}: the complete stop reason must be delivered exactly once"
+        );
+        assert_eq!(
+            emitted
+                .iter()
+                .filter(|m| m.as_str() == intro.trim())
+                .count(),
+            1,
+            "{channel_name}: the confirmed intro paragraph must not be replayed"
+        );
+        assert!(
+            emitted.iter().all(|m| !m.contains(key_body)),
+            "{channel_name}: key material must never reach the transport: {emitted:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn multi_message_redaction_spanning_deltas_remaps_confirmed_offset_discord() {
+        assert_multi_message_cross_delta_redaction_remaps_confirmed_offset("discord").await;
+    }
+
+    #[tokio::test]
+    async fn multi_message_redaction_spanning_deltas_remaps_confirmed_offset_matrix() {
+        assert_multi_message_cross_delta_redaction_remaps_confirmed_offset("matrix").await;
+    }
+
+    /// A suffix shared only inside a word is not evidence that any canonical
+    /// paragraph was delivered. Exercise the cumulative updater/finalizer
+    /// boundary used by both real adapters: `base` must remain pending even
+    /// though the confirmed `database` paragraph ends with the same bytes.
+    async fn assert_multi_message_word_suffix_is_not_confirmed(channel_name: &'static str) {
+        use zeroclaw_runtime::agent::loop_::StreamDelta;
+
+        let confirmed_prefix = "I looked at database\n\n";
+        let leading_paragraph = "base";
+        let stop_reason = "Stopped after reaching the tool-call limit.";
+        let delivered_response = format!("{leading_paragraph}\n\n{stop_reason}");
+        let channel_impl = Arc::new(DraftRecordingChannel::multi_message_cumulative(
+            channel_name,
+        ));
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        tx.send(StreamDelta::Text(format!("{confirmed_prefix}held tail")))
+            .await
+            .unwrap();
+        drop(tx);
+
+        let streamed = Arc::new(Mutex::new(String::new()));
+        run_draft_updater_with_leak_detection(
+            channel,
+            "chat-1".to_string(),
+            "draft-1".to_string(),
+            no_tools(),
+            Arc::clone(&streamed),
+            zeroclaw_config::schema::LeakDetectionConfig::default(),
+            OutboundContentFormat::Markdown,
+            false,
+            None,
+            String::new(),
+            rx,
+        )
+        .await;
+
+        let sent_so_far = channel_impl
+            .multi_message_confirmed_offset("chat-1", "draft-1")
+            .await;
+        assert_eq!(sent_so_far, confirmed_prefix.len());
+        let final_text = cumulative_multi_message_final_text(
+            &streamed.lock().unwrap_or_else(|e| e.into_inner()),
+            &delivered_response,
+            sent_so_far,
+        );
+        assert_eq!(
+            &final_text[sent_so_far..],
+            delivered_response,
+            "{channel_name}: a word-internal suffix must not count as a delivered paragraph"
+        );
+
+        channel_impl
+            .finalize_draft("chat-1", "draft-1", &final_text, false)
+            .await
+            .unwrap();
+        let emitted = channel_impl.emitted_paragraphs.lock().await;
+        assert_eq!(
+            emitted.as_slice(),
+            [
+                confirmed_prefix.trim().to_string(),
+                delivered_response.clone(),
+            ],
+            "{channel_name}: the complete canonical response must be emitted exactly once"
+        );
+        assert_eq!(
+            emitted
+                .iter()
+                .filter(|message| message.as_str() == delivered_response)
+                .count(),
+            1,
+            "{channel_name}: the canonical response must not be dropped or replayed"
+        );
+        assert!(
+            emitted[1].starts_with(leading_paragraph),
+            "{channel_name}: the real leading canonical paragraph must remain intact"
+        );
+    }
+
+    #[tokio::test]
+    async fn multi_message_word_suffix_is_not_confirmed_discord() {
+        assert_multi_message_word_suffix_is_not_confirmed("discord").await;
+    }
+
+    #[tokio::test]
+    async fn multi_message_word_suffix_is_not_confirmed_matrix() {
+        assert_multi_message_word_suffix_is_not_confirmed("matrix").await;
+    }
+
+    /// Overlapping paragraph delimiters must all be reconciliation candidates.
+    /// With three newlines, the longest candidate has three trailing newlines
+    /// and does not match the confirmed prefix, while the overlapping candidate
+    /// one byte earlier is the exact already-delivered `answer\n\n` paragraph.
+    async fn assert_multi_message_overlapping_delimiter_is_confirmed(channel_name: &'static str) {
+        use zeroclaw_runtime::agent::loop_::StreamDelta;
+
+        let confirmed_prefix = "narration\n\nanswer\n\n";
+        let delivered_response = "answer\n\n\nstop";
+        let channel_impl = Arc::new(DraftRecordingChannel::multi_message_cumulative(
+            channel_name,
+        ));
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        tx.send(StreamDelta::Text(format!("{confirmed_prefix}held tail")))
+            .await
+            .unwrap();
+        drop(tx);
+
+        let streamed = Arc::new(Mutex::new(String::new()));
+        run_draft_updater_with_leak_detection(
+            channel,
+            "chat-1".to_string(),
+            "draft-1".to_string(),
+            no_tools(),
+            Arc::clone(&streamed),
+            zeroclaw_config::schema::LeakDetectionConfig::default(),
+            OutboundContentFormat::Markdown,
+            false,
+            None,
+            String::new(),
+            rx,
+        )
+        .await;
+
+        let sent_so_far = channel_impl
+            .multi_message_confirmed_offset("chat-1", "draft-1")
+            .await;
+        assert_eq!(sent_so_far, confirmed_prefix.len());
+        let final_text = cumulative_multi_message_final_text(
+            &streamed.lock().unwrap_or_else(|e| e.into_inner()),
+            delivered_response,
+            sent_so_far,
+        );
+        assert_eq!(final_text, "narration\n\nanswer\n\n\nstop");
+
+        channel_impl
+            .finalize_draft("chat-1", "draft-1", &final_text, false)
+            .await
+            .unwrap();
+        let emitted = channel_impl.emitted_paragraphs.lock().await;
+        assert_eq!(
+            emitted.as_slice(),
+            [
+                "narration".to_string(),
+                "answer".to_string(),
+                "stop".to_string(),
+            ],
+            "{channel_name}: the confirmed answer paragraph must not be replayed"
+        );
+        assert_eq!(
+            emitted
+                .iter()
+                .filter(|message| message.as_str() == "answer")
+                .count(),
+            1,
+            "{channel_name}: the answer paragraph must be delivered exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn multi_message_overlapping_delimiter_is_confirmed_discord() {
+        assert_multi_message_overlapping_delimiter_is_confirmed("discord").await;
+    }
+
+    #[tokio::test]
+    async fn multi_message_overlapping_delimiter_is_confirmed_matrix() {
+        assert_multi_message_overlapping_delimiter_is_confirmed("matrix").await;
+    }
+
     #[tokio::test]
     async fn draft_updater_uses_legacy_tool_status_and_ignores_reasoning() {
         use zeroclaw_runtime::agent::loop_::StreamDelta;
@@ -50929,7 +57208,7 @@ Done."#;
     }
 
     #[test]
-    fn build_channel_system_prompt_refreshes_legacy_datetime_section_to_date_only() {
+    fn build_channel_system_prompt_strips_legacy_datetime_keeps_project_note() {
         let prompt = build_channel_system_prompt(
             "Base.\n\n## Current Date\n\nProject note, not generated date context.\n\n## Current Date & Time\n\n2026-01-01 01:02:03 (UTC)\n\n## Runtime\n\nHost: old\n",
             "mattermost",
@@ -50940,43 +57219,66 @@ Done."#;
         assert!(prompt.contains("Project note, not generated date context."));
         assert!(!prompt.contains("## Current Date & Time"));
         assert!(!prompt.contains("01:02:03"));
-        let generated_section = prompt
-            .split("## Runtime")
-            .next()
-            .expect("prompt should contain runtime section before generated date assertion");
-        let date_line = generated_section
-            .rsplit("## Current Date\n\n")
-            .next()
-            .and_then(|rest| rest.lines().next())
-            .expect("current date section should have a date line");
-        assert_eq!(
-            &date_line[..10],
-            &chrono::Local::now().format("%Y-%m-%d").to_string()
-        );
         assert!(
-            date_line[10..].starts_with(" ("),
-            "date line should contain only date plus UTC offset: {date_line}"
+            !prompt.contains(&chrono::Local::now().format("%Y-%m-%d").to_string()),
+            "system prompt must not inject today's date (#11704): {prompt}"
         );
     }
 
     #[test]
-    fn build_channel_system_prompt_refreshes_current_date_section() {
+    fn build_channel_system_prompt_strips_date_after_multibyte_text() {
+        let prompt = build_channel_system_prompt(
+            "\u{e9}\n## Current Date\n\n2026-01-01 (+00:00)\n\n## Runtime\n\nHost: old\n",
+            "mattermost",
+            None,
+        );
+
+        assert!(prompt.starts_with('\u{e9}'));
+        assert!(!prompt.contains("## Current Date"));
+        assert!(!prompt.contains("2026-01-01 (+00:00)"));
+    }
+
+    #[test]
+    fn build_channel_system_prompt_keeps_dated_project_note() {
+        let prompt = build_channel_system_prompt(
+            "Base.\n\n## Current Date\n\n2026-10-16 is the project launch date.\n\n## Runtime\n\nHost: old\n",
+            "mattermost",
+            None,
+        );
+
+        assert!(prompt.contains("## Current Date\n\n2026-10-16 is the project launch date."));
+    }
+
+    #[test]
+    fn generated_date_line_matches_only_builder_output() {
+        assert!(is_generated_date_line("2026-01-01 (+00:00)"));
+        assert!(is_generated_date_line("2026-01-01 01:02:03 (UTC)"));
+        assert!(!is_generated_date_line(
+            "2026-10-16 is the project launch date."
+        ));
+        assert!(!is_generated_date_line("2026-01-01 (+00:00)\nmore notes"));
+        assert!(!is_generated_date_line(
+            "Project note, not generated date context."
+        ));
+    }
+
+    #[test]
+    fn build_channel_system_prompt_strips_generated_current_date_section() {
         let prompt = build_channel_system_prompt(
             "Base.\n\n## Current Date\n\n2026-01-01 (+00:00)\n\n## Runtime\n\nHost: old\n",
             "mattermost",
             None,
         );
 
-        assert!(prompt.contains("## Current Date\n\n"));
+        assert!(!prompt.contains("## Current Date"));
         assert!(!prompt.contains("2026-01-01 (+00:00)"));
-        let date_line = prompt
-            .split("## Current Date\n\n")
-            .nth(1)
-            .and_then(|rest| rest.lines().next())
-            .expect("current date section should have a date line");
-        assert_eq!(
-            &date_line[..10],
-            &chrono::Local::now().format("%Y-%m-%d").to_string()
+        assert!(
+            prompt.starts_with("Base.\n\n## Runtime\n"),
+            "next heading keeps its blank line: {prompt:?}"
+        );
+        assert!(
+            !prompt.contains(&chrono::Local::now().format("%Y-%m-%d").to_string()),
+            "system prompt must not inject today's date (#11704): {prompt}"
         );
     }
 
@@ -51539,6 +57841,10 @@ Done."#;
             single_ctx: None,
             sop_engine: None,
             sop_audit: None,
+            agent_lifecycle: Default::default(),
+            execution_capability: None,
+            turn_generations: Arc::new(HashMap::new()),
+            sop_driver_sink: None,
         }
     }
 
@@ -51582,6 +57888,7 @@ Done."#;
             admission_policy: SopAdmissionPolicy::Parallel,
             max_pending_approvals: 0,
             agent: None,
+            decision: None,
         }
     }
 
@@ -51637,11 +57944,15 @@ Done."#;
         };
         let engine = Arc::new(Mutex::new(engine));
         let router = AgentRouter {
+            sop_driver_sink: None,
             by_agent: Arc::new(HashMap::new()),
             owner_by_channel_key: Arc::new(HashMap::new()),
             single_ctx: None,
             sop_engine: Some(Arc::clone(&engine)),
             sop_audit: None,
+            agent_lifecycle: Default::default(),
+            execution_capability: None,
+            turn_generations: Arc::new(HashMap::new()),
         };
         (router, engine, run_id)
     }
@@ -52245,8 +58556,8 @@ mod omitted_feature_tests {
                 ..Default::default()
             },
         );
-        let config_arc = Arc::new(RwLock::new(config));
-        let channels = collect_configured_channels(&config_arc, "test", &[], None, None);
+        let config_arc = zeroclaw_config::live::LiveConfig::new(config).handle();
+        let channels = collect_configured_channels(&config_arc, "test", &[], None, None, None);
         assert!(
             channels.iter().all(|c| c.display_name != "Telegram"),
             "Telegram must be absent from collect_configured_channels when \

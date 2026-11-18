@@ -389,7 +389,7 @@ fn matches_filter(event: &LogEvent, filter: &LogFilter, needle: Option<&str>) ->
         return false;
     }
     for (key, want) in &filter.field_eq {
-        if event.zeroclaw.get(key) != Some(want.as_str()) {
+        if !matches_attribution_field(event, key, want) {
             return false;
         }
     }
@@ -406,6 +406,34 @@ fn matches_filter(event: &LogEvent, filter: &LogFilter, needle: Option<&str>) ->
         }
     }
     true
+}
+
+/// Match a canonical attribution field, with a narrow compatibility bridge for
+/// SOP events written before `zeroclaw.sop_run_id` existed. Older transition
+/// events stored the run id in `attributes.run_id`; the audit start/finish rows
+/// only included it in their fixed-format message. Keeping this compatibility
+/// here means every consumer (gateway, CLI, web, and TUI) sees the same history.
+fn matches_attribution_field(event: &LogEvent, key: &str, want: &str) -> bool {
+    if event.zeroclaw.get(key) == Some(want) {
+        return true;
+    }
+    if key != "sop_run_id" {
+        return false;
+    }
+    if event
+        .attributes
+        .get("run_id")
+        .and_then(serde_json::Value::as_str)
+        == Some(want)
+    {
+        return true;
+    }
+
+    let Some(message) = event.message.as_deref() else {
+        return false;
+    };
+    let audit_prefix = format!("SOP audit: run {want} ");
+    message.starts_with(&audit_prefix)
 }
 
 pub fn find_event_by_id(path: &Path, id: &str) -> Result<Option<LogEvent>> {
@@ -1634,6 +1662,40 @@ mod tests {
     }
 
     #[test]
+    fn filter_by_sop_run_id_includes_canonical_and_legacy_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("trace.jsonl");
+        let run_id = "run-123-0001";
+
+        let mut canonical = make_event("invoke", None);
+        canonical.zeroclaw.set("sop_run_id", run_id);
+        let mut legacy_attributes = make_event("complete", None);
+        legacy_attributes.attributes = serde_json::json!({ "run_id": run_id, "step": 1 });
+        let mut legacy_audit = make_event("note", None);
+        legacy_audit.message = Some(format!(
+            "SOP audit: run {run_id} finished with status completed"
+        ));
+        let unrelated = make_event("unrelated", None);
+        write_jsonl(
+            &path,
+            &[canonical, legacy_attributes, legacy_audit, unrelated],
+        );
+
+        let filter = LogFilter {
+            field_eq: BTreeMap::from([("sop_run_id".into(), run_id.into())]),
+            ..Default::default()
+        };
+        let page = load_page(&path, &filter, 10).unwrap();
+        assert_eq!(page.events.len(), 3);
+
+        let missing = LogFilter {
+            field_eq: BTreeMap::from([("sop_run_id".into(), "run-missing".into())]),
+            ..Default::default()
+        };
+        assert!(load_page(&path, &missing, 10).unwrap().events.is_empty());
+    }
+
+    #[test]
     fn filter_by_native_trace_id() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("trace.jsonl");
@@ -1945,6 +2007,45 @@ mod tests {
             all_seen_ids, expected,
             "byte-offset cursor must walk the file in newest-first page order without losing or duplicating events"
         );
+    }
+
+    #[test]
+    fn line_offset_pagination_uses_utf8_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("trace.jsonl");
+        let messages = ["开始🦀", "e\u{301}\n第二行", "🌍终点"];
+        let events: Vec<_> = messages
+            .iter()
+            .enumerate()
+            .map(|(index, message)| {
+                let mut event = make_event("test", None);
+                event.id = format!("evt-{index}");
+                event.message = Some((*message).to_string());
+                event
+            })
+            .collect();
+        write_jsonl(&path, &events);
+        let bytes = std::fs::read(&path).unwrap();
+        let line_ends: Vec<_> = bytes
+            .iter()
+            .enumerate()
+            .filter_map(|(index, byte)| (*byte == b'\n').then_some((index + 1) as u64))
+            .collect();
+        assert_eq!(line_ends.len(), messages.len());
+
+        let mut filter = LogFilter::default();
+        for index in (0..messages.len()).rev() {
+            let page = load_page(&path, &filter, 1).unwrap();
+            assert_eq!(page.events.len(), 1);
+            assert_eq!(page.events[0].id, events[index].id);
+            assert_eq!(page.events[0].message.as_deref(), Some(messages[index]));
+            assert_eq!(page.next_cursor_line_offset, Some(line_ends[index]));
+            filter.until_line_offset = page.next_cursor_line_offset;
+        }
+        let exhausted = load_page(&path, &filter, 1).unwrap();
+        assert!(exhausted.events.is_empty());
+        assert!(exhausted.at_end);
+        assert!(exhausted.next_cursor_line_offset.is_none());
     }
 
     #[test]

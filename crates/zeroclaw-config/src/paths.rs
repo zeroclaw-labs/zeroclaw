@@ -4,6 +4,16 @@
 
 use std::path::{Component, Path, PathBuf};
 
+/// The memory snapshot at the workspace root: a human-readable export of the
+/// agent's core memories, which an agent re-hydrates its store from.
+///
+/// It lives here rather than in `zeroclaw-memory` because two tiers need the
+/// same name: the memory crate writes the file, and
+/// [`crate::agent_bundle`] has to recognize it to keep memory out of an
+/// exported bundle. `zeroclaw_memory::snapshot::SNAPSHOT_FILENAME` is this
+/// constant.
+pub const MEMORY_SNAPSHOT_FILE: &str = "MEMORY_SNAPSHOT.md";
+
 /// Resolve `.` and `..` components lexically — never touches the
 /// filesystem. Sufficient for "stays inside `<root>`" reasoning where the
 /// path may not yet exist.

@@ -89,16 +89,17 @@ impl Chord {
     pub fn display(&self) -> String {
         let mut parts: Vec<&str> = Vec::new();
         let mut literal_word_control = false;
-        if self.primary {
-            parts.push(if cfg!(target_os = "macos") {
-                "⌘"
-            } else {
-                "Ctrl"
-            });
-        }
         if self.modifiers.contains(KeyModifiers::CONTROL) {
             literal_word_control = true;
             parts.push("Ctrl");
+        }
+        if self.primary {
+            #[cfg(target_os = "macos")]
+            parts.push("⌘");
+            #[cfg(not(target_os = "macos"))]
+            if !self.modifiers.contains(KeyModifiers::CONTROL) {
+                parts.push("Ctrl");
+            }
         }
         if self.modifiers.contains(KeyModifiers::SUPER) {
             parts.push(if cfg!(target_os = "macos") {
@@ -286,7 +287,10 @@ fn effective_event_modifiers(code: KeyCode, m: KeyModifiers) -> KeyModifiers {
 }
 
 fn strip_redundant_shift(code: KeyCode, mut m: KeyModifiers) -> KeyModifiers {
-    if matches!(code, KeyCode::Char(_)) {
+    // Enhanced keyboard protocols can report Shift with a lowercase glyph.
+    // That Shift distinguishes undo from redo; it is not encoded in the glyph.
+    // Keep the existing compatibility for already-shifted glyphs and symbols.
+    if matches!(code, KeyCode::Char(c) if !c.is_lowercase()) {
         m.remove(KeyModifiers::SHIFT);
     }
     m
@@ -349,7 +353,7 @@ mod tests {
     #[test]
     fn explicit_shift_char_chord_still_matches_bare_event() {
         // A user who hand-bound `shift+?` as a workaround keeps working:
-        // SHIFT is redundant on a char key, so it's stripped from both
+        // SHIFT is redundant on this glyph, so it's stripped from both
         // sides of the comparison.
         let chord = Chord::with(KeyCode::Char('?'), KeyModifiers::SHIFT);
         let event = KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE);
@@ -358,13 +362,39 @@ mod tests {
 
     #[test]
     fn shift_still_discriminates_non_char_keys() {
-        // Shift is only redundant on character glyphs. On named keys it
+        // On named keys Shift is not encoded in the glyph, and it
         // genuinely changes the chord, so Shift+Up must not match Up.
         let chord = Chord::shift(KeyCode::Up);
         let bare = KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
         let shifted = KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT);
         assert!(!chord.matches(&bare));
         assert!(chord.matches(&shifted));
+    }
+
+    #[test]
+    fn lowercase_shift_distinguishes_matching_and_ownership() {
+        for plain in [Chord::char('z'), Chord::ctrl('z'), Chord::primary('z')] {
+            let mut shifted = plain.clone();
+            shifted.modifiers.insert(KeyModifiers::SHIFT);
+            let plain_event = KeyEvent::new(plain.code, plain.modifiers_for_event());
+            let shifted_event = KeyEvent::new(shifted.code, shifted.modifiers_for_event());
+            assert!(plain.matches(&plain_event));
+            assert!(shifted.matches(&shifted_event));
+            assert!(!plain.matches(&shifted_event));
+            assert!(!shifted.matches(&plain_event));
+            assert!(!plain.same_key(&shifted));
+            assert!(!shifted.same_key(&plain));
+            assert_eq!(Chord::from_str(&shifted.wire()).unwrap(), shifted);
+        }
+
+        // Traditional terminal events may omit Shift once it is in the glyph.
+        for c in ['Z', '?', ' '] {
+            let plain = Chord::char(c);
+            let shifted = Chord::shift(KeyCode::Char(c));
+            assert!(plain.same_key(&shifted));
+            assert!(plain.matches(&KeyEvent::new(plain.code, KeyModifiers::SHIFT)));
+            assert!(shifted.matches(&KeyEvent::new(plain.code, KeyModifiers::NONE)));
+        }
     }
 
     #[test]
@@ -446,8 +476,21 @@ mod tests {
 
     #[cfg(not(target_os = "macos"))]
     #[test]
-    fn display_ctrl_on_non_darwin() {
+    fn session_shortcut_display_ctrl_on_non_darwin() {
         assert_eq!(Chord::ctrl('k').display(), "Ctrl+k");
+        assert_eq!(
+            Chord::with_primary(KeyCode::Char('1'), KeyModifiers::CONTROL).display(),
+            "Ctrl+1"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn session_shortcut_display_ctrl_primary_on_darwin() {
+        assert_eq!(
+            Chord::with_primary(KeyCode::Char('1'), KeyModifiers::CONTROL).display(),
+            "Ctrl+⌘+1"
+        );
     }
 
     #[cfg(target_os = "macos")]

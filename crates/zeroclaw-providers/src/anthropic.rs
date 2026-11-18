@@ -19,16 +19,16 @@ use zeroclaw_config::schema::CacheTtl;
 const TEMPERATURE_DEFAULT: f64 = 1.0;
 /// Anthropic's public API endpoint. Overrideable via `model_providers.<name>.base_url`.
 pub(crate) const BASE_URL: &str = "https://api.anthropic.com";
+/// Per-image ceiling for base64-encoded payloads, shared with the multimodal
+/// structural check so this adapter and the pre-dispatch resolvability count
+/// cannot drift apart on what an image may weigh (see
+/// `MAX_ENCODED_IMAGE_PAYLOAD_BYTES` in `crate::multimodal`). Anthropic
+/// documents 10 MB encoded per image for the direct API; its separate
+/// per-request budget (32 MB across all images) is not enforced here.
+use crate::multimodal::MAX_ENCODED_IMAGE_PAYLOAD_BYTES;
 use crate::safeguard_notice::{
     SafeguardFallbackKind, SafeguardFallbackNotice, commit_safeguard_fallback,
 };
-/// Anthropic's documented per-image ceiling for the direct API: 10 MB
-/// **base64-encoded**. Measured on the encoded payload length, unlike the
-/// multimodal config's `max_image_size_mb`, which bounds decoded bytes. MB is
-/// read as 1024 * 1024 here, the same way `max_image_size_mb` reads it, so the
-/// two ceilings stay consistent with each other. Anthropic's separate
-/// per-request budget (32 MB across all images) is not enforced here.
-const MAX_ENCODED_IMAGE_PAYLOAD_BYTES: usize = 10 * 1024 * 1024;
 /// Replaces a raw `data:<media type>;base64,<payload>` run that survived marker
 /// parsing and would otherwise sit in a text position. See
 /// [`AnthropicModelProvider::sweep_residual_image_data`].
@@ -89,6 +89,7 @@ pub struct AnthropicModelProvider {
     alias: String,
     credential: Option<String>,
     base_url: String,
+    single_tool_rounds_supported: bool,
     max_tokens: u32,
     timeout_secs: u64,
     /// Opt-in Anthropic server-side fallback targets, sent as the native
@@ -101,6 +102,8 @@ pub struct AnthropicModelProvider {
     /// One TTL per request by design. Defaults to the 5-minute API
     /// default.
     cache_ttl: CacheTtl,
+    /// Sent as `output_config.effort` on every request; `None` omits it.
+    effort: Option<String>,
     /// Memoized cleaned tool schemas: each registered schema is cleaned once
     /// per provider instance (not once per request) and the byte-stable
     /// result keeps the `cache_control` tools block identical across
@@ -165,6 +168,14 @@ struct NativeChatRequest {
     /// only; `None` (the default) keeps the request byte-identical to today.
     #[serde(skip_serializing_if = "Option::is_none")]
     fallbacks: Option<Vec<NativeFallbackEntry>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_config: Option<OutputConfig>,
+}
+
+/// The native `output_config` object: how deeply the model thinks.
+#[derive(Debug, Serialize)]
+struct OutputConfig {
+    effort: String,
 }
 
 /// One entry in the native `fallbacks` array: a model Anthropic may serve
@@ -183,8 +194,8 @@ struct NativeThinkingConfig {
     #[serde(rename = "type")]
     kind: &'static str,
     /// Fixed token budget for `enabled` thinking. Absent for `adaptive`
-    /// thinking, which lets the model pace itself — adaptive-only models
-    /// (Opus 4.7, Fable 5.1) reject `enabled` with HTTP 400.
+    /// thinking, which lets the model pace itself — models numbered 4.7 or
+    /// later reject `enabled` with HTTP 400.
     #[serde(skip_serializing_if = "Option::is_none")]
     budget_tokens: Option<u32>,
     /// Anthropic's `thinking.display` beta field. `None` leaves the key out
@@ -267,21 +278,66 @@ fn anthropic_beta_features(
     }
 }
 
-/// Anthropic thinking request styles. Adaptive-only models (Opus 4.7,
-/// Fable 5.1) reject the fixed-budget `enabled` shape with HTTP 400 and
-/// require `adaptive`; budget-based models require `enabled`.
+/// Anthropic thinking request styles. Models numbered 4.7 or later reject
+/// the fixed-budget `enabled` shape with HTTP 400 and require `adaptive`;
+/// earlier models, and IDs with no such version, require `enabled`.
+///
+/// Shared crate-wide: the OpenAI-compatible passthrough builder resolves the
+/// same style so gateway requests match the native provider's shapes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AnthropicThinkingStyle {
+pub(crate) enum AnthropicThinkingStyle {
     Budget,
     Adaptive,
 }
 
-fn anthropic_thinking_style(model: &str) -> AnthropicThinkingStyle {
-    if model.contains("claude-opus-4-7") || model.contains("claude-fable-5-1") {
-        AnthropicThinkingStyle::Adaptive
-    } else {
-        AnthropicThinkingStyle::Budget
+/// Adaptive thinking for every Claude model numbered 4.7 or later, whatever
+/// the family. Anthropic rejects `enabled` + `budget_tokens` with HTTP 400
+/// on those models. 4.6 and earlier, and IDs that carry no such version
+/// (Mythos Preview, non-Claude models), keep the budget shape.
+///
+/// The version is the first `claude-<family>-<major>[-<minor>]` token.
+/// Text before it (gateway prefixes, `anthropic.`, `us.`) and after it
+/// (snapshot dates, `-v1:0`, `@...`, `-latest`, `-fast`) is ignored, so a
+/// decorated ID resolves the same way as the bare name.
+pub(crate) fn anthropic_thinking_style(model: &str) -> AnthropicThinkingStyle {
+    match claude_model_version(model) {
+        Some(version) if version >= (4, 7) => AnthropicThinkingStyle::Adaptive,
+        _ => AnthropicThinkingStyle::Budget,
     }
+}
+
+/// `(major, minor)` of the first `claude-<family>-<major>[-<minor>]` token
+/// in a model ID. A missing minor is `0`.
+fn claude_model_version(model: &str) -> Option<(u32, u32)> {
+    const FAMILIES: [&str; 5] = ["opus", "sonnet", "haiku", "fable", "mythos"];
+    model.match_indices("claude-").find_map(|(at, token)| {
+        let rest = &model[at + token.len()..];
+        let family = FAMILIES
+            .iter()
+            .copied()
+            .find(|family| rest.starts_with(family))?;
+        let rest = rest[family.len()..].strip_prefix('-')?;
+        let (major, rest) = leading_version_number(rest)?;
+        // A minor is one or two digits after `-` or `.`. An eight-digit
+        // snapshot date is not a minor, and neither is a later component
+        // such as the `2` in `claude-opus-4-5-2`.
+        let minor = rest
+            .strip_prefix('-')
+            .or_else(|| rest.strip_prefix('.'))
+            .and_then(leading_version_number)
+            .map_or(0, |(minor, _)| minor);
+        Some((major, minor))
+    })
+}
+
+/// Splits a leading run of one or two ASCII digits off `s`. A longer run is
+/// a date or build number, not a version component.
+fn leading_version_number(s: &str) -> Option<(u32, &str)> {
+    let digits = s.bytes().take_while(u8::is_ascii_digit).count();
+    if !(1..=2).contains(&digits) {
+        return None;
+    }
+    Some((s[..digits].parse().ok()?, &s[digits..]))
 }
 
 /// Characters legal between `data:` and `;base64,` in a data URI header: the
@@ -372,7 +428,8 @@ enum ToolResultBlock {
 }
 
 /// The tool-result envelope this crate's runtime writes for a native tool call:
-/// `{"tool_call_id": …, "content": "…"}`. Parsed, never serialized.
+/// `{"tool_call_id": …, "content": …, "attachments": …}`. Parsed, never
+/// serialized.
 struct ToolResultEnvelope {
     /// `None` when `tool_call_id` is present but not a string — a shape the
     /// current turn engine does not emit but restored or externally supplied
@@ -620,13 +677,20 @@ pub struct AnthropicBuilder {
     alias: String,
     credential: Option<String>,
     base_url: Option<String>,
+    single_tool_rounds_supported: bool,
     max_tokens: Option<u32>,
     timeout_secs: Option<u64>,
     server_fallback_models: Vec<String>,
     cache_ttl: Option<CacheTtl>,
+    effort: Option<String>,
 }
 
 impl AnthropicBuilder {
+    pub(crate) fn single_tool_rounds_supported(mut self, supported: bool) -> Self {
+        self.single_tool_rounds_supported = supported;
+        self
+    }
+
     /// Explicit API credential. Whitespace-only inputs are normalized
     /// to `None` so a stray `Some("   ")` from config cannot produce a
     /// bogus `Bearer    ` header.
@@ -674,11 +738,20 @@ impl AnthropicBuilder {
         self
     }
 
+    /// Effort level sent as `output_config.effort` on every request (`low`,
+    /// `medium`, `high`, `xhigh`, `max`). Defaults to unset, which leaves
+    /// requests byte-identical to today.
+    pub fn effort(mut self, effort: Option<&str>) -> Self {
+        self.effort = effort.map(ToString::to_string);
+        self
+    }
+
     pub fn build(self) -> AnthropicModelProvider {
         AnthropicModelProvider {
             alias: self.alias,
             credential: self.credential,
             base_url: self.base_url.unwrap_or_else(|| BASE_URL.to_string()),
+            single_tool_rounds_supported: self.single_tool_rounds_supported,
             max_tokens: self
                 .max_tokens
                 .unwrap_or(zeroclaw_api::model_provider::BASELINE_MAX_TOKENS),
@@ -687,6 +760,7 @@ impl AnthropicBuilder {
                 .unwrap_or(zeroclaw_api::model_provider::BASELINE_TIMEOUT_SECS),
             server_fallback_models: self.server_fallback_models,
             cache_ttl: self.cache_ttl.unwrap_or_default(),
+            effort: self.effort,
             schema_cache: zeroclaw_api::schema::SchemaCleanCache::new(),
         }
     }
@@ -700,11 +774,17 @@ impl AnthropicModelProvider {
             alias: alias.to_string(),
             credential: None,
             base_url: None,
+            single_tool_rounds_supported: false,
             max_tokens: None,
             timeout_secs: None,
             server_fallback_models: Vec::new(),
             cache_ttl: None,
+            effort: None,
         }
+    }
+
+    fn output_config(&self) -> Option<OutputConfig> {
+        self.effort.clone().map(|effort| OutputConfig { effort })
     }
 
     fn is_setup_token(token: &str) -> bool {
@@ -955,38 +1035,60 @@ impl AnthropicModelProvider {
         format!("[{count} image(s) omitted: unsupported or oversized image reference]")
     }
 
-    /// Builds `tool_result.content` from tool-result text, turning image
-    /// markers into nested `image` blocks.
+    /// Builds `tool_result.content` from a tool result's body and its
+    /// declared attachments, turning the image attachments into nested
+    /// `image` blocks.
     ///
-    /// Multimodal preparation normalizes `[IMAGE:<path>]` to a `data:` URI
-    /// whenever the provider reports `vision`. Before nested blocks existed the
-    /// payload was serialized into a text position and billed as prose — tens of
-    /// thousands of tokens the model reads as gibberish rather than as an image.
+    /// Multimodal preparation normalizes a declared local-path attachment to
+    /// a `data:` URI whenever the provider reports `vision`. Before nested
+    /// blocks existed the payload was serialized into a text position and
+    /// billed as prose — tens of thousands of tokens the model reads as
+    /// gibberish rather than as an image.
     ///
-    /// References that fail the shared structural check are dropped and counted
-    /// in an omission note instead. With no markers at all the original string
-    /// is returned unchanged, so the common path is byte-identical to before.
+    /// The body is never scanned for markers: a carrier's images are exactly
+    /// its declared attachments, and a carrier's body — DECLARED or LEGACY —
+    /// is delivered verbatim, quoted data URIs included: no residual sweep,
+    /// no rewrite. Only attachment metadata is validated: references that
+    /// fail the shared structural check are dropped and counted in an
+    /// omission note appended after the untouched body. A LEGACY carrier
+    /// (`None`: no `attachments` key, a non-array `attachments` value, or
+    /// raw non-JSON tool text) declared nothing, so nothing is validated,
+    /// omitted, or swept either.
     ///
     /// Block order is text first, then images, matching Anthropic's own
     /// documented example. (The user-message arm emits images first and text
     /// after; the two arms differ, and the ordering rule Anthropic enforces is
     /// about `tool_result` blocks relative to other blocks in a message, not
     /// about text relative to image inside a block list.)
-    fn tool_result_content(content: &str) -> ToolResultContent {
-        let (cleaned, refs) = crate::multimodal::parse_image_markers(content);
+    fn tool_result_content(
+        content: &str,
+        attachments: Option<&[zeroclaw_api::media::RenderedMarker]>,
+    ) -> ToolResultContent {
+        let Some(attachments) = attachments else {
+            // A legacy carrier is delivered as its bytes: it never declared
+            // attachments, so nothing is validated, omitted, or swept — the
+            // body is text, quoted data URIs included.
+            return ToolResultContent::Text(content.to_string());
+        };
+        // Image references come only from the declared attachments; the body
+        // is never scanned for markers.
+        let refs: Vec<String> = attachments
+            .iter()
+            .filter(|marker| marker.kind == zeroclaw_api::media::MarkerKind::Image)
+            .map(|marker| marker.target.clone())
+            .collect();
         if refs.is_empty() {
-            // The early return still sweeps. An unterminated marker yields zero
-            // references and copies its payload verbatim into the cleaned text,
-            // so returning here without sweeping would leave raw base64 in a
-            // text position on exactly the path that has no references.
-            return ToolResultContent::Text(Self::sweep_residual_image_data(content).into_owned());
+            // Declared with zero image attachments: the body is verbatim,
+            // data URIs included. Nothing was declared, so nothing is
+            // validated, omitted, or swept.
+            return ToolResultContent::Text(content.to_string());
         }
 
         let (sources, omitted) = Self::deliverable_image_sources(&refs);
-        // Unloadable placeholders stay in `cleaned` as prose and never reach
-        // `refs`, so the count only covers references that were recognised and
-        // still could not be sent.
-        let text = Self::text_with_omission_note(&cleaned, omitted);
+        // Rejected references drop out of the block list; the count only
+        // covers attachments that were declared and still could not be sent.
+        // The body itself stays verbatim: only the omission note is appended.
+        let text = Self::text_with_note(content, omitted);
 
         if sources.is_empty() {
             return ToolResultContent::Text(text);
@@ -1025,20 +1127,8 @@ impl AnthropicModelProvider {
         (sources, omitted)
     }
 
-    /// Sweeps residual raw base64 out of marker-cleaned prose and appends the
-    /// omission note when references were rejected.
-    ///
-    /// The tool arm uses this unconditionally, through
-    /// [`Self::tool_result_content`], its only caller: that input is machine
-    /// output, where a quoted data URI is far rarer than a truncated
-    /// screenshot. The user arm sweeps only marker-carrying text and then calls
-    /// [`Self::text_with_note`] directly — see its call site.
-    fn text_with_omission_note(cleaned: &str, omitted: usize) -> String {
-        Self::text_with_note(&Self::sweep_residual_image_data(cleaned), omitted)
-    }
-
-    /// Appends the omission note to text that has already been swept, or that
-    /// deliberately was not.
+    /// Appends the omission note to text that was deliberately not swept
+    /// (declared carrier bodies pass verbatim; only the note is added).
     fn text_with_note(text: &str, omitted: usize) -> String {
         if omitted == 0 {
             return text.to_string();
@@ -1073,12 +1163,14 @@ impl AnthropicModelProvider {
     /// a truncated marker was never a reference. Keeping it out of the count is
     /// what stops the sweep from double-reporting.
     ///
-    /// On the tool arm, prose that legitimately quotes a data URI is
-    /// rewritten too. That is accepted: a documentation-style example in a tool
-    /// result is far rarer than a truncated screenshot, and the replacement says
-    /// what happened. The user arm does **not** accept that trade — a person
-    /// asking what a data URI decodes to must keep their own text — so it runs
-    /// this only on marker-carrying messages, where residue is possible at all.
+    /// This runs in exactly one place: the user arm, on marker-carrying text
+    /// that is not a tool-result carrier at all. Channel media pipelines
+    /// write data-URI markers into ordinary user text, and a truncated or
+    /// undeliverable marker can leave its payload behind as residue; that is
+    /// the residue this sweep exists to remove. No tool-result carrier body
+    /// — declared or legacy — is ever swept: a carrier's images are exactly
+    /// its declared attachments, and its body is delivered as the tool wrote
+    /// it, quoted data URIs included.
     ///
     /// **What this does not cover**, stated so a reader does not credit it with
     /// more than it does:
@@ -1087,8 +1179,8 @@ impl AnthropicModelProvider {
     ///   character, such as `data:imagé/png;base64,…`. Such a header cannot come
     ///   from this crate's preparation code, and loosening the header rule would
     ///   let any `data:` in prose claim a `;base64,` further down the string.
-    /// - Assistant message text. This runs on the tool-result arm
-    ///   unconditionally and on the user arm only for marker-carrying messages.
+    /// - Assistant message text. This runs only on the user arm, for
+    ///   marker-carrying messages that are not tool-result carriers.
     ///   Assistant content is copied to the wire verbatim, so a data URI the
     ///   model itself wrote is left as the model wrote it.
     /// - A bare data URI a user typed with no image marker anywhere in the
@@ -1393,17 +1485,29 @@ impl AnthropicModelProvider {
                 "tool" => {
                     let envelope = Self::parse_tool_result_envelope(&msg.content);
                     // The tool's own output: the envelope's `content` when this
-                    // is an envelope at all, the raw message otherwise.
+                    // is an envelope at all, the raw message otherwise. A
+                    // legacy envelope or raw text carries no declared
+                    // attachments, so its body is text and never scanned.
                     let carrier = match &envelope {
                         Some(parsed) => parsed.content.as_str(),
                         None => msg.content.as_str(),
                     };
+                    // Declaredness and attachments come from the one
+                    // classifier, not from this arm's own envelope read:
+                    // `None` is a legacy carrier (no declaration); `Some` is
+                    // declared, empty list included. The distinction decides
+                    // whether the body may keep the legacy residual sweep.
+                    let parts = zeroclaw_api::tool_carrier::classify("tool", &msg.content);
+                    let attachments = parts
+                        .as_ref()
+                        .filter(|parts| parts.declared)
+                        .map(|parts| parts.attachments.as_slice());
                     let tool_msg = if let Some(tool_use_id) = envelope
                         .as_ref()
                         .and_then(|parsed| parsed.tool_use_id.clone())
                     {
                         run.mark_answered(&tool_use_id);
-                        Self::tool_result_message(tool_use_id, carrier)
+                        Self::tool_result_message(tool_use_id, carrier, attachments)
                     } else if carrier.trim().is_empty() {
                         // No payload and no usable id: there is nothing to
                         // deliver, so the call is left to the backfill below.
@@ -1418,7 +1522,7 @@ impl AnthropicModelProvider {
                         // `backfill_orphaned_tool_uses` from putting a "tool
                         // result missing" stub next to the real result.
                         run.mark_answered(&tool_use_id);
-                        Self::tool_result_message(tool_use_id, carrier)
+                        Self::tool_result_message(tool_use_id, carrier, attachments)
                     } else {
                         // Zero candidates, or two or more: nothing proves which
                         // call this answers. A `tool_result` structurally requires
@@ -1465,8 +1569,15 @@ impl AnthropicModelProvider {
                     // turn before it.
                     run.end();
 
-                    // Parse image markers from user message content
-                    let (text, image_refs) = crate::multimodal::parse_image_markers(&msg.content);
+                    // Carrier-aware user parsing, the same helper every other
+                    // adapter uses: a declared prompt carrier contributes only
+                    // its declared image attachments and its body survives
+                    // verbatim; a legacy carrier contributes nothing; ordinary
+                    // user text keeps its marker behavior. The raw
+                    // `parse_image_markers` call this replaced let a carrier
+                    // body quoting a marker attach the file it named.
+                    let (text, image_refs) =
+                        crate::multimodal::parse_user_message_image_refs(&msg.content);
                     let mut content_blocks: Vec<NativeContentOut> = Vec::new();
                     let mut omitted = 0usize;
 
@@ -1487,12 +1598,37 @@ impl AnthropicModelProvider {
                                 Ok((mime, payload)) => {
                                     (mime.to_ascii_lowercase(), payload.to_string())
                                 }
-                                Err(_) => {
+                                Err(reason) => {
+                                    ::zeroclaw_log::record!(
+                                        WARN,
+                                        ::zeroclaw_log::Event::new(
+                                            module_path!(),
+                                            ::zeroclaw_log::Action::Note
+                                        )
+                                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                        .with_attrs(::serde_json::json!({
+                                            "error": format!("{reason}"),
+                                            "error_key": "anthropic_image_marker_malformed_data_uri",
+                                        })),
+                                        "dropping image marker: data URI failed the structural check"
+                                    );
                                     omitted += 1;
                                     continue;
                                 }
                             }
                         } else {
+                            ::zeroclaw_log::record!(
+                                WARN,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note
+                                )
+                                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                .with_attrs(::serde_json::json!({
+                                    "error_key": "anthropic_image_source_missing",
+                                })),
+                                "dropping image marker: source is neither a data URI nor an existing file"
+                            );
                             // Counted exactly like the tool-result arm. The
                             // multimodal normalizer is the only component
                             // allowed to turn a file reference into inline
@@ -1517,27 +1653,37 @@ impl AnthropicModelProvider {
                         });
                     }
 
-                    // The sweep runs only on marker-carrying text here. Residual
-                    // base64 in a user message can only come from this crate's
-                    // own marker normalization, so a message with no marker at
+                    // The sweep runs only on marker-carrying text that is
+                    // not a tool-result carrier at all — ordinary user text.
+                    // Residual base64 in a user message can only come from
+                    // this crate's own
+                    // marker normalization, so a message with no marker at
                     // all has nothing residual in it — and sweeping anyway
-                    // deleted a data URI the author quoted on purpose ("what does
-                    // this data:application/json;base64,… decode to?"). The tool
-                    // arm still sweeps unconditionally: its input is machine
-                    // output, not something a person typed.
+                    // deleted a data URI the author quoted on purpose ("what
+                    // does this data:application/json;base64,… decode to?").
+                    // A prompt carrier quoting marker syntax in its body is
+                    // a tool reading source text — the ordinary shape of a
+                    // file-reading result — so its body is delivered
+                    // verbatim whether it declared its attachments or not,
+                    // the same rule the native arm applies.
                     //
                     // The test is on `text`, the *cleaned* content, not on
-                    // `msg.content`. `parse_image_markers` lifts a loadable marker
-                    // out whole, so its payload is already gone from `text` and
+                    // `msg.content`. For ordinary user text,
+                    // `parse_image_markers` lifts a loadable marker out
+                    // whole, so its payload is already gone from `text` and
                     // its prefix with it; only the two shapes that can leave
-                    // residue — an unterminated marker, and a terminated one whose
-                    // reference will not load — are copied through verbatim, and
-                    // both keep the `[IMAGE:` prefix. Testing the raw message
-                    // instead opened the gate for the entire text of any message
-                    // that merely attached an image, so a quoted data URI sitting
-                    // beside a working attachment was swept — the exact case this
-                    // gate exists to prevent, one message shape over.
-                    let swept = if crate::multimodal::carries_image_marker(&text) {
+                    // residue — an unterminated marker, and a terminated one
+                    // whose reference will not load — are copied through
+                    // verbatim, and both keep the `[IMAGE:` prefix. Testing
+                    // the raw message instead opened the gate for the entire
+                    // text of any message that merely attached an image, so
+                    // a quoted data URI sitting beside a working attachment
+                    // was swept — the exact case this gate exists to
+                    // prevent, one message shape over.
+                    let swept = if zeroclaw_api::tool_carrier::classify(&msg.role, &msg.content)
+                        .is_none()
+                        && crate::multimodal::carries_image_marker(&text)
+                    {
                         Self::sweep_residual_image_data(&text)
                     } else {
                         Cow::Borrowed(text.as_str())
@@ -1617,13 +1763,19 @@ impl AnthropicModelProvider {
     }
 
     /// A user-role message carrying one `tool_result` for `tool_use_id`, which is
-    /// how Anthropic represents a tool's answer.
-    fn tool_result_message(tool_use_id: String, carrier: &str) -> NativeMessage {
+    /// how Anthropic represents a tool's answer. `attachments` is `None` for a
+    /// legacy carrier (no declaration at the fixed position), `Some` for a
+    /// declared one (including an empty declaration).
+    fn tool_result_message(
+        tool_use_id: String,
+        carrier: &str,
+        attachments: Option<&[zeroclaw_api::media::RenderedMarker]>,
+    ) -> NativeMessage {
         NativeMessage {
             role: "user".to_string(),
             content: vec![NativeContentOut::ToolResult {
                 tool_use_id,
-                content: Self::tool_result_content(carrier),
+                content: Self::tool_result_content(carrier, attachments),
                 cache_control: None,
             }],
         }
@@ -2721,14 +2873,19 @@ impl AnthropicModelProvider {
                     return;
                 }
                 "error" => {
-                    let msg = event
-                        .get("error")
+                    let error = event.get("error");
+                    let msg = error
                         .and_then(|e| e.get("message"))
                         .and_then(|m| m.as_str())
                         .unwrap_or("unknown streaming error");
-                    let _ = tx
-                        .send(Err(StreamError::ModelProvider(msg.to_string())))
-                        .await;
+                    // Carry the machine-readable type (`overloaded_error`,
+                    // `rate_limit_error`, ...) so downstream retry
+                    // classification can match on it.
+                    let msg = match error.and_then(|e| e.get("type")).and_then(|t| t.as_str()) {
+                        Some(error_type) => format!("{error_type}: {msg}"),
+                        None => msg.to_string(),
+                    };
+                    let _ = tx.send(Err(StreamError::ModelProvider(msg))).await;
                     return;
                 }
                 _ => {}
@@ -2741,6 +2898,18 @@ impl AnthropicModelProvider {
 
 #[async_trait]
 impl ModelProvider for AnthropicModelProvider {
+    fn supports_single_tool_rounds(&self, _model: &str) -> bool {
+        self.single_tool_rounds_supported
+    }
+
+    fn supports_exact_request_replay(
+        &self,
+        request: crate::traits::ChatRequest<'_>,
+        model: &str,
+    ) -> bool {
+        request.thinking.is_some() || self.server_fallbacks_for(model, None).is_none()
+    }
+
     fn default_temperature(&self) -> f64 {
         TEMPERATURE_DEFAULT
     }
@@ -2808,6 +2977,7 @@ impl ModelProvider for AnthropicModelProvider {
             stream: None,
             thinking: None,
             fallbacks,
+            output_config: self.output_config(),
         };
 
         let mut request = self
@@ -2822,7 +2992,12 @@ impl ModelProvider for AnthropicModelProvider {
         let response = request.send().await?;
 
         if !response.status().is_success() {
-            return Err(super::api_error("Anthropic", response).await);
+            let status = response.status();
+            let error = super::api_error("Anthropic", response).await;
+            return Err(anyhow::Error::new(crate::reliable::ProviderHttpError::new(
+                status,
+                error.to_string(),
+            )));
         }
 
         let chat_response: NativeChatResponse = response.json().await?;
@@ -2842,6 +3017,22 @@ impl ModelProvider for AnthropicModelProvider {
         request: ProviderChatRequest<'_>,
         model: &str,
         temperature: Option<f64>,
+    ) -> anyhow::Result<ProviderChatResponse> {
+        self.chat_with_tool_round_policy(
+            request,
+            model,
+            temperature,
+            zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
+        )
+        .await
+    }
+
+    async fn chat_with_tool_round_policy(
+        &self,
+        request: ProviderChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        policy: zeroclaw_api::model_provider::ToolRoundPolicy,
     ) -> anyhow::Result<ProviderChatResponse> {
         commit_safeguard_fallback(None);
         if let Some(refusal) = crate::reliable::take_stream_refusal_recovery() {
@@ -2877,7 +3068,15 @@ impl ModelProvider for AnthropicModelProvider {
             .flatten();
         let native_tools = self.convert_tools(request.tools);
         let tools_count = native_tools.as_ref().map_or(0, Vec::len);
-        let tool_choice = if native_tools.is_some() {
+        let tool_choice = if tools_count > 0
+            && policy == zeroclaw_api::model_provider::ToolRoundPolicy::Single
+            && self.supports_single_tool_rounds(model)
+        {
+            Some(serde_json::json!({
+                "type": tool_choice_override.as_deref().unwrap_or("auto"),
+                "disable_parallel_tool_use": true,
+            }))
+        } else if native_tools.is_some() {
             tool_choice_override.map(|tc| serde_json::json!({ "type": tc }))
         } else {
             None
@@ -2933,6 +3132,7 @@ impl ModelProvider for AnthropicModelProvider {
             stream: None,
             thinking: thinking_config,
             fallbacks,
+            output_config: self.output_config(),
         };
 
         let req = self
@@ -2947,7 +3147,12 @@ impl ModelProvider for AnthropicModelProvider {
             .send()
             .await?;
         if !response.status().is_success() {
-            return Err(super::api_error("Anthropic", response).await);
+            let status = response.status();
+            let error = super::api_error("Anthropic", response).await;
+            return Err(anyhow::Error::new(crate::reliable::ProviderHttpError::new(
+                status,
+                error.to_string(),
+            )));
         }
 
         let native_response: NativeChatResponse = response.json().await?;
@@ -3065,6 +3270,23 @@ impl ModelProvider for AnthropicModelProvider {
         temperature: Option<f64>,
         options: StreamOptions,
     ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
+        self.stream_chat_with_tool_round_policy(
+            request,
+            model,
+            temperature,
+            options,
+            zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
+        )
+    }
+
+    fn stream_chat_with_tool_round_policy(
+        &self,
+        request: ProviderChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        options: StreamOptions,
+        policy: zeroclaw_api::model_provider::ToolRoundPolicy,
+    ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
         commit_safeguard_fallback(None);
         if !options.enabled {
             return stream::once(async { Ok(StreamEvent::Final) }).boxed();
@@ -3095,7 +3317,15 @@ impl ModelProvider for AnthropicModelProvider {
             .flatten();
         let native_tools = self.convert_tools(request.tools);
         let tools_count = native_tools.as_ref().map_or(0, Vec::len);
-        let tool_choice = if native_tools.is_some() {
+        let tool_choice = if tools_count > 0
+            && policy == zeroclaw_api::model_provider::ToolRoundPolicy::Single
+            && self.supports_single_tool_rounds(model)
+        {
+            Some(serde_json::json!({
+                "type": tool_choice_override.as_deref().unwrap_or("auto"),
+                "disable_parallel_tool_use": true,
+            }))
+        } else if native_tools.is_some() {
             tool_choice_override.map(|tc| serde_json::json!({ "type": tc }))
         } else {
             None
@@ -3141,6 +3371,7 @@ impl ModelProvider for AnthropicModelProvider {
                 // Streaming path (incl. this thinking `stream: None` request):
                 // never opts into server-side fallback.
                 fallbacks: None,
+                output_config: self.output_config(),
             };
             // Serialize eagerly so the request body is owned and `'static`
             // across the async boundary.
@@ -3171,17 +3402,27 @@ impl ModelProvider for AnthropicModelProvider {
                 {
                     req = req.header("anthropic-beta", beta_features);
                 }
-                let response = req
-                    .send()
-                    .await
-                    .map_err(|e| StreamError::Http(e.to_string()))?;
+                let response = req.send().await.map_err(|e| {
+                    // Tag the transport's verdict at the send site: a
+                    // connect failure gets the typed variant Reliable reads
+                    // for its recovery exception. See the variant's doc for
+                    // the redirect limit.
+                    if e.is_connect() {
+                        StreamError::ConnectFailed(e.to_string())
+                    } else {
+                        StreamError::Http(e.to_string())
+                    }
+                })?;
                 if !response.status().is_success() {
                     let status = response.status();
                     let body = response
                         .text()
                         .await
                         .unwrap_or_else(|_| format!("HTTP error: {status}"));
-                    return Err(StreamError::ModelProvider(format!("{status}: {body}")));
+                    return Err(StreamError::HttpStatus {
+                        status: status.as_u16(),
+                        message: super::sanitize_api_error(&body),
+                    });
                 }
                 let parsed: NativeChatResponse = response
                     .json()
@@ -3262,6 +3503,7 @@ impl ModelProvider for AnthropicModelProvider {
             thinking: thinking_config,
             // Streaming never opts into server-side fallback.
             fallbacks: None,
+            output_config: self.output_config(),
         };
 
         let body = match Self::build_streaming_request(&native_request) {
@@ -3322,9 +3564,17 @@ impl ModelProvider for AnthropicModelProvider {
             let response = match tokio::time::timeout(phase_timeout, req.send()).await {
                 Ok(Ok(r)) => r,
                 Ok(Err(e)) => {
-                    let _ = tx
-                        .send(Err(StreamError::Http(super::format_error_chain(&e))))
-                        .await;
+                    // Tag the transport's verdict at the send site: a connect
+                    // failure gets the typed variant Reliable reads for its
+                    // recovery exception (the variant's doc carries the
+                    // redirect limit). Any other send error keeps the
+                    // unclassified Http form.
+                    let error = if e.is_connect() {
+                        StreamError::ConnectFailed(super::format_error_chain(&e))
+                    } else {
+                        StreamError::Http(super::format_error_chain(&e))
+                    };
+                    let _ = tx.send(Err(error)).await;
                     return;
                 }
                 Err(_) => {
@@ -3349,9 +3599,10 @@ impl ModelProvider for AnthropicModelProvider {
                     ),
                 };
                 let _ = tx
-                    .send(Err(StreamError::ModelProvider(format!(
-                        "{status}: {error}"
-                    ))))
+                    .send(Err(StreamError::HttpStatus {
+                        status: status.as_u16(),
+                        message: super::sanitize_api_error(&error),
+                    }))
                     .await;
                 return;
             }
@@ -3399,6 +3650,11 @@ mod tests {
     /// A second canonical payload, so a test with two images can tell them
     /// apart. Decodes to a JPEG SOI + APP0 header.
     const CANONICAL_JPEG_B64: &str = "/9j/4AAQ";
+    /// A decodable 1x1 PNG, IDAT and IEND included: unlike
+    /// `CANONICAL_PNG_B64` (a splitter fixture that stops after IDAT), this
+    /// one survives preparation's pixel-level content validation, so tests
+    /// that declare an attachment the preparation path must LOAD use this.
+    const DECODABLE_PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
     /// The omission note for a single rejected reference, spelled out once so
     /// the tests pin the exact prompt text the model reads.
     const OMISSION_NOTE_ONE: &str =
@@ -3623,6 +3879,36 @@ mod tests {
     /// A history whose last message is a JSON tool-result envelope answering a
     /// single `tool_use`, so the converted `tool_result` is well-formed and the
     /// cache breakpoint lands on it.
+    /// History whose tool result declares image attachments at the carrier's
+    /// fixed position, the shape the runtime writes.
+    fn history_with_tool_attachments(body: &str, images: &[String]) -> Vec<ChatMessage> {
+        let attachments: Vec<serde_json::Value> = images
+            .iter()
+            .map(|target| serde_json::json!({"kind": "image", "target": target}))
+            .collect();
+        vec![
+            ChatMessage::system("You take screenshots."),
+            ChatMessage::user("take a screenshot"),
+            ChatMessage::assistant(
+                serde_json::json!({
+                    "content": "",
+                    "tool_calls": [
+                        {"id": "toolu_screenshot", "name": "screenshot", "arguments": "{}"}
+                    ]
+                })
+                .to_string(),
+            ),
+            ChatMessage::tool(
+                serde_json::json!({
+                    "tool_call_id": "toolu_screenshot",
+                    "content": body,
+                    "attachments": attachments,
+                })
+                .to_string(),
+            ),
+        ]
+    }
+
     fn history_with_tool_result(result_text: &str) -> Vec<ChatMessage> {
         vec![
             ChatMessage::system("You take screenshots."),
@@ -3737,6 +4023,66 @@ data: {\"type\":\"message_stop\"}\n\n"
             Some(42),
             "cache_read_input_tokens from message_start"
         );
+    }
+
+    #[tokio::test]
+    async fn stream_error_frame_carries_error_type() {
+        use std::io::Cursor;
+
+        let bytes: &[u8] = b"event: error\n\
+data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n";
+        let reader = tokio::io::BufReader::new(Cursor::new(bytes));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
+        AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx, "claude-sonnet-4-6")
+            .await;
+
+        let mut last_err = None;
+        while let Ok(Some(ev)) =
+            tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
+        {
+            if let Err(err) = ev {
+                last_err = Some(err);
+            }
+        }
+        match last_err.expect("error frame must emit a StreamError") {
+            StreamError::ModelProvider(msg) => {
+                assert_eq!(
+                    msg, "overloaded_error: Overloaded",
+                    "the machine-readable type must prefix the message so retry classification can match it"
+                );
+            }
+            other => panic!("expected ModelProvider error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_error_frame_without_type_keeps_message() {
+        use std::io::Cursor;
+
+        let bytes: &[u8] = b"event: error\n\
+data: {\"type\":\"error\",\"error\":{\"message\":\"Overloaded\"}}\n\n";
+        let reader = tokio::io::BufReader::new(Cursor::new(bytes));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
+        AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx, "claude-sonnet-4-6")
+            .await;
+
+        let mut last_err = None;
+        while let Ok(Some(ev)) =
+            tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
+        {
+            if let Err(err) = ev {
+                last_err = Some(err);
+            }
+        }
+        match last_err.expect("error frame must emit a StreamError") {
+            StreamError::ModelProvider(msg) => {
+                assert_eq!(
+                    msg, "Overloaded",
+                    "message must be unchanged when the type is absent"
+                );
+            }
+            other => panic!("expected ModelProvider error, got {other:?}"),
+        }
     }
 
     /// A reader that yields one buffer of bytes, then parks forever — models
@@ -4336,36 +4682,55 @@ data: {\"type\":\"message_stop\"}\n\n";
 
     #[test]
     fn anthropic_thinking_style_matrix() {
-        // Adaptive-only families: fixed-budget `enabled` returns 400.
-        assert_eq!(
-            anthropic_thinking_style("claude-opus-4-7"),
-            AnthropicThinkingStyle::Adaptive
-        );
-        assert_eq!(
-            anthropic_thinking_style("claude-opus-4-7-20260101"),
-            AnthropicThinkingStyle::Adaptive
-        );
-        assert_eq!(
-            anthropic_thinking_style("claude-fable-5-1"),
-            AnthropicThinkingStyle::Adaptive
-        );
-        assert_eq!(
-            anthropic_thinking_style("claude-fable-5-1-20260815"),
-            AnthropicThinkingStyle::Adaptive
-        );
-        // Budget-based families keep the `enabled` shape.
-        assert_eq!(
-            anthropic_thinking_style("claude-opus-4-6"),
-            AnthropicThinkingStyle::Budget
-        );
-        assert_eq!(
-            anthropic_thinking_style("claude-sonnet-4-6"),
-            AnthropicThinkingStyle::Budget
-        );
-        assert_eq!(
-            anthropic_thinking_style("claude-haiku-4-5"),
-            AnthropicThinkingStyle::Budget
-        );
+        // Models numbered 4.7 or later reject `enabled`. Prefixes and
+        // suffixes must not change the answer; 4.6 and earlier, and IDs
+        // with no version, keep the budget shape.
+        let cases = [
+            ("claude-opus-4-7", AnthropicThinkingStyle::Adaptive),
+            ("claude-opus-4-7-20260101", AnthropicThinkingStyle::Adaptive),
+            ("claude-opus-4-7@20260101", AnthropicThinkingStyle::Adaptive),
+            ("claude-opus-4.7", AnthropicThinkingStyle::Adaptive),
+            ("claude-opus-5", AnthropicThinkingStyle::Adaptive),
+            ("claude-opus-5-5", AnthropicThinkingStyle::Adaptive),
+            ("claude-opus-5-5-20260101", AnthropicThinkingStyle::Adaptive),
+            ("claude-opus-5-5-fast", AnthropicThinkingStyle::Adaptive),
+            (
+                "anthropic.claude-opus-4-7-v1:0",
+                AnthropicThinkingStyle::Adaptive,
+            ),
+            ("claude-fable-5", AnthropicThinkingStyle::Adaptive),
+            ("claude-fable-5-1", AnthropicThinkingStyle::Adaptive),
+            (
+                "claude-fable-5-1-20260815",
+                AnthropicThinkingStyle::Adaptive,
+            ),
+            ("claude-fable-5-2-fast", AnthropicThinkingStyle::Adaptive),
+            (
+                "claude-group/claude-fable-5",
+                AnthropicThinkingStyle::Adaptive,
+            ),
+            ("claude-mythos-5-2", AnthropicThinkingStyle::Adaptive),
+            ("claude-sonnet-5", AnthropicThinkingStyle::Adaptive),
+            ("claude-sonnet-5-5", AnthropicThinkingStyle::Adaptive),
+            ("claude-haiku-5-5", AnthropicThinkingStyle::Adaptive),
+            (
+                "us.anthropic.claude-haiku-5-5",
+                AnthropicThinkingStyle::Adaptive,
+            ),
+            ("claude-opus-4-6", AnthropicThinkingStyle::Budget),
+            // A trailing component is not the version. Reading from the end
+            // would misread this as 5.2.
+            ("claude-opus-4-5-2", AnthropicThinkingStyle::Budget),
+            ("claude-opus-4-20250514", AnthropicThinkingStyle::Budget),
+            ("claude-sonnet-4-6", AnthropicThinkingStyle::Budget),
+            ("claude-sonnet-4-6-latest", AnthropicThinkingStyle::Budget),
+            ("claude-haiku-4-5", AnthropicThinkingStyle::Budget),
+            ("claude-mythos-preview", AnthropicThinkingStyle::Budget),
+            ("gpt-4o", AnthropicThinkingStyle::Budget),
+        ];
+        for (model, expected) in cases {
+            assert_eq!(anthropic_thinking_style(model), expected, "{model}");
+        }
     }
 
     #[test]
@@ -4388,6 +4753,52 @@ data: {\"type\":\"message_stop\"}\n\n";
         assert_eq!(config.display, None);
         assert_eq!(temp, Some(1.0));
         assert_eq!(max_tokens, provider.max_tokens);
+    }
+
+    #[test]
+    fn resolve_thinking_emits_adaptive_shape_for_4_7_families_and_decorated_ids() {
+        // The config this returns is what the messages request serializes.
+        // Qualified and fast-mode IDs must not fall back to `enabled`.
+        let provider = AnthropicModelProvider::builder("test")
+            .credential(Some("test-key"))
+            .build();
+        let params = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: 10_000,
+            display: None,
+        };
+        for model in [
+            "claude-opus-5-5",
+            "claude-fable-5-2-fast",
+            "anthropic.claude-opus-4-7-v1:0",
+            "claude-sonnet-5",
+            "claude-sonnet-5-5",
+            "claude-haiku-5-5",
+        ] {
+            let (temp, config, max_tokens) =
+                provider.resolve_thinking(Some(params), Some(0.7_f64), model);
+            let config = config.unwrap_or_else(|| panic!("thinking config for {model}"));
+            assert_eq!(
+                serde_json::to_value(&config).unwrap(),
+                serde_json::json!({"type": "adaptive"}),
+                "{model} must emit adaptive with no budget"
+            );
+            assert_eq!(temp, Some(1.0), "{model}");
+            assert_eq!(max_tokens, provider.max_tokens, "{model}");
+        }
+
+        for model in [
+            "claude-opus-4-20250514",
+            "claude-mythos-preview",
+            "claude-sonnet-4-6",
+        ] {
+            let (_, config, _) = provider.resolve_thinking(Some(params), Some(0.7_f64), model);
+            let config = config.unwrap_or_else(|| panic!("thinking config for {model}"));
+            assert_eq!(
+                serde_json::to_value(&config).unwrap(),
+                serde_json::json!({"type": "enabled", "budget_tokens": 10_000}),
+                "{model} must keep the budget shape"
+            );
+        }
     }
 
     #[test]
@@ -4441,6 +4852,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             stream: None,
             thinking: None,
             fallbacks: None,
+            output_config: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("max_tokens"));
@@ -4463,6 +4875,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             stream: None,
             thinking: None,
             fallbacks: None,
+            output_config: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(
@@ -5356,6 +5769,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             stream: None,
             thinking: None,
             fallbacks: None,
+            output_config: None,
         };
 
         let json = serde_json::to_string(&req).unwrap();
@@ -5385,6 +5799,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             stream: None,
             thinking: None,
             fallbacks: None,
+            output_config: None,
         };
 
         let json = serde_json::to_string(&req).unwrap();
@@ -6355,9 +6770,10 @@ data: {\"type\":\"message_stop\"}\n\n";
             .timeout_secs(120)
             .build();
 
-        let messages = history_with_tool_result(&format!(
-            "saved screenshot [IMAGE:data:image/png;base64,{CANONICAL_PNG_B64}]"
-        ));
+        let messages = history_with_tool_attachments(
+            "saved screenshot",
+            &[format!("data:image/png;base64,{CANONICAL_PNG_B64}")],
+        );
         let tools = vec![serde_json::json!({
             "type": "function",
             "function": {
@@ -6453,10 +6869,13 @@ data: {\"type\":\"message_stop\"}\n\n";
     /// omission note, so there were zero image blocks.
     #[test]
     fn tool_result_with_several_images() {
-        let messages = history_with_tool_result(&format!(
-            "two shots [IMAGE:data:image/png;base64,{CANONICAL_PNG_B64}] \
-             and [IMAGE:data:image/jpeg;base64,{CANONICAL_JPEG_B64}]"
-        ));
+        let messages = history_with_tool_attachments(
+            "two shots",
+            &[
+                format!("data:image/png;base64,{CANONICAL_PNG_B64}"),
+                format!("data:image/jpeg;base64,{CANONICAL_JPEG_B64}"),
+            ],
+        );
 
         let (_, native_msgs) =
             AnthropicModelProvider::convert_messages(&messages, CacheTtl::default());
@@ -6499,11 +6918,14 @@ data: {\"type\":\"message_stop\"}\n\n";
     #[test]
     fn tool_result_mixes_valid_and_rejected_images() {
         let svg_payload = "PHN2Zz48L3N2Zz4=";
-        let messages = history_with_tool_result(&format!(
-            "mixed bag [IMAGE:data:image/png;base64,{CANONICAL_PNG_B64}] \
-             [IMAGE:data:image/svg+xml;base64,{svg_payload}] \
-             [IMAGE:http://example.com/remote.png]"
-        ));
+        let messages = history_with_tool_attachments(
+            "mixed bag",
+            &[
+                format!("data:image/png;base64,{CANONICAL_PNG_B64}"),
+                format!("data:image/svg+xml;base64,{svg_payload}"),
+                "http://example.com/remote.png".to_string(),
+            ],
+        );
 
         let (_, native_msgs) =
             AnthropicModelProvider::convert_messages(&messages, CacheTtl::default());
@@ -6545,15 +6967,306 @@ data: {\"type\":\"message_stop\"}\n\n";
         );
     }
 
+    // ── B1: carrier-aware conversion, both arms ────────────────────────────
+
+    /// A declared prompt carrier with count zero whose body quotes a marker
+    /// for an existing, valid PNG. The catch-all user arm once parsed the
+    /// body directly and attached that file; the carrier-aware helper must
+    /// leave the marker as text with zero image blocks.
+    ///
+    /// Runs the shared preparation first, then the production converter both
+    /// request modes share.
+    #[tokio::test]
+    async fn prompt_carrier_body_marker_is_never_attached() {
+        let temp = tempfile::tempdir().unwrap();
+        let png = temp.path().join("body-marker.png");
+        std::fs::write(&png, [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n']).unwrap();
+        let body = format!("source example: [IMAGE:{}]", png.display());
+        let carrier = zeroclaw_api::tool_carrier::render_prompt_tool_carrier(&body, &[]);
+        let messages = vec![ChatMessage::user(carrier.clone())];
+
+        let prepared = crate::multimodal::prepare_messages_for_provider(
+            &messages,
+            &zeroclaw_config::schema::MultimodalConfig::default(),
+        )
+        .await
+        .expect("preparation succeeds");
+        assert!(
+            !prepared.contains_images,
+            "a count-zero carrier's body marker is not an image"
+        );
+
+        let (_, native_msgs) =
+            AnthropicModelProvider::convert_messages(&prepared.messages, CacheTtl::default());
+        let blocks = top_level_user_blocks(&native_msgs);
+        assert!(
+            blocks.iter().all(|block| block["type"] != "image"),
+            "no image block may be built from carrier body text: {blocks:?}"
+        );
+        let text = blocks
+            .iter()
+            .find(|block| block["type"] == "text")
+            .and_then(|block| block["text"].as_str())
+            .expect("one text block");
+        assert_eq!(text, carrier, "the carrier text is byte-identical");
+        let parsed = zeroclaw_api::tool_carrier::parse_prompt_tool_carrier(text)
+            .expect("delivered text is still a carrier");
+        assert_eq!(parsed.text, body, "the body is byte-identical");
+    }
+
+    /// A declared prompt carrier with count zero whose body quotes a full
+    /// marker wrapping an inline data URI — the ordinary shape of a tool
+    /// reading a source file that contains one. Extraction leaves the quote
+    /// as body text, and the sweep must agree: byte-identical text, zero
+    /// image blocks, no truncation note, no omission note.
+    ///
+    /// Restoring the sweep gate to marker presence alone (dropping the
+    /// declared-carrier check) replaces the quoted payload with the
+    /// truncation note and fails every assertion here.
+    #[tokio::test]
+    async fn prompt_declared_zero_body_quoting_data_uri_passes_verbatim() {
+        let body =
+            format!("source example: [IMAGE:data:image/png;base64,{CANONICAL_PNG_B64}] in prose");
+        let carrier = zeroclaw_api::tool_carrier::render_prompt_tool_carrier(&body, &[]);
+        let messages = vec![ChatMessage::user(carrier.clone())];
+
+        let prepared = crate::multimodal::prepare_messages_for_provider(
+            &messages,
+            &zeroclaw_config::schema::MultimodalConfig::default(),
+        )
+        .await
+        .expect("preparation succeeds");
+        assert!(
+            !prepared.contains_images,
+            "a count-zero carrier's quoted marker is not an image"
+        );
+
+        let (_, native_msgs) =
+            AnthropicModelProvider::convert_messages(&prepared.messages, CacheTtl::default());
+        let blocks = top_level_user_blocks(&native_msgs);
+        assert!(
+            blocks.iter().all(|block| block["type"] != "image"),
+            "no image block may be built from carrier body text: {blocks:?}"
+        );
+        assert_eq!(blocks.len(), 1, "exactly one text block: {blocks:?}");
+        let text = blocks[0]["text"]
+            .as_str()
+            .expect("the single block is a text block");
+        assert_eq!(text, carrier, "the carrier text is byte-identical");
+        let parsed = zeroclaw_api::tool_carrier::parse_prompt_tool_carrier(text)
+            .expect("delivered text is still a carrier");
+        assert_eq!(parsed.text, body, "the body is byte-identical");
+        assert!(
+            !text.contains(TRUNCATED_DATA_NOTE),
+            "a declared carrier's body is never swept: {text}"
+        );
+        assert!(
+            !text.contains(OMISSION_NOTE_ONE),
+            "nothing was declared and nothing rejected, so no omission note: {text}"
+        );
+    }
+
+    /// A declared prompt carrier with one real image attachment (a tempdir
+    /// PNG that decodes, content validation refuses signature-only bytes)
+    /// whose body also quotes a data URI
+    /// in marker syntax: exactly one image block from the declaration, and
+    /// the body rides the text block byte-identical, quoted data URI
+    /// included.
+    ///
+    /// Restoring the sweep gate to marker presence alone sweeps the quoted
+    /// payload out of the body and fails the byte-identity assertion.
+    #[tokio::test]
+    async fn prompt_carrier_declared_image_body_quoting_data_uri_verbatim() {
+        use base64::Engine as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let png = temp.path().join("declared.png");
+        let signature = base64::engine::general_purpose::STANDARD
+            .decode(DECODABLE_PNG_B64)
+            .expect("valid PNG fixture");
+        std::fs::write(&png, &signature).unwrap();
+        let body =
+            format!("source example: [IMAGE:data:image/png;base64,{CANONICAL_PNG_B64}] in prose");
+        let marker = zeroclaw_api::media::RenderedMarker {
+            target: png.display().to_string(),
+            kind: zeroclaw_api::media::MarkerKind::Image,
+        };
+        let carrier = zeroclaw_api::tool_carrier::render_prompt_tool_carrier(
+            &body,
+            std::slice::from_ref(&marker),
+        );
+        let messages = vec![ChatMessage::user(carrier)];
+
+        let prepared = crate::multimodal::prepare_messages_for_provider(
+            &messages,
+            &zeroclaw_config::schema::MultimodalConfig::default(),
+        )
+        .await
+        .expect("preparation succeeds");
+        assert!(prepared.contains_images, "the declared image counts");
+
+        let (_, native_msgs) =
+            AnthropicModelProvider::convert_messages(&prepared.messages, CacheTtl::default());
+        let blocks = top_level_user_blocks(&native_msgs);
+        let images: Vec<_> = blocks
+            .iter()
+            .filter(|block| block["type"] == "image")
+            .collect();
+        assert_eq!(images.len(), 1, "exactly one image block: {blocks:?}");
+        assert_eq!(images[0]["source"]["media_type"], "image/png");
+        assert_eq!(
+            images[0]["source"]["data"],
+            base64::engine::general_purpose::STANDARD.encode(signature),
+            "the image block carries the declared file's bytes"
+        );
+        let text = blocks
+            .iter()
+            .find(|block| block["type"] == "text")
+            .and_then(|block| block["text"].as_str())
+            .expect("one text block");
+        assert_eq!(
+            text,
+            zeroclaw_api::tool_carrier::render_prompt_tool_carrier(&body, &[]),
+            "the body rides the text block byte-identical, quoted data URI included"
+        );
+        let wire = serde_json::to_string(&native_msgs).expect("serialize");
+        assert!(
+            !wire.contains(TRUNCATED_DATA_NOTE),
+            "a declared carrier's body is never swept: {wire}"
+        );
+    }
+
+    /// A declared native carrier with `attachments: []` whose body quotes a
+    /// base64 image data URI inside prose. The residual sweep must not touch
+    /// a declared carrier's body: the text block is byte-identical and no
+    /// truncation note appears.
+    #[tokio::test]
+    async fn native_declared_zero_attachments_body_passes_verbatim() {
+        let body = format!("source example: data:image/png;base64,{CANONICAL_PNG_B64} in prose");
+        let messages = history_with_tool_attachments(&body, &[]);
+
+        let prepared = crate::multimodal::prepare_messages_for_provider(
+            &messages,
+            &zeroclaw_config::schema::MultimodalConfig::default(),
+        )
+        .await
+        .expect("preparation succeeds");
+        assert!(!prepared.contains_images);
+
+        let (_, native_msgs) =
+            AnthropicModelProvider::convert_messages(&prepared.messages, CacheTtl::default());
+        let tool_result = first_tool_result_on_the_wire(&native_msgs);
+        // One text block serializes as a bare string, not a block list.
+        let content = tool_result["content"]
+            .as_str()
+            .expect("zero-declared content is a bare text string");
+        assert_eq!(
+            content, body,
+            "the declared body is byte-identical, data URI included"
+        );
+        assert!(
+            !body.contains(TRUNCATED_DATA_NOTE),
+            "the fixture must not name the note itself"
+        );
+        assert!(
+            !tool_result.to_string().contains(TRUNCATED_DATA_NOTE),
+            "no truncation note may be appended to a declared body: {tool_result}"
+        );
+    }
+
+    /// A declared prompt carrier with one image attachment: exactly one image
+    /// block from the declaration, and the body verbatim in the text block.
+    #[tokio::test]
+    async fn prompt_carrier_declared_image_builds_exactly_one_block() {
+        let body = "<tool_result name=\"image_info\">File: /tmp/a.png</tool_result>";
+        let marker = zeroclaw_api::media::RenderedMarker {
+            target: format!("data:image/png;base64,{DECODABLE_PNG_B64}"),
+            kind: zeroclaw_api::media::MarkerKind::Image,
+        };
+        let carrier = zeroclaw_api::tool_carrier::render_prompt_tool_carrier(
+            body,
+            std::slice::from_ref(&marker),
+        );
+        let messages = vec![ChatMessage::user(carrier)];
+
+        let prepared = crate::multimodal::prepare_messages_for_provider(
+            &messages,
+            &zeroclaw_config::schema::MultimodalConfig::default(),
+        )
+        .await
+        .expect("preparation succeeds");
+        assert!(prepared.contains_images, "the declared image counts");
+
+        let (_, native_msgs) =
+            AnthropicModelProvider::convert_messages(&prepared.messages, CacheTtl::default());
+        let blocks = top_level_user_blocks(&native_msgs);
+        let images: Vec<_> = blocks
+            .iter()
+            .filter(|block| block["type"] == "image")
+            .collect();
+        assert_eq!(images.len(), 1, "exactly one image block: {blocks:?}");
+        assert_eq!(images[0]["source"]["media_type"], "image/png");
+        assert_eq!(images[0]["source"]["data"], DECODABLE_PNG_B64);
+        let text = blocks
+            .iter()
+            .find(|block| block["type"] == "text")
+            .and_then(|block| block["text"].as_str())
+            .expect("one text block");
+        assert_eq!(
+            text,
+            zeroclaw_api::tool_carrier::render_prompt_tool_carrier(body, &[]),
+            "the body rides the text block verbatim"
+        );
+    }
+
+    /// A legacy native carrier (no `attachments` key) whose body quotes a
+    /// base64 image data URI in prose: the carrier declared nothing, so
+    /// nothing is validated, omitted, or swept — the body reaches the
+    /// serialized `tool_result` verbatim, quoted payload included. This is
+    /// the known limit of the legacy rule: a pre-upgrade carrier body is
+    /// text, and nothing infers, sweeps, or strips it.
+    #[tokio::test]
+    async fn legacy_native_carrier_body_reaches_tool_result_verbatim() {
+        let body = format!(
+            "saved data:image/png;{}{CANONICAL_PNG_B64} payload",
+            "base64,"
+        );
+        let messages = history_with_tool_result(&body);
+
+        let prepared = crate::multimodal::prepare_messages_for_provider(
+            &messages,
+            &zeroclaw_config::schema::MultimodalConfig::default(),
+        )
+        .await
+        .expect("preparation succeeds");
+
+        let (_, native_msgs) =
+            AnthropicModelProvider::convert_messages(&prepared.messages, CacheTtl::default());
+        let tool_result = first_tool_result_on_the_wire(&native_msgs);
+        // One text block serializes as a bare string, not a block list.
+        let content = tool_result["content"]
+            .as_str()
+            .expect("legacy verbatim content is a bare text string");
+        assert_eq!(
+            content, body,
+            "a legacy carrier's body is delivered byte for byte, data URI included"
+        );
+        assert!(
+            !tool_result.to_string().contains(TRUNCATED_DATA_NOTE),
+            "no residual sweep runs on a legacy carrier: {tool_result}"
+        );
+    }
+
     /// An image with no prose around it produces an image block and no empty
     /// text block.
     ///
     /// Before the change the content became the bare omission note.
     #[test]
     fn tool_result_image_only_has_no_empty_text_block() {
-        let messages = history_with_tool_result(&format!(
-            "[IMAGE:data:image/png;base64,{CANONICAL_PNG_B64}]"
-        ));
+        let messages = history_with_tool_attachments(
+            "",
+            &[format!("data:image/png;base64,{CANONICAL_PNG_B64}")],
+        );
 
         let (_, native_msgs) =
             AnthropicModelProvider::convert_messages(&messages, CacheTtl::default());
@@ -6601,9 +7314,13 @@ data: {\"type\":\"message_stop\"}\n\n";
         ];
 
         for (label, rejected) in cases {
-            let messages = history_with_tool_result(&format!(
-                "prose [IMAGE:{rejected}] [IMAGE:data:image/png;base64,{CANONICAL_PNG_B64}]"
-            ));
+            let messages = history_with_tool_attachments(
+                "prose",
+                &[
+                    rejected.clone(),
+                    format!("data:image/png;base64,{CANONICAL_PNG_B64}"),
+                ],
+            );
 
             let (_, native_msgs) =
                 AnthropicModelProvider::convert_messages(&messages, CacheTtl::default());
@@ -6645,6 +7362,41 @@ data: {\"type\":\"message_stop\"}\n\n";
         }
     }
 
+    /// An oversized image attachment on a declared tool result is refused
+    /// with the fixed note, never forwarded as raw text. The bound is this
+    /// adapter's own encoded-payload ceiling: the marker-span ceiling
+    /// belonged to the tool-text parse path the attachment-identity
+    /// contract removes, so an oversized reference can only arrive as a
+    /// declared attachment, and `MAX_ENCODED_IMAGE_PAYLOAD_BYTES` is the
+    /// check that refuses it.
+    #[test]
+    fn oversized_tool_result_attachment_is_refused_not_forwarded() {
+        let oversized = format!(
+            "data:image/png;base64,{}",
+            "A".repeat(MAX_ENCODED_IMAGE_PAYLOAD_BYTES + 1)
+        );
+        let messages = history_with_tool_attachments("screenshot", &[oversized]);
+
+        let (_, native_msgs) =
+            AnthropicModelProvider::convert_messages(&messages, CacheTtl::default());
+        let tool_result = first_tool_result_on_the_wire(&native_msgs);
+
+        let text = tool_result["content"]
+            .as_str()
+            .unwrap_or_else(|| panic!("expected plain text content: {tool_result}"));
+        assert!(text.contains("screenshot"), "prose must survive: {text}");
+        assert!(
+            text.contains(OMISSION_NOTE_ONE),
+            "the refusal note must replace the oversized marker: {text}"
+        );
+
+        let wire = serde_json::to_string(&native_msgs).expect("serialize");
+        assert!(
+            !wire.contains("AAAA"),
+            "the raw oversized payload must not reach the wire"
+        );
+    }
+
     /// A tool result whose content is a block list still takes the conversation
     /// cache breakpoint.
     ///
@@ -6653,9 +7405,10 @@ data: {\"type\":\"message_stop\"}\n\n";
     /// fails before the change.
     #[test]
     fn tool_result_block_list_still_takes_cache_control() {
-        let messages = history_with_tool_result(&format!(
-            "shot [IMAGE:data:image/png;base64,{CANONICAL_PNG_B64}]"
-        ));
+        let messages = history_with_tool_attachments(
+            "shot",
+            &[format!("data:image/png;base64,{CANONICAL_PNG_B64}")],
+        );
 
         let (_, mut native_msgs) =
             AnthropicModelProvider::convert_messages(&messages, CacheTtl::default());
@@ -6768,24 +7521,22 @@ data: {\"type\":\"message_stop\"}\n\n";
         );
         assert_eq!(tool_results[0]["tool_use_id"], "toolu_only");
 
-        let blocks = tool_results[0]["content"]
-            .as_array()
-            .unwrap_or_else(|| panic!("expected a block list: {}", tool_results[0]));
+        // A raw non-JSON carrier is a legacy shape: its body is text under
+        // the attachment-identity contract, so the tool_result delivers plain
+        // text, never an image block, and the marker syntax survives.
+        let content = tool_results[0]["content"].as_str().unwrap_or_else(|| {
+            panic!(
+                "legacy tool_result content must be text: {}",
+                tool_results[0]
+            )
+        });
         assert!(
-            blocks
-                .iter()
-                .any(|block| block["type"] == "image"
-                    && block["source"]["data"] == CANONICAL_PNG_B64),
-            "the image must be nested in the recovered tool_result: {}",
-            tool_results[0]
+            content.contains("raw output"),
+            "the raw body must survive: {content}"
         );
         assert!(
-            blocks.iter().any(|block| block["type"] == "text"
-                && block["text"]
-                    .as_str()
-                    .is_some_and(|text| text.contains("raw output"))),
-            "the surrounding prose must survive: {}",
-            tool_results[0]
+            content.contains("[IMAGE:"),
+            "the marker syntax in the body stays literal text: {content}"
         );
 
         let wire = serde_json::to_string(&native_msgs).expect("serialize");
@@ -7128,7 +7879,11 @@ data: {\"type\":\"message_stop\"}\n\n";
     fn null_id_envelope_still_delivers_the_image() {
         let envelope = serde_json::json!({
             "tool_call_id": serde_json::Value::Null,
-            "content": format!("shot [IMAGE:data:image/png;base64,{CANONICAL_PNG_B64}]"),
+            "content": "shot",
+            "attachments": [{
+                "kind": "image",
+                "target": format!("data:image/png;base64,{CANONICAL_PNG_B64}")
+            }],
         })
         .to_string();
         let messages = vec![
@@ -7287,7 +8042,11 @@ data: {\"type\":\"message_stop\"}\n\n";
             ChatMessage::tool(
                 serde_json::json!({
                     "tool_call_id": "toolu_a",
-                    "content": format!("second answer [IMAGE:data:image/png;base64,{CANONICAL_PNG_B64}]"),
+                    "content": "second answer",
+                    "attachments": [{
+                        "kind": "image",
+                        "target": format!("data:image/png;base64,{CANONICAL_PNG_B64}")
+                    }],
                 })
                 .to_string(),
             ),
@@ -7558,46 +8317,6 @@ data: {\"type\":\"message_stop\"}\n\n";
         );
     }
 
-    /// A line-wrapped unterminated marker leaves no base64 behind either, and
-    /// ordinary prose after a data URI survives.
-    ///
-    /// `parse_image_markers` only collapses a wrapped marker when it is
-    /// terminated, so a truncated wrapped payload arrives with its newlines
-    /// intact. Sweeping only to the first newline left every later line in a text
-    /// position — tens of thousands of prose tokens, which is the original bug.
-    #[test]
-    fn wrapped_unterminated_marker_leaves_no_base64_in_text() {
-        // Two lines, each a full canonical payload, with no closing bracket.
-        let wrapped =
-            format!("[IMAGE:data:image/png;base64,{CANONICAL_PNG_B64}\n{CANONICAL_PNG_B64}");
-        let messages = history_with_tool_result(&format!("saved {wrapped}"));
-
-        let (_, native_msgs) =
-            AnthropicModelProvider::convert_messages(&messages, CacheTtl::default());
-        let wire = serde_json::to_string(&native_msgs).expect("serialize");
-        assert!(
-            !wire.contains(CANONICAL_PNG_B64),
-            "no wrapped line may survive on the wire: {wire}"
-        );
-        assert!(
-            wire.contains("[truncated inline data removed]"),
-            "the replacement literal must say what happened: {wire}"
-        );
-
-        // The continuation rule must not eat prose: a short word after the
-        // payload is not a wrapped line.
-        let with_prose = history_with_tool_result(&format!(
-            "[IMAGE:data:image/png;base64,{CANONICAL_PNG_B64}\nthe screenshot was truncated"
-        ));
-        let (_, native_msgs) =
-            AnthropicModelProvider::convert_messages(&with_prose, CacheTtl::default());
-        let wire = serde_json::to_string(&native_msgs).expect("serialize");
-        assert!(
-            wire.contains("the screenshot was truncated"),
-            "prose after a swept run must survive: {wire}"
-        );
-    }
-
     /// The residual sweep makes one pass over its input, and says so by the
     /// clock rather than by hanging.
     ///
@@ -7772,30 +8491,6 @@ data: {\"type\":\"message_stop\"}\n\n";
                 "{label}: no header may survive either: {swept}"
             );
         }
-    }
-
-    /// The payload of an overlapping run reaches no text field on the wire.
-    ///
-    /// The unit test above pins the sweep itself; this pins the property a
-    /// reader actually cares about, through the whole conversion.
-    #[test]
-    fn overlapping_marker_payload_reaches_no_serialized_text_field() {
-        let overlapped =
-            format!("[IMAGE:data:image/png;base64,AAAAdata:image/png;base64,{CANONICAL_PNG_B64}");
-        let messages = history_with_tool_result(&format!("saved {overlapped}"));
-
-        let (_, native_msgs) =
-            AnthropicModelProvider::convert_messages(&messages, CacheTtl::default());
-        let wire = serde_json::to_string(&native_msgs).expect("serialize");
-
-        assert!(
-            !wire.contains(CANONICAL_PNG_B64),
-            "the overlapped payload must not survive anywhere on the wire: {wire}"
-        );
-        assert!(
-            wire.contains("[truncated inline data removed]"),
-            "the replacement literal must say what happened: {wire}"
-        );
     }
 
     /// A near-miss `base64` parameter is refused by the splitter, so it cannot
@@ -8176,48 +8871,38 @@ data: {\"type\":\"message_stop\"}\n\n";
         );
     }
 
-    /// A marker with no closing `]` leaves raw base64 in a text position:
-    /// `parse_image_markers` copies the remainder verbatim into the cleaned text
-    /// and returns no reference, so the zero-reference early return passed it
-    /// straight through. Asserted on both a tool result and a user message,
-    /// because both consume the same parser.
-    ///
-    /// Fails before the change on both arms: the payload survives in a `text`
-    /// field and no replacement literal is written.
     #[test]
     fn unterminated_marker_leaves_no_base64_in_text() {
-        let unterminated = format!("[IMAGE:data:image/png;base64,{CANONICAL_PNG_B64}");
+        // The sweep's remaining scope is ordinary user text: channel media
+        // pipelines write data-URI markers into user messages, and a
+        // truncated one can leave its payload behind as residue. (A tool
+        // result carrying the same shape is a legacy carrier: its body is
+        // delivered as its bytes, payload included.)
+        let unterminated = format!(
+            "[{}data:image/png;{}{CANONICAL_PNG_B64}",
+            "IMAGE:", "base64,"
+        );
+        let messages = vec![ChatMessage::user(format!("look at {unterminated}"))];
 
-        let tool_messages = history_with_tool_result(&format!("saved {unterminated}"));
-        let user_messages = vec![ChatMessage::user(format!("look at {unterminated}"))];
+        let (_, native_msgs) =
+            AnthropicModelProvider::convert_messages(&messages, CacheTtl::default());
+        // The whole serialized request, not just `text` fields.
+        let wire = serde_json::to_string(&native_msgs).expect("serialize");
 
-        for (label, messages) in [
-            ("tool result", tool_messages),
-            ("user message", user_messages),
-        ] {
-            let (_, native_msgs) =
-                AnthropicModelProvider::convert_messages(&messages, CacheTtl::default());
-            // The whole serialized request, not just `text` fields: an
-            // image-free tool result carries its prose as a bare JSON string on
-            // `content`, which is a text position all the same.
-            let wire = serde_json::to_string(&native_msgs).expect("serialize");
-
-            assert!(
-                !wire.contains(CANONICAL_PNG_B64),
-                "{label}: raw base64 must not survive anywhere on the wire: {wire}"
-            );
-            assert!(
-                wire.contains("[truncated inline data removed]"),
-                "{label}: the replacement literal must say what happened: {wire}"
-            );
-            // A truncated marker was never a reference, so it is not counted.
-            assert!(
-                !wire.contains("image(s) omitted"),
-                "{label}: a swept run must not be double-reported as an omission: {wire}"
-            );
-        }
+        assert!(
+            !wire.contains(CANONICAL_PNG_B64),
+            "raw base64 must not survive anywhere on the wire: {wire}"
+        );
+        assert!(
+            wire.contains("[truncated inline data removed]"),
+            "the replacement literal must say what happened: {wire}"
+        );
+        // A truncated marker was never a reference, so it is not counted.
+        assert!(
+            !wire.contains("image(s) omitted"),
+            "a swept run must not be double-reported as an omission: {wire}"
+        );
     }
-
     /// The user arm now runs its data URIs through the same structural check the
     /// tool arm uses. Each rejection class carries a deliverable PNG alongside
     /// it, and the all-rejected case must not claim an image is attached.
@@ -8405,13 +9090,20 @@ data: {\"type\":\"message_stop\"}\n\n";
     async fn prepared_local_image_reaches_the_wire_as_a_nested_block() {
         let temp = tempfile::tempdir().expect("temp dir");
         let image_path = temp.path().join("screenshot.png");
-        // A PNG signature is enough for MIME detection, and its 12-character
-        // base64 is canonical.
-        std::fs::write(
-            &image_path,
-            [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'],
-        )
-        .expect("write png");
+        // A real 1x1 PNG, not a bare signature. Preparation decodes pixels to
+        // reject corrupt images, so a signature-only file would be dropped.
+        let png_bytes = {
+            let mut buf = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+                1,
+                1,
+                image::Rgba([255, 0, 0, 255]),
+            ))
+            .write_to(&mut buf, image::ImageFormat::Png)
+            .expect("test PNG encodes");
+            buf.into_inner()
+        };
+        std::fs::write(&image_path, &png_bytes).expect("write png");
 
         let messages = vec![
             ChatMessage::user("take a screenshot"),
@@ -8429,7 +9121,11 @@ data: {\"type\":\"message_stop\"}\n\n";
                     "tool_call_id": "toolu_shot",
                     // Drive-letter paths are loadable references, so this works
                     // on Windows as well as Unix.
-                    "content": format!("saved [IMAGE:{}]", image_path.display()),
+                    "content": "saved",
+                    "attachments": [{
+                        "kind": "image",
+                        "target": image_path.display().to_string()
+                    }],
                 })
                 .to_string(),
             ),
@@ -8443,7 +9139,7 @@ data: {\"type\":\"message_stop\"}\n\n";
         .expect("preparation should succeed for a local PNG");
         assert!(
             prepared.contains_images,
-            "preparation must have found the marker, or the rest asserts nothing"
+            "preparation must have normalized the declared attachment, or the rest asserts nothing"
         );
 
         let (_, native_msgs) =
@@ -8467,7 +9163,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             base64::engine::general_purpose::STANDARD
                 .decode(data)
                 .expect("payload must be decodable base64"),
-            [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'],
+            png_bytes,
             "the bytes written to disk must be the bytes on the wire"
         );
 
@@ -8777,6 +9473,31 @@ data: {\"type\":\"message_stop\"}\n\n";
         })
     }
 
+    #[test]
+    fn exact_request_replay_rejects_effective_server_fallback() {
+        let messages = [crate::traits::ChatMessage::user("hello")];
+        let request = ProviderChatRequest {
+            messages: &messages,
+            tools: None,
+            thinking: None,
+        };
+        let provider = AnthropicModelProvider::builder("test")
+            .credential(Some("test-key"))
+            .server_fallback_models(vec!["claude-opus-4-8".to_string()])
+            .build();
+
+        assert!(!provider.supports_exact_request_replay(request, "claude-fable-5"));
+
+        let thinking_request = ProviderChatRequest {
+            thinking: Some(zeroclaw_api::model_provider::NativeThinkingParams {
+                budget_tokens: 1_024,
+                display: None,
+            }),
+            ..request
+        };
+        assert!(provider.supports_exact_request_replay(thinking_request, "claude-fable-5"));
+    }
+
     #[tokio::test]
     async fn server_fallback_config_adds_param_and_beta_header() {
         let (addr, captured, server) = spawn_capturing_server().await;
@@ -8812,6 +9533,31 @@ data: {\"type\":\"message_stop\"}\n\n";
             betas[0].to_str().unwrap(),
             "server-side-fallback-2026-06-01"
         );
+    }
+
+    #[tokio::test]
+    async fn effort_config_adds_output_config_and_nothing_else() {
+        let (addr, captured, server) = spawn_capturing_server().await;
+        let builder = || {
+            AnthropicModelProvider::builder("test")
+                .credential(Some("sk-ant-api-key"))
+                .base_url(&format!("http://{addr}"))
+        };
+        for (effort, expected) in [
+            (Some("medium"), serde_json::json!({"effort": "medium"})),
+            (None, serde_json::Value::Null),
+        ] {
+            let result = builder()
+                .effort(effort)
+                .build()
+                .chat_with_system(None, "hello", "claude-opus-5-5", None)
+                .await;
+            assert!(result.is_ok(), "chat failed: {:?}", result.err());
+            let (_, body) = captured.lock().unwrap().take().expect("no request");
+            assert_eq!(body["output_config"], expected, "{body}");
+            assert!(body.get("thinking").is_none(), "no thinking: {body}");
+        }
+        server.abort();
     }
 
     #[tokio::test]
@@ -9644,6 +10390,142 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"refusal\"},\"usag
         assert_eq!(refusal.to_string(), ANTHROPIC_REFUSAL_MESSAGE);
     }
 
+    /// A streaming request to a closed local port fails at connect on the
+    /// first hop: the adapter must tag the transport failure as
+    /// `ConnectFailed` so Reliable can retry the entry.
+    #[tokio::test]
+    async fn connect_failed_tagged_on_connect_failure_to_closed_port() {
+        use futures_util::StreamExt;
+
+        // Take a port and drop the listener: nothing is listening there.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let provider = refusal_test_provider(addr);
+        let messages = vec![ChatMessage::user("hello")];
+        let request = ProviderChatRequest {
+            messages: messages.as_slice(),
+            tools: None,
+            thinking: None,
+        };
+        let mut stream =
+            provider.stream_chat(request, "claude-sonnet-4-6", None, StreamOptions::new(true));
+        let first = tokio::time::timeout(std::time::Duration::from_secs(10), stream.next())
+            .await
+            .expect("closed-port stream must fail immediately");
+        match first.expect("closed-port stream must yield an item") {
+            Err(StreamError::ConnectFailed(message)) => {
+                assert!(
+                    message.contains("error sending request"),
+                    "the transport chain must stay in the message: {message}"
+                );
+            }
+            Err(other) => panic!("connect failure must be tagged ConnectFailed, got {other:?}"),
+            Ok(_) => panic!("a closed port cannot produce stream events"),
+        }
+    }
+
+    /// B1's counterexample at the adapter boundary: an accepted HTTP 200
+    /// stream whose SSE error frame says `failed to resolve backend` is a
+    /// provider-side error, never `ConnectFailed`, so error text cannot
+    /// purchase the connect-failed recovery grant.
+    #[tokio::test]
+    async fn connect_failed_not_tagged_on_sse_error_frame_after_accepted_response() {
+        use futures_util::StreamExt;
+
+        const SSE: &str = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":100}}}\n\n",
+            "event: error\n",
+            "data: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"failed to resolve backend\"}}\n\n"
+        );
+        let (addr, server) = spawn_messages_sse_server(SSE).await;
+        let provider = refusal_test_provider(addr);
+        let messages = vec![ChatMessage::user("hello")];
+        let request = ProviderChatRequest {
+            messages: messages.as_slice(),
+            tools: None,
+            thinking: None,
+        };
+        let mut stream =
+            provider.stream_chat(request, "claude-sonnet-4-6", None, StreamOptions::new(true));
+        let mut saw_error = None;
+        while let Some(item) = stream.next().await {
+            if let Err(err) = item {
+                saw_error = Some(err);
+                break;
+            }
+        }
+        server.abort();
+        match saw_error.expect("the SSE error frame must surface an error") {
+            StreamError::ModelProvider(message) => {
+                assert!(
+                    message.contains("failed to resolve backend"),
+                    "the frame text must stay in the message: {message}"
+                );
+            }
+            other => panic!(
+                "an accepted stream's error frame must not be tagged ConnectFailed, got {other:?}"
+            ),
+        }
+    }
+
+    /// The redirect limit documented on `StreamError::ConnectFailed`: a
+    /// client that follows redirects may already have delivered an earlier
+    /// hop. A local gateway accepts the POST and answers 303 See Other
+    /// pointing at a closed local port; the follow-up GET fails at
+    /// connect, and the adapter still tags the error `ConnectFailed`, so
+    /// the tag alone is not proof that nothing was delivered.
+    #[tokio::test]
+    async fn connect_failed_on_redirect_hop_is_tagged_known_limit() {
+        use futures_util::StreamExt;
+
+        // The redirect target: a port with nothing listening.
+        let closed_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let closed_addr = closed_listener.local_addr().unwrap();
+        drop(closed_listener);
+
+        // The first hop: accepts the POST, answers 303 See Other.
+        let app = axum::Router::new().route(
+            "/v1/messages",
+            axum::routing::post(move || async move {
+                axum::response::Redirect::to(&format!("http://{closed_addr}/v1/messages"))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let provider = refusal_test_provider(addr);
+        let messages = vec![ChatMessage::user("hello")];
+        let request = ProviderChatRequest {
+            messages: messages.as_slice(),
+            tools: None,
+            thinking: None,
+        };
+        let mut stream =
+            provider.stream_chat(request, "claude-sonnet-4-6", None, StreamOptions::new(true));
+        let first = tokio::time::timeout(std::time::Duration::from_secs(10), stream.next())
+            .await
+            .expect("the redirect-following stream must fail");
+        match first.expect("the redirect stream must yield an item") {
+            Err(StreamError::ConnectFailed(message)) => {
+                assert!(
+                    message.contains("error sending request"),
+                    "the transport chain must stay in the message: {message}"
+                );
+            }
+            Err(other) => panic!(
+                "a connect failure on the redirect hop must still be tagged ConnectFailed, got {other:?}"
+            ),
+            Ok(_) => panic!("a closed redirect target cannot produce stream events"),
+        }
+        server.abort();
+    }
+
     #[tokio::test]
     async fn unwrapped_anthropic_refusal_recovery_bills_exactly_one_attempt() {
         use futures_util::StreamExt;
@@ -9867,6 +10749,7 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"refusal\"},\"usag
                 display: Some(ThinkingDisplay::Updates),
             }),
             fallbacks: None,
+            output_config: None,
         };
 
         let body = serde_json::to_value(&request).expect("serialize");
@@ -10192,6 +11075,7 @@ data: {\"type\":\"message_stop\"}\n\n";
                 display: Some(ThinkingDisplay::Updates),
             }),
             fallbacks: None,
+            output_config: None,
         };
 
         let body = serde_json::to_value(&request).expect("serialize");
@@ -10328,5 +11212,199 @@ data: {\"type\":\"message_stop\"}\n\n";
             serde_json::from_str(&reasoning).expect("reasoning_content line must be a JSON object");
         assert_eq!(parsed["thinking"], "");
         assert_eq!(parsed["signature"], "sigX");
+    }
+
+    #[tokio::test]
+    async fn message_only_bad_request_preserves_http_status_without_prose_classification() {
+        use axum::{Router, http::StatusCode, routing::post};
+
+        let app = Router::new().route(
+            "/v1/messages",
+            post(|| async { (StatusCode::BAD_REQUEST, "request could not be processed") }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind Anthropic HTTP test server");
+        let addr = listener.local_addr().expect("Anthropic HTTP test address");
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve Anthropic HTTP test");
+        });
+        let provider = AnthropicModelProvider::builder("test")
+            .credential(Some("test-key"))
+            .base_url(&format!("http://{addr}"))
+            .build();
+        let messages = [crate::traits::ChatMessage::user("hello")];
+
+        let error = provider
+            .chat(
+                crate::traits::ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "claude-test",
+                None,
+            )
+            .await
+            .expect_err("HTTP 400 must remain terminal");
+        server.abort();
+
+        assert_eq!(
+            error
+                .downcast_ref::<crate::reliable::ProviderHttpError>()
+                .map(crate::reliable::ProviderHttpError::status),
+            Some(400)
+        );
+    }
+
+    /// Remove every `cache_control` key at any depth. The rolling cache
+    /// breakpoint moves to the newest message by design, so eviction
+    /// stability is asserted with every breakpoint stripped: everything
+    /// else must stay byte-identical across requests.
+    fn strip_cache_control(value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::Object(map) => {
+                map.remove("cache_control");
+                for child in map.values_mut() {
+                    strip_cache_control(child);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for child in items.iter_mut() {
+                    strip_cache_control(child);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Eviction stability must survive the Anthropic request converter, not
+    /// just prepared-message equality. The same fixture as the multimodal
+    /// contract test (four user images, a fifth image, then an image-free
+    /// user turn; `max_images: 4`, `max_image_turns: 0`) goes through the
+    /// production conversion sequence of `chat`: prepare, convert, then the
+    /// rolling cache breakpoint. The breakpoint moves by design; everything
+    /// else must not.
+    #[tokio::test]
+    async fn image_cap_eviction_keeps_prior_native_messages_identical() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        // A real PNG: preparation decodes pixels and drops corrupt images.
+        let png_data = {
+            let mut buf = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+                1,
+                1,
+                image::Rgba([255, 0, 0, 255]),
+            ))
+            .write_to(&mut buf, image::ImageFormat::Png)
+            .expect("test PNG encodes");
+            buf.into_inner()
+        };
+        let config = zeroclaw_config::schema::MultimodalConfig {
+            max_images: 4,
+            max_image_size_mb: 5,
+            allow_remote_fetch: false,
+            max_image_turns: 0,
+            ..Default::default()
+        };
+        let img = |i: usize| {
+            let p = temp.path().join(format!("img{i}.png"));
+            std::fs::write(&p, &png_data).unwrap();
+            p
+        };
+        // Four image turns (one image-only, three with captions), each answered.
+        let mut history = vec![ChatMessage::system("sys")];
+        for i in 0..4 {
+            let content = if i == 1 {
+                format!("[IMAGE:{}]", img(i).display())
+            } else {
+                format!("[IMAGE:{}]\ncaption {i}", img(i).display())
+            };
+            history.push(ChatMessage::user(content));
+            history.push(ChatMessage::assistant(format!("saw {i}")));
+        }
+
+        // The conversion sequence of `chat`, mirrored: prepare, convert,
+        // then the rolling breakpoint on a long conversation.
+        async fn convert_stripped(
+            messages: &[ChatMessage],
+            config: &zeroclaw_config::schema::MultimodalConfig,
+        ) -> Vec<String> {
+            let prepared = crate::multimodal::prepare_messages_for_provider(messages, config)
+                .await
+                .expect("preparation must succeed");
+            let (_, mut native) =
+                AnthropicModelProvider::convert_messages(&prepared.messages, CacheTtl::default());
+            if AnthropicModelProvider::should_cache_conversation(&prepared.messages) {
+                AnthropicModelProvider::apply_cache_to_last_message(
+                    &mut native,
+                    CacheTtl::default(),
+                );
+            }
+            native
+                .iter()
+                .map(|message| {
+                    let mut value =
+                        serde_json::to_value(message).expect("serialize native message");
+                    strip_cache_control(&mut value);
+                    value.to_string()
+                })
+                .collect()
+        }
+
+        let p0 = convert_stripped(&history, &config).await;
+
+        // Fifth image arrives: the count drops to the mark of two, so the
+        // three oldest image messages lose their images.
+        history.push(ChatMessage::user(format!(
+            "[IMAGE:{}]\ncaption 4",
+            img(4).display()
+        )));
+        let p1 = convert_stripped(&history, &config).await;
+        // The fixtures must reach the wire as image blocks; otherwise the
+        // stability assertions below hold with no image in play.
+        let image_blocks = |messages: &[String]| {
+            messages
+                .iter()
+                .map(|m| m.matches("\"type\":\"image\"").count())
+                .sum::<usize>()
+        };
+        assert_eq!(image_blocks(&p0), 4, "all four fixtures reach the wire");
+        assert_eq!(
+            image_blocks(&p1),
+            2,
+            "the cap evicts down to two image blocks"
+        );
+
+        // Image-free follow-up.
+        history.push(ChatMessage::assistant("saw 4"));
+        history.push(ChatMessage::user("no image this time"));
+        let p2 = convert_stripped(&history, &config).await;
+
+        // Every pre-existing serialized native message stays byte-identical
+        // on the image-free follow-up, breakpoints aside.
+        assert_eq!(
+            &p2[..p1.len()],
+            p1.as_slice(),
+            "the image-free follow-up must not change any prior native message"
+        );
+
+        // Exactly three messages differ from before the fifth image: the
+        // positions holding the three oldest images, the first three user
+        // messages.
+        let changed: Vec<usize> = p0
+            .iter()
+            .zip(p1.iter())
+            .enumerate()
+            .filter(|(_, (before, after))| before != after)
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            changed,
+            vec![0, 2, 4],
+            "the fifth image must rewrite only the three oldest image messages"
+        );
     }
 }

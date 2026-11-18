@@ -23,6 +23,7 @@
 //! TLS, no X.509 parser and no relay frame codec.
 
 use crate::Inner;
+use crate::dashboard::write_flushed;
 use crate::enroll_proxy::{self, MAX_FRONTDOOR_REQUEST_BYTES, ProxyError};
 use crate::frontdoor_assets::{APP_JS, INDEX_HTML};
 use anyhow::{Context, Result};
@@ -188,7 +189,10 @@ where
         if request_is_head(&head) {
             response = head_only(response);
         }
-        if stream.write_all(&response).await.is_err() {
+        // Flushed, not only written (see `write_flushed`): the read below waits
+        // for the browser's next request, which it sends only once it has all
+        // of this response.
+        if write_flushed(&mut stream, &response).await.is_err() {
             break;
         }
         if close {
@@ -755,6 +759,69 @@ mod tests {
         );
     }
 
+    /// Read one response's head, then its body up to `content-length`.
+    async fn read_response_body<S: AsyncRead + Unpin>(stream: &mut S) -> std::io::Result<Vec<u8>> {
+        let mut data = Vec::new();
+        let mut buf = [0u8; 4096];
+        let (end, length) = loop {
+            let n = stream.read(&mut buf).await?;
+            if n == 0 {
+                return Err(std::io::ErrorKind::UnexpectedEof.into());
+            }
+            data.extend_from_slice(&buf[..n]);
+            if let Some(end) = data.windows(4).position(|w| w == b"\r\n\r\n") {
+                let head = String::from_utf8_lossy(&data[..end]).to_ascii_lowercase();
+                let length: usize = head
+                    .lines()
+                    .find_map(|line| line.strip_prefix("content-length:"))
+                    .and_then(|value| value.trim().parse().ok())
+                    .expect("a content-length");
+                break (end + 4, length);
+            }
+        };
+        let mut body = data.split_off(end);
+        while body.len() < length {
+            let n = stream.read(&mut buf).await?;
+            if n == 0 {
+                return Err(std::io::ErrorKind::UnexpectedEof.into());
+            }
+            body.extend_from_slice(&buf[..n]);
+        }
+        Ok(body)
+    }
+
+    /// A browser on a real TLS stream gets the whole page script while the
+    /// connection stays open for its next request, not only once the keep-alive
+    /// wait ends and closing the connection flushes the TLS writer. The socket
+    /// holds far less than the script, so its end is still in the writer's own
+    /// buffer when the response has been written (see `write_flushed`).
+    #[tokio::test]
+    async fn a_tls_browser_gets_the_whole_script_before_the_keep_alive_wait_ends() {
+        let cfg = crate::RelayConfig {
+            frontdoor_enabled: true,
+            ..Default::default()
+        };
+        let inner = crate::RelayServer::new(cfg).inner.clone();
+        let (mut browser, relay_side) = crate::dashboard::tls_over_duplex(4 * 1024).await;
+        browser
+            .write_all(b"GET /app.js HTTP/1.1\r\nHost: x\r\n\r\n")
+            .await
+            .unwrap();
+        browser.flush().await.unwrap();
+        let session = match accept(relay_side, true).await.expect("accept") {
+            Accepted::Http(s) => s,
+            _ => panic!("expected a frontdoor HTTP session"),
+        };
+        let serving = tokio::spawn(async move { serve_session(session, inner).await });
+        // Well inside the keep-alive wait, so only a flush can deliver the end.
+        let body = timeout(HTTP_KEEP_ALIVE_IDLE / 2, read_response_body(&mut browser))
+            .await
+            .expect("the whole script must arrive while the connection stays open")
+            .unwrap();
+        assert_eq!(body, APP_JS.as_bytes());
+        serving.abort();
+    }
+
     /// The mirror of the test below, and the case an `Err`-based predicate misses:
     /// an asset route answers `Ok` WITHOUT reading a declared body, so those body
     /// bytes must be drained rather than parsed as the next request head.
@@ -962,6 +1029,71 @@ mod tests {
             request_line(b"POST /enroll?x=1 HTTP/1.1\r\nHost: x\r\n\r\n").expect("request line");
         assert_eq!(method, "POST");
         assert_eq!(path, "/enroll");
+    }
+
+    /// A prefill link (`/?node=..&code=..`) is served the ordinary page: the
+    /// query is dropped at the request line, so the pairing code is never routed
+    /// on, stored, or reflected into the response. The page reads the values
+    /// client-side and scrubs them from the address bar.
+    #[tokio::test]
+    async fn a_prefill_link_serves_the_page_without_reflecting_the_code() {
+        let cfg = crate::RelayConfig {
+            frontdoor_enabled: true,
+            ..Default::default()
+        };
+        let inner = crate::RelayServer::new(cfg).inner.clone();
+        let secret = "PrefillSecret0123456789";
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        let request = format!(
+            "GET /?node=0d3c4f3e8b9a1d2c3b4a5968778695a4&code={secret} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
+        );
+        client.write_all(request.as_bytes()).await.unwrap();
+        let session = match accept(server, true).await.expect("accept") {
+            Accepted::Http(s) => s,
+            _ => panic!("expected a frontdoor HTTP session"),
+        };
+        let task = tokio::spawn(async move { serve_session(session, inner).await });
+        let mut buf = Vec::new();
+        client.read_to_end(&mut buf).await.unwrap();
+        task.await.unwrap();
+        let text = String::from_utf8_lossy(&buf);
+        assert!(
+            text.starts_with("HTTP/1.1 200 OK"),
+            "the page must be served: {text}"
+        );
+        assert!(
+            text.contains("ZeroClaw browser enrollment"),
+            "not the enrollment page"
+        );
+        assert!(
+            !text.contains(secret),
+            "the pairing code was reflected into the response"
+        );
+        let head = text
+            .split("\r\n\r\n")
+            .next()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        assert!(
+            head.contains("cache-control: no-store"),
+            "a prefilled page must not be cached: {head}"
+        );
+        assert!(
+            head.contains("referrer-policy: no-referrer"),
+            "the link must not leak via Referer: {head}"
+        );
+    }
+
+    #[test]
+    fn a_get_with_a_prefill_query_routes_to_the_page_path() {
+        let (method, path) =
+            request_line(b"GET /?node=abc&code=PairingCode123 HTTP/1.1\r\nHost: x\r\n\r\n")
+                .expect("request line");
+        assert_eq!(method, "GET");
+        assert_eq!(
+            path, "/",
+            "the query (and the code in it) must not reach routing"
+        );
     }
 
     #[test]

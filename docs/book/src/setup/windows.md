@@ -69,7 +69,7 @@ Flags:
 |---|---|
 | `--prebuilt` | Download prebuilt binary from GitHub Releases (fastest once reached; current script still checks for `cargo` first) |
 | `--minimal`  | Build core only (no channels, no hardware) |
-| `--dist`     | Build the lean release distribution feature set |
+| `--dist`     | Build the standard distribution for minimal/full runtime tools |
 | `--default`  | Build with Cargo's default feature set |
 | `--all`      | Build with every registered feature |
 
@@ -170,7 +170,7 @@ docker build -t zeroclaw:local -f Dockerfile.debian .
   [wsl2]
   networkingMode=mirrored
   ```
-- **Daemon under Docker, not Task Scheduler.** Inside the container there is no Windows Task Scheduler. Use Docker's [restart policy](https://docs.docker.com/engine/containers/start-containers-automatically/), `--restart=unless-stopped` as in the example above, for daemon-mode startup. The published image runs as PID 1 / nonroot user; the container *is* the service; don't run `zeroclaw service install` inside it.
+- **Daemon under Docker, not Task Scheduler.** Inside the container there is no Windows Task Scheduler. Use Docker's [restart policy](https://docs.docker.com/engine/containers/start-containers-automatically/), `--restart=unless-stopped` as in the example above, for daemon-mode startup. The published image runs as PID 1 / nonroot user; the container _is_ the service; don't run `zeroclaw service install` inside it.
 - **Skill sandbox via host Docker socket.** ZeroClaw's skill-execution sandbox can shell out to Docker. If you're running ZeroClaw itself in a container and want skill sandboxing to also use Docker, mount the host Docker socket so child containers run on the host daemon rather than nesting Docker-in-Docker:
   ```
   # PowerShell / cmd.exe: use a single leading slash.
@@ -215,7 +215,9 @@ zeroclaw service logs
 
 > **About `--service-init`.** The CLI exposes a `--service-init [auto|systemd|openrc]` flag for cross-platform consistency, but on Windows it is a no-op; the scheduled-task path is always used.
 
-Logs go to `%USERPROFILE%\.zeroclaw\logs\` (specifically, `<config_dir>/logs/` where `<config_dir>` defaults to `%USERPROFILE%\.zeroclaw\`). The scheduled-task wrapper itself, however, lives next to the config file at `%USERPROFILE%\.zeroclaw\zeroclaw-daemon.cmd`. Only the daemon output files (`daemon.stdout.log` / `daemon.stderr.log`) are written under `logs\`.
+Logs go to `%USERPROFILE%\.zeroclaw\logs\` (specifically, `<config_dir>/logs/` where `<config_dir>` defaults to `%USERPROFILE%\.zeroclaw\`). The task runs the ZeroClaw binary directly through an internal runner, which keeps each `daemon.stdout.log` and `daemon.stderr.log` file within 8 MiB while retaining recent output. To replace an existing task, including an older `.cmd` wrapper or this direct runner, first run `schtasks /Change /TN "ZeroClaw Daemon" /Disable`, reboot Windows, then run `zeroclaw service install`. Installation refuses to replace a task in any state except Disabled because Task Scheduler's Ready state does not prove that its processes exited; `zeroclaw service stop` alone is insufficient. The installer checks that the task is Disabled but cannot verify that Windows rebooted, so complete that step before reinstalling. The old wrapper file may remain but is no longer used. The runner restricts the config root and log files to the task account and rejects reparse-point paths, so existing paths owned by another account must be corrected before the task can start. Literal `%` signs in executable or config paths are unsupported because Task Scheduler expands them in action paths.
+
+Windows currently attaches an empty console window to this interactive scheduled task. Leave it open while the service runs; closing it may stop the runner and daemon. Background launch without that window is tracked in [#10991](https://github.com/zeroclaw-labs/zeroclaw/issues/10991).
 
 > **Server / multi-user installs.** Native Windows Service / LocalSystem support is on the roadmap but not yet implemented. For now, on a server box, install ZeroClaw under the account that the agent should run as; the scheduled-task path will start it on that user's login. If you need it to start before any user logs in, use **Task Scheduler → ZeroClaw Daemon → Properties → General → "Run whether user is logged on or not."**
 

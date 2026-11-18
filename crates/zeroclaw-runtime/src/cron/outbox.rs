@@ -763,6 +763,7 @@ mod tests {
             wasm_path: Some("plugin.wasm".to_string()),
             wasm_sha256: None,
             capabilities: vec![PluginCapability::Channel],
+            provides: None,
             permissions: Vec::new(),
             config_schema: None,
             signature: None,

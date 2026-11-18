@@ -23,6 +23,8 @@
 use anyhow::{Context, Result};
 use chacha20poly1305::aead::{Aead, KeyInit, OsRng};
 use chacha20poly1305::{AeadCore, ChaCha20Poly1305, Key, Nonce};
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
 use std::fmt::Debug;
 use std::fs;
 use std::io::Write;
@@ -31,12 +33,23 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+#[cfg(windows)]
+mod windows_key_file;
+
 /// Length of the random encryption key in bytes (256-bit, matches `ChaCha20`).
 #[cfg(test)]
 const KEY_LEN: usize = 32;
 
 /// ChaCha20-Poly1305 nonce length in bytes.
 const NONCE_LEN: usize = 12;
+
+/// Domain prefix for [`SecretStore::keyed_digest`], so a blind-index digest
+/// can never collide with another use of the install key.
+const KEYED_DIGEST_DOMAIN: &[u8] = b"zeroclaw.secret-store.keyed-digest.v1\0";
+
+/// HKDF `info` for the blind-index subkey. The install key encrypts with
+/// ChaCha20-Poly1305; digests use a key derived from it, never the key itself.
+const KEYED_DIGEST_SUBKEY_INFO: &[u8] = b"zeroclaw.secret-store.keyed-digest-subkey.v1";
 
 const ONEPASSWORD_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -325,6 +338,7 @@ impl SecretStore {
 
     /// Decrypt using ChaCha20-Poly1305 (current secure format).
     fn decrypt_chacha20(&self, hex_str: &str) -> Result<String> {
+        self.require_existing_key()?;
         let blob =
             hex_decode(hex_str).context("Failed to decode encrypted secret (corrupt hex)")?;
         anyhow::ensure!(
@@ -369,6 +383,7 @@ impl SecretStore {
 
     /// Decrypt using legacy XOR cipher (insecure, for backward compatibility only).
     fn decrypt_legacy_xor(&self, hex_str: &str) -> Result<String> {
+        self.require_existing_key()?;
         let ciphertext = hex_decode(hex_str)
             .context("Failed to decode legacy encrypted secret (corrupt hex)")?;
 
@@ -377,6 +392,36 @@ impl SecretStore {
             String::from_utf8(plaintext_bytes)
                 .context("Decrypted legacy secret is not valid UTF-8 — wrong key or corrupt data")
         })
+    }
+
+    /// Compute a domain-separated keyed digest with the existing install key.
+    ///
+    /// Never provisions a key: callers fail closed when none exists. Suits
+    /// blind database indexes that must not be enumerable without the
+    /// install secret.
+    pub fn keyed_digest(&self, domain: &[u8], data: &[u8]) -> Result<[u8; 32]> {
+        self.require_existing_key()?;
+        self.get_key(|key| keyed_digest_with_key(key, domain, data))
+    }
+
+    /// Compute a domain-separated keyed digest, provisioning the install key
+    /// when needed for a write that will persist new encrypted material.
+    pub fn keyed_digest_or_create(&self, domain: &[u8], data: &[u8]) -> Result<[u8; 32]> {
+        self.get_key(|key| keyed_digest_with_key(key, domain, data))
+    }
+
+    /// Refuse a read-side key use when no key has been provisioned. Reads
+    /// must never mint a replacement: a new key cannot decrypt what the lost
+    /// one encrypted, and creating it hides the loss.
+    fn require_existing_key(&self) -> Result<()> {
+        if self.key_source.provisioning_state() == ProvisioningState::NeedsInitialization {
+            anyhow::bail!(
+                "No existing `.secret_key` for the '{}' key source; refusing to create a \
+                 replacement on a read. Restore the original key material from backup.",
+                self.key_source.backend_name()
+            );
+        }
+        Ok(())
     }
 
     /// Check if a value is already encrypted or externally resolved.
@@ -395,12 +440,34 @@ impl SecretStore {
     }
 }
 
+fn keyed_digest_with_key(key: &[u8], domain: &[u8], data: &[u8]) -> Result<[u8; 32]> {
+    let subkey = keyed_digest_subkey(key)?;
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&subkey)
+        .map_err(|_| anyhow::Error::msg("Secret key file is corrupt"))?;
+    mac.update(KEYED_DIGEST_DOMAIN);
+    mac.update(&(domain.len() as u64).to_be_bytes());
+    mac.update(domain);
+    mac.update(data);
+    Ok(mac.finalize().into_bytes().into())
+}
+
+/// One-block HKDF-Expand (RFC 5869) of the install key. The key is already
+/// 32 uniformly random bytes, so it serves as the pseudorandom key directly
+/// and the Extract step is skipped, as RFC 5869 section 3.3 permits.
+fn keyed_digest_subkey(key: &[u8]) -> Result<[u8; 32]> {
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(key)
+        .map_err(|_| anyhow::Error::msg("Secret key file is corrupt"))?;
+    mac.update(KEYED_DIGEST_SUBKEY_INFO);
+    mac.update(&[1]);
+    Ok(mac.finalize().into_bytes().into())
+}
+
 // ── Atomic key publication ──────────────────────────────────────
 //
-// Key creation writes full content to a private temp file, hardens it,
-// then publishes it atomically without replacing an existing target:
-//   - Unix:    hard_link(temp, final)  — fails with EEXIST if final exists
-//   - Windows: MoveFileExW(temp, final, 0)  — fails with ERROR_ALREADY_EXISTS
+// Key creation writes full content to a restrictive-at-creation temp file,
+// then publishes it without replacing an existing target:
+//   - Unix: hard_link(temp, final).
+//   - Windows: FileRenameInfo on the same exclusive handle.
 // The final path either appears with complete content, or not at all.
 
 /// Monotonically increasing counter for unique temp file names
@@ -430,10 +497,12 @@ fn temp_path_for(key_path: &Path) -> PathBuf {
 /// Covers every `?` early return AND panics between temp creation and
 /// successful publication, so a failed initialization never leaves key
 /// material behind or lets a stale PID/sequence name block a later attempt.
+#[cfg(unix)]
 struct TempFileGuard {
     path: Option<PathBuf>,
 }
 
+#[cfg(unix)]
 impl TempFileGuard {
     fn new(path: &Path) -> Self {
         TempFileGuard {
@@ -442,13 +511,13 @@ impl TempFileGuard {
     }
 
     /// Call after successful publication so drop does not remove anything:
-    /// on Unix the temp name was already removed by hand; on Windows the temp
-    /// was renamed into the final path, so no temp name remains.
+    /// the temp name was already removed by hand.
     fn disarm(&mut self) {
         self.path = None;
     }
 }
 
+#[cfg(unix)]
 impl Drop for TempFileGuard {
     fn drop(&mut self) {
         if let Some(p) = &self.path {
@@ -526,10 +595,12 @@ fn open_no_follow(key_path: &Path) -> std::io::Result<std::fs::File> {
     const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
     const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
 
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
-        .open(key_path)?;
+    let file = windows_key_file::open_existing_with_retry(|| {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+            .open(key_path)
+    })?;
 
     // Inspect the SAME handle we will read from.  If it carries the
     // reparse-point attribute, refuse.
@@ -567,7 +638,7 @@ fn read_key_file_no_follow(key_path: &Path) -> std::io::Result<String> {
 ///
 /// Reads go through a no-follow / reparse-point-verified handle.  Creation
 /// uses atomic no-replace publication (write-to-temp then `hard_link` on Unix
-/// / `MoveFileExW` on Windows) so concurrent readers never observe empty or
+/// / handle-based no-replace rename on Windows) so readers never observe empty or
 /// partial key material.
 fn load_or_create_key(key_path: &Path) -> Result<Vec<u8>> {
     let validate_key = |bytes: Vec<u8>| {
@@ -597,7 +668,12 @@ fn load_or_create_key(key_path: &Path) -> Result<Vec<u8>> {
                     // winner used atomic publication, the file content is
                     // guaranteed complete at this point.
                     let hex = read_key_file_no_follow(key_path)
-                        .context("Failed to read key file (created by concurrent process)")?;
+                        .with_context(|| {
+                            format!(
+                                "Failed to read key file at {} (created by concurrent process); initial publication error: {write_err:#}",
+                                key_path.display()
+                            )
+                        })?;
                     let bytes = hex_decode(hex.trim())
                         .context("Secret key file created by concurrent process is corrupt")?;
                     validate_key(bytes)
@@ -618,95 +694,55 @@ fn is_already_exists_error(err: &anyhow::Error) -> bool {
     })
 }
 
-/// Write `key` as hex to `key_path` with restrictive permissions, using atomic
-/// no-replace publication: full content is written and durably flushed to a
-/// private temp file, hardened, then published to the final path with a
-/// create-if-absent atomic operation — `hard_link` on Unix (EEXIST if present),
-/// `MoveFileExW` without `MOVEFILE_REPLACE_EXISTING` on Windows
-/// (ERROR_ALREADY_EXISTS if present).  `std::fs::rename` is not used on Windows
-/// as it would replace an existing key.
+/// Write and sync the complete key before no-replace publication.
+/// Windows retains the exclusive, restrictive-at-creation handle through rename.
 fn write_key_file_atomic_publish(key_path: &Path, key: &[u8]) -> Result<()> {
     write_key_file_atomic_publish_with(key_path, key, |f, bytes| {
         f.write_all(bytes)?;
         f.flush()?;
-        f.sync_all() // durable before publish (fsync / FlushFileBuffers)
+        f.sync_all()
     })
 }
 
-/// Core of atomic key publication.  `write_fn` performs the entire
-/// write-then-durable stage (write_all + flush + sync_all) on the temp file;
-/// extracting it behind a closure lets tests inject a deterministic write-stage
-/// failure and assert that `TempFileGuard` removes the temp file on every early
-/// return.  The temp creation, guard arm, and closure run identically on all
-/// platforms — only the publication step below is `cfg`-split.
+/// The write-stage callback lets tests fail after partial writes or before sync
+/// while exercising production creation, publication, and cleanup.
 fn write_key_file_atomic_publish_with<F>(key_path: &Path, key: &[u8], write_fn: F) -> Result<()>
 where
     F: FnOnce(&mut std::fs::File, &[u8]) -> std::io::Result<()>,
 {
-    // Ensure parent directory exists.
     if let Some(parent) = key_path.parent() {
         fs::create_dir_all(parent)?;
     }
-
-    // Reject symlink / reparse point on the final path before publishing.
     if is_symlink_like(key_path) {
         anyhow::bail!("Key file path is a symlink — refusing to write");
     }
-
-    // Write full key material to a unique temporary file.  The guard is
-    // armed ONLY after successful creation — arming before create_new would
-    // let a name-collision loser delete another process's temp file.
     let temp_path = temp_path_for(key_path);
-
-    let mut open_opts = std::fs::OpenOptions::new();
-    open_opts.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        open_opts.mode(0o600); // restrictive at birth
-    }
-    let mut file = open_opts
-        .open(&temp_path)
-        .with_context(|| format!("Failed to create temp key file at {}", temp_path.display()))?;
-
-    // Guard armed after we own the file — covers every ? early return AND
-    // panics between here and successful publication.
-    let mut temp_guard = TempFileGuard::new(&temp_path);
-
-    // Harden permissions BEFORE writing key bytes.  On Windows the temp file
-    // inherits the parent directory ACL at creation; apply_windows_acl (now
-    // fail-closed) must establish a restrictive ACL before a single key byte
-    // hits disk.  On Unix, mode(0o600) at open() already provides restrictive-
-    // at-birth; the follow-up set_permissions below is belt-and-suspenders.
-    #[cfg(windows)]
-    apply_windows_acl(&temp_path)?;
-
     let hex_key = hex_encode(key);
-    write_fn(&mut file, hex_key.as_bytes()).context("Failed to write key data to temp file")?;
-    drop(file);
 
-    // Belt-and-suspenders permission hardening on Unix (restrictive-at-birth
-    // is already set via mode(0o600) at open time).
-    #[cfg(unix)]
+    #[cfg(windows)]
     {
-        // Sync temp directory entry before hard_link — crash between
-        // data sync and hard_link can orphan the inode.
-        sync_parent_dir(&temp_path)?;
-
-        use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(&temp_path, fs::Permissions::from_mode(0o600));
+        windows_key_file::write_and_publish_with(&temp_path, key_path, hex_key.as_bytes(), write_fn)
     }
 
-    // Atomic no-replace publication — one equivalent design per platform.
-    #[cfg(not(any(unix, windows)))]
-    compile_error!(
-        "atomic key publication requires a platform no-replace mechanism \
-         (hard_link on Unix, MoveFileExW on Windows); unsupported target"
-    );
-
-    // Unix: hard_link(temp, final) fails with EEXIST if final exists.
     #[cfg(unix)]
     {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temp_path)
+            .with_context(|| {
+                format!("Failed to create temp key file at {}", temp_path.display())
+            })?;
+        // Arm only after creation so a collision cannot remove someone else's file.
+        let mut temp_guard = TempFileGuard::new(&temp_path);
+        write_fn(&mut file, hex_key.as_bytes()).context("Failed to write key data to temp file")?;
+        drop(file);
+
+        sync_parent_dir(&temp_path)?;
+        let _ = fs::set_permissions(&temp_path, fs::Permissions::from_mode(0o600));
         match std::fs::hard_link(&temp_path, key_path) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -715,40 +751,17 @@ where
             }
             Err(e) => return Err(e).context("Failed to atomically publish key file"),
         }
-        // Sync the parent directory before removing the temp name — the
-        // hard_link entry must be crash-durable before the temp inode's
-        // last remaining name is destroyed.
+        // Persist the final link before removing the temp inode's other name.
         sync_parent_dir(key_path)?;
-        // Remove the temp *name* (inode survives via the key_path link).
-        // Only disarm when removal succeeds — if it fails, the guard stays
-        // armed so Drop retries cleanup.
         if std::fs::remove_file(&temp_path).is_ok() {
             temp_guard.disarm();
-            // Sync so the temp-name removal is also crash-durable.
             sync_parent_dir(key_path)?;
         }
+        Ok(())
     }
 
-    // Windows: MoveFileExW(temp, final, MOVEFILE_WRITE_THROUGH) — atomic
-    // rename WITHOUT MOVEFILE_REPLACE_EXISTING.  Fails with
-    // ERROR_ALREADY_EXISTS if final exists.  MOVEFILE_WRITE_THROUGH makes
-    // the rename itself crash-durable (the call does not return until the
-    // metadata is flushed), so no separate directory sync is needed.
-    #[cfg(windows)]
-    {
-        match move_file_no_replace(&temp_path, key_path) {
-            Ok(()) => {
-                temp_guard.disarm(); // temp renamed away — nothing to remove
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                return Err(e)
-                    .context("Key file already exists — another process created it concurrently");
-            }
-            Err(e) => return Err(e).context("Failed to atomically publish key file"),
-        }
-    }
-
-    Ok(())
+    #[cfg(not(any(unix, windows)))]
+    compile_error!("atomic key publication requires a platform no-replace mechanism");
 }
 
 /// Sync the parent directory so the new name is crash-durable.
@@ -766,155 +779,6 @@ fn sync_parent_dir(file_path: &Path) -> Result<()> {
                 )
             })?;
     }
-    Ok(())
-}
-
-/// `MoveFileExW(src, dst, MOVEFILE_WRITE_THROUGH)` — atomic rename WITHOUT
-/// `MOVEFILE_REPLACE_EXISTING`.  `MOVEFILE_WRITE_THROUGH` makes the rename
-/// crash-durable: the call does not return until the metadata is flushed.
-///
-/// `dst` existing → `GetLastError()` = `ERROR_ALREADY_EXISTS` (183) → std maps to
-/// `io::ErrorKind::AlreadyExists`, preserving create-if-absent.  Universal across
-/// NTFS/ReFS/SMB/FAT.
-///
-/// NOTE: `std::fs::rename` must NOT be used — on Windows it passes
-/// `MOVEFILE_REPLACE_EXISTING` and would overwrite an existing key.
-#[cfg(windows)]
-fn move_file_no_replace(src: &Path, dst: &Path) -> std::io::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows::Win32::Storage::FileSystem::{
-        MOVE_FILE_FLAGS, MOVEFILE_WRITE_THROUGH, MoveFileExW,
-    };
-    use windows::core::PCWSTR;
-
-    // NUL-terminated wide strings for the Win32 W API.  Keep the buffers alive
-    // for the duration of the call (PCWSTR only borrows the pointer).
-    let src_w: Vec<u16> = src
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
-    let dst_w: Vec<u16> = dst
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
-
-    let result = unsafe {
-        MoveFileExW(
-            PCWSTR(src_w.as_ptr()),
-            PCWSTR(dst_w.as_ptr()),
-            MOVE_FILE_FLAGS(MOVEFILE_WRITE_THROUGH.0),
-        )
-    };
-
-    // On failure, read GetLastError via std, which already maps
-    // ERROR_ALREADY_EXISTS(183) → ErrorKind::AlreadyExists.
-    match result {
-        Ok(()) => Ok(()),
-        Err(_) => Err(std::io::Error::last_os_error()),
-    }
-}
-
-/// Apply takeown + icacls hardening to `path` (the TEMP file), BEFORE it is
-/// published.  The final name therefore never appears with inherited/loose
-/// ACLs.  Fail-closed: if hardening cannot be established, publication aborts
-/// so the key is never visible with unhardened permissions.
-#[cfg(windows)]
-fn apply_windows_acl(path: &Path) -> Result<()> {
-    let username = std::process::Command::new("whoami")
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_else(|| std::env::var("USERNAME").unwrap_or_default());
-    let Some(grant_arg) = build_windows_icacls_grant_arg(&username) else {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-            "USERNAME environment variable is empty; \
-             cannot restrict key file permissions via icacls"
-        );
-        anyhow::bail!(
-            "Cannot determine current username; \
-             ACL hardening is required for key file protection"
-        );
-    };
-
-    match std::process::Command::new("takeown")
-        .arg("/F")
-        .arg(path)
-        .output()
-    {
-        Ok(o) if !o.status.success() => {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                &format!(
-                    "Failed to take ownership of key file via takeown (exit code {:?})",
-                    o.status.code()
-                )
-            );
-            anyhow::bail!(
-                "Failed to take ownership of key file via takeown; \
-                 cannot establish restrictive ACL"
-            );
-        }
-        Err(e) => {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                "Could not take ownership of key file"
-            );
-            anyhow::bail!(
-                "Could not take ownership of key file; \
-                 cannot establish restrictive ACL"
-            );
-        }
-        _ => {}
-    }
-
-    match std::process::Command::new("icacls")
-        .arg(path)
-        .args(["/inheritance:r", "/grant:r"])
-        .arg(grant_arg)
-        .output()
-    {
-        Ok(o) if !o.status.success() => {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                &format!(
-                    "Failed to set key file permissions via icacls (exit code {:?})",
-                    o.status.code()
-                )
-            );
-            anyhow::bail!(
-                "Failed to set restrictive ACL via icacls; \
-                 key file permissions may be insecure"
-            );
-        }
-        Err(e) => {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                "Could not set key file permissions"
-            );
-            anyhow::bail!(
-                "Could not set key file permissions via icacls; \
-                 key file permissions may be insecure"
-            );
-        }
-        _ => {}
-    }
-
     Ok(())
 }
 
@@ -951,17 +815,6 @@ fn hex_encode(data: &[u8]) -> String {
         let _ = write!(s, "{b:02x}");
     }
     s
-}
-
-/// Build the `/grant` argument for `icacls` using a normalized username.
-/// Returns `None` when the username is empty or whitespace-only.
-#[cfg(any(windows, test))]
-fn build_windows_icacls_grant_arg(username: &str) -> Option<String> {
-    let normalized = username.trim();
-    if normalized.is_empty() {
-        return None;
-    }
-    Some(format!("{normalized}:F"))
 }
 
 /// Hex-decode a hex string to bytes.
@@ -1153,6 +1006,68 @@ mod tests {
     }
 
     // ── SecretStore basics ─────────────────────────────────────
+
+    #[test]
+    fn decrypt_with_missing_key_fails_without_creating_a_replacement() {
+        let source = TempDir::new().unwrap();
+        let missing = TempDir::new().unwrap();
+        let encrypted = SecretStore::new(source.path(), true)
+            .encrypt("preserve-recovery-path")
+            .unwrap();
+        let store = SecretStore::new(missing.path(), true);
+
+        let error = store
+            .decrypt(&encrypted)
+            .expect_err("missing install key must fail closed");
+        assert!(error.to_string().contains(".secret_key"), "{error}");
+        assert!(
+            !missing.path().join(".secret_key").exists(),
+            "a read failure must not create a replacement key"
+        );
+    }
+
+    #[test]
+    fn keyed_digests_are_stable_domain_separated_and_read_only_by_default() {
+        let tmp = TempDir::new().unwrap();
+        let store = SecretStore::new(tmp.path(), true);
+        assert!(store.keyed_digest(b"owner", b"same").is_err());
+        assert!(!tmp.path().join(".secret_key").exists());
+
+        let first = store.keyed_digest_or_create(b"owner", b"same").unwrap();
+        assert_eq!(store.keyed_digest(b"owner", b"same").unwrap(), first);
+        assert_ne!(store.keyed_digest(b"row", b"same").unwrap(), first);
+        assert_ne!(store.keyed_digest(b"owner", b"other").unwrap(), first);
+        assert_eq!(
+            SecretStore::new(tmp.path(), false)
+                .keyed_digest(b"owner", b"same")
+                .unwrap(),
+            first,
+            "blind-index derivation is independent of the plaintext preference"
+        );
+    }
+
+    #[test]
+    fn keyed_digests_use_a_derived_subkey_not_the_install_key() {
+        let key = [7_u8; 32];
+        let digest = keyed_digest_with_key(&key, b"owner", b"value").unwrap();
+        let mut raw = <Hmac<Sha256> as Mac>::new_from_slice(&key).unwrap();
+        raw.update(KEYED_DIGEST_DOMAIN);
+        raw.update(&5_u64.to_be_bytes());
+        raw.update(b"owner");
+        raw.update(b"value");
+        let raw: [u8; 32] = raw.finalize().into_bytes().into();
+        assert_ne!(digest, raw, "the AEAD key must not also key the HMAC");
+        assert_ne!(keyed_digest_subkey(&key).unwrap(), key);
+    }
+
+    #[test]
+    fn wrong_length_secret_key_is_rejected_without_panicking() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join(".secret_key"), "00").unwrap();
+        let store = SecretStore::new(tmp.path(), true);
+        assert!(store.keyed_digest(b"owner", b"value").is_err());
+        assert!(store.encrypt("value").is_err());
+    }
 
     #[test]
     fn encrypt_decrypt_roundtrip() {
@@ -1741,28 +1656,6 @@ exit 65
     }
 
     #[test]
-    fn windows_icacls_grant_arg_rejects_empty_username() {
-        assert_eq!(build_windows_icacls_grant_arg(""), None);
-        assert_eq!(build_windows_icacls_grant_arg("   \t\n"), None);
-    }
-
-    #[test]
-    fn windows_icacls_grant_arg_trims_username() {
-        assert_eq!(
-            build_windows_icacls_grant_arg("  alice  "),
-            Some("alice:F".to_string())
-        );
-    }
-
-    #[test]
-    fn windows_icacls_grant_arg_preserves_valid_characters() {
-        assert_eq!(
-            build_windows_icacls_grant_arg("DOMAIN\\svc-user"),
-            Some("DOMAIN\\svc-user:F".to_string())
-        );
-    }
-
-    #[test]
     fn generate_random_key_correct_length() {
         let key = generate_random_key();
         assert_eq!(key.len(), KEY_LEN);
@@ -1829,29 +1722,6 @@ exit 65
             perms.mode() & 0o777,
             0o600,
             "Key file must be owner-only (0600)"
-        );
-    }
-
-    /// Document the expected ordering on Windows: `takeown` runs before `icacls`.
-    ///
-    /// Without `takeown`, the file owner may be an invalid SID, causing `icacls`
-    /// grants to succeed against an unowned file that later becomes unreadable.
-    /// This test verifies the code structure expectation.
-    #[test]
-    fn takeown_runs_before_icacls_on_windows() {
-        // Read the source to confirm `takeown` appears before `icacls` in the
-        // Windows cfg block of `write_key_file`. This is a structural
-        // documentation test — the actual commands are Windows-only.
-        let source = include_str!("secrets.rs");
-        let takeown_pos = source
-            .find("Command::new(\"takeown\")")
-            .expect("takeown call must exist in secrets.rs");
-        let icacls_pos = source
-            .find("Command::new(\"icacls\")")
-            .expect("icacls call must exist in secrets.rs");
-        assert!(
-            takeown_pos < icacls_pos,
-            "takeown must run before icacls to fix file ownership first (issue #4532)"
         );
     }
 
@@ -2034,195 +1904,6 @@ exit 65
         sync_parent_dir(&key_path).unwrap();
     }
 
-    // Verifies that write_key_file applies a non-inherited DACL before key bytes
-    // reach disk, and that the file owner is the current user.
-    //
-    // Uses raw FFI because windows 0.61 removed the managed wrappers for
-    // GetNamedSecurityInfoW / GetUserNameW / LookupAccountNameW / LocalFree.
-    #[cfg(windows)]
-    #[test]
-    fn write_key_file_creates_with_restrictive_acl_at_birth() {
-        use std::os::windows::ffi::OsStrExt;
-
-        // ── Raw FFI declarations ────────────────────────────────────────────
-        #[repr(C)]
-        struct SidBuf([u8; 256]);
-
-        // Security information flags
-        const OWNER_SECURITY_INFORMATION: u32 = 0x00000001;
-        const DACL_SECURITY_INFORMATION: u32 = 0x00000004;
-        const SE_FILE_OBJECT: u32 = 0x1;
-
-        // Return codes
-        const ERROR_SUCCESS: u32 = 0;
-
-        // GetUserNameW
-        #[link(name = "advapi32")]
-        unsafe extern "system" {
-            fn GetUserNameW(name: *mut u16, size: *mut u32) -> i32;
-        }
-
-        // LookupAccountNameW
-        #[link(name = "advapi32")]
-        unsafe extern "system" {
-            fn LookupAccountNameW(
-                sysname: *const u16,
-                name: *const u16,
-                sid: *mut std::ffi::c_void,
-                cb_sid: *mut u32,
-                ref_domain: *mut u16,
-                cb_ref_domain: *mut u32,
-                sid_name_use: *mut u32,
-            ) -> i32;
-        }
-
-        // GetNamedSecurityInfoW
-        #[link(name = "advapi32")]
-        unsafe extern "system" {
-            fn GetNamedSecurityInfoW(
-                obj: *const u16,
-                obj_type: u32,
-                info: u32,
-                owner: *mut *mut std::ffi::c_void,
-                group: *mut *mut std::ffi::c_void,
-                dacl: *mut *mut std::ffi::c_void,
-                sacl: *mut *mut std::ffi::c_void,
-                sd: *mut *mut std::ffi::c_void,
-            ) -> u32;
-        }
-
-        // LocalFree
-        #[link(name = "kernel32")]
-        unsafe extern "system" {
-            fn LocalFree(mem: *mut std::ffi::c_void) -> *mut std::ffi::c_void;
-        }
-
-        // IsValidSid
-        #[link(name = "advapi32")]
-        unsafe extern "system" {
-            fn IsValidSid(sid: *const std::ffi::c_void) -> i32;
-        }
-
-        // EqualSid
-        #[link(name = "advapi32")]
-        unsafe extern "system" {
-            fn EqualSid(sid1: *const std::ffi::c_void, sid2: *const std::ffi::c_void) -> i32;
-        }
-
-        // ═══════════════════════════════════════════════════════════════════════
-
-        let tmp = TempDir::new().unwrap();
-        let key_path = tmp.path().join(".secret_key");
-
-        // Use a fresh file — no race.
-        let key = generate_random_key();
-        write_key_file(&key_path, &key).unwrap();
-        assert!(key_path.exists(), "key file must be published");
-
-        // ── 1. Get current username via GetUserNameW ─────────────────────────
-        let mut name_buf = vec![0u16; 256];
-        let mut name_len = name_buf.len() as u32;
-        let result = unsafe { GetUserNameW(name_buf.as_mut_ptr(), &mut name_len) };
-        assert_eq!(result, 1, "GetUserNameW must succeed");
-        let username = String::from_utf16_lossy(&name_buf[..name_len as usize - 1]);
-
-        // ── 2. Look up the user's SID ─────────────────────────────────────────
-        let mut sid_buf = SidBuf([0; 256]);
-        let mut sid_len = 256u32;
-        let mut domain_buf = vec![0u16; 256];
-        let mut domain_len = 256u32;
-        let mut sid_name_use = 0u32;
-
-        let name_wide: Vec<u16> = username.encode_utf16().chain(std::iter::once(0)).collect();
-
-        let result = unsafe {
-            LookupAccountNameW(
-                std::ptr::null(),
-                name_wide.as_ptr(),
-                sid_buf.0.as_mut_ptr() as *mut std::ffi::c_void,
-                &mut sid_len,
-                domain_buf.as_mut_ptr(),
-                &mut domain_len,
-                &mut sid_name_use,
-            )
-        };
-        assert_eq!(
-            result, 1,
-            "LookupAccountNameW must succeed for user: {username}"
-        );
-        // SidTypeUser = 1
-        assert_eq!(sid_name_use, 1, "account type must be SidTypeUser");
-
-        // ═══════════════════════════════════════════════════════════════════════
-        // ║ 3.  Read security descriptor from the published key file.          ║
-        // ║    OWNER_SECURITY_INFORMATION → fills `owner` param               ║
-        // ║    DACL_SECURITY_INFORMATION → fills `dacl` param                 ║
-        // ═══════════════════════════════════════════════════════════════════════
-        let mut owner_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
-        let mut dacl_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
-        let mut sd_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
-
-        let key_w: Vec<u16> = key_path
-            .as_os_str()
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect();
-
-        let result = unsafe {
-            GetNamedSecurityInfoW(
-                key_w.as_ptr(),
-                SE_FILE_OBJECT,
-                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
-                &mut owner_ptr,
-                std::ptr::null_mut(),
-                &mut dacl_ptr,
-                std::ptr::null_mut(),
-                &mut sd_ptr,
-            )
-        };
-
-        assert_eq!(
-            result, ERROR_SUCCESS,
-            "GetNamedSecurityInfoW failed with error {result} — ACL not applied?"
-        );
-
-        // Owner must be non-null and valid.
-        assert!(!owner_ptr.is_null(), "file owner must not be NULL");
-        unsafe {
-            assert_eq!(IsValidSid(owner_ptr), 1, "owner SID must be valid");
-        }
-
-        // Verify the file owner IS the current user, not just some valid SID.
-        // EqualSid compares two SIDs byte-for-byte — proves ACL was set for
-        // the intended principal, not inherited from the parent directory.
-        unsafe {
-            assert_eq!(
-                EqualSid(owner_ptr, sid_buf.0.as_ptr() as *const std::ffi::c_void,),
-                1,
-                "file owner SID must match the current user's SID — \
-                 ACL was not applied correctly?"
-            );
-        }
-
-        // DACL must be present (not inherited from parent dir).
-        assert!(
-            !dacl_ptr.is_null(),
-            "DACL must not be NULL — expected an explicit ACL, not inherited"
-        );
-
-        // Free the security descriptor allocated by GetNamedSecurityInfoW.
-        unsafe {
-            LocalFree(sd_ptr);
-        }
-
-        // ── 4. Verify key content survived ACL-hardened publication ───────────
-        let loaded = load_or_create_key(&key_path).unwrap();
-        assert_eq!(
-            loaded, key,
-            "key content must survive ACL-hardened publication"
-        );
-    }
-
     // ── Symlink rejection on read paths ──────────────────────
 
     #[cfg(unix)]
@@ -2271,7 +1952,7 @@ exit 65
 
     /// True iff no `.tmp.` entry remains in `dir`.
     #[cfg(test)]
-    fn no_temp_residue(dir: &Path) -> bool {
+    pub(super) fn no_temp_residue(dir: &Path) -> bool {
         fs::read_dir(dir)
             .unwrap()
             .filter_map(|e| e.ok())
@@ -2280,9 +1961,7 @@ exit 65
 
     #[test]
     fn temp_file_removed_on_write_failure() {
-        // Cross-platform: the write stage (temp create + write_fn) is common to
-        // Unix and Windows and runs before the cfg-split publication, so the
-        // guard cleanup is validated on whatever platform CI runs.
+        // Exercise the production temp-file owner and cleanup on each platform.
         let tmp = TempDir::new().unwrap();
         let key_path = tmp.path().join(".secret_key");
         let err =
@@ -2305,9 +1984,8 @@ exit 65
         );
     }
 
-    #[cfg(unix)]
     #[test]
-    fn temp_file_removed_on_write_failure_unix() {
+    fn temp_file_removed_after_partial_write_or_sync_failure() {
         let tmp = TempDir::new().unwrap();
         let key_path = tmp.path().join(".secret_key");
         let key = generate_random_key();
@@ -2395,78 +2073,6 @@ exit 65
             result.is_err(),
             "no-follow open must refuse the symlink, never read the attacker target: {result:?}"
         );
-    }
-
-    // Windows concurrent publication interleaving: multiple threads racing on
-    // first-use key creation must all converge on the same complete key, with
-    // MoveFileExW providing no-replace atomicity.  Compiled/linted by the
-    // scheduled cross-platform-clippy workflow; runs on a Windows runner.
-    #[cfg(windows)]
-    #[test]
-    fn windows_concurrent_publish_never_observes_partial_key() {
-        use std::sync::Barrier;
-        let tmp = TempDir::new().unwrap();
-        let key_path = Arc::new(tmp.path().join(".secret_key"));
-        let barrier = Arc::new(Barrier::new(4));
-
-        let handles: Vec<_> = (0..4)
-            .map(|_| {
-                let kp = Arc::clone(&key_path);
-                let b = Arc::clone(&barrier);
-                std::thread::spawn(move || {
-                    b.wait();
-                    load_or_create_key(&kp)
-                })
-            })
-            .collect();
-
-        let keys: Vec<Vec<u8>> = handles
-            .into_iter()
-            .map(|h| h.join().unwrap().unwrap())
-            .collect();
-        for k in &keys {
-            assert_eq!(k.len(), 32, "no thread may observe a partial key");
-            assert_eq!(
-                k, &keys[0],
-                "all callers must receive the same published key"
-            );
-        }
-        assert_ne!(keys[0], vec![0u8; 32], "key must not be all-zero");
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn windows_move_no_replace_rejects_existing() {
-        let tmp = TempDir::new().unwrap();
-        let src = tmp.path().join("src.tmp");
-        let dst = tmp.path().join(".secret_key");
-        fs::write(&src, b"deadbeef").unwrap();
-        fs::write(&dst, b"existing").unwrap();
-
-        let err = move_file_no_replace(&src, &dst).unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
-        assert_eq!(
-            fs::read(&dst).unwrap(),
-            b"existing",
-            "dst must not be overwritten"
-        );
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn windows_move_no_replace_publishes_when_absent() {
-        let tmp = TempDir::new().unwrap();
-        let src = tmp.path().join("src.tmp");
-        let dst = tmp.path().join(".secret_key");
-        fs::write(&src, b"deadbeef").unwrap();
-
-        move_file_no_replace(&src, &dst).unwrap();
-        assert!(dst.exists(), "final path must be published");
-        assert!(
-            !src.exists(),
-            "temp must be renamed away, leaving no residue"
-        );
-        assert_eq!(fs::read(&dst).unwrap(), b"deadbeef");
     }
 
     // ── Concurrent key creation safety ────────────────────────
@@ -2583,6 +2189,9 @@ exit 65
         let tmp2 = TempDir::new().unwrap();
         let store1 = SecretStore::new(tmp1.path(), true);
         let store2 = SecretStore::new(tmp2.path(), true);
+        // Give store2 its own key: a missing key fails earlier, as a missing
+        // key rather than as a wrong one.
+        store2.encrypt("provision-store2-key").unwrap();
 
         let encrypted = store1.encrypt("secret-for-store1").unwrap();
         let err = store2.decrypt(&encrypted).expect_err("wrong key must fail");

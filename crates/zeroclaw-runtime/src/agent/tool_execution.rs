@@ -10,7 +10,7 @@ use crate::observability::{Observer, ObserverEvent};
 use crate::tools::{ActivatedToolSet, Tool};
 use tokio::sync::mpsc::Sender;
 use zeroclaw_api::agent::{ToolArtifact, TurnEvent};
-use zeroclaw_api::attribution::Attributable;
+use zeroclaw_api::tool::{ToolExecutionCancelled, ToolExecutionContext};
 
 // Items that still live in `loop_` — import via the parent module.
 use super::loop_::{ParsedToolCall, ToolLoopCancelled, is_tool_loop_cancelled, scrub_credentials};
@@ -39,6 +39,47 @@ pub fn find_tool<'a>(tools: &'a [Box<dyn Tool>], name: &str) -> Option<&'a dyn T
     tools.iter().find(|t| t.name() == name).map(|t| t.as_ref())
 }
 
+enum ResolvedTool<'a> {
+    Static(&'a dyn Tool),
+    Activated(Arc<dyn Tool>),
+}
+
+impl ResolvedTool<'_> {
+    fn tool(&self) -> &dyn Tool {
+        match self {
+            Self::Static(tool) => *tool,
+            Self::Activated(tool) => tool.as_ref(),
+        }
+    }
+}
+
+fn resolve_tool<'a>(
+    tools_registry: &'a [Box<dyn Tool>],
+    activated_tools: Option<&Arc<std::sync::Mutex<ActivatedToolSet>>>,
+    name: &str,
+    tool_call_id: Option<&str>,
+) -> Option<ResolvedTool<'a>> {
+    if let Some(tool) = find_tool(tools_registry, name) {
+        return Some(ResolvedTool::Static(tool));
+    }
+    let activated = activated_tools?;
+    let activated = match activated.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_category(::zeroclaw_log::EventCategory::Tool)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"tool": name, "tool_call_id": tool_call_id})),
+                "activated-tool lock poisoned while resolving tool; recovering guard for read"
+            );
+            poisoned.into_inner()
+        }
+    };
+    activated.get_resolved(name).map(ResolvedTool::Activated)
+}
+
 /// Resolve presentation provenance with the same static-then-activated lookup
 /// order used by execution. Unknown names remain `None` so callers fail closed.
 pub(crate) fn resolved_tool_provenance(
@@ -46,20 +87,8 @@ pub(crate) fn resolved_tool_provenance(
     activated_tools: Option<&Arc<std::sync::Mutex<ActivatedToolSet>>>,
     name: &str,
 ) -> Option<zeroclaw_api::attribution::ToolProvenance> {
-    if let Some(tool) = find_tool(tools_registry, name) {
-        return Some(tool.tool_provenance());
-    }
-
-    activated_tools
-        .map(|activated| match activated.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        })
-        .and_then(|activated| {
-            activated
-                .get_resolved(name)
-                .map(|tool| tool.tool_provenance())
-        })
+    resolve_tool(tools_registry, activated_tools, name, None)
+        .map(|resolved| resolved.tool().tool_provenance())
 }
 
 #[derive(Clone, Copy)]
@@ -75,6 +104,165 @@ fn is_excluded_tool(name: &str, excluded_tools: &[String]) -> bool {
     excluded_tools
         .iter()
         .any(|excluded| excluded.trim().eq_ignore_ascii_case(name))
+}
+
+enum DispatchResolution<'a> {
+    Available(ResolvedTool<'a>),
+    Unavailable,
+    Unknown,
+}
+
+fn resolve_dispatch_tool<'a>(
+    name: &str,
+    dispatch: ToolDispatchContext<'a>,
+    tool_call_id: Option<&str>,
+) -> DispatchResolution<'a> {
+    if is_excluded_tool(name, dispatch.excluded_tools) {
+        return DispatchResolution::Unavailable;
+    }
+    match resolve_tool(
+        dispatch.tools_registry,
+        dispatch.activated_tools,
+        name,
+        tool_call_id,
+    ) {
+        Some(resolved) if is_excluded_tool(resolved.tool().name(), dispatch.excluded_tools) => {
+            DispatchResolution::Unavailable
+        }
+        Some(resolved) => DispatchResolution::Available(resolved),
+        None => DispatchResolution::Unknown,
+    }
+}
+
+/// Admission snapshot from the executor's canonical resolver. Completed
+/// dispatch provenance remains authoritative if availability changes later.
+pub(crate) fn dispatch_tool_name(name: &str, dispatch: ToolDispatchContext<'_>) -> Option<String> {
+    match resolve_dispatch_tool(name, dispatch, None) {
+        DispatchResolution::Available(resolved) => Some(resolved.tool().name().to_owned()),
+        DispatchResolution::Unavailable | DispatchResolution::Unknown => None,
+    }
+}
+
+/// The active headless SOP step's exclusions merged over `dispatch`'s, or
+/// `None` outside a step. Sequential execution re-derives these per call, as a
+/// `tool_search` earlier in the batch may have activated a tool the step denies.
+fn step_scoped_exclusions(dispatch: ToolDispatchContext<'_>) -> Option<Vec<String>> {
+    crate::sop::active_scope::active_headless_step_scope().map(|scope| {
+        let mut merged = dispatch.excluded_tools.to_vec();
+        crate::agent::loop_::merge_sop_step_exclusions(
+            &mut merged,
+            dispatch.tools_registry,
+            dispatch.activated_tools,
+            Some(&scope),
+        );
+        merged
+    })
+}
+
+fn record_tool_call_start(
+    call_name: &str,
+    tool_call_id_owned: Option<String>,
+    full_args: &str,
+    meta: &TurnMeta<'_>,
+    observer: &dyn Observer,
+) {
+    observer.record_event(&ObserverEvent::ToolCallStart {
+        tool: call_name.to_string(),
+        tool_call_id: tool_call_id_owned,
+        arguments: Some(full_args.to_string()),
+        channel: Some(meta.channel_name.to_string()),
+        agent_alias: meta.agent_alias.map(|s| s.to_string()),
+        parent_agent_alias: meta.parent_agent_alias.map(|s| s.to_string()),
+        turn_id: Some(meta.turn_id.to_string()),
+    });
+}
+
+/// The answer sequential execution would give a call this turn cannot
+/// dispatch, recorded with the same observer events; `None` when the name
+/// resolves. Approval preparation uses it so nobody is asked to approve a
+/// call that would run nothing.
+pub(crate) fn undispatchable_tool_outcome(
+    call_name: &str,
+    call_arguments: &serde_json::Value,
+    tool_call_id: Option<&str>,
+    dispatch: ToolDispatchContext<'_>,
+    meta: &TurnMeta<'_>,
+    observer: &dyn Observer,
+) -> Option<ToolExecutionOutcome> {
+    let step_exclusions = step_scoped_exclusions(dispatch);
+    let dispatch = ToolDispatchContext {
+        excluded_tools: step_exclusions
+            .as_deref()
+            .unwrap_or(dispatch.excluded_tools),
+        ..dispatch
+    };
+    let unknown = match resolve_dispatch_tool(call_name, dispatch, tool_call_id) {
+        DispatchResolution::Available(_) => return None,
+        DispatchResolution::Unavailable => false,
+        DispatchResolution::Unknown => true,
+    };
+    let full_args = call_arguments.to_string();
+    let tool_call_id_owned = tool_call_id.map(str::to_string);
+    record_tool_call_start(
+        call_name,
+        tool_call_id_owned.clone(),
+        &full_args,
+        meta,
+        observer,
+    );
+    // Nothing ran; execution's duration here is only the lookup.
+    let duration = Duration::ZERO;
+    Some(if unknown {
+        unknown_tool_outcome(
+            call_name,
+            tool_call_id_owned,
+            &full_args,
+            meta,
+            observer,
+            duration,
+        )
+    } else {
+        unavailable_tool_outcome(
+            call_name,
+            tool_call_id_owned,
+            &full_args,
+            meta,
+            observer,
+            duration,
+        )
+    })
+}
+
+fn unknown_tool_outcome(
+    call_name: &str,
+    tool_call_id_owned: Option<String>,
+    full_args: &str,
+    meta: &TurnMeta<'_>,
+    observer: &dyn Observer,
+    duration: Duration,
+) -> ToolExecutionOutcome {
+    let reason = format!("Unknown tool: {call_name}");
+    observer.record_event(&ObserverEvent::ToolCall {
+        tool: call_name.to_string(),
+        tool_call_id: tool_call_id_owned,
+        duration,
+        success: false,
+        arguments: Some(full_args.to_string()),
+        result: Some(scrub_credentials(&reason)),
+        channel: Some(meta.channel_name.to_string()),
+        agent_alias: meta.agent_alias.map(|s| s.to_string()),
+        parent_agent_alias: meta.parent_agent_alias.map(|s| s.to_string()),
+        turn_id: Some(meta.turn_id.to_string()),
+    });
+    ToolExecutionOutcome {
+        output: reason.clone(),
+        success: false,
+        error_reason: Some(reason),
+        duration,
+        receipt: None,
+        output_data: None,
+        attachments: Vec::new(),
+    }
 }
 
 fn unavailable_tool_outcome(
@@ -105,6 +293,7 @@ fn unavailable_tool_outcome(
         duration,
         receipt: None,
         output_data: None,
+        attachments: Vec::new(),
     }
 }
 
@@ -116,6 +305,10 @@ pub struct ToolExecutionOutcome {
     /// fold a tool's detailed error body (which can reflect a token or signed
     /// URL) into this text and credential-scrub it before storing it here.
     pub output: String,
+    /// Attachments the tool declared for this result (`ToolOutput::attachments`).
+    /// They reach history through the carrier grammar and are never recovered
+    /// by scanning `output`.
+    pub attachments: Vec<zeroclaw_api::media::RenderedMarker>,
     /// Structured output when the tool declared one (`ToolOutput::data`).
     /// Feeds SOP step capture and data-flow surfaces; the LLM sees only
     /// `output`. Stored raw — consumers scrub at their own rendering boundary.
@@ -135,6 +328,14 @@ pub struct ToolExecutionOutcome {
 
 // ── Single tool execution ────────────────────────────────────────────────
 
+pub(crate) struct CompletedToolExecution {
+    pub(crate) outcome: ToolExecutionOutcome,
+    /// Created by the executor only after `Tool::execute` completes. An
+    /// unavailable name returns an outcome without dispatch evidence.
+    pub(crate) executed_tool_name: Option<String>,
+}
+
+#[cfg(test)]
 pub(crate) async fn execute_one_tool(
     call_name: &str,
     call_arguments: serde_json::Value,
@@ -146,96 +347,73 @@ pub(crate) async fn execute_one_tool(
     receipt_generator: Option<&super::tool_receipts::ReceiptGenerator>,
     event_tx: Option<&Sender<TurnEvent>>,
 ) -> Result<ToolExecutionOutcome> {
+    execute_one_tool_with_provenance(
+        call_name,
+        call_arguments,
+        tool_call_id,
+        dispatch,
+        meta,
+        observer,
+        cancellation_token,
+        receipt_generator,
+        event_tx,
+    )
+    .await
+    .map(|completed| completed.outcome)
+}
+
+async fn execute_one_tool_with_provenance(
+    call_name: &str,
+    call_arguments: serde_json::Value,
+    tool_call_id: Option<&str>,
+    dispatch: ToolDispatchContext<'_>,
+    meta: &TurnMeta<'_>,
+    observer: &dyn Observer,
+    cancellation_token: Option<&CancellationToken>,
+    receipt_generator: Option<&super::tool_receipts::ReceiptGenerator>,
+    event_tx: Option<&Sender<TurnEvent>>,
+) -> Result<CompletedToolExecution> {
     let full_args = call_arguments.to_string();
     let tool_call_id_owned = tool_call_id.map(str::to_string);
-    observer.record_event(&ObserverEvent::ToolCallStart {
-        tool: call_name.to_string(),
-        tool_call_id: tool_call_id_owned.clone(),
-        arguments: Some(full_args.clone()),
-        channel: Some(meta.channel_name.to_string()),
-        agent_alias: meta.agent_alias.map(|s| s.to_string()),
-        parent_agent_alias: meta.parent_agent_alias.map(|s| s.to_string()),
-        turn_id: Some(meta.turn_id.to_string()),
-    });
+    record_tool_call_start(
+        call_name,
+        tool_call_id_owned.clone(),
+        &full_args,
+        meta,
+        observer,
+    );
     let start = Instant::now();
 
-    if is_excluded_tool(call_name, dispatch.excluded_tools) {
-        return Ok(unavailable_tool_outcome(
-            call_name,
-            tool_call_id_owned,
-            &full_args,
-            meta,
-            observer,
-            start.elapsed(),
-        ));
-    }
-
-    let static_tool = find_tool(dispatch.tools_registry, call_name);
-    let activated_arc = if static_tool.is_none() {
-        match dispatch.activated_tools {
-            Some(at) => {
-                let activated_tools = match at.lock() {
-                    Ok(guard) => guard,
-                    Err(poisoned) => {
-                        ::zeroclaw_log::record!(
-                            WARN,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Note
-                            )
-                            .with_category(::zeroclaw_log::EventCategory::Tool)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                            .with_attrs(::serde_json::json!({
-                                "tool": call_name,
-                                "tool_call_id": tool_call_id,
-                            })),
-                            "activated-tool lock poisoned while resolving tool; recovering guard for read"
-                        );
-                        poisoned.into_inner()
-                    }
-                };
-                activated_tools.get_resolved(call_name)
-            }
-            None => None,
+    let resolved = match resolve_dispatch_tool(call_name, dispatch, tool_call_id) {
+        DispatchResolution::Available(resolved) => resolved,
+        DispatchResolution::Unavailable => {
+            return Ok(CompletedToolExecution {
+                executed_tool_name: None,
+                outcome: unavailable_tool_outcome(
+                    call_name,
+                    tool_call_id_owned,
+                    &full_args,
+                    meta,
+                    observer,
+                    start.elapsed(),
+                ),
+            });
         }
-    } else {
-        None
+        DispatchResolution::Unknown => {
+            return Ok(CompletedToolExecution {
+                executed_tool_name: None,
+                outcome: unknown_tool_outcome(
+                    call_name,
+                    tool_call_id_owned,
+                    &full_args,
+                    meta,
+                    observer,
+                    start.elapsed(),
+                ),
+            });
+        }
     };
-    let Some(tool) = static_tool.or(activated_arc.as_deref()) else {
-        let reason = format!("Unknown tool: {call_name}");
-        let duration = start.elapsed();
-        observer.record_event(&ObserverEvent::ToolCall {
-            tool: call_name.to_string(),
-            tool_call_id: tool_call_id_owned.clone(),
-            duration,
-            success: false,
-            arguments: Some(full_args.clone()),
-            result: Some(scrub_credentials(&reason)),
-            channel: Some(meta.channel_name.to_string()),
-            agent_alias: meta.agent_alias.map(|s| s.to_string()),
-            parent_agent_alias: meta.parent_agent_alias.map(|s| s.to_string()),
-            turn_id: Some(meta.turn_id.to_string()),
-        });
-        return Ok(ToolExecutionOutcome {
-            output: reason.clone(),
-            success: false,
-            error_reason: Some(reason),
-            duration,
-            receipt: None,
-            output_data: None,
-        });
-    };
-
-    if is_excluded_tool(tool.name(), dispatch.excluded_tools) {
-        return Ok(unavailable_tool_outcome(
-            call_name,
-            tool_call_id_owned,
-            &full_args,
-            meta,
-            observer,
-            start.elapsed(),
-        ));
-    }
+    let tool = resolved.tool();
 
     use ::zeroclaw_log::Instrument;
     let tool_span = ::zeroclaw_log::info_span!(
@@ -279,24 +457,21 @@ pub(crate) async fn execute_one_tool(
             .await;
     }
 
-    let tool_future = tool
-        .execute(call_arguments.clone())
+    let context = ToolExecutionContext::new(cancellation_token.cloned());
+    let execute = context
+        .run(tool.execute_with_context(call_arguments.clone(), &context))
         .instrument(tool_span.clone());
-    let execute = async {
-        if let Some(token) = cancellation_token {
-            tokio::select! {
-                () = token.cancelled() => Err::<_, anyhow::Error>(ToolLoopCancelled.into()),
-                result = tool_future => Ok(result),
-            }
-        } else {
-            Ok(tool_future.await)
-        }
-    };
     let tool_result = if let Some(model_switch_callback) = dispatch.model_switch_callback {
         scope_model_switch_state(Arc::clone(model_switch_callback), execute).await
     } else {
         execute.await
-    }?;
+    };
+    if tool_result
+        .as_ref()
+        .is_err_and(|error| error.is::<ToolExecutionCancelled>())
+    {
+        return Err(ToolLoopCancelled.into());
+    }
 
     let outcome = {
         let _result_guard = tool_span.entered();
@@ -361,6 +536,7 @@ pub(crate) async fn execute_one_tool(
                     });
                     Ok(ToolExecutionOutcome {
                         output: normalized_output.to_string(),
+                        attachments: r.output.attachments().to_vec(),
                         output_data: r.output.into_data(),
                         success: true,
                         error_reason: None,
@@ -378,6 +554,7 @@ pub(crate) async fn execute_one_tool(
                     // it. Tools that already put everything into `error` and
                     // leave `output` empty (the common case) are unaffected.
                     let output_text = r.output.as_str().to_string();
+                    let attachments = r.output.attachments().to_vec();
                     let output_data = r.output.into_data();
                     let reason = r.error.unwrap_or_else(|| output_text.clone());
                     let full_output = if !output_text.is_empty() && output_text != reason {
@@ -414,6 +591,7 @@ pub(crate) async fn execute_one_tool(
                         error_reason: Some(reason),
                         duration,
                         receipt: None,
+                        attachments,
                         output_data,
                     })
                 }
@@ -434,7 +612,7 @@ pub(crate) async fn execute_one_tool(
                         })),
                     format!("tool error: {call_name}")
                 );
-                let reason = format!("Error executing {call_name}: {e}");
+                let reason = format!("Error executing {}: {e}", tool.name());
                 // Same model-visible egress boundary as the
                 // `Ok(success = false)` arm above: a tool error can embed a
                 // redirect URL with a signed query string. Scrub the
@@ -460,6 +638,7 @@ pub(crate) async fn execute_one_tool(
                     duration,
                     receipt: None,
                     output_data: None,
+                    attachments: Vec::new(),
                 })
             }
         }
@@ -491,7 +670,10 @@ pub(crate) async fn execute_one_tool(
         let _ = tx.send(plan_event).await;
     }
 
-    outcome
+    outcome.map(|outcome| CompletedToolExecution {
+        outcome,
+        executed_tool_name: Some(tool.name().to_owned()),
+    })
 }
 
 // ── Parallel / sequential decision ───────────────────────────────────────
@@ -509,6 +691,25 @@ pub fn should_execute_tools_in_parallel(
     // race condition where the tool lookup happens before activation completes.
     // Force sequential execution whenever tool_search is in the batch.
     if tool_calls.iter().any(|call| call.name == "tool_search") {
+        return false;
+    }
+
+    // file_edit is a read-modify-write operation. If another file mutation in
+    // the same prepared batch runs concurrently, either call can overwrite a
+    // result computed from stale contents. Preserve model order for the whole
+    // batch whenever at least one edit shares the batch with another edit or
+    // full-file write. Two file_write calls remain parallel-eligible because
+    // their atomic replacement already has sequential-equivalent
+    // last-writer-wins semantics.
+    let file_edit_count = tool_calls
+        .iter()
+        .filter(|call| call.name == "file_edit")
+        .count();
+    let file_mutation_count = tool_calls
+        .iter()
+        .filter(|call| matches!(call.name.as_str(), "file_edit" | "file_write"))
+        .count();
+    if file_edit_count > 0 && file_mutation_count > 1 {
         return false;
     }
 
@@ -533,11 +734,11 @@ pub(crate) async fn execute_tools_parallel(
     cancellation_token: Option<&CancellationToken>,
     receipt_generator: Option<&super::tool_receipts::ReceiptGenerator>,
     event_tx: Option<&Sender<TurnEvent>>,
-) -> Result<Vec<Option<ToolExecutionOutcome>>> {
+) -> Result<Vec<Option<CompletedToolExecution>>> {
     let futures: Vec<_> = tool_calls
         .iter()
         .map(|call| {
-            execute_one_tool(
+            execute_one_tool_with_provenance(
                 &call.name,
                 call.arguments.clone(),
                 call.tool_call_id.as_deref(),
@@ -573,18 +774,34 @@ pub(crate) async fn execute_tools_sequential(
     cancellation_token: Option<&CancellationToken>,
     receipt_generator: Option<&super::tool_receipts::ReceiptGenerator>,
     event_tx: Option<&Sender<TurnEvent>>,
-) -> Result<Vec<Option<ToolExecutionOutcome>>> {
-    let mut slots: Vec<Option<ToolExecutionOutcome>> = Vec::with_capacity(tool_calls.len());
+) -> Result<Vec<Option<CompletedToolExecution>>> {
+    let mut slots: Vec<Option<CompletedToolExecution>> = Vec::with_capacity(tool_calls.len());
 
     for call in tool_calls {
         if cancellation_token.is_some_and(CancellationToken::is_cancelled) {
             break;
         }
-        let outcome = match execute_one_tool(
+        // Re-derive the active SOP step's tool scope against the CURRENT
+        // callable set, per call rather than per response. `dispatch` carries
+        // the exclusion snapshot taken before the batch; a `tool_search` earlier
+        // in this same response can activate a deferred tool the step denies,
+        // and that snapshot does not know about it. Without this, the denied
+        // tool executes and the step's boundary is only re-derived in time for
+        // the NEXT provider request — one call too late.
+        let rescoped_exclusions = step_scoped_exclusions(dispatch);
+        let call_dispatch = ToolDispatchContext {
+            tools_registry: dispatch.tools_registry,
+            activated_tools: dispatch.activated_tools,
+            excluded_tools: rescoped_exclusions
+                .as_deref()
+                .unwrap_or(dispatch.excluded_tools),
+            model_switch_callback: dispatch.model_switch_callback,
+        };
+        let outcome = match execute_one_tool_with_provenance(
             &call.name,
             call.arguments.clone(),
             call.tool_call_id.as_deref(),
-            dispatch,
+            call_dispatch,
             meta,
             observer,
             cancellation_token,
@@ -607,15 +824,19 @@ pub(crate) async fn execute_tools_sequential(
 #[cfg(test)]
 mod tests {
     use super::{
-        Observer, ObserverEvent, ToolDispatchContext, execute_one_tool, resolved_tool_provenance,
+        Observer, ObserverEvent, ToolDispatchContext, ToolExecutionOutcome, TurnMeta,
+        execute_one_tool, is_tool_loop_cancelled, resolved_tool_provenance,
     };
     use crate::observability::noop::NoopObserver;
     use crate::observability::traits::ObserverMetric;
     use crate::tools::ActivatedToolSet;
+    use anyhow::Result;
     use async_trait::async_trait;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
-    use zeroclaw_api::tool::Tool;
+    use std::time::Duration;
+    use tokio_util::sync::CancellationToken;
+    use zeroclaw_api::tool::{Tool, ToolExecutionContext};
 
     /// Minimal tool that records invocations. Used to verify that the
     /// poisoned-lock recovery path still resolves an activated tool and
@@ -755,6 +976,126 @@ mod tests {
             invocations.load(Ordering::SeqCst),
             1,
             "recovered activated tool should have been invoked exactly once"
+        );
+    }
+
+    /// Stands in for `tool_search`: activates a deferred tool part-way through a
+    /// response, so the call after it attempts something the active step denies.
+    struct ActivatingTool {
+        activated: Arc<Mutex<ActivatedToolSet>>,
+        activates: String,
+        target: Arc<dyn Tool>,
+    }
+
+    impl zeroclaw_api::attribution::Attributable for ActivatingTool {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::System
+        }
+        fn alias(&self) -> &str {
+            "test-activating-tool"
+        }
+    }
+
+    #[async_trait]
+    impl Tool for ActivatingTool {
+        fn name(&self) -> &str {
+            "activator"
+        }
+
+        fn description(&self) -> &str {
+            "Activates a deferred tool, as tool_search does"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> anyhow::Result<zeroclaw_api::tool::ToolResult> {
+            match self.activated.lock() {
+                Ok(mut set) => set.activate(self.activates.clone(), Arc::clone(&self.target)),
+                Err(poisoned) => poisoned
+                    .into_inner()
+                    .activate(self.activates.clone(), Arc::clone(&self.target)),
+            }
+            Ok(zeroclaw_api::tool::ToolResult {
+                success: true,
+                output: String::from("activated").into(),
+                error: None,
+            })
+        }
+    }
+
+    /// The dispatch context is built once for a whole response, so the exclusion
+    /// slice it carries predates anything that response activates. A step that
+    /// denies `sop_execute` — every step does, it is a SOP control tool — must
+    /// still refuse it when an earlier call in the SAME response activated it;
+    /// re-deriving only for the next provider request is one call too late.
+    #[tokio::test]
+    async fn a_tool_activated_mid_response_cannot_escape_the_step_scope() {
+        let activated = Arc::new(Mutex::new(ActivatedToolSet::new()));
+        let denied_calls = Arc::new(AtomicUsize::new(0));
+        let denied: Arc<dyn Tool> =
+            Arc::new(CountingTool::new("sop_execute", Arc::clone(&denied_calls)));
+        let registry: Vec<Box<dyn Tool>> = vec![Box::new(ActivatingTool {
+            activated: Arc::clone(&activated),
+            activates: "sop_execute".to_string(),
+            target: Arc::clone(&denied),
+        })];
+
+        let meta = crate::agent::turn::TurnMeta {
+            parent_agent_alias: None,
+            agent_alias: None,
+            turn_id: "test-turn-id",
+            channel_name: "test",
+        };
+        let calls = vec![
+            parsed_tool_call("activator"),
+            parsed_tool_call("sop_execute"),
+        ];
+        let scope = crate::sop::active_scope::HeadlessStepScope {
+            run_id: "run-1".into(),
+            step: crate::sop::types::SopStep::default(),
+            config: zeroclaw_config::schema::SopConfig::default(),
+        };
+        let excluded: Vec<String> = Vec::new();
+
+        let outcomes = crate::sop::active_scope::with_active_headless_step_scope(scope, async {
+            super::execute_tools_sequential(
+                &calls,
+                ToolDispatchContext {
+                    tools_registry: &registry,
+                    activated_tools: Some(&activated),
+                    excluded_tools: &excluded,
+                    model_switch_callback: None,
+                },
+                &meta,
+                &NoopObserver,
+                None,
+                None,
+                None,
+            )
+            .await
+        })
+        .await
+        .expect("sequential dispatch completes");
+
+        assert_eq!(
+            denied_calls.load(Ordering::SeqCst),
+            0,
+            "a tool the step denies must not execute, even when a call earlier in \
+             the same response activated it"
+        );
+        let second = outcomes[1]
+            .as_ref()
+            .map(|completed| &completed.outcome)
+            .expect("the second call produced an outcome");
+        assert!(
+            !second.success,
+            "the denied tool must be refused, got: {}",
+            second.output
         );
     }
 
@@ -2010,6 +2351,7 @@ mod tests {
     async fn failed_tool_credential_is_scrubbed_in_provider_history() {
         use crate::agent::loop_detector::{LoopDetector, LoopDetectorConfig};
         use crate::agent::turn::history_append::append_tool_round_to_history;
+        use crate::agent::turn::results_collect::ToolRoundResult;
         use crate::agent::turn::results_collect::collect_tool_results;
         use std::collections::HashSet;
         use zeroclaw_providers::ChatMessage;
@@ -2078,10 +2420,11 @@ mod tests {
             "prompt-mode <tool_result> block must be scrubbed: {}",
             collected.tool_results
         );
-        for (_, result) in &collected.individual_results {
+        for result in &collected.individual_results {
             assert!(
-                !result.contains(secret) && result.contains("[REDACTED]"),
-                "native role=tool content must be scrubbed: {result}"
+                !result.output.contains(secret) && result.output.contains("[REDACTED]"),
+                "native role=tool content must be scrubbed: {}",
+                result.output
             );
         }
 
@@ -2106,7 +2449,11 @@ mod tests {
             "the native tool-result message must carry the scrubbed body"
         );
 
-        let prompt_results = vec![(None, collected.individual_results[0].1.clone())];
+        let prompt_results = vec![ToolRoundResult {
+            tool_call_id: None,
+            output: collected.individual_results[0].output.clone(),
+            attachments: Vec::new(),
+        }];
         let mut prompt_history: Vec<ChatMessage> = Vec::new();
         append_tool_round_to_history(
             &mut prompt_history,
@@ -2196,6 +2543,52 @@ mod tests {
         assert!(
             should_execute_tools_in_parallel(&calls, None),
             "non-tool_search, non-approval batch must remain parallel-eligible (default branch)"
+        );
+    }
+
+    #[test]
+    fn two_file_edits_force_sequential_execution() {
+        let calls = vec![parsed_tool_call("file_edit"), parsed_tool_call("file_edit")];
+
+        assert!(
+            !should_execute_tools_in_parallel(&calls, None),
+            "concurrent read-modify-write calls can silently lose one edit"
+        );
+    }
+
+    #[test]
+    fn file_edit_and_file_write_force_sequential_execution() {
+        let calls = vec![
+            parsed_tool_call("file_edit"),
+            parsed_tool_call("file_write"),
+        ];
+
+        assert!(
+            !should_execute_tools_in_parallel(&calls, None),
+            "a full-file write must not race an edit computed from stale contents"
+        );
+    }
+
+    #[test]
+    fn file_edit_and_non_mutating_tool_remain_parallel_eligible() {
+        let calls = vec![parsed_tool_call("file_edit"), parsed_tool_call("file_read")];
+
+        assert!(
+            should_execute_tools_in_parallel(&calls, None),
+            "one file mutation does not create a same-batch lost-update hazard"
+        );
+    }
+
+    #[test]
+    fn two_atomic_file_writes_remain_parallel_eligible() {
+        let calls = vec![
+            parsed_tool_call("file_write"),
+            parsed_tool_call("file_write"),
+        ];
+
+        assert!(
+            should_execute_tools_in_parallel(&calls, None),
+            "atomic full replacements retain last-writer-wins semantics"
         );
     }
 
@@ -2348,5 +2741,300 @@ mod tests {
                 _ => panic!("expected an empty Plan event (clear)"),
             }
         }
+    }
+
+    struct TurnTokenProbe {
+        saw_turn_token: Arc<Mutex<Option<bool>>>,
+    }
+
+    impl zeroclaw_api::attribution::Attributable for TurnTokenProbe {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::System
+        }
+        fn alias(&self) -> &str {
+            "test-turn-token-probe"
+        }
+    }
+
+    #[async_trait]
+    impl Tool for TurnTokenProbe {
+        fn name(&self) -> &str {
+            "turn_token_probe"
+        }
+
+        fn description(&self) -> &str {
+            "Records whether the running turn's cancellation token is visible"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}, "required": []})
+        }
+
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
+            *self.saw_turn_token.lock().unwrap() = Some(
+                ToolExecutionContext::current()
+                    .and_then(|context| context.cancellation_token().cloned())
+                    .is_some(),
+            );
+            Ok(crate::tools::ToolResult {
+                success: true,
+                output: crate::tools::ToolOutput::from("probed"),
+                error: None,
+            })
+        }
+    }
+
+    async fn probe_turn_token(token: Option<&tokio_util::sync::CancellationToken>) -> bool {
+        let saw = Arc::new(Mutex::new(None));
+        let probe: Box<dyn Tool> = Box::new(TurnTokenProbe {
+            saw_turn_token: Arc::clone(&saw),
+        });
+        let registry = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![probe]);
+        let meta = crate::agent::turn::TurnMeta {
+            parent_agent_alias: None,
+            agent_alias: None,
+            turn_id: "test-turn-id",
+            channel_name: "test",
+        };
+        let outcome = execute_one_tool(
+            "turn_token_probe",
+            serde_json::json!({}),
+            None,
+            ToolDispatchContext {
+                tools_registry: &registry,
+                activated_tools: None,
+                excluded_tools: &[],
+                model_switch_callback: None,
+            },
+            &meta,
+            &NoopObserver,
+            token,
+            None,
+            None,
+        )
+        .await
+        .expect("probe executes");
+        assert!(outcome.success);
+        let seen = saw.lock().unwrap();
+        seen.expect("the probe ran")
+    }
+
+    #[tokio::test]
+    async fn tools_see_the_running_turn_token_only_while_the_turn_runs_with_one() {
+        let token = tokio_util::sync::CancellationToken::new();
+        assert!(probe_turn_token(Some(&token)).await);
+        assert!(!probe_turn_token(None).await);
+        assert!(
+            ToolExecutionContext::current().is_none(),
+            "the token must not leak past the tool execution"
+        );
+    }
+
+    async fn execute_context_test_tool(
+        name: &str,
+        args: serde_json::Value,
+        tools: Vec<Box<dyn Tool>>,
+        token: &CancellationToken,
+    ) -> Result<ToolExecutionOutcome> {
+        let registry = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(tools);
+        let meta = TurnMeta {
+            parent_agent_alias: None,
+            agent_alias: None,
+            turn_id: "test-turn",
+            channel_name: "test",
+        };
+        execute_one_tool(
+            name,
+            args,
+            None,
+            ToolDispatchContext {
+                tools_registry: &registry,
+                activated_tools: None,
+                excluded_tools: &[],
+                model_switch_callback: None,
+            },
+            &meta,
+            &NoopObserver,
+            Some(token),
+            None,
+            None,
+        )
+        .await
+    }
+
+    struct ContextChildProbe {
+        started: Arc<tokio::sync::Notify>,
+        child: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    }
+
+    zeroclaw_api::mock_tool_attribution!(ContextChildProbe);
+
+    #[async_trait]
+    impl Tool for ContextChildProbe {
+        fn name(&self) -> &str {
+            "context_child_probe"
+        }
+        fn description(&self) -> &str {
+            "Starts token-bound child work"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
+            anyhow::bail!("context-aware entrypoint required")
+        }
+        async fn execute_with_context(
+            &self,
+            args: serde_json::Value,
+            context: &ToolExecutionContext,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
+            assert_eq!(args["scope"], "fixed");
+            let token = context
+                .cancellation_token()
+                .expect("turn token")
+                .child_token();
+            *self.child.lock().unwrap() = Some(zeroclaw_spawn::spawn!(async move {
+                token.cancelled().await;
+            }));
+            self.started.notify_one();
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_context_dispatch_cancels_child_after_wrapper_future_is_dropped() {
+        let started = Arc::new(tokio::sync::Notify::new());
+        let child = Arc::new(Mutex::new(None));
+        let probe: Arc<dyn Tool> = Arc::new(ContextChildProbe {
+            started: Arc::clone(&started),
+            child: Arc::clone(&child),
+        });
+        let skill = crate::skills::SkillTool {
+            name: "child".into(),
+            description: "Context child".into(),
+            kind: "builtin".into(),
+            command: String::new(),
+            args: Default::default(),
+            target: Some("context_child_probe".into()),
+            locked_args: Default::default(),
+            timeout_secs: None,
+        };
+        let wrapped: Arc<dyn Tool> = Arc::new(crate::tools::skill_tool::SkillBuiltinTool::new(
+            "context",
+            &skill,
+            probe,
+            std::collections::HashMap::from([("scope".into(), "fixed".into())]),
+        ));
+        let name = wrapped.name().to_string();
+        let token = CancellationToken::new();
+        let turn = token.clone();
+        let mut tasks = tokio::task::JoinSet::new();
+        tasks.spawn(async move {
+            execute_context_test_tool(
+                &name,
+                serde_json::json!({"scope": "model override"}),
+                vec![Box::new(crate::tools::ArcToolRef(wrapped))],
+                &turn,
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(3), started.notified())
+            .await
+            .unwrap();
+        token.cancel();
+        let outcome = tokio::time::timeout(Duration::from_secs(3), tasks.join_next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(is_tool_loop_cancelled(
+            &outcome.err().expect("cancelled dispatch")
+        ));
+        let child = child.lock().unwrap().take().expect("child was started");
+        tokio::time::timeout(Duration::from_secs(3), child)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tool_context_dispatch_cancellation_stops_shell_process_group() {
+        use crate::platform::NativeRuntime;
+        use crate::security::{AutonomyLevel, SecurityPolicy};
+        let workspace = tempfile::tempdir().unwrap();
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: workspace.path().to_path_buf(),
+            allowed_commands: vec!["*".into()],
+            block_high_risk_commands: false,
+            ..SecurityPolicy::default()
+        });
+        let shell = crate::tools::shell::ShellTool::new(security, Arc::new(NativeRuntime::new()));
+        let token = CancellationToken::new();
+        let turn = token.clone();
+        let mut tasks = tokio::task::JoinSet::new();
+        tasks.spawn(async move {
+            execute_context_test_tool(
+                "shell",
+                serde_json::json!({"command": "sleep 30 & echo $! > child.pid; wait"}),
+                vec![Box::new(shell)],
+                &turn,
+            )
+            .await
+        });
+        let pid_path = workspace.path().join("child.pid");
+        let pid: i32 = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Ok(text) = tokio::fs::read_to_string(&pid_path).await
+                    && let Ok(pid) = text.trim().parse()
+                {
+                    break pid;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("shell child started");
+        token.cancel();
+        let outcome = tokio::time::timeout(Duration::from_secs(3), tasks.join_next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(is_tool_loop_cancelled(
+            &outcome.err().expect("cancelled dispatch")
+        ));
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                // SAFETY: signal zero probes this fixture's child PID without sending a signal.
+                if unsafe { libc::kill(pid, 0) } == -1
+                    && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+                {
+                    break;
+                }
+                #[cfg(target_os = "linux")]
+                if tokio::fs::read_to_string(format!("/proc/{pid}/stat"))
+                    .await
+                    .ok()
+                    .and_then(|stat| {
+                        stat.rsplit_once(") ")
+                            .map(|(_, tail)| tail.starts_with('Z'))
+                    })
+                    .unwrap_or(false)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("cancelled shell child stopped");
     }
 }
