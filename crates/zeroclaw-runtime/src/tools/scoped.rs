@@ -3180,10 +3180,13 @@ mod tests {
         let accounting = error
             .downcast_ref::<zeroclaw_goal::accounting::GoalAccountingFailure>()
             .unwrap();
+        // The provider returned a complete rejection without usage, rather
+        // than losing the transport before the physical attempt settled.
         assert_eq!(
             accounting.accounting_state(),
-            zeroclaw_goal::GoalAccountingState::OutcomeUnknown
+            zeroclaw_goal::GoalAccountingState::Missing
         );
+        assert!(!accounting.has_pending_operation());
         assert_eq!(effects.load(Ordering::SeqCst), 0);
         assert!(!server.received_requests().await.unwrap().is_empty());
         let goal = fixture
@@ -3196,9 +3199,17 @@ mod tests {
             .unwrap();
         assert_eq!(
             goal.accounting_state,
-            zeroclaw_goal::GoalAccountingState::OutcomeUnknown
+            zeroclaw_goal::GoalAccountingState::Missing
         );
         assert!(goal.pending_call_id.is_none());
+        assert_eq!(
+            fixture
+                .tracker
+                .get_strict_usage_totals_for_task_with_pricing(fixture.identity.task_id())
+                .unwrap()
+                .0,
+            0
+        );
     }
 
     #[tokio::test]
@@ -4136,20 +4147,32 @@ mod tests {
     #[tokio::test]
     async fn registered_goal_pipeline_missing_usage_reaches_parent_hooks_history_and_engine() {
         for outer in [tools::PipelineTool::NAME, "ops__chain"] {
-            registered_goal_engine_fixture(RegisteredPipelineFailure::Missing, outer).await;
+            Box::pin(registered_goal_engine_fixture(
+                RegisteredPipelineFailure::Missing,
+                outer,
+            ))
+            .await;
         }
     }
     #[tokio::test]
     async fn registered_goal_pipeline_invalid_usage_reaches_parent_hooks_history_and_engine() {
         for outer in [tools::PipelineTool::NAME, "ops__chain"] {
-            registered_goal_engine_fixture(RegisteredPipelineFailure::Invalid, outer).await;
+            Box::pin(registered_goal_engine_fixture(
+                RegisteredPipelineFailure::Invalid,
+                outer,
+            ))
+            .await;
         }
     }
     #[tokio::test]
     async fn registered_goal_pipeline_real_terminal_failure_reaches_parent_hooks_history_and_engine()
      {
         for outer in [tools::PipelineTool::NAME, "ops__chain"] {
-            registered_goal_engine_fixture(RegisteredPipelineFailure::TerminalCommit, outer).await;
+            Box::pin(registered_goal_engine_fixture(
+                RegisteredPipelineFailure::TerminalCommit,
+                outer,
+            ))
+            .await;
         }
     }
 

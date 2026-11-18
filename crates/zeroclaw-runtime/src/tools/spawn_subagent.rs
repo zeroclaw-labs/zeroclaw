@@ -13,6 +13,7 @@ use async_trait::async_trait;
 use futures_util::FutureExt;
 use serde_json::json;
 use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::schema::Config;
@@ -554,51 +555,44 @@ impl SpawnSubagentTool {
         // sources would not have returned.
         let bound = self.capabilities.get().cloned();
         let config = (*config).clone();
-        let run_future = Box::pin(scope!(
-            agent_alias: parent_alias,
-            session_key: run_id,
-            =>
-            async {
-                match bound {
-                    Some(bound) => {
-                        crate::agent::run_with_capabilities(
-                            config,
-                            bound.capabilities,
-                            bound.principal,
-                            &self.parent_alias,
-                            Some(prompt),
-                            None,
-                            None,
-                            temperature,
-                            vec![],
-                            false,
-                            Some(session_path),
-                            None,
-                            zeroclaw_api::ingress::TurnOrigin::SubTurn,
-                            run_overrides,
-                        )
-                        .await
-                    }
-                    None => {
-                        crate::agent::run(
-                            config,
-                            &self.parent_alias,
-                            Some(prompt),
-                            None,
-                            None,
-                            temperature,
-                            vec![],
-                            false,
-                            Some(session_path),
-                            None,
-                            zeroclaw_api::ingress::TurnOrigin::SubTurn,
-                            run_overrides,
-                        )
-                        .await
-                    }
-                }
+        // Keep construction of the large concrete turn future out of the
+        // nested polling frame. Both routes remain lazy and are polled in
+        // the same attribution scope.
+        let make_run = move || -> Pin<Box<dyn Future<Output = Result<String>> + Send + '_>> {
+            match bound {
+                Some(bound) => Box::pin(crate::agent::run_with_capabilities(
+                    config,
+                    bound.capabilities,
+                    bound.principal,
+                    &self.parent_alias,
+                    Some(prompt),
+                    None,
+                    None,
+                    temperature,
+                    vec![],
+                    false,
+                    Some(session_path),
+                    None,
+                    zeroclaw_api::ingress::TurnOrigin::SubTurn,
+                    run_overrides,
+                )),
+                None => Box::pin(crate::agent::run(
+                    config,
+                    &self.parent_alias,
+                    Some(prompt),
+                    None,
+                    None,
+                    temperature,
+                    vec![],
+                    false,
+                    Some(session_path),
+                    None,
+                    zeroclaw_api::ingress::TurnOrigin::SubTurn,
+                    run_overrides,
+                )),
             }
-        ));
+        };
+        let run_future = scope!(agent_alias: parent_alias, session_key: run_id => make_run());
 
         if let Some(context) = goal {
             return run_goal_spawn_owned(context, &cp_task_id, run_future).await;
