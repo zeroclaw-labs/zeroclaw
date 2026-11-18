@@ -77,24 +77,32 @@ fn redact_response_body(
         match bytes[cursor] {
             b'"' => {
                 cursor += 1;
+                let mut closed = false;
                 while cursor < bytes.len() {
                     match bytes[cursor] {
                         b'\\' => cursor = (cursor + 2).min(bytes.len()),
                         b'"' => {
                             cursor += 1;
+                            closed = true;
                             break;
                         }
                         _ => cursor += 1,
                     }
                 }
+                if !closed {
+                    // No later quote can close a JSON string in this suffix.
+                    // Copy it once; never rescan every escaped quote inside it.
+                    output.push_str(&body[start..]);
+                    break;
+                }
                 let token = &body[start..cursor];
                 if let Ok(decoded) = serde_json::from_str::<String>(token) {
                     let redacted = redact(&decoded);
                     if redacted == decoded && !is_json {
-                        // Every quote can begin a JSON string in an arbitrary
-                        // wrapper; an unrelated pair must not consume it.
-                        output.push('"');
-                        cursor = start + 1;
+                        // Reconsider the closing quote as an opening boundary,
+                        // but never rewind through the already decoded string.
+                        output.push_str(&body[start..cursor - 1]);
+                        cursor -= 1;
                     } else if redacted == decoded {
                         output.push_str(token);
                     } else {
@@ -104,10 +112,10 @@ fn redact_response_body(
                 } else if is_json {
                     output.push_str(token);
                 } else {
-                    // Invalid surrounding text must not hide a later valid
-                    // JSON string, e.g. an HTML attribute or a partial reply.
-                    output.push('"');
-                    cursor = start + 1;
+                    // A malformed wrapper may overlap the next opening quote.
+                    // Each span is inspected at most twice, including decoding.
+                    output.push_str(&body[start..cursor - 1]);
+                    cursor -= 1;
                 }
             }
             b'-' | b'0'..=b'9' | b't' | b'f' | b'n' if is_json => {
@@ -2714,6 +2722,15 @@ api_token = "Bearer from-secret"
         assert_eq!(parsed["authorization"], "Bearer secret");
         assert_eq!(parsed["x-api-key"], "my-key");
         assert_eq!(parsed["content-type"], "application/json");
+    }
+
+    #[test]
+    fn authenticated_escaped_quote_runs_are_processed_without_suffix_rescans() {
+        let escaped = r#"\""#.repeat(200_000);
+        for body in [format!("\"{escaped}"), format!("callback(\"{escaped}\")")] {
+            let output = redact_response_body(body.clone(), &str::to_owned, true);
+            assert_eq!(output, body);
+        }
     }
 
     #[test]
