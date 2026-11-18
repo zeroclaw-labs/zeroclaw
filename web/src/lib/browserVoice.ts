@@ -20,7 +20,10 @@ export function beginVoiceCapture(): (() => void) | null {
 }
 
 export function voicePlaybackBusy(): boolean {
-  return activeVoiceCapture !== null || activeVoicePlayback !== null || window.speechSynthesis.speaking || window.speechSynthesis.pending;
+  // The page leases are canonical. Some engines keep speaking/pending true
+  // briefly after cancelling our own utterance; those stale flags must not
+  // reject its owner's immediate switch to dictation or a replacement reply.
+  return activeVoiceCapture !== null || activeVoicePlayback !== null;
 }
 
 export function playVoice(utterance: SpeechSynthesisUtterance): boolean {
