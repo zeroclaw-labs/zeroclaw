@@ -7141,7 +7141,7 @@ schedule = { kind = "every", every_ms = 300000 }
             },
             command: Some("echo raw-decl-output".to_string()),
             prompt: None,
-            enabled: true,
+            enabled: false,
             model: None,
             allowed_tools: None,
             uses_memory: true,
@@ -7190,7 +7190,7 @@ schedule = { kind = "every", every_ms = 300000 }
             &config,
             "raw-decl",
             CronJobPatch {
-                enabled: Some(false),
+                enabled: Some(true),
                 ..CronJobPatch::default()
             },
         )
@@ -7229,7 +7229,7 @@ schedule = { kind = "every", every_ms = 300000 }
             "get_job must follow the current config value, not a value snapshotted by an unrelated update"
         );
         assert!(
-            !job.uses_memory,
+            job.enabled,
             "the unrelated patch must still have taken effect"
         );
 
