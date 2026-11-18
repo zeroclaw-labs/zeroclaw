@@ -526,11 +526,10 @@ api_key = "..."
 ```
 
 **Obscurify.ai**: slot `obscurify`. OpenAI-compatible endpoint
-`https://obscurify.ai/v1` with bearer-token auth. Accounts are a random account
-number with no email, and prompts and responses are not stored.
+`https://obscurify.ai/v1` with bearer-token auth.
 `GET https://obscurify.ai/v1/models` lists model IDs with context lengths
 without a key. Key from the account page at
-[obscurify.ai](https://obscurify.ai/?utm_source=zeroclaw).
+[obscurify.ai](https://obscurify.ai).
 
 ```toml
 [providers.models.obscurify.default]

@@ -5,6 +5,8 @@ use std::time::Duration;
 use anyhow::Result;
 use serde::Deserialize;
 
+use crate::compatible::{MAX_MODELS_RESPONSE_BYTES, read_body_capped};
+
 const NEARAI_CATALOG_URL: &str = "https://cloud-api.near.ai/v1/model/list";
 const ATLASCLOUD_CATALOG_URL: &str = "https://api.atlascloud.ai/v1/models";
 const OBSCURIFY_CATALOG_URL: &str = "https://obscurify.ai/v1/models";
@@ -193,7 +195,7 @@ async fn list_public_openai_models(url: &str) -> Result<Vec<String>> {
         .timeout(Duration::from_secs(FETCH_TIMEOUT_SECS))
         .build()?;
     let response = client.get(url).send().await?.error_for_status()?;
-    let bytes = response.bytes().await?;
+    let bytes = read_body_capped(response, MAX_MODELS_RESPONSE_BYTES).await?;
     parse_openai_models_catalog(&bytes)
 }
 
