@@ -15,6 +15,7 @@ import {
   type OidcSession,
 } from './auth';
 import { apiOrigin, basePath } from './basePath';
+import { generateUUID } from './uuid';
 
 // ---------------------------------------------------------------------------
 // Contract types
@@ -276,16 +277,48 @@ export function currentReturnPath(
 /** `/auth/sign-in/{alias}`: a full-page start, or the re-auth popup. */
 export function signInUrl(
   alias: string,
-  options: { returnPath?: string; popup?: boolean } = {},
+  options: { returnPath?: string; popup?: boolean; notice?: string } = {},
 ): string {
   const params = new URLSearchParams();
   if (options.popup) {
     params.set('popup', '1');
   } else if (options.returnPath) {
     params.set('return', options.returnPath);
+    if (options.notice) params.set('notice', options.notice);
   }
   const query = params.toString();
   return gatewayUrl(`/auth/sign-in/${encodeURIComponent(alias)}${query ? `?${query}` : ''}`);
+}
+
+// The gateway echoes this tab's nonce in the successful callback redirect.
+const SIGN_IN_NOTICE_KEY = 'zeroclaw_sign_in_notice';
+
+export function fullPageSignInUrl(alias: string): string {
+  const returnPath = currentReturnPath() + window.location.hash;
+  try {
+    const notice = generateUUID();
+    sessionStorage.setItem(SIGN_IN_NOTICE_KEY, notice);
+    return signInUrl(alias, { returnPath, notice });
+  } catch {
+    return signInUrl(alias, { returnPath });
+  }
+}
+
+/** Consume a completed full-page sign-in. An ordinary visit discards a cancelled attempt. */
+export function takeSignInNotice(): boolean {
+  try {
+    const notice = sessionStorage.getItem(SIGN_IN_NOTICE_KEY);
+    if (!notice) return false;
+    sessionStorage.removeItem(SIGN_IN_NOTICE_KEY);
+    const suffix = `#zeroclaw-signed-in=${notice}`;
+    const { pathname, search, hash } = window.location;
+    if (!hash.endsWith(suffix)) return false;
+    const originalUrl = pathname + search + hash.slice(0, -suffix.length);
+    window.history.replaceState(window.history.state, '', originalUrl);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /**

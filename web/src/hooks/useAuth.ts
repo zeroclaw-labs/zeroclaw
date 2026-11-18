@@ -27,16 +27,17 @@ import { pair as apiPair, getPublicHealth } from '../lib/api';
 import {
   AUTH_CHANNEL,
   REAUTH_WARNING_MS,
-  currentReturnPath,
   expiryPhase,
   fetchAuthMethods,
   fetchAuthSession,
+  fullPageSignInUrl,
   msUntilExpiry,
   parseChannelMessage,
   postSignOut,
   refreshOidcSession,
   resolveInitialAuth,
   signInUrl,
+  takeSignInNotice,
   type AuthChannelMessage,
   type OidcMethod,
 } from '../lib/authSession';
@@ -203,6 +204,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
     })
       .then((initial) => {
         if (cancelled) return;
+        const announce = takeSignInNotice();
         switch (initial.kind) {
           case 'open':
             setPhase('open');
@@ -214,6 +216,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
             setProviders(initial.providers);
             setProvidersKnown(true);
             setOidcSession(initial.session, initial.clockOffsetMs);
+            if (announce) post({ type: 'signed-in' });
             break;
           case 'signed-out':
             setProviders(initial.providers);
@@ -230,7 +233,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [post]);
 
   // A paired browser that lost its token never asked which providers exist,
   // and a first answer may not have come. The answer marks them known:
@@ -424,7 +427,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
   }, []);
 
   const signIn = useCallback((alias: string) => {
-    window.location.assign(signInUrl(alias, { returnPath: currentReturnPath() }));
+    window.location.assign(fullPageSignInUrl(alias));
   }, []);
 
   const signOut = useCallback(async (): Promise<void> => {
@@ -475,9 +478,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
   const continueReauthHere = useCallback(() => {
     const held = getOidcSession();
     if (!held) return;
-    window.location.assign(
-      signInUrl(providerAlias(held.provider), { returnPath: currentReturnPath() }),
-    );
+    window.location.assign(fullPageSignInUrl(providerAlias(held.provider)));
   }, []);
 
   const checkSession = useCallback(() => {
