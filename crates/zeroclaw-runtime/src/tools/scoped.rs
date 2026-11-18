@@ -382,6 +382,13 @@ impl BuildRegistry {
 pub(crate) const ROUTE_SHARING_TOOL_NAMES: [&str; 3] =
     [tools::SpawnSubagentTool::NAME, "sop_execute", "sop_advance"];
 
+/// Tools that only read through the session memory route: `sop_status` shows
+/// the runs of the plane the route is pinned to. A bounded hop in an owned
+/// session whose target inherits one needs the target's route too, but they
+/// start no memory work, so they are not part of `ROUTE_SHARING_TOOL_NAMES`
+/// and the registry's memory-work check.
+pub(crate) const ROUTE_READING_TOOL_NAMES: [&str; 1] = ["sop_status"];
+
 /// A per-agent tool registry that has been scoped and gated. The inner field is
 /// private and production code can only mint one through
 /// [`ScopedToolRegistry::assemble`]. The engine's turn-entry carriers

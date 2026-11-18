@@ -36,6 +36,21 @@ impl SopStatusTool {
         self
     }
 
+    /// A fresh instance sharing this one's live `engine` and `collector`,
+    /// reading runs through `route` instead. Used by the `Bounded` delegate
+    /// rebuild in `delegate.rs`: the runs this tool may show are those of the
+    /// plane its route is pinned to, so a target must read through its own.
+    pub(crate) fn rebound_with_session_memory(
+        &self,
+        route: Arc<zeroclaw_tools::session_memory::SessionMemoryRoute>,
+    ) -> Self {
+        Self {
+            engine: Arc::clone(&self.engine),
+            collector: self.collector.clone(),
+            session_memory: Some(route),
+        }
+    }
+
     fn append_gate_status(&self, output: &mut String, include_gate_status: bool) {
         if include_gate_status {
             let _ = writeln!(
@@ -48,6 +63,10 @@ impl SopStatusTool {
 
 #[async_trait]
 impl Tool for SopStatusTool {
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        Some(self)
+    }
+
     fn name(&self) -> &str {
         "sop_status"
     }
