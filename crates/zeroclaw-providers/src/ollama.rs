@@ -629,6 +629,9 @@ impl OllamaModelProvider {
         );
 
         if !status.is_success() {
+            crate::dispatch::accounting::observe_completed_string_wire_rejection::<ApiChatResponse>(
+                &body,
+            );
             let raw = String::from_utf8_lossy(&body);
             let sanitized = super::sanitize_api_error(&raw);
             ::zeroclaw_log::record!(
@@ -650,6 +653,7 @@ impl OllamaModelProvider {
         let chat_response: ApiChatResponse = match serde_json::from_slice(&body) {
             Ok(r) => r,
             Err(e) => {
+                crate::dispatch::accounting::observe_rejected_string_wire::<ApiChatResponse>(&body);
                 let raw = String::from_utf8_lossy(&body);
                 let sanitized = super::sanitize_api_error(&raw);
                 ::zeroclaw_log::record!(
@@ -1189,6 +1193,7 @@ mod tests {
         let replies = Arc::new(Mutex::new(std::collections::VecDeque::from(vec![
             serde_json::json!({"message":{"content":"", "tool_calls":[{"id":"t", "function":{"name":"echo", "arguments":{"x":1}}}]}, "prompt_eval_count":8, "eval_count":3}),
             serde_json::json!({"message":{"content":"", "thinking":"reasoned answer"}, "prompt_eval_count":8, "eval_count":3}),
+            serde_json::json!({"message":{"content":"unused"}, "prompt_eval_count":-1, "eval_count":3}),
         ])));
         let shared = Arc::clone(&replies);
         let app = Router::new().route(
@@ -1226,6 +1231,21 @@ mod tests {
                 assert_eq!(text, "reasoned answer");
             }
         }
+        let scope = crate::dispatch::AccountedChatScope::new_with_string_usage();
+        assert!(
+            scope
+                .scope(dispatch.chat_with_system(None, "hello", "model", None))
+                .await
+                .is_err()
+        );
+        let report = scope.take();
+        assert!(report.accepted_route().is_none());
+        assert!(matches!(
+            report.attempts()[0].outcome(),
+            crate::dispatch::AttemptUsageOutcome::Invalid {
+                observed: usage, reason: crate::dispatch::InvalidUsageReason::MalformedUsage,
+            } if usage.input_tokens.is_none() && usage.output_tokens == Some(3)
+        ));
         server.abort();
     }
 

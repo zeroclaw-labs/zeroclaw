@@ -86,6 +86,7 @@ pub mod error_codes {
 
     pub const SESSION_NOT_FOUND: i32 = -32000;
     pub const SESSION_BUSY: i32 = -32002;
+    pub const FORBIDDEN: i32 = -32012;
     pub const INVALID_PARAMS: i32 = -32602;
 }
 

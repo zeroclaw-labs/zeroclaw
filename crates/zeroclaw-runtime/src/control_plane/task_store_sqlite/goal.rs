@@ -2,6 +2,7 @@
 
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use zeroclaw_goal::task::GoalDispatchStart;
 
 use crate::control_plane::authority::is_authoritative;
 use crate::control_plane::goal_task::{
@@ -1090,6 +1091,30 @@ impl GoalTaskRegistry for SqliteTaskStore {
         Ok(GoalTransitionResult::Applied)
     }
 
+    async fn begin_operation_dispatch(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        expected_epoch: i64,
+        pending_call_id: &str,
+    ) -> Result<Option<GoalDispatchStart>> {
+        let gate = self.goal_dispatch_gates.gate(session_id).lock_owned().await;
+        let conn = self.conn.lock();
+        let found = conn
+            .query_row(
+                "SELECT 1 FROM tasks t JOIN goal_tasks g ON g.task_id = t.id
+                  WHERE t.id = ?1 AND t.kind = 'goal' AND t.session_id = ?2
+                    AND t.status = 'running' AND t.execution_epoch = ?3
+                    AND g.pending_call_id = ?4 AND g.pending_call_epoch = ?3",
+                params![task_id, session_id, expected_epoch, pending_call_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .context("check Goal operation dispatch fence")?
+            .is_some();
+        Ok(found.then(|| GoalDispatchStart::new(gate)))
+    }
+
     async fn pause_session_goal(
         &self,
         task_id: &str,
@@ -1099,6 +1124,7 @@ impl GoalTaskRegistry for SqliteTaskStore {
     ) -> Result<GoalTransitionResult> {
         let reason = pause_reason_to_db(pause.reason)?;
         let blockers = blockers_to_db(&pause.blockers)?;
+        let dispatch_gate = self.goal_dispatch_gates.gate(session_id).lock_owned().await;
         let mut conn = self.conn.lock();
         let tx = conn.transaction().context("start guarded goal pause")?;
         let updated = tx.execute(
@@ -1123,6 +1149,8 @@ impl GoalTaskRegistry for SqliteTaskStore {
             params![reason, pause.description, blockers, task_id],
         )?;
         tx.commit().context("commit guarded goal pause")?;
+        drop(conn);
+        drop(dispatch_gate);
         Ok(GoalTransitionResult::Applied)
     }
 
@@ -1180,6 +1208,7 @@ impl GoalTaskRegistry for SqliteTaskStore {
         if !status.is_terminal() {
             anyhow::bail!("guarded goal finish requires a terminal task status");
         }
+        let dispatch_gate = self.goal_dispatch_gates.gate(session_id).lock_owned().await;
         let mut conn = self.conn.lock();
         let tx = conn.transaction().context("start guarded goal finish")?;
         let updated = tx.execute(
@@ -1202,6 +1231,8 @@ impl GoalTaskRegistry for SqliteTaskStore {
             return transition_failure(&tx, task_id);
         }
         tx.commit().context("commit guarded goal finish")?;
+        drop(conn);
+        drop(dispatch_gate);
         Ok(GoalTransitionResult::Applied)
     }
 

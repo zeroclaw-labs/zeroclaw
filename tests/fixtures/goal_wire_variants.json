@@ -10,7 +10,8 @@
     "resumable": true
   },
   "unit_responses": [
-    "help", "disabled", "no_current_goal", "already_active", "budget_required", "stale"
+    "help", "disabled", "no_current_goal", "session_unavailable", "already_active",
+    "budget_required", "stale"
   ],
   "status_responses": [
     "started", "status", "budget", "budget_updated", "paused", "already_paused",

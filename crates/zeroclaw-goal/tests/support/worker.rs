@@ -9,8 +9,9 @@ use zeroclaw_goal::{
     GoalParentTurnResult, GoalVerifierResult, GoalVerifierTurn,
     accounting::{
         GoalAccountingFailure, GoalOperationAccounting, GoalOperationAccountingFactory,
-        GoalOperationRequest, GoalOperationSettlement,
+        GoalOperationGuard, GoalOperationRequest, GoalOperationSettlement,
     },
+    task::GoalDispatchStart,
 };
 
 struct Script {
@@ -77,12 +78,24 @@ struct NoPhysicalAttempts;
 
 #[async_trait]
 impl GoalOperationAccounting for NoPhysicalAttempts {
+    fn admission_guard(&self) -> Result<GoalOperationGuard> {
+        bail!("script unexpectedly guarded a physical provider attempt")
+    }
+
     async fn admit(&self, _request: GoalOperationRequest) -> Result<()> {
         bail!("script unexpectedly admitted a physical provider attempt")
     }
 
+    async fn begin_dispatch(&self) -> Result<GoalDispatchStart> {
+        bail!("script unexpectedly dispatched a physical provider attempt")
+    }
+
     async fn settle(&self, _settlement: GoalOperationSettlement) -> Result<()> {
         bail!("script unexpectedly settled a physical provider attempt")
+    }
+
+    async fn release_unstarted(&self) -> Result<()> {
+        bail!("script unexpectedly released a physical provider attempt")
     }
 
     async fn pricing_complete(&self) -> Result<bool> {
@@ -1234,7 +1247,7 @@ async fn restart_pause_failure_closes_checkpoint_before_draining_all_hosts() {
 }
 
 #[tokio::test]
-async fn prelaunch_pause_releases_command_before_blocked_predecessor_drains() {
+async fn queued_resume_releases_command_while_the_predecessor_drains() {
     let (driver, ingress, registry, supervisor) = running_worker().await;
     let config = goal_config_with(Some(1000), None, "openai.default", true);
     let pause = supervisor
@@ -1251,29 +1264,27 @@ async fn prelaunch_pause_releases_command_before_blocked_predecessor_drains() {
         GoalResponse::TransitionPending(_)
     ));
     drop(pause);
-    let mut resume = supervisor
-        .submit(
+    let paused_scope = fixture_scope(&registry);
+    let zeroclaw_goal::GoalControlAdmission::Queued { deferred, .. } = supervisor
+        .admit_control(
             &settings(&config),
             ingress.clone(),
             driver.clone(),
             GoalCommand::Resume { response: None },
         )
         .await
-        .unwrap();
-    assert!(matches!(resume.response(), GoalResponse::Resumed(_)));
-    let pausing = supervisor.clone();
-    let mut paused = zeroclaw_spawn::spawn!(async move {
-        pausing
-            .pause_before_launch(&mut resume, zeroclaw_goal::GoalPauseReason::OperatorPaused)
-            .await
-    });
-    tokio::time::timeout(Duration::from_secs(1), async {
-        while registry.0.lock().unwrap().task.as_ref().unwrap().status != TaskStatus::Paused {
-            tokio::task::yield_now().await;
-        }
+        .unwrap()
+    else {
+        panic!("Resume must queue while its predecessor still owns execution");
+    };
+    let mut resume = Box::pin(deferred.wait());
+    std::future::poll_fn(|cx| {
+        assert!(std::future::Future::poll(resume.as_mut(), cx).is_pending());
+        std::task::Poll::Ready(())
     })
-    .await
-    .unwrap();
+    .await;
+    assert_same_fixture_scope(&fixture_scope(&registry), &paused_scope);
+
     let cancel = tokio::time::timeout(
         Duration::from_secs(1),
         supervisor.submit(
@@ -1290,27 +1301,37 @@ async fn prelaunch_pause_releases_command_before_blocked_predecessor_drains() {
         cancel.response(),
         GoalResponse::TransitionPending(_) | GoalResponse::Cancelled(_)
     ));
-    assert!(
-        tokio::time::timeout(Duration::from_millis(20), &mut paused)
-            .await
-            .is_err()
-    );
     assert_eq!(driver.script.parent_calls.load(Ordering::SeqCst), 1);
     drop(cancel);
     driver.script.release.add_permits(1);
-    tokio::time::timeout(Duration::from_secs(1), paused)
+    let response = match tokio::time::timeout(Duration::from_secs(1), resume)
         .await
         .unwrap()
-        .unwrap()
-        .unwrap();
+    {
+        Ok(ready) => {
+            let commit = ready.commit(&settings(&config)).await.unwrap();
+            let response = commit.response().clone();
+            drop(commit.release());
+            response
+        }
+        Err(closed) => closed.response().clone(),
+    };
+    assert!(matches!(
+        response,
+        GoalResponse::Terminal(_) | GoalResponse::Stale
+    ));
+    assert_eq!(
+        registry.0.lock().unwrap().task.as_ref().unwrap().status,
+        TaskStatus::Cancelled
+    );
     assert_eq!(driver.script.verified.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]
 async fn successor_reads_live_revocation_after_blocked_predecessor_drain() {
-    use std::future::Future as _;
-
-    for revoke in [true, false] {
+    for (revoke_before_commit, revoke_before_launch) in
+        [(true, false), (false, true), (false, false)]
+    {
         let (driver, ingress, registry, supervisor) = running_worker().await;
         let config = goal_config_with(Some(1000), None, "openai.default", true);
         let live = LiveConfig::new(config.clone());
@@ -1329,51 +1350,68 @@ async fn successor_reads_live_revocation_after_blocked_predecessor_drain() {
             GoalResponse::TransitionPending(_)
         ));
         drop(pause);
-        let mut resume = supervisor
-            .submit(
+        let paused_scope = fixture_scope(&registry);
+        let zeroclaw_goal::GoalControlAdmission::Queued { deferred, .. } = supervisor
+            .admit_control(
                 &settings(&config),
-                ingress.clone(),
+                ingress,
                 driver.clone(),
                 GoalCommand::Resume { response: None },
             )
             .await
-            .unwrap();
-        let GoalResponse::Resumed(projection) = resume.response() else {
-            panic!("fixture must admit the successor before draining its predecessor");
+            .unwrap()
+        else {
+            panic!("successor cannot be admitted before its predecessor drains");
         };
-        let scope = GoalExecutionScope::new(
-            &projection.task_id,
-            ingress.session_key().durable_id(),
-            projection.execution_epoch,
-        )
-        .unwrap();
-        let lookups_before_drain = registry.0.lock().unwrap().session_lookups;
-        let mut launch = Box::pin(supervisor.launch_after_response(&settings_source, &mut resume));
-        std::future::poll_fn(|cx| match launch.as_mut().poll(cx) {
-            std::task::Poll::Pending => std::task::Poll::Ready(()),
-            std::task::Poll::Ready(_) => {
-                panic!("successor handoff must wait for the admitted predecessor")
-            }
+        let mut wait = Box::pin(deferred.wait());
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(wait.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
         })
         .await;
-        assert_eq!(
-            registry.0.lock().unwrap().session_lookups,
-            lookups_before_drain + 1,
-            "the first poll must reach the predecessor drain's registry lookup"
-        );
+        assert_same_fixture_scope(&fixture_scope(&registry), &paused_scope);
         assert_eq!(driver.script.parent_calls.load(Ordering::SeqCst), 1);
-        if revoke {
+        let revoke = || {
             let mut disabled = config.clone();
             disabled.goal.enabled = false;
             live.publish(live.next_revision().unwrap(), disabled)
                 .unwrap();
+        };
+        if revoke_before_commit {
+            revoke();
         }
         driver.script.release.add_permits(1);
-        tokio::time::timeout(Duration::from_secs(1), launch)
+        let ready = tokio::time::timeout(Duration::from_secs(1), wait)
             .await
             .unwrap()
             .unwrap();
-        if revoke {
+        let commit = ready.commit(&settings(&live.snapshot())).await.unwrap();
+        if revoke_before_commit {
+            assert!(matches!(commit.response(), GoalResponse::Disabled));
+            drop(commit.release());
+            assert_same_fixture_scope(&fixture_scope(&registry), &paused_scope);
+            assert_eq!(
+                registry.0.lock().unwrap().task.as_ref().unwrap().status,
+                TaskStatus::Paused
+            );
+            assert_eq!(driver.script.parent_calls.load(Ordering::SeqCst), 1);
+            continue;
+        }
+        assert!(matches!(commit.response(), GoalResponse::Resumed(_)));
+        let scope = fixture_scope(&registry);
+        assert_eq!(scope.execution_epoch(), paused_scope.execution_epoch() + 1);
+        let mut resume = commit.release();
+        if revoke_before_launch {
+            revoke();
+        }
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            supervisor.launch_after_response(&settings_source, &mut resume),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        if revoke_before_launch {
             let error = tokio::time::timeout(Duration::from_secs(1), supervisor.drain(&scope))
                 .await
                 .unwrap()
@@ -2871,6 +2909,59 @@ async fn disposal_withdraws_inflight_drainer_delivery_without_waiting_on_its_lat
     assert!(driver.script.events.lock().unwrap().is_empty());
     assert_eq!(driver.script.notices.load(Ordering::SeqCst), 0);
     assert!(supervisor.try_retire().await);
+}
+
+#[tokio::test]
+async fn disposal_drains_the_fenced_worker_without_disposing_a_successor() {
+    let (driver, ingress, registry, supervisor) = running_worker().await;
+    let session_id = ingress.session_key().durable_id();
+    let predecessor = fixture_scope(&registry);
+    let dispose = {
+        let supervisor = Arc::clone(&supervisor);
+        let session_id = session_id.clone();
+        zeroclaw_spawn::spawn!(async move { supervisor.dispose_session(&session_id).await })
+    };
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if registry.0.lock().unwrap().task.as_ref().unwrap().status == TaskStatus::Cancelled {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("disposal must fence before waiting on the parent");
+    assert!(!dispose.is_finished(), "the admitted parent remains held");
+
+    // Model a new durable owner winning while the captured worker drains.
+    let (successor_task, successor_goal) = {
+        let mut state = registry.0.lock().unwrap();
+        let task = state.task.as_mut().unwrap();
+        task.id = "disposal-race-successor".into();
+        task.status = TaskStatus::Running;
+        task.execution_epoch = 1;
+        let successor_task = serde_json::to_value(&*task).unwrap();
+        let goal = state.goal.as_mut().unwrap();
+        goal.task_id = "disposal-race-successor".into();
+        goal.pending_call_id = Some("successor-pending".into());
+        goal.pending_call_epoch = Some(1);
+        (successor_task, goal.clone())
+    };
+    driver.script.release.add_permits(1);
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), dispose)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap(),
+        zeroclaw_goal::GoalTransitionResult::Stale
+    );
+    assert!(!supervisor.owns_scope(&predecessor).await);
+    let state = registry.0.lock().unwrap();
+    assert_eq!(serde_json::to_value(&state.task).unwrap(), successor_task);
+    assert_eq!(state.goal.as_ref(), Some(&successor_goal));
+    assert_eq!(state.delete_calls, 0);
+    assert_eq!(driver.script.verified.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]
@@ -4479,6 +4570,12 @@ async fn wait_cleanup_signal(signal: &Semaphore) {
         .expect("the exact fixture cleanup boundary must be reached")
         .unwrap()
         .forget();
+}
+
+fn assert_same_fixture_scope(actual: &GoalExecutionScope, expected: &GoalExecutionScope) {
+    assert_eq!(actual.task_id(), expected.task_id());
+    assert_eq!(actual.session_id(), expected.session_id());
+    assert_eq!(actual.execution_epoch(), expected.execution_epoch());
 }
 
 fn fixture_scope(registry: &Registry) -> GoalExecutionScope {

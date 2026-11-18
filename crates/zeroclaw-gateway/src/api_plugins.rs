@@ -102,7 +102,14 @@ pub async fn list_plugins(State(state): State<AppState>, headers: HeaderMap) -> 
             .and_then(|value| value.to_str().ok())
             .and_then(|authorization| authorization.strip_prefix("Bearer "))
             .unwrap_or_default();
-        if !state.pairing.is_authenticated(token) {
+        if token.is_empty() {
+            use crate::dashboard_session::{OperatorSession, operator_session};
+            match operator_session(None, &state) {
+                OperatorSession::Admitted(_) => {}
+                OperatorSession::Denied(denied) => return denied,
+                OperatorSession::Absent => return StatusCode::UNAUTHORIZED.into_response(),
+            }
+        } else if !state.pairing.is_authenticated(token) {
             return StatusCode::UNAUTHORIZED.into_response();
         }
     }

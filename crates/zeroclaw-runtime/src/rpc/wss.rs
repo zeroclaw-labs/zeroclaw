@@ -2023,9 +2023,9 @@ mod accept_error_tests {
         use crate::rpc::context::RpcContext;
         use crate::rpc::dispatch::connection_test_support::insert_immediate_session_with_owner;
         use crate::rpc::session::SessionStore;
+        use crate::rpc::types::GoalResponseWire as GoalResponse;
         use crate::rpc::types::SessionGoalResult;
         use zeroclaw_config::schema::Config;
-        use zeroclaw_goal::control::GoalResponse;
         use zeroclaw_infra::session_queue::SessionActorQueue;
 
         const SESSION_ID: &str = "goal-wss-transport";
@@ -2536,8 +2536,13 @@ mod accept_error_tests {
         };
         use crate::rpc::session::SessionStore;
         use crate::rpc::types::SessionGoalResult;
+        use crate::rpc::types::{
+            GoalAccountingStateWire, GoalPauseReasonWire, GoalPendingActionWire,
+            GoalQueuedControlWire as GoalQueuedControl, GoalResponseWire as GoalResponse,
+            GoalTaskStatusWire,
+        };
         use zeroclaw_config::schema::Config;
-        use zeroclaw_goal::control::{GoalQueuedControl, GoalResponse, GoalSessionKey};
+        use zeroclaw_goal::control::GoalSessionKey;
         use zeroclaw_goal::{GoalAccountingState, GoalPauseReason};
         use zeroclaw_infra::session_queue::SessionActorQueue;
 
@@ -3311,16 +3316,17 @@ mod accept_error_tests {
                 panic!("restart status must be directly observable");
             };
             assert_eq!(status.task_id, before.id);
-            assert_eq!(status.status, zeroclaw_api::task::TaskStatus::Paused);
-            assert_eq!(status.pause_reason, Some(GoalPauseReason::DaemonRestart));
+            assert_eq!(status.status, GoalTaskStatusWire::Paused);
+            assert_eq!(
+                status.pause_reason,
+                Some(GoalPauseReasonWire::DaemonRestart)
+            );
             assert!(!status.resumable);
         } else {
             assert_eq!(
                 queued.response,
                 if immediate {
-                    GoalResponse::TransitionPending(
-                        zeroclaw_goal::control::GoalPendingAction::Pause,
-                    )
+                    GoalResponse::TransitionPending(GoalPendingActionWire::Pause)
                 } else {
                     GoalResponse::Queued(if budget_fence {
                         GoalQueuedControl::Budget
@@ -3571,10 +3577,13 @@ mod accept_error_tests {
                 panic!("paused budget change must return BudgetUpdated");
             };
             assert_eq!(raised.task_id, before.id);
-            assert_eq!(raised.status, zeroclaw_api::task::TaskStatus::Paused);
+            assert_eq!(raised.status, GoalTaskStatusWire::Paused);
             assert_eq!(raised.execution_epoch, paused.execution_epoch);
             assert_eq!(raised.token_limit, Some(10));
-            assert_eq!(raised.pause_reason, Some(GoalPauseReason::BudgetExhausted));
+            assert_eq!(
+                raised.pause_reason,
+                Some(GoalPauseReasonWire::BudgetExhausted)
+            );
             assert!(raised.resumable);
             assert_eq!(turn.calls.load(std::sync::atomic::Ordering::Acquire), 1);
             sink.send(Message::Text(
@@ -3605,7 +3614,7 @@ mod accept_error_tests {
                 panic!("budget recovery must explicitly resume the existing Goal");
             };
             assert_eq!(resumed.task_id, before.id);
-            assert_eq!(resumed.status, zeroclaw_api::task::TaskStatus::Running);
+            assert_eq!(resumed.status, GoalTaskStatusWire::Running);
             assert_eq!(resumed.execution_epoch, paused.execution_epoch + 1);
             tokio::time::timeout(Duration::from_secs(2), turn.started.notified())
                 .await
@@ -3666,7 +3675,7 @@ mod accept_error_tests {
             .expect("cancel must fence without waiting for the held parent");
             assert_eq!(
                 pending.response,
-                GoalResponse::TransitionPending(zeroclaw_goal::control::GoalPendingAction::Cancel,)
+                GoalResponse::TransitionPending(GoalPendingActionWire::Cancel,)
             );
             let fenced = registry
                 .current_goal_for_session(&key)
@@ -3718,8 +3727,11 @@ mod accept_error_tests {
             .await
             .expect("cancelled recovery must settle the held operation and drain");
             assert_eq!(cancelled.task_id, before.id);
-            assert_eq!(cancelled.status, zeroclaw_api::task::TaskStatus::Cancelled);
-            assert_eq!(cancelled.accounting_state, GoalAccountingState::Complete);
+            assert_eq!(cancelled.status, GoalTaskStatusWire::Cancelled);
+            assert_eq!(
+                cancelled.accounting_state,
+                GoalAccountingStateWire::Complete
+            );
             crate::rpc::dispatch::connection_test_support::assert_held_goal_usage_attempts(
                 tmp.path(),
                 &before.id,
@@ -3835,8 +3847,8 @@ mod accept_error_tests {
             let budget = events.applied_budget.as_ref().unwrap();
             assert_eq!(budget.task_id, before.id);
             assert_eq!(budget.execution_epoch, before.execution_epoch);
-            assert_eq!(budget.status, zeroclaw_api::task::TaskStatus::Running);
-            assert_eq!(budget.accounting_state, GoalAccountingState::Complete);
+            assert_eq!(budget.status, GoalTaskStatusWire::Running);
+            assert_eq!(budget.accounting_state, GoalAccountingStateWire::Complete);
             assert_eq!(paused.token_limit, Some(7));
             crate::rpc::dispatch::connection_test_support::assert_budget_then_pause_intents(
                 tmp.path(),
@@ -3863,7 +3875,10 @@ mod accept_error_tests {
             assert_eq!(status.task_id, before.id);
             assert_eq!(status.execution_epoch, before.execution_epoch + 1);
             assert_eq!(status.token_limit, Some(10));
-            assert_eq!(status.pause_reason, Some(GoalPauseReason::OperatorPaused));
+            assert_eq!(
+                status.pause_reason,
+                Some(GoalPauseReasonWire::OperatorPaused)
+            );
             crate::rpc::dispatch::connection_test_support::assert_budget_intent_state(
                 tmp.path(),
                 &key,
@@ -3876,14 +3891,14 @@ mod accept_error_tests {
         assert_eq!(
             paused.pause_reason,
             Some(if restart {
-                GoalPauseReason::DaemonRestart
+                GoalPauseReasonWire::DaemonRestart
             } else {
-                GoalPauseReason::OperatorPaused
+                GoalPauseReasonWire::OperatorPaused
             })
         );
         assert_eq!(paused.task_id, before.id);
         assert_eq!(paused.execution_epoch, before.execution_epoch + 1);
-        assert_eq!(paused.accounting_state, GoalAccountingState::Complete);
+        assert_eq!(paused.accounting_state, GoalAccountingStateWire::Complete);
         assert!(paused.resumable);
         let goal = registry.get_goal_task(&before.id).await.unwrap().unwrap();
         assert_eq!(goal.accounting_state, GoalAccountingState::Complete);
@@ -4018,7 +4033,7 @@ mod accept_error_tests {
             };
             assert_eq!(resumed.task_id, before.id);
             assert_eq!(resumed.execution_epoch, paused.execution_epoch + 1);
-            assert_eq!(resumed.status, zeroclaw_api::task::TaskStatus::Running);
+            assert_eq!(resumed.status, GoalTaskStatusWire::Running);
             tokio::time::timeout(Duration::from_secs(2), turn.started.notified())
                 .await
                 .expect("authorized recovery must admit the second parent");
@@ -4063,7 +4078,7 @@ mod accept_error_tests {
             .unwrap();
             assert_eq!(
                 pending.response,
-                GoalResponse::TransitionPending(zeroclaw_goal::control::GoalPendingAction::Pause)
+                GoalResponse::TransitionPending(GoalPendingActionWire::Pause)
             );
             let fenced = registry
                 .current_goal_for_session(&key)
@@ -4092,9 +4107,12 @@ mod accept_error_tests {
             assert_eq!(final_pause.execution_epoch, resumed.execution_epoch + 1);
             assert_eq!(
                 final_pause.pause_reason,
-                Some(GoalPauseReason::OperatorPaused)
+                Some(GoalPauseReasonWire::OperatorPaused)
             );
-            assert_eq!(final_pause.accounting_state, GoalAccountingState::Complete);
+            assert_eq!(
+                final_pause.accounting_state,
+                GoalAccountingStateWire::Complete
+            );
             assert!(final_pause.resumable);
             assert!(!supervisor.owns_scope(&resumed_scope).await);
             crate::rpc::dispatch::connection_test_support::assert_held_goal_usage_attempts(
@@ -4170,8 +4188,9 @@ mod accept_error_tests {
         };
         use crate::rpc::session::SessionStore;
         use crate::rpc::types::SessionGoalResult;
+        use crate::rpc::types::{GoalQueuedControlWire, GoalResponseWire as GoalResponse};
         use zeroclaw_config::schema::Config;
-        use zeroclaw_goal::control::{GoalResponse, GoalSessionKey};
+        use zeroclaw_goal::control::GoalSessionKey;
         use zeroclaw_infra::session_queue::SessionActorQueue;
 
         const SID: &str = "goal-wss-boundary";
@@ -4329,7 +4348,7 @@ mod accept_error_tests {
             serde_json::to_value(&before).unwrap(),
             "queued controls must leave their canonical predecessor unchanged"
         );
-        if control == zeroclaw_goal::control::GoalQueuedControl::Budget {
+        if control == GoalQueuedControlWire::Budget {
             crate::rpc::dispatch::connection_test_support::assert_budget_intent_state(
                 tmp.path(),
                 &key,
@@ -5104,7 +5123,10 @@ mod accept_error_tests {
             // connection leaves its turn task unwinding. Gate on the daemon's
             // own reload drain, which is what production waits on.
             assert_eq!(
-                crate::daemon::await_rpc_connection_drain(&count1_for_gen2).await,
+                crate::daemon::await_rpc_connection_drain_with(
+                    || count1_for_gen2.load(std::sync::atomic::Ordering::Relaxed)
+                )
+                .await,
                 crate::daemon::RpcDrain::Complete,
                 "the retiring generation must finish draining within the reload budget"
             );

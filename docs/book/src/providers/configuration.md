@@ -6,6 +6,8 @@ Every model provider lives at `[providers.models.<type>.<alias>]`. `<type>` is a
 
 The smallest config that loads clean has four section headers: a provider entry, an agent that references it, and a risk profile the agent gates against. Configure them through the gateway, zerocode, or `zeroclaw config set`; the [config reference](../reference/config.md#providers) has the full field index.
 
+If you write `config.toml` by hand, make `schema_version = 4` its first line. The tools above add it for you. Without it, ZeroClaw has to guess the file's version: it reads a file whose sections are plainly in the current shape as version 3, migrates it from there and warns you to add the key (`zeroclaw config migrate` writes it), but any other file is read as the oldest version and migrated.
+
 ## Field reference: provider entry
 
 Almost every family also takes the shared fields from `ModelProviderConfig`:
@@ -21,7 +23,7 @@ Almost every family also takes the shared fields from `ModelProviderConfig`:
 - `fallback`: ordered list of other dotted provider aliases to try after this alias fails.
 - `wire_api`, `native_tools`, `provider_extra`, `think`, `thinking_passthrough`, and `chat_template_kwargs`: advanced protocol and request-body overrides.
 - `vision`: override the provider's image-input (vision) capability. Leave unset to use the family's built-in default. Set `false` for a text-only model served by a vision-capable family (for example, a text model behind llama.cpp) so image messages route to a configured `[multimodal] vision_model_provider` instead of erroring; set `true` to force it on. Without a configured vision provider, a non-vision turn proceeds with media markers replaced by a placeholder when none of the latest user message's image references pass the existence, data-URI-structure, or remote-fetch-policy checks (a missing file, a malformed data URI, or a remote URL while `multimodal.allow_remote_fetch` is off). A local path counts only when it is absolute, allowed by the agent's filesystem policy (the same check the file tools apply), and exists as a file; paths the policy rejects are never probed. If any reference does pass, the turn still fails with the vision capability error. The resolvability check evaluates at most 16 absolute local-path markers per turn; for those, the policy check and the existence probe run together on a blocking thread, off the async executor. A message with more such markers treats the rest as resolvable without any check, so an oversized message fails toward the capability error instead of a silent degrade.
-- `tool_result_image_policy`: handling for images attached to native `role = "tool"` results sent to compatible chat-completions providers. A tool result's images are declared in an `attachments` array beside the result text in the tool-result carrier, never recovered from the result text itself, so literal marker syntax in a tool's output is just text. Defaults to `"image_url"` (send declared images as `image_url` parts); set to `"omit"` to drop them and append a fixed notice. The policy reads the `attachments` array of native carriers only; a legacy tool result (no array key) passes verbatim under both settings, because it declares nothing and its body is text. This does not change direct user images or OpenAI Responses providers.
+- `tool_result_image_policy`: handling for images attached to native `role = "tool"` results sent to compatible chat-completions providers. A tool result's images are declared in an `attachments` array beside the result text in the tool-result carrier, never recovered from the result text itself, so literal marker syntax in a tool's output is just text. Defaults to `"relocate"`: the declared image is kept but moved into a following `role = "user"` message, so endpoints that reject image parts in a tool result (HTTP 400) still receive it with no per-provider config; verified against opencode zen (mimo-v2.5) and llama.cpp. Relocation places a user message directly after a tool message: if a backend's chat template rejects that order, fall back to `"image_url"` or `"omit"`. Set to `"image_url"` to send declared images as `image_url` parts inside the tool message, or to `"omit"` to drop them and append a fixed notice. The policy reads the `attachments` array of native carriers only; a legacy tool result (no array key) passes verbatim under all settings, because it declares nothing and its body is text. This does not change direct user images or OpenAI Responses providers.
 - `cache_passthrough`: opt into Anthropic prompt caching on chat-completions gateways that translate to the Anthropic Messages API. Adds at most two `cache_control` breakpoints per request and surfaces gateway-reported cache reads in token usage. Default `false`, requests unchanged. Requires route qualification before production use; see [Prompt cache passthrough](#prompt-cache-passthrough-chat-completions-gateways).
 - `cache_ttl`: cache entry lifetime requested for Anthropic prompt-cache markers. `"5m"` (default) or `"1h"`. Applies to the native Anthropic provider directly, and to chat-completions gateways behind `cache_passthrough`; without passthrough it is inert. Providers that emit their own cache markers by other means (openrouter) ignore the setting. See [Choosing a 1h cache lifetime](#choosing-a-1h-cache-lifetime).
 - `tls_ca_cert_path`: absolute path to a PEM-encoded CA certificate for TLS connections to this provider (a per-provider trust override, distinct from the gateway TLS `ca_cert_path`). Shell expansion such as `~` is not performed; leave unset to use the system trust store.
@@ -120,12 +122,13 @@ thinking_passthrough = true
   when wire-first streaming support lands.
 - **Thinking shape follows the model.** The injected object matches the
   native provider's style resolution: fixed-budget models get
-  `{"type": "enabled", "budget_tokens": N}`, adaptive-only models
-  (Opus 4.7, the whole Fable 5 family) get `{"type": "adaptive"}` with no
-  budget key. Gateway model IDs may carry routing prefixes
-  (`claude-group/...`); resolution matches on substrings, so prefixed IDs
-  resolve to the same shape as bare names. When the runtime requests a
-  display mode, the snake_case `display` key rides on both shapes
+  `{"type": "enabled", "budget_tokens": N}`, and every Claude model numbered
+  4.7 or later gets `{"type": "adaptive"}` with no budget key. The version
+  is read immediately after the family token, so gateway prefixes
+  (`claude-group/...`, `anthropic.`) and suffixes (`-fast`, `-v1:0`,
+  snapshot dates, `-latest`) resolve to the same shape as the bare name.
+  When the runtime requests a display mode, the snake_case `display` key
+  rides on both shapes
   (`omitted`, `updates`, `summarized`); with no display requested the key
   is omitted entirely.
 - **Escape hatch**: for shapes this feature does not cover, `provider_extra`
@@ -357,10 +360,10 @@ messages change serialization.
 The flag also scopes to the structured request paths: agent turns, tool
 calls, and structured streaming. The text-only helpers (`chat_with_system`,
 `chat_with_history`, the legacy chunk-stream APIs) deliberately emit no
-breakpoints even with the flag on, because their responses drop token usage
-entirely; a premium cache write they triggered could never show up in
-accounting. On those helpers the flag is inert, which also means fallback
-re-entries that route through them send unmarked requests. With the flag
+breakpoints even with the flag on. Ordinary String callers do not receive
+token usage; Goal-scoped accounting can observe returned counters without
+changing this request policy. Fallback re-entries through these helpers
+still send unmarked requests. With the flag
 off (the default), request bodies are byte-identical to previous versions.
 
 ```toml
@@ -734,14 +737,42 @@ recover it two ways:
   must name permitted fallback targets, for example mapping `claude-fable-5` to
   `claude-opus-4-8`.
 
-Either way the delivered reply carries a short footer naming the requested and
-served models, so the switch is visible to the user. In the web dashboard chat
+When the fallback metadata identifies a switch, the delivered reply carries a
+short footer naming the requested and served models. In the web dashboard chat
 the same switch surfaces as an inline notice just before the answer, showing
 only the requested and served model names. When an ordinary provider failure
 already moved the request to a client-side fallback before Anthropic switched
-models on its side, the reply keeps the ordinary fallback notice as well, so
-the originally requested model stays visible and the two causes are not
-conflated.
+models on its side, the reply keeps the ordinary fallback notice as well. A
+handoff without an `iterations` breakdown does not produce a server-side
+fallback notice.
+
+For non-streaming structured chat responses that include a per-attempt usage
+breakdown, accounting can report each model's tokens separately.
+Ordinary String-only provider calls do not record that breakdown. Goal-scoped
+String calls use opt-in accounting to preserve the reported per-model
+observations without changing the returned text. In a recognized
+breakdown, the returned attempt is attributed using its iteration's model, or
+the response's model when the iteration omits it. Conflicting model IDs leave
+the attempt unattributed. An unrecognized or ambiguous breakdown retains only
+the top-level observation, without model attribution. Usage with no established
+model is labeled `(unattributed)` in the accounting report and is not priced.
+Because its cost is unknown, that usage does not increase the ordinary daily
+or monthly dollar totals used by cost limits.
+The ordinary ledger omits declined attempts with invalid counters, such as a
+missing token count; the accepted row instead uses the response's top-level
+usage. In an otherwise decodable, recognized breakdown, a malformed counter
+or model value in one entry does not discard valid entries. A structurally
+malformed response can fail to decode without retaining its usage. If a response
+shows a handoff but has no per-attempt breakdown, only the returned attempt's
+usage is known; the declined attempt's usage is unknown, not zero. Consumers
+requiring complete accounting must stop on such incomplete reports. If a
+returned attempt's top-level usage omits a counter present only in its
+iteration, an ordinary accepted cost row
+can omit that counter. Context limits remain those of the configured route, and
+reported tokens are not an invoice. When neither an iteration
+breakdown nor a handoff block is present, accounting retains the requested
+route identity; a sticky-routed response missing both cannot be distinguished
+from an ordinary single-model response.
 
 Streaming has a limit: a refusal that arrives after streamed output has begun
 keeps the existing interrupted-reply behavior; fallback applies only to refusals

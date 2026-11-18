@@ -43,9 +43,8 @@ use zeroclaw_goal::control::{
     GoalVerifierAttribution, GoalVerifierResult, GoalVerifierTurn, dispose_unowned_session_goal,
     goal_parent_turn_input,
 };
-use zeroclaw_goal::{GoalParentTurnCheckpoint, GoalPauseReason};
-
-const GOAL_UPDATE_METHOD: &str = "session/goal_update";
+use zeroclaw_goal::{GoalParentTurnCheckpoint, GoalPauseReason, GoalTransitionResult};
+use zeroclaw_rpc_proto::notification::SESSION_GOAL_UPDATE;
 
 /// Resolve each priced attempt from the ordinary ZeroCode pricing source.
 /// Retain live config rather than RpcContext so a resident supervisor neither
@@ -114,7 +113,7 @@ async fn publish_goal_lifecycle(
         outbound,
         crate::rpc::types::SessionGoalUpdate::Lifecycle {
             session_id: session_id.to_owned(),
-            response: response.clone(),
+            response: crate::rpc::types::goal_response_wire(response),
         },
     )
     .await
@@ -124,14 +123,20 @@ async fn publish_goal_update(
     outbound: &RpcOutbound,
     update: crate::rpc::types::SessionGoalUpdate,
 ) -> Result<()> {
-    let params = serde_json::to_value(update)?;
-    let notification =
-        serde_json::to_string(&JsonRpcNotification::new(GOAL_UPDATE_METHOD, params))?;
+    let notification = encode_goal_update(update)?;
     ensure!(
         outbound.send_raw(notification).await,
         "ZeroCode Goal lifecycle response could not be queued"
     );
     Ok(())
+}
+
+fn encode_goal_update(update: crate::rpc::types::SessionGoalUpdate) -> Result<String> {
+    let params = serde_json::to_value(update)?;
+    Ok(serde_json::to_string(&JsonRpcNotification::new(
+        SESSION_GOAL_UPDATE,
+        params,
+    ))?)
 }
 
 async fn report_goal_command_failure(
@@ -161,11 +166,44 @@ impl RpcGoalCommandSubmission {
     /// same queue preserves response-before-agent-event ordering for both
     /// local IPC and WSS.
     pub(super) async fn after_response(self) -> Result<()> {
-        let Some(post_response) = self.post_response else {
-            return Ok(());
+        self.finish(true).await
+    }
+
+    /// Without the first acknowledgement, an unseen Goal must not launch.
+    pub(super) async fn response_delivery_failed(self) -> Result<()> {
+        self.finish(false).await
+    }
+
+    async fn finish(self, acknowledged: bool) -> Result<()> {
+        if let Some(post_response) = self.post_response {
+            post_response.finish(acknowledged).await?;
+        }
+        Ok(())
+    }
+}
+
+impl RpcGoalPostResponse {
+    async fn finish(self, acknowledged: bool) -> Result<()> {
+        let runtime = Arc::clone(&self.runtime);
+        let supervisor = Arc::clone(&self.supervisor);
+        let session_id = self.session_id.clone();
+        let result = if acknowledged {
+            self.after_acknowledgement().await
+        } else {
+            self.abandon_unacknowledged().await
         };
+        // No command custody remains here. Even read-only and refused
+        // controls can leave a registration that has never owned a worker.
+        runtime
+            .retire_supervisor_if_idle(&session_id, &supervisor)
+            .await;
+        result
+    }
+
+    async fn after_acknowledgement(self) -> Result<()> {
+        #[cfg(test)]
+        let runtime = Arc::clone(&self.runtime);
         let RpcGoalPostResponse {
-            runtime,
             context,
             control_plane,
             session_id,
@@ -173,7 +211,8 @@ impl RpcGoalCommandSubmission {
             settings_source,
             admission,
             outbound,
-        } = post_response;
+            ..
+        } = self;
         let (mut submission, publish_initial) = match admission {
             GoalControlAdmission::Direct(submission) => (submission, false),
             GoalControlAdmission::Queued { deferred, .. } => {
@@ -226,9 +265,6 @@ impl RpcGoalCommandSubmission {
                                 GoalPauseReason::ExternalDependency,
                             )
                             .await?;
-                        runtime
-                            .retire_supervisor_if_idle(&session_id, &supervisor)
-                            .await;
                         return Err(error);
                     }
                     (submission, false)
@@ -250,44 +286,17 @@ impl RpcGoalCommandSubmission {
                 return Err(report_goal_command_failure(&outbound, &session_id, error).await);
             }
         };
-        let lifecycle_delivery_result = async {
-            if let Some(response) = late_response
-                .as_ref()
-                .or_else(|| publish_initial.then_some(&initial_response))
-            {
-                publish_goal_lifecycle(&outbound, &session_id, response).await?;
-            }
-            Ok::<(), anyhow::Error>(())
+        if let Some(response) = late_response
+            .as_ref()
+            .or_else(|| publish_initial.then_some(&initial_response))
+        {
+            publish_goal_lifecycle(&outbound, &session_id, response).await?;
         }
-        .await;
-        let initial_is_final = matches!(
-            &initial_response,
-            GoalResponse::Paused(_)
-                | GoalResponse::AlreadyPaused(_)
-                | GoalResponse::Cancelled(_)
-                | GoalResponse::AlreadyCancelled(_)
-                | GoalResponse::Terminal(_)
-        );
-        let pending_was_finalized = matches!(&initial_response, GoalResponse::TransitionPending(_))
-            && late_response.is_some();
-        if initial_is_final || pending_was_finalized {
-            runtime
-                .retire_supervisor_if_idle(&session_id, &supervisor)
-                .await;
-        }
-        lifecycle_delivery_result?;
         Ok(())
     }
 
-    /// If a start/resume acknowledgement cannot be queued, pause before any
-    /// parent model call so an unseen Goal cannot begin running.
-    /// Drain a resident predecessor and deliver its owed failure output just
-    /// as after a delivered acknowledgement.
-    pub(super) async fn response_delivery_failed(self) -> Result<()> {
-        let Some(post_response) = self.post_response else {
-            return Ok(());
-        };
-        match post_response.admission {
+    async fn abandon_unacknowledged(self) -> Result<()> {
+        match self.admission {
             GoalControlAdmission::Queued { deferred, .. } => {
                 deferred
                     .abandon(GoalControlAbandonReason::DeliveryFailed)
@@ -302,17 +311,9 @@ impl RpcGoalCommandSubmission {
                         | GoalResponse::TransitionPending(_)
                         | GoalResponse::Terminal(_)
                 ) {
-                    post_response
-                        .supervisor
+                    self.supervisor
                         .pause_before_launch(&mut submission, GoalPauseReason::ExternalDependency)
                         .await?;
-                    post_response
-                        .runtime
-                        .retire_supervisor_if_idle(
-                            &post_response.session_id,
-                            &post_response.supervisor,
-                        )
-                        .await;
                 }
             }
         }
@@ -326,9 +327,8 @@ pub struct ZeroCodeGoalSessionDriver {
     control_plane: Option<ControlPlaneHandle>,
     authorization: Arc<super::dispatch::GoalSessionAuthorization>,
     outbound: Arc<RpcOutbound>,
-    // Held by the worker-owned driver so the RPC generation cannot finish
-    // draining while a Goal it admitted is still unwinding.
-    connection_activity: Option<crate::rpc::ConnectionActivity>,
+    // Held until launch transfers it into the worker future.
+    connection_activity: std::sync::Mutex<Option<crate::rpc::ConnectionActivity>>,
     session_key: GoalSessionKey,
     agent_alias: String,
     session_generation: u64,
@@ -373,7 +373,7 @@ impl ZeroCodeGoalSessionDriver {
             control_plane,
             authorization: Arc::new(authorization),
             outbound,
-            connection_activity,
+            connection_activity: std::sync::Mutex::new(connection_activity),
             session_key,
             agent_alias: snapshot.agent_alias,
             session_generation: snapshot.generation,
@@ -454,11 +454,15 @@ impl GoalSessionDriver for ZeroCodeGoalSessionDriver {
         &self.session_key
     }
 
+    fn take_execution_liveness(&self) -> Option<Box<dyn Send>> {
+        self.connection_activity
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+            .map(|activity| Box::new(activity) as Box<dyn Send>)
+    }
+
     async fn bind(&self, ingress: &GoalIngressContext) -> Result<GoalSessionLease> {
-        // This is deliberately a liveness token rather than a cancellation
-        // signal. Ordinary EOF must retain the durable Goal, while reload must
-        // wait until the worker has released the driver.
-        let _connection_generation = self.connection_activity.as_ref();
         self.assert_ingress(ingress)?;
         self.revalidate_session().await?;
         let guard = self.command_lock.clone().lock_owned().await;
@@ -560,7 +564,6 @@ impl GoalSessionDriver for ZeroCodeGoalSessionDriver {
             context: Arc::clone(&self.context),
             session_key: self.session_key.clone(),
             authorization: Arc::clone(&self.authorization),
-            epoch_admission: GoalEpochAdmission::Pending,
             recall_query: self.recall_query.clone(),
         }))
     }
@@ -580,13 +583,7 @@ struct ZeroCodeGoalExecutionLease {
     context: Arc<RpcContext>,
     session_key: GoalSessionKey,
     authorization: Arc<super::dispatch::GoalSessionAuthorization>,
-    epoch_admission: GoalEpochAdmission,
     recall_query: String,
-}
-
-enum GoalEpochAdmission {
-    Pending,
-    Admitted,
 }
 
 impl ZeroCodeGoalExecutionLease {
@@ -597,39 +594,37 @@ impl ZeroCodeGoalExecutionLease {
         }
     }
 
-    async fn admit_agent_effect(&mut self) -> Result<tokio::sync::OwnedMutexGuard<Agent>> {
-        let result = async {
-            let first_admission = matches!(self.epoch_admission, GoalEpochAdmission::Pending);
-            let mut agent = Arc::clone(&self.agent).lock_owned().await;
-            if first_admission {
-                // These checks must follow the last awaited Agent lock. A
-                // grant or session binding can change while that lock waits.
-                let grants = self.authorization.revalidate().await?;
-                let snapshot = self
-                    .context
-                    .sessions
-                    .goal_session_snapshot(self.raw_session_id()?)
-                    .await
-                    .context("ZeroCode Goal session is absent")?;
-                ensure!(
-                    snapshot.generation == self.session_generation
-                        && snapshot.agent_alias == self.agent_alias
-                        && snapshot.owner_tui_id.as_deref() == Some(self.tui_id.as_str())
-                        && matches!(snapshot.chat_mode, crate::rpc::types::ChatMode::Chat)
-                        && Arc::ptr_eq(&snapshot.agent, &self.agent),
-                    "ZeroCode Goal session binding changed before Agent admission"
-                );
-                self.authorization
-                    .admit_execution(grants.as_ref(), &snapshot.reaction_channels)
-                    .await?;
-                self.authorization.ensure_turn_capability(&agent)?;
-                self.authorization
-                    .apply_ceiling(grants.as_ref(), &mut agent);
-                self.epoch_admission = GoalEpochAdmission::Admitted;
-            } else {
-                self.authorization.ensure_turn_capability(&agent)?;
-            }
-            Ok::<_, anyhow::Error>(agent)
+    async fn admit_agent_effect(&self) -> Result<tokio::sync::OwnedMutexGuard<Agent>> {
+        let mut agent = Arc::clone(&self.agent).lock_owned().await;
+        self.revalidate_agent_effect(&mut agent).await?;
+        Ok(agent)
+    }
+
+    async fn revalidate_agent_effect(&self, agent: &mut Agent) -> Result<()> {
+        let result: Result<()> = async {
+            // Epoch ownership does not confer continuing RPC authority.
+            // Recheck at each new effect after waiting for the Agent.
+            let grants = self.authorization.revalidate().await?;
+            let snapshot = self
+                .context
+                .sessions
+                .goal_session_snapshot(self.raw_session_id()?)
+                .await
+                .context("ZeroCode Goal session is absent")?;
+            ensure!(
+                snapshot.generation == self.session_generation
+                    && snapshot.agent_alias == self.agent_alias
+                    && snapshot.owner_tui_id.as_deref() == Some(self.tui_id.as_str())
+                    && matches!(snapshot.chat_mode, crate::rpc::types::ChatMode::Chat)
+                    && Arc::ptr_eq(&snapshot.agent, &self.agent),
+                "ZeroCode Goal session binding changed before Agent admission"
+            );
+            self.authorization
+                .admit_execution(grants.as_ref(), &snapshot.reaction_channels)
+                .await?;
+            self.authorization.ensure_turn_capability(agent)?;
+            self.authorization.apply_ceiling(grants.as_ref(), agent);
+            Ok(())
         }
         .await;
         if let Err(error) = &result
@@ -642,7 +637,7 @@ impl ZeroCodeGoalExecutionLease {
                 format!("turn refused by daemon: {}", refusal.message),
                 None,
                 None,
-                super::dispatch::TurnCompleteExtras::default(),
+                super::dispatch::TurnCompleteExtras::for_goal(),
             )
             .await;
         }
@@ -677,7 +672,7 @@ impl ZeroCodeGoalExecutionLease {
             diagnostic,
             None,
             None,
-            super::dispatch::TurnCompleteExtras::default(),
+            super::dispatch::TurnCompleteExtras::for_goal(),
         )
         .await;
     }
@@ -782,9 +777,12 @@ impl GoalSessionExecutionLease for ZeroCodeGoalExecutionLease {
         let input = goal_parent_turn_input(&turn);
         let prepared = match turn.kind {
             GoalParentTurnKind::Start | GoalParentTurnKind::Resume => {
-                let prepared = self.prepared_parent.take()
+                let mut prepared = self.prepared_parent.take()
                     .context("ZeroCode Goal parent has no captured preparation")?;
                 ensure!(prepared.matches_input(&input), "ZeroCode Goal parent input changed after preparation");
+                // Capture is read-only and can precede the parent checkpoint.
+                // Revalidate on the same held Agent after that admission wait.
+                self.revalidate_agent_effect(prepared.agent_mut()).await?;
                 prepared
             }
             GoalParentTurnKind::Continue => {
@@ -846,10 +844,13 @@ impl GoalSessionExecutionLease for ZeroCodeGoalExecutionLease {
             crate::security::scrub_with_config(&candidate, &config.security.leak_detection)
         };
         let candidate = crate::agent::turn::scrub_credentials(&candidate);
-        publish_goal_update(&self.outbound, crate::rpc::types::SessionGoalUpdate::VerifiedCandidate {
+        let notification = encode_goal_update(crate::rpc::types::SessionGoalUpdate::VerifiedCandidate {
             session_id,
             candidate,
-        }).await?;
+        })?;
+        // Losing the observer after admission must not turn successful work
+        // into a parent failure or prevent the controller from saving it.
+        let _ = self.outbound.send_raw(notification).await;
         Ok(result)
         };
         tokio::pin!(work);
@@ -955,11 +956,11 @@ impl GoalSessionExecutionLease for ZeroCodeGoalExecutionLease {
             }
             GoalExecutionNotice::Failed(reason) => crate::rpc::types::SessionGoalUpdate::Failed {
                 session_id: self.raw_session_id()?.to_owned(),
-                reason,
+                reason: crate::rpc::types::goal_failure_reason_wire(reason),
             },
         };
         self.outbound
-            .notify(GOAL_UPDATE_METHOD, serde_json::to_value(update)?)
+            .notify(SESSION_GOAL_UPDATE, serde_json::to_value(update)?)
             .await;
         Ok(())
     }
@@ -1177,23 +1178,41 @@ impl RpcGoalRuntime {
         control_plane().cloned()
     }
 
-    /// Whether this session's Goal can be safely disposed without waiting for
-    /// a process-local worker. LRU eviction is nonblocking: resumable Goals
-    /// and sessions with a live resident worker stay attached rather than
-    /// being fenced while an actor permit is held. A completed worker may be
-    /// drained because it no longer owns the session execution lease.
-    pub async fn can_evict_session_goal(&self, session_id: &str) -> Result<bool> {
-        let durable_session_id = GoalSessionKey::zero_code(session_id)?.durable_id();
-        let supervisor = self.supervisor(session_id).await;
-        if let Some(supervisor) = supervisor.as_ref()
-            && !supervisor
-                .worker_completed_for_session(&durable_session_id)
-                .await
-        {
+    /// Opening another session must not dispose this session's Goal. The
+    /// optional sibling sweep retains both live and durable Goal owners,
+    /// including those that still expose a terminal result.
+    pub(super) async fn can_evict_session_goal(&self, session_id: &str) -> Result<bool> {
+        if self.supervisor(session_id).await.is_some() {
             return Ok(false);
         }
         let Some(control_plane) = self.current_control_plane() else {
-            return Ok(supervisor.is_none());
+            return Ok(true);
+        };
+        let durable_session_id = GoalSessionKey::zero_code(session_id)?.durable_id();
+        Ok(control_plane
+            .goal_store()?
+            .current_goal_for_session(&durable_session_id)
+            .await?
+            .is_none())
+    }
+
+    /// Orphan retirement only detaches a live entry; it never settles a pending
+    /// operation or deletes the durable Goal.
+    pub(super) async fn can_retire_session_goal(&self, session_id: &str) -> Result<bool> {
+        let durable_session_id = GoalSessionKey::zero_code(session_id)?.durable_id();
+        if let Some(supervisor) = self.supervisor(session_id).await {
+            if !supervisor
+                .try_retire_terminal_session(&durable_session_id)
+                .await?
+            {
+                return Ok(false);
+            }
+            self.remove_supervisor_if_current(session_id, &supervisor)
+                .await;
+            return Ok(true);
+        }
+        let Some(control_plane) = self.current_control_plane() else {
+            return Ok(true);
         };
         let registry = control_plane.goal_store()?;
         let Some(task) = registry
@@ -1203,7 +1222,14 @@ impl RpcGoalRuntime {
             return Ok(true);
         };
 
-        Ok(task.status.is_terminal())
+        if !task.status.is_terminal() {
+            return Ok(false);
+        }
+        let goal = registry
+            .get_goal_task(&task.id)
+            .await?
+            .context("Goal extension disappeared during session retirement")?;
+        Ok(goal.pending_call_id.is_none() && goal.pending_call_epoch.is_none())
     }
 
     /// Fence and dispose the current Goal before its RPC session disappears.
@@ -1211,18 +1237,46 @@ impl RpcGoalRuntime {
     /// This must run before the caller waits on `SessionActorQueue`: an active
     /// Goal owns that queue until its admitted operation has settled.
     pub async fn dispose_session(&self, session_id: &str) -> Result<()> {
+        let durable_session_id = GoalSessionKey::zero_code(session_id)?.durable_id();
         if let Some(supervisor) = self.supervisor(session_id).await {
-            supervisor
-                .dispose_session(&GoalSessionKey::zero_code(session_id)?.durable_id())
+            let result = supervisor.dispose_session(&durable_session_id).await?;
+            self.confirm_goal_disposed(&durable_session_id, result)
                 .await?;
-            self.remove_supervisor_if_current(session_id, &supervisor)
+            self.retire_supervisor_if_idle(session_id, &supervisor)
                 .await;
         } else if let Some(control_plane) = self.current_control_plane() {
             let registry = control_plane.goal_store()?;
-            let durable_session_id = GoalSessionKey::zero_code(session_id)?.durable_id();
-            let _ = dispose_unowned_session_goal(registry.as_ref(), &durable_session_id).await?;
+            let result =
+                dispose_unowned_session_goal(registry.as_ref(), &durable_session_id).await?;
+            self.confirm_goal_disposed(&durable_session_id, result)
+                .await?;
         }
         Ok(())
+    }
+
+    async fn confirm_goal_disposed(
+        &self,
+        durable_session_id: &str,
+        result: GoalTransitionResult,
+    ) -> Result<()> {
+        match result {
+            GoalTransitionResult::Applied => Ok(()),
+            GoalTransitionResult::Stale => anyhow::bail!("Goal changed during session disposal"),
+            GoalTransitionResult::Missing => {
+                let control_plane = self
+                    .current_control_plane()
+                    .context("Goal control plane unavailable during session disposal")?;
+                ensure!(
+                    control_plane
+                        .goal_store()?
+                        .current_goal_for_session(durable_session_id)
+                        .await?
+                        .is_none(),
+                    "Goal changed during session disposal"
+                );
+                Ok(())
+            }
+        }
     }
 
     /// Submit one parsed Goal command through the current ZeroCode session.
@@ -1286,17 +1340,33 @@ impl RpcGoalRuntime {
                             .execution_engine(accounting)
                             .with_diagnostic_text_guard(Arc::new(RuntimeGoalDiagnosticTextGuard)),
                     );
-                    let candidate = restart_coordinator.new_supervisor(engine).await;
-                    self.install_supervisor_if_absent(session_id.clone(), candidate)
-                        .await
+                    // Register with restart only after winning the session's
+                    // slot. The coordinator retains a strong registration.
+                    let mut supervisors = self.supervisors.lock().await;
+                    match supervisors.entry(session_id.clone()) {
+                        std::collections::hash_map::Entry::Occupied(entry) => {
+                            Arc::clone(entry.get())
+                        }
+                        std::collections::hash_map::Entry::Vacant(entry) => {
+                            let supervisor = restart_coordinator.new_supervisor(engine).await;
+                            Arc::clone(entry.insert(supervisor))
+                        }
+                    }
                 }
             };
             let current_config = context.config.snapshot();
-            let settings = GoalHostSettings::from_config(
+            let settings = match GoalHostSettings::from_config(
                 &current_config,
                 std::process::id(),
                 control_plane.boot_id.clone(),
-            )?;
+            ) {
+                Ok(settings) => settings,
+                Err(error) => {
+                    self.retire_supervisor_if_idle(&session_id, &supervisor)
+                        .await;
+                    return Err(error);
+                }
+            };
             match supervisor
                 .admit_control(&settings, ingress.clone(), driver.clone(), command.clone())
                 .await
@@ -1308,7 +1378,11 @@ impl RpcGoalRuntime {
                     self.remove_supervisor_if_current(&session_id, &supervisor)
                         .await;
                 }
-                Err(error) => return Err(error),
+                Err(error) => {
+                    self.retire_supervisor_if_idle(&session_id, &supervisor)
+                        .await;
+                    return Err(error);
+                }
             }
         };
         let (response, admission) = match admission {
@@ -1355,10 +1429,9 @@ impl RpcGoalRuntime {
         }
     }
 
-    /// Atomically retain one supervisor for a session and return the resident
-    /// instance. A concurrent candidate was never used to launch work, so it
-    /// safely drops after losing this insertion race.
-    pub async fn install_supervisor_if_absent(
+    /// Install a preconstructed supervisor for a test fixture.
+    #[cfg(test)]
+    pub(crate) async fn install_supervisor_if_absent(
         &self,
         session_id: String,
         supervisor: Arc<GoalExecutionSupervisor>,

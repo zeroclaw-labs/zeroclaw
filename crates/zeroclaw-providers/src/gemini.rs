@@ -183,6 +183,35 @@ struct GenerateContentResponse {
     usage_metadata: Option<GeminiUsageMetadata>,
 }
 
+enum GeminiGenerateReply {
+    Completed(String, Option<TokenUsage>),
+    Rejected(reqwest::StatusCode, String),
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("Gemini API error ({status}): {body}")]
+struct GeminiHttpRejection {
+    status: reqwest::StatusCode,
+    body: String,
+}
+
+impl crate::dispatch::accounting::ObserveRejectedStringWire for GenerateContentResponse {
+    fn observe_rejected_usage(wire: &serde_json::Value) {
+        let inner_usage = wire
+            .get("error")
+            .is_none_or(serde_json::Value::is_null)
+            .then(|| wire.get("response")?.get("usageMetadata"))
+            .flatten()
+            .filter(|usage| !usage.is_null());
+        crate::dispatch::accounting::observe_string_usage_fields(
+            inner_usage.or_else(|| wire.get("usageMetadata")),
+            "promptTokenCount",
+            "candidatesTokenCount",
+            None,
+        );
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct GeminiUsageMetadata {
     #[serde(default, rename = "promptTokenCount")]
@@ -1269,24 +1298,28 @@ impl GeminiModelProvider {
         };
 
         let url = Self::build_generate_content_url(model, auth);
+        let capture_string_usage = crate::dispatch::accounting::string_usage_observation_enabled();
 
-        let mut response = self
-            .build_generate_content_request(
+        let build = |include_generation_config, project: Option<&str>, token: Option<&str>| {
+            self.build_generate_content_request(
                 auth,
                 &url,
                 &request,
                 model,
-                true,
-                project.as_deref(),
-                oauth_token.as_deref(),
-            )?
-            .send()
+                include_generation_config,
+                project,
+                token,
+            )
+        };
+        let mut response = self
+            .send_generate_content_attempt(
+                build(true, project.as_deref(), oauth_token.as_deref())?,
+                model,
+                capture_string_usage,
+            )
             .await?;
 
-        if !response.status().is_success() {
-            let status = response.status();
-            let error_text = response.text().await.unwrap_or_default();
-
+        if let GeminiGenerateReply::Rejected(status, error_text) = response {
             if auth.is_oauth() && Self::should_rotate_oauth_on_error(status, &error_text) {
                 // For CLI OAuth: rotate credentials
                 // For ManagedOAuth: AuthService handles refresh, just retry
@@ -1350,16 +1383,11 @@ impl GeminiModelProvider {
                     oauth_token = Some(new_token);
                     project = Some(new_project);
                     response = self
-                        .build_generate_content_request(
-                            auth,
-                            &url,
-                            &request,
+                        .send_generate_content_attempt(
+                            build(true, project.as_deref(), oauth_token.as_deref())?,
                             model,
-                            true,
-                            project.as_deref(),
-                            oauth_token.as_deref(),
-                        )?
-                        .send()
+                            capture_string_usage,
+                        )
                         .await?;
                 } else {
                     anyhow::bail!("Gemini API error ({status}): {error_text}");
@@ -1374,25 +1402,18 @@ impl GeminiModelProvider {
                     "Gemini OAuth internal endpoint rejected generationConfig; retrying without generationConfig"
                 );
                 response = self
-                    .build_generate_content_request(
-                        auth,
-                        &url,
-                        &request,
+                    .send_generate_content_attempt(
+                        build(false, project.as_deref(), oauth_token.as_deref())?,
                         model,
-                        false,
-                        project.as_deref(),
-                        oauth_token.as_deref(),
-                    )?
-                    .send()
+                        capture_string_usage,
+                    )
                     .await?;
             } else {
                 anyhow::bail!("Gemini API error ({status}): {error_text}");
             }
         }
 
-        if !response.status().is_success() {
-            let status = response.status();
-            let error_text = response.text().await.unwrap_or_default();
+        if let GeminiGenerateReply::Rejected(status, error_text) = response {
             if auth.is_oauth()
                 && Self::should_retry_oauth_without_generation_config(status, &error_text)
             {
@@ -1403,40 +1424,90 @@ impl GeminiModelProvider {
                     "Gemini OAuth internal endpoint rejected generationConfig; retrying without generationConfig"
                 );
                 response = self
-                    .build_generate_content_request(
-                        auth,
-                        &url,
-                        &request,
+                    .send_generate_content_attempt(
+                        build(false, project.as_deref(), oauth_token.as_deref())?,
                         model,
-                        false,
-                        project.as_deref(),
-                        oauth_token.as_deref(),
-                    )?
-                    .send()
+                        capture_string_usage,
+                    )
                     .await?;
             } else {
                 anyhow::bail!("Gemini API error ({status}): {error_text}");
             }
         }
 
-        if !response.status().is_success() {
-            let status = response.status();
-            let error_text = response.text().await.unwrap_or_default();
-            anyhow::bail!("Gemini API error ({status}): {error_text}");
+        match response {
+            GeminiGenerateReply::Completed(text, usage) => Ok((text, usage)),
+            GeminiGenerateReply::Rejected(status, error_text) => {
+                anyhow::bail!("Gemini API error ({status}): {error_text}")
+            }
         }
+    }
 
-        let result: GenerateContentResponse = response.json().await?;
+    async fn send_generate_content_attempt(
+        &self,
+        request: reqwest::RequestBuilder,
+        model: &str,
+        capture_string_usage: bool,
+    ) -> anyhow::Result<GeminiGenerateReply> {
+        let attempt = async {
+            let response = request.send().await?;
+            if !response.status().is_success() {
+                let status = response.status();
+                let body = match response.text().await {
+                    Ok(body) => {
+                        crate::dispatch::accounting::observe_rejected_string_wire::<
+                            GenerateContentResponse,
+                        >(body.as_bytes());
+                        crate::dispatch::accounting::finish_current_string_attempt_after_completed_response();
+                        body
+                    }
+                    Err(_) => String::new(),
+                };
+                return Err(GeminiHttpRejection { status, body }.into());
+            }
+            Self::decode_generate_content(response).await
+        };
+        let result = if capture_string_usage {
+            crate::dispatch::accounted_string_call(self, model, attempt).await
+        } else {
+            attempt.await
+        };
+        match result {
+            Err(error) => match error.downcast::<GeminiHttpRejection>() {
+                Ok(rejected) => Ok(GeminiGenerateReply::Rejected(
+                    rejected.status,
+                    rejected.body,
+                )),
+                Err(error) => Err(error),
+            },
+            Ok(reply) => Ok(reply),
+        }
+    }
+
+    async fn decode_generate_content(
+        response: reqwest::Response,
+    ) -> anyhow::Result<GeminiGenerateReply> {
+        let crate::dispatch::accounting::StringWireResponse(result) = response
+            .json::<crate::dispatch::accounting::StringWireResponse<GenerateContentResponse>>()
+            .await?;
         if let Some(err) = &result.error {
+            crate::dispatch::accounting::observe_string_usage(
+                result
+                    .usage_metadata
+                    .and_then(Self::token_usage_from_metadata),
+            );
+            crate::dispatch::accounting::finish_current_string_attempt_after_completed_response();
             anyhow::bail!("Gemini API error: {}", err.message);
         }
         let result = result.into_effective_response();
-        if let Some(err) = result.error {
-            anyhow::bail!("Gemini API error: {}", err.message);
-        }
-
         let usage = result
             .usage_metadata
             .and_then(Self::token_usage_from_metadata);
+        crate::dispatch::accounting::observe_string_usage(usage.clone());
+        if let Some(err) = result.error {
+            crate::dispatch::accounting::finish_current_string_attempt_after_completed_response();
+            anyhow::bail!("Gemini API error: {}", err.message);
+        }
 
         let text = result
             .candidates
@@ -1453,7 +1524,7 @@ impl GeminiModelProvider {
                 anyhow::Error::msg("No response from Gemini")
             })?;
 
-        Ok((text, usage))
+        Ok(GeminiGenerateReply::Completed(text, usage))
     }
 }
 
@@ -1490,10 +1561,9 @@ impl ModelProvider for GeminiModelProvider {
             parts: build_parts(message),
         }];
 
-        let (text, usage) = self
+        let (text, _) = self
             .send_generate_content(contents, system_instruction, model, temperature)
             .await?;
-        crate::dispatch::accounting::observe_string_usage(usage);
         Ok(text)
     }
 
@@ -1885,7 +1955,7 @@ mod tests {
             Missing,
             Complete(u64, u64),
             Invalid(InvalidUsageReason, Option<u64>, Option<u64>),
-            Unknown,
+            RejectMalformed,
         }
         let cases = vec![
             (None, Expected::Missing),
@@ -1913,15 +1983,15 @@ mod tests {
             ),
             (
                 Some(json!({"promptTokenCount":"8","candidatesTokenCount":3})),
-                Expected::Unknown,
+                Expected::RejectMalformed,
             ),
             (
                 Some(json!({"promptTokenCount":-1,"candidatesTokenCount":3})),
-                Expected::Unknown,
+                Expected::RejectMalformed,
             ),
             (
                 Some(json!({"promptTokenCount":1.8446744073709552e19,"candidatesTokenCount":3})),
-                Expected::Unknown,
+                Expected::RejectMalformed,
             ),
         ];
         for (usage, expected) in cases {
@@ -1978,8 +2048,18 @@ mod tests {
                     assert_eq!(*actual, reason);
                     assert_eq!((observed.input_tokens, observed.output_tokens), (i, o));
                 }
-                (Expected::Unknown, AttemptUsageOutcome::OutcomeUnknown { observed: None }) => {
-                    assert!(result.is_err())
+                (
+                    Expected::RejectMalformed,
+                    AttemptUsageOutcome::Invalid {
+                        observed,
+                        reason: InvalidUsageReason::MalformedUsage,
+                    },
+                ) => {
+                    assert!(result.is_err());
+                    assert_eq!(
+                        (observed.input_tokens, observed.output_tokens),
+                        (None, Some(3))
+                    );
                 }
                 (_, actual) => panic!("unexpected Gemini outcome: {actual:?}"),
             }
@@ -2013,14 +2093,21 @@ mod tests {
         );
         check_api(receive(&mut capture_rx).await, None);
 
-        for (body, expected) in [
+        for (body, expected, native_rejection) in [
             (
                 json!({"candidates":[{"content":{"parts":[]}}],"usageMetadata":{"promptTokenCount":8,"candidatesTokenCount":3}}),
                 "No response from Gemini",
+                false,
             ),
             (
                 json!({"error":{"message":"synthetic envelope error"},"usageMetadata":{"promptTokenCount":8,"candidatesTokenCount":3}}),
                 "synthetic envelope error",
+                true,
+            ),
+            (
+                json!({"response":{"error":{"message":"nested envelope error"},"usageMetadata":{"promptTokenCount":8,"candidatesTokenCount":3}}}),
+                "nested envelope error",
+                true,
             ),
         ] {
             let mut errors = Vec::new();
@@ -2067,10 +2154,28 @@ mod tests {
                 errors.push(error.to_string());
                 if let Some(report) = report {
                     assert_eq!(report.attempts().len(), 1);
-                    assert!(matches!(
-                        report.attempts()[0].outcome(),
-                        AttemptUsageOutcome::OutcomeUnknown { observed: None }
-                    ));
+                    let observed = report.attempts()[0].outcome();
+                    if mode == 2 && native_rejection {
+                        assert!(
+                            matches!(
+                                observed,
+                                AttemptUsageOutcome::Complete(usage)
+                                    if usage.input_tokens == Some(8) && usage.output_tokens == Some(3)
+                            ),
+                            "expected complete native rejection, got {observed:?}"
+                        );
+                    } else if mode == 2 {
+                        assert!(matches!(
+                            observed,
+                            AttemptUsageOutcome::OutcomeUnknown { observed: Some(usage) }
+                                if usage.input_tokens == Some(8) && usage.output_tokens == Some(3)
+                        ));
+                    } else {
+                        assert!(matches!(
+                            observed,
+                            AttemptUsageOutcome::OutcomeUnknown { observed: None }
+                        ));
+                    }
                     assert!(report.accepted_route().is_none());
                 }
                 check_api(receive(&mut capture_rx).await, Some(0.25));
@@ -2120,10 +2225,15 @@ mod tests {
                 .await;
             if let Some(report) = report {
                 assert_eq!(report.attempts().len(), 1);
-                assert!(matches!(
-                    report.attempts()[0].outcome(),
-                    AttemptUsageOutcome::OutcomeUnknown { observed: None }
-                ));
+                let outcome = report.attempts()[0].outcome();
+                if mode == 2 {
+                    assert!(matches!(outcome, AttemptUsageOutcome::Missing));
+                } else {
+                    assert!(matches!(
+                        outcome,
+                        AttemptUsageOutcome::OutcomeUnknown { observed: None }
+                    ));
+                }
             }
             errors.push(error);
             check_api(receive(&mut capture_rx).await, Some(0.25));
@@ -2177,10 +2287,22 @@ mod tests {
                 .await;
             if let Some(report) = report {
                 assert_eq!(report.attempts().len(), 1);
-                assert!(matches!(
-                    report.attempts()[0].outcome(),
-                    AttemptUsageOutcome::OutcomeUnknown { observed: None }
-                ));
+                let observed = report.attempts()[0].outcome();
+                if mode == 2 {
+                    assert!(matches!(
+                        observed,
+                        AttemptUsageOutcome::Invalid {
+                            observed: usage,
+                            reason: crate::dispatch::InvalidUsageReason::MalformedUsage,
+                        }
+                            if usage.input_tokens.is_none() && usage.output_tokens == Some(3)
+                    ));
+                } else {
+                    assert!(matches!(
+                        observed,
+                        AttemptUsageOutcome::OutcomeUnknown { observed: None }
+                    ));
+                }
             }
             malformed_errors.push(error);
             check_api(receive(&mut capture_rx).await, Some(0.25));
@@ -2311,7 +2433,10 @@ mod tests {
         );
         check_oauth(receive(&mut capture_rx).await, true);
 
-        enqueue(bad, StatusCode::BAD_REQUEST, false);
+        let mut billed_rejection = bad;
+        billed_rejection["usageMetadata"] =
+            json!({"promptTokenCount": 5, "candidatesTokenCount": 0});
+        enqueue(billed_rejection, StatusCode::BAD_REQUEST, false);
         enqueue(wrapped, StatusCode::OK, false);
         let (text, report) = GENERATE_CONTENT_TEST_ORIGIN
             .scope(local.clone(), async {
@@ -2330,9 +2455,22 @@ mod tests {
             })
             .await;
         assert_eq!(text, "oauth answer");
-        assert_eq!(report.attempts().len(), 1);
+        assert_eq!(report.attempts().len(), 2);
+        let [rejected] = report.rejected_attempts() else {
+            panic!("expected exactly one rejected Gemini request");
+        };
+        assert_eq!(
+            (
+                rejected.usage().input_tokens,
+                rejected.usage().output_tokens
+            ),
+            (Some(5), Some(0))
+        );
         assert!(
-            matches!(report.attempts()[0].outcome(), AttemptUsageOutcome::Complete(u) if u.input_tokens == Some(8) && u.output_tokens == Some(3))
+            matches!(report.attempts()[0].outcome(), AttemptUsageOutcome::Complete(u) if u.input_tokens == Some(5) && u.output_tokens == Some(0))
+        );
+        assert!(
+            matches!(report.attempts()[1].outcome(), AttemptUsageOutcome::Complete(u) if u.input_tokens == Some(8) && u.output_tokens == Some(3))
         );
         assert!(report.accepted_route().is_some());
         let first = receive(&mut capture_rx).await;

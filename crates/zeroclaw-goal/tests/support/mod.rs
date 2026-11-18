@@ -9,7 +9,7 @@ use zeroclaw_goal::{
     GoalAccountingState, GoalExecutionScope, GoalPauseState, GoalTaskRecord, GoalTaskRegistry,
     GoalTransitionResult, TaskContinuationContext,
     accounting::{GoalOperationAccounting, GoalOperationAccountingFactory},
-    task::{GoalControlIntent, GoalControlIntentSettlement},
+    task::{GoalControlIntent, GoalControlIntentSettlement, GoalDispatchStart},
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -480,6 +480,15 @@ impl GoalTaskRegistry for Registry {
             state.terminal_reason = error;
             state.transitions.push("finish");
         }))
+    }
+    async fn begin_operation_dispatch(
+        &self,
+        _id: &str,
+        _session: &str,
+        _epoch: i64,
+        _pending: &str,
+    ) -> Result<Option<GoalDispatchStart>> {
+        bail!("fixture driver makes no physical provider attempt")
     }
     async fn admit_pending_operation(
         &self,

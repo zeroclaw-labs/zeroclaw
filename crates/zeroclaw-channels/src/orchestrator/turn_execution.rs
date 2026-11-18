@@ -59,6 +59,7 @@ pub(super) fn resolved_channel_execution<'a>(
             strict_tool_parsing: context.agent_cfg.resolved.strict_tool_parsing,
             parallel_tools: context.agent_cfg.resolved.parallel_tools,
             max_tool_result_chars: context.max_tool_result_chars,
+            keep_tool_context_turns: context.agent_cfg.resolved.keep_tool_context_turns,
             context_limits: resolve_channel_context_limits(
                 context.prompt_config.as_ref(),
                 context.agent_alias.as_str(),

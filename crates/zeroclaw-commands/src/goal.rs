@@ -1,32 +1,11 @@
 //! Transport-neutral parsing for the fixed Goal Mode V1 command grammar.
 
+pub use zeroclaw_api::goal::{
+    GoalBudgetLimits, is_valid_finite_goal_cost_limit, is_valid_finite_goal_token_limit,
+};
+
 /// Maximum accepted length of the declared success criterion.
 pub const MAX_GOAL_OBJECTIVE_CHARS: usize = 4096;
-
-/// Return whether a finite token budget is positive and can be represented by
-/// the canonical SQLite task plane.
-///
-/// This predicate is shared by command parsing and direct runtime admission so
-/// a typed command cannot accept a finite token value the grammar rejects.
-pub fn is_valid_finite_goal_token_limit(value: u64) -> bool {
-    value > 0 && value <= i64::MAX as u64
-}
-
-/// Return whether a finite cost budget is usable for Goal admission.
-///
-/// This predicate is shared by command parsing and direct runtime admission so
-/// a typed command cannot accept a finite cost value the grammar rejects.
-pub fn is_valid_finite_goal_cost_limit(value: f64) -> bool {
-    value.is_finite() && value > 0.0
-}
-
-/// A finite limit selected by a command. `None` means unlimited in that
-/// dimension; it is deliberately distinct from omitted command flags.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct GoalBudgetLimits {
-    pub token_limit: Option<u64>,
-    pub cost_limit_usd: Option<f64>,
-}
 
 /// Budget selection supplied by `start` or `budget set`.
 #[derive(Debug, Clone, Copy, PartialEq)]

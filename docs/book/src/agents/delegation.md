@@ -78,6 +78,11 @@ When parallel tool execution is enabled (`parallel_tools = true` in the runtime 
 
 Goal foreground work keeps `delegate` and `spawn_subagent` available when the existing tool, target, approval, and principal policies permit them, but executes child operations synchronously. Prepared Goal tool batches run sequentially in model order, including calls that do not themselves start children; parallel delegate fan-out is not a foreground Goal path. A completed child returns to depth zero, so a later sibling may run, while a depth-one child cannot start another agent child through any tool. Ordinary non-Goal parallel calls, delegation modes, and their authorization rules are unchanged.
 
+Goal turns cannot start agents through `cron_run` or `send_message_to_peer`.
+Shell cron jobs and messages to human peers retain their ordinary checks. Run
+manual cron steps sequentially in a Goal pipeline: a job ID alone does not
+prove the job is child-free before parallel execution.
+
 Goal children use the same operation accountant and ledger as their parent, and their terminal outcome is settled before the parent continues. Existing provider methods that return a legacy `String` may not expose token usage; usage is observed only where genuinely available, and missing usage fails closed for Goal progress rather than being invented. This limitation does not change ordinary non-Goal `String` response handling.
 
 ## ZeroCode transcript inspection

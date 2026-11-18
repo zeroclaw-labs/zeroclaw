@@ -54,6 +54,7 @@ use launch_guard::GoalLaunchOwner;
 const MAX_VERIFIER_REASON_CHARS: usize = 2_000;
 const MAX_VERIFIER_BLOCKERS: usize = 16;
 const MAX_VERIFIER_BLOCKER_MESSAGE_CHARS: usize = 2_000;
+const LIFECYCLE_PERSISTENCE_FAILED: &str = "lifecycle_persistence_failed";
 /// Maximum UTF-8 bytes accepted before parsing a verifier response.
 const MAX_VERIFIER_RESPONSE_BYTES: usize = 1_048_576;
 /// Maximum compact-JSON bytes retained for one blocker payload.
@@ -387,6 +388,23 @@ struct GoalFailurePublication {
     notice_published: bool,
     notice_withdrawn: bool,
     core_error: GoalCoreErrorPublication,
+    accounting: Option<GoalAccountingMetadata>,
+}
+
+fn terminal_worker_is_releasable(
+    status: TaskStatus,
+    completion: Option<&GoalWorkerCompletion>,
+    publication: &GoalFailurePublication,
+) -> bool {
+    if matches!(publication.core_error, GoalCoreErrorPublication::Parked(_)) {
+        return false;
+    }
+    match (status, completion) {
+        (TaskStatus::Completed, Some(Ok(GoalExecutionOutcome::Completed)))
+        | (TaskStatus::Cancelled, Some(Ok(GoalExecutionOutcome::Fenced))) => true,
+        (TaskStatus::Failed, Some(Err(_))) => publication.notice_published,
+        _ => false,
+    }
 }
 
 /// Owns one unlaunched notice until delivery settles or its task is torn down.
@@ -424,7 +442,9 @@ enum GoalCoreErrorPublication {
 enum GoalRunErrorReport {
     #[default]
     Unreported,
-    Surfaced,
+    // The host attempted its native delivery, or this is a Goal-only
+    // verdict whose lifecycle notice is the user-visible report.
+    Surfaced(Option<GoalAccountingMetadata>),
     Handed(anyhow::Error),
 }
 
@@ -455,7 +475,15 @@ fn report_transition_error(
     }
 }
 
-type GoalWorkerCompletion = std::result::Result<GoalExecutionOutcome, String>;
+type GoalAccountingMetadata = (GoalAccountingState, bool);
+
+#[derive(Clone, Debug)]
+struct GoalWorkerFailure {
+    message: String,
+    accounting: Option<GoalAccountingMetadata>,
+}
+
+type GoalWorkerCompletion = std::result::Result<GoalExecutionOutcome, GoalWorkerFailure>;
 
 // A queued control must also be released when the worker future unwinds or is dropped.
 struct GoalWorkerCheckpointGuard(GoalParentTurnCheckpoint);
@@ -542,10 +570,47 @@ impl GoalExecutionSupervisor {
     /// for custody or queue a writer behind active controls or launch handoffs.
     /// A retired supervisor still permits disposal, restart fencing and drains.
     pub async fn try_retire(&self) -> bool {
+        self.try_retire_with_terminal(None)
+    }
+
+    /// Release a settled terminal worker when the host retires a live session.
+    /// This uses durable state as evidence only; it never settles or deletes it.
+    /// Callers serialize this with lifecycle changes to the exact session.
+    pub async fn try_retire_terminal_session(&self, session_id: &str) -> Result<bool> {
+        let Some(task) = self
+            .engine
+            .registry
+            .current_goal_for_session(session_id)
+            .await?
+        else {
+            return Ok(self.try_retire_with_terminal(None));
+        };
+        if !task.status.is_terminal() {
+            return Ok(false);
+        }
+        let goal = self
+            .engine
+            .registry
+            .get_goal_task(&task.id)
+            .await?
+            .context("Goal extension disappeared during session retirement")?;
+        // An incomplete classification can be durably settled. Check the
+        // pending markers separately from the recorded accounting outcome.
+        if (task.status == TaskStatus::Completed
+            && goal.accounting_state != GoalAccountingState::Complete)
+            || goal.pending_call_id.is_some()
+            || goal.pending_call_epoch.is_some()
+        {
+            return Ok(false);
+        }
+        Ok(self.try_retire_with_terminal(Some((session_id, &task))))
+    }
+
+    fn try_retire_with_terminal(&self, terminal: Option<(&str, &TaskRecord)>) -> bool {
         let Ok(_barrier) = self.custody_gate.barrier.clone().try_write_owned() else {
             return false;
         };
-        let Ok(workers) = self.workers.try_lock() else {
+        let Ok(mut workers) = self.workers.try_lock() else {
             return false;
         };
         let Ok(boundaries) = self.pending_boundaries.try_lock() else {
@@ -557,10 +622,39 @@ impl GoalExecutionSupervisor {
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
                 .is_empty()
-            || !workers.is_empty()
             || !boundaries.is_empty()
         {
             return false;
+        }
+        if !workers.is_empty() {
+            let Some((session_id, task)) = terminal else {
+                return false;
+            };
+            if workers.len() != 1 {
+                return false;
+            }
+            let Some(worker) = workers.get(session_id).cloned() else {
+                return false;
+            };
+            let Ok(worker) = worker.try_lock() else {
+                return false;
+            };
+            let matches_completion = worker.execution_epoch == task.execution_epoch
+                || worker.execution_epoch.checked_add(1) == Some(task.execution_epoch);
+            if worker.task_id != task.id || !matches_completion {
+                return false;
+            }
+            let Ok(publication) = worker.failure_publication.try_lock() else {
+                return false;
+            };
+            if !terminal_worker_is_releasable(
+                task.status,
+                worker.completion.borrow().as_ref(),
+                &publication,
+            ) {
+                return false;
+            }
+            workers.remove(session_id);
         }
         self.custody_gate.retired.store(true, Ordering::Release);
         true
@@ -606,6 +700,7 @@ impl GoalExecutionSupervisor {
         let worker_driver = Arc::clone(&driver);
         let worker_ingress = ingress.clone();
         let checkpoint_guard = GoalWorkerCheckpointGuard(checkpoint.clone());
+        let execution_liveness = driver.take_execution_liveness();
         let (completion_tx, completion) = watch::channel(None);
         let source = source.clone();
         let handle = zeroclaw_spawn::spawn!(async move {
@@ -629,8 +724,10 @@ impl GoalExecutionSupervisor {
                 Ok(outcome) => Ok(outcome),
                 Err(error) => {
                     let mut completion_text = format!("{error:#}");
+                    let mut accounting = accounting_failure_metadata(&error);
                     {
                         let mut publication = worker_failure_publication.lock().await;
+                        accounting = merge_accounting_metadata(accounting, publication.accounting);
                         if matches!(publication.core_error, GoalCoreErrorPublication::Absent) {
                             publication.core_error = GoalCoreErrorPublication::Parked(error);
                         }
@@ -638,8 +735,13 @@ impl GoalExecutionSupervisor {
                     if engine.exact_running_task(&scope).await.is_ok()
                         && let Err(error) = engine.fail(&scope, "executor_failed").await
                     {
-                        completion_text =
-                            format!("failed to terminalize Goal executor failure: {error:#}");
+                        accounting = merge_accounting_metadata(
+                            accounting,
+                            accounting_failure_metadata(&error),
+                        );
+                        completion_text = format!(
+                            "{completion_text}; failed to terminalize Goal executor failure: {error:#}"
+                        );
                         let mut publication = worker_failure_publication.lock().await;
                         if matches!(
                             publication.core_error,
@@ -648,7 +750,10 @@ impl GoalExecutionSupervisor {
                             publication.core_error = GoalCoreErrorPublication::Parked(error);
                         }
                     }
-                    Err(completion_text)
+                    Err(GoalWorkerFailure {
+                        message: completion_text,
+                        accounting,
+                    })
                 }
             };
             if result.is_err()
@@ -666,6 +771,7 @@ impl GoalExecutionSupervisor {
             }
             worker_checkpoint.close();
             let _ = completion_tx.send(Some(result));
+            drop(execution_liveness);
         });
         workers.insert(
             session_id,
@@ -698,6 +804,8 @@ impl GoalExecutionSupervisor {
     /// A retired supervisor returns [`GoalSupervisorRetired`] before admission
     /// has any effects. The adapter must select a current supervisor before
     /// retrying the command.
+    /// Resume through [`Self::admit_control`] when a paused predecessor may
+    /// still be owned; this immediate primitive returns Stale until it drains.
     /// Build settings from the current canonical config for this command.
     pub async fn submit(
         &self,
@@ -727,11 +835,55 @@ impl GoalExecutionSupervisor {
         let retained_ingress = ingress.clone();
         let mut launch_guard =
             GoalLaunchGuard::new(self.launches.clone(), admission, Some(custody));
-        let runtime_submission = self
-            .engine
-            .runtime
-            .submit_with_launch_guard(settings, ingress, driver, command, &mut launch_guard)
-            .await?;
+        let runtime_submission = if matches!(command, GoalCommand::Resume { .. }) {
+            // Authenticate and bind first, then refuse a direct Resume while
+            // the exact paused predecessor still belongs to this supervisor.
+            let submission = self
+                .engine
+                .runtime
+                .host
+                .submit(settings, ingress, driver, command)
+                .await?;
+            let (rejection, current) = self
+                .engine
+                .runtime
+                .controller
+                .preflight_normal(settings, &submission)
+                .await?;
+            let predecessor_owned = if let Some(task) = current
+                .as_ref()
+                .filter(|task| task.status == TaskStatus::Paused)
+            {
+                self.scope_for_session(&retained_ingress)
+                    .await?
+                    .is_some_and(|scope| {
+                        task.id == scope.task_id() && is_fenced_lifecycle_epoch(task, &scope)
+                    })
+            } else {
+                false
+            };
+            if let Some(response) = rejection.or(predecessor_owned.then_some(GoalResponse::Stale)) {
+                GoalRuntimeSubmission {
+                    response,
+                    execution: None,
+                    lease: submission.into_admission_lease(),
+                }
+            } else {
+                self.engine
+                    .runtime
+                    .apply_submission_with_launch_guard(
+                        settings,
+                        submission,
+                        Some(&mut launch_guard),
+                    )
+                    .await?
+            }
+        } else {
+            self.engine
+                .runtime
+                .submit_with_launch_guard(settings, ingress, driver, command, &mut launch_guard)
+                .await?
+        };
         let previous = match self.scope_for_session(&retained_ingress).await {
             Ok(previous) => previous,
             Err(error) => {
@@ -1065,7 +1217,8 @@ impl GoalExecutionSupervisor {
             }
         }
 
-        dispose_unowned_session_goal(self.engine.registry.as_ref(), session_id).await
+        delete_exact_terminal_session_goal(self.engine.registry.as_ref(), session_id, &task_id)
+            .await
     }
 
     /// Fence and drain every resident epoch for daemon restart.
@@ -1297,7 +1450,7 @@ impl GoalExecutionSupervisor {
             .borrow()
             .clone()
             .context("Goal execution worker stopped without reporting its completion")
-            .and_then(|outcome| outcome.map_err(anyhow::Error::msg));
+            .and_then(|outcome| outcome.map_err(|failure| anyhow::Error::msg(failure.message)));
         // Lifecycle finalization owns worker retirement and pending-operation
         // classification. Never let a generic drainer remove the handle first.
         self.drain_lifecycle_fence(scope).await?.deliver().await;
@@ -1526,11 +1679,15 @@ impl GoalExecutionSupervisor {
         // A failed pre-drain lookup must not let an admitted operation outlive
         // this fence. Preserve that error, but only after the worker settles.
         let _ = current?;
-        let (completion_missing, completion_failed) = {
+        let (completion_missing, completion_failed, accounting_failure) = {
             let completion = completion.borrow();
             (
                 completion.is_none(),
                 matches!(completion.as_ref(), Some(Err(_))),
+                completion
+                    .as_ref()
+                    .and_then(|result| result.as_ref().err())
+                    .and_then(|failure| failure.accounting),
             )
         };
 
@@ -1601,9 +1758,11 @@ impl GoalExecutionSupervisor {
         let mut classified_epoch = None;
         let pending_operation = goal.pending_call_id.is_some() || goal.pending_call_epoch.is_some();
         let incomplete_accounting = goal.accounting_state != GoalAccountingState::Complete;
+        let durable_accounting = (pending_operation || incomplete_accounting)
+            .then_some((goal.accounting_state, pending_operation));
+        let accounting = merge_accounting_metadata(durable_accounting, accounting_failure);
         if matches!(current.status, TaskStatus::Paused | TaskStatus::Running)
-            && (pending_operation
-                || incomplete_accounting
+            && (accounting.is_some()
                 || completion_missing
                 || (current.status == TaskStatus::Running && completion_failed))
         {
@@ -1616,9 +1775,8 @@ impl GoalExecutionSupervisor {
                     scope.session_id(),
                     failure_epoch,
                     TaskStatus::Failed,
-                    Some(if pending_operation || incomplete_accounting {
-                        accounting_failure_reason(goal.accounting_state, pending_operation)
-                            .to_owned()
+                    Some(if let Some((state, pending)) = accounting {
+                        accounting_failure_reason(state, pending).to_owned()
                     } else {
                         "executor_failed".to_owned()
                     }),
@@ -1930,10 +2088,20 @@ pub async fn dispose_unowned_session_goal(
         }
     }
 
+    delete_exact_terminal_session_goal(registry, session_id, &current.id).await
+}
+
+// The authorized task must survive the drain unchanged. Never fence whatever
+// task happens to own this session by the time the predecessor settles.
+async fn delete_exact_terminal_session_goal(
+    registry: &dyn GoalTaskRegistry,
+    session_id: &str,
+    task_id: &str,
+) -> Result<GoalTransitionResult> {
     let Some(reloaded) = registry.current_goal_for_session(session_id).await? else {
         return Ok(GoalTransitionResult::Missing);
     };
-    if reloaded.id != current.id || !reloaded.status.is_terminal() {
+    if reloaded.id != task_id || !reloaded.status.is_terminal() {
         return Ok(GoalTransitionResult::Stale);
     }
     let goal = registry
@@ -1964,14 +2132,16 @@ pub async fn dispose_unowned_session_goal(
 
 // Anyhow contexts and foreign standard-error wrappers expose types differently.
 fn accounting_failure_metadata(error: &anyhow::Error) -> Option<(GoalAccountingState, bool)> {
+    let fields = |failure: &GoalAccountingFailure| {
+        (failure.accounting_state(), failure.has_pending_operation())
+    };
     error
-        .downcast_ref::<GoalAccountingFailure>()
-        .or_else(|| {
-            error
-                .chain()
-                .find_map(|cause| cause.downcast_ref::<GoalAccountingFailure>())
-        })
-        .map(|failure| (failure.accounting_state(), failure.has_pending_operation()))
+        .chain()
+        .filter_map(|cause| cause.downcast_ref::<GoalAccountingFailure>())
+        .fold(
+            error.downcast_ref::<GoalAccountingFailure>().map(fields),
+            |acc, failure| merge_accounting_metadata(acc, Some(fields(failure))),
+        )
 }
 
 fn accounting_failure_reason(state: GoalAccountingState, pending: bool) -> &'static str {
@@ -1980,6 +2150,43 @@ fn accounting_failure_reason(state: GoalAccountingState, pending: bool) -> &'sta
     } else {
         "accounting_missing_or_invalid"
     }
+}
+
+fn is_accounting_failure(error: &anyhow::Error) -> bool {
+    accounting_failure_metadata(error).is_some()
+}
+
+fn merge_accounting_metadata(
+    first: Option<GoalAccountingMetadata>,
+    second: Option<GoalAccountingMetadata>,
+) -> Option<GoalAccountingMetadata> {
+    match (first, second) {
+        (Some((left, left_pending)), Some((right, right_pending))) => Some((
+            crate::accounting::combine_accounting_state(left, right),
+            left_pending || right_pending,
+        )),
+        (first, second) => first.or(second),
+    }
+}
+
+#[derive(Debug)]
+struct VisibleErrorContext(String);
+
+impl std::fmt::Display for VisibleErrorContext {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+fn with_visible_context(error: anyhow::Error, context: &str) -> anyhow::Error {
+    let detail = if error.downcast_ref::<VisibleErrorContext>().is_some()
+        || error.downcast_ref::<GoalAccountingFailure>().is_some()
+    {
+        error.to_string()
+    } else {
+        format!("{error:#}")
+    };
+    error.context(VisibleErrorContext(format!("{context}: {detail}")))
 }
 
 impl GoalExecutionEngine {
@@ -2016,6 +2223,9 @@ impl GoalExecutionEngine {
     /// acquisition or its config refusal, resume-response append, and history
     /// access—make no durable lifecycle change. The owning caller must settle
     /// the exact execution epoch when such an error follows a transition.
+    /// After the first parent operation, errors either record a guarded Failed
+    /// disposition or leave a competing transition intact. The original error
+    /// is retained; restart reconciliation owns an epoch the store cannot write.
     pub async fn run(
         &self,
         source: &GoalHostSettingsSource,
@@ -2070,6 +2280,10 @@ impl GoalExecutionEngine {
                 if let Some(publication) = &failure_publication {
                     let text = format!("acquire Goal session execution lease: {error:#}");
                     let mut publication = publication.lock().await;
+                    publication.accounting = merge_accounting_metadata(
+                        publication.accounting,
+                        accounting_failure_metadata(&error),
+                    );
                     if matches!(publication.core_error, GoalCoreErrorPublication::Absent) {
                         publication.core_error = GoalCoreErrorPublication::Parked(error);
                     }
@@ -2116,12 +2330,18 @@ impl GoalExecutionEngine {
             let mut publication = publication.lock().await;
             match error_report {
                 GoalRunErrorReport::Unreported => {}
-                GoalRunErrorReport::Surfaced => {
+                GoalRunErrorReport::Surfaced(accounting) => {
+                    publication.accounting =
+                        merge_accounting_metadata(publication.accounting, accounting);
                     if matches!(publication.core_error, GoalCoreErrorPublication::Absent) {
                         publication.core_error = GoalCoreErrorPublication::RunErrorRendered;
                     }
                 }
                 GoalRunErrorReport::Handed(error) => {
+                    publication.accounting = merge_accounting_metadata(
+                        publication.accounting,
+                        accounting_failure_metadata(&error),
+                    );
                     if matches!(publication.core_error, GoalCoreErrorPublication::Absent) {
                         publication.core_error = GoalCoreErrorPublication::Parked(error);
                     }
@@ -2189,6 +2409,7 @@ impl GoalExecutionEngine {
                     return Err(error);
                 };
                 let text = format!("{error:#}");
+                let accounting = accounting_failure_metadata(&error);
                 let mut publication = publication.lock().await;
                 if matches!(publication.core_error, GoalCoreErrorPublication::Absent) {
                     publication.core_error = GoalCoreErrorPublication::Parked(error);
@@ -2196,7 +2417,7 @@ impl GoalExecutionEngine {
                     // before worker fallback can encounter a competing pause.
                     publish_parked_core_error(scope, lease, &mut publication).await;
                 }
-                report_run_error(&mut error_report, GoalRunErrorReport::Surfaced);
+                report_run_error(&mut error_report, GoalRunErrorReport::Surfaced(accounting));
                 return Err(anyhow::Error::msg(text));
             }
         };
@@ -2230,11 +2451,13 @@ impl GoalExecutionEngine {
                     self.require_complete_accounting(scope, accountant.as_ref(), &mut error_report)
                         .await?;
                     if parent.candidate.trim().is_empty() {
-                        if let Err(error) = self.fail(scope, "candidate_empty").await {
+                        let verdict = anyhow::Error::msg("Goal parent returned an empty candidate");
+                        if let Err(transition) = self.fail(scope, "candidate_empty").await {
+                            let error = verdict.context(format!("{transition:#}"));
                             return Err(report_transition_error(&mut error_report, error));
                         }
-                        report_run_error(&mut error_report, GoalRunErrorReport::Surfaced);
-                        bail!("Goal parent returned an empty candidate");
+                        report_run_error(&mut error_report, GoalRunErrorReport::Surfaced(None));
+                        return Err(verdict);
                     }
 
                     if let Err(error) = lease
@@ -2274,22 +2497,25 @@ impl GoalExecutionEngine {
                         GoalSpendRefusalOutcome::Fenced => return Ok(GoalExecutionOutcome::Fenced),
                         GoalSpendRefusalOutcome::NotPaused(error) => error,
                     };
-                    let (reason, error) =
-                        if let Some((state, pending)) = accounting_failure_metadata(&error) {
-                            (accounting_failure_reason(state, pending), error)
-                        } else {
-                            (
-                                "parent_operation_failed",
-                                error.context("Goal parent operation failed"),
-                            )
-                        };
+                    let (reason, error) = self
+                        .classify_operation_failure(
+                            scope,
+                            accountant.as_ref(),
+                            error,
+                            "parent_operation_failed",
+                            "Goal parent operation failed",
+                        )
+                        .await;
                     if let Err(transition_error) = self.fail(scope, reason).await {
                         return Err(report_transition_error(
                             &mut error_report,
                             error.context(format!("{transition_error:#}")),
                         ));
                     }
-                    report_run_error(&mut error_report, GoalRunErrorReport::Surfaced);
+                    report_run_error(
+                        &mut error_report,
+                        GoalRunErrorReport::Surfaced(accounting_failure_metadata(&error)),
+                    );
                     return Err(error);
                 }
             };
@@ -2300,14 +2526,22 @@ impl GoalExecutionEngine {
             // A lifecycle transition can race with the parent call above.
             // Recheck the exact durable task and epoch before the verifier so
             // a drained parent result cannot start a second model operation.
-            if self.exact_running_task_or_fenced(scope).await?.is_none() {
+            if self
+                .running_after_operation_or_fenced(scope)
+                .await?
+                .is_none()
+            {
                 return Ok(GoalExecutionOutcome::Fenced);
             }
             let verifier_operation = match checkpoint.admit_operation().await {
                 Ok(operation) => operation,
                 Err(_) => return Ok(GoalExecutionOutcome::Fenced),
             };
-            if self.exact_running_task_or_fenced(scope).await?.is_none() {
+            if self
+                .running_after_operation_or_fenced(scope)
+                .await?
+                .is_none()
+            {
                 return Ok(GoalExecutionOutcome::Fenced);
             }
 
@@ -2337,8 +2571,8 @@ impl GoalExecutionEngine {
                             Some(DiagnosticReason::Fixed(
                                 "Verifier usage settlement was incomplete.",
                             )),
-                            "terminal_failure",
-                            "before_controller_action",
+                            "accounting_failure_reported",
+                            "after_accounting_check",
                         );
                         return Err(error);
                     }
@@ -2370,15 +2604,15 @@ impl GoalExecutionEngine {
                         GoalSpendRefusalOutcome::Fenced => return Ok(GoalExecutionOutcome::Fenced),
                         GoalSpendRefusalOutcome::NotPaused(error) => error,
                     };
-                    let (reason, error) =
-                        if let Some((state, pending)) = accounting_failure_metadata(&error) {
-                            (accounting_failure_reason(state, pending), error)
-                        } else {
-                            (
-                                "verifier_operation_failed",
-                                error.context("Goal verifier operation failed"),
-                            )
-                        };
+                    let (reason, error) = self
+                        .classify_operation_failure(
+                            scope,
+                            accountant.as_ref(),
+                            error,
+                            "verifier_operation_failed",
+                            "Goal verifier operation failed",
+                        )
+                        .await;
                     log_verifier_diagnostic(
                         self.diagnostic_text_guard.as_deref(),
                         scope,
@@ -2426,56 +2660,17 @@ impl GoalExecutionEngine {
                         "terminal_failure",
                         "after_controller_action",
                     );
-                    report_run_error(&mut error_report, GoalRunErrorReport::Surfaced);
+                    report_run_error(
+                        &mut error_report,
+                        GoalRunErrorReport::Surfaced(accounting_failure_metadata(&error)),
+                    );
                     return Err(error);
                 }
             };
-            drop(verifier_operation);
 
-            // Serialize validated verifier actions with controls submitted
-            // while the verifier operation was in flight. A pause/cancel
-            // fence must win before a completion transition or a successor
-            // operation can be admitted.
-            let _decision_operation = match checkpoint.admit_operation().await {
-                Ok(operation) => operation,
-                Err(_) => {
-                    log_verifier_diagnostic(
-                        self.diagnostic_text_guard.as_deref(),
-                        scope,
-                        &candidate_fingerprint,
-                        verifier.attribution.as_ref(),
-                        "not_validated",
-                        None,
-                        Some(DiagnosticReason::Fixed(
-                            "A control fence closed before the verifier result could be applied.",
-                        )),
-                        "fenced_before_decision",
-                        "before_controller_action",
-                    );
-                    return Ok(GoalExecutionOutcome::Fenced);
-                }
-            };
-
-            // A control fence may commit while an admitted verifier call is
-            // settling. Its result cannot override that transition or admit
-            // another parent/verifier call.
-            if self.exact_running_task_or_fenced(scope).await?.is_none() {
-                log_verifier_diagnostic(
-                    self.diagnostic_text_guard.as_deref(),
-                    scope,
-                    &candidate_fingerprint,
-                    verifier.attribution.as_ref(),
-                    "not_validated",
-                    None,
-                    Some(DiagnosticReason::Fixed(
-                        "The Goal epoch was fenced before the verifier result could be applied.",
-                    )),
-                    "fenced_before_decision",
-                    "before_controller_action",
-                );
-                return Ok(GoalExecutionOutcome::Fenced);
-            }
-
+            // A malformed result remains an operation error even if a control
+            // fenced this epoch while the verifier was in flight. Only a
+            // validated decision proceeds to the control checkpoint below.
             let decision = match parse_verifier_response(&verifier.response) {
                 Ok(decision) => {
                     let (decision_name, reason) = verifier_decision_log_fields(&decision);
@@ -2493,6 +2688,7 @@ impl GoalExecutionEngine {
                     decision
                 }
                 Err(error) => {
+                    let error = error.context("Goal verifier response is invalid");
                     log_verifier_diagnostic(
                         self.diagnostic_text_guard.as_deref(),
                         scope,
@@ -2522,7 +2718,10 @@ impl GoalExecutionEngine {
                             "terminal_transition_failed",
                             "after_controller_action",
                         );
-                        return Err(report_transition_error(&mut error_report, transition_error));
+                        return Err(report_transition_error(
+                            &mut error_report,
+                            error.context(format!("{transition_error:#}")),
+                        ));
                     }
                     log_verifier_diagnostic(
                         self.diagnostic_text_guard.as_deref(),
@@ -2537,10 +2736,74 @@ impl GoalExecutionEngine {
                         "terminal_failure",
                         "after_controller_action",
                     );
-                    report_run_error(&mut error_report, GoalRunErrorReport::Surfaced);
-                    return Err(error).context("Goal verifier response is invalid");
+                    report_run_error(&mut error_report, GoalRunErrorReport::Surfaced(None));
+                    return Err(error);
                 }
             };
+            drop(verifier_operation);
+
+            // Serialize validated verifier actions with controls submitted
+            // while the verifier operation was in flight. A pause/cancel
+            // fence must win before a completion transition or a successor
+            // operation can be admitted.
+            let _decision_operation = match checkpoint.admit_operation().await {
+                Ok(operation) => operation,
+                Err(_) => {
+                    log_verifier_diagnostic(
+                        self.diagnostic_text_guard.as_deref(),
+                        scope,
+                        &candidate_fingerprint,
+                        verifier.attribution.as_ref(),
+                        "valid",
+                        None,
+                        Some(DiagnosticReason::Fixed(
+                            "A control fence closed before the verifier result could be applied.",
+                        )),
+                        "fenced_before_decision",
+                        "before_controller_action",
+                    );
+                    return Ok(GoalExecutionOutcome::Fenced);
+                }
+            };
+
+            // A control fence may commit while an admitted verifier call is
+            // settling. Its result cannot override that transition or admit
+            // another parent/verifier call.
+            let running = match self.running_after_operation_or_fenced(scope).await {
+                Ok(running) => running,
+                Err(error) => {
+                    log_verifier_diagnostic(
+                        self.diagnostic_text_guard.as_deref(),
+                        scope,
+                        &candidate_fingerprint,
+                        verifier.attribution.as_ref(),
+                        "valid",
+                        None,
+                        Some(DiagnosticReason::Fixed(
+                            "The Goal lifecycle could not be read before applying the verifier result.",
+                        )),
+                        "lifecycle_read_failed",
+                        "after_controller_action",
+                    );
+                    return Err(error);
+                }
+            };
+            if running.is_none() {
+                log_verifier_diagnostic(
+                    self.diagnostic_text_guard.as_deref(),
+                    scope,
+                    &candidate_fingerprint,
+                    verifier.attribution.as_ref(),
+                    "valid",
+                    None,
+                    Some(DiagnosticReason::Fixed(
+                        "The Goal epoch was fenced before the verifier result could be applied.",
+                    )),
+                    "fenced_before_decision",
+                    "before_controller_action",
+                );
+                return Ok(GoalExecutionOutcome::Fenced);
+            }
 
             match decision {
                 VerifierDecision::Complete { reason } => {
@@ -2589,6 +2852,13 @@ impl GoalExecutionEngine {
                         "continuation_prepared",
                         "after_controller_action",
                     );
+                    if self
+                        .running_after_operation_or_fenced(scope)
+                        .await?
+                        .is_none()
+                    {
+                        return Ok(GoalExecutionOutcome::Fenced);
+                    }
                 }
                 VerifierDecision::Blocked { reason, blockers } => {
                     if let Err(error) = self.pause_verifier_blocked(scope, blockers).await {
@@ -2635,13 +2905,14 @@ impl GoalExecutionEngine {
         if error
             .downcast_ref::<crate::accounting::GoalOperationFenced>()
             .is_none()
+            || accounting_failure_metadata(error).is_some()
             || self.exact_running_task_or_fenced(scope).await?.is_some()
         {
             return Ok(None);
         }
         self.require_complete_accounting(scope, accountant, error_report)
             .await?;
-        report_run_error(error_report, GoalRunErrorReport::Surfaced);
+        report_run_error(error_report, GoalRunErrorReport::Surfaced(None));
         Ok(Some(GoalExecutionOutcome::Fenced))
     }
 
@@ -2713,7 +2984,7 @@ impl GoalExecutionEngine {
         }.await;
         match transition {
             Ok(true) => {
-                report_run_error(error_report, GoalRunErrorReport::Surfaced);
+                report_run_error(error_report, GoalRunErrorReport::Surfaced(None));
                 Ok(GoalSpendRefusalOutcome::Fenced)
             }
             Ok(false) => Ok(GoalSpendRefusalOutcome::NotPaused(error)),
@@ -2730,11 +3001,39 @@ impl GoalExecutionEngine {
         accountant: &dyn crate::accounting::GoalOperationAccounting,
         error_report: &mut Option<&mut GoalRunErrorReport>,
     ) -> Result<()> {
-        let goal = self
-            .registry
-            .get_goal_task(scope.task_id())
-            .await?
-            .context("Goal extension disappeared while settling accounting")?;
+        accountant.quiesce().await;
+        if let Some(failure) = accountant.unsettled_failure() {
+            let reason = accounting_failure_reason(
+                failure.accounting_state(),
+                failure.has_pending_operation(),
+            );
+            let error = self.fail_with(scope, reason, failure.into()).await;
+            return Err(report_transition_error(error_report, error));
+        }
+        let goal = match self.registry.get_goal_task(scope.task_id()).await {
+            Ok(Some(goal)) => goal,
+            Ok(None) => {
+                let error =
+                    anyhow::Error::msg("Goal extension disappeared while settling accounting");
+                let error = self
+                    .fail_with(scope, "accounting_missing_or_invalid", error)
+                    .await;
+                return Err(report_transition_error(error_report, error));
+            }
+            Err(error) => {
+                let error = self
+                    .fail_with(
+                        scope,
+                        "accounting_missing_or_invalid",
+                        with_visible_context(
+                            error,
+                            "failed to read Goal accounting after an operation",
+                        ),
+                    )
+                    .await;
+                return Err(report_transition_error(error_report, error));
+            }
+        };
         if goal.accounting_state != GoalAccountingState::Complete
             || goal.pending_call_id.is_some()
             || goal.pending_call_epoch.is_some()
@@ -2753,22 +3052,99 @@ impl GoalExecutionEngine {
                 .await;
             return Err(report_transition_error(error_report, error));
         }
-        if goal.effective_cost_limit_usd.is_some() && !accountant.pricing_complete().await? {
-            if let Err(error) = self.fail(scope, "pricing_unavailable").await {
-                return Err(report_transition_error(error_report, error));
-            }
-            report_run_error(error_report, GoalRunErrorReport::Surfaced);
-            bail!("Goal cost budget lacks complete pricing for actual provider usage");
+        if goal.effective_cost_limit_usd.is_some() {
+            let (reason, error) = match accountant.pricing_complete().await {
+                Ok(true) => return Ok(()),
+                Ok(false) => {
+                    let verdict = anyhow::Error::msg(
+                        "Goal cost budget lacks complete pricing for actual provider usage",
+                    );
+                    if let Err(transition) = self.fail(scope, "pricing_unavailable").await {
+                        let error = verdict.context(format!("{transition:#}"));
+                        return Err(report_transition_error(error_report, error));
+                    }
+                    report_run_error(error_report, GoalRunErrorReport::Surfaced(None));
+                    return Err(verdict);
+                }
+                Err(error) if is_accounting_failure(&error) => (
+                    "accounting_missing_or_invalid",
+                    error.context("failed to read Goal accounting after an operation"),
+                ),
+                Err(error) => (
+                    "pricing_unavailable",
+                    error.context("failed to check pricing for actual Goal provider usage"),
+                ),
+            };
+            let error = self.fail_with(scope, reason, error).await;
+            return Err(report_transition_error(error_report, error));
         }
         Ok(())
+    }
+
+    async fn classify_operation_failure(
+        &self,
+        scope: &GoalExecutionScope,
+        accountant: &dyn crate::accounting::GoalOperationAccounting,
+        error: anyhow::Error,
+        operation_reason: &'static str,
+        operation_context: &'static str,
+    ) -> (&'static str, anyhow::Error) {
+        accountant.quiesce().await;
+        if let Some((state, pending)) = accounting_failure_metadata(&error) {
+            return (accounting_failure_reason(state, pending), error);
+        }
+        if let Some(failure) = accountant.unsettled_failure() {
+            let reason = accounting_failure_reason(
+                failure.accounting_state(),
+                failure.has_pending_operation(),
+            );
+            return (
+                reason,
+                GoalAccountingFailure::preserving_primary_error(
+                    error.context(operation_context),
+                    failure.into(),
+                ),
+            );
+        }
+        match self.registry.get_goal_task(scope.task_id()).await {
+            Ok(Some(goal))
+                if goal.accounting_state != GoalAccountingState::Complete
+                    || goal.pending_call_id.is_some()
+                    || goal.pending_call_epoch.is_some() =>
+            {
+                let pending = goal.pending_call_id.is_some() || goal.pending_call_epoch.is_some();
+                let accounting = GoalAccountingFailure::incomplete(goal.accounting_state, pending);
+                (
+                    accounting_failure_reason(goal.accounting_state, pending),
+                    GoalAccountingFailure::preserving_primary_error(
+                        error.context(operation_context),
+                        accounting.into(),
+                    ),
+                )
+            }
+            Ok(_) => (operation_reason, error.context(operation_context)),
+            Err(check_error) => (
+                operation_reason,
+                error.context(format!(
+                    "{operation_context}; Goal accounting could not be checked: {check_error:#}"
+                )),
+            ),
+        }
     }
 
     async fn exact_running_task(&self, scope: &GoalExecutionScope) -> Result<TaskRecord> {
         let task = self
             .registry
             .current_goal_for_session(scope.session_id())
-            .await?
-            .context("Goal session no longer has a current task")?;
+            .await?;
+        Self::ensure_exact_running(scope, task)
+    }
+
+    fn ensure_exact_running(
+        scope: &GoalExecutionScope,
+        task: Option<TaskRecord>,
+    ) -> Result<TaskRecord> {
+        let task = task.context("Goal session no longer has a current task")?;
         ensure!(task.id == scope.task_id(), "Goal task identity is stale");
         ensure!(
             task.status == TaskStatus::Running,
@@ -2801,8 +3177,37 @@ impl GoalExecutionEngine {
         Ok(Some(task))
     }
 
+    async fn running_after_operation_or_fenced(
+        &self,
+        scope: &GoalExecutionScope,
+    ) -> Result<Option<TaskRecord>> {
+        let task = match self
+            .registry
+            .current_goal_for_session(scope.session_id())
+            .await
+        {
+            Ok(task) => task,
+            Err(error) => {
+                return Err(self
+                    .fail_with(
+                        scope,
+                        LIFECYCLE_PERSISTENCE_FAILED,
+                        with_visible_context(
+                            error,
+                            "failed to read Goal lifecycle after an operation",
+                        ),
+                    )
+                    .await);
+            }
+        };
+        Ok(task.filter(|task| {
+            task.id == scope.task_id()
+                && task.status == TaskStatus::Running
+                && task.execution_epoch == scope.execution_epoch()
+        }))
+    }
+
     async fn complete(&self, scope: &GoalExecutionScope) -> Result<()> {
-        self.exact_running_task(scope).await?;
         match self
             .registry
             .finish_session_goal(
@@ -2812,11 +3217,20 @@ impl GoalExecutionEngine {
                 TaskStatus::Completed,
                 None,
             )
-            .await?
+            .await
         {
-            GoalTransitionResult::Applied => {}
-            GoalTransitionResult::Stale | GoalTransitionResult::Missing => {
+            Ok(GoalTransitionResult::Applied) => {}
+            Ok(GoalTransitionResult::Stale | GoalTransitionResult::Missing) => {
                 bail!("Goal completion lost its execution fence")
+            }
+            Err(error) => {
+                return Err(self
+                    .fail_with(
+                        scope,
+                        LIFECYCLE_PERSISTENCE_FAILED,
+                        with_visible_context(error, "failed to record Goal completion"),
+                    )
+                    .await);
             }
         }
         Ok(())
@@ -2840,12 +3254,23 @@ impl GoalExecutionEngine {
                 scope.execution_epoch(),
                 pause,
             )
-            .await?
+            .await
         {
-            GoalTransitionResult::Applied => Ok(()),
-            GoalTransitionResult::Stale | GoalTransitionResult::Missing => {
-                bail!("Goal verifier pause lost its execution fence")
-            }
+            Ok(GoalTransitionResult::Applied) => Ok(()),
+            Ok(GoalTransitionResult::Stale | GoalTransitionResult::Missing) => Err(self
+                .fail_with(
+                    scope,
+                    LIFECYCLE_PERSISTENCE_FAILED,
+                    anyhow::Error::msg("Goal verifier pause lost its execution fence"),
+                )
+                .await),
+            Err(error) => Err(self
+                .fail_with(
+                    scope,
+                    LIFECYCLE_PERSISTENCE_FAILED,
+                    with_visible_context(error, "failed to record Goal verifier pause"),
+                )
+                .await),
         }
     }
 
@@ -3137,8 +3562,49 @@ fn parse_verifier_response(raw: &str) -> Result<VerifierDecision> {
 }
 
 #[cfg(test)]
+#[path = "goal_execution_quiescence_tests.rs"]
+mod quiescence_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retirement_requires_matching_completion_and_settled_publication() {
+        let failed = Err(GoalWorkerFailure {
+            message: "fixture failure".into(),
+            accounting: None,
+        });
+        let completed = Ok(GoalExecutionOutcome::Completed);
+        let cancelled = Ok(GoalExecutionOutcome::Fenced);
+        let mut publication = GoalFailurePublication::default();
+        for (status, completion, expected) in [
+            (TaskStatus::Failed, Some(&failed), false),
+            (TaskStatus::Failed, None, false),
+            (TaskStatus::Failed, Some(&completed), false),
+            (TaskStatus::Completed, Some(&completed), true),
+            (TaskStatus::Cancelled, Some(&cancelled), true),
+            (TaskStatus::Paused, Some(&cancelled), false),
+        ] {
+            assert_eq!(
+                terminal_worker_is_releasable(status, completion, &publication),
+                expected,
+            );
+        }
+        publication.notice_published = true;
+        assert!(terminal_worker_is_releasable(
+            TaskStatus::Failed,
+            Some(&failed),
+            &publication,
+        ));
+        publication.core_error =
+            GoalCoreErrorPublication::Parked(anyhow::Error::msg("fixture error"));
+        assert!(!terminal_worker_is_releasable(
+            TaskStatus::Failed,
+            Some(&failed),
+            &publication,
+        ));
+    }
 
     #[tokio::test]
     async fn ready_control_removes_pending_registration_before_commit() {
@@ -3345,6 +3811,15 @@ mod tests {
         struct UnusedAccountant;
         #[async_trait::async_trait]
         impl GoalOperationAccounting for UnusedAccountant {
+            fn admission_guard(&self) -> Result<crate::accounting::GoalOperationGuard> {
+                unreachable!()
+            }
+            async fn begin_dispatch(&self) -> Result<crate::task::GoalDispatchStart> {
+                unreachable!()
+            }
+            async fn release_unstarted(&self) -> Result<()> {
+                unreachable!()
+            }
             async fn admit(&self, _: GoalOperationRequest) -> Result<()> {
                 unreachable!()
             }
@@ -3411,6 +3886,15 @@ mod tests {
         struct UnusedAccountant;
         #[async_trait::async_trait]
         impl crate::accounting::GoalOperationAccounting for UnusedAccountant {
+            fn admission_guard(&self) -> Result<crate::accounting::GoalOperationGuard> {
+                unreachable!()
+            }
+            async fn begin_dispatch(&self) -> Result<crate::task::GoalDispatchStart> {
+                unreachable!()
+            }
+            async fn release_unstarted(&self) -> Result<()> {
+                unreachable!()
+            }
             async fn admit(&self, _: crate::accounting::GoalOperationRequest) -> Result<()> {
                 unreachable!()
             }
@@ -3478,6 +3962,27 @@ mod tests {
                 Some("accounting_outcome_unknown")
             );
         }
+    }
+
+    #[test]
+    fn accounting_failure_is_classified_through_standard_error_source() {
+        #[derive(Debug)]
+        struct Wrapper(GoalAccountingFailure);
+        impl std::fmt::Display for Wrapper {
+            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("outer failure")
+            }
+        }
+        impl std::error::Error for Wrapper {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+        let error = anyhow::Error::new(Wrapper(GoalAccountingFailure::incomplete(
+            GoalAccountingState::OutcomeUnknown,
+            false,
+        )));
+        assert!(is_accounting_failure(&error));
     }
 
     #[test]

@@ -91,6 +91,12 @@ struct ApiChatResponse {
     usage: Option<serde_json::Value>,
 }
 
+impl crate::dispatch::accounting::ObserveRejectedStringWire for ApiChatResponse {
+    fn observe_rejected_usage(wire: &serde_json::Value) {
+        crate::dispatch::accounting::observe_raw_string_usage(wire.get("usage"), true);
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct Choice {
     message: ResponseMessage,
@@ -685,15 +691,16 @@ impl ModelProvider for OpenRouterModelProvider {
             .await?;
 
         if !response.status().is_success() {
-            return Err(super::api_error("OpenRouter", response).await);
+            return Err(
+                super::string_wire_api_error::<ApiChatResponse>("OpenRouter", response).await,
+            );
         }
 
         let resp_body = Self::read_response_body("OpenRouter", response).await?;
-        let chat_response = Self::parse_response_body::<ApiChatResponse>(
-            "OpenRouter",
-            &resp_body,
-            "chat-completions",
-        )?;
+        let crate::dispatch::accounting::StringWireResponse(chat_response) =
+            Self::parse_response_body::<
+                crate::dispatch::accounting::StringWireResponse<ApiChatResponse>,
+            >("OpenRouter", &resp_body, "chat-completions")?;
         crate::dispatch::accounting::observe_raw_string_usage(chat_response.usage.as_ref(), true);
 
         chat_response
@@ -1452,6 +1459,32 @@ mod tests {
             check_capture(receive(&mut capture_rx).await, Some(0.25), Some(123));
         }
 
+        enqueue(
+            json!({"choices":null,"usage":{"prompt_tokens":8,"completion_tokens":3}}),
+            StatusCode::OK,
+            false,
+        );
+        let scope = AccountedChatScope::new_with_string_usage();
+        assert!(
+            scope
+                .scope(dispatch.chat_with_system(
+                    Some("system\nbytes"),
+                    "user\nbytes",
+                    "fixture/model",
+                    Some(0.25),
+                ))
+                .await
+                .is_err()
+        );
+        let report = scope.take();
+        assert!(report.accepted_route().is_none());
+        assert!(matches!(
+            report.attempts()[0].outcome(),
+            AttemptUsageOutcome::OutcomeUnknown { observed: Some(usage) }
+                if usage.input_tokens == Some(8) && usage.output_tokens == Some(3)
+        ));
+        check_capture(receive(&mut capture_rx).await, Some(0.25), Some(123));
+
         // None omission and extra-body precedence are separate original request policies.
         let no_options = OpenRouterModelProvider::builder("none")
             .credential(Some("synthetic-key"))
@@ -1505,21 +1538,30 @@ mod tests {
         check_capture(capture, Some(0.75), Some(77));
 
         let mut opt_in_http_error = None;
-        for (body, status, lower_bound) in [
+        for (body, status, empty_choices, expected_usage) in [
             (
                 json!({"choices":[],"usage":{"prompt_tokens":8,"completion_tokens":3,"prompt_tokens_details":{"cached_tokens":2}}}),
                 StatusCode::OK,
                 true,
+                Some((Some(8), Some(3), Some(2))),
             ),
             (
                 json!({"error":{"message":"fixture rejection"}}),
                 StatusCode::BAD_REQUEST,
                 false,
+                None,
+            ),
+            (
+                json!({"error":{"message":"fixture rejection"},"usage":{"prompt_tokens":8,"completion_tokens":3,"prompt_tokens_details":{"cached_tokens":2}}}),
+                StatusCode::TOO_MANY_REQUESTS,
+                false,
+                Some((Some(8), Some(3), Some(2))),
             ),
             (
                 json!({"choices":"invalid","usage":{"prompt_tokens":8,"completion_tokens":3}}),
                 StatusCode::OK,
                 false,
+                Some((Some(8), Some(3), None)),
             ),
         ] {
             enqueue(body, status, false);
@@ -1533,7 +1575,7 @@ mod tests {
                 ))
                 .await
                 .unwrap_err();
-            if lower_bound {
+            if empty_choices {
                 assert!(error.to_string().contains("No response from OpenRouter"));
             } else {
                 assert!(error.to_string().contains("OpenRouter"));
@@ -1545,13 +1587,25 @@ mod tests {
             assert_eq!(report.attempts().len(), 1);
             assert!(report.accepted_route().is_none());
             match report.attempts()[0].outcome() {
-                AttemptUsageOutcome::OutcomeUnknown { observed: Some(u) } if lower_bound => {
+                AttemptUsageOutcome::Complete(u) if status == StatusCode::TOO_MANY_REQUESTS => {
                     assert_eq!(
-                        (u.input_tokens, u.output_tokens, u.cached_input_tokens),
-                        (Some(8), Some(3), Some(2))
+                        Some((u.input_tokens, u.output_tokens, u.cached_input_tokens)),
+                        expected_usage
+                    );
+                    assert_eq!(report.rejected_attempts().len(), 1);
+                }
+                AttemptUsageOutcome::Missing if status == StatusCode::BAD_REQUEST => {
+                    assert_eq!(expected_usage, None);
+                }
+                AttemptUsageOutcome::OutcomeUnknown { observed: Some(u) } => {
+                    assert_eq!(
+                        Some((u.input_tokens, u.output_tokens, u.cached_input_tokens)),
+                        expected_usage
                     )
                 }
-                AttemptUsageOutcome::OutcomeUnknown { observed: None } if !lower_bound => (),
+                AttemptUsageOutcome::OutcomeUnknown { observed: None } => {
+                    assert_eq!(expected_usage, None)
+                }
                 other => panic!("unexpected error outcome: {other:?}"),
             }
             check_capture(receive(&mut capture_rx).await, Some(0.25), Some(123));

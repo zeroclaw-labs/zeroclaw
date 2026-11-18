@@ -54,6 +54,7 @@ pub enum GoalResponse {
     Cancelled(GoalStatusProjection),
     AlreadyCancelled(GoalStatusProjection),
     NoCurrentGoal,
+    SessionUnavailable,
     AlreadyActive,
     BudgetRequired,
     Terminal(GoalStatusProjection),

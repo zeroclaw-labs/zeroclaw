@@ -44,6 +44,12 @@ struct ChatResponse {
     usage: Option<serde_json::Value>,
 }
 
+impl crate::dispatch::accounting::ObserveRejectedStringWire for ChatResponse {
+    fn observe_rejected_usage(wire: &serde_json::Value) {
+        crate::dispatch::accounting::observe_raw_string_usage(wire.get("usage"), false);
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct Choice {
     message: ResponseMessage,
@@ -585,10 +591,14 @@ impl ModelProvider for AzureOpenAiModelProvider {
             .await?;
 
         if !response.status().is_success() {
-            return Err(super::api_error("Azure OpenAI", response).await);
+            return Err(
+                super::string_wire_api_error::<ChatResponse>("Azure OpenAI", response).await,
+            );
         }
 
-        let chat_response: ChatResponse = response.json().await?;
+        let crate::dispatch::accounting::StringWireResponse(chat_response) = response
+            .json::<crate::dispatch::accounting::StringWireResponse<ChatResponse>>()
+            .await?;
         crate::dispatch::accounting::observe_raw_string_usage(chat_response.usage.as_ref(), false);
 
         chat_response
@@ -917,8 +927,13 @@ mod tests {
         let app = Router::new().route("/chat/completions", post(move |Json(body): Json<serde_json::Value>| {
             let capture = Arc::clone(&capture);
             async move {
+                let choices = if body["messages"][1]["content"] == "malformed" {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::json!([{"message":{"content":"ok"}}])
+                };
                 *capture.lock().unwrap() = Some(body);
-                Json(serde_json::json!({"choices":[{"message":{"content":"ok"}}],"usage":{"prompt_tokens":8,"completion_tokens":3}}))
+                Json(serde_json::json!({"choices":choices,"usage":{"prompt_tokens":8,"completion_tokens":3}}))
             }
         }));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -940,7 +955,6 @@ mod tests {
             .await
             .unwrap();
         let report = scope.take();
-        server.abort();
         assert_eq!(text, "ok");
         assert!(
             matches!(report.attempts()[0].outcome(), crate::dispatch::AttemptUsageOutcome::Complete(usage)
@@ -951,6 +965,22 @@ mod tests {
         assert_eq!(body["messages"][1]["content"], "hello");
         assert_eq!(body["reasoning_effort"], "high");
         assert!(body.get("temperature").is_none());
+
+        let scope = crate::dispatch::AccountedChatScope::new_with_string_usage();
+        assert!(
+            scope
+                .scope(dispatch.chat_with_system(Some("system"), "malformed", "gpt-5", None))
+                .await
+                .is_err()
+        );
+        let report = scope.take();
+        assert!(report.accepted_route().is_none());
+        assert!(matches!(
+            report.attempts()[0].outcome(),
+            crate::dispatch::AttemptUsageOutcome::OutcomeUnknown { observed: Some(usage) }
+                if usage.input_tokens == Some(8) && usage.output_tokens == Some(3)
+        ));
+        server.abort();
     }
 
     #[tokio::test]

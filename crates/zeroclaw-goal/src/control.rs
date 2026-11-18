@@ -29,7 +29,7 @@ use zeroclaw_commands::goal::{
     GoalBudgetLimits, GoalBudgetSelection, GoalCommand, is_valid_finite_goal_cost_limit,
     is_valid_finite_goal_token_limit, validate_goal_objective,
 };
-use zeroclaw_config::goal::{GoalBudgetLimits as ConfigGoalBudgetLimits, GoalDefaultBudget};
+use zeroclaw_config::goal::GoalDefaultBudget;
 
 mod deferred;
 mod goal_execution;
@@ -168,8 +168,13 @@ impl GoalSessionKey {
 /// hook-mutable generic channel field and `tui_id` is never durable identity.
 #[derive(Clone, PartialEq, Eq)]
 pub enum GoalIngressPrincipal {
-    Matrix { raw_mxid: String },
-    ZeroCode { tui_id: String },
+    /// The authenticated Matrix user ID, stored verbatim without a surface prefix.
+    Matrix {
+        raw_mxid: String,
+    },
+    ZeroCode {
+        tui_id: String,
+    },
 }
 
 impl fmt::Debug for GoalIngressPrincipal {
@@ -308,6 +313,12 @@ impl GoalSessionBinding {
 #[async_trait]
 pub trait GoalSessionDriver: Send + Sync {
     fn session_key(&self) -> &GoalSessionKey;
+
+    /// Transfer a surface's execution liveness token to the actual worker.
+    /// A retained driver is not proof that the worker is still running.
+    fn take_execution_liveness(&self) -> Option<Box<dyn Send>> {
+        None
+    }
 
     /// Revalidate the exact live session and acquire its validity lease.
     ///
@@ -717,6 +728,11 @@ pub enum GoalExecutionNotice {
 /// Surface-owned foreground execution bridge. It retains the live-session
 /// guard and one foreground slot for its lifetime, but has no lifecycle or
 /// ledger authority; the later executor owns both around these calls.
+///
+/// Parent and verifier calls run inside `GOAL_OPERATION_ACCOUNTING`. Tokio
+/// task-local values do not automatically follow spawned tasks: an implementor
+/// that spawns model work must carry and re-enter that accounting scope, and
+/// must not return before the work and its settlement finish.
 #[async_trait]
 pub trait GoalSessionExecutionLease: Send {
     /// Exact live session retained by this foreground lease.
@@ -1410,10 +1426,7 @@ impl<'a> GoalHostSettings<'a> {
         {
             GoalDefaultBudget::Configured(limits) => {
                 validate_default_limits(limits)?;
-                Ok(Some(GoalBudgetLimits {
-                    token_limit: limits.token_limit,
-                    cost_limit_usd: limits.cost_limit_usd,
-                }))
+                Ok(Some(limits))
             }
             GoalDefaultBudget::Unconfigured => Ok(None),
         }
@@ -1471,7 +1484,7 @@ impl fmt::Debug for GoalHostSettingsSource {
     }
 }
 
-fn validate_default_limits(limits: ConfigGoalBudgetLimits) -> Result<()> {
+fn validate_default_limits(limits: GoalBudgetLimits) -> Result<()> {
     if limits
         .token_limit
         .is_some_and(|limit| !is_valid_finite_goal_token_limit(limit))
@@ -1508,6 +1521,8 @@ pub enum GoalResponse {
     Cancelled(GoalStatusProjection),
     AlreadyCancelled(GoalStatusProjection),
     NoCurrentGoal,
+    /// The session cannot be used for Goal control. No owner or Goal state is disclosed.
+    SessionUnavailable,
     AlreadyActive,
     /// A start without budget flags found no configured default budget; no Goal was created.
     BudgetRequired,
@@ -1572,6 +1587,20 @@ pub struct GoalController {
     registry: Arc<dyn GoalTaskRegistry>,
 }
 
+enum CurrentGoalFailure {
+    Missing,
+    Unavailable,
+}
+
+impl CurrentGoalFailure {
+    fn into_response(self) -> GoalResponse {
+        match self {
+            Self::Missing => GoalResponse::NoCurrentGoal,
+            Self::Unavailable => GoalResponse::SessionUnavailable,
+        }
+    }
+}
+
 impl GoalController {
     pub fn new(registry: Arc<dyn GoalTaskRegistry>) -> Self {
         Self { registry }
@@ -1599,7 +1628,7 @@ impl GoalController {
             let current = self.registry.current_goal_for_session(&session_id).await?;
             let response = current.as_ref().and_then(|task| {
                 if !ingress_owns_task(ingress, task) {
-                    Some(GoalResponse::NoCurrentGoal)
+                    Some(GoalResponse::SessionUnavailable)
                 } else if !task.status.is_terminal() {
                     Some(GoalResponse::AlreadyActive)
                 } else {
@@ -1608,8 +1637,9 @@ impl GoalController {
             });
             return Ok((response, current));
         }
-        let Some(task) = self.current(ingress, &session_id).await? else {
-            return Ok((Some(GoalResponse::NoCurrentGoal), None));
+        let task = match self.current(ingress, &session_id).await? {
+            Ok(task) => task,
+            Err(failure) => return Ok((Some(failure.into_response()), None)),
         };
         let rejection = if task.status.is_terminal() {
             Some(
@@ -1807,7 +1837,7 @@ impl GoalController {
             // A Matrix principal that does not own this persisted Goal must
             // neither learn its state nor receive a retry-shaped response for
             // an authorization conflict.
-            return Ok(GoalResponse::NoCurrentGoal);
+            return Ok(GoalResponse::SessionUnavailable);
         }
         if !task.status.is_terminal() {
             return Ok(GoalResponse::AlreadyActive);
@@ -1818,8 +1848,9 @@ impl GoalController {
 
     async fn status(&self, ingress: &GoalIngressContext, budget: bool) -> Result<GoalResponse> {
         let session_id = ingress.session_key().durable_id();
-        let Some(task) = self.current(ingress, &session_id).await? else {
-            return Ok(GoalResponse::NoCurrentGoal);
+        let task = match self.current(ingress, &session_id).await? {
+            Ok(task) => task,
+            Err(failure) => return Ok(failure.into_response()),
         };
         let Some(projection) = self.project_current(ingress, &session_id, &task).await? else {
             return Ok(GoalResponse::Stale);
@@ -1839,8 +1870,9 @@ impl GoalController {
         selection: GoalBudgetSelection,
     ) -> Result<GoalResponse> {
         let session_id = ingress.session_key().durable_id();
-        let Some(task) = self.current(ingress, &session_id).await? else {
-            return Ok(GoalResponse::NoCurrentGoal);
+        let task = match self.current(ingress, &session_id).await? {
+            Ok(task) => task,
+            Err(failure) => return Ok(failure.into_response()),
         };
         if task.status.is_terminal() {
             return self
@@ -1879,8 +1911,9 @@ impl GoalController {
 
     async fn pause(&self, ingress: &GoalIngressContext) -> Result<GoalResponse> {
         let session_id = ingress.session_key().durable_id();
-        let Some(task) = self.current(ingress, &session_id).await? else {
-            return Ok(GoalResponse::NoCurrentGoal);
+        let task = match self.current(ingress, &session_id).await? {
+            Ok(task) => task,
+            Err(failure) => return Ok(failure.into_response()),
         };
         if task.status == TaskStatus::Paused {
             return self
@@ -1932,8 +1965,9 @@ impl GoalController {
     ) -> Result<GoalResponse> {
         settings.require_execution_admissible()?;
         let session_id = ingress.session_key().durable_id();
-        let Some(task) = self.current(ingress, &session_id).await? else {
-            return Ok(GoalResponse::NoCurrentGoal);
+        let task = match self.current(ingress, &session_id).await? {
+            Ok(task) => task,
+            Err(failure) => return Ok(failure.into_response()),
         };
         if task.status.is_terminal() {
             return self
@@ -1990,8 +2024,10 @@ impl GoalController {
         ingress: &GoalIngressContext,
         session_id: &str,
     ) -> Result<GoalResponse> {
-        let Some(task) = self.current(ingress, session_id).await? else {
-            return Ok(GoalResponse::Stale);
+        let task = match self.current(ingress, session_id).await? {
+            Ok(task) => task,
+            Err(CurrentGoalFailure::Unavailable) => return Ok(GoalResponse::SessionUnavailable),
+            Err(CurrentGoalFailure::Missing) => return Ok(GoalResponse::Stale),
         };
         if task.status.is_terminal() {
             return self
@@ -2004,8 +2040,9 @@ impl GoalController {
 
     async fn cancel(&self, ingress: &GoalIngressContext) -> Result<GoalResponse> {
         let session_id = ingress.session_key().durable_id();
-        let Some(task) = self.current(ingress, &session_id).await? else {
-            return Ok(GoalResponse::NoCurrentGoal);
+        let task = match self.current(ingress, &session_id).await? {
+            Ok(task) => task,
+            Err(failure) => return Ok(failure.into_response()),
         };
         if task.status == TaskStatus::Cancelled {
             return self
@@ -2050,17 +2087,17 @@ impl GoalController {
         &self,
         ingress: &GoalIngressContext,
         session_id: &str,
-    ) -> Result<Option<TaskRecord>> {
+    ) -> Result<std::result::Result<TaskRecord, CurrentGoalFailure>> {
         let Some(task) = self.registry.current_goal_for_session(session_id).await? else {
-            return Ok(None);
+            return Ok(Err(CurrentGoalFailure::Missing));
         };
         // Matrix history keys are filesystem-safe and therefore lossy. The
         // exact authenticated MXID is the durable authority for an existing
         // Matrix Goal, while a ZeroCode tui_id remains transient continuity.
         if !ingress_owns_task(ingress, &task) {
-            return Ok(None);
+            return Ok(Err(CurrentGoalFailure::Unavailable));
         }
-        Ok(Some(task))
+        Ok(Ok(task))
     }
 
     async fn projection_for(
@@ -2069,7 +2106,7 @@ impl GoalController {
         session_id: &str,
         task_id: &str,
     ) -> Result<Option<GoalStatusProjection>> {
-        let Some(task) = self.current(ingress, session_id).await? else {
+        let Ok(task) = self.current(ingress, session_id).await? else {
             return Ok(None);
         };
         if task.id != task_id {
@@ -2090,10 +2127,7 @@ impl GoalController {
                 // the projection with a fresh canonical task snapshot so its
                 // status and epoch cannot come from different moments.
                 let current = self.current(ingress, session_id).await?;
-                if current
-                    .as_ref()
-                    .is_none_or(|current| !same_task_snapshot(current, task))
-                {
+                if !matches!(current, Ok(ref current) if same_task_snapshot(current, task)) {
                     return Ok(None);
                 }
                 Ok(Some(GoalStatusProjection::from_parts(task, &goal)))
@@ -2104,10 +2138,7 @@ impl GoalController {
                 // genuine missing-extension error only while the same task
                 // snapshot remains current.
                 let current = self.current(ingress, session_id).await?;
-                if current
-                    .as_ref()
-                    .is_none_or(|current| !same_task_snapshot(current, task))
-                {
+                if !matches!(current, Ok(ref current) if same_task_snapshot(current, task)) {
                     Ok(None)
                 } else {
                     bail!("Goal task extension is missing")
