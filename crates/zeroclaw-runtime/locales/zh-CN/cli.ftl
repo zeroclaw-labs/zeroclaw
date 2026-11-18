@@ -540,6 +540,7 @@ cli-cron-added-oneshot = ✅ 已添加一次性 cron 任务 {$id}
 cli-cron-added-interval-agent = ✅ 已添加间隔 agent cron 任务 {$id}
 cli-cron-added-interval = ✅ 已添加间隔 cron 任务 {$id}
 cli-cron-updated = ✅ 已更新 cron 任务 {$id}
+cli-cron-declarative-field-owned = 要更新此声明式任务，请在 config.toml 中编辑 { $key }，然后重启守护进程。
 cli-cron-update-no-field = 必须至少提供 --expression、--tz、--command、--name、--allowed-tool、--uses-memory 或投递选项（--channel、--to、--thread、--best-effort、--no-best-effort）中的一个
 cli-cron-removed = ✅ 已移除 cron 任务 {$id}
 cli-cron-paused = ⏸️  已暂停 cron 任务 {$id}

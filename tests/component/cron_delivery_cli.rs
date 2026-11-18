@@ -584,3 +584,28 @@ fn cron_delivery_accepts_negative_telegram_chat_id() {
         "the message must not advertise an escape hatch that does not work:\n{equals_stderr}"
     );
 }
+
+#[test]
+fn cron_update_rejects_a_declarative_command_before_reporting_success() {
+    let dir = tempfile::tempdir().expect("temp config dir");
+    let config_dir = dir.path();
+    std::fs::write(config_dir.join("config.toml"), DECLARATIVE_CONFIG_TOML).expect("write config");
+    seed_declarative_job(config_dir);
+    let before = stored_job(config_dir, "decl_job").command;
+    let output = run(
+        config_dir,
+        &[
+            "cron",
+            "update",
+            "decl_job",
+            "--agent",
+            "default",
+            "--command",
+            "echo edited",
+        ],
+    );
+    assert!(!output.status.success(), "{}", stdout_of(&output));
+    let error = stderr_of(&output);
+    assert!(error.contains("[cron.decl_job].command"), "{error}");
+    assert_eq!(stored_job(config_dir, "decl_job").command, before);
+}

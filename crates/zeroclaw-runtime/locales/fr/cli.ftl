@@ -544,6 +544,7 @@ cli-cron-added-oneshot = ✅ Tâche cron à exécution unique {$id} ajoutée
 cli-cron-added-interval-agent = ✅ Tâche cron d'agent par intervalle {$id} ajoutée
 cli-cron-added-interval = ✅ Tâche cron par intervalle {$id} ajoutée
 cli-cron-updated = ✅ Tâche cron {$id} mise à jour
+cli-cron-declarative-field-owned = Modifiez { $key } dans config.toml et redémarrez le démon pour mettre à jour cette tâche déclarative.
 cli-cron-update-no-field = Au moins un des paramètres --expression, --tz, --command, --name, --allowed-tool, --uses-memory ou une option de livraison (--channel, --to, --thread, --best-effort, --no-best-effort) doit être fourni
 cli-cron-removed = ✅ Tâche cron {$id} supprimée
 cli-cron-paused = ⏸️  Tâche cron {$id} en pause
