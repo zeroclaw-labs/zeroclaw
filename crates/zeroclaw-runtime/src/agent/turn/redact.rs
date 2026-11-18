@@ -14,7 +14,7 @@ use std::sync::LazyLock;
 /// redacted. Values under 8 characters are left alone so that short ordinary
 /// values (`token: none`) stay readable.
 pub(crate) static SENSITIVE_KV_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?i)(authorization|token|api[_-]?key|password|secret|user[_-]?key|bearer|credential|set[_-]?cookie|cookie)["']?\s*[:=]\s*(?P<scheme>(?:bearer|basic)\s+)?(?:"([^"]{8,})"|'([^']{8,})'|([a-zA-Z0-9_\-\./+=]{8,}))"#)
+    Regex::new(r#"(?i)(authorization|token|api[_-]?key|password|secret|user[_-]?key|bearer|credential|set[_-]?cookie|cookie)["']?\s*[:=]\s*(?P<scheme>(?:bearer|basic)\s+)?(?:"([^"]{8,})"|'([^']{8,})'|([a-zA-Z0-9_\-\./+=~]{8,}))"#)
         .expect("static sensitive key-value regex must compile")
 });
 
@@ -275,6 +275,18 @@ mod tests {
         assert_eq!(
             scrub_credentials(basic),
             "Authorization: Basic dXNl*[REDACTED]"
+        );
+    }
+
+    #[test]
+    fn scrub_credentials_redacts_tokens_containing_tilde() {
+        assert_eq!(
+            scrub_credentials("Authorization: Bearer ab~cdefghijklmnop"),
+            "Authorization: Bearer ab~c*[REDACTED]"
+        );
+        assert_eq!(
+            scrub_credentials("Authorization: Bearer abcdefgh~ijklmnop"),
+            "Authorization: Bearer abcd*[REDACTED]"
         );
     }
 
