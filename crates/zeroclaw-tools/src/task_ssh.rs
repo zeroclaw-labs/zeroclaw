@@ -19,6 +19,16 @@ pub fn current() -> Option<SshTask> {
     SSH_TASK.try_with(Clone::clone).ok()
 }
 
+/// Restore an existing owner only for foreground work awaited by its parent.
+/// This does not create a helper, transfer its lease or resolve credentials.
+/// Detached/background jobs must establish their own task lifetime instead.
+pub async fn scope_inherited<T>(task: Option<SshTask>, future: impl Future<Output = T>) -> T {
+    match task {
+        Some(task) => SSH_TASK.scope(task, future).await,
+        None => future.await,
+    }
+}
+
 struct Lease {
     input: Option<ChildStdin>,
     child: Child,
@@ -149,6 +159,38 @@ mod tests {
         std::fs::write(&file, format!("#!/bin/sh\nprintf '{{\"ready\":true,\"state_dir\":\"/tmp\"}}\\n'\ncat >/dev/null\nprintf closed > '{}'\n", marker.display())).unwrap();
         std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o700)).unwrap();
         file
+    }
+
+    #[tokio::test]
+    async fn foreground_spawn_reuses_parent_owner_and_does_not_close_its_lease() {
+        let directory = tempfile::tempdir().unwrap();
+        let command = helper(directory.path());
+        scope_with_helper_and_agent(
+            Some(command.into_os_string()),
+            Some("/synthetic/session-agent.sock".into()),
+            Box::pin(async {
+                let parent = current().unwrap();
+                let mut workers = Vec::new();
+                for _ in 0..2 {
+                    let inherited = Some(parent.clone());
+                    workers.push(zeroclaw_spawn::spawn!(async move {
+                        assert!(current().is_none(), "Tokio does not inherit task locals");
+                        scope_inherited(inherited, async { current().unwrap() }).await
+                    }));
+                }
+                for worker in workers {
+                    let child = worker.await.unwrap();
+                    assert_eq!(child.id, parent.id);
+                    assert_eq!(child.state_dir, parent.state_dir);
+                }
+                assert!(!directory.path().join("closed").exists());
+                Ok(())
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(directory.path().join("closed").exists());
+        assert!(current().is_none());
     }
 
     #[tokio::test]
