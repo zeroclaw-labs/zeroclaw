@@ -65,14 +65,6 @@ deny = [
 # dependency bumps eliminate the older duplicates. Version-scoping
 # ensures that any future unlisted duplicate version fails CI.
 
-
-# Patched SMTP libraries require base64 0.23.1 while current HTTP/IMAP
-# consumers still require 0.22.1. Exact duplicate only; no advisory waiver.
-# Remove once dependency updates eliminate 0.22.1; tracked in #12551.
-[[bans.skip]]
-name = "base64"
-version = "=0.22.1"
-
 [[bans.skip]]
 name = "async-channel"
 version = "=1.9.0"
