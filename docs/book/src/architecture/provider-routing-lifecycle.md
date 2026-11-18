@@ -50,6 +50,13 @@ For a production alias, the factory flattens the configured graph depth-first. T
 
 For each materialized entry, `ReliableModelProvider` attempts the request up to `provider_retries + 1` times. A retryable error normally stays on the entry and applies bounded backoff. A retryable rate limit places that provider profile on an in-memory cooldown and advances when another entry exists. Most non-retryable errors advance immediately; context-window errors have method-specific handling and can return early for runtime recovery. A successful response ends the walk; if every entry fails, the wrapper returns an aggregated error with the attempt failures.
 
+For nonstreaming HTTP chat calls, a valid `Retry-After` on a 429 or 503
+takes precedence over a delay in the response text. ZeroClaw accepts
+seconds and HTTP dates. The per-attempt wait remains capped at 30 seconds,
+and the rate-limit cooldown for a provider profile at 60 seconds. An invalid
+or missing header leaves the existing text-based delay and backoff in effect.
+Streaming error delivery follows its existing recovery path.
+
 Materialization order and effective execution order can differ after a rate limit. A profile's primary and `fallback_models` entries share one cooldown key, so a `429` on the primary can cause the remaining same-profile models to be skipped while the cooldown is active.
 
 The global `reliability.api_keys` pool is not a working failover mechanism today. The wrapper selects and logs an alternate key after a retryable rate limit, but the `ModelProvider` trait cannot apply that key to the constructed provider, so the retry still uses the original credential. [Issue #9190](https://github.com/zeroclaw-labs/zeroclaw/issues/9190) tracks the repair. Use distinct fallback profiles or an external routing service when credential-level failover is required.

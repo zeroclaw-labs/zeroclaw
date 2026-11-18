@@ -866,6 +866,9 @@ pub fn is_context_window_exceeded(err: &anyhow::Error) -> bool {
 
 /// Check if an error is a rate-limit (429) error.
 fn is_rate_limited(err: &anyhow::Error) -> bool {
+    if let Some((status, _)) = ProviderHttpError::retry_hint(err) {
+        return status == 429;
+    }
     if let Some(reqwest_err) = err.downcast_ref::<reqwest::Error>()
         && let Some(status) = reqwest_err.status()
     {
@@ -963,9 +966,12 @@ fn is_non_retryable_rate_limit(err: &anyhow::Error) -> bool {
     false
 }
 
-/// Try to extract a Retry-After value (in milliseconds) from an error message.
+/// Prefer the parsed HTTP header. Older adapters may only supply a delay in the message.
 /// Looks for patterns like `Retry-After: 5` or `retry_after: 2.5` in the error string.
 fn parse_retry_after_ms(err: &anyhow::Error) -> Option<u64> {
+    if let Some((_, delay)) = ProviderHttpError::retry_hint(err) {
+        return Some(u64::try_from(delay.as_millis()).unwrap_or(u64::MAX));
+    }
     let msg = err.to_string();
     let lower = msg.to_lowercase();
 
@@ -1023,13 +1029,37 @@ fn compact_error_detail(err: &anyhow::Error) -> String {
 pub struct ProviderHttpError {
     status: u16,
     message: String,
+    retry_after: Option<Duration>,
 }
 
 impl ProviderHttpError {
-    pub(crate) fn new(status: reqwest::StatusCode, message: impl Into<String>) -> Self {
+    pub(crate) fn new(
+        status: reqwest::StatusCode,
+        message: String,
+        retry_after: Option<Duration>,
+    ) -> Self {
         Self {
             status: status.as_u16(),
-            message: message.into(),
+            message,
+            retry_after,
+        }
+    }
+
+    fn retry_hint(error: &anyhow::Error) -> Option<(u16, Duration)> {
+        error.chain().find_map(|cause| {
+            let http = cause.downcast_ref::<Self>()?;
+            Some((http.status, http.retry_after?))
+        })
+    }
+
+    /// Adapters that previously returned plain text only introduce a typed status
+    /// when they have a retry hint. In particular, a 400 must not opt those
+    /// adapters into the runtime's typed image-recovery path.
+    pub(crate) fn into_retry_error(self) -> anyhow::Error {
+        if self.retry_after.is_some() {
+            self.into()
+        } else {
+            anyhow::Error::msg(self.message)
         }
     }
 
@@ -8780,6 +8810,88 @@ mod tests {
     }
 
     // ── New tests: Retry-After parsing ──
+
+    #[tokio::test]
+    async fn retry_after_response_header_controls_retry_and_cooldown() {
+        let provider = ReliableModelProvider::new("test", Vec::new(), 1, 500);
+        for (status, header, body, backoff_ms, cooldown_ms) in [
+            (429, "4", "Retry-After: 2", 4_000, 4_000),
+            (503, "90", "temporarily unavailable", 30_000, 60_000),
+            (429, "invalid", "Retry-After: 2", 2_000, 2_000),
+            (
+                503,
+                "Fri, 01 Jan 2100 00:00:00 GMT",
+                "temporarily unavailable",
+                30_000,
+                60_000,
+            ),
+        ] {
+            let response = reqwest::Response::from(
+                axum::http::Response::builder()
+                    .status(status)
+                    .header("retry-after", header)
+                    .header("x-provider-debug", "private-fixture-marker")
+                    .body(reqwest::Body::from(body))
+                    .unwrap(),
+            );
+            let error = crate::api_error("test", response).await;
+            assert_eq!(provider.compute_backoff(500, &error), backoff_ms);
+            assert_eq!(
+                provider.set_rate_limit_cooldown("test", &error),
+                Duration::from_millis(cooldown_ms)
+            );
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "test API error ({}): {body}",
+                    reqwest::StatusCode::from_u16(status).unwrap()
+                )
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn retry_after_header_does_not_change_other_http_statuses() {
+        let response = reqwest::Response::from(
+            axum::http::Response::builder()
+                .status(400)
+                .header("retry-after", "20")
+                .body(reqwest::Body::from("invalid request"))
+                .unwrap(),
+        );
+        let error = crate::api_error("test", response).await;
+        assert_eq!(parse_retry_after_ms(&error), None);
+        assert!(error.downcast_ref::<ProviderHttpError>().is_none());
+    }
+
+    #[test]
+    fn retry_after_http_date_uses_the_interval_from_the_response_time() {
+        let now = httpdate::parse_http_date("Sun, 06 Nov 1994 08:49:37 GMT").unwrap();
+        assert_eq!(
+            crate::parse_retry_after_header("Sun, 06 Nov 1994 08:49:42 GMT", now),
+            Some(Duration::from_secs(5))
+        );
+        assert_eq!(
+            crate::parse_retry_after_header("Sun, 06 Nov 1994 08:49:36 GMT", now),
+            Some(Duration::ZERO)
+        );
+        assert_eq!(crate::parse_retry_after_header("not a date", now), None);
+    }
+
+    #[tokio::test]
+    async fn retry_after_header_keeps_business_quota_non_retryable() {
+        let response = reqwest::Response::from(
+            axum::http::Response::builder()
+                .status(429)
+                .header("retry-after", "20")
+                .body(reqwest::Body::from(
+                    r#"{"error":{"code":"insufficient_quota"}}"#,
+                ))
+                .unwrap(),
+        );
+        let error = crate::api_error("test", response).await;
+        assert!(is_non_retryable_rate_limit(&error));
+    }
 
     #[test]
     fn parse_retry_after_integer() {

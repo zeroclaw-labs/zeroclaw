@@ -192,8 +192,10 @@ impl ModelProvider for GlmModelProvider {
             .await?;
 
         if !response.status().is_success() {
+            let status = response.status();
+            let retry_after = super::response_retry_after(&response);
             let error = response.text().await?;
-            anyhow::bail!("GLM API error: {error}");
+            return Err(super::reliable::ProviderHttpError::new(status, format!("GLM API error: {error}"), retry_after).into_retry_error());
         }
 
         let chat_response: ChatResponse = response.json().await?;
@@ -247,8 +249,10 @@ impl ModelProvider for GlmModelProvider {
             .await?;
 
         if !response.status().is_success() {
+            let status = response.status();
+            let retry_after = super::response_retry_after(&response);
             let error = response.text().await?;
-            anyhow::bail!("GLM API error: {error}");
+            return Err(super::reliable::ProviderHttpError::new(status, format!("GLM API error: {error}"), retry_after).into_retry_error());
         }
 
         let chat_response: ChatResponse = response.json().await?;
