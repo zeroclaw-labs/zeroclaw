@@ -21950,7 +21950,9 @@ target = "memory_recall"
                     result.output
                 );
                 assert!(
-                    error.as_deref().is_some_and(|error| error.contains(REFUSAL)),
+                    error
+                        .as_deref()
+                        .is_some_and(|error| error.contains(REFUSAL)),
                     "the failed task names the provider source's refusal; error: {error:?}"
                 );
                 assert_eq!(
@@ -21966,7 +21968,7 @@ target = "memory_recall"
         /// provider.
         #[test]
         fn bounded_rebuilt_send_message_to_peer_failing_memory_fails_relay_without_config_fallback()
-         {
+        {
             on_deep_stack(async {
                 let hop = hop(
                     "send_message_to_peer",
