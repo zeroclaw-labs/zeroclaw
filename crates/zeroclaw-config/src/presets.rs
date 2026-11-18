@@ -39,7 +39,8 @@ pub const RISK_PRESETS: &[RiskPreset] = &[
         preset_name: "locked_down",
         label: "Locked Down",
         help: "Tightest defaults. Workspace-only filesystem access, approval \
-               required for medium and high risk, no shell environment passthrough.",
+               required for medium risk, high-risk commands blocked outright \
+               even when allowlisted, no shell environment passthrough.",
         values: locked_down_risk,
     },
     RiskPreset {
@@ -48,7 +49,8 @@ pub const RISK_PRESETS: &[RiskPreset] = &[
         help: "Trusted daily driver for a personal dev box. Supervised, \
                workspace-scoped with sensitive paths blocked and the sandbox \
                on. Any command runs without an allowlist, but high-risk \
-               commands stay blocked unless explicitly allowlisted. \
+               commands stay blocked even when allowlisted; set \
+               block_high_risk_commands = false to allow them under approval. \
                Recommended for most users.",
         values: balanced_risk,
     },
@@ -550,9 +552,8 @@ mod tests {
         assert!(v.workspace_only);
         assert_eq!(v.sandbox_enabled, Some(true));
         // Any command runs without an allowlist, but high-risk is blocked, not
-        // prompted: the `*` wildcard is not an explicit exemption, so
-        // block_high_risk_commands rejects high-risk commands outright while
-        // medium-risk friction is off.
+        // prompted: block_high_risk_commands rejects high-risk commands
+        // outright while medium-risk friction is off.
         assert_eq!(v.allowed_commands, vec!["*".to_string()]);
         assert!(v.block_high_risk_commands);
         assert!(!v.require_approval_for_medium_risk);
@@ -576,9 +577,8 @@ mod tests {
             );
         }
         // High-risk command passes the allowlist but is blocked outright at
-        // execution: the `*` wildcard is not an explicit allowlist entry, so
-        // block_high_risk_commands rejects it even when approved=true. This is
-        // a hard block, not an approval prompt.
+        // execution: block_high_risk_commands rejects it even when
+        // approved=true. This is a hard block, not an approval prompt.
         assert!(policy.is_command_allowed("rm -rf node_modules"));
         let err_unapproved = policy
             .validate_command_execution("rm -rf node_modules", false)
