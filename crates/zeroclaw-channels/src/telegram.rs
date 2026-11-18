@@ -6122,25 +6122,29 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         Some(format!("> @{reply_sender}:\n{quoted_lines}"))
     }
 
-    /// Whether an inbound parser would admit `message` under the mention-only
-    /// gate. Reply-voice preparation consults this before fetching a quoted
-    /// recording: an admission decision broader than the parsers spends a
-    /// download (and possibly a transcription) on an update that is dropped
-    /// afterwards.
+    /// Whether an inbound parser would admit `message` at all. Reply-voice
+    /// preparation consults this before fetching a quoted recording: an
+    /// admission decision broader than the parsers spends a download (and
+    /// possibly a transcription) on an update that is dropped afterwards.
+    /// Runs in every chat — DMs and mention-free groups skip the mention
+    /// gate, but a sticker, video or location reply still reaches no parser.
     ///
     /// The decision mirrors the parser branches exactly:
-    /// - the text parser sees messages with `text` and admits addressed ones,
-    ///   plus unaddressed text under passive group context;
-    /// - the media parsers (`check_media_mention_gate`) see photo/document
-    ///   and voice/audio messages and admit only a caption that mentions the
-    ///   bot or answers it directly — a captionless reply to the bot admits
-    ///   nothing, and no passive fallback exists there;
+    /// - the text parser consumes any message with `text`; in a mention_only
+    ///   group it further requires a bot mention, a reply to the bot, or
+    ///   passive group context — otherwise unaddressed group text is dropped;
+    /// - the media parsers see photo/document and voice/audio messages and
+    ///   admit everything outside the mention_only group gate, where they
+    ///   require a caption that mentions the bot or answers it directly;
     /// - anything neither parser can see admits nothing.
-    ///
-    /// Call only under `mention_only` in a group chat, the condition both
-    /// parser gates key on.
     fn reply_prep_parser_admission(&self, message: &serde_json::Value) -> bool {
+        let is_group = Self::is_group_message(message);
         if let Some(text) = message.get("text").and_then(serde_json::Value::as_str) {
+            if !is_group || !self.mention_only {
+                // DM text, or a group without the mention gate: the text
+                // parser consumes it as-is.
+                return true;
+            }
             let bot_username_guard = self.bot_username.lock();
             let Some(bot_username) = bot_username_guard.as_ref() else {
                 // Without the bot's username the text parser drops every
@@ -6165,6 +6169,8 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         if Self::parse_attachment_metadata(message).is_none()
             && Self::parse_voice_metadata(message).is_none()
         {
+            // Sticker, video, location, …: no inbound parser sees these, so
+            // nothing will ever quote the prepared recording.
             return false;
         }
         let caption = message.get("caption").and_then(serde_json::Value::as_str);
@@ -6187,6 +6193,20 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             return;
         }
 
+        // Telegram injects the forum topic root as `reply_to_message` on the
+        // first message of a topic; `extract_reply_context` drops that shape
+        // (it is not a real reply), so preparation must not spend a download
+        // or a transcription on it.
+        if let (Some(reply_mid), Some(thread_id)) = (
+            reply.get("message_id").and_then(serde_json::Value::as_i64),
+            message
+                .get("message_thread_id")
+                .and_then(serde_json::Value::as_i64),
+        ) && reply_mid == thread_id
+        {
+            return;
+        }
+
         // Authorize with the same identity set the parsers use: the display
         // fallback "unknown" from `extract_sender_info` is not a real
         // identity and must not match an allowlisted username.
@@ -6195,15 +6215,11 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             return;
         }
 
-        // Admit only updates the inbound parsers themselves would process.
-        // Passive group context admits text observations only; media replies
-        // must clear the media gate (a mention or a captioned reply to the
-        // bot), so no download or transcription is spent on an update every
-        // parser drops.
-        if self.mention_only
-            && Self::is_group_message(message)
-            && !self.reply_prep_parser_admission(message)
-        {
+        // Admit only updates the inbound parsers themselves would process,
+        // in every chat: the mention gate is one input here, not the switch —
+        // a DM or mention-free group still drops sticker/video/location
+        // replies, and no parser means no consumer for the quoted recording.
+        if !self.reply_prep_parser_admission(message) {
             return;
         }
 
@@ -19814,6 +19830,197 @@ mod tests {
         assert!(
             ch.voice_transcriptions.lock().is_empty(),
             "no transcript may be cached when transcription never finished"
+        );
+    }
+
+    #[tokio::test]
+    async fn prep_skips_voice_reply_when_reply_is_the_topic_root() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let workspace = tempfile::tempdir().unwrap();
+        let mock_server = MockServer::start().await;
+        // Only getFile is instrumented: the assertion is that it is never
+        // hit, because the topic-root shape is dropped by
+        // extract_reply_context as well.
+        Mock::given(method("GET"))
+            .and(path_regex(r"/bot[^/]+/getFile$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "file_path": "voice/file_root.ogg" }
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let ch = TelegramChannel::new(
+            "t".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            true,
+        )
+        .with_mock_api_base(mock_server.uri())
+        .with_workspace_dir(workspace.path().to_path_buf())
+        .with_voice_reply_prep_timeout(Duration::from_millis(250));
+        {
+            let mut cache = ch.bot_username.lock();
+            *cache = Some("mybot".to_string());
+        }
+        // First message of a forum topic: Telegram injects the topic root as
+        // reply_to_message, so reply.message_id equals message_thread_id.
+        let update = serde_json::json!({
+            "update_id": 9,
+            "message": {
+                "message_id": 23,
+                "message_thread_id": 42,
+                "text": "@mybot привет",
+                "from": { "id": 1, "username": "alice" },
+                "chat": { "id": -100_200_300, "type": "supergroup", "is_forum": true },
+                "reply_to_message": {
+                    "message_id": 42,
+                    "from": { "username": "bob" },
+                    "voice": { "file_id": "root_voice", "duration": 5 }
+                }
+            }
+        });
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let mut transient_retry = None;
+        let outcome = ch.process_update(&update, &tx, &mut transient_retry).await;
+        assert!(matches!(outcome, UpdateOutcome::Advanced));
+        let msg = rx.recv().await.expect("addressed message must dispatch");
+        assert!(msg.content.contains("привет"));
+        assert!(
+            ch.voice_file_paths.lock().is_empty(),
+            "topic-root reply must not be prepared: nothing will quote it"
+        );
+        let get_file_hits = mock_server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|req| req.url.path().contains("getFile"))
+            .count();
+        assert_eq!(get_file_hits, 0, "no file request for the topic root");
+    }
+
+    #[tokio::test]
+    async fn prep_skips_voice_reply_for_unconsumed_sticker_in_dm() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let workspace = tempfile::tempdir().unwrap();
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/bot[^/]+/getFile$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "file_path": "voice/file_dm.ogg" }
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let ch = TelegramChannel::new(
+            "t".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            true,
+        )
+        .with_mock_api_base(mock_server.uri())
+        .with_workspace_dir(workspace.path().to_path_buf())
+        .with_voice_reply_prep_timeout(Duration::from_millis(250));
+        // A sticker reaches no inbound parser even in a DM, so the quoted
+        // voice note must not be downloaded for it.
+        let update = serde_json::json!({
+            "update_id": 10,
+            "message": {
+                "message_id": 7,
+                "from": { "id": 1, "username": "alice" },
+                "chat": { "id": 555, "type": "private" },
+                "sticker": { "file_id": "st1" },
+                "reply_to_message": {
+                    "message_id": 42,
+                    "from": { "username": "bob" },
+                    "voice": { "file_id": "dm_voice", "duration": 5 }
+                }
+            }
+        });
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let mut transient_retry = None;
+        let _outcome = ch.process_update(&update, &tx, &mut transient_retry).await;
+        assert!(
+            ch.voice_file_paths.lock().is_empty(),
+            "sticker reply must not trigger voice preparation"
+        );
+        let get_file_hits = mock_server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|req| req.url.path().contains("getFile"))
+            .count();
+        assert_eq!(get_file_hits, 0, "no file request for an unconsumed update");
+    }
+
+    #[tokio::test]
+    async fn prep_prepares_voice_reply_inside_topic_when_ids_differ() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let workspace = tempfile::tempdir().unwrap();
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/bot[^/]+/getFile$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "file_path": "voice/file_topic.ogg" }
+            })))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/file/bot[^/]+/voice/file_topic\.ogg$"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![0u8; 64]))
+            .mount(&mock_server)
+            .await;
+
+        let ch = TelegramChannel::new(
+            "t".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            true,
+        )
+        .with_mock_api_base(mock_server.uri())
+        .with_workspace_dir(workspace.path().to_path_buf())
+        .with_voice_reply_prep_timeout(Duration::from_millis(500));
+        {
+            let mut cache = ch.bot_username.lock();
+            *cache = Some("mybot".to_string());
+        }
+        let update = serde_json::json!({
+            "update_id": 11,
+            "message": {
+                "message_id": 24,
+                "message_thread_id": 7,
+                "text": "@mybot привет",
+                "from": { "id": 1, "username": "alice" },
+                "chat": { "id": -100_200_300, "type": "supergroup", "is_forum": true },
+                "reply_to_message": {
+                    "message_id": 42,
+                    "from": { "username": "bob" },
+                    "voice": { "file_id": "topic_voice", "duration": 5 }
+                }
+            }
+        });
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let mut transient_retry = None;
+        let outcome = ch.process_update(&update, &tx, &mut transient_retry).await;
+        assert!(matches!(outcome, UpdateOutcome::Advanced));
+        let msg = rx.recv().await.expect("addressed message must dispatch");
+        assert!(msg.content.contains("привет"));
+        assert!(
+            ch.voice_file_paths.lock().contains_key("-100200300:42"),
+            "a real reply inside a topic (ids differ) must still be prepared"
         );
     }
 
