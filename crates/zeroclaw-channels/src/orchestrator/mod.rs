@@ -22640,10 +22640,12 @@ temperature = 0.3
             prepare_live_channel_registry(true);
             let predecessor: Arc<dyn zeroclaw_api::conversation_binding::ConversationBindingOwner> =
                 Arc::new(PredecessorOwner);
-            let predecessor_lease = zeroclaw_infra::conversation_owners::publish_conversation_owner(
-                zeroclaw_api::conversation_binding::ConversationSurface::Channel,
-                "first",
-                Arc::clone(&predecessor),
+            let mut predecessor_lease = Some(
+                zeroclaw_infra::conversation_owners::publish_conversation_owner(
+                    zeroclaw_api::conversation_binding::ConversationSurface::Channel,
+                    "first",
+                    Arc::clone(&predecessor),
+                ),
             );
             let mut attempt_config = config.clone();
             if scenario == "later-agent-failure" {
@@ -22757,6 +22759,14 @@ temperature = 0.3
                     first_owner().is_some_and(|owner| !same_owner(&owner, &predecessor)),
                     "a published instance serves `first` itself"
                 );
+                // The order that matters in production: the successor is
+                // serving when the replaced instance shuts down and drops its
+                // lease. The successor must stay published.
+                drop(predecessor_lease.take());
+                assert!(
+                    first_owner().is_some_and(|owner| !same_owner(&owner, &predecessor)),
+                    "the replaced instance's lease removed its successor"
+                );
                 cancel.cancel();
                 tokio::time::timeout(Duration::from_secs(5), task)
                     .await
@@ -22769,11 +22779,12 @@ temperature = 0.3
                     "a stopped instance leaves no owner behind"
                 );
             }
-            // The replaced predecessor's lease must not remove anything.
-            drop(predecessor_lease);
+            // Cleanup: where the stand-in was never replaced, its still-current
+            // lease removes it, so no owner leaks into the next scenario.
+            drop(predecessor_lease.take());
             assert!(
-                first_owner().is_none_or(|owner| !same_owner(&owner, &predecessor)),
-                "{scenario}: stale owner left published"
+                first_owner().is_none(),
+                "{scenario}: an owner was left published"
             );
         }
     }
