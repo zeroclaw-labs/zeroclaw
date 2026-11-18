@@ -68,6 +68,16 @@ class TaskTransportTests(unittest.TestCase):
                 module.read_message(type('DisconnectedPeer', (), {'recv': lambda self, size: b''})())
             translate.assert_called_once_with('SSH client disconnected')
 
+    def test_argument_errors_use_the_standalone_translation_path(self):
+        for args in [['-X', 'example', 'true'], ['-o', 'IdentityFile=x', 'example', 'true'], [], ['example']]:
+            with patch.object(module, 'translate', return_value='localized argument error') as translate:
+                with self.assertRaisesRegex(ValueError, 'localized argument error'):
+                    module.parse_args(list(args))
+                translate.assert_called_once()
+        with patch.dict(module.os.environ, {}, clear=True), patch.object(module, 'translate', return_value='localized missing task'):
+            with self.assertRaisesRegex(RuntimeError, 'localized missing task'):
+                module.client(['example', 'true'])
+
     def test_host_is_separated_from_openssh_options(self):
         with self.assertRaisesRegex(ValueError, 'configured SSH host alias'):
             module.parse_args(['--', '-invalid', 'true'])

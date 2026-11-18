@@ -35,16 +35,16 @@ def parse_args(args):
         if flag == '--':
             break
         if flag not in ('-o', '-p', '-l') or not args:
-            raise ValueError('Unsupported SSH option; use configured host aliases')
+            raise ValueError(translate('Unsupported SSH option; use configured host aliases'))
         value = args.pop(0)
         if flag == '-o' and value.split('=', 1)[0].lower() not in SAFE_OPTIONS:
-            raise ValueError('SSH identity, trust and transport options cannot be overridden')
+            raise ValueError(translate('SSH identity, trust and transport options cannot be overridden'))
         options.extend((flag, value))
     if not args or args[0].startswith('-') or not re.fullmatch(r'[a-zA-Z0-9_.:@\[\]-]+', args[0]):
-        raise ValueError('A configured SSH host alias is required')
+        raise ValueError(translate('A configured SSH host alias is required'))
     host = args.pop(0)
     if not args:
-        raise ValueError('An explicit noninteractive remote command is required')
+        raise ValueError(translate('An explicit noninteractive remote command is required'))
     return options, host, args
 
 
@@ -110,7 +110,7 @@ class Pool:
     def acquire(self, key, options, host):
         with self.lock:
             if self.closed:
-                raise RuntimeError('SSH task has ended')
+                raise RuntimeError(translate('SSH task has ended'))
             entry = self.entries.get(key)
             owner = entry is None
             if owner:
@@ -155,19 +155,19 @@ class Pool:
             if entry['failed']:
                 detail = entry['log'].detail()
                 self.stop(entry)
-                raise RuntimeError('SSH connection failed; not retried in this task: ' + detail)
+                raise RuntimeError(translate('SSH connection failed; not retried in this task: ') + detail)
         else:
             if not entry['ready'].wait(timeout=18):
-                raise RuntimeError('SSH connection setup did not complete')
+                raise RuntimeError(translate('SSH connection setup did not complete'))
         with self.lock:
             if self.closed:
-                raise RuntimeError('SSH task has ended')
+                raise RuntimeError(translate('SSH task has ended'))
             # Expiry may have retired this entry after ready.wait returned.
             # Validate its generation under the same lock as the active lease.
             if self.entries.get(key) is entry and not entry.get('retired'):
                 if entry['failed'] or entry['process'] is None or entry['process'].poll() is not None:
                     entry['failed'] = True
-                    raise RuntimeError('SSH transport unavailable; diagnose before starting a new task')
+                    raise RuntimeError(translate('SSH transport unavailable; diagnose before starting a new task'))
                 entry['active'] += 1
                 entry['last'] = self.clock()
                 return entry['path']
@@ -245,7 +245,7 @@ def read_message(peer):
             raise EOFError(translate('SSH client disconnected'))
         data.extend(part)
         if len(data) > 16384:
-            raise ValueError('SSH request too large')
+            raise ValueError(translate('SSH request too large'))
     return json.loads(data)
 
 
@@ -317,7 +317,7 @@ def serve(directory):
 def client(args):
     scope = os.environ.get('ZEROCLAW_SSH_TASK')
     if not scope or not re.fullmatch('[a-f0-9]{32}', scope):
-        raise RuntimeError('SSH requires an active ZeroClaw task; no unmanaged fallback')
+        raise RuntimeError(translate('SSH requires an active ZeroClaw task; no unmanaged fallback'))
     options, host, commands = parse_args(list(args))
     with socket.socket(socket.AF_UNIX) as peer:
         peer.settimeout(20)
@@ -339,7 +339,7 @@ if __name__ == '__main__':
     try:
         if len(sys.argv) == 3 and sys.argv[1] == '--serve':
             if not re.fullmatch('[a-f0-9]{32}', sys.argv[2]):
-                raise ValueError('Invalid task identity')
+                raise ValueError(translate('Invalid task identity'))
             serve(ROOT / sys.argv[2])
         else:
             sys.exit(client(sys.argv[1:]))
