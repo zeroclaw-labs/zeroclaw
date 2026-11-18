@@ -1056,6 +1056,7 @@ cli-desktop-download-at = {"  "}Descárgala en: {$url}
 cli-config-legend = Leyenda: 💉 anulado por entorno  🔒 secreto
 cli-config-secret-set = {$path} está establecido (secreto cifrado — valor no mostrado)
 cli-config-secret-unset = {$path} no está establecido (secreto cifrado)
+cli-config-value-prompt = Introduce un valor para {$path}
 cli-config-updated = {$path} actualizado.
 cli-config-review-hint = Ejecuta `zeroclaw config list` para revisar y luego establece los campos requeridos.
 cli-config-catalog-unavailable-manual = {"  "}⚠ El catálogo de {$provider} no está disponible ({$error}); introduce manualmente el ID del modelo.

@@ -1055,6 +1055,7 @@ cli-desktop-download-at = {"  "}下载地址：{$url}
 cli-config-legend = 图例：💉 env 已覆盖  🔒 密钥
 cli-config-secret-set = {$path} 已设置（加密密钥——不显示值）
 cli-config-secret-unset = {$path} 未设置（加密密钥）
+cli-config-value-prompt = 请输入 {$path} 的值
 cli-config-updated = {$path} 已更新。
 cli-config-review-hint = 运行 `zeroclaw config list` 进行查看，然后设置必填字段。
 cli-config-catalog-unavailable-manual = {"  "}⚠ 无法使用 {$provider} 的模型目录（{$error}）；请手动输入模型 ID。
