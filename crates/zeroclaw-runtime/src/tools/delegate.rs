@@ -6790,8 +6790,11 @@ impl DelegateTool {
                 // against the single read of the owner above. A plane opened
                 // under another reading (a shared handle, another agent's
                 // plane) refuses the hop instead of running its child there.
-                // SOP tools rebound into this registry keep the caller's own
-                // route and are not judged here.
+                // The route is created, pinned and handed to the assembly in
+                // this same function, so this is a guard against a later edit
+                // that stops passing it on, not an independent source of
+                // truth. SOP tools rebound into this registry keep the
+                // caller's own route and are not judged here.
                 let sealed_route = assembled_bounded.registry.session_memory_route();
                 #[cfg(test)]
                 record_sealed_route(sealed_route);
@@ -22006,6 +22009,179 @@ target = "memory_recall"
                     hop.endpoint.connections(),
                     0,
                     "nothing reaches the target's configured endpoint"
+                );
+            });
+        }
+
+        /// Lets the target inherit `memory_store`, in the caller's and the
+        /// target's risk profiles alike.
+        fn grant_memory_store(config: &mut Config, _url: &str) {
+            for name in ["balanced", "research"] {
+                config
+                    .risk_profiles
+                    .get_mut(name)
+                    .unwrap_or_else(|| panic!("fixture risk profile '{name}' must exist"))
+                    .allowed_tools
+                    .push("memory_store".to_string());
+            }
+        }
+
+        /// Adds a native `memory_store`, with its provenance, to the hop's
+        /// inherited tools. A hop that inherits a native memory tool opens the
+        /// target's memory before its tools are assembled, which the plain
+        /// fixture's provenance-less parent list never does.
+        fn with_native_memory_parent(hop: Hop) -> Hop {
+            let Hop {
+                _tmp,
+                tool,
+                target_config,
+                config,
+                endpoint,
+                providers,
+                memory,
+                store,
+            } = hop;
+            let security = Arc::new(
+                SecurityPolicy::for_agent(&config, "executive_assistant")
+                    .expect("caller policy resolves"),
+            );
+            let runtime: Arc<dyn RuntimeAdapter> = Arc::new(crate::platform::NativeRuntime::new());
+            let request = crate::composition::ToolRequest {
+                config: &config,
+                agent_alias: "executive_assistant",
+                security: &security,
+                runtime: &runtime,
+                memory: &store,
+            };
+            let built = crate::composition::defaults::native_compat_registry(
+                crate::composition::NativeRecipeInputs {
+                    request: &request,
+                    workspace_dir: &security.workspace_dir,
+                    canvas_store: None,
+                    is_subagent_caller: false,
+                    forwarded_environment: None,
+                    sop_engine: None,
+                    sop_audit: None,
+                    live_config: None,
+                    execution_capability: None,
+                    acp_sessions: None,
+                    caller_ceiling: None,
+                },
+            )
+            .expect("the native registry builds");
+            let native_memory_store = built
+                .unfiltered_tool_arcs
+                .iter()
+                .find(|tool| tool.name() == "memory_store")
+                .cloned()
+                .expect("the native registry builds memory_store");
+            let mut parents = tool.parent_tools.tools.read().clone();
+            parents.push(native_memory_store);
+            let tool = tool.with_owned_parent_tools(
+                Arc::new(RwLock::new(parents)),
+                built.native_memory.origins,
+            );
+            Hop {
+                _tmp,
+                tool,
+                target_config,
+                config,
+                endpoint,
+                providers,
+                memory,
+                store,
+            }
+        }
+
+        /// In an owned session, a target that inherits a memory tool already
+        /// has its memory open when the child-starting tools are rebuilt, and
+        /// the owner's plane the rebuilt `spawn_subagent` pins is that same
+        /// open handle: the caller's source is asked for the target's memory
+        /// exactly as often as when the target inherits no memory tool, and
+        /// the child runs on the owner's plane for the target.
+        #[test]
+        fn bounded_rebuilt_spawn_subagent_owned_with_memory_tools_pins_the_memory_it_opened() {
+            on_deep_stack(async {
+                let mut opened = Vec::new();
+                for with_memory_tools in [false, true] {
+                    let base = hop(
+                        "spawn_subagent",
+                        true,
+                        HopMemory::Recording,
+                        grant_memory_store,
+                    )
+                    .await;
+                    let hop = if with_memory_tools {
+                        with_native_memory_parent(base)
+                    } else {
+                        base
+                    };
+                    hop.tool
+                        .bind_principal_scope(owner_scope())
+                        .expect("the session's owner binds");
+                    let inherited_with_origin = {
+                        let tools = hop.tool.parent_tools.tools.read();
+                        hop.tool.parent_tools.origins.snapshot(&tools)
+                    };
+                    assert_eq!(
+                        inherited_with_origin.iter().any(|(tool, origin)| {
+                            tool.name() == "memory_store" && origin.is_some()
+                        }),
+                        with_memory_tools,
+                        "precondition: the target inherits a native memory tool exactly when \
+                         the fixture adds one"
+                    );
+
+                    let SpawnRun {
+                        result,
+                        child,
+                        probe,
+                    } = run_spawn(&hop).await;
+                    assert_eq!(
+                        probe.refusal, None,
+                        "the owned hop is not refused (memory tools: {with_memory_tools}); \
+                         delegate output: {}",
+                        result.output
+                    );
+                    let Some(handed) = child else {
+                        panic!(
+                            "precondition: the rebuilt spawn_subagent started its child run \
+                             (memory tools: {with_memory_tools}); delegate output: {}",
+                            result.output
+                        );
+                    };
+                    assert_eq!(
+                        handed.as_ref().and_then(|memory| memory.principal_scope()),
+                        Some(owner_target_scope()),
+                        "the child runs on the owner's plane for the target (memory tools: \
+                         {with_memory_tools})"
+                    );
+                    assert!(
+                        matches!(
+                            &probe.sealed,
+                            Some(SealedRoute::Pinned(memory))
+                                if handed.as_ref().is_some_and(|handed| Arc::ptr_eq(handed, memory))
+                        ),
+                        "the sealed registry's route holds the plane the child is handed \
+                         (memory tools: {with_memory_tools})"
+                    );
+                    opened.push(
+                        hop.memory
+                            .agents
+                            .lock()
+                            .iter()
+                            .filter(|alias| alias.as_str() == TARGET)
+                            .count(),
+                    );
+                }
+                assert!(
+                    opened[0] >= 1,
+                    "precondition: the caller's source is asked for {TARGET}'s memory"
+                );
+                assert_eq!(
+                    opened[1], opened[0],
+                    "a target that inherits a memory tool must not have its memory opened a \
+                     second time for the owner's plane"
                 );
             });
         }
