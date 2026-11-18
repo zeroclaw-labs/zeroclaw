@@ -4537,11 +4537,11 @@ fn channel_history_before_turn_delta<'a>(
         if message.role != "user" || is_paired_prompt_tool_result(history, index) {
             return false;
         }
-        if let Some(remaining) = generated_users.get_mut(message.content.as_str()) {
-            if *remaining > 0 {
-                *remaining -= 1;
-                return false;
-            }
+        if let Some(remaining) = generated_users.get_mut(message.content.as_str())
+            && *remaining > 0
+        {
+            *remaining -= 1;
+            return false;
         }
         true
     });
@@ -4567,7 +4567,6 @@ fn channel_history_before_turn_delta<'a>(
 /// recreate an unreconciled entry from its own working buffer instead of
 /// letting the next turn reload from the backend.
 #[allow(clippy::too_many_arguments)]
-
 fn resync_history_after_trim_or_evict_cache(
     ctx: &ChannelRuntimeContext,
     sender_key: &str,
