@@ -21272,8 +21272,8 @@ target = "memory_recall"
     mod rebuilt_child_starting_tools {
         use super::*;
         use crate::composition::test_support::{
-            CountingEndpoint, RecordingMemory, RecordingProviders, STUB_REPLY, counting_endpoint,
-            recording_capabilities,
+            CountingEndpoint, REFUSAL, RecordingMemory, RecordingProviders, RefusingProviders,
+            STUB_REPLY, counting_endpoint, recording_capabilities,
         };
         use crate::tools::spawn_subagent::CHILD_MEMORY_SINK;
 
@@ -21367,6 +21367,15 @@ target = "memory_recall"
             );
         }
 
+        /// Which provider source the binding of a bound hop serves.
+        #[derive(Clone, Copy)]
+        enum HopProviders {
+            /// Records every request and serves the stub provider.
+            Recording,
+            /// Refuses every request, naming the agent it refused.
+            Refusing,
+        }
+
         struct Hop {
             _tmp: TempDir,
             tool: DelegateTool,
@@ -21386,6 +21395,24 @@ target = "memory_recall"
         async fn hop(
             tool_name: &str,
             bind: bool,
+            memory_source: HopMemory,
+            configure: impl FnOnce(&mut Config, &str),
+        ) -> Hop {
+            hop_with_sources(
+                tool_name,
+                bind,
+                HopProviders::Recording,
+                memory_source,
+                configure,
+            )
+            .await
+        }
+
+        /// [`hop`], with the provider source of the binding chosen too.
+        async fn hop_with_sources(
+            tool_name: &str,
+            bind: bool,
+            provider_source: HopProviders,
             memory_source: HopMemory,
             configure: impl FnOnce(&mut Config, &str),
         ) -> Hop {
@@ -21421,6 +21448,10 @@ target = "memory_recall"
                         capabilities.memory = Arc::new(OneStore(Arc::clone(&store)));
                     }
                     HopMemory::Failing => capabilities.memory = Arc::new(FailingStore),
+                }
+                match provider_source {
+                    HopProviders::Recording => {}
+                    HopProviders::Refusing => capabilities.providers = Arc::new(RefusingProviders),
                 }
                 tool.with_memory(Arc::clone(&store))
                     .with_capabilities(capabilities, Some(caller_principal()))
@@ -21639,6 +21670,124 @@ target = "memory_recall"
             });
         }
 
+        /// Routes the target's relay to a peer agent: a recipient on the
+        /// target's channel, in one peer group, served by the counting endpoint.
+        fn configure_peer_relay(config: &mut Config, url: &str) {
+            use zeroclaw_config::multi_agent::{AgentAlias, PeerGroupConfig};
+            route_agent_to(config, PEER, url);
+            config.risk_profiles.insert(
+                "peer".to_string(),
+                zeroclaw_config::schema::RiskProfileConfig::default(),
+            );
+            config.agents.insert(
+                PEER.to_string(),
+                AliasedAgentConfig {
+                    channels: vec![PEER_CHANNEL.into()],
+                    model_provider: "ollama.peer_recipient".into(),
+                    risk_profile: "peer".into(),
+                    ..AliasedAgentConfig::default()
+                },
+            );
+            config
+                .agents
+                .get_mut(TARGET)
+                .expect("the fixture configures the target")
+                .channels = vec![PEER_CHANNEL.into()];
+            config.peer_groups.insert(
+                "rebuilt-relay".to_string(),
+                PeerGroupConfig {
+                    channel: "telegram".into(),
+                    agents: vec![AgentAlias::new(TARGET), AgentAlias::new(PEER)],
+                    ..PeerGroupConfig::default()
+                },
+            );
+        }
+
+        /// Has the target relay one message to [`PEER`] and waits until the
+        /// relayed turn settles its task, which happens only after the whole
+        /// turn returned, so every request it made is counted by the caller.
+        /// Returns the delegated result and the settled task's status and
+        /// error.
+        async fn relay_to_peer(
+            hop: &Hop,
+        ) -> (ToolResult, crate::control_plane::TaskStatus, Option<String>) {
+            let result = run_target(
+                hop,
+                "send_message_to_peer",
+                json!({
+                    "channel": PEER_CHANNEL,
+                    "target": PEER,
+                    "message": "post a one-line status",
+                }),
+            )
+            .await;
+            assert!(
+                result.output.contains("task_id="),
+                "precondition: the rebuilt send_message_to_peer accepted the relay for \
+                 in-process delivery; delegate output: {}",
+                result.output
+            );
+
+            // The relayed turn is detached, so wait for its task to settle.
+            let task_id: String = result
+                .output
+                .split_once("task_id=")
+                .map(|(_, rest)| {
+                    rest.chars()
+                        .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+                        .collect()
+                })
+                .filter(|id: &String| !id.is_empty())
+                .expect("the accepted relay names its task");
+            let control_plane = match crate::control_plane::control_plane().cloned() {
+                Some(handle) => handle,
+                None => crate::control_plane::non_daemon_control_plane(&hop.config.data_dir)
+                    .await
+                    .expect("the relay's control plane opens"),
+            };
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+            loop {
+                let snapshot = control_plane
+                    .store
+                    .get_snapshot(&task_id)
+                    .await
+                    .expect("the relay's task is queryable")
+                    .expect("the relay's task is registered in the control plane");
+                if snapshot.task.status.is_terminal() {
+                    return (result, snapshot.task.status, snapshot.error);
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the relayed turn did not settle its task within 60 s; seen: {:?}; \
+                     connections to the configured endpoint: {}",
+                    hop.providers.seen.lock().clone(),
+                    hop.endpoint.connections()
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        }
+
+        /// Stores an hourly agent job owned by [`TARGET`] and returns its id.
+        fn add_target_agent_job(hop: &Hop) -> String {
+            crate::cron::add_agent_job(
+                &hop.config,
+                TARGET,
+                Some("target-agent-job".to_string()),
+                crate::cron::Schedule::Every {
+                    every_ms: 3_600_000,
+                },
+                "say hello",
+                crate::cron::SessionTarget::Isolated,
+                None,
+                None,
+                false,
+                Some(Vec::new()),
+                true,
+            )
+            .unwrap()
+            .id
+        }
+
         /// `send_message_to_peer` rebuilt for the target relays to a peer agent
         /// whose turn runs detached from the delegated turn. That turn must
         /// still resolve through the caller's binding and principal.
@@ -21649,95 +21798,11 @@ target = "memory_recall"
                     "send_message_to_peer",
                     true,
                     HopMemory::Recording,
-                    |config, url| {
-                        use zeroclaw_config::multi_agent::{AgentAlias, PeerGroupConfig};
-                        route_agent_to(config, PEER, url);
-                        config.risk_profiles.insert(
-                            "peer".to_string(),
-                            zeroclaw_config::schema::RiskProfileConfig::default(),
-                        );
-                        config.agents.insert(
-                            PEER.to_string(),
-                            AliasedAgentConfig {
-                                channels: vec![PEER_CHANNEL.into()],
-                                model_provider: "ollama.peer_recipient".into(),
-                                risk_profile: "peer".into(),
-                                ..AliasedAgentConfig::default()
-                            },
-                        );
-                        config
-                            .agents
-                            .get_mut(TARGET)
-                            .expect("the fixture configures the target")
-                            .channels = vec![PEER_CHANNEL.into()];
-                        config.peer_groups.insert(
-                            "rebuilt-relay".to_string(),
-                            PeerGroupConfig {
-                                channel: "telegram".into(),
-                                agents: vec![AgentAlias::new(TARGET), AgentAlias::new(PEER)],
-                                ..PeerGroupConfig::default()
-                            },
-                        );
-                    },
+                    configure_peer_relay,
                 )
                 .await;
 
-                let result = run_target(
-                    &hop,
-                    "send_message_to_peer",
-                    json!({
-                        "channel": PEER_CHANNEL,
-                        "target": PEER,
-                        "message": "post a one-line status",
-                    }),
-                )
-                .await;
-                assert!(
-                    result.output.contains("task_id="),
-                    "precondition: the rebuilt send_message_to_peer accepted the relay for \
-                     in-process delivery; delegate output: {}",
-                    result.output
-                );
-
-                // The relayed turn is detached: wait until the relay settles
-                // its task, which happens only after the whole turn returned,
-                // so every request it made is counted below.
-                let task_id: String = result
-                    .output
-                    .split_once("task_id=")
-                    .map(|(_, rest)| {
-                        rest.chars()
-                            .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
-                            .collect()
-                    })
-                    .filter(|id: &String| !id.is_empty())
-                    .expect("the accepted relay names its task");
-                let control_plane = match crate::control_plane::control_plane().cloned() {
-                    Some(handle) => handle,
-                    None => crate::control_plane::non_daemon_control_plane(&hop.config.data_dir)
-                        .await
-                        .expect("the relay's control plane opens"),
-                };
-                let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
-                loop {
-                    let snapshot = control_plane
-                        .store
-                        .get_snapshot(&task_id)
-                        .await
-                        .expect("the relay's task is queryable")
-                        .expect("the relay's task is registered in the control plane");
-                    if snapshot.task.status.is_terminal() {
-                        break;
-                    }
-                    assert!(
-                        tokio::time::Instant::now() < deadline,
-                        "the relayed turn did not settle its task within 60 s; seen: {:?}; \
-                         connections to the configured endpoint: {}",
-                        hop.providers.seen.lock().clone(),
-                        hop.endpoint.connections()
-                    );
-                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-                }
+                let _settled = relay_to_peer(&hop).await;
 
                 let principal = caller_principal();
                 let seen = hop.providers.seen.lock().clone();
@@ -21755,6 +21820,266 @@ target = "memory_recall"
                 assert_eq!(
                     connections, 0,
                     "the relayed turn must not build {PEER}'s configured provider"
+                );
+            });
+        }
+
+        // The tests below give the binding a source that refuses. A rebuilt
+        // tool that fell back to config once its source refused would run the
+        // child anyway, on the target's configured endpoint, so each asserts
+        // that the work fails, that nothing reaches that endpoint, and that no
+        // reply comes back.
+
+        /// The caller's provider source refuses the target: the rebuilt
+        /// `spawn_subagent`'s child fails with the source's refusal instead of
+        /// building the target's configured provider.
+        #[test]
+        fn bounded_rebuilt_spawn_subagent_refused_provider_fails_child_without_config_fallback() {
+            on_deep_stack(async {
+                let hop = hop_with_sources(
+                    "spawn_subagent",
+                    true,
+                    HopProviders::Refusing,
+                    HopMemory::Recording,
+                    |_, _| {},
+                )
+                .await;
+                let SpawnRun {
+                    result,
+                    child,
+                    probe,
+                } = run_spawn(&hop).await;
+                assert_eq!(
+                    probe.refusal, None,
+                    "precondition: the hop itself is not refused; delegate output: {}",
+                    result.output
+                );
+                assert!(
+                    child.is_some(),
+                    "precondition: the rebuilt spawn_subagent started its child run; \
+                     delegate output: {}",
+                    result.output
+                );
+                assert!(
+                    result.output.contains("subagent run failed")
+                        && result.output.contains(REFUSAL),
+                    "the child fails with the provider source's refusal; delegate output: {}",
+                    result.output
+                );
+                assert!(
+                    !result.output.contains(STUB_REPLY),
+                    "no reply comes back; delegate output: {}",
+                    result.output
+                );
+                assert_eq!(
+                    hop.endpoint.connections(),
+                    0,
+                    "a refused child must not fall back to {TARGET}'s configured provider; \
+                     delegate output: {}",
+                    result.output
+                );
+            });
+        }
+
+        /// The caller's memory source cannot open the target's memory, in a
+        /// session without an owner: the rebuilt `spawn_subagent`'s child
+        /// fails instead of opening the memory the target's config names.
+        /// (With an owner the hop is refused before its registry is sealed,
+        /// which `..._owned_refuses_when_target_memory_fails` covers.)
+        #[test]
+        fn bounded_rebuilt_spawn_subagent_unowned_failing_memory_fails_child_without_config_fallback()
+         {
+            on_deep_stack(async {
+                let hop = hop("spawn_subagent", true, HopMemory::Failing, |_, _| {}).await;
+                let SpawnRun {
+                    result,
+                    child,
+                    probe,
+                } = run_spawn(&hop).await;
+                assert_eq!(
+                    probe.refusal, None,
+                    "precondition: the unowned hop is not refused; delegate output: {}",
+                    result.output
+                );
+                assert!(
+                    child.is_some(),
+                    "precondition: the rebuilt spawn_subagent started its child run; \
+                     delegate output: {}",
+                    result.output
+                );
+                assert!(
+                    result.output.contains("subagent run failed"),
+                    "the child fails when its memory cannot be opened; delegate output: {}",
+                    result.output
+                );
+                assert!(
+                    !result.output.contains(STUB_REPLY),
+                    "no reply comes back; delegate output: {}",
+                    result.output
+                );
+                assert_eq!(
+                    hop.endpoint.connections(),
+                    0,
+                    "nothing reaches {TARGET}'s configured provider; delegate output: {}",
+                    result.output
+                );
+            });
+        }
+
+        /// The caller's provider source refuses the recipient: the relayed
+        /// turn of the rebuilt `send_message_to_peer` ends as a failed task
+        /// that names the refusal, and never builds the recipient's
+        /// configured provider.
+        #[test]
+        fn bounded_rebuilt_send_message_to_peer_refused_provider_fails_relay_without_config_fallback()
+         {
+            on_deep_stack(async {
+                let hop = hop_with_sources(
+                    "send_message_to_peer",
+                    true,
+                    HopProviders::Refusing,
+                    HopMemory::Recording,
+                    configure_peer_relay,
+                )
+                .await;
+                let (result, status, error) = relay_to_peer(&hop).await;
+                assert_eq!(
+                    status,
+                    crate::control_plane::TaskStatus::Failed,
+                    "the relayed turn fails; delegate output: {}",
+                    result.output
+                );
+                assert!(
+                    error.as_deref().is_some_and(|error| error.contains(REFUSAL)),
+                    "the failed task names the provider source's refusal; error: {error:?}"
+                );
+                assert_eq!(
+                    hop.endpoint.connections(),
+                    0,
+                    "a refused relay must not fall back to {PEER}'s configured provider"
+                );
+            });
+        }
+
+        /// The caller's memory source cannot open the recipient's memory: the
+        /// relayed turn fails and never builds the recipient's configured
+        /// provider.
+        #[test]
+        fn bounded_rebuilt_send_message_to_peer_failing_memory_fails_relay_without_config_fallback()
+         {
+            on_deep_stack(async {
+                let hop = hop(
+                    "send_message_to_peer",
+                    true,
+                    HopMemory::Failing,
+                    configure_peer_relay,
+                )
+                .await;
+                let (result, status, error) = relay_to_peer(&hop).await;
+                assert_eq!(
+                    status,
+                    crate::control_plane::TaskStatus::Failed,
+                    "the relayed turn fails when its memory cannot be opened; delegate \
+                     output: {}",
+                    result.output
+                );
+                assert!(
+                    error
+                        .as_deref()
+                        .is_some_and(|error| error.contains("cannot open this agent's memory")),
+                    "the failed task names the memory source's refusal; error: {error:?}"
+                );
+                assert_eq!(
+                    hop.endpoint.connections(),
+                    0,
+                    "nothing reaches {PEER}'s configured provider"
+                );
+            });
+        }
+
+        /// The caller's provider source refuses the target: the rebuilt
+        /// `cron_run`'s job ends in error, recorded as such, and never builds
+        /// the target's configured provider.
+        #[test]
+        fn bounded_rebuilt_cron_run_refused_provider_fails_job_without_config_fallback() {
+            on_deep_stack(async {
+                let hop = hop_with_sources(
+                    "cron_run",
+                    true,
+                    HopProviders::Refusing,
+                    HopMemory::Recording,
+                    |_, _| {},
+                )
+                .await;
+                let job_id = add_target_agent_job(&hop);
+
+                let result = run_target(&hop, "cron_run", json!({ "job_id": job_id })).await;
+                let runs = crate::cron::list_runs(&hop.config, &job_id, 10).unwrap();
+                assert_eq!(
+                    runs.len(),
+                    1,
+                    "precondition: the rebuilt cron_run executed {TARGET}'s job; delegate \
+                     output: {}",
+                    result.output
+                );
+                assert_eq!(
+                    runs[0].execution.as_deref(),
+                    Some("error"),
+                    "the job's run is recorded as failed; run: {:?}; delegate output: {}",
+                    runs[0],
+                    result.output
+                );
+                assert!(
+                    !result.output.contains(STUB_REPLY),
+                    "no reply comes back; delegate output: {}",
+                    result.output
+                );
+                assert_eq!(
+                    hop.endpoint.connections(),
+                    0,
+                    "a refused job must not fall back to {TARGET}'s configured provider; \
+                     delegate output: {}",
+                    result.output
+                );
+            });
+        }
+
+        /// The caller's memory source cannot open the target's memory: the
+        /// rebuilt `cron_run`'s job ends in error and never builds the
+        /// target's configured provider.
+        #[test]
+        fn bounded_rebuilt_cron_run_failing_memory_fails_job_without_config_fallback() {
+            on_deep_stack(async {
+                let hop = hop("cron_run", true, HopMemory::Failing, |_, _| {}).await;
+                let job_id = add_target_agent_job(&hop);
+
+                let result = run_target(&hop, "cron_run", json!({ "job_id": job_id })).await;
+                let runs = crate::cron::list_runs(&hop.config, &job_id, 10).unwrap();
+                assert_eq!(
+                    runs.len(),
+                    1,
+                    "precondition: the rebuilt cron_run executed {TARGET}'s job; delegate \
+                     output: {}",
+                    result.output
+                );
+                assert_eq!(
+                    runs[0].execution.as_deref(),
+                    Some("error"),
+                    "the job's run is recorded as failed when its memory cannot be opened; \
+                     run: {:?}; delegate output: {}",
+                    runs[0],
+                    result.output
+                );
+                assert!(
+                    !result.output.contains(STUB_REPLY),
+                    "no reply comes back; delegate output: {}",
+                    result.output
+                );
+                assert_eq!(
+                    hop.endpoint.connections(),
+                    0,
+                    "nothing reaches {TARGET}'s configured provider; delegate output: {}",
+                    result.output
                 );
             });
         }
