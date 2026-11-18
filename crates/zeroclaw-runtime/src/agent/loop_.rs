@@ -277,7 +277,7 @@ fn effort_turn_route(
     }))
 }
 
-fn effort_scoped_provider_config(
+pub(super) fn effort_scoped_provider_config(
     config: &Config,
     allowed_provider_refs: &HashSet<String>,
 ) -> Box<Config> {
