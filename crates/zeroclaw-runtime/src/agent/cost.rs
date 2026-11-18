@@ -263,6 +263,8 @@ fn unpriced_usage(
     let cached_input_tokens = cached_input_tokens.min(input_tokens);
     let cache_creation_input_tokens =
         cache_creation_input_tokens.min(input_tokens.saturating_sub(cached_input_tokens));
+    // A zero cache-read rate uses the standard input price.
+    let cached_rate_applies = rates.cached_input_per_mtok.is_some_and(|rate| rate > 0.0);
     let write_rate_applies = rates.cache_write_per_mtok.is_some_and(|rate| rate > 0.0);
     let uncached_input_tokens = input_tokens.saturating_sub(cached_input_tokens);
     let ordinary_input_tokens = uncached_input_tokens.saturating_sub(if write_rate_applies {
@@ -277,7 +279,7 @@ fn unpriced_usage(
             unpriced.dimensions.push("input");
         }
     }
-    if rates.cached_input_per_mtok.is_none() && rates.input_per_mtok.is_none() {
+    if !cached_rate_applies && rates.input_per_mtok.is_none() {
         unpriced.tokens = unpriced.tokens.saturating_add(cached_input_tokens);
         if cached_input_tokens > 0 {
             unpriced.dimensions.push("cached_input");
@@ -1206,12 +1208,22 @@ mod tests {
             cached_input_per_mtok: Some(0.0),
             cache_write_per_mtok: None,
         };
-        assert_eq!(unpriced_tokens_for_usage(cached_only, 100, 100, 0), 0);
-        assert_eq!(unpriced_tokens_for_usage(cached_only, 100, 99, 0), 1);
+        assert_eq!(unpriced_tokens_for_usage(cached_only, 100, 100, 0), 100);
+        assert_eq!(unpriced_tokens_for_usage(cached_only, 100, 99, 0), 100);
+        assert_eq!(
+            unpriced_usage(cached_only, 100, 100, 0, 0).dimensions,
+            vec!["cached_input"]
+        );
         assert_eq!(
             unpriced_usage(cached_only, 100, 0, 99, 0).dimensions,
             vec!["input"]
         );
+
+        let cached_at_own_rate = ModelRates {
+            cached_input_per_mtok: Some(2.0),
+            ..cached_only
+        };
+        assert_eq!(unpriced_tokens_for_usage(cached_at_own_rate, 100, 99, 0), 1);
 
         let write_priced = ModelRates {
             input_per_mtok: None,
@@ -1978,6 +1990,60 @@ mod tests {
         assert!(!records[1].usage.pricing_available);
         assert_eq!(records[1].usage.total_tokens, 150);
         assert_eq!(records[1].usage.unpriced_tokens, 150);
+    }
+
+    #[tokio::test]
+    async fn cached_price_fallback_persists_missing_input_pricing() {
+        let workspace = tempfile::tempdir().unwrap();
+        let tracker = Arc::new(CostTracker::new(Default::default(), workspace.path()).unwrap());
+        let ctx = ToolLoopCostTrackingContext::new(Arc::clone(&tracker), Arc::default());
+        let usage = zeroclaw_providers::traits::TokenUsage {
+            input_tokens: Some(100),
+            output_tokens: Some(0),
+            cached_input_tokens: Some(100),
+            cache_creation_input_tokens: None,
+        };
+
+        TOOL_LOOP_COST_TRACKING_CONTEXT
+            .scope(Some(ctx), async {
+                for (model, rate) in [
+                    ("missing-input", None),
+                    ("free-input", Some(0.0)),
+                    ("paid-input", Some(2.0)),
+                ] {
+                    let rates = ModelRates {
+                        input_per_mtok: rate,
+                        cached_input_per_mtok: Some(0.0),
+                        ..ModelRates::default()
+                    };
+                    record_tool_loop_cost_usage_inner_with_live(
+                        "example",
+                        model,
+                        &usage,
+                        true,
+                        Some(rates),
+                    )
+                    .expect("cached usage must be recorded");
+                }
+            })
+            .await;
+
+        let stored = std::fs::read_to_string(workspace.path().join("state/costs.jsonl")).unwrap();
+        let records: Vec<zeroclaw_config::cost::types::CostRecord> = stored
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(records.len(), 3);
+        for (record, (unpriced, cost)) in records.iter().zip([(100, 0.0), (0, 0.0), (0, 0.0002)]) {
+            assert_eq!(record.usage.unpriced_tokens, unpriced);
+            assert_eq!(record.usage.pricing_available, unpriced == 0);
+            assert!((record.usage.cost_usd - cost).abs() < 1e-12);
+        }
+        let month_by_model = tracker.get_current_month_model_stats().unwrap();
+        let warnings = unpriced_models_in_summary(&month_by_model);
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].model, "missing-input");
+        assert_eq!(warnings[0].unpriced_tokens, 100);
     }
 
     #[test]
