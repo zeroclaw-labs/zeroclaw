@@ -168,6 +168,18 @@ where
 
 #[async_trait]
 impl Tool for WasmTool {
+    /// A dispatch-granted plugin starts turns on other agents. Wake dispatch
+    /// carries the caller's identity into that turn but not its live agent and
+    /// tool selectors, so a restricted principal must not hold the tool. This
+    /// matches `send_message_to_peer` and stays until `dispatch.wake` enforces
+    /// the caller's live authority itself. Plugins without the grant are
+    /// unaffected.
+    fn requires_unrestricted_principal(&self) -> bool {
+        self.scope
+            .grants()
+            .allows(crate::PluginPermission::AgentDispatch)
+    }
+
     fn name(&self) -> &str {
         &self.name
     }
@@ -239,6 +251,39 @@ mod tests {
         assert_eq!(tool.scope.id().package(), "fixture");
         assert_eq!(tool.scope.id().capability(), PluginCapability::Tool);
         assert_eq!(tool.scope.id().binding(), "redaction-primary");
+    }
+
+    /// Only a dispatch grant marks the adapter: it starts turns on other agents
+    /// without carrying the caller's live selectors, so restricted principals
+    /// must not hold it. An ordinary plugin keeps the default.
+    #[test]
+    fn only_a_dispatch_grant_requires_an_unrestricted_principal() {
+        let build = |scope| {
+            WasmTool::new(
+                "probe".to_string(),
+                "probe".to_string(),
+                serde_json::json!({}),
+                component(),
+                scope,
+                crate::services::test_host_services(),
+                crate::component::test_limits(1_000),
+            )
+            .expect("tool scope matches adapter")
+        };
+
+        assert!(
+            !build(tool_scope()).requires_unrestricted_principal(),
+            "an ordinary plugin stays available to restricted principals"
+        );
+        let dispatching = crate::instance::test_scope(
+            PluginCapability::Tool,
+            "redaction-primary",
+            [crate::PluginPermission::AgentDispatch],
+        );
+        assert!(
+            build(dispatching).requires_unrestricted_principal(),
+            "a dispatch-granted plugin starts turns on other agents"
+        );
     }
 
     #[test]

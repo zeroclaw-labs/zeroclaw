@@ -503,6 +503,15 @@ Every call passes five host-owned checks before spawning a turn:
    against `AgentExecutionCapability`, record a durable `TaskRecord`, and run
    under `InternalPrincipal::PluginTool`.
 
+**Restricted principals do not receive dispatch-capable tools.** A wake carries
+the caller's identity into the target turn as attribution, but not the caller's
+live agent and tool selectors. A tool instance holding `agent_dispatch`
+therefore reports `requires_unrestricted_principal`, like `send_message_to_peer`.
+Non-admin RPC sessions and other restricted principal postures withhold it even
+when their tool selectors name it. Plugins without `agent_dispatch` are not
+affected. This restriction stays in place until `dispatch.wake` can enforce the
+caller's live authority in the target turn.
+
 ### `inbound`
 
 `wit/v0/inbound.wit` is imported by the `channel-plugin` world. A channel plugin

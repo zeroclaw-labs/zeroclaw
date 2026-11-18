@@ -1796,18 +1796,19 @@ mod tests {
         (root, plugin_manifest)
     }
 
-    /// The real component boundary: a compiled `tool` guest calls
-    /// `dispatch.wake`, and the host answers through
-    /// [`RuntimeAgentWakeBackend`] rather than a recording stub.
-    ///
-    /// This is the only test that pins the *seam* instead of the backend: the
-    /// grant, the frame, the shape validation and the caller attribution all
-    /// live in `zeroclaw-plugins`, and what crosses into this module is exactly
-    /// what an installed plugin would send.
+    /// A [`WasmTool`] over the compiled dispatch fixture, granted
+    /// `agent-dispatch` and wired to a real [`RuntimeAgentWakeBackend`] whose
+    /// operator grant names `recipient`. The guards keep the staged package,
+    /// control plane and plugin state alive for the caller.
     #[cfg(feature = "plugins-wasm-cranelift")]
-    #[tokio::test]
-    async fn wasm_tool_dispatch_reaches_the_runtime_backend_end_to_end() {
-        use zeroclaw_api::tool::Tool as _;
+    struct DispatchFixture {
+        tool: zeroclaw_plugins::wasm_tool::WasmTool,
+        store: Arc<dyn TaskRegistry>,
+        _guards: [tempfile::TempDir; 3],
+    }
+
+    #[cfg(feature = "plugins-wasm-cranelift")]
+    fn dispatch_fixture_tool() -> DispatchFixture {
         use zeroclaw_plugins::component::PluginLimits;
         use zeroclaw_plugins::config::{PluginConfigResolver, resolve_plugin_config};
         use zeroclaw_plugins::host::{AdmittedComponent, PluginHost};
@@ -1879,6 +1880,31 @@ mod tests {
         )
         .expect("a dispatch-granted scope instantiates the importing component")
         .with_caller_alias("alpha");
+        DispatchFixture {
+            tool,
+            store,
+            _guards: [root, workspace, state_dir],
+        }
+    }
+
+    /// The real component boundary: a compiled `tool` guest calls
+    /// `dispatch.wake`, and the host answers through
+    /// [`RuntimeAgentWakeBackend`] rather than a recording stub.
+    ///
+    /// This is the only test that pins the *seam* instead of the backend: the
+    /// grant, the frame, the shape validation and the caller attribution all
+    /// live in `zeroclaw-plugins`, and what crosses into this module is exactly
+    /// what an installed plugin would send.
+    #[cfg(feature = "plugins-wasm-cranelift")]
+    #[tokio::test]
+    async fn wasm_tool_dispatch_reaches_the_runtime_backend_end_to_end() {
+        use zeroclaw_api::tool::Tool as _;
+
+        let DispatchFixture {
+            tool,
+            store,
+            _guards,
+        } = dispatch_fixture_tool();
         assert_eq!(tool.name(), "dispatch_fixture");
 
         let result = tool
@@ -1919,6 +1945,76 @@ mod tests {
             tasks_for(store.as_ref(), "recipient").await.len(),
             1,
             "a refused wake registers nothing further"
+        );
+    }
+
+    /// The principal boundary at the real Agent/WASM seam: dispatch carries the
+    /// caller's identity into the target turn but not its live agent and tool
+    /// selectors, so the non-admin posture must withhold a dispatch-granted
+    /// plugin even when an explicit tool ceiling names it.
+    ///
+    /// An unrestricted Agent first runs the compiled guest and completes one
+    /// target turn, proving the tool is live. After the restricted posture is
+    /// applied, the same dispatch must be unreachable and register nothing.
+    #[cfg(feature = "plugins-wasm-cranelift")]
+    #[tokio::test]
+    async fn restricted_principal_posture_withholds_dispatch_capable_plugin() {
+        use crate::agent::{Agent, SteeringPosture, dispatcher::NativeToolDispatcher};
+        use crate::composition::test_support::StubProvider;
+        use crate::tools::scoped::ScopedToolRegistry;
+        use zeroclaw_api::tool::Tool as _;
+
+        let DispatchFixture {
+            tool,
+            store,
+            _guards,
+        } = dispatch_fixture_tool();
+        let tool_name = tool.name().to_string();
+        assert!(
+            tool.requires_unrestricted_principal(),
+            "a dispatch-granted plugin is marked for unrestricted principals only"
+        );
+
+        let workspace = tempfile::TempDir::new().expect("agent workspace");
+        let mut agent = Agent::builder()
+            .model_provider(Box::new(StubProvider))
+            .tools(ScopedToolRegistry::from_raw_for_test(vec![Box::new(tool)]))
+            .memory(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
+            .observer(Arc::new(crate::observability::NoopObserver {}))
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(workspace.path().to_path_buf())
+            .build()
+            .expect("agent builds");
+        let args = serde_json::json!({"target": "recipient", "prompt": "crossbar is up"});
+
+        // Unrestricted: the guest runs and the target turn completes.
+        let result = agent
+            .execute_tool_for_test(&tool_name, args.clone())
+            .await
+            .expect("an unrestricted Agent holds the dispatch plugin")
+            .expect("the guest returns a tool result, not a trap");
+        assert!(result.success, "the admitted wake must succeed: {result:?}");
+        let tasks = tasks_for(store.as_ref(), "recipient").await;
+        assert_eq!(tasks.len(), 1, "the unrestricted wake registered one task");
+        await_terminal(store.as_ref(), &tasks[0].id).await;
+
+        // Restricted: an explicit ceiling naming the tool does not restore it.
+        agent.apply_principal_tool_posture(SteeringPosture {
+            tool_ceiling: Some(vec![tool_name.clone()]),
+            disable_principal_unaware_nested_tools: true,
+            withhold_unrestricted_tools: true,
+        });
+        assert!(
+            agent
+                .execute_tool_for_test(&tool_name, args)
+                .await
+                .is_none(),
+            "a restricted principal must not reach a dispatch-capable plugin"
+        );
+        assert_eq!(
+            tasks_for(store.as_ref(), "recipient").await.len(),
+            1,
+            "the refused dispatch registers no further target task"
         );
     }
 

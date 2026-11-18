@@ -359,7 +359,10 @@ for configured agents: bind `wit/v0` with `features: ["plugins-wit-v0",
 "plugins-wit-v0-dispatch"]` and call `zeroclaw::plugin::dispatch::wake`.
 Declaring `agent_dispatch` seeds an empty instance row on install, and every
 target still stays denied until an operator adds aliases (or `"*"`) to
-`plugins.entries.<key>.dispatch_agents`.
+`plugins.entries.<key>.dispatch_agents`. A dispatch-capable tool is available
+only to unrestricted principals: non-admin RPC sessions do not receive it, even
+when their tool selectors name it, because a wake does not carry the caller's
+agent and tool restrictions into the target turn.
 
 ### Tools that call the network
 
