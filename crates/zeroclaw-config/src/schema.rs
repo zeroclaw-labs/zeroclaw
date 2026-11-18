@@ -9276,10 +9276,17 @@ mod scoped_credential_source_tests {
 
 impl ScopedHttpCredential {
     pub fn https_origin(raw: &str) -> Option<String> {
-        let url = url::Url::parse(raw).ok()?;
+        let mut url = url::Url::parse(raw).ok()?;
         if url.scheme() != "https" || !url.username().is_empty() || url.password().is_some() {
             return None;
         }
+        // Match the HTTP destination policy's DNS-root normalization before
+        // the encrypted record is saved and whenever an origin is compared.
+        let host = url.host_str()?.trim_end_matches('.').to_string();
+        if host.is_empty() {
+            return None;
+        }
+        url.set_host(Some(&host)).ok()?;
         Some(url.origin().ascii_serialization())
     }
 
@@ -55528,5 +55535,31 @@ mod scoped_credential_dirty_paths {
         let aliases = &document["http_request"]["scoped_credentials"];
         assert!(aliases.get("TEST-KEY").is_none());
         assert_eq!(aliases["TEST_KEY"].as_str(), Some("neighbor"));
+    }
+}
+
+#[cfg(test)]
+mod scoped_http_origin_regressions {
+    use super::ScopedHttpCredential;
+
+    #[test]
+    fn trailing_dns_root_dots_share_the_runtime_http_origin() {
+        for (raw, expected) in [
+            ("https://API.EXAMPLE.COM./", "https://api.example.com"),
+            (
+                "https://api.example.com...:8443/",
+                "https://api.example.com:8443",
+            ),
+            ("https://[::1]:8443/", "https://[::1]:8443"),
+        ] {
+            assert_eq!(
+                ScopedHttpCredential::configured_https_origin(raw).as_deref(),
+                Some(expected)
+            );
+        }
+        assert!(
+            ScopedHttpCredential::configured_https_origin("https://api.example.com./v1").is_none()
+        );
+        assert!(ScopedHttpCredential::https_origin("https://./").is_none());
     }
 }
