@@ -171,7 +171,8 @@ write selector. A rejected batch saves none of its changes.
 
 Authenticated response redaction inspects decoded JSON strings in ordinary
 JSON and wrapped or streamed replies, including JSONP and NDJSON, alongside
-literal values in text. Malformed quotation runs are scanned in linear time.
+literal values in text. Malformed quotation runs are scanned in linear time. Undecodable quoted
+spans and incomplete escaped tails are omitted rather than exposed.
 This does not make remote content trusted instructions.
 
 ### AnySearch provider
