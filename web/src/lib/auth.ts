@@ -58,6 +58,10 @@ export const AUTH_EVENTS = {
 } as const;
 
 let oidcSession: OidcSession | null = null;
+// A sign-out invalidates session checks already in flight, even if this tab
+// was waiting for its first session and still holds none.
+let signOutGeneration = 0;
+
 // The session expired and the page waits for a new sign-in. Sockets and
 // streams don't retry on a timer meanwhile: every attempt would be refused.
 let reauthPending = false;
@@ -79,6 +83,11 @@ export function getAuthMode(): AuthMode {
 /** The signed-in OIDC session, or null in pairing mode. */
 export function getOidcSession(): OidcSession | null {
   return oidcSession;
+}
+
+/** Changes whenever the tab is signed out, including by a broadcast. */
+export function getSignOutGeneration(): number {
+  return signOutGeneration;
 }
 
 /** The principal of the last session this page held, or null if it held none. */
@@ -104,6 +113,7 @@ export function markReauthPending(pending: boolean): void {
 export function setOidcSession(session: OidcSession | null, offsetMs = 0): void {
   oidcSession = session;
   if (session) lastPrincipalId = session.principal_id;
+  else signOutGeneration += 1;
   clockOffsetMs = session ? offsetMs : 0;
   reauthPending = false;
   for (const listener of [...sessionListeners]) listener(session);

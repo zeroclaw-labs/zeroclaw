@@ -89,7 +89,7 @@ let providers: string[] = [];
 let viaRelay = false;
 // How `/api/auth/methods` fails, when a test makes it fail.
 let methodsFailure: null | "network" | number = null;
-let sessionResponse: () => Response = () => new Response("", { status: 401 });
+let sessionResponse: () => Response | Promise<Response> = () => new Response("", { status: 401 });
 // Paths whose next request meets a gateway generation that is stopping for a reload.
 let restartingOnce = new Set<string>();
 // Other API paths a test answers itself.
@@ -478,6 +478,63 @@ test("sign-out ends the session, tells other tabs, and names the provider", asyn
   assert.equal(state().isAuthenticated, false);
   assert.deepEqual(state().signOutNotice, { kind: "signed-out", provider: "corp" });
   assert.deepEqual(heard, [{ type: "signed-out" }]);
+});
+
+test("a session check from before sign-out cannot dismiss the sign-out notice", async () => {
+  providers = ["corp"];
+  sessionResponse = () => json(200, session());
+  await mountScreen();
+  assert.equal(state().isAuthenticated, true);
+  let deliver!: (response: Response) => void;
+  const pending = new Promise<Response>((resolve) => {
+    deliver = resolve;
+  });
+  let probes = 0;
+  sessionResponse = () => {
+    probes += 1;
+    return pending;
+  };
+  await fire("accessLost");
+  assert.equal(probes, 1);
+  await act(async () => {
+    await state().signOut();
+  });
+
+  await act(async () => {
+    deliver(json(200, session()));
+  });
+  assert.equal(auth.getOidcSession(), null);
+  assert.equal(state().isAuthenticated, false);
+  const notices = renderer!.root.findAllByProps({ role: "status" });
+  assert.ok(notices.some((node) =>
+    node.children.includes("You're signed out of ZeroClaw. You may still be signed in at corp."),
+  ));
+
+  sessionResponse = () => json(200, session({ csrf_token: "csrf-fresh" }));
+  await broadcast({ type: "signed-in" });
+  assert.equal(state().session?.csrf_token, "csrf-fresh");
+});
+
+test("a sign-out broadcast invalidates the pending session check during startup", async () => {
+  providers = ["corp"];
+  let deliver!: (response: Response) => void;
+  const pending = new Promise<Response>((resolve) => {
+    deliver = resolve;
+  });
+  let probes = 0;
+  sessionResponse = () => {
+    probes += 1;
+    return pending;
+  };
+  await mount();
+  assert.equal(probes, 1);
+  await broadcast({ type: "signed-out" });
+  await act(async () => {
+    deliver(json(200, session()));
+  });
+  assert.equal(state().loading, false);
+  assert.equal(state().isAuthenticated, false);
+  assert.equal(auth.getOidcSession(), null);
 });
 
 test("sign-out in another tab signs this tab out too", async () => {
