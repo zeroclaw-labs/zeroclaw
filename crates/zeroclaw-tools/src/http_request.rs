@@ -92,7 +92,11 @@ fn redact_response_body(
                 if !closed {
                     // No later quote can close a JSON string in this suffix.
                     // Copy it once; never rescan every escaped quote inside it.
-                    output.push_str(&body[start..]);
+                    if body[start..].contains('\\') {
+                        output.push_str("[REDACTED]");
+                    } else {
+                        output.push_str(&body[start..]);
+                    }
                     break;
                 }
                 let token = &body[start..cursor];
@@ -112,9 +116,10 @@ fn redact_response_body(
                 } else if is_json {
                     output.push_str(token);
                 } else {
-                    // A malformed wrapper may overlap the next opening quote.
-                    // Each span is inspected at most twice, including decoding.
-                    output.push_str(&body[start..cursor - 1]);
+                    // Rejected spans may contain recoverable escaped secrets.
+                    // Omit the ambiguous span instead of exposing it or rescanning
+                    // every interior escaped quote. Reconsider only its end.
+                    output.push_str("[REDACTED]");
                     cursor -= 1;
                 }
             }
@@ -2594,7 +2599,26 @@ api_token = "Bearer from-secret"
         let escaped = r#"\""#.repeat(200_000);
         for body in [format!("\"{escaped}"), format!("callback(\"{escaped}\")")] {
             let output = redact_response_body(body.clone(), &str::to_owned, true);
-            assert_eq!(output, body);
+            if body.starts_with("callback") {
+                assert_eq!(output, body);
+            } else {
+                assert_eq!(output, "[REDACTED]");
+            }
+        }
+    }
+
+    #[test]
+    fn authenticated_rejected_quoted_spans_fail_closed() {
+        for body in [
+            r#"log: "bad\q \"\u0073ecret123""#,
+            r#""\q\"\u0073ecret123 ""#,
+            r#"log: "\u0073ecret123"#,
+        ] {
+            let output =
+                redact_response_body(body.into(), &|s| s.replace("secret123", "[REDACTED]"), true);
+            assert!(!output.contains("secret123"));
+            assert!(!output.contains(r"\u0073ecret123"));
+            assert!(output.contains("[REDACTED]"));
         }
     }
 
