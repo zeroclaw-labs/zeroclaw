@@ -49,6 +49,7 @@ struct RetrievalCacheKey {
     namespace: Option<String>,
     since: Option<String>,
     until: Option<String>,
+    prompt_only: bool,
 }
 
 impl RetrievalCacheKey {
@@ -67,6 +68,7 @@ impl RetrievalCacheKey {
             namespace: namespace.map(str::to_string),
             since: since.map(str::to_string),
             until: until.map(str::to_string),
+            prompt_only: false,
         }
     }
 }
@@ -214,16 +216,25 @@ impl RetrievalPipeline {
         limit: usize,
         session_id: Option<&str>,
         namespace: Option<&str>,
-        since: Option<&str>,
-        until: Option<&str>,
+        window: (Option<&str>, Option<&str>),
+        prompt_only: bool,
     ) -> anyhow::Result<Vec<MemoryEntry>> {
+        let (since, until) = window;
         if !self.config.cache_enabled {
             return self
-                .backend_recall(query, limit, session_id, namespace, since, until)
+                .backend_recall(
+                    query,
+                    limit,
+                    session_id,
+                    namespace,
+                    (since, until),
+                    prompt_only,
+                )
                 .await;
         }
 
-        let ck = Self::cache_key(query, limit, session_id, namespace, since, until);
+        let mut ck = Self::cache_key(query, limit, session_id, namespace, since, until);
+        ck.prompt_only = prompt_only;
         if let Some(cached) = self.check_cache(&ck) {
             ::zeroclaw_log::record!(
                 DEBUG,
@@ -238,7 +249,14 @@ impl RetrievalPipeline {
         // mutation turns the eventual store into a no-op (store_in_cache_if_current).
         let generation = self.generation.load(Ordering::SeqCst);
         let results = self
-            .backend_recall(query, limit, session_id, namespace, since, until)
+            .backend_recall(
+                query,
+                limit,
+                session_id,
+                namespace,
+                (since, until),
+                prompt_only,
+            )
             .await?;
         if !results.is_empty() {
             self.store_in_cache_if_current(ck, results.clone(), generation);
@@ -253,9 +271,16 @@ impl RetrievalPipeline {
         limit: usize,
         session_id: Option<&str>,
         namespace: Option<&str>,
-        since: Option<&str>,
-        until: Option<&str>,
+        window: (Option<&str>, Option<&str>),
+        prompt_only: bool,
     ) -> anyhow::Result<Vec<MemoryEntry>> {
+        let (since, until) = window;
+        if prompt_only {
+            return self
+                .memory
+                .recall_for_prompt(query, limit, session_id)
+                .await;
+        }
         match namespace {
             Some(ns) => {
                 self.memory
@@ -280,7 +305,7 @@ impl RetrievalPipeline {
         since: Option<&str>,
         until: Option<&str>,
     ) -> anyhow::Result<Vec<MemoryEntry>> {
-        self.cached_recall(query, limit, session_id, namespace, since, until)
+        self.cached_recall(query, limit, session_id, namespace, (since, until), false)
             .await
     }
 
@@ -325,6 +350,18 @@ impl Memory for RetrievalPipeline {
             .await;
         self.invalidate_cache();
         result
+    }
+
+    async fn recall_for_prompt_for_principal(
+        &self,
+        scope: &PrincipalScope,
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        self.memory
+            .recall_for_prompt_for_principal(scope, query, limit, session_id)
+            .await
     }
 
     async fn recall_for_principal(
@@ -428,6 +465,28 @@ impl Memory for RetrievalPipeline {
         result
     }
 
+    async fn recall_for_prompt(
+        &self,
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        self.cached_recall(query, limit, session_id, None, (None, None), true)
+            .await
+    }
+
+    async fn recall_for_prompt_for_agents(
+        &self,
+        allowed_agent_ids: &[&str],
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        self.memory
+            .recall_for_prompt_for_agents(allowed_agent_ids, query, limit, session_id)
+            .await
+    }
+
     async fn recall(
         &self,
         query: &str,
@@ -436,7 +495,7 @@ impl Memory for RetrievalPipeline {
         since: Option<&str>,
         until: Option<&str>,
     ) -> anyhow::Result<Vec<MemoryEntry>> {
-        self.cached_recall(query, limit, session_id, None, since, until)
+        self.cached_recall(query, limit, session_id, None, (since, until), false)
             .await
     }
 
@@ -602,8 +661,15 @@ impl Memory for RetrievalPipeline {
         since: Option<&str>,
         until: Option<&str>,
     ) -> anyhow::Result<Vec<MemoryEntry>> {
-        self.cached_recall(query, limit, session_id, Some(namespace), since, until)
-            .await
+        self.cached_recall(
+            query,
+            limit,
+            session_id,
+            Some(namespace),
+            (since, until),
+            false,
+        )
+        .await
     }
 
     async fn export(&self, filter: &ExportFilter) -> anyhow::Result<Vec<MemoryEntry>> {

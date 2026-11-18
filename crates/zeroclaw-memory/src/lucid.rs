@@ -405,6 +405,18 @@ impl Memory for LucidMemory {
         Ok(())
     }
 
+    async fn recall_for_prompt_for_agents(
+        &self,
+        allowed_agent_ids: &[&str],
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        self.local
+            .recall_for_prompt_for_agents(allowed_agent_ids, query, limit, session_id)
+            .await
+    }
+
     async fn recall(
         &self,
         query: &str,

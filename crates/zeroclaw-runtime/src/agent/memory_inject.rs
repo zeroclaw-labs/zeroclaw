@@ -279,7 +279,7 @@ pub async fn render_memory_context(
     let query_summary = make_query_summary(user_msg);
 
     // Over-fetch a larger candidate pool only when reranking is enabled;
-    // otherwise recall exactly `limit` so the default path is unchanged.
+    // otherwise recall exactly `limit` prompt candidates, not archive rows.
     let recall_limit = if cfg.rerank_enabled {
         let requested_pool = cfg
             .limit
@@ -303,7 +303,7 @@ pub async fn render_memory_context(
     };
     for session_id in scopes {
         match mem
-            .recall(user_msg, recall_limit, *session_id, None, None)
+            .recall_for_prompt(user_msg, recall_limit, *session_id)
             .await
         {
             Ok(recalled) => {
@@ -1226,6 +1226,305 @@ mod tests {
             &[(1, true), (1, true)],
             "both renders emit a MemoryRecall event"
         );
+    }
+
+    /// Real SQLite, its production decorators, and the default rerank-off
+    /// renderer: generic recall remains archival; prompt slots belong to facts.
+    #[tokio::test]
+    async fn sqlite_autosaves_do_not_crowd_out_prompt_facts() {
+        use std::sync::Arc;
+        use zeroclaw_memory::{
+            AgentScopedMemory, AuditedMemory, RetrievalConfig, RetrievalPipeline, ScannedMemory,
+            SqliteMemory,
+        };
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sqlite = SqliteMemory::new("prompt-regression", tmp.path()).unwrap();
+        let own = sqlite.ensure_agent_uuid("own").await.unwrap();
+        let other = sqlite.ensure_agent_uuid("other").await.unwrap();
+        let scanned = ScannedMemory::new(
+            sqlite,
+            &zeroclaw_config::schema::MemoryPolicyConfig::default(),
+        );
+        let audited = AuditedMemory::new(scanned, tmp.path()).unwrap();
+        let storage: Arc<dyn Memory> = Arc::new(audited);
+        let scoped: Arc<dyn Memory> = Arc::new(AgentScopedMemory::new(
+            storage.clone(),
+            own,
+            Vec::<String>::new(),
+        ));
+        let memory = RetrievalPipeline::new(
+            scoped,
+            RetrievalConfig {
+                cache_enabled: true,
+                ..RetrievalConfig::default()
+            },
+        );
+        let cfg = MemoryInjectConfig::from_memory_config(
+            &zeroclaw_config::schema::MemoryConfig::default(),
+            5,
+        );
+        assert_eq!(cfg.min_relevance_score, 0.4);
+        assert!(!cfg.rerank_enabled);
+        assert_eq!(cfg.limit, 5);
+        let session = Some("prompt-session");
+        let fact = "orchid prefers shade";
+        memory
+            .store("plant_fact", fact, MemoryCategory::Core, session)
+            .await
+            .unwrap();
+        let mut keys = Vec::new();
+        // Exceed scanner refill (5 * 4) and SQLite FTS overfetch (20 * 2).
+        for _ in 0..48 {
+            let key = format!("user_msg_{}", uuid::Uuid::new_v4());
+            memory
+                .store(
+                    &key,
+                    "orchid orchid orchid",
+                    MemoryCategory::Conversation,
+                    session,
+                )
+                .await
+                .unwrap();
+            keys.push(key);
+        }
+        memory
+            .store(
+                "other_session_fact",
+                "orchid secret session",
+                MemoryCategory::Core,
+                Some("other-session"),
+            )
+            .await
+            .unwrap();
+        storage
+            .store_with_agent(
+                "other_agent_fact",
+                "orchid secret agent",
+                MemoryCategory::Core,
+                session,
+                None,
+                None,
+                Some(&other),
+            )
+            .await
+            .unwrap();
+
+        // Prime the generic cache with genuinely crowded results. This is not
+        // a fixture that assumes insertion order is the backend's ranking.
+        let crowded = Memory::recall(&memory, "orchid", cfg.limit, session, None, None)
+            .await
+            .unwrap();
+        assert_eq!(crowded.len(), cfg.limit);
+        assert!(
+            crowded
+                .iter()
+                .all(|e| zeroclaw_memory::is_user_autosave_key(&e.key))
+        );
+        let pool = Memory::recall(&memory, "orchid", 40, session, None, None)
+            .await
+            .unwrap();
+        assert_eq!(pool.len(), 40);
+        assert!(
+            pool.iter()
+                .all(|e| zeroclaw_memory::is_user_autosave_key(&e.key))
+        );
+        let all = Memory::recall(&memory, "orchid", 64, session, None, None)
+            .await
+            .unwrap();
+        let fact_score = all
+            .iter()
+            .find(|e| e.key == "plant_fact")
+            .unwrap()
+            .score
+            .unwrap();
+        assert!(
+            fact_score >= cfg.min_relevance_score,
+            "fact must pass production floor: {fact_score}"
+        );
+        assert_eq!(
+            all.iter()
+                .filter(|e| zeroclaw_memory::is_user_autosave_key(&e.key)
+                    && e.score.unwrap() > fact_score)
+                .count(),
+            48
+        );
+
+        assert!(
+            memory
+                .recall_for_prompt_for_agents(&[&other], "orchid", cfg.limit, session)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let recent = memory
+            .recall_for_prompt("*", cfg.limit, session)
+            .await
+            .unwrap();
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].key, "plant_fact");
+        let observer = RecordingObserver::default();
+        for _ in 0..2 {
+            let context = render_memory_context(
+                &memory,
+                &observer,
+                "orchid",
+                &[session],
+                &cfg,
+                false,
+                TurnMeta {
+                    parent_agent_alias: None,
+                    agent_alias: Some("own"),
+                    turn_id: "prompt-test",
+                    channel_name: "test",
+                },
+            )
+            .await;
+            assert!(
+                context.contains("plant_fact: orchid prefers shade"),
+                "{context}"
+            );
+            assert!(!context.contains("user_msg"));
+            assert!(!context.contains("orchid orchid orchid"));
+            assert!(!context.contains("other_session_fact"));
+            assert!(!context.contains("other_agent_fact"));
+        }
+        assert_eq!(
+            Memory::recall(&memory, "orchid", cfg.limit, session, None, None)
+                .await
+                .unwrap()
+                .iter()
+                .map(|e| &e.key)
+                .collect::<Vec<_>>(),
+            crowded.iter().map(|e| &e.key).collect::<Vec<_>>()
+        );
+        for key in keys {
+            let saved = memory.get(&key).await.unwrap().unwrap();
+            assert_eq!(saved.content, "orchid orchid orchid");
+            assert_eq!(saved.session_id.as_deref(), session);
+        }
+        let scope = zeroclaw_api::memory_traits::PrincipalScope::new("private-owner-é")
+            .with_agent(Some("own".into()))
+            .with_namespace(Some("notes".into()))
+            .with_tenant(Some("tenant".into()));
+        let private = zeroclaw_memory::PrincipalPlaneMemory::new(storage.clone(), scope.clone());
+        private
+            .store(
+                "private_fact",
+                "orchid prefers shade privately",
+                MemoryCategory::Core,
+                session,
+            )
+            .await
+            .unwrap();
+        // Ensure private recent-order candidates strictly postdate the fact.
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        let mut private_keys = Vec::new();
+        for _ in 0..48 {
+            let key = format!("user_msg_{}", uuid::Uuid::new_v4());
+            private
+                .store(
+                    &key,
+                    "orchid private raw message",
+                    MemoryCategory::Conversation,
+                    session,
+                )
+                .await
+                .unwrap();
+            private_keys.push(key);
+        }
+        private
+            .store(
+                "other_private_session",
+                "orchid other session",
+                MemoryCategory::Core,
+                Some("other-session"),
+            )
+            .await
+            .unwrap();
+        let foreign = zeroclaw_memory::PrincipalPlaneMemory::new(
+            storage.clone(),
+            zeroclaw_api::memory_traits::PrincipalScope::new("foreign-owner"),
+        );
+        foreign
+            .store(
+                "foreign_private_fact",
+                "orchid other owner",
+                MemoryCategory::Core,
+                session,
+            )
+            .await
+            .unwrap();
+        let crowded = private
+            .recall("orchid", 40, session, None, None)
+            .await
+            .unwrap();
+        assert_eq!(crowded.len(), 40);
+        assert!(
+            crowded
+                .iter()
+                .all(|e| zeroclaw_memory::is_user_autosave_key(&e.key))
+        );
+        let private_pipeline = RetrievalPipeline::new(
+            Arc::new(private),
+            RetrievalConfig {
+                cache_enabled: true,
+                ..RetrievalConfig::default()
+            },
+        );
+        let context = render_memory_context(
+            &private_pipeline,
+            &observer,
+            "orchid",
+            &[session],
+            &cfg,
+            false,
+            TurnMeta {
+                parent_agent_alias: None,
+                agent_alias: Some("own"),
+                turn_id: "private-test",
+                channel_name: "test",
+            },
+        )
+        .await;
+        assert!(
+            context.contains("private_fact: orchid prefers shade privately"),
+            "{context}"
+        );
+        assert!(!context.contains("user_msg"));
+        assert!(!context.contains("private raw message"));
+        assert!(!context.contains("other_private_session"));
+        assert!(!context.contains("foreign_private_fact"));
+        assert!(!context.contains("plant_fact"));
+        for key in private_keys {
+            let saved = private_pipeline.get(&key).await.unwrap().unwrap();
+            assert_eq!(saved.content, "orchid private raw message");
+            assert_eq!(saved.principal_id.as_deref(), Some("private-owner-é"));
+            assert_eq!(saved.session_id.as_deref(), session);
+        }
+        let still_crowded = Memory::recall(&private_pipeline, "orchid", 5, session, None, None)
+            .await
+            .unwrap();
+        assert_eq!(still_crowded.len(), 5);
+        assert!(
+            still_crowded
+                .iter()
+                .all(|e| zeroclaw_memory::is_user_autosave_key(&e.key))
+        );
+        for wrong_scope in [
+            scope.clone().with_agent(Some("other".into())),
+            scope.clone().with_namespace(Some("other".into())),
+            scope.clone().with_tenant(Some("other".into())),
+        ] {
+            let wrong = zeroclaw_memory::PrincipalPlaneMemory::new(storage.clone(), wrong_scope);
+            assert!(
+                wrong
+                    .recall_for_prompt("orchid", 5, session)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
     }
 
     // -- rerank stage + injection goldens --------------------------------

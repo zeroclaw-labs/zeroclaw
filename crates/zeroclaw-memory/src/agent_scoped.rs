@@ -132,26 +132,32 @@ impl AgentScopedMemory {
         query: &str,
         limit: usize,
         session_id: Option<&str>,
-        since: Option<&str>,
-        until: Option<&str>,
+        window: (Option<&str>, Option<&str>),
+        prompt_only: bool,
     ) -> Result<Vec<MemoryEntry>> {
+        let (since, until) = window;
         if limit == 0 {
             return Ok(Vec::new());
         }
 
         let mut fetch_limit = limit;
         loop {
-            let entries = self
-                .inner
-                .recall_for_agents(
-                    allowed_agent_ids,
-                    query,
-                    fetch_limit,
-                    session_id,
-                    since,
-                    until,
-                )
-                .await?;
+            let entries = if prompt_only {
+                self.inner
+                    .recall_for_prompt_for_agents(allowed_agent_ids, query, fetch_limit, session_id)
+                    .await?
+            } else {
+                self.inner
+                    .recall_for_agents(
+                        allowed_agent_ids,
+                        query,
+                        fetch_limit,
+                        session_id,
+                        since,
+                        until,
+                    )
+                    .await?
+            };
             let backend_may_have_more = entries.len() >= fetch_limit;
             let filtered = self.filter_entries(entries);
             if filtered.len() >= limit || !backend_may_have_more {
@@ -190,6 +196,18 @@ impl Memory for AgentScopedMemory {
     ) -> Result<()> {
         self.inner
             .store_for_principal(scope, key, content, category, session_id)
+            .await
+    }
+
+    async fn recall_for_prompt_for_principal(
+        &self,
+        scope: &PrincipalScope,
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+    ) -> Result<Vec<MemoryEntry>> {
+        self.inner
+            .recall_for_prompt_for_principal(scope, query, limit, session_id)
             .await
     }
 
@@ -403,6 +421,39 @@ impl Memory for AgentScopedMemory {
             .await
     }
 
+    async fn recall_for_prompt(
+        &self,
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+    ) -> Result<Vec<MemoryEntry>> {
+        let allowed = self.allowed_slice();
+        self.recall_with_category_refill(&allowed, query, limit, session_id, (None, None), true)
+            .await
+    }
+
+    async fn recall_for_prompt_for_agents(
+        &self,
+        caller_allowed: &[&str],
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+    ) -> Result<Vec<MemoryEntry>> {
+        if caller_allowed.is_empty() {
+            return self.recall_for_prompt(query, limit, session_id).await;
+        }
+        let intersected: Vec<&str> = caller_allowed
+            .iter()
+            .copied()
+            .filter(|id| self.allowed_agent_ids.contains(*id))
+            .collect();
+        if intersected.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.recall_with_category_refill(&intersected, query, limit, session_id, (None, None), true)
+            .await
+    }
+
     async fn recall(
         &self,
         query: &str,
@@ -412,7 +463,7 @@ impl Memory for AgentScopedMemory {
         until: Option<&str>,
     ) -> Result<Vec<MemoryEntry>> {
         let allowed = self.allowed_slice();
-        self.recall_with_category_refill(&allowed, query, limit, session_id, since, until)
+        self.recall_with_category_refill(&allowed, query, limit, session_id, (since, until), false)
             .await
     }
 
@@ -428,7 +479,14 @@ impl Memory for AgentScopedMemory {
         if caller_allowed.is_empty() {
             let bound: Vec<&str> = self.allowed_agent_ids.iter().map(String::as_str).collect();
             return self
-                .recall_with_category_refill(&bound, query, limit, session_id, since, until)
+                .recall_with_category_refill(
+                    &bound,
+                    query,
+                    limit,
+                    session_id,
+                    (since, until),
+                    false,
+                )
                 .await;
         }
 
@@ -440,8 +498,15 @@ impl Memory for AgentScopedMemory {
         if intersected.is_empty() {
             return Ok(Vec::new());
         }
-        self.recall_with_category_refill(&intersected, query, limit, session_id, since, until)
-            .await
+        self.recall_with_category_refill(
+            &intersected,
+            query,
+            limit,
+            session_id,
+            (since, until),
+            false,
+        )
+        .await
     }
 
     async fn get(&self, key: &str) -> Result<Option<MemoryEntry>> {
