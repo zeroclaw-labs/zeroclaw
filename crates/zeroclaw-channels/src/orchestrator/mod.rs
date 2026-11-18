@@ -14014,11 +14014,7 @@ fn build_channel_by_id(
         "voice-call" => {
             #[cfg(feature = "channel-voice-call")]
             {
-                let (alias, vc) = config
-                    .channels
-                    .voice_call
-                    .iter()
-                    .next()
+                let (alias, vc) = bare_voice_call_instance(&config)
                     .context("Voice Call channel is not configured")?;
                 Ok(Arc::new(VoiceCallChannel::new(alias.clone(), vc.clone())))
             }
@@ -14031,6 +14027,22 @@ fn build_channel_by_id(
     }
 }
 
+/// The voice-call instance a bare `voice-call` id names. Voice call has no
+/// `default` alias convention, so the one-shot builder and the off-switch
+/// check both resolve it here: the first enabled instance by alias, else the
+/// first configured one, so a setup whose only instance is off is refused by
+/// name rather than reported as missing.
+fn bare_voice_call_instance(
+    config: &Config,
+) -> Option<(&String, &zeroclaw_config::scattered_types::VoiceCallConfig)> {
+    let instances = &config.channels.voice_call;
+    instances
+        .iter()
+        .filter(|(_, vc)| vc.enabled)
+        .min_by_key(|(alias, _)| alias.as_str())
+        .or_else(|| instances.iter().min_by_key(|(alias, _)| alias.as_str()))
+}
+
 /// Send a one-off message to a configured channel.
 pub async fn send_channel_message(
     config: &Config,
@@ -14038,14 +14050,25 @@ pub async fn send_channel_message(
     recipient: &str,
     message: &str,
 ) -> Result<()> {
+    // A bare id names the instance the one-shot builder uses: `default`, or
+    // for voice call the instance `bare_voice_call_instance` picks.
+    let (channel_type, alias) = match channel_id.split_once('.') {
+        Some((channel_type, alias)) => (channel_type.to_ascii_lowercase(), alias.to_string()),
+        None => {
+            let channel_type = channel_id.to_ascii_lowercase();
+            let alias = if matches!(channel_type.as_str(), "voice-call" | "voice_call") {
+                bare_voice_call_instance(config)
+                    .map_or_else(|| "default".to_string(), |(alias, _)| alias.clone())
+            } else {
+                "default".to_string()
+            };
+            (channel_type, alias)
+        }
+    };
+    refuse_disabled_channel_instance(config, &channel_type, &alias)?;
     // Wrap into a private one-shot storage for the builder; the snapshot
     // is dropped immediately after send and never enters a supervised
     // publication domain.
-    // A bare id names the instance the one-shot builder uses, `default`.
-    let (channel_type, alias) = channel_id
-        .split_once('.')
-        .unwrap_or((channel_id, "default"));
-    refuse_disabled_channel_instance(config, &channel_type.to_ascii_lowercase(), alias)?;
     let config_arc = zeroclaw_config::live::LiveConfig::new(config.clone()).handle();
     // The builder gets first refusal so families it already resolves natively
     // (notably `linq.<alias>`) keep their established route and their own
@@ -57846,6 +57869,40 @@ Done."#;
         // No config block: left to the arm's own "not configured" error.
         refuse_disabled_channel_instance(&config, "telegram", "work")
             .expect("an unconfigured instance is not refused here");
+    }
+
+    #[tokio::test]
+    async fn a_bare_voice_call_send_honours_the_switch_of_the_instance_it_would_use() {
+        // Voice call has no `default` alias: a bare `voice-call` id names the
+        // instance the builder picks, so the switch is read from that one.
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.channels.voice_call.insert(
+            "main".to_string(),
+            zeroclaw_config::scattered_types::VoiceCallConfig {
+                enabled: false,
+                ..Default::default()
+            },
+        );
+        let err = send_channel_message(&config, "voice-call", "+15550100", "hi")
+            .await
+            .expect_err("the only voice-call instance is off");
+        assert!(
+            format!("{err:#}").contains("[channels.voice_call.main] is disabled"),
+            "{err:#}"
+        );
+
+        // An enabled instance is preferred over a disabled one.
+        config.channels.voice_call.insert(
+            "backup".to_string(),
+            zeroclaw_config::scattered_types::VoiceCallConfig {
+                enabled: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            bare_voice_call_instance(&config).map(|(alias, _)| alias.as_str()),
+            Some("backup")
+        );
     }
 
     #[tokio::test]
