@@ -493,7 +493,7 @@ test('manual playback in a second pane shows the playback busy message', async (
     await act(async () => { speaker(other).props.onClick(); });
     assert.deepEqual(spoken, ['Historical reply']);
     const alert = other.root.findByProps({ role: 'alert' });
-    assert.match(alert.children.join(''), /Voice playback is already in progress/);
+    assert.match(alert.children.join(''), /audio is busy/);
   } finally {
     await act(async () => { other.unmount(); owner.unmount(); });
   }
@@ -771,4 +771,28 @@ test('microphone waits for the initial global timeout before capture can start',
     if (renderer) await act(async () => { renderer.unmount(); });
     globalThis.fetch = originalFetch;
   }
+});
+
+
+test('dictation waits for another pane playback instead of capturing its reply', async () => {
+  const owner = await mount(); const other = await mount();
+  try {
+    await act(async () => { owner.root.findAllByType('button')[1]!.props.onClick(); });
+    await act(async () => { await other.root.findAllByType('button')[0]!.props.onClick(); });
+    assert.equal(other.root.findAllByType('button')[0]!.props['aria-pressed'], false);
+    assert.match(other.root.findByProps({role:'alert'}).children.join(''), /audio is busy/);
+  } finally { await act(async () => { other.unmount(); owner.unmount(); }); }
+});
+
+test('one pane dictation blocks narration and releases audio on capture end', async () => {
+  const recording = await mount(); const reading = await mount();
+  try {
+    await act(async () => { await recording.root.findAllByType('button')[0]!.props.onClick(); });
+    await act(async () => { reading.root.findAllByType('button')[1]!.props.onClick(); });
+    assert.deepEqual(spoken, []);
+    assert.match(reading.root.findByProps({role:'alert'}).children.join(''), /audio is busy/);
+    await act(async () => { await recording.root.findAllByType('button')[0]!.props.onClick(); });
+    await act(async () => { reading.root.findAllByType('button')[1]!.props.onClick(); });
+    assert.deepEqual(spoken, ['Historical reply']);
+  } finally { await act(async () => { reading.unmount(); recording.unmount(); }); }
 });
