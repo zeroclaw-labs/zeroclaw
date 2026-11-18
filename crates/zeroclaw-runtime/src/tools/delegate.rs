@@ -1811,7 +1811,8 @@ impl DelegateTool {
     /// why. One record per refusal, and no text from the failing source: the
     /// reason is a fixed token.
     fn bounded_tools_refusal_because(agent_name: &str, reason: Option<&'static str>) -> ToolResult {
-        ::zeroclaw_log::record!(WARN,
+        ::zeroclaw_log::record!(
+            WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
                 .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                 .with_attrs(serde_json::json!({
@@ -1819,7 +1820,8 @@ impl DelegateTool {
                     "error_kind": "bounded_tools_initialization_refused",
                     "reason": reason,
                 })),
-            "bounded delegate tool initialization refused");
+            "bounded delegate tool initialization refused"
+        );
         ToolResult {
             success: false,
             output: ToolOutput::default(),
@@ -21355,7 +21357,10 @@ target = "memory_recall"
                 &self,
                 request: &crate::composition::ProviderRequest<'_>,
             ) -> anyhow::Result<Arc<dyn ModelProvider>> {
-                self.0.providers.lock().push(request.agent_alias.to_string());
+                self.0
+                    .providers
+                    .lock()
+                    .push(request.agent_alias.to_string());
                 anyhow::bail!("{REFUSAL} {}", request.agent_alias)
             }
         }
@@ -21892,7 +21897,8 @@ target = "memory_recall"
                 let (result, _status, _error) = relay_to_peer(&hop).await;
                 assert!(
                     hop.endpoint.connections() >= 1,
-                    "an unbound delegate's relay builds {PEER}'s configured provider;                      delegate output: {}",
+                    "an unbound delegate's relay builds {PEER}'s configured provider; \
+                    delegate output: {}",
                     result.output
                 );
                 assert!(
@@ -21916,12 +21922,14 @@ target = "memory_recall"
                 assert_eq!(
                     runs.len(),
                     1,
-                    "precondition: the rebuilt cron_run executed {TARGET}'s job; delegate                      output: {}",
+                    "precondition: the rebuilt cron_run executed {TARGET}'s job; delegate \
+                    output: {}",
                     result.output
                 );
                 assert!(
                     hop.endpoint.connections() >= 1,
-                    "an unbound delegate's job builds {TARGET}'s configured provider;                      delegate output: {}",
+                    "an unbound delegate's job builds {TARGET}'s configured provider; \
+                    delegate output: {}",
                     result.output
                 );
                 assert!(
@@ -22023,8 +22031,13 @@ target = "memory_recall"
                     result.output
                 );
                 assert!(
-                    hop.refusals.memory.lock().iter().any(|alias| alias == TARGET),
-                    "the child failed because the memory source could not open {TARGET}'s                      memory; refused: {:?}",
+                    hop.refusals
+                        .memory
+                        .lock()
+                        .iter()
+                        .any(|alias| alias == TARGET),
+                    "the child failed because the memory source could not open {TARGET}'s \
+                    memory; refused: {:?}",
                     hop.refusals.memory.lock().clone()
                 );
                 assert!(
@@ -22033,7 +22046,8 @@ target = "memory_recall"
                         .lock()
                         .iter()
                         .all(|request| request.agent_alias != TARGET),
-                    "the memory source is asked before the provider source, so a refused                      memory ends the turn before any provider is requested for {}; seen: {:?}",
+                    "the memory source is asked before the provider source, so a refused \
+                    memory ends the turn before any provider is requested for {}; seen: {:?}",
                     TARGET,
                     hop.providers.seen.lock().clone()
                 );
@@ -22127,7 +22141,8 @@ target = "memory_recall"
                 );
                 assert!(
                     hop.refusals.memory.lock().iter().any(|alias| alias == PEER),
-                    "the relay failed because the memory source could not open {PEER}'s                      memory; refused: {:?}",
+                    "the relay failed because the memory source could not open {PEER}'s \
+                    memory; refused: {:?}",
                     hop.refusals.memory.lock().clone()
                 );
                 assert!(
@@ -22136,7 +22151,8 @@ target = "memory_recall"
                         .lock()
                         .iter()
                         .all(|request| request.agent_alias != PEER),
-                    "the memory source is asked before the provider source, so a refused                      memory ends the turn before any provider is requested for {}; seen: {:?}",
+                    "the memory source is asked before the provider source, so a refused \
+                    memory ends the turn before any provider is requested for {}; seen: {:?}",
                     PEER,
                     hop.providers.seen.lock().clone()
                 );
@@ -22231,8 +22247,13 @@ target = "memory_recall"
                     result.output
                 );
                 assert!(
-                    hop.refusals.memory.lock().iter().any(|alias| alias == TARGET),
-                    "the job failed because the memory source could not open {TARGET}'s                      memory; refused: {:?}",
+                    hop.refusals
+                        .memory
+                        .lock()
+                        .iter()
+                        .any(|alias| alias == TARGET),
+                    "the job failed because the memory source could not open {TARGET}'s \
+                    memory; refused: {:?}",
                     hop.refusals.memory.lock().clone()
                 );
                 assert!(
@@ -22241,7 +22262,8 @@ target = "memory_recall"
                         .lock()
                         .iter()
                         .all(|request| request.agent_alias != TARGET),
-                    "the memory source is asked before the provider source, so a refused                      memory ends the turn before any provider is requested for {}; seen: {:?}",
+                    "the memory source is asked before the provider source, so a refused \
+                    memory ends the turn before any provider is requested for {}; seen: {:?}",
                     TARGET,
                     hop.providers.seen.lock().clone()
                 );
@@ -22674,7 +22696,9 @@ target = "memory_recall"
                         } else {
                             "reopened"
                         }),
-                        "the plane pinned for the owner comes from the memory already opened                          for the target's memory tools when it has them, and is opened for the                          route otherwise"
+                        "the plane pinned for the owner comes from the memory already opened \
+                        for the target's memory tools when it has them, and is opened for the \
+                        route otherwise"
                     );
                     opened.push(
                         hop.memory
