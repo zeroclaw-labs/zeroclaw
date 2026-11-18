@@ -120,33 +120,24 @@ Quick start:
 # Persistent volume for config + workspace; ZeroClaw's data dir inside the container is /zeroclaw-data
 docker run -d --name zeroclaw `
   --restart=unless-stopped `
-  -p 42617:42617 `
+  -p 127.0.0.1:42617:42617 `
   -v zeroclaw-data:/zeroclaw-data `
   ghcr.io/zeroclaw-labs/zeroclaw:latest
 
-# Watch the first-run logs
-docker logs -f zeroclaw
+# Check health and the effective pairing setting.
+Invoke-RestMethod http://127.0.0.1:42617/health
+docker exec zeroclaw zeroclaw config get gateway.require_pairing
 
-# Health check (no auth required)
-curl http://localhost:42617/health
-
-# (Optional) pair a client. NOTE: the published image defaults to
-# `require_pairing = false`, so by default no pairing code is emitted
-# and `/api/*` accepts requests without auth. To enable pairing,
-# override the config (set `require_pairing = true` in
-# /zeroclaw-data/.zeroclaw/config.toml inside the container) and restart;
-# a one-time code is then printed to stdout on first start, after which
-# clients POST it to `/pair`:
-curl -X POST http://localhost:42617/pair -H 'X-Pairing-Code: <code-from-logs>'
+# To pair the dashboard, obtain a one-time code and enter it in the browser.
+docker exec -it zeroclaw zeroclaw gateway get-paircode --new
 ```
 
-**Image facts (verified against `ghcr.io/zeroclaw-labs/zeroclaw:latest`):**
+**Release image layout (v0.9.0):**
 
-- **Base:** `gcr.io/distroless/cc-debian13:nonroot` (release stage; the `dev` stage is `debian:trixie-slim`)
-- **`ENTRYPOINT ["zeroclaw"]`**, `CMD ["daemon"]`: running with no args starts the daemon and gateway
-- **`EXPOSE 42617`**: both the daemon and gateway listen on this port
-- **Data dir:** `/zeroclaw-data` (config: `/zeroclaw-data/.zeroclaw/config.toml`, workspace: `/zeroclaw-data/workspace`). Mount a named volume or bind here for persistence; note this is **not** `/root/.zeroclaw`.
-- **Pairing:** the published image defaults to `require_pairing = false`, so `/api/*` accepts requests without authentication out-of-the-box. When pairing is enabled (set `require_pairing = true` in `/zeroclaw-data/.zeroclaw/config.toml` and restart), the daemon prints a one-time code to stdout on first start, and clients then POST it to `/pair` with the `X-Pairing-Code` header before any authenticated endpoint will respond.
+- **Base:** `gcr.io/distroless/cc-debian13:nonroot`
+- **Startup:** the default command runs `zeroclaw daemon`, which serves the gateway on port 42617.
+- **Storage:** mount `/zeroclaw-data` to persist the config under `.zeroclaw/`, per-agent workspaces under `.zeroclaw/agents/<alias>/workspace/`, and instance databases under `data/`.
+- **Pairing:** the v0.9.0 release image uses the schema default of `true` on a fresh volume. An existing config or environment override can change it.
 - **Web dashboard:** bundled and served by default in the published image. The image sets `gateway.web_dist_dir = "/usr/share/zeroclawlabs/web/dist"` and includes the built frontend there, so the gateway serves the SPA fallback out-of-the-box. The assets live **outside** the `/zeroclaw-data` mount point so a `-v …:/zeroclaw-data` volume mount cannot shadow them (ref #6400).
 
 Build from source against the bundled Dockerfile:

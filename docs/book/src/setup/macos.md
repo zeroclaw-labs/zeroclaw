@@ -38,14 +38,15 @@ brew install zeroclaw
 
 Gets you `brew services` integration. Binary lives at `$HOMEBREW_PREFIX/bin/zeroclaw`.
 
-**Workspace location gotcha:** with Homebrew, the service user and the CLI user may be different, so the workspace lives at `$HOMEBREW_PREFIX/var/zeroclaw/` rather than `~/.zeroclaw/`. Point CLI invocations at the same workspace:
+The Homebrew service uses the data directory under the Homebrew prefix.
+To point an interactive ZeroClaw CLI at the same directory:
 
 <div class="os-tabs-src">
 
 #### sh
 
 ```sh
-export ZEROCLAW_WORKSPACE="$HOMEBREW_PREFIX/var/zeroclaw"
+export ZEROCLAW_DATA_DIR="$(brew --prefix)/var/zeroclaw"
 ```
 
 </div>
@@ -197,7 +198,7 @@ rm -rf ~/.zeroclaw ~/.config/zeroclaw
 
 ## Gotchas
 
-- **Homebrew config path mismatch.** The `brew services` daemon reads config from `$HOMEBREW_PREFIX/var/zeroclaw/`, not `~/.zeroclaw/`. If your service is reading stale config, check which one the daemon sees and set `ZEROCLAW_WORKSPACE` accordingly.
+- **Homebrew config path mismatch.** The `brew services` daemon reads config from `$HOMEBREW_PREFIX/var/zeroclaw/`, not `~/.zeroclaw/`. If your service is reading stale config, check which one the daemon sees and set `ZEROCLAW_DATA_DIR` accordingly.
 - **First launch of the browser tool** downloads Chromium (~150 MB) via Playwright.
 - **Apple Silicon and Intel:** the bootstrap script detects the architecture and uses a matching prebuilt release artifact when one is available. If the release has no matching artifact, it falls back to a source build. Homebrew selects the appropriate package for the host.
 

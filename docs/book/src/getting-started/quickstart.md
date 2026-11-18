@@ -20,7 +20,7 @@ where you are.
 
 ## CLI
 
-The fastest path on a headless box or over SSH:
+Run Quickstart in an interactive terminal, either locally or over SSH. It needs a terminal on both stdin and stderr. For unattended configuration, use `zeroclaw config set <path> <value>`.
 
 <div class="os-tabs-src">
 
@@ -50,8 +50,8 @@ zeroclaw auth login --model-provider openai-codex --import ~/.codex/auth.json
 zeroclaw auth login --model-provider openai-codex
 ```
 
-For scripted setup, `openai-codex` is accepted as a quickstart input alias and
-writes the canonical `[providers.models.openai.<alias>]` entry:
+To prefill the interactive prompts, pass the provider, model and agent alias.
+When you finish Quickstart, it writes a `[providers.models.openai.<alias>]` entry:
 
 ```sh
 zeroclaw quickstart --model-provider openai-codex --model gpt-5.4 --agent assistant
@@ -68,20 +68,20 @@ zeroclaw quickstart --model-provider anthropic --model claude-sonnet-4-5 --agent
 ```
 
 Choose **Anthropic**, set **Authentication** to `setup_token`, then paste the
-token from `claude setup-token` into the API key/token prompt. Scripted input
-may use `--model-provider claude` as an alias. Quickstart still writes the
+token from `claude setup-token` into the API key/token prompt. The provider flag
+also accepts `claude` as an alias. Quickstart still writes the
 canonical `[providers.models.anthropic.<alias>]` entry; the token is stored
 through the same credential path as `api_key`.
 
 ### Plugins
 
 Builds with WASM plugin support add an optional **Plugins** row to the CLI
-checklist, after **Peer groups**. The row exists only when the binary is built
-with the `plugins-wasm` feature. Today's release archives are built without it,
-so their checklist has no Plugins row; a source build with `--preset full` and
-the `all-features` container image include it. Only the CLI Quickstart offers
-the row for now: the zerocode and web gateway Quickstart do not list plugins
-yet. Leaving the row unvisited changes nothing.
+checklist, after **Peer groups**. The v0.9.0 CLI archives for 64-bit desktop and server targets include
+the plugin host. For other builds, check the
+[plugin support table](../developing/plugin-protocol.md#plugin-support-per-release-artifact).
+The picker is specific to CLI Quickstart. To browse tool and channel plugins
+in the [official registry](https://github.com/zeroclaw-labs/zeroclaw-plugins),
+use `zeroclaw plugin search <query>`. Try `zeroclaw plugin search redact` for a tool example.
 
 Opening the row fetches the plugin registry index, the same one
 `zeroclaw plugin search` uses (set `ZEROCLAW_PLUGIN_REGISTRY_URL` to use another
@@ -321,9 +321,8 @@ The architecture roadmap
 RFC [#5574](https://github.com/zeroclaw-labs/zeroclaw/issues/5574), deliverable
 D4) asks for `zeroclaw onboard` to install plugins. `zeroclaw quickstart`, the
 maintained command that `zeroclaw onboard` now points to, delivers that for
-tool plugins, in builds with plugin support. Installing channel plugins during
-onboarding and shipping release artifacts with plugin support are separate
-deliverables.
+tool plugins, in builds with plugin support. For a channel plugin example, see
+[Running Discord as a plugin](../channels/discord.md#running-discord-as-a-plugin-experimental).
 
 ## zerocode
 
