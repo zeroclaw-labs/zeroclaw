@@ -12,8 +12,11 @@
 //! trigger, never picks a mode outside `modes`, and never removes a step-level
 //! `requires_confirmation` or `checkpoint` gate (those are resolved per step,
 //! independently of the run's mode). Every failure path falls back to the
-//! strictest listed mode, so an outage or a low-confidence answer adds human
-//! supervision rather than removing it.
+//! fail-closed mode (the strictest of the listed modes, the authored mode, and
+//! `supervised`), so an outage or a low-confidence answer adds human
+//! supervision rather than removing it. An unusable gate or mode answer also
+//! discards the model's step answers, because a skipped step never asks for
+//! approval.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -77,7 +80,8 @@ pub struct SopDecisionSpec {
     /// Guidance for the mode choice (what makes a run routine vs. risky).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode_instructions: Option<String>,
-    /// A mode choice below this confidence falls back to the strictest mode.
+    /// A mode choice below this confidence falls back to the fail-closed mode,
+    /// and the model's step answers are ignored so every step runs.
     #[serde(default = "default_threshold")]
     pub min_confidence: f64,
     /// Minimum "yes" probability for a step's `decide` question to include
@@ -139,13 +143,24 @@ impl SopDecisionSpec {
     /// Mode used whenever the model's answer cannot be trusted: never less
     /// supervision than the SOP's authored mode, the strictest listed mode, or
     /// (for a gate-only spec) `supervised`. `None` keeps an authored mode the
-    /// model cannot override (`priority_based`, `deterministic`).
+    /// model cannot override (`priority_based`, `deterministic`). A
+    /// `priority_based` run already gates at least as much as `supervised`, so
+    /// only a listed `step_by_step` replaces it.
     fn fail_closed_mode(&self, authored: SopExecutionMode) -> Option<SopExecutionMode> {
-        strictness(authored)?;
-        let floor = self
-            .strictest_mode()
-            .unwrap_or(SopExecutionMode::Supervised);
-        [floor, authored].into_iter().max_by_key(|m| strictness(*m))
+        match authored {
+            SopExecutionMode::Deterministic => None,
+            SopExecutionMode::PriorityBased => (self.strictest_mode()
+                == Some(SopExecutionMode::StepByStep))
+            .then_some(SopExecutionMode::StepByStep),
+            SopExecutionMode::Auto
+            | SopExecutionMode::Supervised
+            | SopExecutionMode::StepByStep => {
+                let floor = self
+                    .strictest_mode()
+                    .unwrap_or(SopExecutionMode::Supervised);
+                [floor, authored].into_iter().max_by_key(|m| strictness(*m))
+            }
+        }
     }
 }
 
@@ -344,7 +359,9 @@ pub struct SopDecision {
     /// Mode for this run; `None` keeps the SOP's authored mode.
     pub mode: Option<SopExecutionMode>,
     /// p(yes) per conditional-part step (`decide`), for well-formed answers
-    /// only. A part missing here (model unavailable, malformed answer) runs.
+    /// only. A part missing here runs: the model was unavailable, the step's
+    /// answer was malformed, or the gate or mode answer was unusable, in which
+    /// case no step answer is kept.
     pub parts: BTreeMap<u32, f64>,
     /// Human-readable account for logs and the skipped-result reason.
     pub rationale: String,
@@ -546,42 +563,53 @@ fn resolve(
             }
             _ => {
                 gate_failed = true;
-                notes.push("gate answer missing or malformed".to_string());
-                spec.gate_on_error == GateOnError::RunStrict
+                let run = spec.gate_on_error == GateOnError::RunStrict;
+                let outcome = if run { "using strictest" } else { "skipping" };
+                notes.push(format!("gate answer missing or malformed; {outcome}"));
+                run
             }
         },
     };
 
-    let mode = if spec.modes.is_empty() {
-        if gate_failed { strict } else { None }
+    // An unreliable answer set must not leave a run less supervised than the
+    // fail-closed result: the model's mode choice and its step answers (a
+    // skipped step never asks for approval) are both set aside.
+    let (mode, trusted) = if gate_failed {
+        (strict, false)
+    } else if spec.modes.is_empty() {
+        (None, true)
     } else {
         match answers.answers.get(MODE_QUESTION) {
             Some(answer) => match validate_choice(answer, &spec.modes) {
                 Ok((mode, confidence)) if confidence >= spec.min_confidence => {
                     notes.push(format!("mode {mode} at confidence {confidence:.2}"));
-                    Some(mode)
+                    (Some(mode), true)
                 }
                 Ok((mode, confidence)) => {
                     notes.push(format!(
                         "mode {mode} at confidence {confidence:.2} is below {:.2}; using strictest",
                         spec.min_confidence
                     ));
-                    strict
+                    (strict, false)
                 }
                 Err(e) => {
                     notes.push(format!("mode answer rejected ({e}); using strictest"));
-                    strict
+                    (strict, false)
                 }
             },
             None => {
                 notes.push("mode answer missing; using strictest".to_string());
-                strict
+                (strict, false)
             }
         }
     };
 
+    let answered_steps: &[u32] = if trusted { part_steps } else { &[] };
+    if start && !trusted && !part_steps.is_empty() {
+        notes.push("step answers ignored; every step runs".to_string());
+    }
     let mut parts = BTreeMap::new();
-    for step in part_steps {
+    for step in answered_steps {
         match answers.answers.get(&part_question_key(*step)) {
             Some(Answer::Noul { noul }) if noul.is_finite() && (0.0..=1.0).contains(noul) => {
                 let verdict = if *noul >= spec.part_threshold {
@@ -806,6 +834,363 @@ mod tests {
         ok.answers.remove(MODE_QUESTION);
         let d = resolve("m", &gate_only, SopExecutionMode::Auto, &[], Ok(ok));
         assert_eq!((d.start, d.mode), (true, None));
+    }
+
+    /// A confident mode answer for `auto`, with the gate answer replaced by `gate`.
+    fn auto_answer_with_gate(gate: Option<Answer>) -> Answers {
+        let mut ok = answers(0.95, "auto", PROBS_AUTO, 0.9);
+        match gate {
+            Some(g) => ok.answers.insert(GATE_QUESTION.to_string(), g),
+            None => ok.answers.remove(GATE_QUESTION),
+        };
+        ok
+    }
+
+    /// A confident `auto` mode answer must not survive the given unusable gate answer.
+    fn assert_unusable_gate_runs_strict(gate: Option<Answer>) {
+        let d = resolve(
+            "m",
+            &spec(),
+            SopExecutionMode::Supervised,
+            &[],
+            Ok(auto_answer_with_gate(gate)),
+        );
+        assert!(d.start, "run_strict still starts the run");
+        assert_eq!(d.mode, Some(SopExecutionMode::StepByStep));
+        assert!(
+            d.rationale
+                .contains("gate answer missing or malformed; using strictest"),
+            "{}",
+            d.rationale
+        );
+    }
+
+    /// `answers` plus a "no" (0.1) answer for step 1, which would skip that step.
+    fn with_low_step_answer(mut answers: Answers) -> Answers {
+        answers
+            .answers
+            .insert(part_question_key(1), Answer::Noul { noul: 0.1 });
+        answers
+    }
+
+    /// Resolve with step 1 conditional; every step must run, so no answer is kept.
+    fn assert_step_answers_ignored(spec: &SopDecisionSpec, answers: Answers) {
+        let d = resolve(
+            "m",
+            spec,
+            SopExecutionMode::Supervised,
+            &[1],
+            Ok(with_low_step_answer(answers)),
+        );
+        assert!(d.parts.is_empty(), "{:?} / {}", d.parts, d.rationale);
+        assert!(
+            d.rationale.contains("step answers ignored"),
+            "{}",
+            d.rationale
+        );
+    }
+
+    #[test]
+    fn absent_gate_answer_ignores_step_answers() {
+        assert_step_answers_ignored(&spec(), auto_answer_with_gate(None));
+    }
+
+    #[test]
+    fn out_of_range_gate_answer_ignores_step_answers() {
+        assert_step_answers_ignored(
+            &spec(),
+            auto_answer_with_gate(Some(Answer::Noul { noul: 1.7 })),
+        );
+    }
+
+    #[test]
+    fn wrong_type_gate_answer_ignores_step_answers() {
+        assert_step_answers_ignored(
+            &spec(),
+            auto_answer_with_gate(Some(Answer::Choice {
+                choice: "x".into(),
+                probabilities: BTreeMap::new(),
+                confidence: 0.9,
+            })),
+        );
+    }
+
+    #[test]
+    fn gate_only_spec_with_an_unusable_gate_ignores_step_answers() {
+        let gate_only = SopDecisionSpec {
+            modes: vec![],
+            ..spec()
+        };
+        assert_step_answers_ignored(&gate_only, auto_answer_with_gate(None));
+    }
+
+    /// A run that does not start has no steps to run, so the note is left out.
+    fn assert_no_step_note_without_a_run(spec: &SopDecisionSpec, answers: Answers) {
+        let d = resolve(
+            "m",
+            spec,
+            SopExecutionMode::Supervised,
+            &[1],
+            Ok(with_low_step_answer(answers)),
+        );
+        assert!(!d.start, "{}", d.rationale);
+        assert!(d.parts.is_empty(), "{:?} / {}", d.parts, d.rationale);
+        assert!(
+            !d.rationale.contains("step answers ignored"),
+            "{}",
+            d.rationale
+        );
+    }
+
+    #[test]
+    fn skip_spec_with_an_unusable_gate_leaves_out_the_step_note() {
+        let skip = SopDecisionSpec {
+            gate_on_error: GateOnError::Skip,
+            ..spec()
+        };
+        assert_no_step_note_without_a_run(&skip, auto_answer_with_gate(None));
+    }
+
+    #[test]
+    fn declining_gate_with_an_unusable_mode_leaves_out_the_step_note() {
+        assert_no_step_note_without_a_run(&spec(), answers(0.1, "auto", PROBS_AUTO, 0.5));
+    }
+
+    #[test]
+    fn low_confidence_mode_ignores_step_answers() {
+        assert_step_answers_ignored(&spec(), answers(0.95, "auto", PROBS_AUTO, 0.5));
+    }
+
+    #[test]
+    fn rejected_mode_answer_ignores_step_answers() {
+        // The chosen mode is not the argmax of its own distribution.
+        assert_step_answers_ignored(&spec(), answers(0.95, "supervised", PROBS_AUTO, 0.9));
+    }
+
+    #[test]
+    fn missing_mode_answer_ignores_step_answers() {
+        let mut no_mode = answers(0.95, "auto", PROBS_AUTO, 0.9);
+        no_mode.answers.remove(MODE_QUESTION);
+        assert_step_answers_ignored(&spec(), no_mode);
+    }
+
+    /// Usable gate and mode answers keep the model's step answers.
+    #[test]
+    fn usable_answers_keep_the_step_answers() {
+        let d = resolve(
+            "m",
+            &spec(),
+            SopExecutionMode::Supervised,
+            &[1],
+            Ok(with_low_step_answer(answers(0.95, "auto", PROBS_AUTO, 0.9))),
+        );
+        assert_eq!(d.parts, BTreeMap::from([(1, 0.1)]));
+    }
+
+    /// With no mode asked there is no mode answer to distrust, so a usable
+    /// gate keeps the step answers.
+    #[test]
+    fn usable_gate_without_modes_keeps_the_step_answers() {
+        let gate_only = SopDecisionSpec {
+            modes: vec![],
+            ..spec()
+        };
+        let d = resolve(
+            "m",
+            &gate_only,
+            SopExecutionMode::Supervised,
+            &[1],
+            Ok(with_low_step_answer(auto_answer_with_gate(Some(
+                Answer::Noul { noul: 0.95 },
+            )))),
+        );
+        assert_eq!(d.parts, BTreeMap::from([(1, 0.1)]));
+    }
+
+    #[test]
+    fn absent_gate_answer_discards_the_models_mode_choice() {
+        assert_unusable_gate_runs_strict(None);
+    }
+
+    #[test]
+    fn gate_answer_above_range_discards_the_models_mode_choice() {
+        assert_unusable_gate_runs_strict(Some(Answer::Noul { noul: 1.7 }));
+    }
+
+    #[test]
+    fn gate_answer_below_range_discards_the_models_mode_choice() {
+        assert_unusable_gate_runs_strict(Some(Answer::Noul { noul: -0.1 }));
+    }
+
+    #[test]
+    fn nan_gate_answer_discards_the_models_mode_choice() {
+        assert_unusable_gate_runs_strict(Some(Answer::Noul { noul: f64::NAN }));
+    }
+
+    #[test]
+    fn infinite_gate_answer_discards_the_models_mode_choice() {
+        assert_unusable_gate_runs_strict(Some(Answer::Noul {
+            noul: f64::INFINITY,
+        }));
+    }
+
+    #[test]
+    fn wrong_type_gate_answer_discards_the_models_mode_choice() {
+        assert_unusable_gate_runs_strict(Some(Answer::Choice {
+            choice: "x".into(),
+            probabilities: BTreeMap::new(),
+            confidence: 0.9,
+        }));
+    }
+
+    #[test]
+    fn unusable_gate_answer_keeps_the_authored_floor() {
+        // Offered modes sit below the authored one: the strictest is the authored mode.
+        let loose = SopDecisionSpec {
+            modes: vec![SopExecutionMode::Auto, SopExecutionMode::Supervised],
+            ..spec()
+        };
+        let mut ok = answers(0.95, "auto", &[("auto", 0.9), ("supervised", 0.1)], 0.9);
+        ok.answers.remove(GATE_QUESTION);
+        let d = resolve("m", &loose, SopExecutionMode::StepByStep, &[], Ok(ok));
+        assert_eq!(d.mode, Some(SopExecutionMode::StepByStep));
+    }
+
+    #[test]
+    fn unusable_gate_answer_with_a_priority_based_sop_applies_a_listed_step_by_step() {
+        let d = resolve(
+            "m",
+            &spec(),
+            SopExecutionMode::PriorityBased,
+            &[],
+            Ok(auto_answer_with_gate(None)),
+        );
+        assert!(d.start);
+        assert_eq!(d.mode, Some(SopExecutionMode::StepByStep));
+    }
+
+    #[test]
+    fn unusable_gate_answer_with_a_priority_based_sop_keeps_it_when_step_by_step_is_not_listed() {
+        let loose = SopDecisionSpec {
+            modes: vec![SopExecutionMode::Auto, SopExecutionMode::Supervised],
+            ..spec()
+        };
+        let d = resolve(
+            "m",
+            &loose,
+            SopExecutionMode::PriorityBased,
+            &[],
+            Ok(auto_answer_with_gate(None)),
+        );
+        assert!(d.start);
+        assert_eq!(d.mode, None);
+    }
+
+    #[test]
+    fn unusable_gate_answer_with_a_gate_only_priority_based_sop_keeps_it() {
+        let gate_only = SopDecisionSpec {
+            modes: vec![],
+            ..spec()
+        };
+        let d = resolve(
+            "m",
+            &gate_only,
+            SopExecutionMode::PriorityBased,
+            &[],
+            Ok(auto_answer_with_gate(None)),
+        );
+        assert!(d.start);
+        assert_eq!(d.mode, None);
+    }
+
+    #[test]
+    fn unusable_gate_answer_with_a_deterministic_sop_keeps_it() {
+        let gate_only = SopDecisionSpec {
+            modes: vec![],
+            ..spec()
+        };
+        let d = resolve(
+            "m",
+            &gate_only,
+            SopExecutionMode::Deterministic,
+            &[],
+            Ok(auto_answer_with_gate(None)),
+        );
+        assert!(d.start);
+        assert_eq!(d.mode, None);
+    }
+
+    #[test]
+    fn unavailable_model_with_a_priority_based_sop_applies_a_listed_step_by_step() {
+        let d = resolve(
+            "m",
+            &spec(),
+            SopExecutionMode::PriorityBased,
+            &[],
+            Err(anyhow::Error::msg("down")),
+        );
+        assert_eq!(d.mode, Some(SopExecutionMode::StepByStep));
+    }
+
+    #[test]
+    fn unusable_gate_answer_under_skip_does_not_start() {
+        let skip = SopDecisionSpec {
+            gate_on_error: GateOnError::Skip,
+            ..spec()
+        };
+        let d = resolve(
+            "m",
+            &skip,
+            SopExecutionMode::Supervised,
+            &[],
+            Ok(auto_answer_with_gate(None)),
+        );
+        assert!(!d.start);
+        assert!(
+            d.rationale
+                .contains("gate answer missing or malformed; skipping"),
+            "{}",
+            d.rationale
+        );
+        assert!(
+            !d.rationale.contains("using strictest"),
+            "a run that does not start has no mode: {}",
+            d.rationale
+        );
+    }
+
+    /// A gate-only spec has no mode answer, so an unusable gate alone sets the
+    /// fail-closed mode.
+    #[test]
+    fn gate_only_spec_with_an_unusable_gate_still_runs_strict() {
+        let gate_only = SopDecisionSpec {
+            modes: vec![],
+            ..spec()
+        };
+        let d = resolve(
+            "m",
+            &gate_only,
+            SopExecutionMode::Auto,
+            &[],
+            Ok(auto_answer_with_gate(None)),
+        );
+        assert_eq!(
+            (d.start, d.mode),
+            (true, Some(SopExecutionMode::Supervised))
+        );
+    }
+
+    /// A usable gate keeps the model's confident mode choice.
+    #[test]
+    fn usable_gate_keeps_the_models_confident_mode_choice() {
+        let d = resolve(
+            "m",
+            &spec(),
+            SopExecutionMode::Supervised,
+            &[],
+            Ok(auto_answer_with_gate(Some(Answer::Noul { noul: 0.95 }))),
+        );
+        assert_eq!((d.start, d.mode), (true, Some(SopExecutionMode::Auto)));
     }
 
     #[test]
@@ -1064,6 +1449,49 @@ mod tests {
         assert!(
             received[0].headers.get("authorization").is_none(),
             "a keyless model must not send an Authorization header"
+        );
+    }
+
+    #[tokio::test]
+    async fn over_http_a_response_without_the_gate_answer_runs_strict() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/systemone"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "answers": {
+                    "part_1": {"type": "noul", "noul": 0.1},
+                    "execution_mode": {
+                        "type": "choice",
+                        "choice": "auto",
+                        "probabilities": {
+                            "auto": 0.9,
+                            "supervised": 0.05,
+                            "step_by_step": 0.05
+                        },
+                        "confidence": 0.9
+                    }
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let model = configured_model(
+            &format!(
+                "[decision_models.local]\nprovider = \"laya\"\nbase_url = \"{}\"\n",
+                server.uri()
+            ),
+            "local",
+        );
+        let sop = parts_sop(Some(spec()));
+        let d = decide(model.as_ref(), &sop, &spec(), &pr_event()).await;
+        assert!(d.start, "{}", d.rationale);
+        assert_eq!(d.mode, Some(SopExecutionMode::StepByStep));
+        assert!(
+            d.parts.is_empty(),
+            "a step answer from an untrusted answer set must not skip a step: {:?}",
+            d.parts
         );
     }
 
