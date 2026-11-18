@@ -1363,7 +1363,15 @@ mod tests {
             &[],
             &[],
             &[],
-            &[home.join("vault-link"), home.join("later-link/new")],
+            &[
+                home.join("vault-link"),
+                home.join("later-link/new"),
+                // Credential stores outside the toolchain grant are closed by
+                // configuration, not by the home prefix the grant used to put
+                // in front of every dotfile.
+                home.join(".netrc"),
+                home.join(".git-credentials"),
+            ],
         )
         .unwrap();
         std::fs::write(
@@ -1373,11 +1381,12 @@ mod tests {
         .unwrap();
         std::fs::create_dir_all(home.join(".later-secrets/new")).unwrap();
         std::fs::write(home.join(".later-secrets/new/token"), "fixture-secret").unwrap();
-        std::fs::write(home.join(".later-secrets/allowed.txt"), "tool-config-ok").unwrap();
+        // The permitted sibling control lives inside a granted tree.
+        std::fs::write(home.join(".cargo/allowed.txt"), "tool-config-ok").unwrap();
         for (index, command) in [
             r#"cat "$HOME/.cargo/config.toml""#,
             r#"exec "$HOME/.cargo/bin/config-probe""#,
-            r#"cat "$HOME/.later-secrets/allowed.txt""#,
+            r#"cat "$HOME/.cargo/allowed.txt""#,
         ]
         .iter()
         .enumerate()
@@ -1449,6 +1458,65 @@ mod tests {
     }
 
     #[test]
+    fn seatbelt_constructor_denies_configured_credential_aliases_and_their_targets() {
+        if !SeatbeltSandbox::is_installed() {
+            return;
+        }
+        // Mirrors the credential aliases the native fixture configures: the
+        // narrowed grant only reaches `.cargo`, so an alias such as `~/.netrc`
+        // is denied because it is configured, and its payload is denied because
+        // the configured alias resolves onto it.
+        let fixture = tempfile::tempdir().unwrap();
+        let home = fixture.path();
+        std::fs::create_dir_all(home.join(".cargo")).unwrap();
+        std::fs::write(home.join(".cargo/private-netrc"), "fixture-secret").unwrap();
+        std::os::unix::fs::symlink(".cargo/private-netrc", home.join(".netrc")).unwrap();
+        std::os::unix::fs::symlink(
+            ".cargo/private-git-credentials",
+            home.join(".git-credentials"),
+        )
+        .unwrap();
+        let workspace = home.join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+
+        let sandbox = SeatbeltSandbox::with_roots_for_home(
+            Some(&workspace),
+            &[],
+            &[],
+            &[],
+            &[home.join(".netrc"), home.join(".git-credentials")],
+            Some(home),
+        )
+        .unwrap();
+        let policy = std::fs::read_to_string(&sandbox.policy_path).unwrap();
+
+        assert!(
+            policy.contains(&format!(
+                r#"(allow file-read* (subpath "{}"))"#,
+                home.join(".cargo").display()
+            )),
+            "the toolchain grant must remain; policy={policy}"
+        );
+        for denied in [
+            ".netrc",
+            ".git-credentials",
+            ".cargo/credentials",
+            ".cargo/credentials.toml",
+            ".cargo/private-netrc",
+            ".cargo/private-git-credentials",
+        ] {
+            let path = home.join(denied);
+            assert!(
+                policy.contains(&format!(
+                    r#"(deny file-read* (subpath "{}"))"#,
+                    path.display()
+                )),
+                "{denied} must stay denied; policy={policy}"
+            );
+        }
+    }
+
+    #[test]
     fn seatbelt_production_constructor_denies_forbidden_aliases() {
         check_production_home_aliases(
             "security::seatbelt::tests::seatbelt_production_constructor_denies_forbidden_aliases",
@@ -1506,11 +1574,19 @@ mod tests {
                 assert!(error.to_string().contains("symlink limit exceeded"));
             }
         }
+        std::fs::create_dir(fixture.path().join(".cargo")).unwrap();
+        // The narrowed policy resolves only the credential files inside an
+        // allowlisted dotfile, so those are the aliases that can break
+        // construction; other credential aliases are denied by configuration.
         for (name, target, expected_kind) in [
-            (".netrc", ".netrc", std::io::ErrorKind::Other),
             (
-                ".git-credentials",
-                "file/child",
+                ".cargo/credentials",
+                "credentials",
+                std::io::ErrorKind::Other,
+            ),
+            (
+                ".cargo/credentials.toml",
+                "../file/child",
                 std::io::ErrorKind::NotADirectory,
             ),
         ] {
