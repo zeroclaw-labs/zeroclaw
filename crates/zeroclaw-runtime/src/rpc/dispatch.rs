@@ -727,6 +727,17 @@ async fn save_and_publish_config_detached(
     revision: zeroclaw_config::live::ConfigRevision,
     mut snapshot: zeroclaw_config::schema::Config,
 ) -> Result<(), JsonRpcError> {
+    // Generic RPC config writes must not bypass the operator credential
+    // API, its explicit grants or mutation audit. Compare canonical maps
+    // under the admitted writer guard, covering batches and map mutations.
+    if snapshot.http_request.scoped_credentials
+        != commit.current_config().http_request.scoped_credentials
+    {
+        return Err(rpc_err(
+            FORBIDDEN,
+            crate::i18n::get_required_cli_string("rpc-scoped-credentials-managed"),
+        ));
+    }
     Box::pin(snapshot.save_dirty())
         .await
         .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Config save failed: {e}")))?;
