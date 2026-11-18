@@ -1,7 +1,7 @@
 use crate::schema::DockerRuntimeConfig;
 use anyhow::{Context, Result};
 use std::ffi::OsStr;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use zeroclaw_api::runtime_traits::{RuntimeAdapter, ShellDialect};
 
 /// Canonicalization failures that the runtime layer can present through
@@ -113,14 +113,51 @@ impl DockerRuntime {
             .map(Some)
     }
 
-    fn build_shell_command_inner(
+    /// Map a coding CLI's selected directory under a root already validated by
+    /// `validated_workspace_mount`. Reject paths that Docker could parse as
+    /// a different `--volume` mount.
+    fn coding_cli_workdir(host_root: &Path, working_dir: &Path) -> Result<String> {
+        anyhow::ensure!(
+            host_root.is_dir() && host_root.parent().is_some(),
+            "Docker coding CLI requires a directory below the filesystem root"
+        );
+        // A Windows drive prefix contains its own colon. A colon inside a
+        // normal directory name is an ambiguous separator in --volume.
+        let has_volume_delimiter = host_root.components().any(|part| {
+            matches!(part, Component::Normal(name) if name.as_encoded_bytes().contains(&b':'))
+        });
+        anyhow::ensure!(
+            host_root.to_str().is_some() && !has_volume_delimiter,
+            "Docker coding CLI workspace cannot be represented by a bind-mount argument"
+        );
+        let selected = working_dir
+            .canonicalize()
+            .context("Cannot resolve the Docker coding CLI working directory")?;
+        anyhow::ensure!(
+            selected.is_dir(),
+            "Docker coding CLI working directory must be a directory"
+        );
+        let relative = selected
+            .strip_prefix(host_root)
+            .context("Docker coding CLI working directory is outside the agent workspace")?;
+        let mut container_dir = String::from("/workspace");
+        for name in relative {
+            container_dir.push('/');
+            container_dir.push_str(
+                name.to_str()
+                    .context("Docker coding CLI working directory must be valid UTF-8")?,
+            );
+        }
+        Ok(container_dir)
+    }
+
+    fn build_shell_command_for_mount(
         &self,
         command: &str,
-        workspace_dir: &Path,
+        host_workspace: Option<&Path>,
+        container_dir: &str,
         env_keys: &[&OsStr],
     ) -> anyhow::Result<tokio::process::Command> {
-        let host_workspace = self.validated_workspace_mount(workspace_dir)?;
-
         #[cfg(unix)]
         let docker = if let Some(resolved_launcher) = &self.resolved_launcher {
             resolved_launcher.clone()
@@ -136,7 +173,8 @@ impl DockerRuntime {
 
         self.build_shell_command_with_launcher(
             command,
-            host_workspace.as_deref(),
+            host_workspace,
+            container_dir,
             env_keys,
             &docker,
         )
@@ -146,6 +184,7 @@ impl DockerRuntime {
         &self,
         command: &str,
         host_workspace: Option<&Path>,
+        container_dir: &str,
         env_keys: &[&OsStr],
         docker: &Path,
     ) -> anyhow::Result<tokio::process::Command> {
@@ -183,7 +222,7 @@ impl DockerRuntime {
                 .arg("--volume")
                 .arg(format!("{}:/workspace:rw", host_workspace.display()))
                 .arg("--workdir")
-                .arg("/workspace");
+                .arg(container_dir);
         }
 
         process
@@ -205,6 +244,7 @@ impl DockerRuntime {
         self.build_shell_command_with_launcher(
             command,
             host_workspace.as_deref(),
+            "/workspace",
             &[],
             Path::new("docker"),
         )
@@ -221,6 +261,7 @@ impl DockerRuntime {
         self.build_shell_command_with_launcher(
             command,
             host_workspace.as_deref(),
+            "/workspace",
             env_keys,
             Path::new("docker"),
         )
@@ -273,7 +314,7 @@ impl RuntimeAdapter for DockerRuntime {
         command: &str,
         workspace_dir: &Path,
     ) -> anyhow::Result<tokio::process::Command> {
-        self.build_shell_command_inner(command, workspace_dir, &[])
+        self.build_shell_command_with_env_keys(command, workspace_dir, &[])
     }
 
     fn build_shell_command_with_env_keys(
@@ -282,7 +323,27 @@ impl RuntimeAdapter for DockerRuntime {
         workspace_dir: &Path,
         env_keys: &[&OsStr],
     ) -> anyhow::Result<tokio::process::Command> {
-        self.build_shell_command_inner(command, workspace_dir, env_keys)
+        let host_workspace = self.validated_workspace_mount(workspace_dir)?;
+        self.build_shell_command_for_mount(
+            command,
+            host_workspace.as_deref(),
+            "/workspace",
+            env_keys,
+        )
+    }
+
+    fn build_coding_cli_shell_command(
+        &self,
+        command: &str,
+        workspace_root: &Path,
+        working_dir: &Path,
+        env_keys: &[&OsStr],
+    ) -> anyhow::Result<tokio::process::Command> {
+        let root = self
+            .validated_workspace_mount(workspace_root)?
+            .context("Docker coding CLI requires workspace mounting")?;
+        let container_dir = Self::coding_cli_workdir(&root, working_dir)?;
+        self.build_shell_command_for_mount(command, Some(&root), &container_dir, env_keys)
     }
 
     fn build_shell_command_with_effective_path(
@@ -306,6 +367,7 @@ impl RuntimeAdapter for DockerRuntime {
             return self.build_shell_command_with_launcher(
                 command,
                 host_workspace.as_deref(),
+                "/workspace",
                 &[],
                 &resolved_launcher,
             );
@@ -342,6 +404,126 @@ mod tests {
     fn docker_reports_posix_shell_dialect() {
         let runtime = DockerRuntime::new(DockerRuntimeConfig::default());
         assert_eq!(runtime.shell_dialect(), ShellDialect::Posix);
+    }
+
+    #[test]
+    fn coding_cli_mounts_the_authorized_root_and_maps_the_selected_directory() {
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path().canonicalize().unwrap();
+        let nested = root.join("packages/app suite");
+        std::fs::create_dir_all(&nested).unwrap();
+        let runtime = DockerRuntime::with_resolved_launcher(
+            DockerRuntimeConfig {
+                mount_workspace: true,
+                allowed_workspace_roots: vec![root.to_string_lossy().into_owned()],
+                ..DockerRuntimeConfig::default()
+            },
+            Some(PathBuf::from("docker")),
+        );
+        for (selected, expected) in [
+            (&nested, "/workspace/packages/app suite"),
+            (&root, "/workspace"),
+        ] {
+            let process = runtime
+                .build_coding_cli_shell_command("pwd", &root, selected, &[OsStr::new("LANG")])
+                .unwrap();
+            let args: Vec<_> = process.as_std().get_args().collect();
+            let volume = format!("{}:/workspace:rw", root.display());
+            assert!(
+                args.windows(2)
+                    .any(|pair| pair == [OsStr::new("--volume"), OsStr::new(&volume)])
+            );
+            assert!(
+                args.windows(2)
+                    .any(|pair| pair == [OsStr::new("--workdir"), OsStr::new(expected)])
+            );
+            assert!(
+                args.windows(2)
+                    .any(|pair| pair == [OsStr::new("--env"), OsStr::new("LANG")])
+            );
+        }
+    }
+
+    #[test]
+    fn coding_cli_requires_an_allowed_mounted_root_and_an_existing_descendant() {
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path().canonicalize().unwrap();
+        let nested = root.join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        let runtime_with = |mount_workspace, allowed_workspace_roots| {
+            DockerRuntime::with_resolved_launcher(
+                DockerRuntimeConfig {
+                    mount_workspace,
+                    allowed_workspace_roots,
+                    ..DockerRuntimeConfig::default()
+                },
+                Some(PathBuf::from("docker")),
+            )
+        };
+        let without_mount = runtime_with(false, vec![]);
+        assert!(
+            without_mount
+                .build_coding_cli_shell_command("pwd", &root, &nested, &[])
+                .is_err()
+        );
+
+        // Permission for a selected subdirectory does not authorize a parent mount.
+        let narrower = runtime_with(true, vec![nested.to_string_lossy().into_owned()]);
+        assert!(
+            narrower
+                .build_coding_cli_shell_command("pwd", &root, &nested, &[])
+                .is_err()
+        );
+
+        let runtime = runtime_with(true, vec![]);
+        let outside = tempfile::tempdir().unwrap();
+        let file = root.join("file");
+        std::fs::write(&file, "").unwrap();
+        for invalid in [
+            outside.path(),
+            file.as_path(),
+            root.join("missing").as_path(),
+        ] {
+            assert!(
+                runtime
+                    .build_coding_cli_shell_command("pwd", &root, invalid, &[])
+                    .is_err()
+            );
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let link = root.join("linked");
+            symlink(outside.path(), &link).unwrap();
+            assert!(
+                runtime
+                    .build_coding_cli_shell_command("pwd", &root, &link, &[])
+                    .is_err()
+            );
+            let ambiguous = root.join("contains:delimiter");
+            std::fs::create_dir(&ambiguous).unwrap();
+            assert!(
+                runtime
+                    .build_coding_cli_shell_command("pwd", &ambiguous, &ambiguous, &[])
+                    .is_err()
+            );
+        }
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            let non_utf8 = root.join(std::ffi::OsString::from_vec(vec![b'n', 0xff]));
+            std::fs::create_dir(&non_utf8).unwrap();
+            assert!(
+                runtime
+                    .build_coding_cli_shell_command("pwd", &non_utf8, &non_utf8, &[])
+                    .is_err()
+            );
+            assert!(
+                runtime
+                    .build_coding_cli_shell_command("pwd", &root, &non_utf8, &[])
+                    .is_err()
+            );
+        }
     }
 
     #[test]
