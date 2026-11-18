@@ -9310,7 +9310,7 @@ impl ScopedHttpCredential {
             return None;
         }
         if url.scheme() == "https" {
-            return Some(url.origin().ascii_serialization());
+            return Self::https_origin(raw);
         }
         Some(url.as_str().trim_end_matches('/').to_owned())
     }
@@ -55552,13 +55552,14 @@ mod scoped_http_origin_regressions {
             ("https://[::1]:8443/", "https://[::1]:8443"),
         ] {
             assert_eq!(
-                ScopedHttpCredential::configured_https_origin(raw).as_deref(),
+                ScopedHttpCredential::https_origin(raw).as_deref(),
                 Some(expected)
             );
         }
         assert!(
-            ScopedHttpCredential::configured_https_origin("https://api.example.com./v1").is_none()
+            ScopedHttpCredential::password_service("https://api.example.com./v1").is_none()
         );
+        assert_eq!(ScopedHttpCredential::password_service("https://api.example.com./").as_deref(), Some("https://api.example.com"));
         assert!(ScopedHttpCredential::https_origin("https://./").is_none());
     }
 }
