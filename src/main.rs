@@ -11826,7 +11826,6 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                     "🌐 Web UI:        not included in this build (CLI-only)"
                 )
             );
-            let effective_memory_backend = config.resolve_active_storage().kind();
             let heartbeat_value = if config.heartbeat.enabled {
                 let interval_minutes = config.heartbeat.interval_minutes.to_string();
                 let heartbeat_every_fallback = format!("every {}min", interval_minutes);
@@ -11847,7 +11846,11 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                     &heartbeat_fallback
                 )
             );
-            let memory_backend = effective_memory_backend.to_string();
+            let runtime_agent = config
+                .resolved_runtime_agent_alias()
+                .filter(|alias| config.agents.get(*alias).is_some_and(|agent| agent.enabled))
+                .or_else(|| agent_aliases.first().map(|alias| alias.as_str()));
+            let memory_backend = zeroclaw_memory::configured_memory_backend(&config, runtime_agent);
             let memory_auto_save = if config.memory.auto_save {
                 t("cli-status-word-on", "on")
             } else {

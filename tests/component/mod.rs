@@ -39,6 +39,8 @@ mod schema_export_feature_graph;
 mod security;
 mod skills_bundle_cli;
 #[cfg(feature = "agent-runtime")]
+mod status_memory_cli;
+#[cfg(feature = "agent-runtime")]
 mod verifiable_intent_notice_visibility;
 #[cfg(feature = "gateway")]
 mod whatsapp_webhook_security;
