@@ -1467,7 +1467,10 @@ mod tests {
         // is denied because it is configured, and its payload is denied because
         // the configured alias resolves onto it.
         let fixture = tempfile::tempdir().unwrap();
-        let home = fixture.path();
+        // The policy is emitted for the resolved HOME (on macOS `/var` is a link
+        // to `/private/var`), so assert against the canonical fixture path.
+        let resolved = fixture.path().canonicalize().unwrap();
+        let home = resolved.as_path();
         std::fs::create_dir_all(home.join(".cargo")).unwrap();
         std::fs::write(home.join(".cargo/private-netrc"), "fixture-secret").unwrap();
         std::os::unix::fs::symlink(".cargo/private-netrc", home.join(".netrc")).unwrap();
