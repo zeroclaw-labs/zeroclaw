@@ -498,10 +498,22 @@ Every call passes five host-owned checks before spawning a turn:
    (retaining the latest prompt and caller attribution). The first pending
    wake reserves one token before returning success; later overwrites share
    that reservation. An exhausted bucket returns `rate-limited` immediately.
-   The follow-up re-checks live grants and target availability before running.
+   A wake is accepted onto a pair only once a worker owns it: a wake that
+   arrives while another wake is still being admitted and registered waits for
+   that claim to settle, then coalesces or claims the pair itself, so a failed
+   claim never drops a wake that already returned success. The follow-up
+   re-checks live grants and target availability before running; a follow-up
+   that cannot run is skipped and the next pending wake is drained, rather than
+   releasing the pair with accepted wakes still queued.
    Idle pairs also spend from the per-instance continuous token bucket, admit
    against `AgentExecutionCapability`, record a durable `TaskRecord`, and run
    under `InternalPrincipal::PluginTool`.
+
+**Woken turns keep the caller's headless SOP step scope.** A wake issued from
+inside a headless SOP step carries that step's tool scope into the woken turn,
+as `send_message_to_peer`, `delegate` and `spawn_subagent` do, so the target
+cannot call tools the step excludes. Each wake carries its own caller's scope,
+including a coalesced follow-up.
 
 **Restricted principals do not receive dispatch-capable tools.** A wake carries
 the caller's identity into the target turn as attribution, but not the caller's

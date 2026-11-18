@@ -83,18 +83,32 @@ struct PendingWake {
     caller_alias: Option<String>,
     capabilities: Option<crate::composition::BoundCapabilities>,
     execution_capability: Option<AgentExecutionCapability>,
+    /// The headless SOP step this wake's caller ran under, restored around the
+    /// turn it queues so the target cannot escape that step's tool scope.
+    step_scope: Option<crate::sop::active_scope::HeadlessStepScope>,
 }
 
-/// Whether an `(instance, agent)` pair is currently running a plugin turn.
+/// Whether an `(instance, agent)` pair is currently held by a plugin wake.
 ///
 /// Absence from the slot map *is* the idle state: a pair with no entry is
-/// wakeable, and a wake claims it by inserting `Running`. Keeping only the held
-/// state means a released slot can never be mistaken for a claim that was never
-/// taken, and the guard's `remove` is the single release path.
+/// wakeable, and a wake claims it by inserting `Starting`. Keeping only the held
+/// states means a released slot can never be mistaken for a claim that was never
+/// taken, and the guards' `remove` is the single release path.
 enum WakeSlotState {
-    /// A turn is running. A later wake for the same pair lands in `pending`
-    /// instead of starting a second turn.
-    Running { pending: Option<PendingWake> },
+    /// A wake claimed the pair and is admitting and registering its turn; no
+    /// worker owns the slot yet, and the claim can still fail. A later wake
+    /// must not be accepted here: a failed claim releases the slot, and a wake
+    /// stored against it would be reported as accepted and never run. It
+    /// subscribes to `gate` instead and retries once the claimant settles.
+    /// Every transition out of this state drops the sender (replaced by
+    /// `Running`, or removed on failure), which wakes all subscribers.
+    Starting {
+        gate: tokio::sync::watch::Sender<()>,
+    },
+    /// A worker owns the pair and runs its turns. A later wake for the same
+    /// pair lands in `pending` instead of starting a second turn; the worker
+    /// drains it, so a pending wake is never dropped by a failed setup.
+    Running { pending: Option<Box<PendingWake>> },
 }
 
 /// Continuous-refill token bucket for one plugin instance.
@@ -357,52 +371,75 @@ impl AgentWakeBackend for RuntimeAgentWakeBackend {
             .ok_or(AgentWakeError::UnknownAgent)?;
 
         let slot_key = (instance_key.clone(), canonical.clone());
-        let pending = PendingWake {
+        // Captured here, on the caller's task: a detached spawn does not
+        // inherit task-locals, so the woken turn would otherwise rebuild its
+        // full tool surface and escape a headless SOP step's boundary.
+        let step_scope = crate::sop::active_scope::active_headless_step_scope();
+        let mut pending = Some(Box::new(PendingWake {
             prompt: prompt.to_string(),
             depth,
             caller_alias: caller_alias.map(str::to_string),
             capabilities: self.capabilities.get().cloned(),
             execution_capability: self.execution_capability.clone(),
-        };
+            step_scope: step_scope.clone(),
+        }));
 
         // Claim the slot and reserve each turn's budget under one lock. The
         // first pending wake pays for its follow-up before we return success;
-        // later overwrites share that reservation.
+        // later overwrites share that reservation. A wake is accepted onto a
+        // slot only once a worker owns it: a claim still in `Starting` can
+        // fail and release the slot, so a wake meeting it waits and retries.
         let rate_limit = entry
             .dispatch_rate_per_min
             .unwrap_or(DEFAULT_DISPATCH_RATE_PER_MIN);
-        {
-            let mut slots = self.coordinator.slots.lock();
-            if let Some(WakeSlotState::Running { pending: existing }) = slots.get_mut(&slot_key) {
-                if existing.is_none()
-                    && !self
-                        .coordinator
-                        .try_consume_token(&instance_key, rate_limit)
-                {
-                    return Err(AgentWakeError::RateLimited);
+        loop {
+            let mut claimant_settled = {
+                let mut slots = self.coordinator.slots.lock();
+                match slots.get_mut(&slot_key) {
+                    Some(WakeSlotState::Running { pending: existing }) => {
+                        if existing.is_none()
+                            && !self
+                                .coordinator
+                                .try_consume_token(&instance_key, rate_limit)
+                        {
+                            return Err(AgentWakeError::RateLimited);
+                        }
+                        *existing = pending.take();
+                        ::zeroclaw_log::record!(
+                            INFO,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Dispatch
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                            .with_attrs(::serde_json::json!({
+                                "plugin": scope.id().package(),
+                                "agent": canonical,
+                                "depth": depth,
+                            })),
+                            "plugin wake coalesced onto the agent's running turn"
+                        );
+                        return Ok(());
+                    }
+                    // Subscribed under the lock, so the claimant cannot settle
+                    // unobserved between this check and the wait below.
+                    Some(WakeSlotState::Starting { gate }) => gate.subscribe(),
+                    None => {
+                        if !self
+                            .coordinator
+                            .try_consume_token(&instance_key, rate_limit)
+                        {
+                            return Err(AgentWakeError::RateLimited);
+                        }
+                        let (gate, _) = tokio::sync::watch::channel(());
+                        slots.insert(slot_key.clone(), WakeSlotState::Starting { gate });
+                        break;
+                    }
                 }
-                *existing = Some(pending);
-                ::zeroclaw_log::record!(
-                    INFO,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Dispatch)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Success)
-                        .with_attrs(::serde_json::json!({
-                            "plugin": scope.id().package(),
-                            "agent": canonical,
-                            "depth": depth,
-                        })),
-                    "plugin wake coalesced onto the agent's running turn"
-                );
-                return Ok(());
-            }
-
-            if !self
-                .coordinator
-                .try_consume_token(&instance_key, rate_limit)
-            {
-                return Err(AgentWakeError::RateLimited);
-            }
-            slots.insert(slot_key.clone(), WakeSlotState::Running { pending: None });
+            };
+            // `Err` is the expected wake-up: the claimant dropped the gate by
+            // handing the slot to its worker or releasing it.
+            let _ = claimant_settled.changed().await;
         }
         // From here every early return releases the slot again.
         let mut slot_guard = SlotGuard::new(Arc::clone(&self.coordinator), slot_key.clone());
@@ -511,9 +548,17 @@ impl AgentWakeBackend for RuntimeAgentWakeBackend {
             depth: next_depth,
             caller_alias: caller_alias.map(str::to_string),
             capabilities: self.capabilities.get().cloned(),
+            step_scope,
             task,
         };
 
+        // Hand the slot to the worker before it exists. Replacing `Starting`
+        // drops its gate, so waiting wakes retry and coalesce onto a slot whose
+        // owner can no longer fail before draining them.
+        self.coordinator
+            .slots
+            .lock()
+            .insert(slot_key.clone(), WakeSlotState::Running { pending: None });
         let _handle = zeroclaw_spawn::spawn!(async move {
             let mut spawned_guard = SlotGuard::new(Arc::clone(&coordinator), spawn_key.clone());
             let mut plan = first_plan;
@@ -563,95 +608,55 @@ impl AgentWakeBackend for RuntimeAgentWakeBackend {
                             ),
                         ),
                     };
-                let result = zeroclaw_spawn::scope_plugin_wake_depth(
-                    plan.depth,
-                    run_wake_turn_with_panic_recovery(cost_ctx.clone(), turn_usage, turn),
+                let result = crate::sop::active_scope::with_inherited_headless_step_scope(
+                    plan.step_scope.clone(),
+                    zeroclaw_spawn::scope_plugin_wake_depth(
+                        plan.depth,
+                        run_wake_turn_with_panic_recovery(cost_ctx.clone(), turn_usage, turn),
+                    ),
                 )
                 .await;
                 settle_wake_task(&task_store, &plan.task, &result).await;
 
-                // Drain a wake that coalesced while this turn ran. `None` means
-                // nothing is pending, so release the slot and stop.
-                let next = {
-                    let mut slots = coordinator.slots.lock();
-                    let next = match slots.get_mut(&spawn_key) {
-                        Some(WakeSlotState::Running { pending }) => pending.take(),
-                        None => None,
+                // Drain wakes that coalesced while this turn ran until one is
+                // ready to run. A follow-up that cannot run (grant revoked,
+                // target disabled, re-admission or registration failed) is
+                // skipped, never the slot: wakes that coalesced while it was
+                // being prepared stay pending and are drained next. The slot is
+                // released only here, under the lock, when nothing is pending,
+                // so no accepted wake is dropped with it.
+                plan = 'drain: loop {
+                    let next = {
+                        let mut slots = coordinator.slots.lock();
+                        match slots.get_mut(&spawn_key) {
+                            Some(WakeSlotState::Running { pending }) => {
+                                let next = pending.take();
+                                if next.is_none() {
+                                    slots.remove(&spawn_key);
+                                }
+                                next
+                            }
+                            // Only this worker releases its slot, so anything
+                            // else here is not ours to touch.
+                            Some(WakeSlotState::Starting { .. }) | None => None,
+                        }
                     };
-                    if next.is_none() {
-                        slots.remove(&spawn_key);
-                    }
-                    next
-                };
-                let Some(next) = next else {
-                    spawned_guard.disarm();
-                    return;
-                };
+                    let Some(next) = next else {
+                        spawned_guard.disarm();
+                        return;
+                    };
+                    let next = *next;
 
-                let follow_up_snapshot = match live_config.as_ref() {
-                    Some(handle) => Arc::new(handle.read().clone()),
-                    None => Arc::clone(&plan.cfg),
-                };
-                let follow_up_entry = follow_up_snapshot
-                    .plugins
-                    .entries
-                    .iter()
-                    .find(|entry| entry.name == spawn_key.0);
-                let Some(entry) = follow_up_entry else {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                            .with_attrs(::serde_json::json!({
-                                "plugin": package,
-                                "agent": spawn_canonical,
-                            })),
-                        "coalesced plugin wake cancelled: instance config row removed"
-                    );
-                    return;
-                };
-                if !entry
-                    .dispatch_agents
-                    .iter()
-                    .any(|allowed| allowed == "*" || allowed.eq_ignore_ascii_case(&spawn_canonical))
-                {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                            .with_attrs(::serde_json::json!({
-                                "plugin": package,
-                                "agent": spawn_canonical,
-                            })),
-                        "coalesced plugin wake cancelled: target no longer granted"
-                    );
-                    return;
-                }
-                if !follow_up_snapshot
-                    .agents
-                    .get(&spawn_canonical)
-                    .is_some_and(|agent| agent.enabled)
-                {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                            .with_attrs(::serde_json::json!({
-                                "plugin": package,
-                                "agent": spawn_canonical,
-                            })),
-                        "coalesced plugin wake cancelled: target agent disabled or removed"
-                    );
-                    return;
-                }
-                let admission = match next
-                    .execution_capability
-                    .as_ref()
-                    .map(|capability| capability.resolve_and_admit(&spawn_canonical))
-                    .transpose()
-                {
-                    Ok(admission) => admission,
-                    Err(error) => {
+                    let follow_up_snapshot = match live_config.as_ref() {
+                        Some(handle) => Arc::new(handle.read().clone()),
+                        None => Arc::clone(&plan.cfg),
+                    };
+                    let follow_up_entry = follow_up_snapshot
+                        .plugins
+                        .entries
+                        .iter()
+                        .find(|entry| entry.name == spawn_key.0);
+                    let Some(entry) = follow_up_entry else {
                         ::zeroclaw_log::record!(
                             WARN,
                             ::zeroclaw_log::Event::new(
@@ -662,47 +667,14 @@ impl AgentWakeBackend for RuntimeAgentWakeBackend {
                             .with_attrs(::serde_json::json!({
                                 "plugin": package,
                                 "agent": spawn_canonical,
-                                "error": format!("{error}"),
                             })),
-                            "coalesced plugin wake target could not be re-admitted"
+                            "coalesced plugin wake cancelled: instance config row removed"
                         );
-                        return;
-                    }
-                };
-                let cfg = admission
-                    .as_ref()
-                    .map(AgentExecutionAdmission::config)
-                    .unwrap_or(follow_up_snapshot);
-                if !cfg
-                    .agents
-                    .get(&spawn_canonical)
-                    .is_some_and(|agent| agent.enabled)
-                {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                            .with_attrs(::serde_json::json!({
-                                "plugin": package,
-                                "agent": spawn_canonical,
-                            })),
-                        "coalesced plugin wake cancelled: admitted target agent is disabled"
-                    );
-                    return;
-                }
-                let next_depth = next.depth.saturating_add(1);
-                let task = match admit_wake_task(
-                    Some(task_store.as_ref()),
-                    &control_plane_boot_id,
-                    &package,
-                    &spawn_canonical,
-                    next.caller_alias.as_deref(),
-                    next_depth,
-                )
-                .await
-                {
-                    Ok(task) => task,
-                    Err(error) => {
+                        continue 'drain;
+                    };
+                    if !entry.dispatch_agents.iter().any(|allowed| {
+                        allowed == "*" || allowed.eq_ignore_ascii_case(&spawn_canonical)
+                    }) {
                         ::zeroclaw_log::record!(
                             WARN,
                             ::zeroclaw_log::Event::new(
@@ -713,21 +685,120 @@ impl AgentWakeBackend for RuntimeAgentWakeBackend {
                             .with_attrs(::serde_json::json!({
                                 "plugin": package,
                                 "agent": spawn_canonical,
-                                "error": format!("{error:#}"),
                             })),
-                            "coalesced plugin wake registration failed"
+                            "coalesced plugin wake cancelled: target no longer granted"
                         );
-                        return;
+                        continue 'drain;
                     }
-                };
-                plan = WakeTurnPlan {
-                    cfg,
-                    admission,
-                    prompt: next.prompt,
-                    depth: next_depth,
-                    caller_alias: next.caller_alias,
-                    capabilities: next.capabilities,
-                    task,
+                    if !follow_up_snapshot
+                        .agents
+                        .get(&spawn_canonical)
+                        .is_some_and(|agent| agent.enabled)
+                    {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Reject
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "plugin": package,
+                                "agent": spawn_canonical,
+                            })),
+                            "coalesced plugin wake cancelled: target agent disabled or removed"
+                        );
+                        continue 'drain;
+                    }
+                    let admission = match next
+                        .execution_capability
+                        .as_ref()
+                        .map(|capability| capability.resolve_and_admit(&spawn_canonical))
+                        .transpose()
+                    {
+                        Ok(admission) => admission,
+                        Err(error) => {
+                            ::zeroclaw_log::record!(
+                                WARN,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Reject
+                                )
+                                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                .with_attrs(::serde_json::json!({
+                                    "plugin": package,
+                                    "agent": spawn_canonical,
+                                    "error": format!("{error}"),
+                                })),
+                                "coalesced plugin wake target could not be re-admitted"
+                            );
+                            continue 'drain;
+                        }
+                    };
+                    let cfg = admission
+                        .as_ref()
+                        .map(AgentExecutionAdmission::config)
+                        .unwrap_or(follow_up_snapshot);
+                    if !cfg
+                        .agents
+                        .get(&spawn_canonical)
+                        .is_some_and(|agent| agent.enabled)
+                    {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Reject
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "plugin": package,
+                                "agent": spawn_canonical,
+                            })),
+                            "coalesced plugin wake cancelled: admitted target agent is disabled"
+                        );
+                        continue 'drain;
+                    }
+                    let next_depth = next.depth.saturating_add(1);
+                    let task = match admit_wake_task(
+                        Some(task_store.as_ref()),
+                        &control_plane_boot_id,
+                        &package,
+                        &spawn_canonical,
+                        next.caller_alias.as_deref(),
+                        next_depth,
+                    )
+                    .await
+                    {
+                        Ok(task) => task,
+                        Err(error) => {
+                            ::zeroclaw_log::record!(
+                                WARN,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Reject
+                                )
+                                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                .with_attrs(::serde_json::json!({
+                                    "plugin": package,
+                                    "agent": spawn_canonical,
+                                    "error": format!("{error:#}"),
+                                })),
+                                "coalesced plugin wake registration failed"
+                            );
+                            continue 'drain;
+                        }
+                    };
+                    break 'drain WakeTurnPlan {
+                        cfg,
+                        admission,
+                        prompt: next.prompt,
+                        depth: next_depth,
+                        caller_alias: next.caller_alias,
+                        capabilities: next.capabilities,
+                        step_scope: next.step_scope,
+                        task,
+                    };
                 };
             }
         });
@@ -745,6 +816,7 @@ struct WakeTurnPlan {
     depth: u32,
     caller_alias: Option<String>,
     capabilities: Option<crate::composition::BoundCapabilities>,
+    step_scope: Option<crate::sop::active_scope::HeadlessStepScope>,
     task: WakeTask,
 }
 
@@ -2121,6 +2193,534 @@ mod tests {
             "rate=1 admits only the initial turn: {tasks:?}"
         );
         assert_eq!(*request_count.lock(), 1);
+        server.abort();
+    }
+
+    /// Delegates to a real store, except that one numbered `create` waits for
+    /// `release` and then fails. That pins a registration failure to a chosen
+    /// wake while the test arranges other wakes around it.
+    struct GatedCreateRegistry {
+        inner: Arc<dyn TaskRegistry>,
+        creates: std::sync::atomic::AtomicUsize,
+        gated_call: usize,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl TaskRegistry for GatedCreateRegistry {
+        async fn create(&self, rec: TaskRecord) -> anyhow::Result<()> {
+            let call = self
+                .creates
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            if call == self.gated_call {
+                self.entered.notify_one();
+                self.release.notified().await;
+                anyhow::bail!("gated registration failure");
+            }
+            self.inner.create(rec).await
+        }
+        async fn heartbeat(&self, id: &str, owner_boot_id: &str) -> anyhow::Result<()> {
+            self.inner.heartbeat(id, owner_boot_id).await
+        }
+        async fn update_status(
+            &self,
+            id: &str,
+            status: TaskStatus,
+            output: Option<String>,
+            error: Option<String>,
+        ) -> anyhow::Result<()> {
+            self.inner.update_status(id, status, output, error).await
+        }
+        async fn transition_terminal(
+            &self,
+            id: &str,
+            status: TaskStatus,
+            output: Option<String>,
+            error: Option<String>,
+        ) -> anyhow::Result<bool> {
+            self.inner
+                .transition_terminal(id, status, output, error)
+                .await
+        }
+        async fn transition_terminal_if_owner(
+            &self,
+            id: &str,
+            owner_pid: u32,
+            owner_boot_id: &str,
+            status: TaskStatus,
+            output: Option<String>,
+            error: Option<String>,
+        ) -> anyhow::Result<bool> {
+            self.inner
+                .transition_terminal_if_owner(id, owner_pid, owner_boot_id, status, output, error)
+                .await
+        }
+        async fn persist_terminal_settlement_intent(
+            &self,
+            intent: crate::control_plane::task_registry::TerminalSettlementIntent,
+        ) -> anyhow::Result<bool> {
+            self.inner.persist_terminal_settlement_intent(intent).await
+        }
+        async fn list_terminal_settlement_intents(
+            &self,
+        ) -> anyhow::Result<Vec<crate::control_plane::task_registry::TerminalSettlementIntent>>
+        {
+            self.inner.list_terminal_settlement_intents().await
+        }
+        async fn promote_terminal_settlement(
+            &self,
+            intent: &crate::control_plane::task_registry::TerminalSettlementIntent,
+            resolved_status: TaskStatus,
+            output: Option<String>,
+            error: Option<String>,
+        ) -> anyhow::Result<bool> {
+            self.inner
+                .promote_terminal_settlement(intent, resolved_status, output, error)
+                .await
+        }
+        async fn discard_terminal_settlement_intent(
+            &self,
+            intent: &crate::control_plane::task_registry::TerminalSettlementIntent,
+        ) -> anyhow::Result<bool> {
+            self.inner.discard_terminal_settlement_intent(intent).await
+        }
+        async fn claim_owner(
+            &self,
+            id: &str,
+            owner_pid: u32,
+            owner_boot_id: &str,
+        ) -> anyhow::Result<()> {
+            self.inner.claim_owner(id, owner_pid, owner_boot_id).await
+        }
+        async fn get(&self, id: &str) -> anyhow::Result<Option<TaskRecord>> {
+            self.inner.get(id).await
+        }
+        async fn get_snapshot(&self, id: &str) -> anyhow::Result<Option<TaskSnapshot>> {
+            self.inner.get_snapshot(id).await
+        }
+        async fn record_progress(
+            &self,
+            id: &str,
+            owner_boot_id: &str,
+            progress: &crate::control_plane::TaskProgress,
+        ) -> anyhow::Result<bool> {
+            self.inner
+                .record_progress(id, owner_boot_id, progress)
+                .await
+        }
+        async fn list_running(&self) -> anyhow::Result<Vec<TaskRecord>> {
+            self.inner.list_running().await
+        }
+        async fn list_by_agent(&self, agent: &str) -> anyhow::Result<Vec<TaskRecord>> {
+            self.inner.list_by_agent(agent).await
+        }
+        async fn reconcile_lost(&self, id: &str, now_boot_id: &str) -> anyhow::Result<bool> {
+            self.inner.reconcile_lost(id, now_boot_id).await
+        }
+        async fn reconcile_timed_out(
+            &self,
+            id: &str,
+            owner_pid: u32,
+            owner_boot_id: &str,
+            heartbeat_at: &str,
+        ) -> anyhow::Result<bool> {
+            self.inner
+                .reconcile_timed_out(id, owner_pid, owner_boot_id, heartbeat_at)
+                .await
+        }
+    }
+
+    /// A control plane over a real store whose `gated_call`-th registration
+    /// waits for `release` and then fails. Returns the handle and the real
+    /// store the test reads back from.
+    fn gated_control_plane(
+        dir: &Path,
+        gated_call: usize,
+        entered: &Arc<tokio::sync::Notify>,
+        release: &Arc<tokio::sync::Notify>,
+    ) -> (ControlPlaneHandle, Arc<dyn TaskRegistry>) {
+        let real = ControlPlaneHandle::open(dir).expect("isolated control plane");
+        let store = Arc::clone(&real.store);
+        let gated = ControlPlaneHandle {
+            store: Arc::new(GatedCreateRegistry {
+                inner: Arc::clone(&store),
+                creates: std::sync::atomic::AtomicUsize::new(0),
+                gated_call,
+                entered: Arc::clone(entered),
+                release: Arc::clone(release),
+            }),
+            boot_id: real.boot_id,
+        };
+        (gated, store)
+    }
+
+    /// Wait until another wake is held against `key`: parked as a pending
+    /// follow-up, or waiting for the slot's claimant to settle.
+    async fn await_contended(coordinator: &Arc<SharedWakeCoordinator>, key: &(String, String)) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let contended = match coordinator.slots.lock().get(key) {
+                    Some(WakeSlotState::Running { pending }) => pending.is_some(),
+                    Some(WakeSlotState::Starting { gate }) => gate.receiver_count() > 0,
+                    None => false,
+                };
+                if contended {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the second wake must reach the held slot");
+    }
+
+    /// A wake that arrives while the first wake is still registering its task
+    /// must not be accepted and then dropped when that registration fails. The
+    /// first caller learns `unavailable`; the second caller's success must mean
+    /// a turn actually runs for it.
+    #[tokio::test]
+    async fn wake_accepted_during_a_failed_claim_still_runs() {
+        let workspace = tempfile::TempDir::new().expect("temp data dir");
+        let mut config = base_config(workspace.path());
+        config.plugins.entries = vec![entry(&instance_key(), &["recipient"], None)];
+
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let (control_plane, store) = gated_control_plane(workspace.path(), 1, &entered, &release);
+        let coordinator = Arc::new(SharedWakeCoordinator::new());
+        let backend = Arc::new(RuntimeAgentWakeBackend::for_tests(
+            Arc::new(config),
+            None,
+            None,
+            Some(control_plane),
+            Arc::clone(&coordinator),
+        ));
+
+        // The first wake claims the slot and stalls inside its registration.
+        let first = {
+            let backend = Arc::clone(&backend);
+            zeroclaw_spawn::spawn!(async move {
+                backend
+                    .wake(&scope(), Some("sender-1"), "recipient", "first")
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(10), entered.notified())
+            .await
+            .expect("the first wake reaches its registration");
+
+        // A second wake meets the held slot before the first one settles.
+        let second = {
+            let backend = Arc::clone(&backend);
+            zeroclaw_spawn::spawn!(async move {
+                backend
+                    .wake(&scope(), Some("sender-2"), "recipient", "second")
+                    .await
+            })
+        };
+        await_contended(&coordinator, &pair()).await;
+
+        // The first registration fails.
+        release.notify_one();
+        assert_eq!(
+            first.await.expect("first wake task"),
+            Err(AgentWakeError::Unavailable),
+            "the caller whose registration failed learns it"
+        );
+        let second = tokio::time::timeout(Duration::from_secs(10), second)
+            .await
+            .expect("the second wake settles")
+            .expect("second wake task");
+        assert_eq!(second, Ok(()), "the second wake was not itself refused");
+
+        await_slots_released(&coordinator).await;
+        let tasks = tasks_for(store.as_ref(), "recipient").await;
+        assert_eq!(
+            tasks.len(),
+            1,
+            "a wake reported as accepted must run a turn: {tasks:?}"
+        );
+        assert_eq!(tasks[0].principal_id.as_deref(), Some("sender-2"));
+        await_terminal(store.as_ref(), &tasks[0].id).await;
+    }
+
+    /// The worker's own follow-up registration can fail too. A wake that
+    /// coalesced while that registration was in flight must still run after
+    /// it: the worker keeps draining instead of releasing the slot.
+    #[tokio::test]
+    async fn wake_coalesced_during_a_failed_followup_registration_still_runs() {
+        use axum::{Json, Router, extract::State, routing::post};
+
+        #[derive(Clone)]
+        struct RequestState {
+            count: Arc<Mutex<u32>>,
+            entered: Arc<tokio::sync::Notify>,
+            release: Arc<tokio::sync::Notify>,
+        }
+        async fn capture_chat(
+            State(state): State<RequestState>,
+            Json(_body): Json<serde_json::Value>,
+        ) -> Json<serde_json::Value> {
+            *state.count.lock() += 1;
+            state.entered.notify_one();
+            state.release.notified().await;
+            Json(serde_json::json!({
+                "choices": [{"message": {"content": "ok"}}]
+            }))
+        }
+
+        let request_count = Arc::new(Mutex::new(0));
+        let provider_entered = Arc::new(tokio::sync::Notify::new());
+        let provider_release = Arc::new(tokio::sync::Notify::new());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("mock provider listener should bind");
+        let mock_addr = listener.local_addr().expect("mock provider addr");
+        let app = Router::new()
+            .route("/v1/chat/completions", post(capture_chat))
+            .with_state(RequestState {
+                count: Arc::clone(&request_count),
+                entered: Arc::clone(&provider_entered),
+                release: Arc::clone(&provider_release),
+            });
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("mock provider server should run");
+        });
+
+        let workspace = tempfile::TempDir::new().expect("temp data dir");
+        let mut config = base_config(workspace.path());
+        config.providers.models.ollama.insert(
+            "default".to_string(),
+            OllamaModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("mock-model".to_string()),
+                    uri: Some(format!("http://{mock_addr}")),
+                    timeout_secs: Some(10),
+                    ..ModelProviderConfig::default()
+                },
+                ..OllamaModelProviderConfig::default()
+            },
+        );
+        config.plugins.entries = vec![entry(&instance_key(), &["recipient"], None)];
+
+        // Registration 1 is the first turn; 2 is the first follow-up and fails.
+        let registry_entered = Arc::new(tokio::sync::Notify::new());
+        let registry_release = Arc::new(tokio::sync::Notify::new());
+        let (control_plane, store) =
+            gated_control_plane(workspace.path(), 2, &registry_entered, &registry_release);
+        let coordinator = Arc::new(SharedWakeCoordinator::new());
+        let backend = RuntimeAgentWakeBackend::for_tests(
+            Arc::new(config),
+            None,
+            None,
+            Some(control_plane),
+            Arc::clone(&coordinator),
+        );
+
+        assert_eq!(
+            backend
+                .wake(&scope(), Some("sender-1"), "recipient", "first")
+                .await,
+            Ok(())
+        );
+        tokio::time::timeout(Duration::from_secs(10), provider_entered.notified())
+            .await
+            .expect("first turn reaches mock provider");
+        assert_eq!(
+            backend
+                .wake(&scope(), Some("sender-2"), "recipient", "second")
+                .await,
+            Ok(()),
+            "the second wake coalesces onto the running turn"
+        );
+
+        // The first turn ends; the worker starts registering the follow-up.
+        provider_release.notify_one();
+        tokio::time::timeout(Duration::from_secs(10), registry_entered.notified())
+            .await
+            .expect("the worker reaches the follow-up registration");
+
+        // A third wake coalesces while that registration is in flight.
+        assert_eq!(
+            backend
+                .wake(&scope(), Some("sender-3"), "recipient", "third")
+                .await,
+            Ok(())
+        );
+
+        // The follow-up registration fails; the third wake must still run.
+        registry_release.notify_one();
+        tokio::time::timeout(Duration::from_secs(10), provider_entered.notified())
+            .await
+            .expect("the third wake's turn must reach the provider");
+        provider_release.notify_one();
+
+        await_slots_released(&coordinator).await;
+        let tasks = tasks_for(store.as_ref(), "recipient").await;
+        let principals: Vec<_> = tasks
+            .iter()
+            .map(|task| task.principal_id.as_deref())
+            .collect();
+        assert_eq!(
+            tasks.len(),
+            2,
+            "the first turn and the third wake run; the failed follow-up registered \
+             nothing: {principals:?}"
+        );
+        assert!(principals.contains(&Some("sender-1")));
+        assert!(principals.contains(&Some("sender-3")));
+        assert_eq!(*request_count.lock(), 2);
+        server.abort();
+    }
+
+    /// A headless SOP step that runs a dispatch-capable plugin must keep the
+    /// woken turn inside the step's tool scope. Detached spawn drops
+    /// task-locals, so without restoring the scope the target rebuilds its full
+    /// surface (`send_message_to_peer`, `delegate` and `spawn_subagent` already
+    /// carry it). Each wake carries its own caller's scope, so a coalesced
+    /// follow-up runs under the scope of the call that queued it.
+    #[tokio::test]
+    async fn woken_turns_keep_each_callers_headless_step_scope() {
+        use axum::{Json, Router, extract::State, routing::post};
+        use zeroclaw_config::schema::SopConfig;
+
+        #[derive(Clone)]
+        struct RequestState {
+            bodies: Arc<Mutex<Vec<serde_json::Value>>>,
+            entered: Arc<tokio::sync::Notify>,
+            release: Arc<tokio::sync::Notify>,
+        }
+        async fn capture_chat(
+            State(state): State<RequestState>,
+            Json(body): Json<serde_json::Value>,
+        ) -> Json<serde_json::Value> {
+            state.bodies.lock().push(body);
+            state.entered.notify_one();
+            state.release.notified().await;
+            Json(serde_json::json!({
+                "choices": [{"message": {"content": "ok"}}]
+            }))
+        }
+        fn offered(body: &serde_json::Value) -> Vec<String> {
+            body["tools"]
+                .as_array()
+                .map(|tools| {
+                    tools
+                        .iter()
+                        .filter_map(|t| t["function"]["name"].as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default()
+        }
+        fn step_allowing(tool: &str) -> crate::sop::active_scope::HeadlessStepScope {
+            crate::sop::active_scope::HeadlessStepScope {
+                run_id: format!("run-{tool}"),
+                step: crate::sop::SopStep {
+                    number: 1,
+                    scope: Some(crate::sop::StepToolScope {
+                        allow: Some(vec![tool.to_string()]),
+                        deny: Vec::new(),
+                    }),
+                    ..crate::sop::SopStep::default()
+                },
+                config: SopConfig {
+                    step_scope_enforce: true,
+                    ..SopConfig::default()
+                },
+            }
+        }
+
+        let bodies = Arc::new(Mutex::new(Vec::new()));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("mock provider listener should bind");
+        let mock_addr = listener.local_addr().expect("mock provider addr");
+        let app = Router::new()
+            .route("/v1/chat/completions", post(capture_chat))
+            .with_state(RequestState {
+                bodies: Arc::clone(&bodies),
+                entered: Arc::clone(&entered),
+                release: Arc::clone(&release),
+            });
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("mock provider server should run");
+        });
+
+        let workspace = tempfile::TempDir::new().expect("temp data dir");
+        let mut config = base_config(workspace.path());
+        config.providers.models.ollama.insert(
+            "default".to_string(),
+            OllamaModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("mock-model".to_string()),
+                    uri: Some(format!("http://{mock_addr}")),
+                    timeout_secs: Some(10),
+                    ..ModelProviderConfig::default()
+                },
+                ..OllamaModelProviderConfig::default()
+            },
+        );
+        config.plugins.entries = vec![entry(&instance_key(), &["recipient"], None)];
+        let control_plane =
+            ControlPlaneHandle::open(workspace.path()).expect("isolated control plane");
+        let coordinator = Arc::new(SharedWakeCoordinator::new());
+        let backend = RuntimeAgentWakeBackend::for_tests(
+            Arc::new(config),
+            None,
+            None,
+            Some(control_plane),
+            Arc::clone(&coordinator),
+        );
+
+        // The first wake comes from a step that may only read files.
+        assert_eq!(
+            crate::sop::active_scope::with_active_headless_step_scope(
+                step_allowing("file_read"),
+                backend.wake(&scope(), Some("sender-1"), "recipient", "first"),
+            )
+            .await,
+            Ok(())
+        );
+        tokio::time::timeout(Duration::from_secs(10), entered.notified())
+            .await
+            .expect("first turn reaches mock provider");
+
+        // A second wake from a step that may only search coalesces meanwhile.
+        assert_eq!(
+            crate::sop::active_scope::with_active_headless_step_scope(
+                step_allowing("glob_search"),
+                backend.wake(&scope(), Some("sender-2"), "recipient", "second"),
+            )
+            .await,
+            Ok(())
+        );
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(10), entered.notified())
+            .await
+            .expect("the coalesced follow-up reaches mock provider");
+        release.notify_one();
+        await_slots_released(&coordinator).await;
+
+        let bodies = bodies.lock().clone();
+        assert_eq!(bodies.len(), 2, "one request per woken turn");
+        assert_eq!(
+            offered(&bodies[0]),
+            vec!["file_read".to_string()],
+            "the first woken turn escaped its caller's step scope"
+        );
+        assert_eq!(
+            offered(&bodies[1]),
+            vec!["glob_search".to_string()],
+            "the coalesced follow-up must run under the scope of the call that queued it"
+        );
         server.abort();
     }
 
