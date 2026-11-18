@@ -796,3 +796,17 @@ test('one pane dictation blocks narration and releases audio on capture end', as
     assert.deepEqual(spoken, ['Historical reply']);
   } finally { await act(async () => { reading.unmount(); recording.unmount(); }); }
 });
+
+
+test('switching own narration to dictation tolerates stale browser speaking flags', async () => {
+  const renderer = await mount();
+  try {
+    await act(async () => { renderer.root.findAllByType('button')[1]!.props.onClick(); });
+    Object.assign(speech, { speaking: true, pending: true });
+    await act(async () => { await renderer.root.findAllByType('button')[0]!.props.onClick(); });
+    assert.equal(renderer.root.findAllByType('button')[0]!.props['aria-pressed'], true);
+  } finally {
+    Object.assign(speech, { speaking: false, pending: false });
+    await act(async () => { renderer.unmount(); });
+  }
+});
