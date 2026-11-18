@@ -1502,12 +1502,13 @@ impl OpenAiCompatibleModelProvider {
     /// Style resolution is shared with the native Anthropic provider via
     /// `crate::anthropic::anthropic_thinking_style` (same crate, free
     /// function): budget models get the fixed-budget `enabled` shape,
-    /// adaptive-only models (Opus 4.7, the whole Fable 5 family) get
+    /// adaptive-only models (every Claude model numbered 4.7 or later) get
     /// `{"type":"adaptive"}` with no `budget_tokens`, matching the native
     /// `NativeThinkingConfig` serialization. `params.display` rides on both
     /// shapes as the snake_case `display` key when present, exactly as the
     /// native provider emits it. Gateway model IDs may carry routing
-    /// prefixes; the resolver's substring matching handles them.
+    /// prefixes and suffixes; the version is read immediately after the
+    /// family token, so decorated IDs resolve like the bare name.
     /// History-path chat with optional thinking rethreading. Fallback paths
     /// that rebuild a tool request as prompt-guided text pass the original
     /// `request.thinking` so the rebuilt body keeps the same injection the
@@ -7034,9 +7035,9 @@ mod tests {
 
     #[test]
     fn thinking_passthrough_prefixed_adaptive_model_id_resolves_adaptive() {
-        // Gateway routing prefixes model IDs; the shared style resolver
-        // matches on substrings, so a prefixed adaptive-only ID must still
-        // resolve to the adaptive shape (live gateways emit IDs like
+        // Gateway routing prefixes model IDs. The version is read after the
+        // family token, so a prefixed adaptive-only ID must still resolve to
+        // the adaptive shape (live gateways emit IDs like
         // "claude-group/claude-fable-5").
         let params = zeroclaw_api::model_provider::NativeThinkingParams {
             budget_tokens: 8_192,
@@ -7095,6 +7096,72 @@ mod tests {
             serde_json::json!({"type": "adaptive", "display": "summarized"}),
             "the request builder must carry the adaptive plus display shape to the wire"
         );
+    }
+
+    #[test]
+    fn thinking_passthrough_request_builder_follows_family_version() {
+        // Request-building coverage for IDs the end-of-string parser
+        // misread, and for the families Anthropic also rejects `enabled` on.
+        let params = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: 8_192,
+            display: None,
+        };
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("http://localhost:8000/v1")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .build();
+        let messages = vec![ChatMessage::user("hello")];
+
+        for model in [
+            "claude-fable-5-2-fast",
+            "anthropic.claude-opus-4-7-v1:0",
+            "claude-sonnet-5",
+            "claude-sonnet-5-5",
+            "claude-haiku-5-5",
+            "claude-opus-5-5-fast",
+        ] {
+            let req = p.build_native_tool_chat_request(
+                &messages,
+                None,
+                model,
+                None,
+                false,
+                false,
+                Some(params),
+            );
+            let value = serde_json::to_value(&req).unwrap();
+            assert_eq!(
+                value["thinking"],
+                serde_json::json!({"type": "adaptive"}),
+                "{model} must reach the wire as adaptive, with no budget"
+            );
+        }
+
+        for model in [
+            "claude-opus-4-20250514",
+            "claude-mythos-preview",
+            "claude-opus-4-6",
+            "claude-sonnet-4-6-latest",
+        ] {
+            let req = p.build_native_tool_chat_request(
+                &messages,
+                None,
+                model,
+                None,
+                false,
+                false,
+                Some(params),
+            );
+            let value = serde_json::to_value(&req).unwrap();
+            assert_eq!(
+                value["thinking"],
+                serde_json::json!({"type": "enabled", "budget_tokens": 8_192}),
+                "{model} must keep the budget shape on the wire"
+            );
+        }
     }
 
     #[test]
