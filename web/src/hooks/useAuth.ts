@@ -191,7 +191,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
         cancelled = true;
       };
     }
-    const generation = getSignOutGeneration();
+    let sessionGeneration: number | undefined;
     resolveInitialAuth({
       hasToken: false,
       desktop: isTauri(),
@@ -201,7 +201,10 @@ export function AuthProvider({ children }: AuthProviderProps) {
           if (methods?.via_relay) setViaRelay(true);
           return methods;
         }),
-      getSession: () => fetchAuthSession(),
+      getSession: () => {
+        sessionGeneration = getSignOutGeneration();
+        return fetchAuthSession();
+      },
     })
       .then((initial) => {
         if (cancelled) return;
@@ -215,7 +218,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
           case 'signed-in':
             setProviders(initial.providers);
             setProvidersKnown(true);
-            if (generation === getSignOutGeneration()) {
+            if (sessionGeneration === getSignOutGeneration()) {
               setOidcSession(initial.session, initial.clockOffsetMs);
             } else if (!getOidcSession()) {
               setPhase('signed-out');
