@@ -51,6 +51,101 @@ struct HttpRequestUrlPolicy {
     private_resolution_allowed: bool,
 }
 
+fn redact_response_body(
+    body: String,
+    redact: &impl Fn(&str) -> String,
+    contains_credentials: bool,
+) -> String {
+    if !contains_credentials {
+        return redact(&body);
+    }
+
+    // Validate without materializing numbers, preserving integers larger than
+    // u64 and avoiding global serde_json numeric feature changes.
+    let mut decoder = serde_json::Deserializer::from_str(&body);
+    let is_json = <serde::de::IgnoredAny as serde::Deserialize>::deserialize(&mut decoder)
+        .and_then(|_| decoder.end())
+        .is_ok();
+
+    // Redact decoded JSON strings and scalar tokens without changing syntax
+    // or escape sequences. Preserve every unrelated numeric token verbatim.
+    let bytes = body.as_bytes();
+    let mut output = String::with_capacity(body.len());
+    let mut cursor = 0;
+    while cursor < bytes.len() {
+        let start = cursor;
+        match bytes[cursor] {
+            b'"' => {
+                cursor += 1;
+                while cursor < bytes.len() {
+                    match bytes[cursor] {
+                        b'\\' => cursor = (cursor + 2).min(bytes.len()),
+                        b'"' => {
+                            cursor += 1;
+                            break;
+                        }
+                        _ => cursor += 1,
+                    }
+                }
+                let token = &body[start..cursor];
+                if let Ok(decoded) = serde_json::from_str::<String>(token) {
+                    let redacted = redact(&decoded);
+                    if redacted == decoded && !is_json {
+                        // Every quote can begin a JSON string in an arbitrary
+                        // wrapper; an unrelated pair must not consume it.
+                        output.push('"');
+                        cursor = start + 1;
+                    } else if redacted == decoded {
+                        output.push_str(token);
+                    } else {
+                        // Serializing a String cannot fail.
+                        output.push_str(&serde_json::to_string(&redacted).expect("JSON string"));
+                    }
+                } else if is_json {
+                    output.push_str(token);
+                } else {
+                    // Invalid surrounding text must not hide a later valid
+                    // JSON string, e.g. an HTML attribute or a partial reply.
+                    output.push('"');
+                    cursor = start + 1;
+                }
+            }
+            b'-' | b'0'..=b'9' | b't' | b'f' | b'n' if is_json => {
+                cursor += 1;
+                while cursor < bytes.len()
+                    && matches!(
+                        bytes[cursor],
+                        b'0'..=b'9' | b'a'..=b'z' | b'A'..=b'Z' | b'.' | b'+' | b'-'
+                    )
+                {
+                    cursor += 1;
+                }
+                let token = &body[start..cursor];
+                let redacted = redact(token);
+                if redacted == token {
+                    output.push_str(token);
+                } else {
+                    // An altered scalar becomes a JSON string, preserving the
+                    // surrounding structured response and unrelated raw numbers.
+                    output.push_str(&serde_json::to_string(&redacted).expect("JSON string"));
+                }
+            }
+            _ => {
+                let character = body[cursor..].chars().next().expect("cursor is in bounds");
+                output.push(character);
+                cursor += character.len_utf8();
+            }
+        }
+    }
+    if is_json {
+        output
+    } else {
+        // JSONP, NDJSON and malformed replies still need decoded-string
+        // scrubbing above, plus literal replacement across quotation marks.
+        redact(&output)
+    }
+}
+
 impl HttpRequestTool {
     pub fn new(
         security: Arc<SecurityPolicy>,
@@ -948,7 +1043,11 @@ impl Tool for HttpRequestTool {
                         "tool-http-request-authenticated-response-truncated",
                     )
                 } else {
-                    redact(response_text)
+                    redact_response_body(
+                        response_text,
+                        &|text| redact(text.to_owned()),
+                        !sensitive.is_empty(),
+                    )
                 };
                 let body_error = body_error.map(redact);
                 let output = format!(
@@ -2615,6 +2714,114 @@ api_token = "Bearer from-secret"
         assert_eq!(parsed["authorization"], "Bearer secret");
         assert_eq!(parsed["x-api-key"], "my-key");
         assert_eq!(parsed["content-type"], "application/json");
+    }
+
+    #[test]
+    fn authenticated_non_json_redacts_escaped_strings() {
+        let secret = "secret123";
+        for body in [
+            r#"callback({"token":"\u0073ecret123"})"#,
+            r#"{"token":"\u0073ecret123","unfinished": "#,
+            r#"<p title="bad\q">{"token":"\u0073ecret123"}</p>"#,
+        ] {
+            let output = redact_response_body(
+                body.into(),
+                &|text| text.replace(secret, "[REDACTED]"),
+                true,
+            );
+            assert!(!output.contains(secret));
+            assert!(!output.contains(r"\u0073ecret123"));
+            assert!(output.contains("[REDACTED]"), "{output}");
+        }
+    }
+
+    #[test]
+    fn authenticated_ndjson_redacts_decoded_secrets_in_each_record() {
+        let secret = "abc\"def";
+        let body = "{\"message\":\"abc\\\"def\"}\n{\"message\":\"abc\\u0022def\"}";
+        let output = redact_response_body(
+            body.into(),
+            &|text| text.replace(secret, "[REDACTED]"),
+            true,
+        );
+        let rows: Vec<serde_json::Value> = output
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|row| row["message"] == "[REDACTED]"));
+    }
+
+    #[test]
+    fn authenticated_json_unicode_escapes_remain_structured() {
+        let output = redact_response_body(
+            r#"{"city":"\u6771\u4eac"}"#.into(),
+            &|text| text.replace("u", "[REDACTED]"),
+            true,
+        );
+        let structured: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(structured["city"], "東京");
+    }
+
+    #[test]
+    fn authenticated_scalar_credentials_preserve_valid_json() {
+        for scalar in ["true", "false", "null", "-123.45e+2"] {
+            let body = format!("{{\"value\":{scalar}}}");
+            let output =
+                redact_response_body(body, &|text| text.replace(scalar, "[REDACTED]"), true);
+            let structured: serde_json::Value = serde_json::from_str(&output).unwrap();
+            assert_eq!(structured["value"], "[REDACTED]");
+        }
+    }
+
+    #[test]
+    fn authenticated_text_redacts_secret_containing_quotes() {
+        let secret = "abc\"def";
+        for body in [format!("credential: {secret}"), format!("<p>{secret}</p>")] {
+            let output =
+                redact_response_body(body, &|text| text.replace(secret, "[REDACTED]"), true);
+            assert!(!output.contains(secret));
+            assert!(output.contains("[REDACTED]"));
+        }
+    }
+
+    #[test]
+    fn authenticated_numeric_secrets_preserve_structured_json() {
+        let output = redact_response_body(
+            r#"{"count":123456,"ok":true,"large":18446744073709551617}"#.into(),
+            &|text| text.replace("123456", "[REDACTED]"),
+            true,
+        );
+        let structured: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(structured["count"], "[REDACTED]");
+        assert_eq!(structured["ok"], true);
+        assert!(output.contains("18446744073709551617"));
+    }
+
+    #[test]
+    fn authenticated_json_body_preserves_large_integers() {
+        let body = r#"{"id":18446744073709551617,"nested":[-9223372036854775809,"fixture-key"]}"#;
+        let output = redact_response_body(
+            body.into(),
+            &|text| text.replace("fixture-key", "[REDACTED]"),
+            true,
+        );
+        assert!(output.contains("18446744073709551617"));
+        assert!(output.contains("-9223372036854775809"));
+        assert!(!output.contains("fixture-key"));
+        let value: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(value["nested"][1], "[REDACTED]");
+    }
+
+    #[test]
+    fn authenticated_json_body_redacts_decoded_values_and_keys() {
+        let secret = r#"token\"with\escapes"#;
+        let body = json!({"nested": [{"credential": secret}], (secret): "key"}).to_string();
+        let output = redact_response_body(body, &|text| text.replace(secret, "[REDACTED]"), true);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&output).unwrap(),
+            json!({"nested": [{"credential": "[REDACTED]"}], "[REDACTED]": "key"})
+        );
     }
 
     #[test]
