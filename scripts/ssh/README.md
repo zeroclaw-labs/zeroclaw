@@ -96,7 +96,7 @@ grant itself such an exception or introduce a second task scheduler.
 Build the Linux binary with `cargo build --locked --release -p zeroclaw-tools
 --bin zeroclaw-ssh-task`. Configure the service helper path and the shell's
 managed SSH wrapper to point to the same binary. The existing task protocol,
-catalog, trust configuration, and idle timeout apply. Roll back by restoring
+SSH-agent identity, trust configuration, and idle timeout apply. Roll back by restoring
 both paths to the previous helper. Keep the Python adapter during review.
 
 ## Native broker scope
