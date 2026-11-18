@@ -55345,7 +55345,7 @@ mod scoped_http_origin_regressions {
             ("https://[::1]:8443/", "https://[::1]:8443"),
         ] {
             assert_eq!(
-                ScopedHttpCredential::configured_https_origin(raw).as_deref(),
+                ScopedHttpCredential::https_origin(raw).as_deref(),
                 Some(expected)
             );
         }
