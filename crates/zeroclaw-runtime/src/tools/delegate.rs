@@ -6791,6 +6791,8 @@ impl DelegateTool {
                 // The sealed registry carries the route its rebuilt
                 // `spawn_subagent` shares, as a registry the native factory
                 // built does.
+                #[cfg(test)]
+                let target_session_memory = route_for_sealed_registry(target_session_memory);
                 bounded_built.session_memory = target_session_memory;
                 // Seal the already-filtered set through the one assembly seam.
                 // The policy is `SecurityPolicy::default()` (no allow/deny
@@ -7341,11 +7343,32 @@ pub(crate) struct OwnerPlaneProbe {
     /// Where the plane the hop pinned came from: `target_memory` (the memory
     /// already opened for the target's inherited memory tools) or `reopened`.
     pub(crate) plane_source: Option<&'static str>,
+    /// Set by a test before the hop runs: the sealed registry is handed an
+    /// empty route instead of the pinned one, the state the guard exists to
+    /// refuse. Production never reaches it, so this is the only way to
+    /// exercise the call that turns it into the hop's refusal.
+    pub(crate) unpin_sealed_route: bool,
 }
 
 #[cfg(test)]
 tokio::task_local! {
     pub(crate) static OWNER_PLANE_PROBE: Arc<std::sync::Mutex<OwnerPlaneProbe>>;
+}
+
+#[cfg(test)]
+fn route_for_sealed_registry(
+    route: Option<Arc<zeroclaw_tools::session_memory::SessionMemoryRoute>>,
+) -> Option<Arc<zeroclaw_tools::session_memory::SessionMemoryRoute>> {
+    let unpin = OWNER_PLANE_PROBE
+        .try_with(|probe| probe.lock().unwrap().unpin_sealed_route)
+        .unwrap_or(false);
+    if unpin {
+        Some(Arc::new(
+            zeroclaw_tools::session_memory::SessionMemoryRoute::default(),
+        ))
+    } else {
+        route
+    }
 }
 
 #[cfg(test)]
@@ -22573,6 +22596,55 @@ target = "memory_recall"
                     0,
                     "nothing reaches the target's configured endpoint"
                 );
+            });
+        }
+
+        /// The hop itself, not only the function it calls, refuses an owned
+        /// target whose sealed registry does not hold the owner's plane: the
+        /// registry is handed an empty route, and the hop ends with the
+        /// existing tool-initialization refusal before any child starts.
+        #[test]
+        fn bounded_owned_hop_is_refused_when_its_sealed_registry_is_not_pinned() {
+            on_deep_stack(async {
+                let hop = hop("spawn_subagent", true, HopMemory::OneStore, |_, _| {}).await;
+                hop.tool
+                    .bind_principal_scope(owner_scope())
+                    .expect("the session's owner binds");
+                let sink = Arc::new(std::sync::Mutex::new(None));
+                let probe = Arc::new(std::sync::Mutex::new(OwnerPlaneProbe {
+                    unpin_sealed_route: true,
+                    ..OwnerPlaneProbe::default()
+                }));
+                let result = OWNER_PLANE_PROBE
+                    .scope(
+                        Arc::clone(&probe),
+                        CHILD_MEMORY_SINK.scope(
+                            Arc::clone(&sink),
+                            run_target(&hop, "spawn_subagent", json!({"prompt": "say hello"})),
+                        ),
+                    )
+                    .await;
+                let child_started = sink.lock().unwrap().is_some();
+                let probe = std::mem::take(&mut *probe.lock().unwrap());
+                assert!(
+                    matches!(probe.sealed, Some(SealedRoute::Unpinned)),
+                    "precondition: the sealed registry carried the empty route"
+                );
+                assert_eq!(
+                    probe.refusal,
+                    Some("sealed_route_not_pinned"),
+                    "the hop is refused for the route its registry carries; delegate output: {}; \
+                     error: {:?}",
+                    result.output,
+                    result.error
+                );
+                assert!(!result.success, "a refused hop does not succeed");
+                assert_eq!(
+                    result.error,
+                    DelegateTool::bounded_tools_refusal(TARGET).error,
+                    "the refusal the model sees is the existing tool-initialization one"
+                );
+                assert!(!child_started, "no child run starts");
             });
         }
 
