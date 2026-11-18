@@ -1231,7 +1231,8 @@ mod binding_ratchet_tests {
     /// to the allowed list with its reason.
     ///
     /// Scope: it reads the source of `crates/zeroclaw-runtime/src` only, and
-    /// matches the text `<Type>::new(`. It does not see another crate that
+    /// matches the text `<Type>::new` followed by any suffix (`new_with_capability`
+    /// and the like). It does not see another crate that
     /// calls the public constructors, a `use ... as` alias of the type,
     /// `Self::new` inside the type's own impl, or a factory called with
     /// `binding: None`. Making the constructors `pub(crate)` would close the

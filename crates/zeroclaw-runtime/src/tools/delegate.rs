@@ -1803,10 +1803,22 @@ impl DelegateTool {
     }
 
     fn bounded_tools_refusal(agent_name: &str) -> ToolResult {
+        Self::bounded_tools_refusal_because(agent_name, None)
+    }
+
+    /// [`Self::bounded_tools_refusal`], with the reason a hop in an owned
+    /// session could not hold the owner's plane for its target when that is
+    /// why. One record per refusal, and no text from the failing source: the
+    /// reason is a fixed token.
+    fn bounded_tools_refusal_because(agent_name: &str, reason: Option<&'static str>) -> ToolResult {
         ::zeroclaw_log::record!(WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
                 .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                .with_attrs(serde_json::json!({"agent_alias": agent_name, "error_kind": "bounded_tools_initialization_refused"})),
+                .with_attrs(serde_json::json!({
+                    "agent_alias": agent_name,
+                    "error_kind": "bounded_tools_initialization_refused",
+                    "reason": reason,
+                })),
             "bounded delegate tool initialization refused");
         ToolResult {
             success: false,
@@ -1819,30 +1831,14 @@ impl DelegateTool {
     }
 
     /// Refuses a bounded hop in an owned session whose sealed registry cannot
-    /// hold the owner's plane for the target, recording why first. The model
-    /// sees the same refusal as for any other tool-initialization failure.
-    fn bounded_owner_plane_refusal(
-        agent_name: &str,
-        reason: &'static str,
-        error: Option<&anyhow::Error>,
-    ) -> ToolResult {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                .with_attrs(::serde_json::json!({
-                    "agent_alias": agent_name,
-                    "error_kind": "bounded_owner_plane_unavailable",
-                    "reason": reason,
-                    "error": error.map(|error| format!("{error:#}")),
-                })),
-            "bounded delegate cannot hold the session owner's memory plane for its target"
-        );
+    /// hold the owner's plane for the target. The model sees the same refusal
+    /// as for any other tool-initialization failure.
+    fn bounded_owner_plane_refusal(agent_name: &str, reason: &'static str) -> ToolResult {
         #[cfg(test)]
         let _ = OWNER_PLANE_PROBE.try_with(|probe| {
             probe.lock().unwrap().refusal = Some(reason);
         });
-        Self::bounded_tools_refusal(agent_name)
+        Self::bounded_tools_refusal_because(agent_name, Some(reason))
     }
 
     /// Why `route`, the session memory route of a bounded target's sealed
@@ -6003,26 +5999,32 @@ impl DelegateTool {
                             .any(|tool| tool.name() == crate::tools::SpawnSubagentTool::NAME)
                     {
                         let plane = match target_memory.as_ref() {
-                            Some(memory) => Arc::clone(memory),
+                            Some(memory) => {
+                                #[cfg(test)]
+                                record_plane_source("target_memory");
+                                Arc::clone(memory)
+                            }
                             None => match self
                                 .memory_for_target_agent(target_config, agent_name)
                                 .await
                             {
-                                Ok(Some(memory)) => memory,
+                                Ok(Some(memory)) => {
+                                    #[cfg(test)]
+                                    record_plane_source("reopened");
+                                    memory
+                                }
                                 // A config is in hand here, and with one the
                                 // target's memory is always opened or fails.
                                 Ok(None) => {
                                     return Ok(Self::bounded_owner_plane_refusal(
                                         agent_name,
                                         "target_memory_absent",
-                                        None,
                                     ));
                                 }
-                                Err(error) => {
+                                Err(_) => {
                                     return Ok(Self::bounded_owner_plane_refusal(
                                         agent_name,
                                         "target_memory_unavailable",
-                                        Some(&error),
                                     ));
                                 }
                             },
@@ -6031,11 +6033,10 @@ impl DelegateTool {
                         // empty route takes any plane.
                         let pinned = route.pin(plane, Arc::clone(&target_policy));
                         debug_assert!(pinned.is_ok(), "a fresh session memory route pins");
-                        if let Err(error) = pinned {
+                        if pinned.is_err() {
                             return Ok(Self::bounded_owner_plane_refusal(
                                 agent_name,
                                 "route_pin_refused",
-                                Some(&error),
                             ));
                         }
                         target_owner_scope = Some(owner_scope);
@@ -6801,7 +6802,7 @@ impl DelegateTool {
                 if let Some(owner_scope) = target_owner_scope.as_ref()
                     && let Some(reason) = Self::owner_plane_mismatch(sealed_route, owner_scope)
                 {
-                    return Ok(Self::bounded_owner_plane_refusal(agent_name, reason, None));
+                    return Ok(Self::bounded_owner_plane_refusal(agent_name, reason));
                 }
                 // The sealed set IS the ceiling for everything below this hop:
                 // bounding each level by what the level above actually received
@@ -7294,11 +7295,21 @@ pub(crate) enum SealedRoute {
 pub(crate) struct OwnerPlaneProbe {
     pub(crate) sealed: Option<SealedRoute>,
     pub(crate) refusal: Option<&'static str>,
+    /// Where the plane the hop pinned came from: `target_memory` (the memory
+    /// already opened for the target's inherited memory tools) or `reopened`.
+    pub(crate) plane_source: Option<&'static str>,
 }
 
 #[cfg(test)]
 tokio::task_local! {
     pub(crate) static OWNER_PLANE_PROBE: Arc<std::sync::Mutex<OwnerPlaneProbe>>;
+}
+
+#[cfg(test)]
+fn record_plane_source(source: &'static str) {
+    let _ = OWNER_PLANE_PROBE.try_with(|probe| {
+        probe.lock().unwrap().plane_source = Some(source);
+    });
 }
 
 #[cfg(test)]
@@ -21272,8 +21283,8 @@ target = "memory_recall"
     mod rebuilt_child_starting_tools {
         use super::*;
         use crate::composition::test_support::{
-            CountingEndpoint, REFUSAL, RecordingMemory, RecordingProviders, RefusingProviders,
-            STUB_REPLY, counting_endpoint, recording_capabilities,
+            CountingEndpoint, REFUSAL, RecordingMemory, RecordingProviders, STUB_REPLY,
+            counting_endpoint, recording_capabilities,
         };
         use crate::tools::spawn_subagent::CHILD_MEMORY_SINK;
 
@@ -21312,16 +21323,40 @@ target = "memory_recall"
             }
         }
 
+        /// The agents whose provider or memory a refusing source refused, so a
+        /// test can tell that a failure came from the source and not from
+        /// anywhere else.
+        #[derive(Default)]
+        struct Refusals {
+            providers: parking_lot::Mutex<Vec<String>>,
+            memory: parking_lot::Mutex<Vec<String>>,
+        }
+
         /// A memory source that cannot open any agent's memory.
-        struct FailingStore;
+        struct FailingStore(Arc<Refusals>);
 
         #[async_trait]
         impl crate::composition::MemorySource for FailingStore {
             async fn memory(
                 &self,
-                _request: &crate::composition::MemoryRequest<'_>,
+                request: &crate::composition::MemoryRequest<'_>,
             ) -> anyhow::Result<Arc<dyn Memory>> {
+                self.0.memory.lock().push(request.agent_alias.to_string());
                 anyhow::bail!("the caller's memory source cannot open this agent's memory")
+            }
+        }
+
+        /// A provider source that refuses every request, naming the agent it
+        /// refused, like the shared `RefusingProviders`, and records it.
+        struct RecordedRefusals(Arc<Refusals>);
+
+        impl crate::composition::ProviderSource for RecordedRefusals {
+            fn model_provider(
+                &self,
+                request: &crate::composition::ProviderRequest<'_>,
+            ) -> anyhow::Result<Arc<dyn ModelProvider>> {
+                self.0.providers.lock().push(request.agent_alias.to_string());
+                anyhow::bail!("{REFUSAL} {}", request.agent_alias)
             }
         }
 
@@ -21385,6 +21420,7 @@ target = "memory_recall"
             providers: Arc<RecordingProviders>,
             memory: Arc<RecordingMemory>,
             store: Arc<dyn Memory>,
+            refusals: Arc<Refusals>,
         }
 
         /// The full bounded fixture for `tool_name`, with the target's route on
@@ -21434,6 +21470,7 @@ target = "memory_recall"
                 SqliteMemory::new("rebuilt-child-store", &config.data_dir.join("child-store"))
                     .unwrap(),
             );
+            let refusals = Arc::new(Refusals::default());
             let providers = Arc::new(RecordingProviders::default());
             let memory = Arc::new(RecordingMemory::default());
             let tool = if bind {
@@ -21447,11 +21484,15 @@ target = "memory_recall"
                     HopMemory::OneStore => {
                         capabilities.memory = Arc::new(OneStore(Arc::clone(&store)));
                     }
-                    HopMemory::Failing => capabilities.memory = Arc::new(FailingStore),
+                    HopMemory::Failing => {
+                        capabilities.memory = Arc::new(FailingStore(Arc::clone(&refusals)));
+                    }
                 }
                 match provider_source {
                     HopProviders::Recording => {}
-                    HopProviders::Refusing => capabilities.providers = Arc::new(RefusingProviders),
+                    HopProviders::Refusing => {
+                        capabilities.providers = Arc::new(RecordedRefusals(Arc::clone(&refusals)));
+                    }
                 }
                 tool.with_memory(Arc::clone(&store))
                     .with_capabilities(capabilities, Some(caller_principal()))
@@ -21467,6 +21508,7 @@ target = "memory_recall"
                 providers,
                 memory,
                 store,
+                refusals,
             }
         }
 
@@ -21830,6 +21872,65 @@ target = "memory_recall"
         // that the work fails, that nothing reaches that endpoint, and that no
         // reply comes back.
 
+        // Controls for the refusal tests below: with no binding the same work
+        // reaches the target's configured endpoint, so a count of zero there
+        // is a measurement and not a property of the fixture.
+
+        /// A delegate no entry point bound keeps the config-backed relay: the
+        /// recipient's turn reaches the recipient's configured endpoint and
+        /// asks no supplied source.
+        #[test]
+        fn bounded_rebuilt_send_message_to_peer_unbound_delegate_relays_on_config() {
+            on_deep_stack(async {
+                let hop = hop(
+                    "send_message_to_peer",
+                    false,
+                    HopMemory::Recording,
+                    configure_peer_relay,
+                )
+                .await;
+                let (result, _status, _error) = relay_to_peer(&hop).await;
+                assert!(
+                    hop.endpoint.connections() >= 1,
+                    "an unbound delegate's relay builds {PEER}'s configured provider;                      delegate output: {}",
+                    result.output
+                );
+                assert!(
+                    hop.providers.seen.lock().is_empty(),
+                    "nothing was bound, so no supplied source is asked"
+                );
+            });
+        }
+
+        /// A delegate no entry point bound keeps the config-backed job: its
+        /// turn reaches the target's configured endpoint and asks no supplied
+        /// source.
+        #[test]
+        fn bounded_rebuilt_cron_run_unbound_delegate_runs_job_on_config() {
+            on_deep_stack(async {
+                let hop = hop("cron_run", false, HopMemory::Recording, |_, _| {}).await;
+                let job_id = add_target_agent_job(&hop);
+
+                let result = run_target(&hop, "cron_run", json!({ "job_id": job_id })).await;
+                let runs = crate::cron::list_runs(&hop.config, &job_id, 10).unwrap();
+                assert_eq!(
+                    runs.len(),
+                    1,
+                    "precondition: the rebuilt cron_run executed {TARGET}'s job; delegate                      output: {}",
+                    result.output
+                );
+                assert!(
+                    hop.endpoint.connections() >= 1,
+                    "an unbound delegate's job builds {TARGET}'s configured provider;                      delegate output: {}",
+                    result.output
+                );
+                assert!(
+                    hop.providers.seen.lock().is_empty(),
+                    "nothing was bound, so no supplied source is asked"
+                );
+            });
+        }
+
         /// The caller's provider source refuses the target: the rebuilt
         /// `spawn_subagent`'s child fails with the source's refusal instead of
         /// building the target's configured provider.
@@ -21865,6 +21966,15 @@ target = "memory_recall"
                         && result.output.contains(REFUSAL),
                     "the child fails with the provider source's refusal; delegate output: {}",
                     result.output
+                );
+                assert!(
+                    hop.refusals
+                        .providers
+                        .lock()
+                        .iter()
+                        .any(|alias| alias == TARGET),
+                    "the child failed because the provider source refused {TARGET}; refused:                      {:?}",
+                    hop.refusals.providers.lock().clone()
                 );
                 assert!(
                     !result.output.contains(STUB_REPLY),
@@ -21913,6 +22023,21 @@ target = "memory_recall"
                     result.output
                 );
                 assert!(
+                    hop.refusals.memory.lock().iter().any(|alias| alias == TARGET),
+                    "the child failed because the memory source could not open {TARGET}'s                      memory; refused: {:?}",
+                    hop.refusals.memory.lock().clone()
+                );
+                assert!(
+                    hop.providers
+                        .seen
+                        .lock()
+                        .iter()
+                        .all(|request| request.agent_alias != TARGET),
+                    "the memory source is asked before the provider source, so a refused                      memory ends the turn before any provider is requested for {}; seen: {:?}",
+                    TARGET,
+                    hop.providers.seen.lock().clone()
+                );
+                assert!(
                     !result.output.contains(STUB_REPLY),
                     "no reply comes back; delegate output: {}",
                     result.output
@@ -21955,6 +22080,15 @@ target = "memory_recall"
                         .is_some_and(|error| error.contains(REFUSAL)),
                     "the failed task names the provider source's refusal; error: {error:?}"
                 );
+                assert!(
+                    hop.refusals
+                        .providers
+                        .lock()
+                        .iter()
+                        .any(|alias| alias == PEER),
+                    "the relay failed because the provider source refused {PEER}; refused: {:?}",
+                    hop.refusals.providers.lock().clone()
+                );
                 assert_eq!(
                     hop.endpoint.connections(),
                     0,
@@ -21990,6 +22124,21 @@ target = "memory_recall"
                         .as_deref()
                         .is_some_and(|error| error.contains("cannot open this agent's memory")),
                     "the failed task names the memory source's refusal; error: {error:?}"
+                );
+                assert!(
+                    hop.refusals.memory.lock().iter().any(|alias| alias == PEER),
+                    "the relay failed because the memory source could not open {PEER}'s                      memory; refused: {:?}",
+                    hop.refusals.memory.lock().clone()
+                );
+                assert!(
+                    hop.providers
+                        .seen
+                        .lock()
+                        .iter()
+                        .all(|request| request.agent_alias != PEER),
+                    "the memory source is asked before the provider source, so a refused                      memory ends the turn before any provider is requested for {}; seen: {:?}",
+                    PEER,
+                    hop.providers.seen.lock().clone()
                 );
                 assert_eq!(
                     hop.endpoint.connections(),
@@ -22032,6 +22181,15 @@ target = "memory_recall"
                     result.output
                 );
                 assert!(
+                    hop.refusals
+                        .providers
+                        .lock()
+                        .iter()
+                        .any(|alias| alias == TARGET),
+                    "the job failed because the provider source refused {TARGET}; refused: {:?}",
+                    hop.refusals.providers.lock().clone()
+                );
+                assert!(
                     !result.output.contains(STUB_REPLY),
                     "no reply comes back; delegate output: {}",
                     result.output
@@ -22071,6 +22229,21 @@ target = "memory_recall"
                      run: {:?}; delegate output: {}",
                     runs[0],
                     result.output
+                );
+                assert!(
+                    hop.refusals.memory.lock().iter().any(|alias| alias == TARGET),
+                    "the job failed because the memory source could not open {TARGET}'s                      memory; refused: {:?}",
+                    hop.refusals.memory.lock().clone()
+                );
+                assert!(
+                    hop.providers
+                        .seen
+                        .lock()
+                        .iter()
+                        .all(|request| request.agent_alias != TARGET),
+                    "the memory source is asked before the provider source, so a refused                      memory ends the turn before any provider is requested for {}; seen: {:?}",
+                    TARGET,
+                    hop.providers.seen.lock().clone()
                 );
                 assert!(
                     !result.output.contains(STUB_REPLY),
@@ -22367,6 +22540,7 @@ target = "memory_recall"
                 providers,
                 memory,
                 store,
+                refusals,
             } = hop;
             let security = Arc::new(
                 SecurityPolicy::for_agent(&config, "executive_assistant")
@@ -22417,6 +22591,7 @@ target = "memory_recall"
                 providers,
                 memory,
                 store,
+                refusals,
             }
         }
 
@@ -22491,6 +22666,15 @@ target = "memory_recall"
                         ),
                         "the sealed registry's route holds the plane the child is handed \
                          (memory tools: {with_memory_tools})"
+                    );
+                    assert_eq!(
+                        probe.plane_source,
+                        Some(if with_memory_tools {
+                            "target_memory"
+                        } else {
+                            "reopened"
+                        }),
+                        "the plane pinned for the owner comes from the memory already opened                          for the target's memory tools when it has them, and is opened for the                          route otherwise"
                     );
                     opened.push(
                         hop.memory
