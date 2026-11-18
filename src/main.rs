@@ -14798,7 +14798,7 @@ async fn sop_admin_dispatch(cmd: SopCommands, config: &crate::config::Config) ->
 }
 
 /// POST a JSON body to a gateway SOP admin endpoint and report the outcome.
-#[cfg(feature = "agent-runtime")]
+#[cfg(all(feature = "agent-runtime", feature = "gateway"))]
 async fn sop_admin_post(
     client: &reqwest::Client,
     url: &str,
