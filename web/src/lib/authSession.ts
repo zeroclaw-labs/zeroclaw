@@ -294,6 +294,8 @@ export function signInUrl(
 const SIGN_IN_NOTICE_KEY = 'zeroclaw_sign_in_notice';
 
 export function fullPageSignInUrl(alias: string): string {
+  // A new sign-in replaces an earlier completion awaiting a session check.
+  takeSignInNotice();
   const returnPath = currentReturnPath() + window.location.hash;
   try {
     const notice = generateUUID();
@@ -304,15 +306,21 @@ export function fullPageSignInUrl(alias: string): string {
   }
 }
 
-/** Consume a completed full-page sign-in. An ordinary visit discards a cancelled attempt. */
-export function takeSignInNotice(): boolean {
+/** Consume a matched callback and restore its return URL. */
+export function takeSignInNotice(mode: 'consume' | 'retry' | 'supersede' = 'consume'): boolean {
   try {
     const notice = sessionStorage.getItem(SIGN_IN_NOTICE_KEY);
     if (!notice) return false;
-    sessionStorage.removeItem(SIGN_IN_NOTICE_KEY);
     const suffix = `#zeroclaw-signed-in=${notice}`;
     const { pathname, search, hash } = window.location;
-    if (!hash.endsWith(suffix)) return false;
+    const matched = hash.endsWith(suffix);
+    // Retry a verified completion, but discard an abandoned attempt on startup.
+    if (matched && mode === 'retry') return false;
+    // A broadcast may supersede a completed callback while its probe is pending.
+    // It must leave a sign-in that hasn't returned from the provider alone.
+    if (!matched && mode === 'supersede') return false;
+    sessionStorage.removeItem(SIGN_IN_NOTICE_KEY);
+    if (!matched) return false;
     const originalUrl = pathname + search + hash.slice(0, -suffix.length);
     window.history.replaceState(window.history.state, '', originalUrl);
     return true;
@@ -359,6 +367,8 @@ export type InitialAuth =
        * through a relay it isn't, and only the answer says so.
        */
       methodsKnown: boolean;
+      /** The cookie check could not tell whether the callback established a session. */
+      sessionCheckFailed?: true;
     };
 
 export interface InitialAuthDeps {
@@ -398,6 +408,9 @@ export async function resolveInitialAuth(deps: InitialAuthDeps): Promise<Initial
         clockOffsetMs: probe.clockOffsetMs,
         providers,
       };
+    }
+    if (probe.kind === 'error') {
+      return { kind: 'signed-out', providers, methodsKnown: true, sessionCheckFailed: true };
     }
   }
   return { kind: 'signed-out', providers, methodsKnown: deps.desktop || methods !== null };

@@ -204,7 +204,10 @@ export function AuthProvider({ children }: AuthProviderProps) {
     })
       .then((initial) => {
         if (cancelled) return;
-        const announce = takeSignInNotice();
+        if (initial.kind !== 'signed-in') {
+          const retry = initial.kind === 'signed-out' && (!initial.methodsKnown || initial.sessionCheckFailed);
+          takeSignInNotice(retry ? 'retry' : 'consume');
+        }
         switch (initial.kind) {
           case 'open':
             setPhase('open');
@@ -216,7 +219,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
             setProviders(initial.providers);
             setProvidersKnown(true);
             setOidcSession(initial.session, initial.clockOffsetMs);
-            if (announce) post({ type: 'signed-in' });
+            if (takeSignInNotice()) post({ type: 'signed-in' });
             break;
           case 'signed-out':
             setProviders(initial.providers);
@@ -340,6 +343,9 @@ export function AuthProvider({ children }: AuthProviderProps) {
     channel.onmessage = (event: MessageEvent) => {
       const message = parseChannelMessage(event.data);
       if (!message) return;
+      // Another tab has already announced its session change. A completion
+      // left here by an earlier callback must not announce again on reload.
+      takeSignInNotice('supersede');
       const current = phaseRef.current;
       if (message.type === 'signed-in') {
         if (current === 'oidc' || (current === 'signed-out' && providersRef.current.length > 0)) {

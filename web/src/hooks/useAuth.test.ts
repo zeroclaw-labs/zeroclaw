@@ -736,6 +736,81 @@ test("a full-page sign-in tells other tabs once and restores the exact return UR
   }
 });
 
+async function returnFromFullPageSignIn(): Promise<void> {
+  providers = ["corp"];
+  await mountScreen();
+  await act(async () => { state().signIn("corp"); });
+  const notice = new URL(assigned[0]!, "https://zc.example").searchParams.get("notice");
+  assert.ok(notice);
+  await unmount();
+  fakeWindow.location.hash += `#zeroclaw-signed-in=${notice}`;
+}
+
+test("a completed sign-in announces once when a reload recovers the cookie session", async () => {
+  await returnFromFullPageSignIn();
+  const heard: unknown[] = [];
+  const otherTab = new BroadcastChannel("zeroclaw-auth");
+  otherTab.onmessage = (event: MessageEvent) => heard.push(event.data);
+  try {
+    sessionResponse = () => json(503, { error: "unavailable" });
+    await mountScreen();
+    assert.equal(state().isAuthenticated, false);
+    assert.equal(rendered("data-signin-provider"), 1);
+    assert.deepEqual(heard, []);
+
+    await unmount();
+    sessionResponse = () => json(200, session());
+    await mountScreen();
+    assert.equal(state().isAuthenticated, true);
+    assert.deepEqual(heard, [{ type: "signed-in" }]);
+    assert.deepEqual(replacedUrls, ["/agent/main"]);
+
+    await unmount();
+    await mountScreen();
+    assert.deepEqual(heard, [{ type: "signed-in" }]);
+  } finally {
+    otherTab.close();
+  }
+});
+
+test("a sign-out cancels a completion notice waiting for the gateway", async () => {
+  await returnFromFullPageSignIn();
+  sessionResponse = () => json(503, { error: "unavailable" });
+  await mountScreen();
+  await broadcast({ type: "signed-out" });
+  await unmount();
+
+  const heard: unknown[] = [];
+  const otherTab = new BroadcastChannel("zeroclaw-auth");
+  otherTab.onmessage = (event: MessageEvent) => heard.push(event.data);
+  try {
+    sessionResponse = () => json(200, session({ display_name: "Later session" }));
+    await mountScreen();
+    assert.equal(state().session?.display_name, "Later session");
+    assert.deepEqual(heard, []);
+  } finally {
+    otherTab.close();
+  }
+});
+
+test("starting sign-in again after a failed check returns to the original fragment", async () => {
+  fakeWindow.location.hash = "#turn";
+  await returnFromFullPageSignIn();
+  sessionResponse = () => json(503, { error: "unavailable" });
+  await mountScreen();
+
+  await act(async () => { state().signIn("corp"); });
+  const next = new URL(assigned[1]!, "https://zc.example");
+  assert.equal(next.searchParams.get("return"), "/agent/main#turn");
+  // An unrelated session event during navigation must not discard the new attempt.
+  await broadcast({ type: "signed-out" });
+  await unmount();
+  fakeWindow.location.hash = `#turn#zeroclaw-signed-in=${next.searchParams.get("notice")}`;
+  sessionResponse = () => json(200, session());
+  await mountScreen();
+  assert.equal(fakeWindow.location.hash, "#turn");
+});
+
 test("returning from an abandoned sign-in ignores a lookalike fragment", async () => {
   await mountSignedIn();
   const heard: unknown[] = [];
