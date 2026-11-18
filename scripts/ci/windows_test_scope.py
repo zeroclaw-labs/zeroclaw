@@ -459,7 +459,8 @@ def select_required_jobs(
         manifests_affect_runtime |= "zeroclaw-runtime" in closure
 
     return {
-        "windows_root": "zeroclaw" in selection.packages,
+        "windows_root": "zeroclaw" in selection.packages
+        or "scripts/install_windows_prebuilt.ps1" in changed_paths,
         "windows_voice_wake": "zeroclaw-channels" in selection.packages,
         "windows_recovery": manifests_affect_runtime or any(
             path == "crates/zeroclaw-runtime/src/lib.rs"
