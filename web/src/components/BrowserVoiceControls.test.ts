@@ -32,6 +32,7 @@ class FakeRecognition {
   abort() { aborted++; }
 }
 class FakeUtterance {
+  onerror: (() => void) | null = null;
   onend: (() => void) | null = null;
   constructor(public text: string) {}
 }
@@ -809,4 +810,21 @@ test('switching own narration to dictation tolerates stale browser speaking flag
     Object.assign(speech, { speaking: false, pending: false });
     await act(async () => { renderer.unmount(); });
   }
+});
+
+
+test('a late completion from cancelled narration cannot clear replacement playback', async () => {
+  const renderer = await mount();
+  try {
+    const speaker = () => renderer.root.findAllByType('button')[1]!;
+    await act(async () => { speaker().props.onClick(); });
+    const cancelled = spokenUtterance!;
+    await act(async () => { speaker().props.onClick(); });
+    await act(async () => { speaker().props.onClick(); });
+    assert.notEqual(spokenUtterance, cancelled);
+    await act(async () => { cancelled.onend?.(); cancelled.onerror?.(); });
+    assert.equal(speaker().props['aria-busy'], true);
+    await act(async () => { await renderer.root.findAllByType('button')[0]!.props.onClick(); });
+    assert.equal(renderer.root.findAllByType('button')[0]!.props['aria-pressed'], true);
+  } finally { await act(async () => { renderer.unmount(); }); }
 });
