@@ -5,8 +5,22 @@ import { getOidcSession, getToken, subscribeOidcSession } from './auth';
 export const voicePlaybackIdle = 'zeroclaw-voice-playback-idle';
 let activeVoicePlayback: SpeechSynthesisUtterance | null = null;
 
+// Browser audio has one owner: microphone capture and narration must not
+// overlap across split panes, including the settings preview.
+let activeVoiceCapture: object | null = null;
+export function beginVoiceCapture(): (() => void) | null {
+  if (voicePlaybackBusy()) return null;
+  const owner = {};
+  activeVoiceCapture = owner;
+  return () => {
+    if (activeVoiceCapture !== owner) return;
+    activeVoiceCapture = null;
+    window.dispatchEvent(new Event(voicePlaybackIdle));
+  };
+}
+
 export function voicePlaybackBusy(): boolean {
-  return activeVoicePlayback !== null || window.speechSynthesis.speaking || window.speechSynthesis.pending;
+  return activeVoiceCapture !== null || activeVoicePlayback !== null || window.speechSynthesis.speaking || window.speechSynthesis.pending;
 }
 
 export function playVoice(utterance: SpeechSynthesisUtterance): boolean {

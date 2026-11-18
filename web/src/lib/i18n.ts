@@ -550,7 +550,7 @@ const translations: Record<Locale, Record<string, string>> = {
   },
 
   en: {
-    "voice.playback_busy": "Voice playback is already in progress. Try again after it ends.",
+    "voice.playback_busy": "Browser audio is busy in another pane. Try again after it ends.",
     "voice.remote_device_resources": "Choose and test a voice by opening these settings in the selected browser. Its available voices and local dictation support are reported by that browser. Other preferences can be changed here.",
     "voice.device_load_error": "Could not load preferences for this device. It may have been revoked.",
     "voice.devices_error": "Could not load paired devices. Return to this tab or reload to retry.",
@@ -11571,7 +11571,7 @@ const translations: Record<Locale, Record<string, string>> = {
   },
 
   pt: {
-    "voice.playback_busy": "Já há uma leitura em andamento. Tente novamente quando ela terminar.",
+    "voice.playback_busy": "O áudio do navegador está em uso em outro painel. Tente novamente quando terminar.",
     "voice.remote_device_resources": "Para escolher e testar uma voz, abra estas configurações no navegador selecionado. As vozes disponíveis e o suporte ao ditado local são informados por ele. As demais preferências podem ser alteradas aqui.",
     "voice.device_load_error": "Não foi possível carregar as preferências deste dispositivo. O pareamento pode ter sido revogado.",
     "voice.devices_error": "Não foi possível carregar os dispositivos pareados. Retorne à aba ou recarregue para tentar novamente.",

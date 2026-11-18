@@ -4,7 +4,7 @@ import { Mic, MicOff, Volume2, VolumeX } from 'lucide-react';
 import type { ChatMessage } from '@/contexts/AgentContext';
 import { t } from '@/lib/i18n';
 import { speechText } from '@/lib/speechText';
-import { playVoice, releaseVoice, voicePlaybackBusy, voicePlaybackIdle, useGlobalVoiceTimeout, readGlobalVoiceTimeout, localRecognitionStatus, recognitionConstructor, shortPressAction, useBrowserVoices, useOidcVoiceSession, useVoicePreferences, type Recognition } from '@/lib/browserVoice';
+import { beginVoiceCapture, playVoice, releaseVoice, voicePlaybackBusy, voicePlaybackIdle, useGlobalVoiceTimeout, readGlobalVoiceTimeout, localRecognitionStatus, recognitionConstructor, shortPressAction, useBrowserVoices, useOidcVoiceSession, useVoicePreferences, type Recognition } from '@/lib/browserVoice';
 
 const readableMessage = (message: ChatMessage) => speechText(displayMessageText(message));
 
@@ -41,6 +41,8 @@ function VoiceControls({ messages, hydrated, typing, onTranscript, onSilence, ca
   const [error, setError] = useState('');
   const root = useRef<HTMLDivElement>(null);
   const recognition = useRef<Recognition | null>(null);
+  const captureLease = useRef<(() => void) | null>(null);
+  const releaseCapture = () => { captureLease.current?.(); captureLease.current = null; };
   const finishing = useRef(false);
   const utterance = useRef<SpeechSynthesisUtterance | null>(null);
   const generation = useRef(0);
@@ -56,6 +58,7 @@ function VoiceControls({ messages, hydrated, typing, onTranscript, onSilence, ca
     setSpeaking(false);
   };
   const stopCapture = () => {
+    releaseCapture();
     clearSilence(); autoSubmit.current = false;
     generation.current++;
     finishing.current = false;
@@ -143,25 +146,27 @@ function VoiceControls({ messages, hydrated, typing, onTranscript, onSilence, ca
     stopSpeech(); setError('');
     const Constructor = recognitionConstructor();
     if (!Constructor || !window.isSecureContext) { setError(t('voice.unsupported')); return; }
+    captureLease.current = beginVoiceCapture();
+    if (!captureLease.current) { setError(t('voice.playback_busy')); return; }
     const version = ++generation.current;
     setListening(true);
     if (prefs.recognition === 'local') {
       const status = await localRecognitionStatus(prefs.language);
       if (version !== generation.current) return;
       if (status !== 'available') {
-        setListening(false);
+        releaseCapture(); setListening(false);
         setError(t(status === 'downloadable' ? 'voice.pack_required'
           : status === 'downloading' ? 'voice.status_downloading' : 'voice.local_unavailable'));
         return;
       }
     }
     if (version !== generation.current || !visible()) {
-      if (version === generation.current) setListening(false);
+      if (version === generation.current) { releaseCapture(); setListening(false); }
       return;
     }
     const capture = new Constructor();
     if (prefs.recognition === 'local' && !('processLocally' in capture)) {
-      setListening(false); setError(t('voice.local_unavailable')); return;
+      releaseCapture(); setListening(false); setError(t('voice.local_unavailable')); return;
     }
     capture.lang = prefs.language; capture.continuous = true; capture.interimResults = true;
     const submissionEpoch = submitCancellation.current;
@@ -216,6 +221,7 @@ function VoiceControls({ messages, hydrated, typing, onTranscript, onSilence, ca
       else if (!silenceTimer.current) armSilence();
       autoSubmit.current = false;
       recognition.current = null;
+      releaseCapture();
       finishing.current = false;
       setListening(false);
       if (!receivedText && visible()) setError(t('voice.no_transcript'));
