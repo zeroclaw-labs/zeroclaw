@@ -2,16 +2,18 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::Result;
 use async_trait::async_trait;
 use tokio::sync::{Mutex, oneshot};
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use zeroclaw_api::attribution::{Attributable, Role};
 use zeroclaw_api::channel::{
     Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelMessage,
-    ChannelModelPickerRequest, DraftProgress, ProgressEvent, RoomCreationOptions, SendMessage,
+    ChannelModelPickerRequest, DraftProgress, PollRequest, ProgressEvent, RoomCreationOptions,
+    SendMessage,
 };
 use zeroclaw_config::schema::{DEFAULT_REPLY_QUEUE_DEPTH, HasReplyPacing, PACING_RECIPIENT_CAP};
 
@@ -20,6 +22,7 @@ enum PacedOp {
     Send(SendMessage),
     /// A completed assistant response. Dispatches to `inner.send_final`.
     SendFinal(SendMessage),
+    SendPoll(PollRequest),
     /// A terminal draft write. Dispatches to `inner.finalize_draft` so the
     /// channel edits the existing draft rather than posting a new message.
     FinalizeDraft {
@@ -35,6 +38,7 @@ impl PacedOp {
     fn recipient(&self) -> &str {
         match self {
             Self::Send(message) | Self::SendFinal(message) => &message.recipient,
+            Self::SendPoll(poll) => &poll.recipient,
             Self::FinalizeDraft { recipient, .. } => recipient,
         }
     }
@@ -43,6 +47,14 @@ impl PacedOp {
     fn payload_chars(&self) -> usize {
         match self {
             Self::Send(message) | Self::SendFinal(message) => message.content.chars().count(),
+            Self::SendPoll(poll) => {
+                poll.question.chars().count()
+                    + poll
+                        .options
+                        .iter()
+                        .map(|option| option.chars().count())
+                        .sum::<usize>()
+            }
             Self::FinalizeDraft { text, .. } => text.chars().count(),
         }
     }
@@ -52,6 +64,7 @@ impl PacedOp {
         match self {
             Self::Send(message) => inner.send(&message).await,
             Self::SendFinal(message) => inner.send_final(&message).await,
+            Self::SendPoll(poll) => inner.send_poll(&poll).await,
             Self::FinalizeDraft {
                 recipient,
                 message_id,
@@ -215,6 +228,10 @@ impl PacedChannel {
                         })),
                     "paced channel queue full: dropping newest outbound message"
                 );
+                // The poll tool treats Ok as confirmation that the poll was posted.
+                if matches!(op, PacedOp::SendPoll(_)) {
+                    anyhow::bail!("paced channel queue full: native poll was not sent");
+                }
                 (None, None, false)
             } else {
                 let (tx, rx) = oneshot::channel();
@@ -533,14 +550,15 @@ impl Channel for PacedChannel {
         self.inner.invite_user(room_id, user_id).await
     }
 
-    /// Forwarded rather than paced: a poll is one stanza, and the inner
-    /// channel owns whatever limits apply to it.
     fn supports_native_polls(&self) -> bool {
         self.inner.supports_native_polls()
     }
 
-    async fn send_poll(&self, poll: &zeroclaw_api::channel::PollRequest) -> Result<()> {
-        self.inner.send_poll(poll).await
+    async fn send_poll(&self, poll: &PollRequest) -> Result<()> {
+        if !self.inner.supports_native_polls() {
+            return self.inner.send_poll(poll).await;
+        }
+        self.paced_dispatch(PacedOp::SendPoll(poll.clone())).await
     }
 
     /// Must be forwarded explicitly: the trait default returns `None`, so
@@ -739,10 +757,12 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
     struct RoomManagementChannel {
         creates: AtomicUsize,
         invites: AtomicUsize,
         polls: AtomicUsize,
+        reject_polls: bool,
     }
 
     impl Attributable for RoomManagementChannel {
@@ -782,6 +802,7 @@ mod tests {
         async fn send_poll(&self, poll: &zeroclaw_api::channel::PollRequest) -> Result<()> {
             assert_eq!(poll.question, "Which tasting slot?");
             self.polls.fetch_add(1, Ordering::SeqCst);
+            anyhow::ensure!(!self.reject_polls, "inner channel rejected the poll");
             Ok(())
         }
     }
@@ -1106,11 +1127,7 @@ mod tests {
 
     #[tokio::test]
     async fn room_management_forwards_to_inner_channel() {
-        let counting = Arc::new(RoomManagementChannel {
-            creates: AtomicUsize::new(0),
-            invites: AtomicUsize::new(0),
-            polls: AtomicUsize::new(0),
-        });
+        let counting = Arc::new(RoomManagementChannel::default());
         let inner: Arc<dyn Channel> = counting.clone();
         let cfg = PacingFixture {
             interval_secs: 3600,
@@ -1198,11 +1215,7 @@ mod tests {
     /// channel posts native polls, and every poll would silently become text.
     #[tokio::test]
     async fn native_polls_reach_the_inner_channel() {
-        let counting = Arc::new(RoomManagementChannel {
-            creates: AtomicUsize::new(0),
-            invites: AtomicUsize::new(0),
-            polls: AtomicUsize::new(0),
-        });
+        let counting = Arc::new(RoomManagementChannel::default());
         let inner: Arc<dyn Channel> = counting.clone();
         let paced = PacedChannel::wrap(
             inner,
@@ -1222,6 +1235,82 @@ mod tests {
             .await
             .expect("the inner channel accepts the poll");
         assert_eq!(counting.polls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn native_poll_waits_behind_queued_message_and_returns_delivery_result() {
+        let inner = Arc::new(RoomManagementChannel {
+            reject_polls: true,
+            ..Default::default()
+        });
+        let paced = PacedChannel::wrap(
+            inner.clone(),
+            &PacingFixture {
+                interval_secs: 1,
+                depth: 2,
+            },
+        );
+        let message = SendMessage::new("message", "recipient");
+        let poll = zeroclaw_api::channel::PollRequest::new(
+            "recipient",
+            "Which tasting slot?",
+            vec!["Friday".into(), "Saturday".into()],
+        );
+
+        paced.send(&message).await.unwrap();
+        let mut queued_message = paced.send(&message);
+        assert!(futures_util::poll!(&mut queued_message).is_pending());
+        let mut queued_poll = paced.send_poll(&poll);
+        assert!(futures_util::poll!(&mut queued_poll).is_pending());
+
+        // Both queue slots are occupied. A dropped poll must report failure.
+        let dropped = paced.send_poll(&poll).await.unwrap_err();
+        assert!(dropped.to_string().contains("queue full"));
+
+        let before_floor = Duration::from_millis(999);
+        assert!(
+            tokio::time::timeout(before_floor, &mut queued_message)
+                .await
+                .is_err()
+        );
+        queued_message.await.unwrap();
+        assert_eq!(inner.polls.load(Ordering::SeqCst), 0);
+        assert!(
+            tokio::time::timeout(before_floor, &mut queued_poll)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            queued_poll.await.unwrap_err().to_string(),
+            "inner channel rejected the poll"
+        );
+        assert_eq!(inner.polls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn unsupported_polls_keep_the_inner_error_without_waiting_for_pacing() {
+        let inner = Arc::new(CountingChannel {
+            sends: AtomicUsize::new(0),
+            final_sends: AtomicUsize::new(0),
+            finalize_drafts: AtomicUsize::new(0),
+        });
+        let paced = PacedChannel::wrap(
+            inner,
+            &PacingFixture {
+                interval_secs: 3600,
+                depth: 1,
+            },
+        );
+        paced
+            .send(&SendMessage::new("message", "recipient"))
+            .await
+            .unwrap();
+        let poll = zeroclaw_api::channel::PollRequest::new("recipient", "Question?", vec![]);
+        assert!(!paced.supports_native_polls());
+        let result = futures_util::poll!(paced.send_poll(&poll));
+        assert!(
+            matches!(result, std::task::Poll::Ready(Err(error)) if error.to_string() == "channel does not support native polls")
+        );
     }
 
     /// A channel whose `send` blocks until the test releases a gate, so the
