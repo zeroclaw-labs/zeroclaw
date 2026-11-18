@@ -4516,6 +4516,38 @@ fn resync_sender_history_after_trim(
     true
 }
 
+/// Runtime-generated user prompts (for example a tools-free closeout) are
+/// part of this turn's delta, not a new inbound boundary. Resync only the
+/// retained base through the original inbound; its tool results are appended
+/// once from the delta below. Prompt-format tool results are not user turns.
+fn channel_history_before_turn_delta<'a>(
+    history: &'a [ChatMessage],
+    delta: &[ChatMessage],
+) -> &'a [ChatMessage] {
+    // Count occurrences in the canonical current-turn delta, rather than
+    // excluding every user message with the same text. An inbound may itself
+    // contain exactly the text of a runtime-generated prompt.
+    let mut generated_users = std::collections::HashMap::<&str, usize>::new();
+    for (index, message) in delta.iter().enumerate() {
+        if message.role == "user" && !is_paired_prompt_tool_result(delta, index) {
+            *generated_users.entry(message.content.as_str()).or_default() += 1;
+        }
+    }
+    let inbound = history.iter().enumerate().rposition(|(index, message)| {
+        if message.role != "user" || is_paired_prompt_tool_result(history, index) {
+            return false;
+        }
+        if let Some(remaining) = generated_users.get_mut(message.content.as_str()) {
+            if *remaining > 0 {
+                *remaining -= 1;
+                return false;
+            }
+        }
+        true
+    });
+    &history[..inbound.map_or(history.len().min(1), |index| index + 1)]
+}
+
 /// Resync the cache and durable transcript to the tool-call loop's trimmed
 /// `history` working buffer when the loop changed the breadcrumb or dropped
 /// prior turns, and report whether that resync could be confirmed.
@@ -4535,25 +4567,6 @@ fn resync_sender_history_after_trim(
 /// recreate an unreconciled entry from its own working buffer instead of
 /// letting the next turn reload from the backend.
 #[allow(clippy::too_many_arguments)]
-/// Runtime-generated user prompts (for example a tools-free closeout) are
-/// part of this turn's delta, not a new inbound boundary. Resync only the
-/// retained base through the original inbound; its tool results are appended
-/// once from the delta below. Prompt-format tool results are not user turns.
-fn channel_history_before_turn_delta<'a>(
-    history: &'a [ChatMessage],
-    delta: &[ChatMessage],
-) -> &'a [ChatMessage] {
-    let inbound = history.iter().enumerate().rposition(|(index, message)| {
-        message.role == "user"
-            && !is_paired_prompt_tool_result(history, index)
-            && !delta.iter().enumerate().any(|(delta_index, generated)| {
-                generated.role == "user"
-                    && !is_paired_prompt_tool_result(delta, delta_index)
-                    && generated.content == message.content
-            })
-    });
-    &history[..inbound.map_or(history.len().min(1), |index| index + 1)]
-}
 
 fn resync_history_after_trim_or_evict_cache(
     ctx: &ChannelRuntimeContext,
@@ -20347,6 +20360,26 @@ fn channel_trim_resync_preserves_a_concurrent_workers_later_turn_across_eviction
 
 #[cfg(test)]
 pub(crate) mod tests {
+    #[test]
+    fn turn_delta_boundary_preserves_inbound_equal_to_generated_prompt() {
+        let history = vec![
+            super::ChatMessage::system("system"),
+            super::ChatMessage::user("same text"),
+            super::ChatMessage::assistant("tool work"),
+            super::ChatMessage::user("same text"),
+            super::ChatMessage::user("same text"),
+        ];
+        let delta = history[2..].to_vec();
+        assert_eq!(
+            super::channel_history_before_turn_delta(&history, &delta).len(),
+            2
+        );
+        assert_eq!(
+            super::channel_history_before_turn_delta(&history, &[]).len(),
+            5
+        );
+    }
+
     use super::*;
 
     #[tokio::test(flavor = "current_thread")]

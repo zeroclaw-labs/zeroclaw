@@ -3649,7 +3649,6 @@ async fn run_tool_call_loop_impl<'a>(
             iteration,
         )
         .await;
-        collected?;
         if cancelled_mid_batch {
             // Completed calls already received their after hook; every other
             // executable context of the batch was interrupted before
@@ -3688,8 +3687,10 @@ async fn run_tool_call_loop_impl<'a>(
                     events::emit_tool_result(tx, &call_id, &call.name, &interrupted).await;
                 }
             }
+            collected?;
             return Err(ToolLoopCancelled.into());
         }
+        collected?;
 
         let mut closeout_reply = None;
         if let Some(key) = repetition_disposition.message_key {
@@ -11875,6 +11876,152 @@ mod tool_lifecycle_abandonment_tests {
             ],
             "every executable context of the interrupted batch gets exactly one abandonment; none reaches after"
         );
+    }
+
+    #[tokio::test]
+    async fn cancelled_batch_detector_break_still_abandons_contexts_and_closes_cards() {
+        let observer = NoopObserver;
+        let pacing = zeroclaw_config::schema::PacingConfig {
+            loop_detection_max_repeats: 1,
+            ..Default::default()
+        };
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let runner = lifecycle_runner(Arc::clone(&events), Vec::new());
+        let token = CancellationToken::new();
+        let response = |last: bool| ChatResponse {
+            text: None,
+            tool_calls: {
+                let mut calls = vec![tool_call(
+                    if last { "echo-3" } else { "echo-prior" },
+                    "echo_tool",
+                    serde_json::json!({"n": 1}),
+                )];
+                if last {
+                    calls.push(tool_call(
+                        "interrupted",
+                        "interrupt_tool",
+                        serde_json::json!({"n": 2}),
+                    ));
+                    calls.push(tool_call(
+                        "pending",
+                        "echo_second",
+                        serde_json::json!({"n": 3}),
+                    ));
+                }
+                calls
+            },
+            usage: None,
+            reasoning_content: None,
+        };
+        let provider = ScriptedProvider {
+            responses: Mutex::new(vec![response(false), response(false), response(true)]),
+        };
+        let tools_registry = registry_with(vec![
+            Box::new(EchoTool {
+                name: "echo_tool".into(),
+            }),
+            Box::new(InterruptingTool {
+                name: "interrupt_tool".into(),
+                token: token.clone(),
+            }),
+            Box::new(EchoTool {
+                name: "echo_second".into(),
+            }),
+        ]);
+        let mut history = vec![ChatMessage::user("repeat then cancel")];
+        let turn_id = "cancelled-detector-break";
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(128);
+        let mut crumb_present = false;
+        let mut injected_preamble = None;
+        let error = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
+            capability_binding: None,
+            exec: ResolvedAgentExecution {
+                model_access: ResolvedModelAccess {
+                    model_provider: &provider,
+                    provider_name: "scripted",
+                    model: "scripted-model",
+                    dispatch_model: "scripted-model",
+                    temperature: Some(0.0),
+                },
+                tools_registry: &tools_registry,
+                observer: &observer,
+                silent: true,
+                approval: None,
+                multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
+                max_tool_iterations: 4,
+                hooks: Some(&runner),
+                excluded_tools: &[],
+                dedup_exempt_tools: &[],
+                activated_tools: None,
+                model_switch_callback: None,
+                pacing: &pacing,
+                strict_tool_parsing: false,
+                parallel_tools: false,
+                max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
+                context_limits: zeroclaw_config::schema::ResolvedContextLimits {
+                    context_token_budget: 0,
+                    ..zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0)
+                },
+                context_limits_resolver: None,
+                receipt_generator: None,
+                knobs: &LoopKnobs::default(),
+                security: None,
+            },
+            history: &mut history,
+            history_has_trim_breadcrumb: &mut crumb_present,
+            injected_memory_preamble: &mut injected_preamble,
+            channel_name: "cli",
+            channel_reply_target: None,
+            cancellation_token: Some(token),
+            on_delta: None,
+            shared_budget: None,
+            channel: None,
+            collected_receipts: None,
+            event_tx: Some(event_tx),
+            steering: None,
+            new_messages_out: None,
+            image_cache: None,
+            memory: None,
+            ingress: IngressContext::sub_turn(),
+            agent_alias: None,
+            turn_id,
+            served_route_sink: None,
+        })
+        .await
+        .expect_err("the detector must stop the cancelled batch");
+
+        assert!(
+            error.to_string().contains("loop detector"),
+            "must exercise Break: {error:#}"
+        );
+        let recorded = events.lock().unwrap();
+        for tool in ["interrupt_tool", "echo_second"] {
+            assert_eq!(
+                recorded
+                    .iter()
+                    .filter(|entry| entry.starts_with(&format!("abandoned:{tool}:")))
+                    .count(),
+                1
+            );
+            assert!(
+                !recorded
+                    .iter()
+                    .any(|entry| entry.starts_with(&format!("after:{tool}:")))
+            );
+        }
+        let mut terminal = std::collections::HashMap::new();
+        while let Ok(event) = event_rx.try_recv() {
+            if let TurnEvent::ToolResult { id, .. } = event {
+                *terminal.entry(id).or_insert(0usize) += 1;
+            }
+        }
+        for id in ["echo-3", "interrupted", "pending"] {
+            assert_eq!(terminal.get(id), Some(&1), "one terminal result for {id}");
+        }
     }
 
     /// Tool that never completes on its own: the containing wrapper decides

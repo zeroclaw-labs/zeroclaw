@@ -88,7 +88,7 @@ session backend before the interruption marker. Native tool pairs and paired
 prompt-mode results both survive a later session reload. This is a transcript
 checkpoint, not an automatic retry or crash-resumable job: an operation without
 a recorded result can have an uncertain outcome and must be checked before it
-is repeated. The processing deadline is not extended by a model switch.
+is repeated. The processing deadline is not extended by a model switch. With tool-context retention enabled, completed tool rows are persisted before the outbound hook; a hook that cancels the reply suppresses delivery but does not remove those rows.
 
 The shared lifecycle should own behavior that must be consistent across
 channels:
