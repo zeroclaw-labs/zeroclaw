@@ -52,10 +52,7 @@ a broker remain governed by the configured sandbox policy.
 
 ## Trust and credentials
 
-The Python helper uses the operator-configured SSH agent. Catalog aliases and
-vault-backed signers belong only to the separate RFC-conditional draft
-extension; neither executable in this reduced PR reads catalog credentials. The Python helper needs only the
-standard library, OpenSSH and the existing process supervision tools.
+The Python helper uses the operator-configured SSH agent. Neither executable reads catalog credentials or loads keys from OpenBao. The Python helper needs only the standard library, OpenSSH and the existing process supervision tools.
 
 For localized helper diagnostics, install the optional compiled gettext
 catalog for the service locale. Set `LANG` and, when using a custom catalog
@@ -98,12 +95,12 @@ Build the Linux binary with `cargo build --locked --release -p zeroclaw-tools
 --bin zeroclaw-ssh-task`. Configure the service helper path and the shell's
 managed SSH wrapper to point to the same binary. The existing task protocol,
 SSH-agent identity, trust configuration, and idle timeout apply. Roll back by restoring
-both paths to the previous helper. Keep the Python adapter during review.
+both paths to the previous helper. For rollback, retain a protected backup of the previous helper executable and PATH link.
 
 ## Native broker scope
 
 The Rust broker uses the operator-configured SSH agent and existing OpenSSH
-host aliases. It requires Linux, OpenSSH and util-linux setpriv. Configure the
+host aliases. It requires Linux, OpenSSH 8.7 or later, and util-linux setpriv. Configure the
 native executable using the helper path described above.
 
 Each persistent master owns a process group. Connection setup failure,
@@ -112,7 +109,4 @@ Pre-existing master socket paths are refused. The broker's directory is private
 to its operating-system user. Arbitrary unsandboxed code under the same user
 has that user's SSH authority.
 
-Catalog-backed keys, OpenBao loading and private destination-constrained signers
-are preserved in the separate RFC #12422 draft extension. That extension is
-used on the operator's Jarvis production test deployment and remains subject
-to the RFC's accepted credential ownership and grant model.
+Catalog-backed credential loading and broker-managed vault signing are not supported by this executable.
