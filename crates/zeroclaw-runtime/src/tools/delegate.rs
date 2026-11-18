@@ -1808,8 +1808,10 @@ impl DelegateTool {
 
     /// [`Self::bounded_tools_refusal`], with the reason a hop in an owned
     /// session could not hold the owner's plane for its target when that is
-    /// why. One record per refusal, and no text from the failing source: the
-    /// reason is a fixed token.
+    /// why. One record per refusal. The reason is a `&'static str`, so no text
+    /// from the failing source can reach the record or the result: the type
+    /// enforces it, and no test captures the log. The cost is that the record
+    /// says which step failed, not why the source did.
     fn bounded_tools_refusal_because(agent_name: &str, reason: Option<&'static str>) -> ToolResult {
         ::zeroclaw_log::record!(
             WARN,
@@ -1841,6 +1843,18 @@ impl DelegateTool {
             probe.lock().unwrap().refusal = Some(reason);
         });
         Self::bounded_tools_refusal_because(agent_name, Some(reason))
+    }
+
+    /// The refusal for a bounded hop whose sealed registry does not hold the
+    /// owner's plane for its target, or `None` when the hop is not owned
+    /// (`owner_scope` is `None`) or the plane is held.
+    fn sealed_route_refusal(
+        agent_name: &str,
+        route: Option<&Arc<zeroclaw_tools::session_memory::SessionMemoryRoute>>,
+        owner_scope: Option<&PrincipalScope>,
+    ) -> Option<ToolResult> {
+        let reason = Self::owner_plane_mismatch(route, owner_scope?)?;
+        Some(Self::bounded_owner_plane_refusal(agent_name, reason))
     }
 
     /// Why `route`, the session memory route of a bounded target's sealed
@@ -5980,14 +5994,15 @@ impl DelegateTool {
                         ))),
                     );
                     // In an owned session the child of the rebuilt
-                    // `spawn_subagent` runs on the owner's plane for the
-                    // target, as the child of the normal registry's runs on
-                    // the owner's plane for its agent. The route is the
-                    // target's own and is pinned now: nothing pins this
-                    // registry later, and an empty route reads as an unowned
-                    // session. Without an owner it stays empty, as there.
-                    // One read of the owner decides both whether this hop is
-                    // owned and which plane the sealed registry must hold.
+                    // `spawn_subagent`, and the audit rows of the rebound
+                    // `sop_execute` and `sop_advance`, go to the owner's plane
+                    // for the target, as the normal registry's go to the
+                    // owner's plane for its agent. The route is the target's
+                    // own and is pinned now: nothing pins this registry later,
+                    // and an empty route reads as an unowned session. Without
+                    // an owner it stays empty, as there. One read of the owner
+                    // decides both whether this hop is owned and which plane
+                    // the sealed registry must hold.
                     let route =
                         Arc::new(zeroclaw_tools::session_memory::SessionMemoryRoute::default());
                     let owner_scope = self
@@ -5996,9 +6011,9 @@ impl DelegateTool {
                         .clone()
                         .map(|scope| scope.with_agent(Some(agent_name.to_string())));
                     if let Some(owner_scope) = owner_scope
-                        && bounded_base_tools
-                            .iter()
-                            .any(|tool| tool.name() == crate::tools::SpawnSubagentTool::NAME)
+                        && bounded_base_tools.iter().any(|tool| {
+                            crate::tools::scoped::ROUTE_SHARING_TOOL_NAMES.contains(&tool.name())
+                        })
                     {
                         let plane = match target_memory.as_ref() {
                             Some(memory) => {
@@ -6672,21 +6687,38 @@ impl DelegateTool {
                             // two downcasts below are the only way they reach a
                             // target, and the name check after them drops an
                             // instance the downcast could not resolve.
+                            //
+                            // In an owned hop their audit rows go to the TARGET's
+                            // plane: they take the route pinned for it above, not
+                            // the caller's, which would write the target's runs on
+                            // the caller's plane. Without an owner they keep the
+                            // route they carry, as before.
+                            let owned_route = target_owner_scope
+                                .as_ref()
+                                .and(target_session_memory.as_ref());
                             if let Some(sop_execute) = tool
                                 .as_any()
                                 .and_then(|any| any.downcast_ref::<crate::tools::SopExecuteTool>())
                             {
-                                return Some(Arc::new(
-                                    sop_execute.rebound_with_ceiling(Arc::clone(&bounded_ceiling)),
-                                ) as Arc<dyn Tool>);
+                                let rebound =
+                                    sop_execute.rebound_with_ceiling(Arc::clone(&bounded_ceiling));
+                                let rebound = match owned_route {
+                                    Some(route) => rebound.with_session_memory(Arc::clone(route)),
+                                    None => rebound,
+                                };
+                                return Some(Arc::new(rebound) as Arc<dyn Tool>);
                             }
                             if let Some(sop_advance) = tool
                                 .as_any()
                                 .and_then(|any| any.downcast_ref::<crate::tools::SopAdvanceTool>())
                             {
-                                return Some(Arc::new(
-                                    sop_advance.rebound_with_ceiling(Arc::clone(&bounded_ceiling)),
-                                ) as Arc<dyn Tool>);
+                                let rebound =
+                                    sop_advance.rebound_with_ceiling(Arc::clone(&bounded_ceiling));
+                                let rebound = match owned_route {
+                                    Some(route) => rebound.with_session_memory(Arc::clone(route)),
+                                    None => rebound,
+                                };
+                                return Some(Arc::new(rebound) as Arc<dyn Tool>);
                             }
                             if let Some(sop_workshop) = tool
                                 .as_any()
@@ -6788,23 +6820,24 @@ impl DelegateTool {
                     )
                     .await;
                 // In an owned session the route the sealed registry carries,
-                // the one its rebuilt `spawn_subagent` shares, must be pinned
-                // to a plane scoped to the owner for the target, judged
-                // against the single read of the owner above. A plane opened
-                // under another reading (a shared handle, another agent's
-                // plane) refuses the hop instead of running its child there.
-                // The route is created, pinned and handed to the assembly in
-                // this same function, so this is a guard against a later edit
-                // that stops passing it on, not an independent source of
-                // truth. SOP tools rebound into this registry keep the
-                // caller's own route and are not judged here.
+                // the one its rebuilt `spawn_subagent` and rebound SOP run
+                // tools share, must be pinned to a plane scoped to the owner
+                // for the target, judged against the single read of the owner
+                // above. A plane opened under another reading (a shared
+                // handle, another agent's plane) refuses the hop instead of
+                // running its child there. The route is created, pinned and
+                // handed to the assembly in this same function, so this is a
+                // guard against a later edit that stops passing it on, not an
+                // independent source of truth.
                 let sealed_route = assembled_bounded.registry.session_memory_route();
                 #[cfg(test)]
                 record_sealed_route(sealed_route);
-                if let Some(owner_scope) = target_owner_scope.as_ref()
-                    && let Some(reason) = Self::owner_plane_mismatch(sealed_route, owner_scope)
-                {
-                    return Ok(Self::bounded_owner_plane_refusal(agent_name, reason));
+                if let Some(refusal) = Self::sealed_route_refusal(
+                    agent_name,
+                    sealed_route,
+                    target_owner_scope.as_ref(),
+                ) {
+                    return Ok(refusal);
                 }
                 // The sealed set IS the ceiling for everything below this hop:
                 // bounding each level by what the level above actually received
@@ -19243,8 +19276,8 @@ target = "memory_recall"
         assert_eq!(
             target_policy.workspace_dir, target_config_workspace,
             "bounded delegate with a DIFFERENT risk profile must keep its own \
-             configured workspace, not inherit the caller's session cwd \
-             (issue #9872): got {:?}, expected {:?}",
+             configured workspace, not inherit the caller's session cwd: \
+             got {:?}, expected {:?}",
             target_policy.workspace_dir, target_config_workspace
         );
     }
@@ -19571,7 +19604,7 @@ target = "memory_recall"
 
         assert!(
             !fixture.caller_workspace.join("proof.txt").exists(),
-            "regression for #9872: a Bounded delegate's file_write must NOT land in the \
+            "regression: a Bounded delegate's file_write must NOT land in the \
              caller's session workspace ({}) just because its tool instance was reused from \
              parent_tools",
             fixture.caller_workspace.display()
@@ -19579,7 +19612,7 @@ target = "memory_recall"
         let target_file = fixture.target_workspace.join("proof.txt");
         assert!(
             target_file.exists(),
-            "regression for #9872: a Bounded delegate's file_write must land in the TARGET's \
+            "regression: a Bounded delegate's file_write must land in the TARGET's \
              own configured workspace ({}), not the caller's",
             fixture.target_workspace.display()
         );
@@ -19621,13 +19654,13 @@ target = "memory_recall"
 
         assert!(
             !fixture.caller_workspace.join("shell_proof.txt").exists(),
-            "regression for #9872: a Bounded delegate's shell command must NOT execute with \
+            "regression: a Bounded delegate's shell command must NOT execute with \
              the caller's session workspace ({}) as its cwd",
             fixture.caller_workspace.display()
         );
         assert!(
             fixture.target_workspace.join("shell_proof.txt").exists(),
-            "regression for #9872: a Bounded delegate's shell command must execute with the \
+            "regression: a Bounded delegate's shell command must execute with the \
              TARGET's own configured workspace ({}) as its cwd, not the caller's",
             fixture.target_workspace.display()
         );
@@ -20576,7 +20609,7 @@ target = "memory_recall"
             "CRITICAL regression: a Bounded delegate's data_management purge must \
              NEVER delete files from the caller's workspace ({}) just because its \
              tool instance was reused from parent_tools - this is a destructive \
-             variant of #9872, not just a read/write leak",
+             variant of the workspace leak, not just a read/write leak",
             fixture.caller_workspace.display()
         );
     }
@@ -21981,7 +22014,7 @@ target = "memory_recall"
                         .lock()
                         .iter()
                         .any(|alias| alias == TARGET),
-                    "the child failed because the provider source refused {TARGET}; refused:                      {:?}",
+                    "the child failed because the provider source refused {TARGET}; refused: {:?}",
                     hop.refusals.providers.lock().clone()
                 );
                 assert!(
@@ -22535,6 +22568,243 @@ target = "memory_recall"
             });
         }
 
+        /// Lets the target inherit `sop_execute` and nothing else, in the
+        /// caller's and the target's risk profiles alike.
+        fn grant_only_sop_execute(config: &mut Config, _url: &str) {
+            for name in ["balanced", "research"] {
+                config
+                    .risk_profiles
+                    .get_mut(name)
+                    .unwrap_or_else(|| panic!("fixture risk profile '{name}' must exist"))
+                    .allowed_tools
+                    .push("sop_execute".to_string());
+            }
+            config
+                .risk_profiles
+                .get_mut("research")
+                .expect("fixture risk profile 'research' must exist")
+                .allowed_tools = vec!["sop_execute".to_string()];
+        }
+
+        /// A SOP that never parks, so `sop_execute` starts it and leaves a run.
+        fn audit_probe_sop() -> crate::sop::types::Sop {
+            use crate::sop::types::{
+                Sop, SopAdmissionPolicy, SopExecutionMode, SopPriority, SopStep, SopStepKind,
+                SopTrigger,
+            };
+            Sop {
+                name: "audit-probe".into(),
+                description: "Starts a run whose audit rows say which plane they landed on".into(),
+                version: "1.0.0".into(),
+                priority: SopPriority::Normal,
+                execution_mode: SopExecutionMode::Auto,
+                triggers: vec![SopTrigger::Manual],
+                steps: vec![SopStep {
+                    number: 1,
+                    title: "Step one".into(),
+                    body: "Do step one".into(),
+                    suggested_tools: vec![],
+                    requires_confirmation: false,
+                    kind: SopStepKind::default(),
+                    schema: None,
+                    ..SopStep::default()
+                }],
+                cooldown_secs: 0,
+                max_concurrent: 1,
+                location: None,
+                deterministic: false,
+                admission_policy: SopAdmissionPolicy::Parallel,
+                max_pending_approvals: 0,
+                agent: None,
+                decision: None,
+            }
+        }
+
+        /// Adds the caller's own `sop_execute` to the hop's inherited tools: a
+        /// shared engine, an audit logger on the hop's store, and the caller's
+        /// session route pinned to the owner's plane for the CALLER. Returns
+        /// the engine, to read back the run it starts.
+        fn with_caller_sop_execute(
+            hop: &Hop,
+        ) -> Arc<std::sync::Mutex<crate::sop::engine::SopEngine>> {
+            let mut engine = crate::sop::engine::SopEngine::new(Default::default());
+            engine.set_sops_for_test(vec![audit_probe_sop()]);
+            let engine = Arc::new(std::sync::Mutex::new(engine));
+            let caller_route =
+                Arc::new(zeroclaw_tools::session_memory::SessionMemoryRoute::default());
+            caller_route
+                .pin(
+                    Arc::new(zeroclaw_memory::PrincipalPlaneMemory::new(
+                        Arc::clone(&hop.store),
+                        owner_scope(),
+                    )),
+                    Arc::new(SecurityPolicy::default()),
+                )
+                .expect("the caller's route pins to the owner's plane for the caller");
+            let sop_execute = crate::tools::SopExecuteTool::new(Arc::clone(&engine))
+                .with_audit(Arc::new(crate::sop::audit::SopAuditLogger::new(
+                    Arc::clone(&hop.store),
+                )))
+                .with_session_memory(caller_route);
+            hop.tool
+                .parent_tools
+                .tools
+                .write()
+                .push(Arc::new(sop_execute) as Arc<dyn Tool>);
+            engine
+        }
+
+        /// The audit logger of the owner's plane for `agent`, on the hop's store.
+        fn owner_plane_audit(hop: &Hop, agent: &str) -> crate::sop::audit::SopAuditLogger {
+            crate::sop::audit::SopAuditLogger::new(Arc::new(
+                zeroclaw_memory::PrincipalPlaneMemory::new(
+                    Arc::clone(&hop.store),
+                    PrincipalScope::new("user:alice").with_agent(Some(agent.to_string())),
+                ),
+            ))
+        }
+
+        /// In an owned session, the `sop_execute` a bounded target inherits
+        /// writes the audit rows of the run it starts on the owner's plane for
+        /// the TARGET, not on the caller's plane its caller's instance carried.
+        #[test]
+        fn bounded_rebound_sop_execute_owned_audits_on_the_target_plane() {
+            on_deep_stack(async {
+                let hop = hop(
+                    "spawn_subagent",
+                    true,
+                    HopMemory::OneStore,
+                    grant_only_sop_execute,
+                )
+                .await;
+                hop.tool
+                    .bind_principal_scope(owner_scope())
+                    .expect("the session's owner binds");
+                let engine = with_caller_sop_execute(&hop);
+
+                let probe = Arc::new(std::sync::Mutex::new(OwnerPlaneProbe::default()));
+                let result = OWNER_PLANE_PROBE
+                    .scope(
+                        Arc::clone(&probe),
+                        run_target(&hop, "sop_execute", json!({"name": "audit-probe"})),
+                    )
+                    .await;
+                let probe = std::mem::take(&mut *probe.lock().unwrap());
+                assert_eq!(
+                    probe.refusal, None,
+                    "the owned hop is not refused; delegate output: {}; error: {:?}",
+                    result.output, result.error
+                );
+                let run_id = engine
+                    .lock()
+                    .unwrap()
+                    .active_runs()
+                    .keys()
+                    .next()
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "precondition: the target's sop_execute started a run; delegate \
+                             output: {}",
+                            result.output
+                        )
+                    });
+
+                let on_target = owner_plane_audit(&hop, TARGET)
+                    .get_run(&run_id)
+                    .await
+                    .unwrap();
+                assert!(
+                    on_target.is_some(),
+                    "the run the target started is on the owner's plane for {TARGET}"
+                );
+                let on_caller = owner_plane_audit(&hop, "executive_assistant")
+                    .get_run(&run_id)
+                    .await
+                    .unwrap();
+                assert!(
+                    on_caller.is_none(),
+                    "nothing of the target's run is written on the caller's plane: {on_caller:?}"
+                );
+            });
+        }
+
+        /// In an owned session, a target that inherits `sop_execute` needs the
+        /// owner's plane before it starts, as one that inherits
+        /// `spawn_subagent` does: when its memory cannot be opened the hop is
+        /// refused, though the model would never have called the tool.
+        #[test]
+        fn bounded_rebound_sop_execute_owned_refuses_when_target_memory_fails() {
+            on_deep_stack(async {
+                let hop = hop(
+                    "spawn_subagent",
+                    true,
+                    HopMemory::Failing,
+                    grant_only_sop_execute,
+                )
+                .await;
+                hop.tool
+                    .bind_principal_scope(owner_scope())
+                    .expect("the session's owner binds");
+                let _engine = with_caller_sop_execute(&hop);
+
+                let probe = Arc::new(std::sync::Mutex::new(OwnerPlaneProbe::default()));
+                let result = OWNER_PLANE_PROBE
+                    .scope(
+                        Arc::clone(&probe),
+                        run_target(&hop, "sop_execute", json!({"name": "audit-probe"})),
+                    )
+                    .await;
+                let probe = std::mem::take(&mut *probe.lock().unwrap());
+                assert_eq!(
+                    probe.refusal,
+                    Some("target_memory_unavailable"),
+                    "the hop is refused because the owner's plane for {TARGET} cannot be \
+                     opened; delegate output: {}; error: {:?}",
+                    result.output,
+                    result.error
+                );
+                assert!(!result.success, "a refused hop does not succeed");
+                assert_eq!(
+                    result.error,
+                    DelegateTool::bounded_tools_refusal(TARGET).error,
+                    "the refusal the model sees is the existing tool-initialization one"
+                );
+            });
+        }
+
+        /// Control for the two above: without an owner the same target, on the
+        /// same failing memory source, is not refused, because no plane is
+        /// pinned for it.
+        #[test]
+        fn bounded_rebound_sop_execute_unowned_is_not_refused_when_target_memory_fails() {
+            on_deep_stack(async {
+                let hop = hop(
+                    "spawn_subagent",
+                    true,
+                    HopMemory::Failing,
+                    grant_only_sop_execute,
+                )
+                .await;
+                let _engine = with_caller_sop_execute(&hop);
+
+                let probe = Arc::new(std::sync::Mutex::new(OwnerPlaneProbe::default()));
+                let result = OWNER_PLANE_PROBE
+                    .scope(
+                        Arc::clone(&probe),
+                        run_target(&hop, "sop_execute", json!({"name": "audit-probe"})),
+                    )
+                    .await;
+                let probe = std::mem::take(&mut *probe.lock().unwrap());
+                assert_eq!(
+                    probe.refusal, None,
+                    "a hop without an owner holds no plane for its target; delegate output: {}; \
+                     error: {:?}",
+                    result.output, result.error
+                );
+            });
+        }
+
         /// Lets the target inherit `memory_store`, in the caller's and the
         /// target's risk profiles alike.
         fn grant_memory_store(config: &mut Config, _url: &str) {
@@ -22765,6 +23035,55 @@ target = "memory_recall"
                 );
             }
             assert_eq!(check(Some(&pinned(plane(owner_target_scope())))), None);
+        }
+
+        /// The guard the sealed registry's route goes through turns a missed
+        /// plane into the hop's refusal, and judges nothing in a hop without an
+        /// owner. `owner_plane_mismatch` alone says why; this is what the hop
+        /// returns.
+        #[test]
+        fn sealed_route_refusal_refuses_an_owned_hop_whose_registry_misses_the_plane() {
+            use zeroclaw_tools::session_memory::SessionMemoryRoute;
+            let shared: Arc<dyn Memory> = Arc::new(zeroclaw_memory::NoneMemory::new("none"));
+            let on_shared = Arc::new(SessionMemoryRoute::default());
+            on_shared
+                .pin(Arc::clone(&shared), Arc::new(SecurityPolicy::default()))
+                .unwrap();
+            let on_target = Arc::new(SessionMemoryRoute::default());
+            on_target
+                .pin(
+                    Arc::new(zeroclaw_memory::PrincipalPlaneMemory::new(
+                        Arc::clone(&shared),
+                        owner_target_scope(),
+                    )),
+                    Arc::new(SecurityPolicy::default()),
+                )
+                .unwrap();
+            let owner = owner_target_scope();
+            let refusal_error = DelegateTool::bounded_tools_refusal(TARGET).error;
+            assert!(
+                refusal_error.is_some(),
+                "precondition: the refusal carries an error"
+            );
+
+            for (route, what) in [
+                (None, "no route"),
+                (Some(&on_shared), "a route on the shared plane"),
+            ] {
+                let refusal = DelegateTool::sealed_route_refusal(TARGET, route, Some(&owner))
+                    .unwrap_or_else(|| panic!("an owned hop with {what} is refused"));
+                assert!(!refusal.success, "{what}");
+                assert_eq!(refusal.error, refusal_error, "{what}");
+            }
+            assert!(
+                DelegateTool::sealed_route_refusal(TARGET, Some(&on_target), Some(&owner))
+                    .is_none(),
+                "an owned hop whose registry holds the owner's plane for the target proceeds"
+            );
+            assert!(
+                DelegateTool::sealed_route_refusal(TARGET, None, None).is_none(),
+                "a hop without an owner is not judged"
+            );
         }
     }
 

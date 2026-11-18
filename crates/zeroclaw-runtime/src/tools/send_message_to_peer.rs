@@ -1635,18 +1635,11 @@ mod tests {
     /// recipient's turn completes deterministically without a real model
     /// provider dependency.
     ///
-    /// Driven on a runtime with an enlarged worker stack, same pattern and
-    /// same size already used by the `bounded_delegate_*` integration tests
-    /// for the same class of issue: this call graph (`execute()` -> detached
-    /// spawn -> `process_message` -> full registry assembly -> agent turn
-    /// loop) is deep enough to overflow the harness's default per-thread
-    /// stack, but only under load — it always passed run in isolation, and
-    /// only failed running inside the full `--lib` suite alongside
-    /// thousands of other tests (confirmed on Linux, both in CI and in a
-    /// local reproduction outside CI; `RUST_MIN_STACK=64MiB` made the same
-    /// full-suite run pass clean). Not a regression in this test's own
-    /// logic — the accumulated size of the registry-assembly/agent-turn
-    /// call graph crossed the harness's default margin.
+    /// Runs on a runtime with an enlarged worker stack, as the
+    /// `bounded_delegate_*` integration tests do: the call graph from
+    /// `execute()` through the detached spawn, registry assembly and the
+    /// agent turn loop can exceed the harness's default per-thread stack
+    /// when the whole `--lib` suite runs.
     #[test]
     fn peer_turn_cost_scope_through_execute_boundary_attributes_recipient_and_shares_budget() {
         // `worker_threads(1)`: the inner body's completion-polling loop

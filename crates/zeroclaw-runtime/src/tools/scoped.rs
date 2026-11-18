@@ -374,6 +374,14 @@ impl BuildRegistry {
     }
 }
 
+/// The native tools whose memory work follows the registry's session memory
+/// route (see [`ScopedToolRegistry::pin_session_memory`]) and that a bounded
+/// hop can inherit: `spawn_subagent`'s child runs and the audit rows of the
+/// SOP run tools. A hop in an owned session whose target inherits one of them
+/// must hold the owner's plane for the target before it starts.
+pub(crate) const ROUTE_SHARING_TOOL_NAMES: [&str; 3] =
+    [tools::SpawnSubagentTool::NAME, "sop_execute", "sop_advance"];
+
 /// A per-agent tool registry that has been scoped and gated. The inner field is
 /// private and production code can only mint one through
 /// [`ScopedToolRegistry::assemble`]. The engine's turn-entry carriers
@@ -456,14 +464,9 @@ impl ScopedToolRegistry {
     /// reach source tools.
     fn starts_memory_work(&self) -> bool {
         self.0.iter().any(|tool| {
-            matches!(
-                tool.name(),
-                tools::SpawnSubagentTool::NAME
-                    | tools::PipelineTool::NAME
-                    | "sop_execute"
-                    | "sop_advance"
-                    | "sop_approve"
-            ) && !self.3.is_supplied_entry(tool.as_ref())
+            (ROUTE_SHARING_TOOL_NAMES.contains(&tool.name())
+                || matches!(tool.name(), tools::PipelineTool::NAME | "sop_approve"))
+                && !self.3.is_supplied_entry(tool.as_ref())
         })
     }
 

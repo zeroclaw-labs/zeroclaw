@@ -1233,10 +1233,14 @@ mod binding_ratchet_tests {
     /// Scope: it reads the source of `crates/zeroclaw-runtime/src` only, and
     /// matches the text `<Type>::new` followed by any suffix (`new_with_capability`
     /// and the like). It does not see another crate that
-    /// calls the public constructors, a `use ... as` alias of the type,
+    /// calls the public constructors, a `use ... as` alias of the type, a
+    /// `type X = ...;` alias, the bracketed form `<SpawnSubagentTool>::new`,
     /// `Self::new` inside the type's own impl, or a factory called with
-    /// `binding: None`. Making the constructors `pub(crate)` would close the
-    /// first of these.
+    /// `binding: None`. Nothing checks the callers of the rebuild factories:
+    /// they pass `self.capabilities.get()`, which is legitimately `None` for
+    /// a delegate bound to nothing, so a caller that passed a literal `None`
+    /// would go unnoticed. Making the constructors `pub(crate)` would close
+    /// the first of these.
     #[test]
     fn child_starting_tools_are_built_only_by_the_registry_factories() {
         let hits = all_production_constructor_hits();
