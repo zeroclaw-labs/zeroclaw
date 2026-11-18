@@ -329,6 +329,28 @@ There is no `systemctl enable` step for generated units: the `[Install] WantedBy
 - **Rootless variant.** Drop the file in `~/.config/containers/systemd/`, use `systemctl --user daemon-reload && systemctl --user restart zeroclaw`, and run `loginctl enable-linger $USER` so it survives logout (same lingering note as [Service & daemon](../ops/service.md)).
 - **WSL2.** Modern WSL2 runs systemd (`[boot] systemd=true` in `/etc/wsl.conf`, then `wsl --shutdown`), so this exact quadlet pattern works inside a WSL distro: no Windows-specific dialect.
 
+## Shell and skill tools using a host engine
+
+When `runtime.kind = "docker"`, shell and skill tools invoke the `docker`
+executable available to the ZeroClaw process. A Podman-compatible `docker`
+launcher can connect to a host rootless Podman service through a mounted Unix
+socket by setting `CONTAINER_HOST` in ZeroClaw's environment, for example
+`unix:///var/run/docker.sock`. Docker users can select their engine with
+`DOCKER_HOST`. Use the socket path visible inside the ZeroClaw container.
+
+ZeroClaw preserves these two connection variables for the engine launcher after
+sanitizing its environment. They are not automatically forwarded into the
+containers that execute tool commands. Other operator-selected launcher
+variables use the existing risk profile's `shell_env_passthrough` list, which
+applies to both shell and skill tools. Native tools retain the usual safe
+environment and configured passthrough filtering.
+
+The host engine must be able to access any configured workspace bind mount;
+the workspace path sent by ZeroClaw is interpreted on the engine host. Keep
+the configured memory, CPU, network, and read-only filesystem limits. Access
+to an engine socket grants that service's container-management authority, so
+mount only the intended service socket into the ZeroClaw container.
+
 ## Config inside containers
 
 The image expects config under `/zeroclaw-data/.zeroclaw/`. Mount your local config in:

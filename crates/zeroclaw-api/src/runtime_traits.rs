@@ -263,6 +263,18 @@ pub trait RuntimeAdapter: Send + Sync {
         None
     }
 
+    /// Host environment names required to connect this runtime's shell launcher.
+    ///
+    /// Shell tools restore these after clearing the process environment. The
+    /// adapter owns this allowlist; values are read from the host environment
+    /// at execution time, without caching them in the runtime. These names do
+    /// not request forwarding into a container or other guest environment.
+    /// Native adapters keep the empty default so engine connection settings
+    /// do not enter ordinary native shell commands automatically.
+    fn shell_launcher_env_vars(&self) -> &'static [&'static str] {
+        &[]
+    }
+
     /// Build a shell command process configured for this runtime.
     ///
     /// Constructs a [`tokio::process::Command`] that will execute `command`
