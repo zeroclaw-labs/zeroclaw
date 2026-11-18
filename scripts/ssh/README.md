@@ -151,3 +151,24 @@ race during authentication.
 
 Each master owns a process group. Setup failure, cancellation, idle retirement
 and task shutdown terminate the group's proxy descendants as well as the master.
+
+### Abrupt native broker death
+
+Each native master has a separate Rust supervisor in its own process group.
+The broker retains the supervisor's stdin write end as a lifetime lease; only
+that broker owns it. Normal retirement or broker death closes the pipe. The
+supervisor keeps running long enough to send TERM and then KILL after 150 ms
+to its complete group, including a proxy that ignores TERM and closed pipes.
+It also cleans the group when the SSH leader exits. The group must equal the
+supervisor PID and exceed 1; the internal mode refuses a shared group or a
+broadcast PID. Its command shape is restricted to the managed setpriv/SSH
+master invocation. There is no new credential lookup, listener or scheduler.
+This adds one supervisor process per master. Processes that deliberately leave
+the owned group are outside this process-group cleanup contract; unsandboxed
+same-user code retains that user's authority. Existing task, idle and policy
+limits continue to apply.
+
+The regression kills an isolated broker fixture with SIGKILL while a real
+TERM-ignoring proxy remains alive, then verifies both proxy and supervisor
+terminate within the bounded deadline. Normal EOF and idle cleanup remain
+covered separately. No Python supervisor is used by the native path.

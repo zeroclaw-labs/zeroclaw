@@ -252,17 +252,114 @@ fn signer_loader_args(effective: &str, home: Option<&Path>) -> Result<Vec<std::f
     Ok(args)
 }
 
+// A separate process owns the SSH process group. Its stdin is a lease held
+// only by the broker; broker SIGKILL closes it even though Rust Drop cannot run.
+// The supervisor deliberately survives that death long enough to kill the group.
+async fn supervise_master(
+    program: std::ffi::OsString,
+    args: Vec<std::ffi::OsString>,
+) -> Result<i32> {
+    // SAFETY: these getters have no preconditions; refuse group 1 (broadcast).
+    let group = unsafe { libc::getpgrp() };
+    let pid = unsafe { libc::getpid() };
+    ensure!(
+        pid > 1 && group == pid,
+        "supervisor requires its own process group"
+    );
+    let mut terminated = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let mut child = Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()?;
+    let (end, mut ended) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        let _ = std::io::copy(&mut std::io::stdin(), &mut std::io::sink());
+        let _ = end.send(());
+    });
+    tokio::select! {
+        _ = &mut ended => {},
+        _ = terminated.recv() => {},
+        _ = child.wait() => {},
+    }
+    // The registered TERM handler keeps this supervisor alive through grace.
+    // Group KILL also terminates the supervisor, even if the SSH leader exited.
+    unsafe {
+        libc::kill(-group, libc::SIGTERM);
+    }
+    sleep(Duration::from_millis(150)).await;
+    unsafe {
+        libc::kill(-group, libc::SIGKILL);
+    }
+    anyhow::bail!("supervisor group cleanup failed")
+}
+
+fn supervised_master_command(command: &Command) -> Result<Command> {
+    let source = command.as_std();
+    let mut supervisor = Command::new(std::env::current_exe()?);
+    #[cfg(not(test))]
+    supervisor
+        .arg("--supervise-master")
+        .arg(source.get_program())
+        .args(source.get_args());
+    #[cfg(test)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let argv: Vec<Vec<u8>> = std::iter::once(source.get_program())
+            .chain(source.get_args())
+            .map(|arg| arg.as_bytes().to_vec())
+            .collect();
+        supervisor
+            .args([
+                "--exact",
+                "task_ssh_broker::tests::supervisor_process_entry",
+                "--nocapture",
+            ])
+            .env(
+                "ZEROCLAW_TEST_SSH_SUPERVISOR",
+                serde_json::to_string(&argv)?,
+            );
+    }
+    for (key, value) in source.get_envs() {
+        match value {
+            Some(value) => {
+                supervisor.env(key, value);
+            }
+            None => {
+                supervisor.env_remove(key);
+            }
+        }
+    }
+    if let Some(directory) = source.get_current_dir() {
+        supervisor.current_dir(directory);
+    }
+    supervisor
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .kill_on_drop(true);
+    Ok(supervisor)
+}
+
 struct OwnedMaster {
     child: Child,
+    input: Option<tokio::process::ChildStdin>,
     group: i32,
 }
 
 impl OwnedMaster {
     fn spawn(command: &mut Command) -> Result<Self> {
-        command.process_group(0);
-        let child = command.spawn()?;
-        let group = child.id().context("missing SSH master pid")? as i32;
-        Ok(Self { child, group })
+        let mut child = supervised_master_command(command)?.spawn()?;
+        let input = child.stdin.take().context("missing supervisor lease")?;
+        let group = child.id().context("missing SSH supervisor pid")? as i32;
+        Ok(Self {
+            child,
+            input: Some(input),
+            group,
+        })
     }
 
     fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
@@ -270,6 +367,7 @@ impl OwnedMaster {
     }
 
     async fn kill(&mut self) -> std::io::Result<()> {
+        drop(self.input.take());
         // Kill the group even if the leader has already exited: a proxy can
         // ignore closed pipes and remain in the original process group.
         unsafe {
@@ -287,6 +385,7 @@ impl OwnedMaster {
 
 impl Drop for OwnedMaster {
     fn drop(&mut self) {
+        drop(self.input.take());
         if self.group > 0 {
             unsafe {
                 libc::kill(-self.group, libc::SIGKILL);
@@ -726,6 +825,22 @@ pub fn run(args: Vec<String>) -> i32 {
         .map_err(anyhow::Error::from)
         .and_then(|runtime| {
             runtime.block_on(async {
+                if args.first().is_some_and(|arg| arg == "--supervise-master") {
+                    ensure!(
+                        args.len() > 5
+                            && args[1] == "/usr/bin/setpriv"
+                            && args[2] == "--pdeathsig"
+                            && args[3] == "TERM"
+                            && args[4] == SSH
+                            && args[5] == "-M",
+                        "invalid supervisor command"
+                    );
+                    return supervise_master(
+                        args[1].clone().into(),
+                        args[2..].iter().map(Into::into).collect(),
+                    )
+                    .await;
+                }
                 if let [flag, id] = args.as_slice()
                     && flag == "--serve"
                 {
@@ -768,6 +883,117 @@ mod tests {
         time::{Duration, Instant},
     };
     use tokio::{process::Command, sync::Mutex};
+
+    // These two entries run only in isolated child test processes. They are
+    // fixtures for the real abrupt-parent-death regression below.
+    #[test]
+    fn supervisor_process_entry() {
+        let Ok(payload) = std::env::var("ZEROCLAW_TEST_SSH_SUPERVISOR") else {
+            return;
+        };
+        use std::os::unix::ffi::OsStringExt;
+        let mut argv: Vec<std::ffi::OsString> = serde_json::from_str::<Vec<Vec<u8>>>(&payload)
+            .unwrap()
+            .into_iter()
+            .map(std::ffi::OsString::from_vec)
+            .collect();
+        let program = argv.remove(0);
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(super::supervise_master(program, argv))
+            .unwrap();
+    }
+
+    #[test]
+    fn broker_process_entry() {
+        let Some(pidfile) = std::env::var_os("ZEROCLAW_TEST_BROKER_PROXY") else {
+            return;
+        };
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let master = OwnedMaster::spawn(
+                    Command::new("/bin/sh")
+                        .arg("-c")
+                        .arg(r#"trap '' TERM; sleep 60 & echo $! > "$1"; wait"#)
+                        .arg("proxy-fixture")
+                        .arg(&pidfile),
+                )
+                .unwrap();
+                std::fs::write(
+                    std::path::Path::new(&pidfile).with_extension("group"),
+                    master.group.to_string(),
+                )
+                .unwrap();
+                std::future::pending::<()>().await;
+                drop(master);
+            });
+    }
+
+    #[tokio::test]
+    async fn abrupt_broker_death_stops_term_ignoring_proxy_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("proxy.pid");
+        let mut broker = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "task_ssh_broker::tests::broker_process_entry",
+                "--nocapture",
+            ])
+            .env("ZEROCLAW_TEST_BROKER_PROXY", &pidfile)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .process_group(0)
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let (proxy, group) = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let proxy = std::fs::read_to_string(&pidfile)
+                    .ok()
+                    .and_then(|s| s.trim().parse::<i32>().ok());
+                let group = std::fs::read_to_string(pidfile.with_extension("group"))
+                    .ok()
+                    .and_then(|s| s.trim().parse::<i32>().ok());
+                if let (Some(proxy), Some(group)) = (proxy, group) {
+                    break (proxy, group);
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("proxy fixture must become ready");
+        // SIGKILL: no broker destructor or normal EOF closeout can run.
+        broker.kill().await.unwrap();
+        broker.wait().await.unwrap();
+        let stopped = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let alive = |pid| {
+                    std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                        .is_ok_and(|s| s.split_whitespace().nth(2) != Some("Z"))
+                };
+                if !alive(proxy) && !alive(group) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        if stopped.is_err() {
+            unsafe {
+                libc::kill(-group, libc::SIGKILL);
+            }
+        }
+        assert!(
+            stopped.is_ok(),
+            "proxy and supervisor must stop after broker SIGKILL"
+        );
+    }
 
     #[test]
     fn prebound_fake_agent_and_master_sockets_are_refused() {
