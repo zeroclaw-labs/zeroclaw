@@ -379,6 +379,21 @@ fn terminal_completion_error_message_with_renderer(
         };
         return Some(render(key, &[]));
     }
+    // The fail-closed budget refusal never reaches a provider, so a cron job
+    // that dies on it must surface the same remediation as an interactive
+    // turn instead of the generic provider-failure projection below.
+    if let Some(floor) = err
+        .chain()
+        .find_map(|source| source.downcast_ref::<SystemPromptFloorExceedsBudget>())
+    {
+        return Some(render(
+            "turn-system-floor-exceeds-budget-error",
+            &[
+                ("floor", &floor.system_floor_tokens.to_string()),
+                ("budget", &floor.context_token_budget.to_string()),
+            ],
+        ));
+    }
     // A refusal that is still the final cause sits beneath Reliable's
     // envelopes; it needs safety-specific guidance rather than the generic
     // provider-failure projection. A later non-refusal failure replaces it as
@@ -586,6 +601,23 @@ mod tests {
         let untyped = anyhow::Error::msg("context window exceeded");
         assert!(context_window_exceeded_from_error(&untyped).is_none());
         assert!(terminal_completion_error_message(&untyped, None).is_none());
+    }
+
+    #[test]
+    fn system_floor_refusal_projects_its_remediation_at_terminal_completion() {
+        let error = anyhow::Error::new(SystemPromptFloorExceedsBudget {
+            system_floor_tokens: 143_448,
+            context_token_budget: 40_000,
+        });
+        let delivered = terminal_completion_error_message(&error, Some("cron-job"))
+            .expect("floor refusal must have a terminal projection");
+        assert_eq!(
+            delivered,
+            crate::i18n::get_required_cli_string_with_args(
+                "turn-system-floor-exceeds-budget-error",
+                &[("floor", "143448"), ("budget", "40000")],
+            ),
+        );
     }
 
     /// When the refused window is the unconfigured-model compatibility stub,
