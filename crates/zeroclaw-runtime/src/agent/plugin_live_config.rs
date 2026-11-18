@@ -426,3 +426,66 @@ async fn live_delegated_plugin_tool_observes_config_reload_after_construction() 
          registry and the target-owned registry the DelegateTool builds"
     );
 }
+
+/// A bounded delegate lends its child the parent's own tool objects. A plugin
+/// tool is bound to the agent whose registry built it (`caller_alias`), and
+/// `dispatch.wake` attributes the woken turn to that alias. If the parent's
+/// plugin tools were lent to a bounded child, the child's wakes would be
+/// recorded as the parent's.
+///
+/// Production assembly registers plugin tools after the delegate snapshots its
+/// parent tools, so a bounded child never inherits them; only the parent's own
+/// turn runs them. This pins that: a change that starts lending plugin tools to
+/// bounded children must rebind each one to the child's alias, as the bounded
+/// path already rebinds the delegate tool itself.
+#[tokio::test]
+async fn bounded_delegate_does_not_lend_caller_bound_plugin_tools() {
+    let tmp = TempDir::new().expect("temp dir");
+    let plugins_root = tmp.path().join("plugins");
+    let instance_key = install_fixture_plugin(&plugins_root);
+    let mut config = live_delegating_agent_config(&tmp, &plugins_root, &instance_key);
+    config
+        .agents
+        .get_mut("plugin-agent")
+        .expect("the parent agent is seeded by live_agent_config")
+        .delegates[0]
+        .mode = DelegateExecutionMode::Bounded;
+
+    let live = zeroclaw_config::live::LiveConfig::new(config);
+    let agent = Agent::from_live_config_with_tui_env(
+        live.handle(),
+        "plugin-agent",
+        None,
+        false,
+        false,
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("build a live-config Agent that can delegate in bounded mode");
+
+    assert!(
+        agent.tools.iter().any(|tool| tool.name() == "config-echo"),
+        "precondition: the parent agent must hold the fixture plugin tool"
+    );
+    let delegate = agent.delegate_tool.as_ref().expect(
+        "the parent registry must register a DelegateTool when delegation targets are \
+         configured and delegate is selected",
+    );
+    let lent: Vec<String> = delegate
+        .parent_tools_handle()
+        .read()
+        .iter()
+        .map(|tool| tool.name().to_string())
+        .collect();
+    assert!(
+        !lent.is_empty(),
+        "precondition: the bounded delegate lends the parent's native tools"
+    );
+    assert!(
+        !lent.iter().any(|name| name == "config-echo"),
+        "a bounded child must not inherit the parent's caller-bound plugin tools, or its \
+         plugin wakes would be attributed to the parent: {lent:?}"
+    );
+}
