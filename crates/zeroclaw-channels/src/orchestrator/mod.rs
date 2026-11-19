@@ -2614,6 +2614,15 @@ fn normalize_cached_channel_turns(turns: Vec<ChatMessage>) -> Vec<ChatMessage> {
             }
             // Interrupted channel turns can produce consecutive user messages
             // (no assistant persisted yet). Merge instead of dropping.
+            (false, "user")
+                if normalized.last().is_some_and(|previous| {
+                    previous.role == "tool"
+                        || (previous.role == "user"
+                            && previous.content.starts_with("[Tool results]\n"))
+                }) =>
+            {
+                normalized.push(turn);
+            }
             (false, "user") | (true, "assistant") => {
                 if let Some(last_turn) = normalized.last_mut()
                     && !turn.content.is_empty()
