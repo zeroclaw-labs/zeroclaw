@@ -114,7 +114,6 @@ export class WebSocketClient {
 
     const token = getToken();
     const params = new URLSearchParams();
-    if (token) params.set('token', token);
     params.set('session_id', this.sessionId);
     params.set('agent', this.agentAlias);
     const url = `${this.baseUrl}${basePath}/ws/chat?${params.toString()}`;
