@@ -54,6 +54,7 @@ const GOOGLE_API_KEY_HEADER: &str = "x-goog-api-key";
 #[derive(Clone)]
 pub(crate) struct AsrProviderConfig {
     pub transport: HttpTransportConfig,
+    pub endpoint: Option<String>,
     pub model: Option<String>,
     pub language: Option<String>,
     pub initial_prompt: Option<String>,
@@ -66,6 +67,7 @@ impl AsrProviderConfig {
                 resolved.selection.connection,
                 resolved.request_timeout_secs.clone(),
             )?,
+            endpoint: resolved.endpoint.clone(),
             model: resolved
                 .selection
                 .model
@@ -77,7 +79,10 @@ impl AsrProviderConfig {
     }
 
     fn endpoint(&self) -> Result<String> {
-        self.transport.endpoint("audio/transcriptions")
+        self.endpoint
+            .clone()
+            .map(Ok)
+            .unwrap_or_else(|| self.transport.endpoint("audio/transcriptions"))
     }
 }
 
@@ -396,6 +401,7 @@ impl DeepgramProvider {
     fn from_canonical(
         alias: &str,
         api_key: Option<&str>,
+        endpoint: Option<String>,
         model: Option<&str>,
         language: Option<String>,
         request_timeout_secs: Option<Override<NonZeroU64>>,
@@ -407,7 +413,9 @@ impl DeepgramProvider {
             .context("Missing API key for canonical Deepgram transcription model")?;
         Ok(Self {
             alias: alias.to_owned(),
-            api_url: "https://api.deepgram.com/v1/listen".into(),
+            api_url: endpoint
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| "https://api.deepgram.com/v1/listen".into()),
             api_key,
             model: model
                 .filter(|value| !value.trim().is_empty())
@@ -741,6 +749,7 @@ impl AsrProvider for AssemblyAiProvider {
 pub struct GoogleSttProvider {
     alias: String,
     api_key: String,
+    endpoint: String,
     language_code: String,
     request_timeout_secs: Option<Override<NonZeroU64>>,
 }
@@ -749,6 +758,7 @@ impl GoogleSttProvider {
     fn from_canonical(
         alias: &str,
         api_key: Option<&str>,
+        endpoint: Option<String>,
         language: Option<String>,
         request_timeout_secs: Option<Override<NonZeroU64>>,
     ) -> Result<Self> {
@@ -760,6 +770,9 @@ impl GoogleSttProvider {
         Ok(Self {
             alias: alias.to_owned(),
             api_key,
+            endpoint: endpoint
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| GOOGLE_STT_ENDPOINT.into()),
             language_code: language.unwrap_or_else(|| "en-US".into()),
             request_timeout_secs,
         })
@@ -827,7 +840,7 @@ impl GoogleSttProvider {
 
     fn build_request(&self, request_body: &serde_json::Value) -> Result<reqwest::RequestBuilder> {
         let request = zeroclaw_config::schema::build_runtime_proxy_client("transcription.google")
-            .post(GOOGLE_STT_ENDPOINT)
+            .post(&self.endpoint)
             .header(GOOGLE_API_KEY_HEADER, self.sensitive_api_key_header()?)
             .json(request_body);
         Ok(apply_transcription_timeout(
@@ -946,7 +959,11 @@ impl LocalWhisperProvider {
             .and_then(|api| api.max_audio_bytes)
             .unwrap_or(MAX_AUDIO_BYTES);
         let bridge = zeroclaw_config::schema::LocalWhisperConfig {
-            url: connection.uri.clone().unwrap_or_default(),
+            url: resolved
+                .endpoint
+                .clone()
+                .or_else(|| connection.uri.clone())
+                .unwrap_or_default(),
             bearer_token: connection
                 .auth
                 .as_ref()
@@ -1139,6 +1156,7 @@ fn build_canonical_transcription_provider(
         ProviderConnection::Deepgram(_) => DeepgramProvider::from_canonical(
             model_ref,
             api_key,
+            resolved.endpoint.clone(),
             model,
             language,
             resolved.request_timeout_secs.clone(),
@@ -1153,6 +1171,7 @@ fn build_canonical_transcription_provider(
         ProviderConnection::Google(_) => GoogleSttProvider::from_canonical(
             model_ref,
             api_key,
+            resolved.endpoint.clone(),
             language,
             resolved.request_timeout_secs.clone(),
         )
