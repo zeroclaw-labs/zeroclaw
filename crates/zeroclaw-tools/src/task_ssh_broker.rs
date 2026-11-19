@@ -243,13 +243,19 @@ impl OwnedMaster {
     }
 
     fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
-        self.child.try_wait()
+        let status = self.child.try_wait()?;
+        if status.is_some() {
+            self.group = 0;
+        }
+        Ok(status)
     }
 
     async fn kill(&mut self) -> std::io::Result<()> {
         drop(self.input.take());
-        // Kill the group even if the leader has already exited: a proxy can
-        // ignore closed pipes and remain in the original process group.
+        // Reaping the supervisor releases its PID for reuse.
+        if self.try_wait()?.is_some() || self.group == 0 {
+            return Ok(());
+        }
         unsafe {
             libc::kill(-self.group, libc::SIGTERM);
         }
@@ -266,7 +272,7 @@ impl OwnedMaster {
 impl Drop for OwnedMaster {
     fn drop(&mut self) {
         drop(self.input.take());
-        if self.group > 0 {
+        if self.group > 0 && matches!(self.try_wait(), Ok(None)) {
             unsafe {
                 libc::kill(-self.group, libc::SIGKILL);
             }
