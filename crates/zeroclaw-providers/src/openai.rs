@@ -2476,7 +2476,7 @@ mod tests {
             .api_url(&format!("http://{direct_addr}"))
             .credential(Some("test-key"))
             .build();
-        let client = provider.http_client();
+        let client = provider.http_client().expect("HTTP client should build");
         let streaming_client = provider.streaming_client();
         set_runtime_proxy_config(ProxyConfig::default());
 

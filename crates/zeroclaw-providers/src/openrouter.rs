@@ -611,7 +611,7 @@ impl OpenRouterModelProvider {
     }
 
     /// Use the same resolved deadlines for transport and diagnostics.
-    fn streaming_http_client(&self) -> Client {
+    fn streaming_http_client(&self) -> Result<Client, reqwest::Error> {
         let timeouts = self.streaming_timeouts();
         let mut builder =
             Client::builder().connect_timeout(Duration::from_secs(OPENROUTER_CONNECT_TIMEOUT_SECS));
@@ -626,7 +626,6 @@ impl OpenRouterModelProvider {
             "model_provider.openrouter",
         )
         .build()
-        .unwrap_or_else(|_| Client::new())
     }
 
     fn streaming_endpoint_url(&self, path: &str) -> String {
@@ -981,7 +980,15 @@ impl ModelProvider for OpenRouterModelProvider {
             }
         };
 
-        let client = self.streaming_http_client();
+        let client = match self.streaming_http_client() {
+            Ok(client) => client,
+            Err(error) => {
+                return stream::once(async move {
+                    Err(StreamError::Http(format!("building HTTP client: {error}")))
+                })
+                .boxed();
+            }
+        };
         let timeouts = self.streaming_timeouts();
         let endpoint_url = self.streaming_endpoint_url("chat/completions");
         let count_tokens = options.count_tokens;
@@ -1438,6 +1445,7 @@ data: [DONE]
             .build();
         let response = provider
             .streaming_http_client()
+            .expect("HTTP client should build")
             .get(format!("http://{addr}/stream"))
             .send()
             .await
