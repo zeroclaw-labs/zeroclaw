@@ -850,7 +850,7 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                     // is actually creating.
                     map_key_section_entries.push(quote! {
                         out.push(crate::config::MapKeySection {
-                            path: #section_path,
+                            path: #section_path.to_string(),
                             kind: crate::config::MapKeyKind::Map,
                             value_type: #inner_ty_name,
                             description: #field_doc,
@@ -1104,7 +1104,7 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                     // typed insertion. Both auto-derived — no hand-table.
                     map_key_section_entries.push(quote! {
                         out.push(crate::config::MapKeySection {
-                            path: #section_path,
+                            path: #section_path.to_string(),
                             kind: crate::config::MapKeyKind::Map,
                             value_type: #value_ty_name,
                             description: #field_doc,
@@ -1479,7 +1479,7 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                 }
                 map_key_section_entries.push(quote! {
                     out.push(crate::config::MapKeySection {
-                        path: #section_path,
+                        path: #section_path.to_string(),
                         kind: crate::config::MapKeyKind::List,
                         value_type: #vec_inner_name,
                         description: #field_doc,
@@ -2087,7 +2087,25 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                         }
                     };
                     map_key_recurse.push(quote! {
-                        out.extend(<#field_ty>::map_key_sections());
+                        for mut section in <#field_ty>::map_key_sections() {
+                            let outer_prefix = Self::configurable_prefix();
+                            let inner_prefix = <#field_ty>::configurable_prefix();
+                            let rebased = if outer_prefix.is_empty() {
+                                Some(section.path.as_str())
+                            } else {
+                                section.path
+                                    .strip_prefix(outer_prefix)
+                                    .and_then(|s| s.strip_prefix('.'))
+                            };
+                            if let Some(leaf) = rebased {
+                                section.path = if inner_prefix.is_empty() {
+                                    leaf.to_string()
+                                } else {
+                                    format!("{inner_prefix}.{leaf}")
+                                };
+                                out.push(section);
+                            }
+                        }
                     });
                     get_map_keys_recurse.push(quote! {
                         if let Some(inner_section) = #rebase {

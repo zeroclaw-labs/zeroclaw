@@ -6969,7 +6969,7 @@ mention_only = false
         for _ in 0..4 {
             let mut created = false;
             for section in Config::map_key_sections() {
-                if config.create_map_key(section.path, "probe") == Ok(true) {
+                if config.create_map_key(&section.path, "probe") == Ok(true) {
                     created = true;
                 }
             }

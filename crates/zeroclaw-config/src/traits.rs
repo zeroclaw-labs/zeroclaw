@@ -839,11 +839,11 @@ pub enum MapKeyKind {
     List,
 }
 
-#[derive(Debug, Clone, Copy, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct MapKeySection {
     /// Dotted section path, e.g. `providers.models`, `mcp.servers`.
-    pub path: &'static str,
+    pub path: String,
     /// Whether the section is a map or a list.
     pub kind: MapKeyKind,
     /// Rust type name of the value, e.g. `ModelProviderConfig`. For display only.
