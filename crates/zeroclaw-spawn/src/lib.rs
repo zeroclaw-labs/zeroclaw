@@ -20,9 +20,15 @@ pub mod __private {
 /// of recomputing it.
 pub const TASK_EVENT_NAME: &str = "runtime.task.spawn";
 
+/// Spawn a task that inherits the caller's span, recording its spawn and
+/// its completion at INFO.
+///
+/// `spawn!(level = DEBUG, future)` records them at that level instead, for
+/// tasks spawned so often that their lifecycle at INFO would crowd out
+/// everything else.
 #[macro_export]
 macro_rules! spawn {
-    ($body:expr) => {{
+    (level = $level:ident, $body:expr) => {{
         #[allow(unused_imports)]
         use $crate::__private::tracing::Instrument as _;
 
@@ -37,7 +43,7 @@ macro_rules! spawn {
         // thread, attributed to whatever span the caller currently has
         // entered.
         $crate::__private::zeroclaw_log::record!(
-            INFO,
+            $level,
             $crate::__private::zeroclaw_log::Event::new(
                 $crate::TASK_EVENT_NAME,
                 $crate::__private::zeroclaw_log::Action::Spawn,
@@ -58,7 +64,7 @@ macro_rules! spawn {
             let __zc_task_output = { $body }.await;
             let __zc_task_elapsed_ms = __zc_task_started_at.elapsed().as_millis() as u64;
             $crate::__private::zeroclaw_log::record!(
-                INFO,
+                $level,
                 $crate::__private::zeroclaw_log::Event::new(
                     $crate::TASK_EVENT_NAME,
                     $crate::__private::zeroclaw_log::Action::Complete,
@@ -79,6 +85,9 @@ macro_rules! spawn {
             $crate::__private::tokio::spawn(__zc_task_future.in_current_span());
         __zc_spawn_handle
     }};
+    ($body:expr) => {
+        $crate::spawn!(level = INFO, $body)
+    };
 }
 
 #[cfg(test)]
@@ -110,6 +119,58 @@ mod tests {
             }
             self.events.lock().unwrap().push(stack);
         }
+    }
+
+    /// Layer that records the level and message of every lifecycle record
+    /// it sees.
+    #[derive(Clone, Default)]
+    struct LifecycleCapture {
+        records: Arc<Mutex<Vec<(tracing::Level, String)>>>,
+    }
+
+    impl<S: Subscriber> Layer<S> for LifecycleCapture {
+        fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+            struct Message(String);
+            impl tracing::field::Visit for Message {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "message" {
+                        self.0 = format!("{value:?}");
+                    }
+                }
+            }
+            let mut message = Message(String::new());
+            event.record(&mut message);
+            if message.0.starts_with("task ") {
+                self.records
+                    .lock()
+                    .unwrap()
+                    .push((*event.metadata().level(), message.0));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn spawn_records_its_lifecycle_at_info_unless_given_a_level() {
+        let capture = LifecycleCapture::default();
+        let _guard = tracing::subscriber::set_default(Registry::default().with(capture.clone()));
+
+        crate::spawn!(async {}).await.unwrap();
+        crate::spawn!(level = DEBUG, async {}).await.unwrap();
+
+        let records = capture.records.lock().unwrap();
+        assert_eq!(
+            *records,
+            [
+                (tracing::Level::INFO, "task spawned".to_string()),
+                (tracing::Level::INFO, "task complete".to_string()),
+                (tracing::Level::DEBUG, "task spawned".to_string()),
+                (tracing::Level::DEBUG, "task complete".to_string()),
+            ]
+        );
     }
 
     #[tokio::test]
