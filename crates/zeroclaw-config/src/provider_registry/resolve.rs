@@ -436,7 +436,7 @@ impl ProviderRegistry {
             apply_asr_preset(&self.model_presets, preset, &mut options)?;
         }
         if let Some(api) = &model.api {
-            request_timeout_secs = api.request_timeout_secs.clone();
+            request_timeout_secs = api.request_timeout_secs.clone().or(request_timeout_secs);
         }
         options.overlay(&model.options);
         Ok(ResolvedAsr {
