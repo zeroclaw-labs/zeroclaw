@@ -81,3 +81,6 @@ apps/*
 # its full source is needed for workspace resolution and the relay build.
 !apps/zerorelay/
 scripts/
+# The `web` cargo alias runs xtask, and xtask's docs generator embeds this
+# installer with include_str!, so it has to reach the build context.
+!scripts/install_windows_prebuilt.ps1
