@@ -681,7 +681,6 @@ impl CostTracker {
 
         let usage = &record.usage;
         if !usage.cost_usd.is_finite() || usage.cost_usd < 0.0 {
-            self.lock_storage().persistence_uncertain = true;
             anyhow::bail!("Token usage cost must be a finite, non-negative value");
         }
         if record.is_coverage_only()
@@ -693,7 +692,6 @@ impl CostTracker {
                 || usage.cache_creation_input_tokens != 0
                 || usage.unpriced_tokens != 0)
         {
-            self.lock_storage().persistence_uncertain = true;
             anyhow::bail!("Coverage-only records cannot contain billable usage");
         }
         if !track_per_agent {

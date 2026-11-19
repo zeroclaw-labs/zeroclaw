@@ -444,6 +444,25 @@ pub fn build_spec() -> serde_json::Value {
                     "404": version_error("Unknown `handoff_id`."),
                 }
             }
+        },
+        "/api/sessions/{id}/cost": {
+            "get": {
+                "tags": ["sessions"],
+                "summary": "Estimated recorded conversation cost",
+                "description": "Returns the estimated recorded spend for a conversation, including attributed delegates. This is not a provider invoice.",
+                "parameters": [
+                    {"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}
+                ],
+                "responses": {
+                    "200": {
+                        "description": "Estimate, incomplete estimate, or unavailable coverage",
+                        "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ConversationCostSummary"}}}
+                    },
+                    "401": {"description": "Authentication required"},
+                    "403": {"description": "Operator access required"},
+                    "500": {"description": "Ledger could not be read"}
+                }
+            }
         }
     });
 
@@ -678,19 +697,7 @@ pub fn build_spec() -> serde_json::Value {
             "version": env!("CARGO_PKG_VERSION"),
             "description": "OpenAPI generation requires the `schema-export` feature; this build was compiled without it.",
         },
-        "paths": {
-            "/api/sessions/{id}/cost": {
-                "get": {
-                    "summary": "Estimated recorded conversation cost",
-                    "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}],
-                    "responses": {
-                        "200": {"description": "Estimate, incomplete estimate, or unavailable coverage", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ConversationCostSummary"}}}},
-                        "401": {"description": "Authentication required"},
-                        "403": {"description": "Operator access required"},
-                        "500": {"description": "Ledger could not be read"}
-                    }
-                }
-            },},
+        "paths": {},
     })
 }
 
@@ -716,6 +723,20 @@ mod tests {
         assert!(paths.get("/api/version/upgrade/status").is_some());
         assert!(paths.get("/api/skills/slash-option-kinds").is_some());
         assert!(paths.get("/api/plugins").is_some());
+        assert!(paths.get("/api/sessions/{id}/cost").is_some());
+        let cost = paths.get("/api/sessions/{id}/cost").unwrap();
+        assert!(
+            spec.pointer("/components/schemas/ConversationCostSummary")
+                .is_some(),
+            "the cost operation must resolve ConversationCostSummary"
+        );
+        let cost_ref = cost.pointer("/get/responses/200/content/application~1json/schema/$ref");
+        assert_eq!(
+            cost_ref,
+            Some(&serde_json::Value::String(
+                "#/components/schemas/ConversationCostSummary".into()
+            ))
+        );
         #[cfg(feature = "a2a")]
         assert!(paths.get("/a2a/{alias}").is_some());
     }
