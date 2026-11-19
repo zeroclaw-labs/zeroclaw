@@ -531,7 +531,19 @@ impl McpOAuthManager {
                     super::discovery::DISCOVERY_BUDGET.as_secs()
                 ))
             })??;
-            *state.discovery.write().await = Some(discovered);
+            // Re-check under the write lock, the rule the grant load above
+            // already follows: two agents connecting while the
+            // authorization server is being replaced can both fetch, and the
+            // fetch that merely finished last must not replace a discovery
+            // that another pass has already used to accept or retire a grant.
+            // Whoever installs first is also the result the issuer check
+            // below reads, so a late answer cannot declare the winner's
+            // sign-in stale and erase it.
+            let mut cached = state.discovery.write().await;
+            if cached.is_none() {
+                *cached = Some(discovered);
+            }
+            drop(cached);
         }
 
         // S3-4: bind the loaded grant to the discovered issuer before any
@@ -2192,6 +2204,18 @@ mod tests {
         token_bodies: Vec<(u16, serde_json::Value)>,
         token_extra_delay: Vec<u64>,
     ) -> Stub {
+        stub_with_discovery_delay(register_body, token_bodies, token_extra_delay, 0).await
+    }
+
+    /// `discovery_delay_ms` slows the authorization-server metadata answer,
+    /// which is how a test keeps a discovery fetch in flight while it plays
+    /// the pass that completes first.
+    async fn stub_with_discovery_delay(
+        register_body: Option<serde_json::Value>,
+        token_bodies: Vec<(u16, serde_json::Value)>,
+        token_extra_delay: Vec<u64>,
+        discovery_delay_ms: u64,
+    ) -> Stub {
         let mcp = MockServer::start().await;
         let as_ = MockServer::start().await;
         Mock::given(method("GET"))
@@ -2205,15 +2229,19 @@ mod tests {
             .await;
         Mock::given(method("GET"))
             .and(path("/.well-known/oauth-authorization-server"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "issuer": as_.uri(),
-                "authorization_endpoint": format!("{}/authorize", as_.uri()),
-                "token_endpoint": format!("{}/token", as_.uri()),
-                "registration_endpoint": format!("{}/register", as_.uri()),
-                "grant_types_supported": ["authorization_code", "refresh_token"],
-                "code_challenge_methods_supported": ["S256"],
-                "token_endpoint_auth_methods_supported": ["none"],
-            })))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({
+                        "issuer": as_.uri(),
+                        "authorization_endpoint": format!("{}/authorize", as_.uri()),
+                        "token_endpoint": format!("{}/token", as_.uri()),
+                        "registration_endpoint": format!("{}/register", as_.uri()),
+                        "grant_types_supported": ["authorization_code", "refresh_token"],
+                        "code_challenge_methods_supported": ["S256"],
+                        "token_endpoint_auth_methods_supported": ["none"],
+                    }))
+                    .set_delay(Duration::from_millis(discovery_delay_ms)),
+            )
             .mount(&as_)
             .await;
         if let Some(body) = register_body {
@@ -5433,6 +5461,142 @@ mod tests {
                 .await
                 .expect("seed grant");
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_late_discovery_does_not_replace_one_another_pass_installed() {
+        // greptile pass-17 P1: `ready` checked the discovery cache before
+        // fetching and then installed its answer without looking again. Two
+        // agents connecting while the authorization server is being replaced
+        // can overlap: this pass fetches the OLD discovery and stalls on the
+        // metadata leg, while the other pass installs its own discovery and
+        // leaves that party's sign-in live and stored. The late answer used to
+        // overwrite the cache, and the issuer check then read a discovery no
+        // pass had acted on and erased the sign-in that agreed with the
+        // winner, in memory and on disk.
+        let stub = stub_with_discovery_delay(
+            Some(serde_json::json!({"client_id": "cid"})),
+            vec![],
+            vec![],
+            // The metadata answer lands 600 ms after its request: the window
+            // the other pass completes in, sized to survive a loaded harness.
+            600,
+        )
+        .await;
+        let manager = Arc::new(manager_with(&stub, Arc::new(NeverLaunch)));
+        let state = manager.state_for(&stub.store).expect("state");
+        let issuer_a = Url::parse("https://issuer-a.example").expect("issuer a");
+        // Warm discovery once to obtain a discovery document of this stub's
+        // own making, then empty the cache so the attempt really fetches.
+        manager.ready(&state, None).await.expect("warm discovery");
+        let mut discovery_a = state
+            .discovery
+            .read()
+            .await
+            .clone()
+            .expect("warm discovery document");
+        discovery_a.auth_server.issuer = issuer_a.clone();
+        *state.discovery.write().await = None;
+
+        let attempt = async { manager.ready(&state, None).await };
+        // Borrowed, not moved: `join!` awaits this in the same scope, and the
+        // authorization-server handle is not cloneable.
+        let installer = async {
+            // Deterministic handoff: the warm-up already recorded one metadata
+            // leg, so a second recorded leg means this pass is in flight with
+            // its answer still 600 ms away.
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                let legs = stub
+                    .as_
+                    .received_requests()
+                    .await
+                    .expect("received requests")
+                    .iter()
+                    .filter(|request| {
+                        request.url.path() == "/.well-known/oauth-authorization-server"
+                    })
+                    .count();
+                if legs >= 2 {
+                    break;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the discovery fetch never reached the authorization server"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            // The premise, checked where it matters: this pass takes the cache
+            // lock first and finds it empty, so the stalled fetch has not
+            // installed anything yet.
+            let mut cached = state.discovery.write().await;
+            assert!(
+                cached.is_none(),
+                "the stalled fetch installed its discovery before the other pass could, so the race was never exercised"
+            );
+            *cached = Some(discovery_a);
+            drop(cached);
+            // The other pass' sign-in, live and on disk for the party its
+            // discovery named: not something this fetch may invalidate.
+            let tokens = TokenSet {
+                access_token: "at-a".to_string(),
+                refresh_token: Some("rt-a".to_string()),
+                id_token: None,
+                expires_at: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+                token_type: Some("Bearer".to_string()),
+                scope: None,
+            };
+            manager
+                .store
+                .save_authorization(&state.canonical, "cid", &issuer_a, tokens.clone())
+                .await
+                .expect("seed the winning sign-in");
+            *state.grant.write().await = Some(Grant {
+                tokens,
+                client_id: "cid".to_string(),
+                issuer: issuer_a.clone(),
+            });
+        };
+        let (outcome, _) = tokio::join!(attempt, installer);
+        outcome.expect("`ready` resolves once a discovery is in place");
+
+        let discovered_issuer = state
+            .discovery
+            .read()
+            .await
+            .as_ref()
+            .map(|discovery| discovery.auth_server.issuer.as_str().to_string());
+        let live_token = state
+            .grant
+            .read()
+            .await
+            .as_ref()
+            .map(|grant| grant.tokens.access_token.clone());
+        let stored = manager
+            .store
+            .load_authorization(&state.canonical)
+            .await
+            .expect("load");
+        let stored_token = stored
+            .as_ref()
+            .map(|grant| grant.tokens.access_token.clone());
+        let context =
+            format!("live={live_token:?} stored={stored_token:?} discovered={discovered_issuer:?}");
+        assert_eq!(
+            discovered_issuer.as_deref(),
+            Some(issuer_a.as_str()),
+            "a discovery that merely finished last must not replace the one another pass installed: {context}"
+        );
+        assert_eq!(
+            live_token.as_deref(),
+            Some("at-a"),
+            "the issuer check must not erase the sign-in that agrees with the winning discovery: {context}"
+        );
+        assert_eq!(
+            stored_token.as_deref(),
+            Some("at-a"),
+            "nor the stored profile behind it: {context}"
+        );
     }
 
     #[tokio::test]
