@@ -94,6 +94,7 @@ pub struct AnthropicModelProvider {
     timeout_secs: u64,
     /// Explicitly disables the legacy request timeout when true.
     timeout_disabled: bool,
+    stream_request_timeout: super::StreamRequestTimeout,
     read_timeout_secs: Option<u64>,
     read_timeout_disabled: bool,
     /// Opt-in Anthropic server-side fallback targets, sent as the native
@@ -685,6 +686,7 @@ pub struct AnthropicBuilder {
     max_tokens: Option<u32>,
     timeout_secs: Option<u64>,
     timeout_disabled: bool,
+    stream_request_timeout: super::StreamRequestTimeout,
     read_timeout_secs: Option<u64>,
     read_timeout_disabled: bool,
     server_fallback_models: Vec<String>,
@@ -693,6 +695,10 @@ pub struct AnthropicBuilder {
 }
 
 impl AnthropicBuilder {
+    pub(crate) fn stream_request_timeout(mut self, timeout: super::StreamRequestTimeout) -> Self {
+        self.stream_request_timeout = timeout;
+        self
+    }
     pub(crate) fn single_tool_rounds_supported(mut self, supported: bool) -> Self {
         self.single_tool_rounds_supported = supported;
         self
@@ -783,6 +789,7 @@ impl AnthropicBuilder {
                 .timeout_secs
                 .unwrap_or(zeroclaw_api::model_provider::BASELINE_TIMEOUT_SECS),
             timeout_disabled: self.timeout_disabled,
+            stream_request_timeout: self.stream_request_timeout,
             read_timeout_secs: self.read_timeout_secs,
             read_timeout_disabled: self.read_timeout_disabled,
             server_fallback_models: self.server_fallback_models,
@@ -805,6 +812,7 @@ impl AnthropicModelProvider {
             max_tokens: None,
             timeout_secs: None,
             timeout_disabled: false,
+            stream_request_timeout: None,
             read_timeout_secs: None,
             read_timeout_disabled: false,
             server_fallback_models: Vec::new(),
@@ -2511,8 +2519,13 @@ impl AnthropicModelProvider {
     /// headers and the complete body; read-idle protection is independent.
     fn streaming_http_client(&self) -> Result<Client, reqwest::Error> {
         let builder = Client::builder().connect_timeout(std::time::Duration::from_secs(10));
-        // Legacy timeout_secs is intentionally absent from streaming clients;
-        // the canonical stream total deadline is a separate option.
+        let builder = match super::stream_request_timeout(
+            &self.stream_request_timeout,
+            (!self.timeout_disabled).then(|| std::time::Duration::from_secs(self.timeout_secs)),
+        ) {
+            Some(timeout) => builder.timeout(timeout),
+            None => builder,
+        };
         let builder = if self.read_timeout_disabled {
             builder
         } else if let Some(read_timeout) = self.read_timeout_secs {

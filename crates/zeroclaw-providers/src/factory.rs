@@ -295,6 +295,7 @@ pub fn apply_compat_options(
     mut b: crate::compatible::OpenAiCompatibleBuilder,
     opts: &ModelProviderRuntimeOptions,
 ) -> Box<dyn ModelProvider> {
+    b = b.stream_request_timeout(opts.provider_stream_request_timeout_secs.clone());
     if let Some(native_tools) = opts.native_tools {
         b = b.with_native_tools(native_tools);
     }
@@ -415,6 +416,7 @@ fn build_responses_provider_if_requested(
     let mut builder = crate::openai::OpenAiResponsesModelProvider::builder(alias)
         .credential(key)
         .single_tool_rounds_supported(single_tool_rounds_supported);
+    builder = builder.stream_request_timeout(opts.provider_stream_request_timeout_secs.clone());
     if let Some(url) = base_url {
         builder = builder.api_url(url);
     }
@@ -1197,6 +1199,7 @@ impl FamilyProviderFactory for OpenRouterModelProviderConfig {
         let mut b = crate::openrouter::OpenRouterModelProvider::builder(alias)
             .credential(key)
             .max_tokens(opts.provider_max_tokens);
+        b = b.stream_request_timeout(opts.provider_stream_request_timeout_secs.clone());
         if let Some(t) = opts.provider_timeout_secs {
             b = b.timeout_secs(t);
         }
@@ -1228,6 +1231,7 @@ impl FamilyProviderFactory for AnthropicModelProviderConfig {
     ) -> Result<Box<dyn ModelProvider>> {
         let mut b = crate::anthropic::AnthropicModelProvider::builder(alias)
             .credential(key)
+            .stream_request_timeout(opts.provider_stream_request_timeout_secs.clone())
             .server_fallback_models(self.server_fallback_models.clone())
             .single_tool_rounds_supported(
                 api_url.is_none_or(|url| url.trim_end_matches('/') == crate::anthropic::BASE_URL),

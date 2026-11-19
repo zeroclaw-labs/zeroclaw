@@ -1102,7 +1102,7 @@ fn native_transport_model_rejects_wire_api_override() {
             result
                 .unwrap_err()
                 .to_string()
-                .contains("wire API overrides are unsupported"),
+                .contains("does not support a model-level wire API override"),
             "{kind}"
         );
     }

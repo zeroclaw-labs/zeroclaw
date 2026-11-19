@@ -75,6 +75,8 @@ pub struct OpenAiCompatibleModelProvider {
     timeout_secs: u64,
     /// Explicitly disables the legacy request timeout when true.
     timeout_disabled: bool,
+    /// Optional total deadline for streaming requests.
+    stream_request_timeout: super::StreamRequestTimeout,
     /// Optional HTTP response-read idle timeout. `None` uses the streaming
     /// baseline; `read_timeout_disabled` explicitly removes that baseline.
     read_timeout_secs: Option<u64>,
@@ -544,6 +546,7 @@ pub struct OpenAiCompatibleBuilder {
     native_tool_calling_override: Option<bool>,
     timeout_secs: Option<u64>,
     timeout_disabled: bool,
+    stream_request_timeout: super::StreamRequestTimeout,
     read_timeout_secs: Option<u64>,
     read_timeout_disabled: bool,
     extra_headers: std::collections::HashMap<String, String>,
@@ -580,6 +583,10 @@ pub struct OpenAiCompatibleBuilder {
 }
 
 impl OpenAiCompatibleBuilder {
+    pub(crate) fn stream_request_timeout(mut self, timeout: super::StreamRequestTimeout) -> Self {
+        self.stream_request_timeout = timeout;
+        self
+    }
     /// The configured `[multimodal]` policy this provider normalizes under.
     ///
     /// Defaults to `MultimodalConfig::default()`; `apply_compat_options`
@@ -915,6 +922,7 @@ impl OpenAiCompatibleBuilder {
             merge_system_into_user,
             timeout_secs: self.timeout_secs.unwrap_or(120),
             timeout_disabled: self.timeout_disabled,
+            stream_request_timeout: self.stream_request_timeout,
             read_timeout_secs: self.read_timeout_secs,
             read_timeout_disabled: self.read_timeout_disabled,
             extra_headers: self.extra_headers,
@@ -962,6 +970,7 @@ impl OpenAiCompatibleModelProvider {
             native_tool_calling_override: None,
             timeout_secs: None,
             timeout_disabled: false,
+            stream_request_timeout: None,
             read_timeout_secs: None,
             read_timeout_disabled: false,
             extra_headers: std::collections::HashMap::new(),
@@ -1165,10 +1174,10 @@ impl OpenAiCompatibleModelProvider {
 
     fn streaming_timeouts(&self) -> super::StreamTimeouts {
         super::StreamTimeouts {
-            // The legacy timeout bounds non-streaming requests and raises the
-            // read-idle floor. A streaming total deadline is supplied by the
-            // later canonical `stream_request_timeout_secs` consumer.
-            request: None,
+            request: super::stream_request_timeout(
+                &self.stream_request_timeout,
+                (!self.timeout_disabled).then(|| std::time::Duration::from_secs(self.timeout_secs)),
+            ),
             read: (!self.read_timeout_disabled).then(|| {
                 self.read_timeout_secs.map_or_else(
                     || super::stream_idle_timeout(self.timeout_secs),
