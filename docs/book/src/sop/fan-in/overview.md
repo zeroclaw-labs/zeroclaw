@@ -52,6 +52,17 @@ Each source has a dedicated guide in the sidebar. Live sources (delivered by a r
 | Peripheral or calendar trigger never fires | event source not wired into the dispatcher | Use a live source ([Webhook](./webhook.md), [MQTT](./mqtt.md), [Filesystem](./filesystem.md), [AMQP](./amqp.md)) or start the run with [`sop_execute`](./manual.md) |
 | Cron trigger never fires | maintenance tick not running (no `zeroclaw daemon` or `zeroclaw channel start`; standalone `gateway start` does not run it), `sops_dir` unset/empty, or `maintenance_interval_secs = 0` | Run `zeroclaw daemon` (or `zeroclaw channel start`) with `sop.sops_dir` set to a non-empty value (unset by default; the documented value is `shared/sops`) and `sop.maintenance_interval_secs` non-zero (default `60`) |
 
+## Approve and observe
+
+An approval gate parks a run as `WaitingApproval`. A deterministic checkpoint
+parks it as `PausedCheckpoint`. Use `zeroclaw sop pending` to list both kinds on
+the running gateway. Submit an approval or denial with
+`zeroclaw sop approve <run-id>` or `zeroclaw sop deny <run-id>`.
+
+Clients can use the [gateway API](../../gateway/api.md) directly with
+`GET /admin/sop/pending`, `POST /admin/sop/approve`, or `POST /admin/sop/deny`.
+For run logs and audit records, see [SOP observability](../observability.md).
+
 ## See also
 
 - [Syntax](../syntax.md): the full `SOP.toml` and `SOP.md` format

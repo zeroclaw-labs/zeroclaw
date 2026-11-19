@@ -22,7 +22,7 @@ That difference shows up in ownership. Through `sop_execute` the calling agent o
 
 ## Approve and observe
 
-Runs that hit a checkpoint pause as `WaitingApproval`. Clear or inspect them with the CLI (`zeroclaw sop list`, `zeroclaw sop approve`) or out-of-band over the [gateway API](../../gateway/api.md) approval endpoints (`GET /admin/sop/pending`, `POST /admin/sop/approve`, `POST /admin/sop/deny`).
+See [Approve and observe](./overview.md#approve-and-observe) for pending runs, approval commands, and run logs.
 
 ## See also
 
