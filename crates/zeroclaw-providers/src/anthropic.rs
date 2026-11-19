@@ -92,7 +92,7 @@ pub struct AnthropicModelProvider {
     single_tool_rounds_supported: bool,
     max_tokens: u32,
     timeout_secs: u64,
-    /// Whether the total deadline was explicitly selected rather than defaulted.
+    /// Explicitly disables the legacy request timeout when true.
     timeout_disabled: bool,
     read_timeout_secs: Option<u64>,
     read_timeout_disabled: bool,
