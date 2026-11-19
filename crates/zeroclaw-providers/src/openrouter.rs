@@ -601,8 +601,10 @@ impl OpenRouterModelProvider {
 
     fn streaming_timeouts(&self) -> super::StreamTimeouts {
         super::StreamTimeouts {
-            request: (self.timeout_configured && !self.timeout_disabled)
-                .then(|| Duration::from_secs(self.timeout_secs)),
+            // Legacy timeout_secs must not terminate an active stream. The
+            // canonical streaming total deadline is wired by the cutover
+            // layer separately.
+            request: None,
             read: (!self.read_timeout_disabled).then(|| {
                 self.read_timeout_secs
                     .map_or(super::StreamIdleBound::Fixed(STREAM_IDLE_TIMEOUT), |secs| {
@@ -1389,14 +1391,6 @@ data: [DONE]
                 .await
                 .expect("request must settle")
                 .expect("stream should yield an event");
-            if deadline == "finite" {
-                let error = second.expect_err("the total deadline must stop an active stream");
-                assert!(
-                    error.to_string().contains("request_timeout_secs"),
-                    "{error}"
-                );
-                continue;
-            }
             let second = second.expect("second SSE event should be readable");
             match second {
                 StreamEvent::TextDelta(chunk) => assert_eq!(chunk.delta, "second"),
