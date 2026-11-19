@@ -129,6 +129,10 @@ pub enum RpcDenialReason {
     LocalRosterRequired,
     /// A remote connection presented no credential.
     RemoteTokenRequired,
+    /// An in-process connection presented no credential. The duplex has no
+    /// socket mode, pipe ACL or peer uid to vouch for it, so a token is the
+    /// only way in.
+    InprocTokenRequired,
     /// The principal lacks the resource and verb grant the method requires.
     GrantMissing,
     /// The principal may not write the requested config path.
@@ -192,6 +196,7 @@ impl RpcDenialReason {
             Self::PolicyGenerationMoved => "policy_generation_moved",
             Self::LocalRosterRequired => "local_roster_required",
             Self::RemoteTokenRequired => "remote_token_required",
+            Self::InprocTokenRequired => "inproc_token_required",
             Self::GrantMissing => "grant_missing",
             Self::ConfigPathNotGranted => "config_path_not_granted",
             Self::AgentNotEntitled => "agent_not_entitled",
@@ -224,7 +229,8 @@ impl RpcDenialReason {
             | Self::PairingRevoked
             | Self::PolicyGenerationMoved
             | Self::LocalRosterRequired
-            | Self::RemoteTokenRequired => AUTH_REQUIRED,
+            | Self::RemoteTokenRequired
+            | Self::InprocTokenRequired => AUTH_REQUIRED,
             Self::NotEntitled
             | Self::AliasNotEntitled
             | Self::Misconfigured
@@ -269,6 +275,7 @@ impl RpcDenialReason {
             Self::PairingRevoked => "rpc-auth-pairing-revoked",
             Self::LocalRosterRequired => "rpc-auth-local-roster-required",
             Self::RemoteTokenRequired => "rpc-auth-remote-token-required",
+            Self::InprocTokenRequired => "rpc-auth-inproc-token-required",
             Self::GrantMissing => "rpc-auth-grant-missing",
             Self::ConfigPathNotGranted => "rpc-auth-config-path-not-granted",
             Self::AgentNotEntitled => "rpc-auth-agent-not-entitled",
@@ -410,6 +417,10 @@ impl AuthDenied {
 
     pub(crate) fn remote_token_required() -> Self {
         Self::with_message(RpcDenialReason::RemoteTokenRequired)
+    }
+
+    pub(crate) fn inproc_token_required() -> Self {
+        Self::with_message(RpcDenialReason::InprocTokenRequired)
     }
 
     pub(crate) fn grant_missing(resource: Resource, verb: Verb, method: &str) -> Self {
@@ -1176,6 +1187,12 @@ impl RpcInboundAuth {
                 TransportKind::Wss => {
                     return Err(AuthDenied::remote_token_required());
                 }
+                // An in-process duplex is same-host but vouched for by
+                // nothing: no socket mode, no pipe ACL, no peer uid. It gets
+                // no compatibility path, roster or not.
+                TransportKind::Inproc => {
+                    return Err(AuthDenied::inproc_token_required());
+                }
             }
         };
 
@@ -1359,6 +1376,42 @@ mod tests {
             .expect("legacy local path");
         assert_eq!(conn.principal.id.as_str(), PrincipalId::SHARED_OPERATOR);
         assert!(conn.grants.admin, "single-operator behavior is unchanged");
+    }
+
+    #[tokio::test]
+    async fn inproc_with_no_roster_gets_no_compatibility_path() {
+        // Same daemon state as the legacy local path above; the in-process
+        // duplex still has to present a credential.
+        let auth = auth_for(&base_config(), &[]);
+        let denied = auth
+            .authenticate(TransportKind::Inproc, Credential::None, None, None)
+            .await
+            .unwrap_err();
+        assert_eq!(denied.code, AUTH_REQUIRED);
+        assert_eq!(denied.reason(), RpcDenialReason::InprocTokenRequired);
+        // The refusal names the one way in: a duplex has no peer uid, so
+        // pointing at a mapped local uid would send the caller nowhere.
+        assert_eq!(
+            denied.message,
+            crate::i18n::get_required_cli_string("rpc-auth-inproc-token-required")
+        );
+        assert!(denied.message.contains("auth_token"), "{}", denied.message);
+        assert!(!denied.message.contains("uid"), "{}", denied.message);
+    }
+
+    #[tokio::test]
+    async fn inproc_with_a_paired_token_authenticates_as_that_token_does_elsewhere() {
+        let auth = auth_for(&base_config(), &["zc_tok"]);
+        let conn = auth
+            .authenticate(
+                TransportKind::Inproc,
+                Credential::None,
+                Some("zc_tok"),
+                None,
+            )
+            .await
+            .expect("paired token is accepted on the duplex");
+        assert_eq!(conn.principal.id.as_str(), PrincipalId::SHARED_OPERATOR);
     }
 
     #[tokio::test]
@@ -2532,6 +2585,7 @@ mod tests {
                 "policy_generation_moved",
                 "local_roster_required",
                 "remote_token_required",
+                "inproc_token_required",
                 "grant_missing",
                 "config_path_not_granted",
                 "agent_not_entitled",
@@ -2633,6 +2687,9 @@ mod tests {
             }
             RpcDenialReason::RemoteTokenRequired => {
                 (AuthDenied::remote_token_required(), AUTH_REQUIRED, &[])
+            }
+            RpcDenialReason::InprocTokenRequired => {
+                (AuthDenied::inproc_token_required(), AUTH_REQUIRED, &[])
             }
             RpcDenialReason::GrantMissing => (
                 AuthDenied::grant_missing(Resource::Config, Verb::Update, "config/set"),
