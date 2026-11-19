@@ -12,6 +12,7 @@ publish = true
 zeroclaw-log.workspace = true
 zeroclaw-api.workspace = true
 zeroclaw-spawn.workspace = true
+zeroclaw-tool-call-parser.workspace = true
 zeroclaw-config = { workspace = true, default-features = false }
 anyhow = "1.0"
 async-trait = "0.1"
