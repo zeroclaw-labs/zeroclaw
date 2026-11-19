@@ -3459,8 +3459,42 @@ impl DelegateTool {
             sink.set_timeout_budget(timeout_secs);
             sink.note_model_request();
         }
-        let accounting = zeroclaw_providers::dispatch::AccountedChatScope::new();
+        // Own settlement across cancellation: the outer `select!` can drop
+        // this worker after the provider request starts. Drop consumes the
+        // report exactly once, including when the provider future is aborted.
+        // Capture the live cost and session scopes here (during poll). When
+        // `select!` drops this future, the cost task-local is torn down
+        // before this guard runs, so settlement must re-enter those scopes.
+        struct SettleAccountedChatOnDrop {
+            scope: zeroclaw_providers::dispatch::AccountedChatScope,
+            cost_ctx: Option<ToolLoopCostTrackingContext>,
+            session_key: Option<String>,
+        }
+        impl Drop for SettleAccountedChatOnDrop {
+            fn drop(&mut self) {
+                let report = self.scope.take();
+                let settle = || {
+                    crate::agent::cost::settle_provider_attempts(report.attempts(), None);
+                };
+                match (self.cost_ctx.take(), self.session_key.take()) {
+                    (Some(cost_ctx), session_key) => TOOL_LOOP_COST_TRACKING_CONTEXT
+                        .sync_scope(Some(cost_ctx), || {
+                            TOOL_LOOP_SESSION_KEY.sync_scope(session_key, settle)
+                        }),
+                    (None, session_key) => TOOL_LOOP_SESSION_KEY.sync_scope(session_key, settle),
+                }
+            }
+        }
+        let accounting = SettleAccountedChatOnDrop {
+            scope: zeroclaw_providers::dispatch::AccountedChatScope::new(),
+            cost_ctx: TOOL_LOOP_COST_TRACKING_CONTEXT
+                .try_with(Clone::clone)
+                .ok()
+                .flatten(),
+            session_key: current_tool_loop_session_key(),
+        };
         let result = accounting
+            .scope
             .scope(zeroclaw_providers::dispatch::with_exact_dispatch_route(
                 agent_config.model_provider.to_string(),
                 model.clone(),
@@ -3479,9 +3513,8 @@ impl DelegateTool {
         // gap just like every other physical attempt, including timeouts.
         // This child scope never updates the parent's context-window meter.
         if matches!(&result, Ok(Ok(_))) {
-            accounting.mark_logical_success();
+            accounting.scope.mark_logical_success();
         }
-        crate::agent::cost::settle_provider_attempts(accounting.take().attempts(), None);
         if let Some(sink) = self.progress.as_deref() {
             sink.note_activity();
         }
@@ -23709,6 +23742,140 @@ command = "rm independent-delegate-marker"
                 "one gap per physical call, {mode}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn conversation_cost_cancelled_background_non_agentic_delegate_persists_missing_usage() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use zeroclaw_api::cost::{ConversationCostReason, ConversationCostStatus};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let uri = format!("http://{}", listener.local_addr().unwrap());
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let requests = Arc::new(AtomicUsize::new(0));
+        let server_entered = entered.clone();
+        let server_requests = Arc::clone(&requests);
+        let _server = zeroclaw_spawn::spawn!(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            read_http_request(&mut socket).await;
+            server_requests.fetch_add(1, Ordering::SeqCst);
+            server_entered.notify_one();
+            // Hold the reply until the cancelled worker drops the socket.
+            std::future::pending::<()>().await;
+        });
+
+        let mut fixture = delegate_cost_fixture(uri, 1000.0, true, 0).await;
+        let mut config = (*fixture.config).clone();
+        config
+            .runtime_profiles
+            .get_mut("delegate_cost_runtime")
+            .unwrap()
+            .agentic = false;
+        fixture.config = Arc::new(config);
+        fixture.tool = fixture
+            .tool
+            .with_root_config(Arc::clone(&fixture.config))
+            .with_runtime_profiles(fixture.config.runtime_profiles.clone());
+
+        // One already-priced call on the originating conversation.
+        let tracker = crate::cost::CostTracker::get_or_init_global(
+            fixture.config.cost.clone(),
+            &fixture.data_dir,
+        )
+        .expect("global cost tracker");
+        tracker
+            .record_usage_attributed(
+                crate::cost::TokenUsage::new("seed-model", 1000, 0, 0, 3.0, 3.0, 0.0),
+                Some("caller"),
+                None,
+                Some("origin".into()),
+            )
+            .expect("seed spend recorded");
+        let seed = tracker
+            .get_summary_for_conversation("origin")
+            .unwrap()
+            .estimated_cost_usd
+            .expect("seed has a priced estimate");
+
+        let started = TOOL_LOOP_SESSION_KEY
+            .scope(
+                Some("origin".into()),
+                fixture.tool.execute(json!({
+                    "agent": "target",
+                    "prompt": "fixture",
+                    "background": true
+                })),
+            )
+            .await
+            .unwrap();
+        assert!(started.success, "{started:?}");
+        let task_id = started
+            .output
+            .lines()
+            .find_map(|line| line.strip_prefix("task_id: "))
+            .expect("background task id")
+            .to_string();
+
+        tokio::time::timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .expect("provider request must begin before cancel");
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+
+        let cancelled = fixture
+            .tool
+            .handle_cancel_task(&json!({"task_id": task_id}))
+            .await
+            .expect("cancel_task runs");
+        assert!(cancelled.success, "{cancelled:?}");
+        let terminal = wait_for_terminal_background_result(&fixture.tool, &task_id).await;
+        assert_eq!(
+            terminal.status,
+            BackgroundTaskStatus::Cancelled,
+            "{terminal:?}"
+        );
+
+        // Cancellation can publish the terminal task row before the
+        // cancelled worker is polled again and dropped; settlement runs
+        // on that drop, so wait for the coverage gap to reach the ledger.
+        let mut last = None;
+        let summary = {
+            let mut found = None;
+            for _ in 0..20_000 {
+                let tracker =
+                    crate::cost::CostTracker::new(fixture.config.cost.clone(), &fixture.data_dir)
+                        .unwrap();
+                let summary = tracker.get_summary_for_conversation("origin").unwrap();
+                if summary
+                    .reasons
+                    .contains(&ConversationCostReason::MissingUsage)
+                {
+                    found = Some(summary);
+                    break;
+                }
+                last = Some(summary);
+                tokio::task::yield_now().await;
+            }
+            found
+                .or(last)
+                .expect("origin conversation already has a seed estimate")
+        };
+        assert!(
+            summary
+                .reasons
+                .contains(&ConversationCostReason::MissingUsage),
+            "cancelled in-flight usage must stay visible: {summary:?}"
+        );
+        assert_eq!(
+            summary.status,
+            ConversationCostStatus::Partial,
+            "{summary:?}"
+        );
+        assert_eq!(
+            summary.estimated_cost_usd,
+            Some(seed),
+            "the seed estimate is the lower bound; do not drop or double-count it: {summary:?}"
+        );
+        assert_eq!(requests.load(Ordering::SeqCst), 1, "no retry after cancel");
     }
 
     #[tokio::test]
