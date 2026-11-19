@@ -9291,6 +9291,25 @@ impl ScopedHttpCredential {
         }
     }
 
+    /// Check the active document and the submission destination before
+    /// resolving a browser secret. No matching grant means no vault lookup.
+    pub fn permits_browser_submission(
+        &self,
+        top_level: &url::Url,
+        document: &url::Url,
+        submission: &url::Url,
+    ) -> bool {
+        self.browser_origin.as_deref().is_some_and(|grant| {
+            self.accepts_browser_origin(grant)
+                && [top_level, document, submission].into_iter().all(|target| {
+                    target.scheme() == "https"
+                        && target.username().is_empty()
+                        && target.password().is_none()
+                        && target.origin().ascii_serialization() == grant
+                })
+        })
+    }
+
     pub fn https_origin(raw: &str) -> Option<String> {
         let mut url = url::Url::parse(raw).ok()?;
         if url.scheme() != "https" || !url.username().is_empty() || url.password().is_some() {
@@ -9363,6 +9382,26 @@ fn scoped_browser_credentials_require_eligible_kind_and_https_origin() {
         header: ScopedApiKeyHeader::Bearer,
     };
     assert!(!record.accepts_browser_origin("https://login.example.test"));
+}
+
+#[test]
+fn scoped_browser_submission_denies_redirects_frames_and_form_origin_changes() {
+    let mut record: ScopedHttpCredential = serde_json::from_value(serde_json::json!({
+        "origin": "",
+        "auth": { "kind": "totp", "seed": "synthetic" }
+    }))
+    .expect("TOTP record");
+    let page = url::Url::parse("https://login.example.test/verify").expect("fixture URL");
+    let form = url::Url::parse("https://login.example.test:443/submit").expect("fixture URL");
+    let foreign = url::Url::parse("https://elsewhere.example.test/submit").expect("fixture URL");
+    assert!(!record.permits_browser_submission(&page, &page, &form));
+    record.browser_origin = Some("https://login.example.test".into());
+    assert!(record.permits_browser_submission(&page, &page, &form));
+    assert!(!record.permits_browser_submission(&foreign, &page, &form));
+    assert!(!record.permits_browser_submission(&page, &foreign, &form));
+    assert!(!record.permits_browser_submission(&page, &page, &foreign));
+    record.browser_origin = None;
+    assert!(!record.permits_browser_submission(&page, &page, &form));
 }
 
 impl Default for HttpRequestConfig {
