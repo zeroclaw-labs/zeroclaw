@@ -116,28 +116,11 @@ impl PgKnowledgeGraph {
         Ok(())
     }
 
-    fn node_type_str(nt: &NodeType) -> &'static str {
-        nt.as_str()
-    }
-
-    fn parse_node_type(s: &str) -> Result<NodeType> {
-        NodeType::parse(s)
-    }
-
-    fn relation_str(r: &Relation) -> &'static str {
-        r.as_str()
-    }
-
-    #[cfg(test)]
-    fn parse_relation(s: &str) -> Result<Relation> {
-        Relation::parse(s)
-    }
-
     fn row_to_node(row: &Row) -> Result<PgNode> {
         Ok(PgNode {
             id: row.get(0),
             name: row.get(1),
-            node_type: Self::parse_node_type(&row.get::<_, String>(2))?,
+            node_type: NodeType::parse(&row.get::<_, String>(2))?,
             content: row.get(3),
             tags: row.get(4),
         })
@@ -182,7 +165,7 @@ impl PgKnowledgeGraph {
         let schema = self.schema_ident.clone();
         let operation_gate = self.operation_gate.clone();
         let name = name.to_string();
-        let nt = Self::node_type_str(&node_type).to_string();
+        let nt = node_type.as_str().to_string();
         let content = content.to_string();
         let tags = tags.to_vec();
         run_bounded(operation_gate, move || {
@@ -202,7 +185,7 @@ impl PgKnowledgeGraph {
         let client = self.client.clone();
         let schema = self.schema_ident.clone();
         let operation_gate = self.operation_gate.clone();
-        let rel = Self::relation_str(&relation).to_string();
+        let rel = relation.as_str().to_string();
         run_bounded(operation_gate, move || {
             let mut client = client.lock();
             let row = client.query_one(&format!("INSERT INTO {schema}.kg_edges (source_id, target_id, relation, weight) VALUES ($1, $2, $3, $4) RETURNING id"), &[&source_id, &target_id, &rel, &weight])?;
@@ -341,29 +324,13 @@ mod tests {
     use tokio::sync::oneshot;
 
     #[test]
-    fn node_type_roundtrips() {
-        for nt in NodeType::ALL {
-            let s = PgKnowledgeGraph::node_type_str(nt);
-            assert_eq!(PgKnowledgeGraph::parse_node_type(s).unwrap(), *nt);
-        }
-    }
-
-    #[test]
-    fn relation_roundtrips() {
-        for r in Relation::ALL {
-            let s = PgKnowledgeGraph::relation_str(r);
-            assert_eq!(PgKnowledgeGraph::parse_relation(s).unwrap(), *r);
-        }
-    }
-
-    #[test]
     fn unknown_node_type_errors() {
-        assert!(PgKnowledgeGraph::parse_node_type("nonexistent").is_err());
+        assert!(NodeType::parse("nonexistent").is_err());
     }
 
     #[test]
     fn unknown_relation_errors() {
-        assert!(PgKnowledgeGraph::parse_relation("nonexistent").is_err());
+        assert!(Relation::parse("nonexistent").is_err());
     }
 
     #[test]
