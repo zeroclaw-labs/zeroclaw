@@ -1590,7 +1590,49 @@ mod capability_tests {
 
 #[cfg(test)]
 mod sampling_input_tests {
-    use super::{CallSampling, ChatMessage, ChatRequest};
+    use super::{CallSampling, ChatMessage, ChatRequest, ChatResponse, ModelProvider};
+    use crate::attribution::{Attributable, ModelProviderKind, ProviderKind, Role};
+    use async_trait::async_trait;
+    use std::sync::Arc;
+
+    struct SamplingOverrideProvider;
+
+    impl Attributable for SamplingOverrideProvider {
+        fn role(&self) -> Role {
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+        }
+
+        fn alias(&self) -> &str {
+            "sampling_override"
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for SamplingOverrideProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("the sampling override should be selected before the legacy method")
+        }
+
+        async fn chat_with_sampling(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            sampling: CallSampling,
+        ) -> anyhow::Result<ChatResponse> {
+            Ok(ChatResponse {
+                text: Some(format!("{:?}", sampling.resolve_for(Some("backup")))),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
 
     #[test]
     fn explicit_none_omits_temperature_even_for_a_target() {
@@ -1620,6 +1662,24 @@ mod sampling_input_tests {
         assert_eq!(request.messages.len(), 1);
         assert!(request.tools.unwrap().is_empty());
         assert!(request.thinking.is_none());
+    }
+
+    #[tokio::test]
+    async fn arc_forwards_sampling_override_to_the_inner_provider() {
+        let provider: Arc<dyn ModelProvider> = Arc::new(SamplingOverrideProvider);
+        let messages = [ChatMessage::user("hello")];
+        let result = provider
+            .chat_with_sampling(
+                ChatRequest::new(&messages),
+                "primary",
+                CallSampling::for_selection(Some(0.7), |selection| {
+                    (selection == "backup").then_some(0.3)
+                }),
+            )
+            .await
+            .expect("Arc must preserve the inner sampling override");
+
+        assert_eq!(result.text.as_deref(), Some("Some(0.3)"));
     }
 }
 
