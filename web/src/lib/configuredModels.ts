@@ -8,6 +8,11 @@ export interface ConfiguredModelBinding {
   resource: string;
 }
 
+/** Provider family used by the corresponding cost-rate map. */
+export function costProviderFamily(kind: string): string {
+  return kind === 'openai-compatible' ? 'custom' : kind;
+}
+
 export async function walkConfiguredModelBindings(
   category: ConfiguredModelCategory,
 ): Promise<ConfiguredModelBinding[]> {
@@ -17,22 +22,18 @@ export async function walkConfiguredModelBindings(
   for (const [alias, model] of Object.entries(registry.models)) {
     const connection = registry.connections[model.provider];
     if (model.capability === capability && model.model && connection) {
-      out.push({ type: rateProviderFamily(connection.kind), alias, resource: model.model });
+      out.push({ type: costProviderFamily(connection.kind), alias, resource: model.model });
     }
   }
   return out;
 }
 
-/** Rate sheets use `custom` for every OpenAI-compatible connection. */
-function rateProviderFamily(kind: string): string {
-  return kind === 'openai-compatible' ? 'custom' : kind;
-}
-
 /**
- * Resolve the canonical model resource to its connection kind.
+ * Resolve the canonical model resource to its cost-provider family.
  *
  * The registry is the source of truth: model aliases point at a connection,
- * and the connection owns the protocol/provider kind used by the dashboard.
+ * and the connection owns the protocol/provider kind used by the dashboard;
+ * compatible transports are folded into the `custom` rate family.
  * Keep the small map-shaped helper for callers that only need navigation
  * metadata; it must not reintroduce the retired providers.<category> lookup.
  */

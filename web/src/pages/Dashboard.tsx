@@ -51,7 +51,7 @@ import {
   getTuis,
   listProps,
 } from "@/lib/api";
-import { resolveModelToProviderType } from "@/lib/configuredModels";
+import { walkConfiguredModelBindings } from "@/lib/configuredModels";
 import DoctorFixModal from "@/components/DoctorFixModal";
 
 type CostWindow = "today" | "7d" | "30d" | "month" | "all";
@@ -109,13 +109,13 @@ function healthFixTarget(
       href: `/config/channels/${encodeURIComponent(chan[1])}/${encodeURIComponent(chan[2])}`,
     };
   }
-  // providers.models.<type>.<alias>
-  const prov = err.match(/^\s*providers\.models\.([a-z0-9_-]+)\.([a-z0-9_-]+)/i);
-  if (prov?.[1] && prov[2]) {
+  // Registry keys are opaque TOML names, so provider errors open the whole
+  // atomic document instead of guessing an editable profile path.
+  if (/^\s*providers\./i.test(err)) {
     return {
-      prefix: `providers.models.${prov[1]}.${prov[2]}`,
-      entity: `${prov[1]}.${prov[2]}`,
-      href: `/config/providers.models/${encodeURIComponent(prov[1])}/${encodeURIComponent(prov[2])}`,
+      prefix: "providers.registry",
+      entity: "providers",
+      href: "/config/providers.registry",
     };
   }
   return null;
@@ -2025,10 +2025,19 @@ function CostTab({
     : costWindow;
 
   const openModelRates = async (modelId: string) => {
-    const map = await resolveModelToProviderType("models").catch(() => null);
-    const type = map?.[modelId];
-    if (!type) return;
-    navigate(`/config/providers.models/${encodeURIComponent(type)}?tab=costs`);
+    const bindings = await walkConfiguredModelBindings("models").catch(() => []);
+    const candidates = bindings.filter((binding) => binding.resource === modelId);
+    // Rate sheets are keyed by provider family, not by the registry alias.
+    // Keep the registry as the fallback when the model is ambiguous or no
+    // longer configured, but send an unambiguous model straight to the
+    // existing cost tab so the dashboard's rate link remains actionable.
+    const providerTypes = [...new Set(candidates.map((binding) => binding.type))];
+    const providerType = providerTypes.length === 1 ? providerTypes[0] : undefined;
+    navigate(
+      providerType
+        ? `/config/providers.models/${encodeURIComponent(providerType)}?tab=costs`
+        : "/config/providers.registry?tab=models",
+    );
   };
 
   return (

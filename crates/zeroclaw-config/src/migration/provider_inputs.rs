@@ -387,9 +387,15 @@ fn providers_for_input(config: &Config) -> Result<crate::providers::Providers> {
         if providers.models.canonical_model(&key).is_some() {
             continue;
         }
-        let provider = ProviderId::from(format!("legacy.asr.section.{family}"));
+        let base_provider = format!("legacy.asr.section.{family}");
+        let mut provider = ProviderId::from(base_provider.as_str());
+        let mut suffix = 1;
+        while providers.connections.contains_key(&provider) {
+            provider = ProviderId::from(format!("{base_provider}.{suffix}"));
+            suffix += 1;
+        }
         let (connection, model) = asr_definition(&input, family, &provider)?;
-        providers.connections.entry(provider).or_insert(connection);
+        providers.connections.insert(provider, connection);
         providers.models.insert_canonical_model(key, model);
     }
     Ok(providers)

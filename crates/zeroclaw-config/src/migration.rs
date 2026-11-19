@@ -2042,6 +2042,18 @@ fn prune_bad_provider_aliases(value: &mut toml::Value, dropped: &mut Vec<String>
         return;
     };
 
+    // V5 uses an exact-key registry (`connections`, canonical `models`,
+    // presets, and fallback edges), while this salvage pass also handles the
+    // retired V3/V4 family/alias layout below. Never walk canonical connection
+    // entries as if they were nested provider families: doing so drops healthy
+    // connections when an unrelated top-level field requires salvage.
+    if provider_kinds.contains_key("connections")
+        || provider_kinds.contains_key("model_presets")
+        || provider_kinds.contains_key("fallback")
+    {
+        return;
+    }
+
     // Non-table nodes where a kind/family map is required (e.g.
     // `[providers.models] ollama = "oops"`) would otherwise still sink the
     // whole section in prune_bad_top_level_sections. Drop just the node.
@@ -5748,6 +5760,33 @@ enabled = "not-a-bool"
         // `[heartbeat]` reverted to its serde default; load did not panic.
         assert!(!cfg.heartbeat.enabled);
         assert_eq!(cfg.heartbeat.interval_minutes, 30);
+    }
+
+    #[test]
+    fn resilient_v5_load_keeps_canonical_connections_when_other_section_is_bad() {
+        let raw = r#"
+schema_version = 5
+locale = 42
+
+[providers.connections."healthy.prod"]
+kind = "custom"
+uri = "https://example.test/v1"
+
+[providers.models."chat.main"]
+capability = "chat"
+provider = "healthy.prod"
+model = "model-a"
+"#;
+        let load = migrate_to_current_salvaged(raw);
+        assert_eq!(
+            load.config
+                .providers
+                .connections
+                .get("healthy.prod")
+                .and_then(|connection| connection.uri()),
+            Some("https://example.test/v1")
+        );
+        assert!(load.dropped.iter().any(|path| path == "locale"));
     }
 
     #[test]
