@@ -1492,7 +1492,8 @@ pub async fn mutate_http_credential(
                 return StatusCode::PRECONDITION_FAILED.into_response();
             }
             if !ScopedHttpCredential::valid_name(&mutation.name)
-                || config.http_request.secrets.contains_key(&mutation.name)
+                || (matches!(mutation.operation, PluginTlsCredentialOperation::Create)
+                    && config.http_request.secrets.contains_key(&mutation.name))
             {
                 return StatusCode::BAD_REQUEST.into_response();
             }
