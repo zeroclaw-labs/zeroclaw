@@ -207,15 +207,17 @@ impl ProviderRegistry {
                 }
             }
         }
-        if config
-            .api
-            .as_ref()
-            .is_some_and(|api| api.wire_api.is_some() && connection.chat_api().is_none())
-        {
+        if config.api.as_ref().is_some_and(|api| {
+            api.wire_api.is_some()
+                && matches!(
+                    connection.kind(),
+                    "hailo_ollama" | "gemini_cli" | "grok_cli" | "kilocli"
+                )
+        }) {
             return Err(RegistryError::model(
                 name,
                 "api.wire_api",
-                "connection has no chat API configuration",
+                "connection kind does not support a model-level wire API override",
             ));
         }
         if let Some(preset) = config.preset.as_ref() {
@@ -614,4 +616,81 @@ pub struct ResolvedDecision<'a> {
     pub model: &'a str,
     pub wire_api: DecisionWireApi,
     pub request_timeout_secs: Option<Override<NonZeroU64>>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Override, ProviderRegistry};
+    use std::num::NonZeroU64;
+
+    #[test]
+    fn asr_timeout_inherits_through_an_empty_model_api_and_can_be_cleared() {
+        let registry: ProviderRegistry = toml::from_str(
+            r#"
+[connections.whisper]
+kind = "local_whisper"
+uri = "http://127.0.0.1:9000"
+[connections.whisper.api.asr]
+request_timeout_secs = 42
+
+[models."asr.inherited"]
+capability = "asr"
+provider = "whisper"
+model = "base"
+api = {}
+
+[models."asr.cleared"]
+capability = "asr"
+provider = "whisper"
+model = "base"
+api = { request_timeout_secs = "null" }
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            registry
+                .resolve_asr(&"asr.inherited".into())
+                .unwrap()
+                .request_timeout_secs,
+            Some(Override::Set(NonZeroU64::new(42).unwrap()))
+        );
+        assert_eq!(
+            registry
+                .resolve_asr(&"asr.cleared".into())
+                .unwrap()
+                .request_timeout_secs,
+            Some(Override::Clear)
+        );
+    }
+
+    #[test]
+    fn model_wire_api_override_does_not_require_connection_defaults() {
+        for kind in ["openai", "custom", "vllm"] {
+            let registry: ProviderRegistry = toml::from_str(&format!(
+                r#"
+[connections.gateway]
+kind = "{kind}"
+uri = "https://example.test/v1"
+
+[models."chat.main"]
+capability = "chat"
+provider = "gateway"
+model = "base"
+api = {{ wire_api = "responses" }}
+"#
+            ))
+            .unwrap_or_else(|error| panic!("{kind}: {error}"));
+
+            assert_eq!(
+                registry
+                    .resolve_chat(&"chat.main".into())
+                    .unwrap()
+                    .wire_api
+                    .map(|wire| wire.as_str()),
+                Some("responses"),
+                "{kind}"
+            );
+        }
+    }
 }
