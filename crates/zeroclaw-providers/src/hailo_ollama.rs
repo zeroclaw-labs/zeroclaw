@@ -1180,14 +1180,14 @@ impl HailoOllamaModelProvider {
         // optional `thinking` field, so this compatibility fallback is
         // deliberately returned as ordinary text and not reported as
         // `reasoning_content`.
-        let content = Self::strip_think_tags(&response.message.content);
+        let content = zeroclaw_api::model_provider::strip_think_tags(&response.message.content);
         if !content.trim().is_empty() {
             return Ok(content);
         }
         if let Some(thinking) = response.message.thinking.as_deref()
             && !thinking.trim().is_empty()
         {
-            let thinking = Self::strip_think_tags(thinking);
+            let thinking = zeroclaw_api::model_provider::strip_think_tags(thinking);
             if !thinking.trim().is_empty() {
                 return Ok(thinking);
             }
