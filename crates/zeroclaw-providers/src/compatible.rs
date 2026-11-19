@@ -73,6 +73,7 @@ pub struct OpenAiCompatibleModelProvider {
     native_tool_calling: bool,
     /// HTTP request timeout in seconds for LLM API calls. Default: 120.
     timeout_secs: u64,
+    timeout_configured: bool,
     /// Explicitly disables the legacy request timeout when true.
     timeout_disabled: bool,
     /// Optional total deadline for streaming requests.
@@ -545,6 +546,7 @@ pub struct OpenAiCompatibleBuilder {
     /// `None` preserves the default derived from `merge_system_into_user`.
     native_tool_calling_override: Option<bool>,
     timeout_secs: Option<u64>,
+    timeout_configured: bool,
     timeout_disabled: bool,
     stream_request_timeout: super::StreamRequestTimeout,
     read_timeout_secs: Option<u64>,
@@ -699,6 +701,7 @@ impl OpenAiCompatibleBuilder {
     pub fn timeout_secs(mut self, timeout_secs: u64) -> Self {
         if timeout_secs > 0 {
             self.timeout_secs = Some(timeout_secs);
+            self.timeout_configured = true;
             self.timeout_disabled = false;
         }
         self
@@ -921,6 +924,7 @@ impl OpenAiCompatibleBuilder {
             native_tool_calling,
             merge_system_into_user,
             timeout_secs: self.timeout_secs.unwrap_or(120),
+            timeout_configured: self.timeout_configured,
             timeout_disabled: self.timeout_disabled,
             stream_request_timeout: self.stream_request_timeout,
             read_timeout_secs: self.read_timeout_secs,
@@ -969,6 +973,7 @@ impl OpenAiCompatibleModelProvider {
             merge_system_into_user_preserve_native: false,
             native_tool_calling_override: None,
             timeout_secs: None,
+            timeout_configured: false,
             timeout_disabled: false,
             stream_request_timeout: None,
             read_timeout_secs: None,
@@ -1176,7 +1181,8 @@ impl OpenAiCompatibleModelProvider {
         super::StreamTimeouts {
             request: super::stream_request_timeout(
                 &self.stream_request_timeout,
-                (!self.timeout_disabled).then(|| std::time::Duration::from_secs(self.timeout_secs)),
+                (self.timeout_configured && !self.timeout_disabled)
+                    .then(|| std::time::Duration::from_secs(self.timeout_secs)),
             ),
             read: (!self.read_timeout_disabled).then(|| {
                 self.read_timeout_secs.map_or_else(
