@@ -59,7 +59,7 @@ impl ProviderEndpoint {
     }
 }
 
-pub(crate) trait FamilyProviderFactory {
+pub trait FamilyProviderFactory {
     const ENDPOINT: ProviderEndpoint;
 
     /// How a context-window discovery probe must authenticate to this
@@ -211,7 +211,7 @@ impl<T: CompatFamilySpec> FamilyProviderFactory for T {
     };
 
     /// Derived, never restated: a family that opted into catalog discovery
-    /// probes it with exactly the [`CompatFamilySpec::AUTH`] its own chat
+    /// probes it with exactly the `CompatFamilySpec::AUTH` its own chat
     /// requests use. There is no second place to declare the auth style, so
     /// discovery cannot drift away from the request path — which is what
     /// would put a `ZhipuJwt` family's long-lived `id.secret` on the wire
@@ -301,6 +301,15 @@ pub fn apply_compat_options(
     if let Some(t) = opts.provider_timeout_secs {
         b = b.timeout_secs(t);
     }
+    if opts.provider_timeout_disabled {
+        b = b.without_timeout();
+    }
+    if let Some(t) = opts.provider_read_timeout_secs {
+        b = b.read_timeout_secs(t);
+    }
+    if opts.provider_read_timeout_disabled {
+        b = b.without_read_timeout();
+    }
     if let Some(ref effort) = opts.reasoning_effort {
         b = b.reasoning_effort(Some(effort.clone()));
     }
@@ -355,7 +364,7 @@ pub fn apply_compat_options(
     if let Some(extra) = &opts.provider_extra
         && !extra.is_object()
     {
-        let config_path = format!("[providers.models.{}].provider_extra", p.alias);
+        let config_path = format!("providers.models[{:?}].options.provider_extra", p.alias);
         ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -371,7 +380,10 @@ pub fn apply_compat_options(
     if let Some(kwargs) = &opts.chat_template_kwargs
         && !kwargs.is_object()
     {
-        let config_path = format!("[providers.models.{}].chat_template_kwargs", p.alias);
+        let config_path = format!(
+            "providers.models[{:?}].options.chat_template_kwargs",
+            p.alias
+        );
         ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -395,7 +407,12 @@ fn build_responses_provider_if_requested(
     opts: &ModelProviderRuntimeOptions,
     single_tool_rounds_supported: bool,
 ) -> Option<Box<dyn ModelProvider>> {
-    if wire_api != Some(zeroclaw_config::schema::WireApi::Responses) {
+    let runtime_wire_api = match opts.wire_api.as_deref() {
+        Some("responses") => Some(zeroclaw_config::schema::WireApi::Responses),
+        Some("chat_completions") => Some(zeroclaw_config::schema::WireApi::ChatCompletions),
+        _ => None,
+    };
+    if runtime_wire_api.or(wire_api) != Some(zeroclaw_config::schema::WireApi::Responses) {
         return None;
     }
     let mut builder = crate::openai::OpenAiResponsesModelProvider::builder(alias)
@@ -406,6 +423,15 @@ fn build_responses_provider_if_requested(
     }
     if let Some(t) = opts.provider_timeout_secs {
         builder = builder.timeout_secs(t);
+    }
+    if opts.provider_timeout_disabled {
+        builder = builder.without_timeout();
+    }
+    if let Some(t) = opts.provider_read_timeout_secs {
+        builder = builder.read_timeout_secs(t);
+    }
+    if opts.provider_read_timeout_disabled {
+        builder = builder.without_read_timeout();
     }
     if let Some(mt) = opts.provider_max_tokens {
         builder = builder.max_tokens(Some(mt));
@@ -1203,6 +1229,15 @@ impl FamilyProviderFactory for OpenRouterModelProviderConfig {
         if let Some(t) = opts.provider_timeout_secs {
             b = b.timeout_secs(t);
         }
+        if opts.provider_timeout_disabled {
+            b = b.without_timeout();
+        }
+        if let Some(t) = opts.provider_read_timeout_secs {
+            b = b.read_timeout_secs(t);
+        }
+        if opts.provider_read_timeout_disabled {
+            b = b.without_read_timeout();
+        }
         if let Some(extra) = opts.provider_extra.clone() {
             b = b.extra_body(extra);
         }
@@ -1232,6 +1267,15 @@ impl FamilyProviderFactory for AnthropicModelProviderConfig {
         }
         if let Some(ts) = opts.provider_timeout_secs {
             b = b.timeout_secs(ts);
+        }
+        if opts.provider_timeout_disabled {
+            b = b.without_timeout();
+        }
+        if let Some(ts) = opts.provider_read_timeout_secs {
+            b = b.read_timeout_secs(ts);
+        }
+        if opts.provider_read_timeout_disabled {
+            b = b.without_read_timeout();
         }
         if let Some(cache_ttl) = opts.cache_ttl {
             b = b.cache_ttl(cache_ttl);
@@ -1308,6 +1352,15 @@ impl FamilyProviderFactory for OpenAIModelProviderConfig {
         }
         if let Some(t) = opts.provider_timeout_secs {
             b = b.timeout_secs(t);
+        }
+        if opts.provider_timeout_disabled {
+            b = b.without_timeout();
+        }
+        if let Some(t) = opts.provider_read_timeout_secs {
+            b = b.read_timeout_secs(t);
+        }
+        if opts.provider_read_timeout_disabled {
+            b = b.without_read_timeout();
         }
         if let Some(mt) = opts.provider_max_tokens {
             b = b.max_tokens(Some(mt));
@@ -1438,9 +1491,9 @@ impl FamilyProviderFactory for HailoOllamaModelProviderConfig {
                 i32::try_from(value).unwrap_or(i32::MAX)
             });
         let tuning = crate::ollama::OllamaTuning {
-            num_ctx: self
-                .base
-                .context_window
+            num_ctx: opts
+                .provider_context_window
+                .or(self.base.context_window)
                 .map(|value| u32::try_from(value).unwrap_or(u32::MAX))
                 .unwrap_or(crate::hailo_ollama::HAILO_DEFAULT_NUM_CTX),
             num_predict: max_tokens,
@@ -1474,7 +1527,7 @@ impl FamilyProviderFactory for GeminiModelProviderConfig {
         &self,
         alias: &str,
         key: Option<&str>,
-        _api_url: Option<&str>,
+        api_url: Option<&str>,
         opts: &ModelProviderRuntimeOptions,
     ) -> Result<Box<dyn ModelProvider>> {
         let state_dir = opts.zeroclaw_dir.clone().unwrap_or_else(|| {
@@ -1487,6 +1540,7 @@ impl FamilyProviderFactory for GeminiModelProviderConfig {
         Ok(Box::new(
             crate::gemini::GeminiModelProvider::builder(alias)
                 .api_key(key)
+                .api_url(api_url)
                 .managed_auth(auth_service, opts.auth_profile_override.clone())
                 .oauth_project_seed(self.oauth_project.clone())
                 .oauth_client(
@@ -1530,9 +1584,8 @@ impl FamilyProviderFactory for AzureModelProviderConfig {
         _api_url: Option<&str>,
         opts: &ModelProviderRuntimeOptions,
     ) -> Result<Box<dyn ModelProvider>> {
-        // Reads typed Azure alias fields directly. Operator sets these
-        // under `[providers.models.azure.<alias>]` or via the schema-mirror
-        // env grammar — env-var fallback eradicated.
+        // Fields were materialized from the selected connection's extra
+        // resource/api_version and the model's extra deployment.
         let resource = self.resource.as_deref().ok_or_else(|| {
             ::zeroclaw_log::record!(
                 ERROR,
@@ -1547,7 +1600,7 @@ impl FamilyProviderFactory for AzureModelProviderConfig {
             );
             anyhow::Error::msg(
                 "Azure model_provider requires `resource`: set \
-                 `[providers.models.azure.<alias>] resource = \"...\"` in config.toml.",
+                 `[providers.connections.<key>.extra] resource = \"...\"` in config.toml.",
             )
         })?;
         let deployment = self.deployment.as_deref().ok_or_else(|| {
@@ -1564,7 +1617,7 @@ impl FamilyProviderFactory for AzureModelProviderConfig {
             );
             anyhow::Error::msg(
                 "Azure model_provider requires `deployment`: set \
-                 `[providers.models.azure.<alias>] deployment = \"...\"` in config.toml.",
+                 `[providers.models.<key>.extra] deployment = \"...\"` in config.toml.",
             )
         })?;
         let api_version = self.api_version.as_deref();
@@ -1587,10 +1640,10 @@ impl FamilyProviderFactory for BedrockModelProviderConfig {
         &self,
         alias: &str,
         key: Option<&str>,
-        _api_url: Option<&str>,
+        api_url: Option<&str>,
         opts: &ModelProviderRuntimeOptions,
     ) -> Result<Box<dyn ModelProvider>> {
-        let builder = crate::bedrock::BedrockModelProvider::builder(alias);
+        let builder = crate::bedrock::BedrockModelProvider::builder(alias).api_url(api_url);
         // Explicit-key path stays no-probe — do not run BEDROCK_API_KEY /
         // AwsCredentials::from_env / from_credential_process (which can
         // spawn a shell command) when the operator has already resolved
@@ -1694,7 +1747,7 @@ impl FamilyProviderFactory for GroqModelProviderConfig {
     const ENDPOINT: ProviderEndpoint = ProviderEndpoint::Fixed(GROQ_DEFAULT_URL);
 
     /// Groq builds its compat provider by hand rather than through
-    /// [`CompatFamilySpec`], so it declares the catalog policy directly. It
+    /// `CompatFamilySpec`, so it declares the catalog policy directly. It
     /// was in the hand-written probe list this const replaces, and
     /// `create_provider` below authenticates with [`AuthStyle::Bearer`] —
     /// discovery states the same thing, and
@@ -1719,7 +1772,7 @@ impl FamilyProviderFactory for GroqModelProviderConfig {
             .without_assistant_reasoning_replay();
         // Groq's llama-family models reject native tool calls with HTTP
         // 400; default to text-fallback. Operators can override per-alias
-        // via `[providers.models.groq.<alias>] native_tools = true`.
+        // via `[providers.models.<key>.options] native_tools = true`.
         if opts.native_tools != Some(true) {
             b = b.without_native_tools();
         }
@@ -1987,7 +2040,7 @@ impl FamilyProviderFactory for CustomModelProviderConfig {
             );
             anyhow::Error::msg(
                 "Custom model_provider requires `uri`: set \
-                 `[providers.models.custom.<alias>] uri = \"https://your-api.com\"` in config.toml.",
+                 `[providers.connections.<key>] uri = \"https://your-api.com\"` in config.toml.",
             )
         })?;
         if let Some(p) = build_responses_provider_if_requested(
@@ -2033,7 +2086,7 @@ impl FamilyProviderFactory for zeroclaw_config::schema::ModelProviderConfig {
         let base_url = api_url.ok_or_else(|| {
             anyhow::Error::msg(
                 "OpenAI-compatible model_provider requires `uri`: set \
-                 `[providers.models.<family>.<alias>] uri = \"https://your-api.com\"` in config.toml.",
+                 `[providers.connections.<key>] uri = \"https://your-api.com\"` in config.toml.",
             )
         })?;
         if let Some(p) = build_responses_provider_if_requested(
