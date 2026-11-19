@@ -78,12 +78,11 @@ pub(crate) fn text_extraction_defaults(
     native_tools: Option<bool>,
 ) -> TextExtraction {
     // MiniMax's unsplit reasoning and Groq's raw reasoning format put
-    // <think> blocks in content. All other configured models default to
-    // preserving literal text; a model/provider must explicitly opt in when
-    // its server emits inline reasoning. `None` remains reserved for the
-    // legacy config-free injection path, where the caller supplies its
-    // historical policy explicitly.
-    let reasoning = Some(matches!(kind, "minimax" | "groq"));
+    // <think> blocks in content. Those adapters opt in by default. Other
+    // configured models leave the option unset so response normalization can
+    // strip a think-only completion and apply the semantic-empty guard. An
+    // explicit `false` remains an opt-out that preserves literal text.
+    let reasoning = matches!(kind, "minimax" | "groq").then_some(true);
     // These adapters currently use prompt-guided tool calls by default.
     // Several upstreams also support native tools; enabling that mode
     // removes the need to infer calls from arbitrary response text.
@@ -198,23 +197,23 @@ mod tests {
             }
         );
         for (kind, reasoning, tool_calls) in [
-            ("openai", Some(false), false),
-            ("anthropic", Some(false), false),
-            ("deepseek", Some(false), false),
-            ("qwen", Some(false), false),
-            ("vllm", Some(false), false),
-            ("openai-compatible", Some(false), false),
+            ("openai", None, false),
+            ("anthropic", None, false),
+            ("deepseek", None, false),
+            ("qwen", None, false),
+            ("vllm", None, false),
+            ("openai-compatible", None, false),
             ("minimax", Some(true), false),
             ("groq", Some(true), true),
-            ("ollama", Some(false), true),
-            ("hailo_ollama", Some(false), true),
-            ("gemini", Some(false), true),
-            ("gemini_cli", Some(false), true),
-            ("grok_cli", Some(false), true),
-            ("kilocli", Some(false), true),
-            ("venice", Some(false), true),
-            ("atomic_chat", Some(false), true),
-            ("custom", Some(false), false),
+            ("ollama", None, true),
+            ("hailo_ollama", None, true),
+            ("gemini", None, true),
+            ("gemini_cli", None, true),
+            ("grok_cli", None, true),
+            ("kilocli", None, true),
+            ("venice", None, true),
+            ("atomic_chat", None, true),
+            ("custom", None, false),
         ] {
             let registry: crate::provider_registry::ProviderRegistry = toml::from_str(&format!(
                 r#"
