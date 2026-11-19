@@ -11,6 +11,7 @@ use async_trait::async_trait;
 use reqwest::Client;
 use serde::Deserialize;
 use std::collections::HashMap;
+use zeroclaw_tool_call_parser::strip_think_tags;
 
 /// Matches Ollama's upstream Modelfile default
 /// (<https://docs.ollama.com/modelfile>): "Increasing the temperature will
@@ -521,9 +522,16 @@ impl OllamaModelProvider {
 
     fn raw_response_text(content: &str, thinking: Option<&str>) -> Option<String> {
         // Preserve textual markup for the runtime's model-owned extractors.
-        // Some Ollama models put their complete answer in `thinking`.
+        // Some Ollama models put their complete answer in `thinking`. When
+        // `content` contains only a reasoning envelope, prefer that answer so
+        // the runtime does not classify the response as an empty terminal.
         let content = content.trim();
         if !content.is_empty() {
+            if strip_think_tags(content).trim().is_empty()
+                && let Some(thinking) = thinking.map(str::trim).filter(|text| !text.is_empty())
+            {
+                return Some(thinking.to_owned());
+            }
             return Some(content.to_owned());
         }
         thinking
@@ -1740,12 +1748,12 @@ mod tests {
     }
 
     #[test]
-    fn raw_response_text_preserves_think_only_content_over_thinking_field() {
+    fn raw_response_text_prefers_thinking_for_think_only_content() {
         let result = OllamaModelProvider::raw_response_text(
             "<think>just reasoning</think>",
             Some("actual useful text from thinking field"),
         );
-        assert_eq!(result, Some("<think>just reasoning</think>".to_string()));
+        assert_eq!(result, Some("actual useful text from thinking field".to_string()));
     }
 
     // ═══════════════════════════════════════════════════════════════════════
