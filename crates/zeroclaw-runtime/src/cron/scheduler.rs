@@ -584,7 +584,9 @@ pub async fn run_with_capability(
 /// Polling goes on while jobs run, so a long job holds one slot and the other
 /// due jobs start in the free ones. When a job finishes, its slot goes at once
 /// to a job that was already due at the last poll; a job that falls due later,
-/// the finished one included, waits for the next poll. Jobs are claimed one at a time for free slots, and each claimed job starts
+/// the finished one included, waits for the next poll. At most
+/// `scheduler.max_tasks` jobs start per poll, the refills after it included.
+/// Jobs are claimed one at a time for free slots, and each claimed job starts
 /// or is released right away, so no claim waits unstarted. A job that cannot
 /// start is released and leaves its slot to the next due job. The runs live in
 /// this future, not in spawned tasks: dropping the scheduler drops them, as
@@ -603,9 +605,13 @@ async fn poll_due_jobs(
     interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     let mut running = FuturesUnordered::new();
     let mut last_poll = Utc::now();
+    // The jobs this poll may still start: each tick resets it to
+    // `scheduler.max_tasks`, and the refills after a finished run draw on it.
+    // The first tick fires at once, so it is set before anything starts.
+    let mut poll_allowance = 0;
 
     loop {
-        let due_by = tokio::select! {
+        let (due_by, polled) = tokio::select! {
             biased;
             _ = cancel.cancelled() => {
                 crate::health::mark_component_ok(component);
@@ -622,13 +628,13 @@ async fn poll_due_jobs(
             }
             Some((result, _execution_admission)) = running.next(), if !running.is_empty() => {
                 report_job_result(event_tx, result);
-                last_poll
+                (last_poll, false)
             }
             _ = interval.tick() => {
                 // Keep scheduler liveness fresh even when there are no due jobs.
                 crate::health::mark_component_ok(component);
                 last_poll = Utc::now();
-                last_poll
+                (last_poll, true)
             }
         };
 
@@ -638,12 +644,16 @@ async fn poll_due_jobs(
             .as_ref()
             .map(|selection| selection.config_handle().read().clone());
         let config = selection_config.as_ref().unwrap_or(config);
+        if polled {
+            poll_allowance = config.scheduler.max_tasks.max(1);
+        }
         let free_slots = config
             .scheduler
             .max_concurrent
             .max(1)
             .saturating_sub(running.len());
-        if free_slots == 0 {
+        let to_start = free_slots.min(poll_allowance);
+        if to_start == 0 {
             continue;
         }
         let jobs = match due_jobs(config, due_by) {
@@ -667,7 +677,7 @@ async fn poll_due_jobs(
         // job is claimed and released at most once per poll or finished run.
         let mut started = 0;
         for job in jobs {
-            if started == free_slots {
+            if started == to_start {
                 break;
             }
             if !claim_due_job(config, &job) {
@@ -679,6 +689,7 @@ async fn poll_due_jobs(
                 started += 1;
             }
         }
+        poll_allowance -= started;
     }
 }
 
@@ -3773,6 +3784,31 @@ mod tests {
             );
         }
 
+        #[tokio::test]
+        async fn max_tasks_limits_the_jobs_started_per_poll_refills_included() {
+            let tmp = TempDir::new().unwrap();
+            let mut config = poll_test_config(&tmp, 4).await;
+            config.scheduler.max_tasks = 1;
+            let first = add_every_job(&config, 50, "echo first");
+            let second = add_every_job(&config, 50, "echo second");
+            // Both are due at the first poll; the second poll is a minute away.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+
+            let _ = poll_until(
+                &config,
+                Duration::from_secs(60),
+                Duration::from_secs(2),
+                || false,
+            )
+            .await;
+            let runs = runs_oldest_first(&config, &first).len()
+                + runs_oldest_first(&config, &second).len();
+            assert_eq!(
+                runs, 1,
+                "with max_tasks = 1 one job starts per poll; a finished run does not start \
+                 the other due job before the next poll"
+            );
+        }
     }
 
     #[tokio::test]
