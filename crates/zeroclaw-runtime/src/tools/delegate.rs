@@ -506,6 +506,11 @@ pub struct DelegateTool {
     /// `None` for one-shot / non-daemon callers, which keep the documented
     /// snapshot fallback.
     live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
+    /// The session's forwarded environment (`PATH` and the rest), when the
+    /// registry that built this tool had one. The shell the registry registers
+    /// carries it; the shell rebuilt for a bounded target must carry the same
+    /// handle. `None` outside a TUI session and for hand-built tools.
+    tui_env: Option<crate::tools::ForwardedEnvironment>,
     /// Capabilities the delegate resolves a target's provider, memory and
     /// supplied tools through. Bound once, by `with_capabilities` or by the
     /// entry point that owns the registry this tool was built into; while
@@ -687,6 +692,7 @@ impl DelegateTool {
             skill_bundles: Arc::new(HashMap::new()),
             root_config: None,
             live_config: None,
+            tui_env: None,
             capabilities: Arc::new(std::sync::OnceLock::new()),
             execution_capability: None,
             caller_alias: String::new(),
@@ -749,6 +755,7 @@ impl DelegateTool {
             skill_bundles: Arc::new(HashMap::new()),
             root_config: None,
             live_config: None,
+            tui_env: None,
             capabilities: Arc::new(std::sync::OnceLock::new()),
             execution_capability: None,
             caller_alias: String::new(),
@@ -951,6 +958,22 @@ impl DelegateTool {
     pub fn with_root_config(mut self, config: Arc<Config>) -> Self {
         self.root_config = Some(config);
         self
+    }
+
+    /// Attach the session's forwarded environment, the handle the registry also
+    /// installs on its own `shell`. The shell rebuilt for a bounded target
+    /// carries it so the target resolves and runs commands on the same `PATH`.
+    pub(crate) fn with_shared_tui_env(
+        mut self,
+        env: Option<crate::tools::ForwardedEnvironment>,
+    ) -> Self {
+        self.tui_env = env;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn forwarded_environment(&self) -> Option<&crate::tools::ForwardedEnvironment> {
+        self.tui_env.as_ref()
     }
 
     #[cfg(test)]
@@ -1921,12 +1944,18 @@ impl DelegateTool {
             Some(&target_policy.workspace_dir),
             &sandbox_extra_roots,
         );
-        Some(crate::tools::build_sandboxed_shell_tool(
-            target_policy,
-            runtime,
-            sandbox,
-            root_config.shell_tool.timeout_secs,
-        ))
+        // The normal registry installs the session's forwarded environment on the
+        // shell it registers; a bounded target's shell is rebuilt here, so it takes
+        // the same handle or it would run on the daemon's own `PATH`.
+        Some(
+            crate::tools::build_sandboxed_shell_tool(
+                target_policy,
+                runtime,
+                sandbox,
+                root_config.shell_tool.timeout_secs,
+            )
+            .with_shared_tui_env(self.tui_env.clone()),
+        )
     }
 
     /// Rebuilds `git_operations` bound to the TARGET's own sandbox and
@@ -4054,6 +4083,7 @@ impl DelegateTool {
         // Carried, not dropped: the background task rebuilds a DelegateTool that
         // will construct its own nested registries.
         let live_config = self.live_config.clone();
+        let tui_env = self.tui_env.clone();
         let capabilities = self.capabilities.clone();
         let execution_capability = self.execution_capability.clone();
         let target_execution_admission = execution_admission;
@@ -4169,6 +4199,7 @@ impl DelegateTool {
                     skill_bundles,
                     root_config,
                     live_config,
+                    tui_env,
                     capabilities,
                     execution_capability,
                     caller_alias,
@@ -4484,6 +4515,7 @@ impl DelegateTool {
             // Carried, not dropped: each fan-out task rebuilds a DelegateTool
             // that will construct its own nested registries.
             let live_config = self.live_config.clone();
+            let tui_env = self.tui_env.clone();
             let capabilities = self.capabilities.clone();
             let execution_capability = self.execution_capability.clone();
             let target_execution_admission = execution_admissions[index].clone();
@@ -4549,6 +4581,7 @@ impl DelegateTool {
                         skill_bundles,
                         root_config,
                         live_config,
+                        tui_env,
                         capabilities,
                         execution_capability,
                         caller_alias,
@@ -6614,6 +6647,7 @@ impl DelegateTool {
                         skill_bundles: Arc::clone(&self.skill_bundles),
                         root_config: self.root_config.clone(),
                         live_config: self.live_config.clone(),
+                        tui_env: self.tui_env.clone(),
                         capabilities: self.capabilities.clone(),
                         execution_capability: self.execution_capability.clone(),
                         caller_alias: agent_name.to_string(),
@@ -19861,6 +19895,342 @@ target = "memory_recall"
             "regression: a Bounded delegate target whose shell_timeout_secs is 0 must \
              inherit the root_config's global default timeout (42), not literally run \
              with a 0-second timeout"
+        );
+    }
+
+    /// Runs a real bounded hop whose target shell writes the child's
+    /// environment to a file, and returns that file's text. `session_env` is
+    /// the forwarded environment the delegating session carries, if any.
+    #[cfg(unix)]
+    async fn bounded_shell_child_environment(session_env: Option<(&str, &str)>) -> String {
+        let mut fixture =
+            bounded_delegate_fs_fixture("shell", Arc::new(crate::platform::NativeRuntime::new()))
+                .await;
+        if let Some((name, value)) = session_env {
+            fixture.tool = fixture
+                .tool
+                .with_shared_tui_env(Some(Arc::new(HashMap::from([(
+                    name.to_string(),
+                    value.to_string(),
+                )]))));
+        }
+        let model_provider = BoundedShellThenFinalModelProvider {
+            command: "env > child_env.txt",
+        };
+        let result = fixture
+            .tool
+            .execute_agentic(
+                "fs_researcher",
+                &fixture.target_config,
+                "custom",
+                "delegate-fs-test-model",
+                &model_provider,
+                "write the environment",
+                Some(0.2),
+            )
+            .await
+            .unwrap();
+        assert!(result.success, "bounded shell delegate failed: {result:?}");
+        std::fs::read_to_string(fixture.target_workspace.join("child_env.txt"))
+            .expect("the target's shell must have written its environment in its own workspace")
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bounded_delegate_shell_runs_with_the_sessions_forwarded_environment() {
+        // Regression: the registry installs the session's forwarded
+        // environment on the `shell` it registers, but the shell a bounded
+        // target gets is rebuilt from the target's policy; without the same
+        // handle it runs on the daemon's own environment.
+        let child_env =
+            bounded_shell_child_environment(Some(("ZC_FORWARDED_ENV_PROBE", "from-the-session")))
+                .await;
+        assert!(
+            child_env
+                .lines()
+                .any(|line| line == "ZC_FORWARDED_ENV_PROBE=from-the-session"),
+            "regression: a bounded target's shell must run with the delegating \
+             session's forwarded environment, got:\n{child_env}"
+        );
+    }
+
+    /// How the delegating call reaches the target's shell, one per place
+    /// `DelegateTool` hands itself on to something that rebuilds the target's
+    /// tools later.
+    #[cfg(unix)]
+    #[derive(Clone, Copy)]
+    enum ForwardedEnvHop {
+        /// `background: true`: a detached worker runs the hop.
+        Background,
+        /// `parallel: [..]`: a fan-out worker runs the hop.
+        FanOut,
+        /// The target delegates again, to the target that owns the shell.
+        SecondHop,
+    }
+
+    #[cfg(unix)]
+    fn forwarded_env_provider_config(uri: &str) -> ModelProviderConfig {
+        ModelProviderConfig {
+            uri: Some(uri.to_string()),
+            model: Some("forwarded-env-test-model".to_string()),
+            api_key: Some("forwarded-env-test-key".to_string()),
+            timeout_secs: Some(10),
+            ..ModelProviderConfig::default()
+        }
+    }
+
+    /// An OpenAI-compatible chat response: a tool call when `call` is
+    /// `Some((name, arguments))`, plain text otherwise.
+    #[cfg(unix)]
+    fn forwarded_env_chat_body(call: Option<(&str, &str)>) -> String {
+        let message = match call {
+            Some((name, arguments)) => json!({
+                "role": "assistant",
+                "content": serde_json::Value::Null,
+                "tool_calls": [{
+                    "id": "call-forwarded-env",
+                    "type": "function",
+                    "function": {"name": name, "arguments": arguments}
+                }]
+            }),
+            None => json!({"role": "assistant", "content": "done"}),
+        };
+        json!({
+            "id": "chatcmpl-forwarded-env",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "forwarded-env-test-model",
+            "choices": [{
+                "index": 0,
+                "message": message,
+                "finish_reason": if call.is_some() { "tool_calls" } else { "stop" }
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+        })
+        .to_string()
+    }
+
+    /// Drives a bounded hop through the real `execute` entry point, against a
+    /// scripted provider, until the target's shell has written its
+    /// environment to `child_env.txt` in the target's own workspace, and
+    /// returns that text. `session_env` is the forwarded environment the
+    /// delegating session carries, if any.
+    #[cfg(unix)]
+    async fn forwarded_env_reaches_hop_shell(
+        hop: ForwardedEnvHop,
+        session_env: Option<(&str, &str)>,
+    ) -> String {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
+
+        const WRITE_ENV: &str = r#"{"command":"env > child_env.txt","approved":true}"#;
+        let steps: Vec<(&'static str, &'static str)> = match hop {
+            ForwardedEnvHop::SecondHop => vec![
+                (
+                    "delegate",
+                    r#"{"action":"delegate","agent":"fs_researcher","prompt":"write the environment"}"#,
+                ),
+                ("shell", WRITE_ENV),
+            ],
+            _ => vec![("shell", WRITE_ENV)],
+        };
+        let server = MockServer::start().await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        Mock::given(method("POST"))
+            .respond_with({
+                let calls = Arc::clone(&calls);
+                move |_: &wiremock::Request| {
+                    let step = calls.fetch_add(1, Ordering::SeqCst);
+                    ResponseTemplate::new(200).set_body_raw(
+                        forwarded_env_chat_body(steps.get(step).copied()),
+                        "application/json",
+                    )
+                }
+            })
+            .mount(&server)
+            .await;
+
+        let uri = server.uri();
+        let mut fixture = bounded_delegate_fs_fixture_with_config(
+            "shell",
+            Arc::new(crate::platform::NativeRuntime::new()),
+            |config| {
+                config.providers.models.custom.insert(
+                    "local".to_string(),
+                    CustomModelProviderConfig {
+                        base: forwarded_env_provider_config(&uri),
+                    },
+                );
+                for agent in config.agents.values_mut() {
+                    agent.model_provider = "custom.local".into();
+                }
+                if matches!(hop, ForwardedEnvHop::SecondHop) {
+                    config.risk_profiles.insert(
+                        "mid_profile".to_string(),
+                        RiskProfileConfig {
+                            delegation_policy: DelegationPolicy {
+                                mode: DelegationMode::Allow,
+                            },
+                            allowed_tools: vec!["shell".to_string(), "delegate".to_string()],
+                            auto_approve: vec!["delegate".to_string()],
+                            allowed_commands: vec!["*".to_string()],
+                            block_high_risk_commands: false,
+                            ..RiskProfileConfig::default()
+                        },
+                    );
+                    config.agents.insert(
+                        "mid".to_string(),
+                        AliasedAgentConfig {
+                            risk_profile: "mid_profile".into(),
+                            runtime_profile: "fs_agentic_test".into(),
+                            model_provider: "custom.local".into(),
+                            delegates: vec![DelegateTargetConfig {
+                                agent: "fs_researcher".to_string(),
+                                mode: DelegateExecutionMode::Bounded,
+                            }],
+                            ..AliasedAgentConfig::default()
+                        },
+                    );
+                    config
+                        .agents
+                        .get_mut("executive_assistant")
+                        .expect("fixture always registers the caller")
+                        .delegates = vec![DelegateTargetConfig {
+                        agent: "mid".to_string(),
+                        mode: DelegateExecutionMode::Bounded,
+                    }];
+                }
+            },
+        )
+        .await;
+        let mut providers_models: HashMap<String, HashMap<String, ModelProviderConfig>> =
+            HashMap::new();
+        providers_models
+            .entry("custom".to_string())
+            .or_default()
+            .insert("local".to_string(), forwarded_env_provider_config(&uri));
+        fixture.tool =
+            with_in_memory_task_store(fixture.tool.with_providers_models(providers_models));
+        if let Some((name, value)) = session_env {
+            fixture.tool = fixture
+                .tool
+                .with_shared_tui_env(Some(Arc::new(HashMap::from([(
+                    name.to_string(),
+                    value.to_string(),
+                )]))));
+        }
+
+        let args = match hop {
+            ForwardedEnvHop::Background => json!({
+                "agent": "fs_researcher",
+                "prompt": "write the environment",
+                "background": true
+            }),
+            ForwardedEnvHop::FanOut => json!({
+                "parallel": ["fs_researcher"],
+                "prompt": "write the environment"
+            }),
+            ForwardedEnvHop::SecondHop => json!({
+                "agent": "mid",
+                "prompt": "hand the task on"
+            }),
+        };
+        let launched = fixture.tool.execute(args).await.unwrap();
+        assert!(launched.success, "the hop did not start: {launched:?}");
+
+        // The background worker outlives the call; the others have finished
+        // by now. `env` is the whole command, so the file is complete once it
+        // holds the `PATH` line every shell child gets.
+        let proof = fixture.target_workspace.join("child_env.txt");
+        for _ in 0..300 {
+            if let Ok(text) = std::fs::read_to_string(&proof)
+                && text.lines().any(|line| line.starts_with("PATH="))
+            {
+                return text;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!(
+            "the target's shell never wrote its environment to {}; model requests seen: {}",
+            proof.display(),
+            calls.load(Ordering::SeqCst)
+        );
+    }
+
+    /// Nested and detached delegation stack large futures: run the hop on a
+    /// worker with a raised stack, as the integration tests for two hops do.
+    #[cfg(unix)]
+    fn forwarded_env_for_hop(hop: ForwardedEnvHop, session_env: Option<(&str, &str)>) -> String {
+        let session_env = session_env.map(|(n, v)| (n.to_string(), v.to_string()));
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .thread_stack_size(64 * 1024 * 1024)
+            .build()
+            .expect("test runtime builds");
+        runtime.block_on(async move {
+            zeroclaw_spawn::spawn!(async move {
+                forwarded_env_reaches_hop_shell(
+                    hop,
+                    session_env.as_ref().map(|(n, v)| (n.as_str(), v.as_str())),
+                )
+                .await
+            })
+            .await
+            .expect("hop task joins")
+        })
+    }
+
+    #[cfg(unix)]
+    fn assert_hop_keeps_forwarded_environment(hop: ForwardedEnvHop) {
+        let child_env =
+            forwarded_env_for_hop(hop, Some(("ZC_FORWARDED_ENV_PROBE", "from-the-session")));
+        assert!(
+            child_env
+                .lines()
+                .any(|line| line == "ZC_FORWARDED_ENV_PROBE=from-the-session"),
+            "regression: the shell this hop's target runs must carry the delegating \
+             session's forwarded environment, got:\n{child_env}"
+        );
+        // Control: the same hop without a forwarded environment reaches the
+        // same shell and shows no probe, so the assertion above can only be
+        // satisfied by the handle.
+        let control = forwarded_env_for_hop(hop, None);
+        assert!(
+            !control.contains("ZC_FORWARDED_ENV_PROBE"),
+            "control: no forwarded environment, yet the child saw the probe:\n{control}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_delegate_background_worker_keeps_the_sessions_forwarded_environment() {
+        assert_hop_keeps_forwarded_environment(ForwardedEnvHop::Background);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_delegate_fan_out_worker_keeps_the_sessions_forwarded_environment() {
+        assert_hop_keeps_forwarded_environment(ForwardedEnvHop::FanOut);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_delegate_second_hop_keeps_the_sessions_forwarded_environment() {
+        assert_hop_keeps_forwarded_environment(ForwardedEnvHop::SecondHop);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bounded_delegate_shell_without_a_session_environment_adds_nothing() {
+        // Control for the test above: with no forwarded environment the probe
+        // variable never reaches the child, so that test's assertion can only
+        // be satisfied by the forwarded handle.
+        let child_env = bounded_shell_child_environment(None).await;
+        assert!(
+            !child_env.contains("ZC_FORWARDED_ENV_PROBE"),
+            "control: no forwarded environment, yet the child saw the probe:\n{child_env}"
         );
     }
 

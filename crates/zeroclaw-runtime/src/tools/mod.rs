@@ -4113,7 +4113,7 @@ fn all_tools_with_runtime_on_thread(
                 } else {
                     root_config.shell_tool.timeout_secs
                 })
-                .with_shared_tui_env(tui_env)
+                .with_shared_tui_env(tui_env.clone())
                 .with_persistent_writes(persistent_writes),
             security.clone(),
         ))
@@ -5542,6 +5542,7 @@ fn all_tools_with_runtime_on_thread(
         .with_runtime_profiles(root_config.runtime_profiles.clone())
         .with_skill_bundles(root_config.skill_bundles.clone())
         .with_root_config(config.clone())
+        .with_shared_tui_env(tui_env.clone())
         // `with_root_config` above is only a snapshot. Delegated targets get
         // their own nested registry, whose plugin tools and `send_via`
         // authority resolve per execution; without the shared handle they would
@@ -10563,6 +10564,74 @@ permissions = ["http_client"]
         .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"delegate"));
+    }
+
+    #[test]
+    fn all_tools_hands_the_forwarded_environment_to_the_delegate_tool() {
+        // The registry installs the session's forwarded environment on its own
+        // `shell`; the delegate tool must receive the same handle so the shell
+        // it rebuilds for a bounded target is given it too.
+        let tmp = TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy::default());
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let build = |tui_env: Option<HashMap<String, String>>| {
+            let mem: Arc<dyn Memory> =
+                Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+            let mut agents = HashMap::new();
+            agents.insert(
+                "researcher".to_string(),
+                AliasedAgentConfig {
+                    model_provider: "ollama.researcher".into(),
+                    ..Default::default()
+                },
+            );
+            all_tools(
+                Arc::new(Config::default()),
+                &security,
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
+                "test-agent",
+                mem,
+                None,
+                None,
+                &BrowserConfig::default(),
+                &zeroclaw_config::schema::HttpRequestConfig::default(),
+                &zeroclaw_config::schema::WebFetchConfig::default(),
+                tmp.path(),
+                &agents,
+                Some("delegate-test-credential"),
+                &test_config(&tmp),
+                None,
+                false,
+                tui_env,
+            )
+            .expect("tool registry builds")
+        };
+
+        let with_env = build(Some(HashMap::from([(
+            "ZC_FORWARDED_ENV_PROBE".to_string(),
+            "from-the-session".to_string(),
+        )])))
+        .delegate_tool
+        .expect("the registry builds a delegate tool when agents are configured");
+        assert_eq!(
+            with_env
+                .forwarded_environment()
+                .and_then(|env| env.get("ZC_FORWARDED_ENV_PROBE"))
+                .map(String::as_str),
+            Some("from-the-session"),
+            "the delegate tool must carry the session's forwarded environment"
+        );
+
+        let without_env = build(None)
+            .delegate_tool
+            .expect("the registry builds a delegate tool when agents are configured");
+        assert!(
+            without_env.forwarded_environment().is_none(),
+            "control: no forwarded environment in, none carried"
+        );
     }
 
     #[test]
