@@ -7645,6 +7645,15 @@ Allowlist Telegram username (without '@') or numeric user ID.",
     /// Fixed, bounded delay between retries of a transiently failing update.
     /// The attempt count is diagnostic only.
     const TRANSIENT_RETRY_DELAY_SECS: u64 = 2;
+    /// How many times reply-document preparation may hold the offset for one
+    /// update (greptile P1, review of 17.11): past the cap a transient prep
+    /// failure stops blocking the queue. Parsing then decides — a message
+    /// the parsers would skip (mention-only gate, no bot mention) can never
+    /// stall later updates behind a failing file server, and a deliverable
+    /// reply degrades to the bare `[Document]` marker, the pre-feature
+    /// behavior for replies. The counter is the shared `transient_retry`
+    /// slot — no new state.
+    const REPLY_PREP_MAX_ATTEMPTS: u32 = 3;
 
     async fn pause_for_transient_update(
         uid: Option<i64>,
@@ -7728,13 +7737,24 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         // Download and cache the replied-to document before parsing, so the
         // reply context can reference it even when the original message was
         // dropped by the mention-only gate. A transient preparation failure
-        // holds the update unacknowledged: the document is the task's
-        // input, and acking the reply with only a bare `[Document]` marker
-        // would confirm delivery of a request the agent cannot serve.
+        // holds the update unacknowledged only up to REPLY_PREP_MAX_ATTEMPTS
+        // times (greptile P1, 17.11): past the cap the update falls through
+        // to parsing, so a message the parsers would skip can never keep
+        // later updates waiting behind a failing file server. The document
+        // is the task's input, and acking the reply with only a bare
+        // `[Document]` marker would confirm delivery of a request the agent
+        // cannot serve — that trade-off stands only while the hold is
+        // bounded.
         if let ReplyPrepOutcome::RetryTransient =
             self.prepopulate_reply_attachment_context(update).await
         {
-            return Self::pause_for_transient_update(uid, transient_retry).await;
+            let held = match transient_retry {
+                Some((tracked_uid, n)) if Some(*tracked_uid) == uid => *n,
+                _ => 0,
+            };
+            if held < Self::REPLY_PREP_MAX_ATTEMPTS {
+                return Self::pause_for_transient_update(uid, transient_retry).await;
+            }
         }
 
         // `parse_update_message` handles text messages and has no fallible
@@ -7934,19 +7954,22 @@ impl TelegramChannel {
         &self,
         tx: &tokio::sync::mpsc::Sender<ChannelMessage>,
         batch: MediaGroupBatch,
+        hold_on_prep_failure: bool,
     ) -> MediaGroupDispatchOutcome {
         // Cache replied-to attachments of album members before parsing, so
         // the anchor's reply context can reference them exactly like an
         // ordinary update does in `process_update`. Best-effort and
         // idempotent: members without a reply return immediately, and an
         // already-cached file is not re-downloaded. One transient member
-        // failure requeues the whole batch: the album is a single logical
-        // message, and its anchor must not be acked without the document
-        // it quotes.
+        // failure requeues the whole batch — but only while
+        // `hold_on_prep_failure` stands (the shared REPLY_PREP_MAX_ATTEMPTS
+        // budget, same greptile P1 as `process_update`): past the cap the
+        // batch falls through to parsing, so a skipped album cannot stall
+        // the queue behind a failing file server.
         let mut prep_outcome = ReplyPrepOutcome::Ready;
         for update in &batch.updates {
             match self.prepopulate_reply_attachment_context(update).await {
-                ReplyPrepOutcome::RetryTransient => {
+                ReplyPrepOutcome::RetryTransient if hold_on_prep_failure => {
                     prep_outcome = ReplyPrepOutcome::RetryTransient;
                 }
                 ReplyPrepOutcome::SkipPermanent
@@ -8025,7 +8048,23 @@ impl TelegramChannel {
     ) -> UpdateOutcome {
         let mut batches = batches.into_iter();
         while let Some(batch) = batches.next() {
-            match self.dispatch_media_group_batch(tx, batch).await {
+            // Shared REPLY_PREP_MAX_ATTEMPTS budget (greptile P1): the batch
+            // may hold the offset for reply-prep only while the tracked
+            // attempt count for its first update is below the cap.
+            let hold_on_prep_failure = match (
+                Self::media_group_batch_first_update_id(&batch),
+                *transient_retry,
+            ) {
+                (Some(tracked_uid), Some((uid, n))) => {
+                    uid == tracked_uid && n < Self::REPLY_PREP_MAX_ATTEMPTS
+                }
+                (Some(_), None) => true,
+                (None, _) => true,
+            };
+            match self
+                .dispatch_media_group_batch(tx, batch, hold_on_prep_failure)
+                .await
+            {
                 MediaGroupDispatchOutcome::Delivered(key) => {
                     Self::mark_media_group_delivered(queue, &key);
                     *transient_retry = None;
@@ -19396,6 +19435,82 @@ mod tests {
                 .contains(&workspace.path().to_string_lossy().to_string()),
             "the path must point into the workspace, got: {}",
             msg.content
+        );
+    }
+
+    #[tokio::test]
+    async fn reply_prep_cap_stops_holding_offset_for_gated_message() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let workspace = tempfile::tempdir().unwrap();
+        let mock_server = MockServer::start().await;
+
+        // The file server never recovers: every getFile call fails with a
+        // bare 5xx (transient classification, so prep keeps returning
+        // RetryTransient on every poll).
+        Mock::given(method("GET"))
+            .and(path_regex(r"/bot[^/]+/getFile$"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&mock_server)
+            .await;
+
+        // mention_only group: this reply names no bot mention and quotes
+        // another user's document, so the parsers would SkipPermanent it.
+        // Before the cap, a transient prep failure held the offset anyway
+        // (greptile P1, 17.11) and every later update waited behind a
+        // message that would never be delivered.
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            true,
+        )
+        .with_mock_api_base(mock_server.uri())
+        .with_workspace_dir(workspace.path().to_path_buf());
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<ChannelMessage>(4);
+        let update = serde_json::json!({
+            "update_id": 56,
+            "message": {
+                "message_id": 46,
+                "chat": { "id": -100_200_300, "type": "supergroup" },
+                "from": { "username": "alice", "id": 99 },
+                "text": "look at this document",
+                "reply_to_message": {
+                    "message_id": 40,
+                    "from": { "username": "bob", "id": 77 },
+                    "document": {
+                        "file_id": "doc-file-id",
+                        "file_name": "Q3 report final.pdf"
+                    }
+                }
+            }
+        });
+
+        // Below the cap each prep failure still holds the offset.
+        let mut transient_retry = None;
+        let outcome = ch.process_update(&update, &tx, &mut transient_retry).await;
+        assert!(
+            matches!(outcome, UpdateOutcome::StopBatch),
+            "below the cap a transient prep failure holds the offset"
+        );
+        assert_eq!(transient_retry, Some((56, 1)));
+
+        // Reach the cap: seed the shared counter at REPLY_PREP_MAX_ATTEMPTS.
+        transient_retry = Some((56, TelegramChannel::REPLY_PREP_MAX_ATTEMPTS));
+        let outcome = ch.process_update(&update, &tx, &mut transient_retry).await;
+        assert!(
+            matches!(outcome, UpdateOutcome::Advanced),
+            "past the cap a message the parsers skip must advance the offset"
+        );
+        assert_eq!(
+            transient_retry, None,
+            "skipped update clears the retry slot"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "a gated reply must not be delivered even after the cap"
         );
     }
 
