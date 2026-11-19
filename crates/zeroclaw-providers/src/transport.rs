@@ -65,11 +65,7 @@ impl HttpTransportConfig {
         service_key: &str,
     ) -> Result<Client> {
         let mut builder = zeroclaw_config::schema::apply_runtime_proxy_to_builder(
-            Client::builder().redirect(if follow_redirects {
-                reqwest::redirect::Policy::default()
-            } else {
-                reqwest::redirect::Policy::none()
-            }),
+            Client::builder().redirect(self.redirect_policy(follow_redirects)),
             service_key,
         );
         match &self.request_timeout_secs {
@@ -93,6 +89,32 @@ impl HttpTransportConfig {
         builder
             .build()
             .with_context(|| format!("building HTTP client for {service_key}"))
+    }
+
+    fn redirect_policy(&self, follow_redirects: bool) -> reqwest::redirect::Policy {
+        if !follow_redirects {
+            return reqwest::redirect::Policy::none();
+        }
+        let origin = reqwest::Url::parse(&self.base_url).ok().map(|url| {
+            (
+                url.scheme().to_owned(),
+                url.host_str().map(ToOwned::to_owned),
+                url.port_or_known_default(),
+            )
+        });
+        reqwest::redirect::Policy::custom(move |attempt| {
+            let destination = attempt.url();
+            let same_origin = origin.as_ref().is_some_and(|(scheme, host, port)| {
+                destination.scheme() == scheme
+                    && destination.host_str().map(str::to_owned) == *host
+                    && destination.port_or_known_default() == *port
+            });
+            if same_origin {
+                attempt.follow()
+            } else {
+                attempt.stop()
+            }
+        })
     }
 
     pub fn headers(&self) -> Result<HeaderMap> {
