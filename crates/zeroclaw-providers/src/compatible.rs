@@ -76,7 +76,6 @@ pub struct OpenAiCompatibleModelProvider {
     /// Whether the operator explicitly selected a total request timeout.
     /// Streaming clients keep the historical no-total-timeout baseline when
     /// this is false, while an explicit finite value applies to streaming too.
-    timeout_configured: bool,
     timeout_disabled: bool,
     /// Optional HTTP response-read idle timeout. `None` uses the streaming
     /// baseline; `read_timeout_disabled` explicitly removes that baseline.
@@ -546,7 +545,6 @@ pub struct OpenAiCompatibleBuilder {
     /// `None` preserves the default derived from `merge_system_into_user`.
     native_tool_calling_override: Option<bool>,
     timeout_secs: Option<u64>,
-    timeout_configured: bool,
     timeout_disabled: bool,
     read_timeout_secs: Option<u64>,
     read_timeout_disabled: bool,
@@ -696,7 +694,6 @@ impl OpenAiCompatibleBuilder {
     pub fn timeout_secs(mut self, timeout_secs: u64) -> Self {
         if timeout_secs > 0 {
             self.timeout_secs = Some(timeout_secs);
-            self.timeout_configured = true;
             self.timeout_disabled = false;
         }
         self
@@ -706,7 +703,6 @@ impl OpenAiCompatibleBuilder {
     /// independent connect/read-idle and outer cancellation boundaries.
     pub fn without_timeout(mut self) -> Self {
         self.timeout_secs = None;
-        self.timeout_configured = true;
         self.timeout_disabled = true;
         self
     }
@@ -920,7 +916,6 @@ impl OpenAiCompatibleBuilder {
             native_tool_calling,
             merge_system_into_user,
             timeout_secs: self.timeout_secs.unwrap_or(120),
-            timeout_configured: self.timeout_configured,
             timeout_disabled: self.timeout_disabled,
             read_timeout_secs: self.read_timeout_secs,
             read_timeout_disabled: self.read_timeout_disabled,
@@ -968,7 +963,6 @@ impl OpenAiCompatibleModelProvider {
             merge_system_into_user_preserve_native: false,
             native_tool_calling_override: None,
             timeout_secs: None,
-            timeout_configured: false,
             timeout_disabled: false,
             read_timeout_secs: None,
             read_timeout_disabled: false,

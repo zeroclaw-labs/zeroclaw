@@ -21,7 +21,6 @@ pub struct OpenRouterModelProvider {
     alias: String,
     credential: Option<String>,
     timeout_secs: u64,
-    timeout_configured: bool,
     timeout_disabled: bool,
     read_timeout_secs: Option<u64>,
     read_timeout_disabled: bool,
@@ -290,7 +289,6 @@ impl OpenRouterBuilder {
             timeout_secs: self
                 .timeout_secs
                 .unwrap_or(zeroclaw_api::model_provider::BASELINE_TIMEOUT_SECS),
-            timeout_configured: self.timeout_secs.is_some(),
             timeout_disabled: self.timeout_disabled,
             read_timeout_secs: self.read_timeout_secs,
             read_timeout_disabled: self.read_timeout_disabled,

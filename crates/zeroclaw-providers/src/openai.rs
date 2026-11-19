@@ -1063,7 +1063,6 @@ pub struct OpenAiResponsesModelProvider {
     /// protection is configured separately by canonical API options.
     /// Default: 120 (matches `OpenAiCompatibleModelProvider`).
     timeout_secs: u64,
-    timeout_configured: bool,
     timeout_disabled: bool,
     read_timeout_secs: Option<u64>,
     read_timeout_disabled: bool,
@@ -1186,7 +1185,6 @@ impl OpenAiResponsesBuilder {
             max_tokens: self.max_tokens,
             reasoning_effort: self.reasoning_effort,
             timeout_secs: self.timeout_secs.unwrap_or(120),
-            timeout_configured: self.timeout_secs.is_some(),
             timeout_disabled: self.timeout_disabled,
             read_timeout_secs: self.read_timeout_secs,
             read_timeout_disabled: self.read_timeout_disabled,
