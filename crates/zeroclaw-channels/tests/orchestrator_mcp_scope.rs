@@ -1,6 +1,4 @@
-//! Regression coverageat the channels-orchestrator MCP
-//! connection site (`crates/zeroclaw-channels/src/orchestrator/mod.rs`,
-//! search for `mcp_servers_for_agent`).
+//! Regression coverage for resolving MCP server grants from agent bundles.
 
 use std::collections::HashMap;
 
@@ -72,16 +70,12 @@ fn make_two_agent_config() -> Config {
 
 #[test]
 fn resolver_grants_only_to_granted_agent_under_two_agent_config() {
-    // The orchestrator now calls `config.mcp_servers_for_agent(alias)`.
-    // Pin its semantics here: `granted` gets `remote`, `unscoped` gets
-    // zero. If this flips, the orchestrator'sfix has regressed
-    // at the contract level.
     let config = make_two_agent_config();
 
-    let granted: Vec<String> = config
-        .mcp_servers_for_agent("granted")
+    let granted_servers: Vec<McpServerConfig> = config.mcp_servers_for_agent("granted");
+    let granted: Vec<String> = granted_servers
         .into_iter()
-        .map(|s| s.name)
+        .map(|server| server.name)
         .collect();
     assert_eq!(granted, vec!["remote"], "granted agent must get `remote`");
 
@@ -94,13 +88,4 @@ fn resolver_grants_only_to_granted_agent_under_two_agent_config() {
         config.mcp_servers_for_agent("ghost-agent").is_empty(),
         "an unknown agent must get zero servers"
     );
-}
-
-/// Compile-time witness: the symbol the orchestrator depends on must
-/// exist and have the right shape. If a future refactor removes or
-/// renames `Config::mcp_servers_for_agent`, this file stops compiling
-/// and signals reviewers to update the orchestrator call site too.
-#[allow(dead_code)]
-fn _mcp_servers_for_agent_witness(config: &Config, alias: &str) -> Vec<McpServerConfig> {
-    config.mcp_servers_for_agent(alias)
 }
