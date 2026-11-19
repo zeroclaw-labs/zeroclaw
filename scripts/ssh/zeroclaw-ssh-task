@@ -338,7 +338,8 @@ def client(args):
         raise RuntimeError(translate('SSH requires an active ZeroClaw task; no unmanaged fallback'))
     options, host, commands = parse_args(list(args))
     with socket.socket(socket.AF_UNIX) as peer:
-        peer.settimeout(20)
+        # Allow config resolution, connection setup, and broker scheduling.
+        peer.settimeout(35)
         peer.connect(str(ROOT / scope / 'broker'))
         peer.sendall(json.dumps({'argv': args}).encode() + b'\n')
         response = read_message(peer)
