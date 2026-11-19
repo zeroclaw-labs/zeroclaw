@@ -62,11 +62,11 @@ impl PrivateStore {
             "Invalid state database file"
         );
         private(&before, uid, 0o600)?;
-        // Linux O_NOFOLLOW. No unsafe code or file creation is required.
+        // Use the architecture-specific Linux flag; no unsafe code is required.
         let file = OpenOptions::new()
             .read(true)
             .write(true)
-            .custom_flags(0x20000)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(&path)?;
         let actual = file.metadata()?;
         ensure!(

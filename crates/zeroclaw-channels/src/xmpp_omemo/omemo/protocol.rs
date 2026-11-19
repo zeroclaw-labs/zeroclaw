@@ -25,6 +25,10 @@ pub enum DoubleRatchetError {
     #[error("Crypto error: {0}")]
     Crypto(#[from] crate::xmpp_omemo::omemo::crypto::CryptoError),
 
+    /// A direction has not yet authenticated its first DH ratchet.
+    #[error("Ratchet chain not established")]
+    ChainNotEstablished,
+
     /// Invalid signature
     #[error("Invalid signature: {0}")]
     InvalidSignature(String),
@@ -130,10 +134,10 @@ pub struct RatchetState {
     pub root_key: RootKey,
 
     /// Send chain key — zeroized on drop
-    pub send_chain_key: ChainKey<Sending>,
+    pub send_chain_key: Option<ChainKey<Sending>>,
 
     /// Receive chain key — zeroized on drop
-    pub receive_chain_key: ChainKey<Receiving>,
+    pub receive_chain_key: Option<ChainKey<Receiving>>,
 
     /// Ratchet key pair
     pub ratchet_key_pair: KeyPair,
@@ -481,8 +485,8 @@ impl DoubleRatchet {
                 remote_identity_key,
                 local_identity_key_pair,
                 root_key,
-                send_chain_key,
-                receive_chain_key: ChainKey::from_slice(&[0u8; 32]).unwrap(), // Not yet established; set on first DH ratchet from Bob
+                send_chain_key: Some(send_chain_key),
+                receive_chain_key: None, // Established only by Bob's first DH ratchet
                 ratchet_key_pair,
                 remote_ratchet_key: remote_signed_prekey,
                 prev_remote_ratchet_key: vec![],
@@ -523,8 +527,8 @@ impl DoubleRatchet {
                 local_identity_key_pair,
                 root_key: RootKey::from_slice(&shared_secret)
                     .expect("X3DH shared secret is 32 bytes"),
-                send_chain_key: ChainKey::from_slice(&[0u8; 32]).unwrap(), // Not yet established
-                receive_chain_key: ChainKey::from_slice(&[0u8; 32]).unwrap(), // Not yet established
+                send_chain_key: None,    // Not yet established
+                receive_chain_key: None, // Not yet established
                 ratchet_key_pair: KeyPair {
                     public_key: PublicKey::new([0u8; 32]), // placeholder — overwritten by new_session_recipient
                     private_key: Secret::new([0u8; 32]),
@@ -598,6 +602,10 @@ impl DoubleRatchet {
 
     /// Skip message keys up to a specific counter
     fn skip_message_keys(state: &mut RatchetState, target: u32) -> Result<(), DoubleRatchetError> {
+        // There is no previous receiving chain before the first DH ratchet.
+        if state.receive_chain_key.is_none() {
+            return Ok(());
+        }
         if target > state.receive_message_number.saturating_add(Self::MAX_SKIP) {
             return Err(DoubleRatchetError::InvalidMessageFormat(format!(
                 "Too many skipped messages: {} (max {})",
@@ -609,7 +617,7 @@ impl DoubleRatchet {
         while state.receive_message_number < target {
             let current_counter = state.receive_message_number;
             // derive_next_receiving_key increments receive_message_number
-            let message_key = Self::derive_next_receiving_key(state);
+            let message_key = Self::derive_next_receiving_key(state)?;
 
             // Store with the counter value this key corresponds to
             let key = (state.remote_ratchet_key.clone(), current_counter);
@@ -640,34 +648,46 @@ impl DoubleRatchet {
     /// Derive the next sending key using HMAC-based chain ratchet (Signal spec)
     /// message_key = HMAC-SHA256(chain_key, 0x01)
     /// next_chain_key = HMAC-SHA256(chain_key, 0x02)
-    fn derive_next_sending_key(state: &mut RatchetState) -> MessageKey {
+    fn derive_next_sending_key(state: &mut RatchetState) -> Result<MessageKey, DoubleRatchetError> {
+        let chain = state
+            .send_chain_key
+            .as_ref()
+            .ok_or(DoubleRatchetError::ChainNotEstablished)?;
         let message_key = MessageKey::from_slice(
-            &crypto::hmac_sha256(state.send_chain_key.expose_secret(), &[0x01])
-                .expect("HMAC-SHA256 cannot fail"),
+            &crypto::hmac_sha256(chain.expose_secret(), &[0x01]).expect("HMAC-SHA256 cannot fail"),
         )
         .expect("HMAC-SHA256 output is always 32 bytes");
-        state.send_chain_key = ChainKey::from_slice(
-            &crypto::hmac_sha256(state.send_chain_key.expose_secret(), &[0x02])
-                .expect("HMAC-SHA256 cannot fail"),
-        )
-        .expect("HMAC-SHA256 output is always 32 bytes");
-        message_key
+        state.send_chain_key = Some(
+            ChainKey::from_slice(
+                &crypto::hmac_sha256(chain.expose_secret(), &[0x02])
+                    .expect("HMAC-SHA256 cannot fail"),
+            )
+            .expect("HMAC-SHA256 output is always 32 bytes"),
+        );
+        Ok(message_key)
     }
 
     /// Derive the next receiving key using HMAC-based chain ratchet (Signal spec)
-    fn derive_next_receiving_key(state: &mut RatchetState) -> MessageKey {
+    fn derive_next_receiving_key(
+        state: &mut RatchetState,
+    ) -> Result<MessageKey, DoubleRatchetError> {
+        let chain = state
+            .receive_chain_key
+            .as_ref()
+            .ok_or(DoubleRatchetError::ChainNotEstablished)?;
         let message_key = MessageKey::from_slice(
-            &crypto::hmac_sha256(state.receive_chain_key.expose_secret(), &[0x01])
-                .expect("HMAC-SHA256 cannot fail"),
+            &crypto::hmac_sha256(chain.expose_secret(), &[0x01]).expect("HMAC-SHA256 cannot fail"),
         )
         .expect("HMAC-SHA256 output is always 32 bytes");
-        state.receive_chain_key = ChainKey::from_slice(
-            &crypto::hmac_sha256(state.receive_chain_key.expose_secret(), &[0x02])
-                .expect("HMAC-SHA256 cannot fail"),
-        )
-        .expect("HMAC-SHA256 output is always 32 bytes");
+        state.receive_chain_key = Some(
+            ChainKey::from_slice(
+                &crypto::hmac_sha256(chain.expose_secret(), &[0x02])
+                    .expect("HMAC-SHA256 cannot fail"),
+            )
+            .expect("HMAC-SHA256 output is always 32 bytes"),
+        );
         state.receive_message_number += 1;
-        message_key
+        Ok(message_key)
     }
 
     /// Perform a DH ratchet step
@@ -706,7 +726,7 @@ impl DoubleRatchet {
         .map_err(DoubleRatchetError::Crypto)?;
         state.root_key = RootKey::from_slice(&kdf_recv[..32]).expect("KDF is always 64 bytes");
         state.receive_chain_key =
-            ChainKey::from_slice(&kdf_recv[32..64]).expect("KDF is always 64 bytes");
+            Some(ChainKey::from_slice(&kdf_recv[32..64]).expect("KDF is always 64 bytes"));
 
         // Generate a new ratchet key pair for sending
         state.ratchet_key_pair = X3DHProtocol::generate_key_pair()?;
@@ -727,7 +747,7 @@ impl DoubleRatchet {
         .map_err(DoubleRatchetError::Crypto)?;
         state.root_key = RootKey::from_slice(&kdf_send[..32]).expect("KDF is always 64 bytes");
         state.send_chain_key =
-            ChainKey::from_slice(&kdf_send[32..64]).expect("KDF is always 64 bytes");
+            Some(ChainKey::from_slice(&kdf_send[32..64]).expect("KDF is always 64 bytes"));
 
         Ok(())
     }
@@ -745,7 +765,7 @@ impl DoubleRatchet {
         }
 
         // Derive a message key from the sending chain
-        let message_key = Self::derive_next_sending_key(state);
+        let message_key = Self::derive_next_sending_key(state)?;
 
         // Expand message_key via HKDF to get (cipher_key, mac_key, iv)
         // Per Signal spec: HKDF(message_key, salt="", info="WhisperMessageKeys", L=80)
@@ -849,7 +869,7 @@ impl DoubleRatchet {
                     }
                     while candidate.receive_message_number < signal_msg.counter {
                         let current_counter = candidate.receive_message_number;
-                        let skipped_key = Self::derive_next_receiving_key(&mut candidate);
+                        let skipped_key = Self::derive_next_receiving_key(&mut candidate)?;
                         let skip_index = (signal_msg.ratchet_key.clone(), current_counter);
                         candidate
                             .skipped_message_keys
@@ -857,7 +877,7 @@ impl DoubleRatchet {
                     }
                 }
 
-                Self::derive_next_receiving_key(&mut candidate)
+                Self::derive_next_receiving_key(&mut candidate)?
             };
 
         // Expand message_key via HKDF to get (cipher_key, mac_key, iv)
@@ -963,6 +983,41 @@ mod tests {
         .unwrap();
 
         (alice, bob)
+    }
+
+    #[test]
+    fn unestablished_chains_cannot_derive_message_keys() {
+        let (mut alice, mut bob) = paired_sessions();
+        assert!(matches!(
+            DoubleRatchet::derive_next_receiving_key(&mut alice),
+            Err(DoubleRatchetError::ChainNotEstablished)
+        ));
+        assert!(matches!(
+            DoubleRatchet::derive_next_receiving_key(&mut bob),
+            Err(DoubleRatchetError::ChainNotEstablished)
+        ));
+        assert!(matches!(
+            DoubleRatchet::encrypt_key(&mut bob, &[1; 32]),
+            Err(DoubleRatchetError::ChainNotEstablished)
+        ));
+    }
+
+    #[test]
+    fn first_ratchet_does_not_store_keys_from_an_absent_previous_chain() {
+        let (mut alice, mut bob) = paired_sessions();
+        alice.prev_send_message_number = 3;
+        let first = DoubleRatchet::encrypt_key(&mut alice, &[0x41; 32]).unwrap();
+        assert_eq!(
+            DoubleRatchet::decrypt_key(&mut bob, &first).unwrap(),
+            vec![0x41; 32]
+        );
+        assert!(bob.skipped_message_keys.is_empty());
+        assert!(bob.send_chain_key.is_some() && bob.receive_chain_key.is_some());
+        let reply = DoubleRatchet::encrypt_key(&mut bob, &[0x42; 32]).unwrap();
+        assert_eq!(
+            DoubleRatchet::decrypt_key(&mut alice, &reply).unwrap(),
+            vec![0x42; 32]
+        );
     }
 
     #[test]

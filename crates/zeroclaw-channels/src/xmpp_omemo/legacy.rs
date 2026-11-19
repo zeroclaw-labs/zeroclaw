@@ -69,16 +69,27 @@ impl LegacySession {
     /// Build the canonical JSON representation after one authenticated passive X3DH receive.
     pub fn from_fresh_recipient(state: RatchetState) -> Result<Self> {
         ensure!(
-            !state.is_initiator && state.receive_message_number > 0,
+            !state.is_initiator
+                && state.receive_message_number > 0
+                && state.send_chain_key.is_some()
+                && state.receive_chain_key.is_some(),
             "Fresh recipient has not authenticated a message"
         );
+        let sending = state
+            .send_chain_key
+            .as_ref()
+            .context("Missing sending chain")?;
+        let receiving = state
+            .receive_chain_key
+            .as_ref()
+            .context("Missing receiving chain")?;
         let template = serde_json::json!({"version":"1.0.0","diffie_hellman_ratchet":{
             "version":"1.0.0","own_ratchet_priv":text(state.ratchet_key_pair.private_key.expose_secret()),
             "other_ratchet_pub":text(&state.remote_ratchet_key),
             "root_chain":{"version":"1.0.0","length":2,"key":text(state.root_key.expose_secret())},
             "symmetric_key_ratchet":{"version":"1.0.0","previous_sending_chain_length":null,
-                "sending_chain":{"version":"1.0.0","length":state.send_message_number,"key":text(state.send_chain_key.expose_secret())},
-                "receiving_chain":{"version":"1.0.0","length":state.receive_message_number,"key":text(state.receive_chain_key.expose_secret())}}},
+                "sending_chain":{"version":"1.0.0","length":state.send_message_number,"key":text(sending.expose_secret())},
+                "receiving_chain":{"version":"1.0.0","length":state.receive_message_number,"key":text(receiving.expose_secret())}}},
             "skipped_message_keys":[]});
         Ok(Self { state, template })
     }
@@ -196,18 +207,29 @@ impl LegacySession {
             identity.public_key.as_raw() == &own_public,
             "Legacy identity does not match its fingerprint"
         );
+        let sending = key(&sym["sending_chain"]["key"])?;
+        ensure!(
+            sending != [0; 32],
+            "Invalid all-zero legacy sending chain; reset session"
+        );
+        let receiving = if waiting_for_reply {
+            None
+        } else {
+            let value = key(&sym["receiving_chain"]["key"])?;
+            ensure!(
+                value != [0; 32],
+                "Invalid all-zero legacy receiving chain; reset session"
+            );
+            Some(ChainKey::new(Secret::new(value)))
+        };
         let state = RatchetState {
             initialized: true,
             is_initiator: waiting_for_reply,
             remote_identity_key: remote_public.to_vec(),
             local_identity_key_pair: identity,
             root_key: RootKey(Secret::new(key(&dh["root_chain"]["key"])?)),
-            send_chain_key: ChainKey::new(Secret::new(key(&sym["sending_chain"]["key"])?)),
-            receive_chain_key: ChainKey::new(Secret::new(if waiting_for_reply {
-                [0; 32]
-            } else {
-                key(&sym["receiving_chain"]["key"])?
-            })),
+            send_chain_key: Some(ChainKey::new(Secret::new(sending))),
+            receive_chain_key: receiving,
             ratchet_key_pair: pair(key(&dh["own_ratchet_priv"])?),
             remote_ratchet_key: key(&dh["other_ratchet_pub"])?.to_vec(),
             prev_remote_ratchet_key: vec![],
@@ -298,14 +320,22 @@ impl LegacySession {
         dh["own_ratchet_priv"] = text(self.state.ratchet_key_pair.private_key.expose_secret());
         dh["other_ratchet_pub"] = text(&self.state.remote_ratchet_key);
         let sym = &mut dh["symmetric_key_ratchet"];
-        sym["sending_chain"]["key"] = text(self.state.send_chain_key.expose_secret());
+        sym["sending_chain"]["key"] = text(
+            self.state
+                .send_chain_key
+                .as_ref()
+                .context("Missing sending chain")?
+                .expose_secret(),
+        );
         sym["sending_chain"]["length"] = self.state.send_message_number.into();
-        if changed || !sym["receiving_chain"].is_null() {
+        if let Some(receiving) = self.state.receive_chain_key.as_ref() {
             if sym["receiving_chain"].is_null() {
                 sym["receiving_chain"] = serde_json::json!({"version":"1.0.0"});
             }
-            sym["receiving_chain"]["key"] = text(self.state.receive_chain_key.expose_secret());
+            sym["receiving_chain"]["key"] = text(receiving.expose_secret());
             sym["receiving_chain"]["length"] = self.state.receive_message_number.into();
+        } else {
+            sym["receiving_chain"] = Value::Null;
         }
         if changed || !sym["previous_sending_chain_length"].is_null() {
             sym["previous_sending_chain_length"] = self.state.prev_send_message_number.into();
@@ -317,6 +347,56 @@ impl LegacySession {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn pending_session_template() -> Value {
+        serde_json::json!({"version":"1.0.0","diffie_hellman_ratchet":{
+            "version":"1.0.0", "own_ratchet_priv":text(&[0x14;32]), "other_ratchet_pub":text(&[0x15;32]),
+            "root_chain":{"version":"1.0.0","length":1,"key":text(&[0x16;32])},
+            "symmetric_key_ratchet":{"version":"1.0.0","previous_sending_chain_length":null,
+                "sending_chain":{"version":"1.0.0","length":0,"key":text(&[0x17;32])},
+                "receiving_chain":null}},"skipped_message_keys":[]})
+    }
+    fn import_template(template: Value) -> Result<LegacySession> {
+        LegacySession::import(
+            template,
+            [0x11; 32],
+            *pair([0x11; 32]).public_key.as_raw(),
+            [0x12; 32],
+            1,
+            2,
+            "peer@example.test".into(),
+        )
+    }
+    #[test]
+    fn pending_receive_chain_stays_absent_on_import_and_export() {
+        let session = import_template(pending_session_template()).unwrap();
+        assert!(session.state.receive_chain_key.is_none());
+        assert!(session.export().unwrap()["diffie_hellman_ratchet"]["symmetric_key_ratchet"]["receiving_chain"].is_null());
+    }
+    #[test]
+    fn all_zero_stored_sending_chain_requires_explicit_reset() {
+        let mut template = pending_session_template();
+        template["diffie_hellman_ratchet"]["symmetric_key_ratchet"]["sending_chain"]["key"] =
+            text(&[0; 32]);
+        assert!(import_template(template).is_err());
+    }
+    #[test]
+    fn all_zero_stored_receiving_chain_requires_explicit_reset() {
+        let mut template = pending_session_template();
+        template["diffie_hellman_ratchet"]["symmetric_key_ratchet"]["receiving_chain"] =
+            serde_json::json!({"version":"1.0.0","length":1,"key":text(&[0;32])});
+        assert!(import_template(template).is_err());
+    }
+    #[test]
+    fn fresh_recipient_requires_both_established_chains() {
+        let mut state = import_template(pending_session_template())
+            .unwrap()
+            .state
+            .clone();
+        state.is_initiator = false;
+        state.receive_message_number = 1;
+        assert!(LegacySession::from_fresh_recipient(state).is_err());
+    }
+
     #[test]
     fn legacy_bytes_are_latin1_not_utf8() {
         let bytes: [u8; 32] = std::array::from_fn(|i| 224 + i as u8);
