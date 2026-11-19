@@ -316,31 +316,18 @@ impl RuntimeAgentWakeBackend {
                 .ok_or(AgentWakeError::Unavailable),
         }
     }
-}
 
-#[async_trait]
-impl AgentWakeBackend for RuntimeAgentWakeBackend {
-    async fn wake(
+    /// Resolve this instance's live grant for `target_agent`.
+    ///
+    /// Read from canonical config on every call, and again after a wake waits
+    /// for another claim to settle, so an operator edit made in between
+    /// applies before the wake is admitted.
+    fn resolve_wake_grant(
         &self,
-        scope: &PluginInstanceScope,
-        caller_alias: Option<&str>,
+        instance_key: &str,
         target_agent: &str,
-        prompt: &str,
-    ) -> Result<(), AgentWakeError> {
-        if !scope.grants().allows(PluginPermission::AgentDispatch) {
-            return Err(AgentWakeError::AccessDenied);
-        }
-
-        let depth = zeroclaw_spawn::current_plugin_wake_depth();
-        if depth >= MAX_PLUGIN_WAKE_DEPTH {
-            return Err(AgentWakeError::AccessDenied);
-        }
-
+    ) -> Result<WakeGrant, AgentWakeError> {
         let config_snapshot = self.config_snapshot()?;
-        let instance_key = scope
-            .id()
-            .config_entry_key()
-            .map_err(|_| AgentWakeError::Unavailable)?;
         // No row means no operator grant, which is the same answer as an empty
         // `dispatch_agents`: this instance may wake nobody.
         let Some(entry) = config_snapshot
@@ -362,6 +349,9 @@ impl AgentWakeBackend for RuntimeAgentWakeBackend {
         {
             return Err(AgentWakeError::AccessDenied);
         }
+        let rate_limit = entry
+            .dispatch_rate_per_min
+            .unwrap_or(DEFAULT_DISPATCH_RATE_PER_MIN);
 
         let canonical = config_snapshot
             .agents
@@ -369,8 +359,44 @@ impl AgentWakeBackend for RuntimeAgentWakeBackend {
             .find(|(alias, agent)| agent.enabled && alias.eq_ignore_ascii_case(trimmed))
             .map(|(alias, _)| alias.clone())
             .ok_or(AgentWakeError::UnknownAgent)?;
+        Ok(WakeGrant {
+            config_snapshot,
+            canonical,
+            rate_limit,
+        })
+    }
+}
 
-        let slot_key = (instance_key.clone(), canonical.clone());
+/// One resolution of an instance's live grant for a target.
+struct WakeGrant {
+    config_snapshot: Arc<Config>,
+    canonical: String,
+    rate_limit: u32,
+}
+
+#[async_trait]
+impl AgentWakeBackend for RuntimeAgentWakeBackend {
+    async fn wake(
+        &self,
+        scope: &PluginInstanceScope,
+        caller_alias: Option<&str>,
+        target_agent: &str,
+        prompt: &str,
+    ) -> Result<(), AgentWakeError> {
+        if !scope.grants().allows(PluginPermission::AgentDispatch) {
+            return Err(AgentWakeError::AccessDenied);
+        }
+
+        let depth = zeroclaw_spawn::current_plugin_wake_depth();
+        if depth >= MAX_PLUGIN_WAKE_DEPTH {
+            return Err(AgentWakeError::AccessDenied);
+        }
+
+        let instance_key = scope
+            .id()
+            .config_entry_key()
+            .map_err(|_| AgentWakeError::Unavailable)?;
+        let mut grant = self.resolve_wake_grant(&instance_key, target_agent)?;
         // Captured here, on the caller's task: a detached spawn does not
         // inherit task-locals, so the woken turn would otherwise rebuild its
         // full tool surface and escape a headless SOP step's boundary.
@@ -389,10 +415,8 @@ impl AgentWakeBackend for RuntimeAgentWakeBackend {
         // later overwrites share that reservation. A wake is accepted onto a
         // slot only once a worker owns it: a claim still in `Starting` can
         // fail and release the slot, so a wake meeting it waits and retries.
-        let rate_limit = entry
-            .dispatch_rate_per_min
-            .unwrap_or(DEFAULT_DISPATCH_RATE_PER_MIN);
-        loop {
+        let slot_key = loop {
+            let slot_key = (instance_key.clone(), grant.canonical.clone());
             let mut claimant_settled = {
                 let mut slots = self.coordinator.slots.lock();
                 match slots.get_mut(&slot_key) {
@@ -400,7 +424,7 @@ impl AgentWakeBackend for RuntimeAgentWakeBackend {
                         if existing.is_none()
                             && !self
                                 .coordinator
-                                .try_consume_token(&instance_key, rate_limit)
+                                .try_consume_token(&instance_key, grant.rate_limit)
                         {
                             return Err(AgentWakeError::RateLimited);
                         }
@@ -414,7 +438,7 @@ impl AgentWakeBackend for RuntimeAgentWakeBackend {
                             .with_outcome(::zeroclaw_log::EventOutcome::Success)
                             .with_attrs(::serde_json::json!({
                                 "plugin": scope.id().package(),
-                                "agent": canonical,
+                                "agent": grant.canonical,
                                 "depth": depth,
                             })),
                             "plugin wake coalesced onto the agent's running turn"
@@ -427,20 +451,30 @@ impl AgentWakeBackend for RuntimeAgentWakeBackend {
                     None => {
                         if !self
                             .coordinator
-                            .try_consume_token(&instance_key, rate_limit)
+                            .try_consume_token(&instance_key, grant.rate_limit)
                         {
                             return Err(AgentWakeError::RateLimited);
                         }
                         let (gate, _) = tokio::sync::watch::channel(());
                         slots.insert(slot_key.clone(), WakeSlotState::Starting { gate });
-                        break;
+                        break slot_key;
                     }
                 }
             };
             // `Err` is the expected wake-up: the claimant dropped the gate by
             // handing the slot to its worker or releasing it.
             let _ = claimant_settled.changed().await;
-        }
+            // The wait can outlast an operator edit. Resolve the grant again
+            // from live config before this wake claims the slot or is queued:
+            // a target revoked, disabled or removed meanwhile is refused here,
+            // exactly as on a first call, and the budget follows the edit.
+            grant = self.resolve_wake_grant(&instance_key, target_agent)?;
+        };
+        let WakeGrant {
+            config_snapshot,
+            canonical,
+            ..
+        } = grant;
         // From here every early return releases the slot again.
         let mut slot_guard = SlotGuard::new(Arc::clone(&self.coordinator), slot_key.clone());
 
@@ -2444,6 +2478,85 @@ mod tests {
         );
         assert_eq!(tasks[0].principal_id.as_deref(), Some("sender-2"));
         await_terminal(store.as_ref(), &tasks[0].id).await;
+    }
+
+    /// A wake that waited for another claim to settle must be judged on the
+    /// grant in force when it claims, not the one it saw before waiting. Here
+    /// the operator revokes the target while the second wake waits; when the
+    /// first claim fails and frees the slot, the waiting wake must be refused
+    /// and start nothing.
+    #[tokio::test]
+    async fn waiting_wake_rechecks_a_grant_revoked_while_it_waited() {
+        let workspace = tempfile::TempDir::new().expect("temp data dir");
+        let key = instance_key();
+        let mut initial = base_config(workspace.path());
+        initial.plugins.entries = vec![entry(&key, &["recipient"], None)];
+        let live = zeroclaw_config::live::LiveConfig::new(initial);
+
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let (control_plane, store) = gated_control_plane(workspace.path(), 1, &entered, &release);
+        let coordinator = Arc::new(SharedWakeCoordinator::new());
+        let backend = Arc::new(RuntimeAgentWakeBackend::for_tests(
+            Arc::new(base_config(workspace.path())),
+            Some(live.handle()),
+            None,
+            Some(control_plane),
+            Arc::clone(&coordinator),
+        ));
+
+        // The first wake claims the slot and stalls inside its registration.
+        let first = {
+            let backend = Arc::clone(&backend);
+            zeroclaw_spawn::spawn!(async move {
+                backend
+                    .wake(&scope(), Some("sender-1"), "recipient", "first")
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(10), entered.notified())
+            .await
+            .expect("the first wake reaches its registration");
+
+        // A second wake, granted when it arrives, waits on the held claim.
+        let second = {
+            let backend = Arc::clone(&backend);
+            zeroclaw_spawn::spawn!(async move {
+                backend
+                    .wake(&scope(), Some("sender-2"), "recipient", "second")
+                    .await
+            })
+        };
+        await_contended(&coordinator, &pair()).await;
+
+        // The operator revokes the target while the second wake waits.
+        let mut revoked = live.snapshot();
+        revoked.plugins.entries = vec![entry(&key, &[], None)];
+        let revision = live.next_revision().expect("revision available");
+        live.publish(revision, revoked)
+            .expect("publication accepted");
+
+        // The first registration fails and frees the slot.
+        release.notify_one();
+        assert_eq!(
+            first.await.expect("first wake task"),
+            Err(AgentWakeError::Unavailable)
+        );
+        let second = tokio::time::timeout(Duration::from_secs(10), second)
+            .await
+            .expect("the second wake settles")
+            .expect("second wake task");
+        assert_eq!(
+            second,
+            Err(AgentWakeError::AccessDenied),
+            "a wake must not claim a slot under a grant revoked while it waited"
+        );
+
+        await_slots_released(&coordinator).await;
+        assert!(
+            tasks_for(store.as_ref(), "recipient").await.is_empty(),
+            "a revoked wake starts no turn"
+        );
     }
 
     /// The worker's own follow-up registration can fail too. A wake that

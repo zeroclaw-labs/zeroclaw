@@ -500,8 +500,9 @@ Every call passes five host-owned checks before spawning a turn:
    that reservation. An exhausted bucket returns `rate-limited` immediately.
    A wake is accepted onto a pair only once a worker owns it: a wake that
    arrives while another wake is still being admitted and registered waits for
-   that claim to settle, then coalesces or claims the pair itself, so a failed
-   claim never drops a wake that already returned success. The follow-up
+   that claim to settle, re-resolves the live grant and target (so an operator
+   edit made while it waited applies), then coalesces or claims the pair
+   itself, so a failed claim never drops a wake that already returned success. The follow-up
    re-checks live grants and target availability before running; a follow-up
    that cannot run is skipped and the next pending wake is drained, rather than
    releasing the pair with accepted wakes still queued.
