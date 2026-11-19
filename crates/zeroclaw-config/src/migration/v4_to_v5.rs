@@ -47,15 +47,13 @@ pub(super) fn preserve_strict_tool_parsing(value: &mut toml::Value) -> Result<()
                 .and_then(toml::Value::as_str)
                 .map(str::trim)
                 .filter(|value| !value.is_empty());
+            // V4 resolved this setting exclusively from the runtime profile;
+            // the agent-inline key was already inert and is retired at V4.
+            // Do not let that stale key override the canonical profile policy.
             let strict = agent
-                .get("strict_tool_parsing")
-                .and_then(toml::Value::as_bool)
-                .unwrap_or_else(|| {
-                    agent
-                        .get("runtime_profile")
-                        .and_then(toml::Value::as_str)
-                        .is_some_and(|profile| strict_profiles.contains(profile))
-                });
+                .get("runtime_profile")
+                .and_then(toml::Value::as_str)
+                .is_some_and(|profile| strict_profiles.contains(profile));
             let mut references = Vec::new();
             if let Some(reference) =
                 model_provider.and_then(|reference| legacy_model_selection(models, reference))
@@ -700,27 +698,28 @@ model = "primary"
 id = "fast"
 [agents.primary]
 model_provider = "ollama.main.us"
-strict_tool_parsing = {strict_primary}
+runtime_profile = "route_policy"
 [agents.named]
 model_provider = "ollama.main.us.fast"
-strict_tool_parsing = {}
+runtime_profile = "route_policy"
+[runtime_profiles.route_policy]
+strict_tool_parsing = {strict_primary}
 [[model_routes]]
 hint = "fast"
 model_provider = "ollama.main.us.fast"
 "#,
-                !strict_primary
             );
             let config = crate::migration::migrate_to_current(&input).unwrap();
             let route = &config.model_routes[0].model_ref;
             assert_eq!(
                 config.model_text_extraction(route).tool_calls,
-                strict_primary
+                !strict_primary
             );
             assert_eq!(
                 config
                     .model_text_extraction("ollama.main.us.fast")
                     .tool_calls,
-                strict_primary
+                !strict_primary
             );
         }
     }
@@ -787,9 +786,11 @@ id = "fast"
 temperature = 0.2
 [agents.strict]
 model_provider = "ollama.main.fast"
-strict_tool_parsing = true
+runtime_profile = "strict"
 [agents.normal]
 model_provider = "ollama.main"
+[runtime_profiles.strict]
+strict_tool_parsing = true
 "#;
         let config = crate::migration::migrate_to_current(input).unwrap();
         let registry = config.provider_registry().unwrap();
@@ -848,9 +849,11 @@ fallback = ["backup"]
 model = "backup"
 [agents.strict]
 model_provider = "ollama.main"
-strict_tool_parsing = true
+runtime_profile = "strict"
 [agents.normal]
 model_provider = "ollama.backup"
+[runtime_profiles.strict]
+strict_tool_parsing = true
 "#;
         let error = migrate_file(input).unwrap_err();
         assert!(
