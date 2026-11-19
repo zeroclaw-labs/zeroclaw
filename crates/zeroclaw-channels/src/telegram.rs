@@ -2021,7 +2021,13 @@ impl TelegramChannel {
         if let Some(user_id) = user_id.as_deref() {
             identities.push(user_id);
         }
-        self.is_any_user_allowed(identities)
+        if self.is_any_user_allowed(identities) {
+            return true;
+        }
+        callback
+            .pointer("/message/chat/id")
+            .and_then(serde_json::Value::as_i64)
+            .is_some_and(|chat_id| self.is_trusted_group_chat_id(chat_id))
     }
 
     async fn prevalidate_model_picker_callback(&self, callback: &serde_json::Value) -> bool {
@@ -4711,6 +4717,13 @@ impl TelegramChannel {
         )
     }
 
+    fn is_trusted_group_chat_id(&self, chat_id: i64) -> bool {
+        (self.trusted_group_resolver)()
+            .iter()
+            .filter_map(|entry| entry.trim().parse::<i64>().ok())
+            .any(|trusted_id| trusted_id < 0 && trusted_id == chat_id)
+    }
+
     /// Whether `message` originates from a group or supergroup listed in
     /// `channels.telegram.<alias>.trusted_groups`.
     fn is_trusted_group_message(&self, message: &serde_json::Value) -> bool {
@@ -4724,10 +4737,7 @@ impl TelegramChannel {
         else {
             return false;
         };
-        (self.trusted_group_resolver)()
-            .iter()
-            .filter_map(|entry| entry.trim().parse::<i64>().ok())
-            .any(|trusted_id| trusted_id < 0 && trusted_id == chat_id)
+        self.is_trusted_group_chat_id(chat_id)
     }
 
     /// Inbound admission for the message parsers: the sender allowlist admits
@@ -4756,7 +4766,18 @@ impl TelegramChannel {
         ) {
             return true;
         }
-        !identities.is_empty() && self.is_trusted_group_message(message)
+        if identities.is_empty() || !self.is_trusted_group_message(message) {
+            return false;
+        }
+        // `/bind` must reach the pairing path, not the agent. The listener
+        // only calls `handle_unauthorized_message` after every parser declines
+        // the update, so admitting the bind text here would turn the one-time
+        // code into ordinary model input.
+        let bind_text = message
+            .get("text")
+            .or_else(|| message.get("caption"))
+            .and_then(serde_json::Value::as_str);
+        !bind_text.is_some_and(|text| Self::extract_bind_code(text).is_some())
     }
 
     fn approval_callback_context(callback: &serde_json::Value) -> (Vec<String>, Option<String>) {
@@ -17131,6 +17152,39 @@ mod tests {
         assert!(
             ch.parse_update_message(&update).is_none(),
             "an ignore entry must win over the trusted-group grant"
+        );
+    }
+
+    #[test]
+    fn trusted_group_bind_command_does_not_reach_the_agent() {
+        let ch = telegram_channel_with_trusted_groups(false, vec!["-100200300".into()]);
+        let update = serde_json::json!({
+            "update_id": 26,
+            "message": {
+                "message_id": 78,
+                "text": "/bind 123456",
+                "from": { "id": 777, "username": "stranger" },
+                "chat": { "id": -100_200_300, "type": "supergroup" }
+            }
+        });
+
+        assert!(
+            ch.parse_update_message(&update).is_none(),
+            "a trusted-group bind command must fall through to the pairing handler"
+        );
+    }
+
+    #[test]
+    fn trusted_group_model_picker_callback_is_allowed() {
+        let ch = telegram_channel_with_trusted_groups(false, vec!["-100200300".into()]);
+        let callback = serde_json::json!({
+            "from": { "id": 777, "username": "stranger" },
+            "message": { "chat": { "id": -100_200_300, "type": "supergroup" } }
+        });
+
+        assert!(
+            ch.model_picker_callback_user_is_allowed(&callback),
+            "the non-approval model picker must follow the trusted-group grant"
         );
     }
 

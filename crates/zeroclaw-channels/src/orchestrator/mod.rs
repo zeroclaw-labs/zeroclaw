@@ -11909,6 +11909,39 @@ fn text_gate_reply_matches_approval_route(
         })
 }
 
+/// Text SOP-gate answers from Telegram must still come from a peer-authorized
+/// sender. `trusted_groups` admits group members to the agent, but it must not
+/// turn a group member into an approval authority for a parked SOP run.
+fn telegram_sop_reply_is_peer_authorized(
+    msg: &zeroclaw_api::channel::ChannelMessage,
+    config: &zeroclaw_config::schema::Config,
+) -> bool {
+    if msg.channel != "telegram" {
+        return true;
+    }
+    let Some(alias) = msg.channel_alias.as_deref() else {
+        return false;
+    };
+    let normalize = |entry: &str| {
+        let (prefix, rest) = match entry.strip_prefix('!') {
+            Some(rest) => ("!", rest),
+            None => ("", entry),
+        };
+        format!("{prefix}{}", rest.trim().trim_start_matches('@'))
+    };
+    let peers: Vec<String> = config
+        .channel_external_peers("telegram", alias)
+        .into_iter()
+        .map(|peer| normalize(&peer))
+        .collect();
+    let mut identities: Vec<String> = vec![normalize(&msg.sender)];
+    if let Some(sender_id) = msg.platform_sender_id.as_deref() {
+        identities.push(normalize(sender_id));
+    }
+    let identities: Vec<&str> = identities.iter().map(String::as_str).collect();
+    crate::allowlist::is_identity_allowed(&peers, &identities, crate::allowlist::Match::Sensitive)
+}
+
 /// Resolve a SOP gate answered from a chat channel. Two answer forms converge
 /// here, per the channel-agnostic gate-prompt seam:
 ///
@@ -12097,6 +12130,24 @@ async fn dispatch_channel_sop_gate(
             Form::Text => false,
         };
     };
+
+    if matches!(form, Form::Text) && !telegram_sop_reply_is_peer_authorized(msg, config) {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({
+                    "run_id": run_id,
+                    "reference": reference,
+                    "sender": msg.sender.as_str(),
+                    "channel": channel_key_for_message(msg),
+                })),
+            "telegram SOP-gate text reply rejected: sender is not peer-authorized"
+        );
+        // Consume the text so it cannot become an agent turn, but do not
+        // resolve the gate. A peer-authorized sender can still answer it.
+        return true;
+    }
 
     use zeroclaw_api::channel::GateChoiceKind;
     use zeroclaw_runtime::sop::approval::ApprovalDecision;
@@ -58019,6 +58070,15 @@ Done."#;
         dispatch_channel_sop_gate(router, msg, &config, &[], &route_keys).await
     }
 
+    async fn dispatch_test_channel_sop_gate_with_config(
+        router: &AgentRouter,
+        msg: &ChannelMessage,
+        config: &zeroclaw_config::schema::Config,
+    ) -> bool {
+        let route_keys = vec![channel_key_for_message(msg)];
+        dispatch_channel_sop_gate(router, msg, config, &[], &route_keys).await
+    }
+
     #[tokio::test]
     async fn dispatch_channel_sop_event_ignores_user_controlled_subject() {
         // An email-shaped message: the reserved prefix sits in the
@@ -58172,6 +58232,71 @@ Done."#;
         assert_eq!(
             active_run_status(&engine, &run_id),
             Some(zeroclaw_runtime::sop::types::SopRunStatus::WaitingApproval)
+        );
+    }
+
+    #[tokio::test]
+    async fn sop_gate_text_reply_from_trusted_group_requires_peer_authorization() {
+        let (router, engine, run_id) =
+            parked_channel_gate_router(Some("prod"), Some("telegram.home:-100200300"));
+        let config = zeroclaw_config::schema::Config::default();
+        let msg = ChannelMessage {
+            channel: "telegram".to_string(),
+            channel_alias: Some("home".to_string()),
+            sender: "stranger".to_string(),
+            platform_sender_id: Some("777".to_string()),
+            reply_target: "-100200300".to_string(),
+            content: format!("approve {run_id}"),
+            internal_sop_event: None,
+            ..ChannelMessage::new("1", "stranger", "-100200300", "", "telegram", 0)
+        };
+
+        assert!(
+            dispatch_test_channel_sop_gate_with_config(&router, &msg, &config).await,
+            "a trusted-group text reply must be consumed, not become an agent turn"
+        );
+        assert_eq!(
+            active_run_status(&engine, &run_id),
+            Some(zeroclaw_runtime::sop::types::SopRunStatus::WaitingApproval),
+            "a sender admitted only through trusted_groups must not resolve the gate"
+        );
+    }
+
+    #[tokio::test]
+    async fn sop_gate_text_reply_from_peer_authorized_telegram_sender_resolves() {
+        use zeroclaw_config::multi_agent::{PeerGroupConfig, PeerUsername};
+        use zeroclaw_config::providers::ChannelRef;
+
+        let (router, engine, run_id) =
+            parked_channel_gate_router(Some("prod"), Some("telegram.home:-100200300"));
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.peer_groups.insert(
+            "telegram_home".to_string(),
+            PeerGroupConfig {
+                channel: ChannelRef::new("telegram.home".to_string()),
+                external_peers: vec![PeerUsername::new("operator".to_string())],
+                ..Default::default()
+            },
+        );
+        let msg = ChannelMessage {
+            channel: "telegram".to_string(),
+            channel_alias: Some("home".to_string()),
+            sender: "operator".to_string(),
+            platform_sender_id: Some("111".to_string()),
+            reply_target: "-100200300".to_string(),
+            content: format!("approve {run_id}"),
+            internal_sop_event: None,
+            ..ChannelMessage::new("1", "operator", "-100200300", "", "telegram", 0)
+        };
+
+        assert!(
+            dispatch_test_channel_sop_gate_with_config(&router, &msg, &config).await,
+            "a peer-authorized text reply must still be consumed as a gate answer"
+        );
+        assert_ne!(
+            active_run_status(&engine, &run_id),
+            Some(zeroclaw_runtime::sop::types::SopRunStatus::WaitingApproval),
+            "a peer-authorized sender must be able to resolve the gate"
         );
     }
 
