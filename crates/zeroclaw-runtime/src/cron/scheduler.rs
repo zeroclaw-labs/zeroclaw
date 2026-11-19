@@ -584,12 +584,13 @@ pub async fn run_with_capability(
 /// Polling goes on while jobs run, so a long job holds one slot and the other
 /// due jobs start in the free ones. When a job finishes, its slot goes at once
 /// to a job that was already due at the last poll; a job that falls due later,
-/// the finished one included, waits for the next poll. Jobs are claimed only
-/// for free slots, and each claimed job starts or is released right away, so
-/// no claim waits unstarted. The runs live in this future, not in spawned
-/// tasks: dropping the scheduler drops them, as the daemon does when its
-/// shutdown grace ends. On cancellation no new job starts, and the running
-/// jobs are driven to completion before the loop returns.
+/// the finished one included, waits for the next poll. Jobs are claimed one at a time for free slots, and each claimed job starts
+/// or is released right away, so no claim waits unstarted. A job that cannot
+/// start is released and leaves its slot to the next due job. The runs live in
+/// this future, not in spawned tasks: dropping the scheduler drops them, as
+/// the daemon does when its shutdown grace ends. On cancellation no new job
+/// starts, and the running jobs are driven to completion before the loop
+/// returns.
 async fn poll_due_jobs(
     config: &Config,
     event_tx: &EventBroadcast,
@@ -659,10 +660,25 @@ async fn poll_due_jobs(
                 continue;
             }
         };
-        let jobs = claim_due_jobs(config, jobs.into_iter().take(free_slots).collect());
-        running.extend(jobs.into_iter().filter_map(|job| {
-            prepare_due_job(config, job, component, execution_selection.as_ref())
-        }));
+        // Count the jobs that start, not the rows picked. A job that is
+        // refused (its target is not admitted, or its agent has no security
+        // policy) is released inside `prepare_due_job` and leaves the slot to
+        // the next due job. Each event scans the selection once, so a refused
+        // job is claimed and released at most once per poll or finished run.
+        let mut started = 0;
+        for job in jobs {
+            if started == free_slots {
+                break;
+            }
+            if !claim_due_job(config, &job) {
+                continue;
+            }
+            if let Some(run) = prepare_due_job(config, job, component, execution_selection.as_ref())
+            {
+                running.push(run);
+                started += 1;
+            }
+        }
     }
 }
 
@@ -1002,31 +1018,35 @@ fn agent_job_turn<'a>(
 
 fn claim_due_jobs(config: &Config, jobs: Vec<CronJob>) -> Vec<CronJob> {
     jobs.into_iter()
-        .filter(|job| match claim_job(config, &job.id, Utc::now()) {
-            Ok(true) => true,
-            Ok(false) => {
-                ::zeroclaw_log::record!(
-                    DEBUG,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_attrs(::serde_json::json!({"job_id": job.id})),
-                    "Cron job already in flight; skipping duplicate launch"
-                );
-                false
-            }
-            Err(e) => {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(
-                            ::serde_json::json!({"job_id": job.id, "error": format!("{}", e)})
-                        ),
-                    "Cron job: failed to claim in-flight lock; skipping launch"
-                );
-                false
-            }
-        })
+        .filter(|job| claim_due_job(config, job))
         .collect()
+}
+
+/// Take a selected job's in-flight claim. A job already in flight, or one
+/// whose claim cannot be written, is skipped.
+fn claim_due_job(config: &Config, job: &CronJob) -> bool {
+    match claim_job(config, &job.id, Utc::now()) {
+        Ok(true) => true,
+        Ok(false) => {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"job_id": job.id})),
+                "Cron job already in flight; skipping duplicate launch"
+            );
+            false
+        }
+        Err(e) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"job_id": job.id, "error": format!("{}", e)})),
+                "Cron job: failed to claim in-flight lock; skipping launch"
+            );
+            false
+        }
+    }
 }
 
 async fn process_due_jobs(
@@ -3707,6 +3727,52 @@ mod tests {
                 "after startup recovery the dropped run is due again"
             );
         }
+
+        #[tokio::test]
+        async fn a_job_that_cannot_start_leaves_its_slot_to_the_next_due_job() {
+            const BLOCKED_AGENT: &str = "blocked-agent";
+            let tmp = TempDir::new().unwrap();
+            let mut config = poll_test_config(&tmp, 1).await;
+            let blocked = config.agents[TEST_AGENT].clone();
+            config.agents.insert(BLOCKED_AGENT.into(), blocked);
+            // Due first: every poll picks it before the healthy job.
+            let refused = cron::add_shell_job(
+                &config,
+                BLOCKED_AGENT,
+                None,
+                Schedule::Every { every_ms: 50 },
+                "echo refused",
+            )
+            .unwrap();
+            let healthy = add_every_job(&config, 200, "echo healthy");
+            // A regular file where the blocked agent's workspace directory
+            // goes, so `SecurityPolicy::for_agent` cannot create it.
+            let workspace = config.agent_workspace_dir(BLOCKED_AGENT);
+            if workspace.is_dir() {
+                std::fs::remove_dir_all(&workspace).unwrap();
+            }
+            std::fs::create_dir_all(workspace.parent().unwrap()).unwrap();
+            std::fs::write(&workspace, "not a directory").unwrap();
+            assert!(
+                SecurityPolicy::for_agent(&config, BLOCKED_AGENT).is_err(),
+                "the blocked agent has no security policy, so its job is refused"
+            );
+
+            let healthy_ran = poll_until(&config, TEST_POLL_EVERY, Duration::from_secs(10), || {
+                !runs_oldest_first(&config, &healthy).is_empty()
+            })
+            .await;
+            assert!(
+                healthy_ran,
+                "with one slot, a job that cannot start must not keep the job due after it from running"
+            );
+            assert!(runs_oldest_first(&config, &refused).is_empty());
+            assert!(
+                !is_claimed(&config, &refused),
+                "the refused job is released, not left claimed"
+            );
+        }
+
     }
 
     #[tokio::test]
