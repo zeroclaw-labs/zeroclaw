@@ -11963,9 +11963,11 @@ impl RpcDispatcher {
         }
 
         // Map-keyed sections surface even when empty.
-        let all_map_paths: Vec<&'static str> =
-            Config::map_key_sections().iter().map(|s| s.path).collect();
-        for &prefix in &all_map_paths
+        let all_map_paths: Vec<String> = Config::map_key_sections()
+            .iter()
+            .map(|s| s.path.clone())
+            .collect();
+        for prefix in all_map_paths
             .iter()
             .filter_map(|p| p.split('.').next())
             .collect::<std::collections::HashSet<_>>()

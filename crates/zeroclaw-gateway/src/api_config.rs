@@ -1347,7 +1347,7 @@ pub struct TemplatesResponse {
 #[derive(Debug, Serialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct TemplateEntry {
-    pub path: &'static str,
+    pub path: String,
     /// `map` for `HashMap<String, T>`, `list` for `Vec<T>`.
     pub kind: &'static str,
     /// Rust type name of the value, e.g. `ModelProviderConfig`.
