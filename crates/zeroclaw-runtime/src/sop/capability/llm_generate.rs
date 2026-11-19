@@ -246,7 +246,7 @@ impl ProviderLlmAdapter {
                 let provider_ref = built.identity().provider_ref().to_owned();
                 let sampling =
                     Temperature::default().for_call(Some(Arc::clone(&config)), &provider_ref);
-                let (provider, _identity, _) = built.into_parts();
+                let (provider, _, _) = built.into_parts();
                 let policy_config = Arc::clone(&config);
                 let resolver =
                     Arc::new(move |model: &str| policy_config.model_text_extraction(model))

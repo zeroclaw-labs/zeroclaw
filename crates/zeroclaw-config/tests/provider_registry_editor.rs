@@ -333,12 +333,15 @@ fn registry_save_rejects_deleting_the_configured_vision_model() {
         .as_object_mut()
         .unwrap()
         .remove("chat.fast.us");
+    // Keep the candidate registry internally valid so the editor reaches its
+    // explicit multimodal reference guard instead of failing while resolving
+    // the fallback table that still points at the removed model.
+    registry["fallback"] = json!({});
 
     let error = stage(&mut config, RegistryEdit { expected, registry }).unwrap_err();
     let message = format!("{error:#}");
     assert!(
-        message.contains("invalid multimodal.vision_model_provider")
-            || (message.contains("chat.fast.us") && message.contains("model does not exist")),
+        message.contains("invalid multimodal.vision_model_provider"),
         "{error:#}"
     );
 }
