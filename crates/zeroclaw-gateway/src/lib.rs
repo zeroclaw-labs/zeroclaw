@@ -1094,7 +1094,10 @@ impl ServeTasks {
         let cancelled = self.0.cancelled.clone();
         // No lock is held here: spawning can drop the task at once (a runtime
         // that has shut down does), and that only updates the count.
-        zeroclaw_spawn::spawn!(async move {
+        // Every connection and HTTP/2 stream is one of these tasks, so their
+        // lifecycle is recorded at DEBUG: at INFO it would fill the runtime
+        // trace with routine traffic.
+        zeroclaw_spawn::spawn!(level = DEBUG, async move {
             // Moves the whole task in. Naming only `task.future` below would
             // capture just that field, and `_done` would take the task off the
             // count as soon as `spawn` returned.
@@ -7955,6 +7958,66 @@ path = "{trigger_path}"
             Arc::strong_count(&owned),
             1,
             "a stream task outlived its gateway's retirement"
+        );
+    }
+
+    /// Each connection, and each stream hyper hands to the executor, is a task
+    /// of the set. Their spawn and completion are recorded at DEBUG, so the
+    /// runtime trace, recorded at INFO by default, does not get a pair of
+    /// records for every connection.
+    #[test]
+    fn serve_tasks_record_their_lifecycle_below_info() {
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut receiver = zeroclaw_log::subscribe_or_install();
+        let test_case = "serve-tasks-lifecycle-level";
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(::zeroclaw_log::scope!(test_case: test_case, => async {
+            let tasks = ServeTasks::default();
+            tasks.spawn(async {});
+            hyper::rt::Executor::execute(&tasks, async {});
+            tasks.idle().await;
+        }));
+        drop(runtime);
+
+        let mut records = Vec::new();
+        loop {
+            let event = match receiver.try_recv() {
+                Ok(event) => event,
+                // Other tests log into the same capture; a lagged receiver
+                // has only dropped older events, so keep reading.
+                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => continue,
+                Err(_) => break,
+            };
+            if event
+                .pointer("/attributes/test_case")
+                .and_then(|v| v.as_str())
+                == Some(test_case)
+                && event.pointer("/attributes/task_site").is_some()
+            {
+                records.push(format!(
+                    "{} {}",
+                    event["severity_text"].as_str().unwrap_or_default(),
+                    event["message"].as_str().unwrap_or_default()
+                ));
+            }
+        }
+        zeroclaw_log::clear_broadcast_hook();
+
+        records.sort();
+        assert_eq!(
+            records,
+            [
+                "DEBUG task complete",
+                "DEBUG task complete",
+                "DEBUG task spawned",
+                "DEBUG task spawned",
+            ],
+            "a connection's or stream's task lifecycle must stay out of the INFO trace"
         );
     }
 
