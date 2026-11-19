@@ -420,6 +420,7 @@ impl ProviderRegistry {
             unreachable!("selection checks capability")
         };
         let mut options = super::AsrOptionsPatch::default();
+        let mut endpoint = None;
         let mut request_timeout_secs = None;
         if let Some((preset, defaults)) = selection.connection.asr_defaults() {
             if let Some(preset) = preset {
@@ -436,11 +437,13 @@ impl ProviderRegistry {
             apply_asr_preset(&self.model_presets, preset, &mut options)?;
         }
         if let Some(api) = &model.api {
+            endpoint = api.endpoint.clone();
             request_timeout_secs = api.request_timeout_secs.clone().or(request_timeout_secs);
         }
         options.overlay(&model.options);
         Ok(ResolvedAsr {
             selection,
+            endpoint,
             request_timeout_secs,
             options,
         })
@@ -593,6 +596,7 @@ pub struct ResolvedTts<'a> {
 #[derive(Debug, Clone)]
 pub struct ResolvedAsr<'a> {
     pub selection: super::ModelSelection<'a>,
+    pub endpoint: Option<String>,
     pub request_timeout_secs: Option<Override<NonZeroU64>>,
     pub options: super::AsrOptionsPatch,
 }
