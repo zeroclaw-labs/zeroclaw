@@ -55,8 +55,6 @@ pub use crate::reddit::RedditChannel;
 pub use crate::signal::SignalChannel;
 #[cfg(feature = "channel-slack")]
 pub use crate::slack::SlackChannel;
-pub use crate::transcription;
-pub use crate::tts::{TtsManager, TtsProvider};
 #[cfg(feature = "channel-twitch")]
 pub use crate::twitch::TwitchChannel;
 #[cfg(feature = "channel-twitter")]
@@ -9455,8 +9453,10 @@ async fn process_channel_message_body(
         // but typed providers are configured), fall back to an empty shell
         // so with_typed_providers() can still populate the registry.
         let transcription_manager = {
-            let base = crate::transcription::TranscriptionManager::new(&ctx.transcription_config)
-                .unwrap_or_else(|_| crate::transcription::TranscriptionManager::empty());
+            let base = zeroclaw_providers::transcription::TranscriptionManager::new(
+                &ctx.transcription_config,
+            )
+            .unwrap_or_else(|_| zeroclaw_providers::transcription::TranscriptionManager::empty());
             let m = base
                 .with_typed_providers(&ctx.prompt_config.providers.transcription)
                 .with_agent_transcription_provider(ctx.agent_transcription_provider.clone());
@@ -13456,7 +13456,7 @@ fn build_channel_by_id(
                                 return None;
                             }
                             let owner = resolve_agent_tts_owner(&config, &tts_channel_key);
-                            Some(crate::tts::TtsManager::from_config_for_agent(
+                            Some(zeroclaw_providers::tts::TtsManager::from_config_for_agent(
                                 &config,
                                 owner.as_deref(),
                             ))
@@ -14542,12 +14542,13 @@ fn resolve_agent_transcription_provider(config: &Config, channel_key: &str) -> S
 fn resolved_transcription_manager(
     config: &Config,
     channel_key: &str,
-) -> Option<Arc<crate::transcription::TranscriptionManager>> {
+) -> Option<Arc<zeroclaw_providers::transcription::TranscriptionManager>> {
     if !config.transcription.enabled {
         return None;
     }
     let provider = resolve_agent_transcription_provider(config, channel_key);
-    match crate::transcription::build_channel_transcription_manager(config, &provider) {
+    match zeroclaw_providers::transcription::build_channel_transcription_manager(config, &provider)
+    {
         Ok(manager) => Some(Arc::new(manager)),
         Err(e) => {
             ::zeroclaw_log::record!(
@@ -14623,7 +14624,7 @@ fn build_configured_discord_channel(
 /// answer for both.
 ///
 /// Returns `None` when no enabled agent owns the channel, which
-/// [`crate::tts::TtsManager::from_config_for_agent`] treats as "fall back to
+/// [`zeroclaw_providers::tts::TtsManager::from_config_for_agent`] treats as "fall back to
 /// the runtime-active agent" — collapsing that to an empty string would
 /// silently drop the fallback.
 #[cfg(feature = "channel-matrix")]
@@ -14708,7 +14709,7 @@ pub(crate) fn build_configured_matrix_channel(
                 return None;
             }
             let owner = resolve_agent_tts_owner(&config, &tts_channel_key);
-            Some(crate::tts::TtsManager::from_config_for_agent(
+            Some(zeroclaw_providers::tts::TtsManager::from_config_for_agent(
                 &config,
                 owner.as_deref(),
             ))
@@ -16225,7 +16226,7 @@ fn collect_configured_channels_with_authority(
                             &config,
                             &transcription_channel_key,
                         );
-                        crate::transcription::build_channel_transcription_manager(
+                        zeroclaw_providers::transcription::build_channel_transcription_manager(
                             &config, &provider,
                         )
                     }),

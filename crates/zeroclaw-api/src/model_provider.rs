@@ -272,6 +272,80 @@ pub struct ChatRequest<'a> {
     pub thinking: Option<NativeThinkingParams>,
 }
 
+impl<'a> ChatRequest<'a> {
+    pub fn new(messages: &'a [ChatMessage]) -> Self {
+        Self {
+            messages,
+            tools: None,
+            thinking: None,
+        }
+    }
+
+    pub fn with_tools(mut self, tools: &'a [ToolSpec]) -> Self {
+        self.tools = Some(tools);
+        self
+    }
+
+    pub fn with_thinking(mut self, thinking: NativeThinkingParams) -> Self {
+        self.thinking = Some(thinking);
+        self
+    }
+}
+
+/// Resolve a temperature from a configuration-independent selection reference.
+pub type SelectionTemperatureResolver = Arc<dyn Fn(&str) -> Option<f64> + Send + Sync>;
+
+/// Explicit sampling input for one logical call and all of its candidates.
+/// `Explicit(None)` omits temperature; configured defaults are opt-in through
+/// a resolver supplied by the caller, without a dependency on configuration.
+#[derive(Clone)]
+pub enum CallSampling {
+    Explicit(Option<f64>),
+    PerSelection {
+        default: Option<f64>,
+        resolve: SelectionTemperatureResolver,
+    },
+}
+
+impl CallSampling {
+    pub fn for_selection(
+        default: Option<f64>,
+        resolve: impl Fn(&str) -> Option<f64> + Send + Sync + 'static,
+    ) -> Self {
+        Self::PerSelection {
+            default,
+            resolve: Arc::new(resolve),
+        }
+    }
+
+    pub fn resolve_for(&self, selection_ref: Option<&str>) -> Option<f64> {
+        match self {
+            Self::Explicit(value) => *value,
+            Self::PerSelection { default, resolve } => {
+                selection_ref.map_or(*default, |reference| resolve(reference))
+            }
+        }
+    }
+
+    /// Select the default for a routed child while retaining candidate-specific
+    /// resolution for reliability wrappers further down the call chain.
+    pub fn for_target(self, selection_ref: &str) -> Self {
+        match self {
+            Self::Explicit(_) => self,
+            Self::PerSelection { resolve, .. } => Self::PerSelection {
+                default: resolve(selection_ref),
+                resolve,
+            },
+        }
+    }
+}
+
+impl From<Option<f64>> for CallSampling {
+    fn from(value: Option<f64>) -> Self {
+        Self::Explicit(value)
+    }
+}
+
 /// A tool result to feed back to the LLM.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolResultMessage {
@@ -671,6 +745,114 @@ pub struct ModelInfo {
 
 #[async_trait]
 pub trait ModelProvider: Send + Sync + crate::attribution::Attributable {
+    /// Preserve candidate-specific sampling while applying a per-call native
+    /// tool-round policy. Composite providers forward both controls together.
+    async fn chat_with_sampling_and_tool_round_policy(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        sampling: CallSampling,
+        policy: ToolRoundPolicy,
+    ) -> anyhow::Result<ChatResponse> {
+        self.chat_with_tool_round_policy(request, model, sampling.resolve_for(None), policy)
+            .await
+    }
+
+    fn stream_chat_with_sampling_and_tool_round_policy(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        sampling: CallSampling,
+        options: StreamOptions,
+        policy: ToolRoundPolicy,
+    ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
+        self.stream_chat_with_tool_round_policy(
+            request,
+            model,
+            sampling.resolve_for(None),
+            options,
+            policy,
+        )
+    }
+
+    async fn chat_with_system_with_sampling(
+        &self,
+        system_prompt: Option<&str>,
+        message: &str,
+        model: &str,
+        sampling: CallSampling,
+    ) -> anyhow::Result<String> {
+        self.chat_with_system(system_prompt, message, model, sampling.resolve_for(None))
+            .await
+    }
+
+    async fn chat_with_history_with_sampling(
+        &self,
+        messages: &[ChatMessage],
+        model: &str,
+        sampling: CallSampling,
+    ) -> anyhow::Result<String> {
+        self.chat_with_history(messages, model, sampling.resolve_for(None))
+            .await
+    }
+
+    async fn chat_with_sampling(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        sampling: CallSampling,
+    ) -> anyhow::Result<ChatResponse> {
+        self.chat(request, model, sampling.resolve_for(None)).await
+    }
+
+    async fn chat_with_tools_with_sampling(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[serde_json::Value],
+        model: &str,
+        sampling: CallSampling,
+    ) -> anyhow::Result<ChatResponse> {
+        self.chat_with_tools(messages, tools, model, sampling.resolve_for(None))
+            .await
+    }
+
+    fn stream_chat_with_system_with_sampling(
+        &self,
+        system_prompt: Option<&str>,
+        message: &str,
+        model: &str,
+        sampling: CallSampling,
+        options: StreamOptions,
+    ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
+        self.stream_chat_with_system(
+            system_prompt,
+            message,
+            model,
+            sampling.resolve_for(None),
+            options,
+        )
+    }
+
+    fn stream_chat_with_history_with_sampling(
+        &self,
+        messages: &[ChatMessage],
+        model: &str,
+        sampling: CallSampling,
+        options: StreamOptions,
+    ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
+        self.stream_chat_with_history(messages, model, sampling.resolve_for(None), options)
+    }
+
+    fn stream_chat_with_sampling(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        sampling: CallSampling,
+        options: StreamOptions,
+    ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
+        self.stream_chat(request, model, sampling.resolve_for(None), options)
+    }
+
     /// Whether repeated requests for `model` are dispatched to one stable
     /// provider/model identity.
     ///
@@ -1020,6 +1202,32 @@ pub trait ModelProvider: Send + Sync + crate::attribution::Attributable {
 /// boilerplate in test and production code.
 #[async_trait]
 impl<T: ModelProvider + ?Sized> ModelProvider for Arc<T> {
+    async fn chat_with_sampling_and_tool_round_policy(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        sampling: CallSampling,
+        policy: ToolRoundPolicy,
+    ) -> anyhow::Result<ChatResponse> {
+        self.as_ref()
+            .chat_with_sampling_and_tool_round_policy(request, model, sampling, policy)
+            .await
+    }
+
+    fn stream_chat_with_sampling_and_tool_round_policy(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        sampling: CallSampling,
+        options: StreamOptions,
+        policy: ToolRoundPolicy,
+    ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
+        self.as_ref()
+            .stream_chat_with_sampling_and_tool_round_policy(
+                request, model, sampling, options, policy,
+            )
+    }
+
     fn supports_single_tool_rounds(&self, model: &str) -> bool {
         self.as_ref().supports_single_tool_rounds(model)
     }
@@ -1051,6 +1259,91 @@ impl<T: ModelProvider + ?Sized> ModelProvider for Arc<T> {
             options,
             policy,
         )
+    }
+
+    async fn chat_with_system_with_sampling(
+        &self,
+        system_prompt: Option<&str>,
+        message: &str,
+        model: &str,
+        sampling: CallSampling,
+    ) -> anyhow::Result<String> {
+        self.as_ref()
+            .chat_with_system_with_sampling(system_prompt, message, model, sampling)
+            .await
+    }
+
+    async fn chat_with_history_with_sampling(
+        &self,
+        messages: &[ChatMessage],
+        model: &str,
+        sampling: CallSampling,
+    ) -> anyhow::Result<String> {
+        self.as_ref()
+            .chat_with_history_with_sampling(messages, model, sampling)
+            .await
+    }
+
+    async fn chat_with_sampling(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        sampling: CallSampling,
+    ) -> anyhow::Result<ChatResponse> {
+        self.as_ref()
+            .chat_with_sampling(request, model, sampling)
+            .await
+    }
+
+    async fn chat_with_tools_with_sampling(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[serde_json::Value],
+        model: &str,
+        sampling: CallSampling,
+    ) -> anyhow::Result<ChatResponse> {
+        self.as_ref()
+            .chat_with_tools_with_sampling(messages, tools, model, sampling)
+            .await
+    }
+
+    fn stream_chat_with_system_with_sampling(
+        &self,
+        system_prompt: Option<&str>,
+        message: &str,
+        model: &str,
+        sampling: CallSampling,
+        options: StreamOptions,
+    ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
+        self.as_ref().stream_chat_with_system_with_sampling(
+            system_prompt,
+            message,
+            model,
+            sampling,
+            options,
+        )
+    }
+
+    fn stream_chat_with_history_with_sampling(
+        &self,
+        messages: &[ChatMessage],
+        model: &str,
+        sampling: CallSampling,
+        options: StreamOptions,
+    ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
+        self.as_ref()
+            .stream_chat_with_history_with_sampling(messages, model, sampling, options)
+    }
+
+    fn stream_chat_with_sampling(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        sampling: CallSampling,
+        options: StreamOptions,
+    ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
+        self.as_ref()
+            .stream_chat_with_sampling(request, model, sampling, options)
     }
 
     fn has_stable_request_identity(&self, model: &str) -> bool {
@@ -1292,6 +1585,41 @@ mod capability_tests {
                 .native_tool_calling,
             "model-aware capability lookup must preserve legacy supports_native_tools overrides"
         );
+    }
+}
+
+#[cfg(test)]
+mod sampling_input_tests {
+    use super::{CallSampling, ChatMessage, ChatRequest};
+
+    #[test]
+    fn explicit_none_omits_temperature_even_for_a_target() {
+        let sampling = CallSampling::Explicit(None).for_target("backup");
+        assert_eq!(sampling.resolve_for(None), None);
+        assert_eq!(sampling.resolve_for(Some("primary")), None);
+    }
+
+    #[test]
+    fn routed_sampling_preserves_candidate_resolution() {
+        let sampling = CallSampling::for_selection(Some(0.7), |name| match name {
+            "primary" => Some(0.2),
+            "backup" => None,
+            _ => Some(0.9),
+        })
+        .for_target("primary");
+        assert_eq!(sampling.resolve_for(None), Some(0.2));
+        assert_eq!(sampling.resolve_for(Some("backup")), None);
+        assert_eq!(sampling.resolve_for(Some("other")), Some(0.9));
+    }
+
+    #[test]
+    fn request_builder_keeps_messages_and_optional_tools() {
+        let messages = [ChatMessage::user("hello")];
+        let tools = [];
+        let request = ChatRequest::new(&messages).with_tools(&tools);
+        assert_eq!(request.messages.len(), 1);
+        assert!(request.tools.unwrap().is_empty());
+        assert!(request.thinking.is_none());
     }
 }
 

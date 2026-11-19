@@ -24,7 +24,7 @@ const GOOGLE_API_KEY_HEADER: &str = "x-goog-api-key";
 /// Map file extension to MIME type for Whisper-compatible transcription APIs.
 /// Canonical accepted-extension predicate — channels reuse this instead of
 /// keeping their own copy of the accepted set.
-pub(crate) fn mime_for_audio(extension: &str) -> Option<&'static str> {
+pub fn mime_for_audio(extension: &str) -> Option<&'static str> {
     match extension.to_ascii_lowercase().as_str() {
         "flac" => Some("audio/flac"),
         "mp3" | "mpeg" | "mpga" => Some("audio/mpeg"),
@@ -41,8 +41,7 @@ pub(crate) fn mime_for_audio(extension: &str) -> Option<&'static str> {
 /// `mime_for_audio`. `None` when the MIME does not map to a format
 /// `resolve_audio_format` accepts. Codec parameters (e.g.
 /// "audio/ogg; codecs=opus") are stripped before matching.
-#[cfg(any(feature = "channel-matrix", test))]
-pub(crate) fn extension_for_audio_mime(mime: &str) -> Option<&'static str> {
+pub fn extension_for_audio_mime(mime: &str) -> Option<&'static str> {
     let mime = mime.split(';').next().unwrap_or(mime).trim();
     match mime.to_ascii_lowercase().as_str() {
         "audio/flac" => Some("flac"),
@@ -104,26 +103,7 @@ fn validate_audio(audio_data: &[u8], file_name: &str) -> Result<(String, &'stati
 
 // ── TranscriptionProvider trait ─────────────────────────────────
 
-/// Trait for speech-to-text transcription_provider implementations.
-#[async_trait]
-pub trait TranscriptionProvider: Send + Sync + ::zeroclaw_api::attribution::Attributable {
-    /// Human-readable transcription_provider name (e.g. "groq", "openai").
-    fn name(&self) -> &str;
-
-    /// Transcribe raw audio bytes. `file_name` includes the extension for
-    /// format detection (e.g. "voice.ogg").
-    async fn transcribe(&self, audio_data: &[u8], file_name: &str) -> Result<String>;
-
-    /// List of supported audio file extensions.
-    fn supported_formats(&self) -> Vec<String> {
-        vec![
-            "flac", "mp3", "mpeg", "mpga", "mp4", "m4a", "ogg", "oga", "opus", "wav", "webm",
-        ]
-        .into_iter()
-        .map(String::from)
-        .collect()
-    }
-}
+use zeroclaw_api::asr::AsrProvider;
 
 /// The Whisper `prompt` field biases recognition toward expected vocabulary;
 /// a blank value would bias it toward nothing, so it is not sent.
@@ -202,7 +182,7 @@ impl GroqProvider {
 }
 
 #[async_trait]
-impl TranscriptionProvider for GroqProvider {
+impl AsrProvider for GroqProvider {
     fn name(&self) -> &str {
         "groq"
     }
@@ -309,7 +289,7 @@ impl OpenAiWhisperProvider {
 }
 
 #[async_trait]
-impl TranscriptionProvider for OpenAiWhisperProvider {
+impl AsrProvider for OpenAiWhisperProvider {
     fn name(&self) -> &str {
         "openai"
     }
@@ -418,7 +398,7 @@ impl DeepgramProvider {
 }
 
 #[async_trait]
-impl TranscriptionProvider for DeepgramProvider {
+impl AsrProvider for DeepgramProvider {
     fn name(&self) -> &str {
         "deepgram"
     }
@@ -523,7 +503,7 @@ impl AssemblyAiProvider {
 }
 
 #[async_trait]
-impl TranscriptionProvider for AssemblyAiProvider {
+impl AsrProvider for AssemblyAiProvider {
     fn name(&self) -> &str {
         "assemblyai"
     }
@@ -722,7 +702,7 @@ impl GoogleSttProvider {
 }
 
 #[async_trait]
-impl TranscriptionProvider for GoogleSttProvider {
+impl AsrProvider for GoogleSttProvider {
     fn name(&self) -> &str {
         "google"
     }
@@ -884,7 +864,7 @@ impl LocalWhisperProvider {
 }
 
 #[async_trait]
-impl TranscriptionProvider for LocalWhisperProvider {
+impl AsrProvider for LocalWhisperProvider {
     fn name(&self) -> &str {
         "local_whisper"
     }
@@ -958,7 +938,7 @@ async fn parse_whisper_response(resp: reqwest::Response) -> Result<String> {
 /// agent's `transcription_provider` reference is the resolved alias for
 /// `transcribe()` calls. there is no global default-provider concept.
 pub struct TranscriptionManager {
-    transcription_providers: HashMap<String, Box<dyn TranscriptionProvider>>,
+    transcription_providers: HashMap<String, Box<dyn AsrProvider>>,
     max_audio_bytes: Option<usize>,
     /// Resolved alias for the agent that owns this manager. Empty when
     /// the agent has no transcription preference (opt-out).
@@ -994,8 +974,7 @@ impl TranscriptionManager {
             bail!("transcription.max_audio_bytes must be greater than zero");
         }
 
-        let mut transcription_providers: HashMap<String, Box<dyn TranscriptionProvider>> =
-            HashMap::new();
+        let mut transcription_providers: HashMap<String, Box<dyn AsrProvider>> = HashMap::new();
 
         Self::register_legacy_providers(&mut transcription_providers, config);
         if let Some(typed) = typed {
@@ -1032,7 +1011,7 @@ impl TranscriptionManager {
     /// Build from the canonical runtime config while binding an already
     /// resolved provider reference. Channel factories use this when routing
     /// has selected an owner separately from the runtime-default agent.
-    pub(crate) fn from_config_with_provider(
+    pub fn from_config_with_provider(
         config: &Config,
         agent_transcription_provider: String,
     ) -> Result<Self> {
@@ -1044,7 +1023,7 @@ impl TranscriptionManager {
     }
 
     fn register_legacy_providers(
-        transcription_providers: &mut HashMap<String, Box<dyn TranscriptionProvider>>,
+        transcription_providers: &mut HashMap<String, Box<dyn AsrProvider>>,
         config: &TranscriptionConfig,
     ) {
         if let Ok(groq) = GroqProvider::from_config("groq", config) {
@@ -1094,7 +1073,7 @@ impl TranscriptionManager {
     }
 
     fn register_typed_providers(
-        transcription_providers: &mut HashMap<String, Box<dyn TranscriptionProvider>>,
+        transcription_providers: &mut HashMap<String, Box<dyn AsrProvider>>,
         typed: &TranscriptionProviders,
     ) {
         for (family, alias, entry) in typed.iter_entries() {
@@ -1102,7 +1081,7 @@ impl TranscriptionManager {
             if transcription_providers.contains_key(&dotted) {
                 continue;
             }
-            let result: Result<Box<dyn TranscriptionProvider>> = match entry {
+            let result: Result<Box<dyn AsrProvider>> = match entry {
                 TranscriptionProviderEntry::Groq(provider_config) => {
                     GroqProvider::from_typed_config(alias, provider_config)
                         .map(|provider| Box::new(provider) as _)
@@ -1225,11 +1204,9 @@ impl TranscriptionManager {
     }
 
     /// The provider `transcribe` will dispatch to, or empty when unbound.
-    /// Test-only: lets channel tests assert the binding without a network
-    /// call. Gated on the two channels whose tests assert it, so no feature
-    /// shape compiles an unused method.
-    #[cfg(all(test, any(feature = "channel-slack", feature = "whatsapp-web")))]
-    pub(crate) fn bound_provider(&self) -> &str {
+    /// Exposes the selected binding without a network call or a second
+    /// provider-selection lookup in downstream consumers.
+    pub fn bound_provider(&self) -> &str {
         &self.agent_transcription_provider
     }
 
@@ -1259,18 +1236,6 @@ impl TranscriptionManager {
 /// 4. Otherwise leave the choice unbound: with several providers a silent
 ///    pick would route audio to an arbitrary vendor, and `transcribe` fails
 ///    loud instead.
-#[cfg(any(
-    feature = "channel-telegram",
-    feature = "channel-discord",
-    feature = "channel-slack",
-    feature = "channel-mattermost",
-    feature = "whatsapp-web",
-    feature = "channel-lark",
-    feature = "channel-line",
-    feature = "channel-qq",
-    feature = "channel-matrix",
-    feature = "voice-wake"
-))]
 fn bind_channel_provider(
     manager: TranscriptionManager,
     agent_provider: &str,
@@ -1301,7 +1266,7 @@ fn bind_channel_provider(
 ///
 /// Registers every configured provider — legacy `[transcription]` and typed
 /// `[providers.transcription.<type>.<alias>]` alike — and binds the provider
-/// per [`bind_channel_provider`]. Built from `Config` rather than a
+/// to the channel's configured selection. Built from `Config` rather than a
 /// `TranscriptionConfig` snapshot so typed providers are visible and
 /// reloadable provider policy is never copied into a channel handle.
 ///
@@ -1309,19 +1274,7 @@ fn bind_channel_provider(
 ///
 /// Returns the manager constructor's error: transcription is enabled but no
 /// provider registered, or an invalid audio bound.
-#[cfg(any(
-    feature = "channel-telegram",
-    feature = "channel-discord",
-    feature = "channel-slack",
-    feature = "channel-mattermost",
-    feature = "whatsapp-web",
-    feature = "channel-lark",
-    feature = "channel-line",
-    feature = "channel-qq",
-    feature = "channel-matrix",
-    feature = "voice-wake"
-))]
-pub(crate) fn build_channel_transcription_manager(
+pub fn build_channel_transcription_manager(
     config: &Config,
     agent_provider: &str,
 ) -> Result<TranscriptionManager> {
@@ -1338,19 +1291,7 @@ pub(crate) fn build_channel_transcription_manager(
 /// returns `None` when transcription is disabled or the manager cannot be
 /// built; the failure is logged once here rather than in every channel, and
 /// the channel stays up without transcription.
-#[cfg(any(
-    feature = "channel-telegram",
-    feature = "channel-discord",
-    feature = "channel-slack",
-    feature = "channel-mattermost",
-    feature = "whatsapp-web",
-    feature = "channel-lark",
-    feature = "channel-line",
-    feature = "channel-qq",
-    feature = "channel-matrix",
-    feature = "voice-wake"
-))]
-pub(crate) fn manager_from_snapshot(
+pub fn manager_from_snapshot(
     config: &TranscriptionConfig,
 ) -> Option<std::sync::Arc<TranscriptionManager>> {
     if !config.enabled {
@@ -1462,7 +1403,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl TranscriptionProvider for StaticTranscriptionProvider {
+    impl AsrProvider for StaticTranscriptionProvider {
         fn name(&self) -> &str {
             "static"
         }
@@ -1491,8 +1432,7 @@ mod tests {
         max_audio_bytes: Option<usize>,
     ) -> (TranscriptionManager, Arc<AtomicUsize>) {
         let calls = Arc::new(AtomicUsize::new(0));
-        let mut transcription_providers: HashMap<String, Box<dyn TranscriptionProvider>> =
-            HashMap::new();
+        let mut transcription_providers: HashMap<String, Box<dyn AsrProvider>> = HashMap::new();
         transcription_providers.insert(
             "static".to_string(),
             Box::new(StaticTranscriptionProvider {
@@ -2905,21 +2845,6 @@ mod tests {
 }
 
 #[cfg(test)]
-#[cfg(all(
-    test,
-    any(
-        feature = "channel-telegram",
-        feature = "channel-discord",
-        feature = "channel-slack",
-        feature = "channel-mattermost",
-        feature = "whatsapp-web",
-        feature = "channel-lark",
-        feature = "channel-line",
-        feature = "channel-qq",
-        feature = "channel-matrix",
-        feature = "voice-wake"
-    )
-))]
 mod channel_builder_tests {
     use super::*;
 
