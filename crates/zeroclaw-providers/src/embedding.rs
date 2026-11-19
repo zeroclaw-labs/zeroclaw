@@ -32,6 +32,7 @@ pub struct OpenAiEmbedding {
     provider_name: String,
     model: String,
     dims: usize,
+    validate_dimensions: bool,
 }
 
 impl OpenAiEmbedding {
@@ -45,6 +46,7 @@ impl OpenAiEmbedding {
             provider_name: "openai".to_owned(),
             model: model.to_owned(),
             dimensions: dims,
+            validate_dimensions: false,
         })
     }
 
@@ -54,6 +56,7 @@ impl OpenAiEmbedding {
             provider_name: config.provider_name,
             model: config.model,
             dims: config.dimensions,
+            validate_dimensions: config.validate_dimensions,
         }
     }
 
@@ -114,7 +117,12 @@ impl EmbeddingProvider for OpenAiEmbedding {
             .send()
             .await?;
 
-        crate::protocols::openai::embedding::vectors(resp, texts.len(), self.dims).await
+        crate::protocols::openai::embedding::vectors(
+            resp,
+            texts.len(),
+            self.validate_dimensions.then_some(self.dims),
+        )
+        .await
     }
 }
 
@@ -125,6 +133,9 @@ pub struct EmbeddingProviderConfig {
     pub(crate) provider_name: String,
     pub(crate) model: String,
     pub(crate) dimensions: usize,
+    // Existing memory callers did not require the endpoint width to match the
+    // configured default. Keep that behavior until the registry consumer cutover.
+    pub(crate) validate_dimensions: bool,
 }
 
 impl EmbeddingProviderConfig {
@@ -145,6 +156,7 @@ impl EmbeddingProviderConfig {
             provider_name: resolved.selection.connection.kind().to_owned(),
             model: model.to_owned(),
             dimensions,
+            validate_dimensions: true,
         })
     }
 }
@@ -190,6 +202,73 @@ pub fn create_embedding_provider(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn factory_none() {
+        assert_eq!(
+            create_embedding_provider("none", None, "model", 1536).dimensions(),
+            0
+        );
+    }
+
+    #[test]
+    fn factory_empty_string_returns_noop() {
+        assert_eq!(
+            create_embedding_provider("", None, "model", 1536).name(),
+            "none"
+        );
+    }
+
+    #[test]
+    fn factory_unknown_provider_returns_noop() {
+        assert_eq!(
+            create_embedding_provider("unknown", None, "model", 1536).name(),
+            "none"
+        );
+    }
+
+    #[test]
+    fn factory_custom_empty_url() {
+        assert_eq!(
+            create_embedding_provider("custom:", None, "model", 768).dimensions(),
+            768
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_factory_preserves_server_dimensions_until_registry_cutover() {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/embeddings"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{"index": 0, "embedding": vec![0.25; 768]}]
+            })))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let legacy =
+            create_embedding_provider(&format!("custom:{}", server.uri()), None, "model", 1536);
+        assert_eq!(legacy.embed_one("query").await.unwrap().len(), 768);
+        let resolved = build_embedding_provider(resolved_config(
+            "custom",
+            Some(&server.uri()),
+            None,
+            "model",
+            1536,
+        ));
+        assert!(
+            resolved
+                .embed_one("query")
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("dimensions")
+        );
+    }
 
     fn resolved_config(
         kind: &str,
@@ -321,6 +400,7 @@ mod tests {
                 provider_name: kind.into(),
                 model: "model".into(),
                 dimensions: 4,
+                validate_dimensions: true,
             });
             assert_eq!(provider.name(), kind);
             assert_eq!(provider.identity(), baseline.identity());

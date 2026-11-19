@@ -10,3 +10,5 @@ will extend the final step with its structural conversion.
 
 Use `zeroclaw config migrate` to write V5. Migration retains versioned backups;
 an older binary must use its pre-upgrade configuration rather than a V5 file.
+Offline edits, including the `model_routing_config` agent tool, require the
+current V5 file; migrate a released V4 file before using those paths.

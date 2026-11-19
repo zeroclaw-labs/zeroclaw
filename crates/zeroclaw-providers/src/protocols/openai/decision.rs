@@ -1,4 +1,6 @@
 //! OpenAI Decisions request wire format.
+//!
+//! Protocol reference: <https://developers.openai.com/api/docs/guides/decisions>.
 
 use anyhow::{Context, Result};
 use serde_json::{Value, json};

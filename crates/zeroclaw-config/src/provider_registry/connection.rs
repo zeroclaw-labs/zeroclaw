@@ -583,14 +583,13 @@ impl ProviderConnection {
         self.with_secret_json(|secret, path| secret.decrypt_in_place(store, path), field)
     }
 
-    pub fn mask_secrets(&mut self) {
-        let Ok(mut value) = serde_json::to_value(&*self) else {
-            return;
-        };
+    pub fn mask_secrets(&mut self) -> anyhow::Result<()> {
+        let mut value = serde_json::to_value(&*self)
+            .context("serialize provider connection before masking secrets")?;
         mask_connection_secrets(&mut value, false);
-        if let Ok(updated) = serde_json::from_value(value) {
-            *self = updated;
-        }
+        *self = serde_json::from_value(value)
+            .context("restore provider connection after masking secrets")?;
+        Ok(())
     }
 
     pub fn restore_secrets_from(&mut self, current: &Self) {

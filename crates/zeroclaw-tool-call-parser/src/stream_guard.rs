@@ -20,6 +20,12 @@ use std::collections::HashSet;
 /// Strips trailing terminal markers (`TERMINAL_MARKERS`) from streaming text
 /// chunks. Handles markers split across multiple chunks, stacked markers, and
 /// markers with arbitrary whitespace between them.
+///
+/// The state machine holds only the possible marker or whitespace suffix. This
+/// keeps ordinary text streaming immediately while retaining enough bytes to
+/// recognize a marker split across deltas. In particular, a delta ending in a
+/// complete marker remains pending until the next delta confirms that it is
+/// terminal metadata rather than inline prose.
 #[derive(Debug, Default)]
 pub struct StreamTerminalMarkerStripper {
     pending: String,
@@ -96,6 +102,9 @@ impl StreamTerminalMarkerStripper {
             return String::new();
         }
 
+        // An incomplete marker followed only by ordinary whitespace is prose,
+        // so the final flush delegates to the non-streaming stripper rather
+        // than discarding the pending suffix unconditionally.
         strip_trailing_terminal_markers(&self.pending)
     }
 }

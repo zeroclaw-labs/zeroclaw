@@ -267,3 +267,50 @@ pub struct ModelSelection<'a> {
     pub provider_id: &'a ProviderId,
     pub connection: &'a ProviderConnection,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::ProviderRegistry;
+
+    const CHAT_CONNECTIONS_AND_MODELS: &str = r#"
+[connections.primary]
+kind = "custom"
+uri = "https://example.test/v1"
+
+[models."chat.primary"]
+capability = "chat"
+provider = "primary"
+model = "primary-model"
+
+[models."chat.backup"]
+capability = "chat"
+provider = "primary"
+model = "backup-model"
+"#;
+
+    #[test]
+    fn fallback_duplicate_targets_are_rejected() {
+        let registry = format!(
+            "{CHAT_CONNECTIONS_AND_MODELS}\n[fallback]\n\"chat.primary\" = [\"chat.backup\", \"chat.backup\"]\n"
+        );
+        let error = toml::from_str::<ProviderRegistry>(&registry).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("fallback contains a duplicate target")
+        );
+    }
+
+    #[test]
+    fn fallback_cycles_are_rejected() {
+        let registry = format!(
+            "{CHAT_CONNECTIONS_AND_MODELS}\n[fallback]\n\"chat.primary\" = [\"chat.backup\"]\n\"chat.backup\" = [\"chat.primary\"]\n"
+        );
+        let error = toml::from_str::<ProviderRegistry>(&registry).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("fallback graph contains a cycle")
+        );
+    }
+}

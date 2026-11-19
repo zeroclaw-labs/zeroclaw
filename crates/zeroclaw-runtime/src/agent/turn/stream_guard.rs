@@ -1,28 +1,18 @@
 //! Runtime adapter for the shared incremental response parser.
 
 use crate::tools::ToolSpec;
-use std::ops::Deref;
 
-#[cfg(test)]
-use zeroclaw_tool_call_parser::ProtocolSuppressionDiagnostic;
-
-pub(crate) use zeroclaw_tool_call_parser::{StreamTerminalMarkerStripper, StreamThinkTagStripper};
+pub(crate) use zeroclaw_tool_call_parser::{
+    ProtocolSuppressionDiagnostic, StreamTerminalMarkerStripper, StreamThinkTagStripper,
+};
 
 /// Runtime owns tool admission and event delivery; the parser crate owns the
 /// incremental protocol state machine. This adapter translates admitted tool
 /// specs into the parser's dependency-free name list. Diagnostics are read
-/// directly from the shared parser, which owns the only copy of its state.
+/// directly from the parser so there is only one source for guard state.
 #[derive(Debug)]
 pub(crate) struct StreamTextGuard {
     inner: zeroclaw_tool_call_parser::StreamTextGuard,
-}
-
-impl Deref for StreamTextGuard {
-    type Target = zeroclaw_tool_call_parser::StreamTextGuard;
-
-    fn deref(&self) -> &Self::Target {
-        &self.inner
-    }
 }
 
 impl StreamTextGuard {
@@ -44,6 +34,14 @@ impl StreamTextGuard {
 
     pub(crate) fn finish(&mut self) -> Option<String> {
         self.inner.finish()
+    }
+
+    pub(crate) fn suppressed_protocol(&self) -> bool {
+        self.inner.suppressed_protocol
+    }
+
+    pub(crate) fn suppression(&self) -> Option<ProtocolSuppressionDiagnostic> {
+        self.inner.suppression
     }
 }
 
@@ -291,7 +289,7 @@ mod stream_text_guard_tests {
     ) -> (String, bool, Option<ProtocolSuppressionDiagnostic>) {
         let mut guard = new_guard();
         let forwarded = push_all(&mut guard, chunks);
-        (forwarded, guard.suppressed_protocol, guard.suppression)
+        (forwarded, guard.suppressed_protocol(), guard.suppression())
     }
 
     /// The scenario with no tool specs at all: the guard still sees the
@@ -331,9 +329,9 @@ mod stream_text_guard_tests {
             forwarded, prefix,
             "prose buffered ahead of a suppressed candidate must be released"
         );
-        assert!(guard.suppressed_protocol);
+        assert!(guard.suppressed_protocol());
         assert_eq!(
-            guard.suppression,
+            guard.suppression(),
             Some(ProtocolSuppressionDiagnostic {
                 detector: "tagged",
                 candidate_offset: prefix.len(),
@@ -357,9 +355,9 @@ mod stream_text_guard_tests {
             ],
         );
         assert_eq!(forwarded, prefix);
-        assert!(guard.suppressed_protocol);
+        assert!(guard.suppressed_protocol());
         assert_eq!(
-            guard.suppression,
+            guard.suppression(),
             Some(ProtocolSuppressionDiagnostic {
                 detector: "function_call",
                 candidate_offset: prefix.len(),
@@ -382,9 +380,9 @@ mod stream_text_guard_tests {
             ],
         );
         assert_eq!(forwarded, prefix);
-        assert!(guard.suppressed_protocol);
+        assert!(guard.suppressed_protocol());
         assert_eq!(
-            guard.suppression,
+            guard.suppression(),
             Some(ProtocolSuppressionDiagnostic {
                 detector: "malformed",
                 candidate_offset: prefix.len(),
@@ -404,9 +402,9 @@ mod stream_text_guard_tests {
         let envelope = "{\"tool_calls\": [{\"function\": {\"name\": \"shell\", \"arguments\": {\"command\": \"ls\"}}}]}";
         let forwarded = push_all(&mut guard, &[format!("{prefix}{envelope}").as_str()]);
         assert_eq!(forwarded, prefix);
-        assert!(guard.suppressed_protocol);
+        assert!(guard.suppressed_protocol());
         assert_eq!(
-            guard.suppression,
+            guard.suppression(),
             Some(ProtocolSuppressionDiagnostic {
                 detector: "function_call",
                 candidate_offset: prefix.len(),
@@ -424,9 +422,9 @@ mod stream_text_guard_tests {
             "{\"toolcalls\": [{\"call_id\": \"call_1\", \"arguments\": {\"command\": \"ls\"}}";
         let forwarded = push_all(&mut guard, &[format!("{prefix}{envelope}").as_str()]);
         assert_eq!(forwarded, prefix);
-        assert!(guard.suppressed_protocol);
+        assert!(guard.suppressed_protocol());
         assert_eq!(
-            guard.suppression,
+            guard.suppression(),
             Some(ProtocolSuppressionDiagnostic {
                 detector: "malformed",
                 candidate_offset: prefix.len(),
@@ -453,10 +451,10 @@ mod stream_text_guard_tests {
         );
         assert_eq!(forwarded, message);
         assert!(
-            !guard.suppressed_protocol,
+            !guard.suppressed_protocol(),
             "an embedded quoted object must not be suppressed"
         );
-        assert!(guard.suppression.is_none());
+        assert!(guard.suppression().is_none());
     }
 
     /// The same object as the entire message is a genuine whole-message
@@ -503,8 +501,8 @@ mod stream_text_guard_tests {
             ],
         );
         assert_eq!(forwarded, message);
-        assert!(!guard.suppressed_protocol);
-        assert!(guard.suppression.is_none());
+        assert!(!guard.suppressed_protocol());
+        assert!(guard.suppression().is_none());
     }
 
     /// The same result object, split after the content key and colon,
@@ -524,8 +522,8 @@ mod stream_text_guard_tests {
             format!("{prefix}{head}{tail}{trailing}"),
             "the split object must be judged when it completes, not on its first fragment"
         );
-        assert!(!guard.suppressed_protocol);
-        assert!(guard.suppression.is_none());
+        assert!(!guard.suppressed_protocol());
+        assert!(guard.suppression().is_none());
     }
 
     /// The one-delta variant: a complete result object followed by
@@ -539,8 +537,8 @@ mod stream_text_guard_tests {
             "{\"tool_call_id\": \"call_1\", \"content\": \"ok\"} and that is the whole shape.";
         let forwarded = push_all(&mut guard, &[prefix, message]);
         assert_eq!(forwarded, format!("{prefix}{message}"));
-        assert!(!guard.suppressed_protocol);
-        assert!(guard.suppression.is_none());
+        assert!(!guard.suppressed_protocol());
+        assert!(guard.suppression().is_none());
     }
 
     /// A result object the stream cuts off never completes, and it
@@ -606,9 +604,9 @@ mod stream_text_guard_tests {
         let envelope = "{\"tool_calls\": [{\"function\": {\"name\": \"shell\", \"arguments\": {\"command\": \"ls\"}}}]}";
         let forwarded = push_all(&mut guard, &[prefix, object, prose, envelope]);
         assert_eq!(forwarded, format!("{prefix}{object}{prose}"));
-        assert!(guard.suppressed_protocol);
+        assert!(guard.suppressed_protocol());
         assert_eq!(
-            guard.suppression,
+            guard.suppression(),
             Some(ProtocolSuppressionDiagnostic {
                 detector: "function_call",
                 candidate_offset: prefix.len() + object.len() + prose.len(),
@@ -641,9 +639,9 @@ mod stream_text_guard_tests {
             format!("{prefix}{object}{prose}"),
             "the completed result quotation and its prose are delivered, the later envelope is not"
         );
-        assert!(guard.suppressed_protocol);
+        assert!(guard.suppressed_protocol());
         assert_eq!(
-            guard.suppression,
+            guard.suppression(),
             Some(ProtocolSuppressionDiagnostic {
                 detector: "function_call",
                 candidate_offset: prefix.len() + object.len() + prose.len(),
@@ -660,9 +658,9 @@ mod stream_text_guard_tests {
         let tail = " \"ok\"}";
         let forwarded = push_all(&mut guard, &[head, tail]);
         assert_eq!(forwarded, "");
-        assert!(guard.suppressed_protocol);
+        assert!(guard.suppressed_protocol());
         assert_eq!(
-            guard.suppression,
+            guard.suppression(),
             Some(ProtocolSuppressionDiagnostic {
                 detector: "malformed",
                 candidate_offset: 0,
@@ -690,8 +688,8 @@ mod stream_text_guard_tests {
             format!("{prefix}{head}{brace}{trailing}"),
             "a payload string is not a protocol key, so the split object must defer, not suppress"
         );
-        assert!(!guard.suppressed_protocol);
-        assert!(guard.suppression.is_none());
+        assert!(!guard.suppressed_protocol());
+        assert!(guard.suppression().is_none());
     }
 
     /// The same escape with the payload string spelling a call-container
@@ -710,8 +708,8 @@ mod stream_text_guard_tests {
             format!("{prefix}{head}{brace}{trailing}"),
             "a payload string is not a protocol key, so the split object must defer, not suppress"
         );
-        assert!(!guard.suppressed_protocol);
-        assert!(guard.suppression.is_none());
+        assert!(!guard.suppressed_protocol());
+        assert!(guard.suppression().is_none());
     }
 
     /// The same escape with an `arguments` key nested one level deeper
@@ -731,8 +729,8 @@ mod stream_text_guard_tests {
             format!("{prefix}{head}{closing}{trailing}"),
             "a nested data key is not a top-level protocol key, so the object must defer"
         );
-        assert!(!guard.suppressed_protocol);
-        assert!(guard.suppression.is_none());
+        assert!(!guard.suppressed_protocol());
+        assert!(guard.suppression().is_none());
     }
 
     /// A quoted LIST of result objects after a preamble, split after the
@@ -753,8 +751,8 @@ mod stream_text_guard_tests {
             format!("{prefix}{head}{tail}{trailing}"),
             "a split result list behind a preamble must defer until it completes, not suppress"
         );
-        assert!(!guard.suppressed_protocol);
-        assert!(guard.suppression.is_none());
+        assert!(!guard.suppressed_protocol());
+        assert!(guard.suppression().is_none());
     }
 
     /// The full split matrix around one result object's identifying keys:
@@ -847,8 +845,8 @@ mod stream_text_guard_tests {
             forwarded, message,
             "the scanner must read through the NBSP the way routing does"
         );
-        assert!(!guard.suppressed_protocol);
-        assert!(guard.suppression.is_none());
+        assert!(!guard.suppressed_protocol());
+        assert!(guard.suppression().is_none());
     }
 
     /// Control for the terminated-not-result-shaped shape: the preamble,
@@ -883,7 +881,7 @@ mod stream_text_guard_tests {
         );
         assert_eq!(forwarded, prefix);
         assert!(
-            !guard.suppressed_protocol,
+            !guard.suppressed_protocol(),
             "the unterminated root defers while the stream runs"
         );
         forwarded.push_str(&guard.push(": \"x\"},}").unwrap_or_default());
@@ -892,7 +890,7 @@ mod stream_text_guard_tests {
             "the trailing comma keeps the root from completing, so the fragment still defers"
         );
         assert!(
-            !guard.suppressed_protocol,
+            !guard.suppressed_protocol(),
             "the verdict waits for the end of the stream when the root never parses"
         );
         assert_eq!(
@@ -900,8 +898,8 @@ mod stream_text_guard_tests {
             Some(object),
             "the fragment is inert, so finish delivers it after the released preamble"
         );
-        assert!(!guard.suppressed_protocol);
-        assert!(guard.suppression.is_none());
+        assert!(!guard.suppressed_protocol());
+        assert!(guard.suppression().is_none());
         assert_eq!(
             guard_outcome(&[message.as_str()]),
             expected,
@@ -935,8 +933,8 @@ mod stream_text_guard_tests {
             format!("{prefix}{object}{trailing}"),
             "the completed object is ordinary JSON and forwards in full at finish"
         );
-        assert!(!guard.suppressed_protocol);
-        assert!(guard.suppression.is_none());
+        assert!(!guard.suppressed_protocol());
+        assert!(guard.suppression().is_none());
     }
 
     /// The classifier-rejected result shape: a prose-prefixed object whose
@@ -971,12 +969,15 @@ mod stream_text_guard_tests {
         let mut forwarded = String::new();
         forwarded.push_str(&guard.push(before).unwrap_or_default());
         assert_eq!(forwarded, "");
-        assert!(!guard.suppressed_protocol, "the unterminated object defers");
+        assert!(
+            !guard.suppressed_protocol(),
+            "the unterminated object defers"
+        );
         forwarded.push_str(&guard.push(after).unwrap_or_default());
         assert_eq!(forwarded, prefix);
-        assert!(guard.suppressed_protocol);
+        assert!(guard.suppressed_protocol());
         assert_eq!(
-            guard.suppression,
+            guard.suppression(),
             Some(ProtocolSuppressionDiagnostic {
                 detector: "malformed",
                 candidate_offset: prefix.len(),
@@ -1017,7 +1018,7 @@ mod stream_text_guard_tests {
         forwarded.push_str(&guard.push(before).unwrap_or_default());
         assert_eq!(forwarded, "");
         assert!(
-            !guard.suppressed_protocol,
+            !guard.suppressed_protocol(),
             "no verdict before the root terminates"
         );
         forwarded.push_str(&guard.push(after).unwrap_or_default());
@@ -1025,14 +1026,14 @@ mod stream_text_guard_tests {
             forwarded, "",
             "the closing delta still defers: the root never parses as a complete value"
         );
-        assert!(!guard.suppressed_protocol);
+        assert!(!guard.suppressed_protocol());
         assert_eq!(
             guard.finish().as_deref(),
             Some(message.as_str()),
             "the inert fragment is released as the tail at finish"
         );
-        assert!(!guard.suppressed_protocol);
-        assert!(guard.suppression.is_none());
+        assert!(!guard.suppressed_protocol());
+        assert!(guard.suppression().is_none());
         assert_eq!(
             guard_outcome(&[before, after]),
             expected,
@@ -1063,8 +1064,8 @@ mod stream_text_guard_tests {
             Some(message.as_str()),
             "the inert quotation is released as the whole tail at finish"
         );
-        assert!(!guard.suppressed_protocol);
-        assert!(guard.suppression.is_none());
+        assert!(!guard.suppressed_protocol());
+        assert!(guard.suppression().is_none());
     }
 
     /// The same message split across deltas, with the span's opening
@@ -1186,7 +1187,7 @@ mod stream_text_guard_tests {
             "the preamble buffers ahead of the candidate while the object arrives"
         );
         assert!(
-            !guard.suppressed_protocol,
+            !guard.suppressed_protocol(),
             "the incomplete call object defers while the stream runs"
         );
         forwarded.push_str(&guard.push(closing).unwrap_or_default());
@@ -1194,9 +1195,9 @@ mod stream_text_guard_tests {
             forwarded, prefix,
             "the closing delta delivers the preamble and withholds the completed call object"
         );
-        assert!(guard.suppressed_protocol);
+        assert!(guard.suppressed_protocol());
         assert_eq!(
-            guard.suppression,
+            guard.suppression(),
             Some(ProtocolSuppressionDiagnostic {
                 detector: "malformed",
                 candidate_offset: prefix.len(),
@@ -1223,9 +1224,9 @@ mod stream_text_guard_tests {
             forwarded, prefix,
             "the prose and the opening backtick are delivered, the envelope is not"
         );
-        assert!(guard.suppressed_protocol);
+        assert!(guard.suppressed_protocol());
         assert_eq!(
-            guard.suppression,
+            guard.suppression(),
             Some(ProtocolSuppressionDiagnostic {
                 detector: "function_call",
                 candidate_offset: prefix.len(),
@@ -1255,9 +1256,9 @@ mod stream_text_guard_tests {
             forwarded, prefix,
             "the prose ahead of the fence is delivered, the fence and everything after it is not"
         );
-        assert!(guard.suppressed_protocol);
+        assert!(guard.suppressed_protocol());
         assert_eq!(
-            guard.suppression,
+            guard.suppression(),
             Some(ProtocolSuppressionDiagnostic {
                 detector: "malformed",
                 candidate_offset: prefix.len(),
@@ -1927,7 +1928,7 @@ mod stream_text_guard_tests {
             .spawn(move || {
                 let mut guard = guard_with_tool();
                 let forwarded = push_all(&mut guard, &[moved.as_str()]);
-                (forwarded, guard.suppressed_protocol)
+                (forwarded, guard.suppressed_protocol())
             })
             .expect("the small-stack thread must spawn");
         let (forwarded, suppressed) = handle.join().expect("the loop must not overflow the stack");
@@ -1970,7 +1971,7 @@ mod stream_text_guard_tests {
             .spawn(move || {
                 let mut guard = guard_with_tool();
                 let forwarded = push_all(&mut guard, &[moved.as_str()]);
-                (forwarded, guard.suppressed_protocol, guard.suppression)
+                (forwarded, guard.suppressed_protocol(), guard.suppression())
             })
             .expect("the small-stack thread must spawn");
         let (forwarded, suppressed, suppression) =

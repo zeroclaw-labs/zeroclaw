@@ -46,7 +46,10 @@ pub(crate) struct SpeechRequest<'a> {
 pub(crate) async fn speech_audio(response: reqwest::Response) -> Result<Vec<u8>> {
     let status = response.status();
     if !status.is_success() {
-        bail!("speech API returned HTTP {status}");
+        bail!(
+            "speech API returned HTTP {status}: {}",
+            super::super::error_body(response).await
+        );
     }
     Ok(response
         .bytes()
@@ -100,7 +103,10 @@ impl TranscriptionClient {
 pub(crate) async fn transcription_text(response: reqwest::Response) -> Result<String> {
     let status = response.status();
     if !status.is_success() {
-        bail!("Transcription API error ({status})");
+        bail!(
+            "Transcription API error ({status}): {}",
+            super::super::error_body(response).await
+        );
     }
     let body: serde_json::Value = response
         .json()
