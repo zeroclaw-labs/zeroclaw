@@ -2397,6 +2397,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn responses_api_key_missing_system_preserves_default_prompt() {
+        let _proxy_guard = crate::RuntimeProxyTestGuard::acquire().await;
+        let (captured, url, server) = capture_responses_bodies(false).await;
+        let provider = OpenAiResponsesModelProvider::builder("test")
+            .api_url(&url)
+            .credential(Some("test-key"))
+            .build();
+        let messages = [ChatMessage::user("hi")];
+        for model in ["gpt-6.2-sol", "gpt-6.1"] {
+            provider
+                .chat(
+                    ProviderChatRequest {
+                        messages: &messages,
+                        tools: None,
+                        thinking: None,
+                    },
+                    model,
+                    None,
+                )
+                .await
+                .expect("chat");
+        }
+        server.abort();
+
+        let bodies = captured.lock().unwrap();
+        let [modern, legacy] = bodies.as_slice() else {
+            panic!("expected two requests, got {}", bodies.len());
+        };
+        let fallback = "You are ZeroClaw, a concise and helpful coding assistant.";
+        let user = serde_json::json!({
+            "type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]
+        });
+        let developer = serde_json::json!({
+            "type": "message", "role": "developer",
+            "content": [{"type": "input_text", "text": fallback}]
+        });
+        assert!(modern.get("instructions").is_none(), "{modern}");
+        assert_eq!(modern["input"], serde_json::json!([developer, &user]));
+        assert_eq!(legacy["instructions"], fallback);
+        assert_eq!(legacy["input"], serde_json::json!([user]));
+    }
+
+    #[tokio::test]
     async fn responses_chat_propagates_usage() {
         use axum::{Json, Router, routing::post};
         use tokio::net::TcpListener;
