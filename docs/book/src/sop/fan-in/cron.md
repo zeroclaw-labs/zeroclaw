@@ -4,6 +4,8 @@
 
 A cron trigger fires on a time window described by a cron expression. Invalid expressions fail closed during parsing and cache build.
 
+This page covers SOP triggers. To run a shell command or an agent prompt on a schedule without a SOP, use the scheduler's jobs instead; see [Scheduled jobs (cron)](../../agents/scheduled-jobs.md).
+
 ## Trigger
 
 {{#sop-trigger cron}}

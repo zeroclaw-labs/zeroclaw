@@ -17,6 +17,12 @@ Switching to another pane parks your draft. Navigation that would replace a pend
 
 Before opening an external personality or Skills editor, Config explains that a successful editor exit imports and saves changed content. You can cancel before launch and continue in the inline editor.
 
+## Rename provider aliases
+
+Model, TTS, and transcription provider aliases can be renamed from Config. Select the alias in its provider family's alias list, or open the alias's settings, and press `e`; the configured `rename_alias` action can replace that key. Type the new name and press Enter to review. The confirmation shows the alias's map path with the old and new names, and a second Enter applies the rename. Escape cancels without changing settings; a rename started from the alias's settings returns to the same tab and field.
+
+The daemon performs the rename and updates existing references to the alias. The confirmation does not list which settings refer to it. On success, Config reloads the list and selects the new name, showing any warnings the daemon returned. A refused rename stays open for editing. If the reply is lost, Config reports that the outcome is unknown, closes the editor, and reloads the aliases; check the current names before renaming again. In Config, rename covers these three provider categories only.
+
 ## Keybinding modifiers
 
 Keybindings use canonical modifier names: `control` is literal Control, `primary` is Command on macOS and Control elsewhere, and `super` is literal Super/Command. For example, `control+c`, `primary+r`, and `alt+shift+up` are portable persisted values. Older `ctrl+...` values are migrated once when the config loads and rewritten to the corresponding canonical spelling.

@@ -78,6 +78,7 @@
   - [Anatomy of an agent](./agents/anatomy.md)
   - [Filesystem components](./agents/filesystem.md)
   - [Running agents](./agents/operating.md)
+  - [Scheduled jobs (cron)](./agents/scheduled-jobs.md)
   - [Multi-agent setup](./agents/multi-agent-setup.md)
   - [Agent portability](./agents/portability.md)
   - [Delegation & SubAgents](./agents/delegation.md)

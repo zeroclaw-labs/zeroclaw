@@ -181,3 +181,26 @@ Tool-result length limits are separate. `max_tool_result_chars` bounds an
 individual result when it is recorded; it does not trim conversation history.
 Provider-side context enforcement is also separate, though a provider overflow
 can trigger the runtime's reactive token-budget trim.
+
+## Settings with no effect
+
+These runtime profile settings are accepted for compatibility but nothing in
+the runtime reads them, so changing them does not change what is sent to the
+model:
+
+| Setting | Status |
+|---|---|
+| `history_pruning.keep_recent` | No effect. No runtime path reads it. |
+| `history_pruning.collapse_tool_results` | No effect. No runtime path reads it. Use `keep_tool_context_turns` to control how much tool output older turns carry. |
+| `context_compression.*` (every field) | No effect. The runtime context compressor was removed. |
+
+`history_pruning.enabled` and `history_pruning.max_tokens` are not in this list:
+together they can lower the token budget, as described in
+[Token budget](#token-budget). To bound context, use `max_context_tokens`,
+`context_compact_ratio`, `max_history_messages`, and `keep_tool_context_turns`.
+
+Config validation reports a `context_compression_unsupported` warning when a
+profile sets `context_compression.enabled = true` or gives any other
+`context_compression` field a non-default value. The warning is logged when the
+config loads and returned to dashboard callers. The two `history_pruning`
+settings above produce no warning.

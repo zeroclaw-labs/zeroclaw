@@ -52,6 +52,18 @@ while this SOP's execution slots are full:
 | `admission_policy` | `parallel` | How a trigger that cannot admit right now is handled (see below). |
 | `max_pending_approvals` | `0` (unlimited) | Upper bound on runs of this SOP parked at a HITL approval simultaneously. Past the bound, further triggers are deferred (backpressure), never silently dropped (except under `drop`). |
 
+A global ceiling applies on top of `max_concurrent`: `max_concurrent_total` in the
+`[sop]` config section (default `4`) caps executing runs across **all** SOPs. A run
+starts only when both its SOP's `max_concurrent` and the global cap have a free
+slot, so raising a SOP's `max_concurrent` above `max_concurrent_total` admits no
+more runs. Parked runs release their slot under both limits and need a free slot
+under both again to resume; a resume that finds them full stays parked and is
+retried later. The capacity refusal (`execution slots full`) names the SOP but not
+the limit, and `zeroclaw sop show` reports only the SOP's own `max_concurrent`. If
+fewer runs of that SOP are executing than its `max_concurrent`, the global cap is
+the one in effect. See the [config reference](../reference/config.md) for the
+`[sop]` settings.
+
 An optional `[decision]` table lets a decision model gate each matched event
 and choose the run's execution mode. See [Decision models](./decision-models.md).
 
