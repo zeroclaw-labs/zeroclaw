@@ -75,7 +75,14 @@ jobs:
         run: mkdir -p web/dist && touch web/dist/.gitkeep
       - name: Install cargo-nextest
         shell: bash
-        run: curl -LsSf "https://get.nexte.st/latest/${{ matrix.nextest-platform }}" | tar zxf - -C "$HOME/.cargo/bin"
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/cargo-nextest.tar.gz"
+          curl -LsSf --retry 5 --retry-delay 3 --retry-all-errors -o "$archive" "https://get.nexte.st/latest/${{ matrix.nextest-platform }}"
+          if command -v cygpath >/dev/null 2>&1; then
+            archive="$(cygpath -u "$archive")"
+          fi
+          tar zxf "$archive" -C "$HOME/.cargo/bin"
       - name: Run tests
         shell: bash
         run: cargo nextest run --locked --workspace --exclude zeroclaw-desktop --no-fail-fast

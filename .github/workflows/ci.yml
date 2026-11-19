@@ -1573,7 +1573,9 @@ jobs:
       - name: Install test system dependencies
         run: bash scripts/ci/apt_install.sh mold expect python3
       - name: Install cargo-nextest
-        run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ~/.cargo/bin
+        run: |
+          curl -LsSf --retry 5 --retry-delay 3 --retry-all-errors -o "$RUNNER_TEMP/cargo-nextest.tar.gz" https://get.nexte.st/latest/linux
+          tar zxf "$RUNNER_TEMP/cargo-nextest.tar.gz" -C ~/.cargo/bin
       - name: Run tests
         run: cargo nextest run --locked --workspace --exclude zeroclaw-desktop
         env:
@@ -1661,7 +1663,9 @@ jobs:
       - name: Install test system dependencies
         run: bash scripts/ci/apt_install.sh mold expect python3
       - name: Install cargo-nextest
-        run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ~/.cargo/bin
+        run: |
+          curl -LsSf --retry 5 --retry-delay 3 --retry-all-errors -o "$RUNNER_TEMP/cargo-nextest.tar.gz" https://get.nexte.st/latest/linux
+          tar zxf "$RUNNER_TEMP/cargo-nextest.tar.gz" -C ~/.cargo/bin
       - name: Run channel feature tests
         run: ${{ matrix.command }}
         env:
@@ -1697,7 +1701,9 @@ jobs:
       - name: Install test system dependencies
         run: bash scripts/ci/apt_install.sh mold expect python3
       - name: Install cargo-nextest
-        run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ~/.cargo/bin
+        run: |
+          curl -LsSf --retry 5 --retry-delay 3 --retry-all-errors -o "$RUNNER_TEMP/cargo-nextest.tar.gz" https://get.nexte.st/latest/linux
+          tar zxf "$RUNNER_TEMP/cargo-nextest.tar.gz" -C ~/.cargo/bin
       - name: Run opt-in tool tests
         run: >-
           cargo nextest run --locked --no-fail-fast
@@ -1749,7 +1755,9 @@ jobs:
       - name: Install test system dependencies
         run: bash scripts/ci/apt_install.sh mold expect python3
       - name: Install cargo-nextest
-        run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ~/.cargo/bin
+        run: |
+          curl -LsSf --retry 5 --retry-delay 3 --retry-all-errors -o "$RUNNER_TEMP/cargo-nextest.tar.gz" https://get.nexte.st/latest/linux
+          tar zxf "$RUNNER_TEMP/cargo-nextest.tar.gz" -C ~/.cargo/bin
       - name: Resolve the CLI-only feature set
         id: features
         run: |
@@ -1800,7 +1808,9 @@ jobs:
       - name: Install mold linker
         run: bash scripts/ci/apt_install.sh mold
       - name: Install cargo-nextest
-        run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ~/.cargo/bin
+        run: |
+          curl -LsSf --retry 5 --retry-delay 3 --retry-all-errors -o "$RUNNER_TEMP/cargo-nextest.tar.gz" https://get.nexte.st/latest/linux
+          tar zxf "$RUNNER_TEMP/cargo-nextest.tar.gz" -C ~/.cargo/bin
       - name: Run memory-postgres feature tests
         run: cargo nextest run --locked -p zeroclaw-memory --features memory-postgres
         env:
@@ -1911,7 +1921,9 @@ jobs:
       - name: Install mold linker
         run: bash scripts/ci/apt_install.sh mold
       - name: Install cargo-nextest
-        run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ~/.cargo/bin
+        run: |
+          curl -LsSf --retry 5 --retry-delay 3 --retry-all-errors -o "$RUNNER_TEMP/cargo-nextest.tar.gz" https://get.nexte.st/latest/linux
+          tar zxf "$RUNNER_TEMP/cargo-nextest.tar.gz" -C ~/.cargo/bin
       - name: Run Landlock tests
         run: cargo nextest run --locked -p zeroclaw-runtime --features sandbox-landlock -- landlock
         env:
@@ -1936,8 +1948,9 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Install cargo-deny
         run: |
-          curl -LsSf https://github.com/EmbarkStudios/cargo-deny/releases/download/0.19.9/cargo-deny-0.19.9-x86_64-unknown-linux-musl.tar.gz \
-            | tar zxf - -C ~/.cargo/bin --strip-components=1
+          curl -LsSf --retry 5 --retry-delay 3 --retry-all-errors -o "$RUNNER_TEMP/cargo-deny.tar.gz" \
+            https://github.com/EmbarkStudios/cargo-deny/releases/download/0.19.9/cargo-deny-0.19.9-x86_64-unknown-linux-musl.tar.gz
+          tar zxf "$RUNNER_TEMP/cargo-deny.tar.gz" -C ~/.cargo/bin --strip-components=1
       - name: Validate scoped lru advisory exception
         run: python3 scripts/ci/lru_advisory_scope_test.py
       - name: Check licenses, sources, and advisories
@@ -1966,8 +1979,9 @@ jobs:
         run: python3 -m unittest discover -s scripts/github -p '*_test.py'
       - name: Install cargo-audit
         run: |
-          curl -LsSf https://github.com/rustsec/rustsec/releases/download/cargo-audit%2Fv0.22.2/cargo-audit-x86_64-unknown-linux-gnu-v0.22.2.tgz \
-            | tar zxf - -C ~/.cargo/bin --strip-components=1
+          curl -LsSf --retry 5 --retry-delay 3 --retry-all-errors -o "$RUNNER_TEMP/cargo-audit.tgz" \
+            https://github.com/rustsec/rustsec/releases/download/cargo-audit%2Fv0.22.2/cargo-audit-x86_64-unknown-linux-gnu-v0.22.2.tgz
+          tar zxf "$RUNNER_TEMP/cargo-audit.tgz" -C ~/.cargo/bin --strip-components=1
       - name: Run cargo audit (RustSec advisory database)
         run: cargo audit
 
