@@ -2021,7 +2021,16 @@ impl TelegramChannel {
         if let Some(user_id) = user_id.as_deref() {
             identities.push(user_id);
         }
-        if self.is_any_user_allowed(identities) {
+        let peers = self.normalized_peer_set();
+        if crate::allowlist::is_identity_denied_by(&peers, &identities, |entry, user| entry == user)
+        {
+            return false;
+        }
+        if crate::allowlist::is_identity_allowed(
+            &peers,
+            &identities,
+            crate::allowlist::Match::Sensitive,
+        ) {
             return true;
         }
         callback
@@ -17185,6 +17194,26 @@ mod tests {
         assert!(
             ch.model_picker_callback_user_is_allowed(&callback),
             "the non-approval model picker must follow the trusted-group grant"
+        );
+    }
+
+    #[test]
+    fn trusted_group_model_picker_callback_rejects_ignored_sender() {
+        let ch = TelegramChannel::new(
+            "token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["!stranger".into()]),
+            false,
+        )
+        .with_trusted_group_resolver(Arc::new(|| vec!["-100200300".into()]));
+        let callback = serde_json::json!({
+            "from": { "id": 777, "username": "stranger" },
+            "message": { "chat": { "id": -100_200_300, "type": "supergroup" } }
+        });
+
+        assert!(
+            !ch.model_picker_callback_user_is_allowed(&callback),
+            "an explicit ignore must win over the trusted-group picker fallback"
         );
     }
 
