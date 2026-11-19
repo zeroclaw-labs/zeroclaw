@@ -688,8 +688,10 @@ fn resolve_qwen_oauth_context(credential_override: Option<&str>) -> QwenOauthPro
     }
 }
 
-/// An optional streaming deadline override. `None` inherits request policy;
-/// `Clear` disables only the streaming total deadline.
+/// An optional streaming total-deadline override. `None` leaves the streaming
+/// total deadline unset; the legacy request timeout remains a non-streaming
+/// policy and only contributes to the separate streaming idle baseline.
+/// `Clear` explicitly disables a previously inherited streaming deadline.
 pub type StreamRequestTimeout =
     Option<zeroclaw_config::provider_registry::Override<std::num::NonZeroU64>>;
 

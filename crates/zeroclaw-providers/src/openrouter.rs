@@ -612,11 +612,7 @@ impl OpenRouterModelProvider {
 
     fn streaming_timeouts(&self) -> super::StreamTimeouts {
         super::StreamTimeouts {
-            request: super::stream_request_timeout(
-                &self.stream_request_timeout,
-                (self.timeout_configured && !self.timeout_disabled)
-                    .then(|| Duration::from_secs(self.timeout_secs)),
-            ),
+            request: super::stream_request_timeout(&self.stream_request_timeout, None),
             read: (!self.read_timeout_disabled).then(|| {
                 self.read_timeout_secs
                     .map_or(super::StreamIdleBound::Fixed(STREAM_IDLE_TIMEOUT), |secs| {
