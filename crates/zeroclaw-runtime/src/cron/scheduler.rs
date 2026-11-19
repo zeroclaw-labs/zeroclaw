@@ -1659,13 +1659,17 @@ async fn run_job_command_with_runtime_and_timeout(
     // Jobs created via the validated helpers were already checked at creation
     // time, but we re-validate at execution time to catch policy changes and
     // manually-edited job stores.
-    if let Err(error) =
-        crate::cron::validate_shell_command_with_security(runtime, security, &job.command, approved)
-    {
-        return (false, error.to_string());
-    }
+    let shell = match crate::cron::validate_shell_command_for_run(
+        runtime,
+        security,
+        &job.command,
+        approved,
+    ) {
+        Ok(shell) => shell,
+        Err(error) => return (false, error.to_string()),
+    };
 
-    if let Some(path) = security.forbidden_path_argument(&job.command) {
+    if let Some(path) = security.forbidden_path_argument_in(&job.command, shell) {
         return (
             false,
             format!("blocked by security policy: forbidden path argument: {path}"),
@@ -1692,6 +1696,9 @@ async fn run_job_command_with_runtime_and_timeout(
         Ok(command) => command,
         Err(error) => return (false, format!("shell setup error: {error}")),
     };
+    if let Err(reason) = security.confirm_built_shell(shell, command.as_std().get_program()) {
+        return (false, format!("blocked by security policy: {reason}"));
+    }
 
     command
         .stdin(Stdio::null())
@@ -2018,6 +2025,79 @@ mod tests {
             1,
             "policy rejection must happen before the runtime builds a command"
         );
+    }
+
+    /// The run-time recheck reads a job in the grammar of the shell the
+    /// runtime will run it with, and refuses it when the runtime built
+    /// another shell instead, before anything is spawned.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cron_recheck_runs_a_bash_read_only_in_bash() {
+        use crate::tools::shell::shell_grammar_test_support::{
+            BASH_ONLY_HEREDOC, MispredictingRuntime, RAN_OUTSIDE_BASH, host_bash,
+            host_shell_other_than_bash, wildcard_policy,
+        };
+        let (Some(bash), Some(other)) = (host_bash(), host_shell_other_than_bash()) else {
+            eprintln!("skipping: needs bash and another POSIX shell");
+            return;
+        };
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let security = wildcard_policy(&config.data_dir);
+        let job = test_job(BASH_ONLY_HEREDOC);
+
+        let runtime = MispredictingRuntime::new(bash.clone(), bash.clone());
+        let (success, output) =
+            run_job_command_with_runtime(&config, &runtime, &security, &job, false).await;
+        assert!(success, "{output}");
+        assert!(output.contains("heredoc body"), "{output}");
+        assert!(!output.contains(RAN_OUTSIDE_BASH), "{output}");
+
+        let runtime = MispredictingRuntime::new(bash, other);
+        let (success, output) =
+            run_job_command_with_runtime(&config, &runtime, &security, &job, false).await;
+        assert!(!success, "{output}");
+        assert!(output.contains("checked as a bash command"), "{output}");
+        assert!(!output.contains(RAN_OUTSIDE_BASH), "{output}");
+        assert_eq!(runtime.builds(), 1);
+    }
+
+    /// A job is written in the grammar every POSIX shell shares, even where
+    /// the scheduler would run it in bash: the shell that runs it is decided
+    /// when it runs.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cron_jobs_are_written_in_the_portable_grammar() {
+        use crate::tools::shell::shell_grammar_test_support::{
+            BASH_ONLY_HEREDOC, MispredictingRuntime, host_bash, wildcard_policy,
+        };
+        let Some(bash) = host_bash() else {
+            eprintln!("skipping: no bash on this host");
+            return;
+        };
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let security = wildcard_policy(&config.data_dir);
+        let runtime = MispredictingRuntime::new(bash.clone(), bash);
+        assert!(
+            crate::cron::validate_shell_command_with_security(
+                &runtime,
+                &security,
+                BASH_ONLY_HEREDOC,
+                false
+            )
+            .is_err()
+        );
+        assert!(
+            crate::cron::validate_shell_command_for_run(
+                &runtime,
+                &security,
+                BASH_ONLY_HEREDOC,
+                false
+            )
+            .is_ok()
+        );
+        assert_eq!(runtime.builds(), 0);
     }
 
     fn unique_component(prefix: &str) -> String {
