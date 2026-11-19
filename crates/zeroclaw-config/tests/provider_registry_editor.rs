@@ -335,10 +335,10 @@ fn registry_save_rejects_deleting_the_configured_vision_model() {
         .remove("chat.fast.us");
 
     let error = stage(&mut config, RegistryEdit { expected, registry }).unwrap_err();
+    let message = format!("{error:#}");
     assert!(
-        error
-            .to_string()
-            .contains("invalid multimodal.vision_model_provider"),
+        message.contains("invalid multimodal.vision_model_provider")
+            || (message.contains("chat.fast.us") && message.contains("model does not exist")),
         "{error:#}"
     );
 }

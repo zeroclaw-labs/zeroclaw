@@ -258,7 +258,7 @@ impl ProviderLlmAdapter {
                         ProviderDispatch::new(Arc::from(provider)).chat_with_system_with_sampling(
                             system.as_deref(),
                             &prompt,
-                            &identity.model_id,
+                            &provider_ref,
                             sampling,
                         ),
                     ))
