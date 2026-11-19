@@ -75,9 +75,11 @@ pub(crate) struct TranscriptionClient {
 impl TranscriptionClient {
     pub(crate) async fn transcribe(&self, audio: &[u8], file_name: &str) -> Result<String> {
         let (file_name, mime) = crate::transcription::validate_audio(audio, file_name)?;
-        let client = self
-            .transport
-            .client(std::time::Duration::from_secs(120), self.service_key)?;
+        let client = self.transport.client_with_policy(
+            Some(std::time::Duration::from_secs(120)),
+            true,
+            self.service_key,
+        )?;
         let form = TranscriptionRequest {
             model: &self.model,
             language: self.language.as_deref(),
@@ -126,9 +128,11 @@ pub(crate) struct SpeechClient {
 
 impl SpeechClient {
     pub(crate) async fn synthesize(&self, text: &str, voice: &str) -> Result<Vec<u8>> {
-        let client = self
-            .transport
-            .client(std::time::Duration::from_secs(60), "channel.tts.openai")?;
+        let client = self.transport.client_with_policy(
+            Some(std::time::Duration::from_secs(60)),
+            true,
+            "channel.tts.openai",
+        )?;
         let body = SpeechRequest {
             model: &self.model,
             input: text,
