@@ -2442,7 +2442,23 @@ impl Memory for SqliteMemory {
 
         let mut count = 0;
         for (id, content) in &entries {
-            if let Ok(Some(emb)) = self.get_or_compute_embedding(content).await {
+            let embedding = match self.get_or_compute_embedding(content).await {
+                Ok(embedding) => embedding,
+                Err(_) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({
+                                "error_key": "memory.reindex_embedding_failed",
+                                "memory_id": id,
+                            })),
+                        "memory reindex: embedding failed; leaving row without a vector for retry"
+                    );
+                    continue;
+                }
+            };
+            if let Some(emb) = embedding {
                 let bytes = vector::vec_to_bytes(&emb);
                 let conn = self.conn.clone();
                 let id = id.clone();
@@ -4608,6 +4624,58 @@ mod tests {
         // FTS should still work after rebuild
         let results = mem.recall("reindex", 10, None, None, None).await.unwrap();
         assert_eq!(results.len(), 2);
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn reindex_logs_empty_embedding_responses_and_preserves_rows_for_retry() {
+        struct EmptyEmbedding;
+
+        #[async_trait::async_trait]
+        impl EmbeddingProvider for EmptyEmbedding {
+            fn name(&self) -> &str {
+                "empty"
+            }
+            fn dimensions(&self) -> usize {
+                4
+            }
+            async fn embed(&self, _texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+                Ok(Vec::new())
+            }
+        }
+
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut events = zeroclaw_log::subscribe_or_install();
+        let (_tmp, mem) = temp_sqlite();
+        mem.store("retry", "retained content", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        let entry = mem.get("retry").await.unwrap().unwrap();
+        mem.swap_embedder(Arc::new(EmptyEmbedding));
+
+        assert_eq!(mem.reindex().await.unwrap(), 0);
+        let mut diagnostic = None;
+        while let Ok(event) = events.try_recv() {
+            if event["attributes"]["error_key"] == "memory.reindex_embedding_failed"
+                && event["attributes"]["memory_id"] == entry.id
+            {
+                diagnostic = Some(event);
+                break;
+            }
+        }
+        let diagnostic =
+            diagnostic.expect("reindex must report a skipped empty embedding response");
+        assert_eq!(diagnostic["severity_text"], "WARN");
+        assert_eq!(
+            mem.get("retry").await.unwrap().unwrap().content,
+            entry.content
+        );
+
+        mem.swap_embedder(Arc::new(FixedEmbedding(4)));
+        assert_eq!(mem.reindex().await.unwrap(), 1);
+        assert_eq!(mem.reindex().await.unwrap(), 0);
     }
 
     // ── Embedding identity primitives──────────────

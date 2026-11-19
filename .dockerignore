@@ -80,5 +80,4 @@ apps/*
 # apps/zerorelay is the nominated relay binary (its own image via apps/zerorelay/Dockerfile);
 # its full source is needed for workspace resolution and the relay build.
 !apps/zerorelay/
-scripts/*
-!scripts/install_windows_prebuilt.ps1
+scripts/
