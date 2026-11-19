@@ -17,10 +17,15 @@ export async function walkConfiguredModelBindings(
   for (const [alias, model] of Object.entries(registry.models)) {
     const connection = registry.connections[model.provider];
     if (model.capability === capability && model.model && connection) {
-      out.push({ type: connection.kind, alias, resource: model.model });
+      out.push({ type: rateProviderFamily(connection.kind), alias, resource: model.model });
     }
   }
   return out;
+}
+
+/** Rate sheets use `custom` for every OpenAI-compatible connection. */
+function rateProviderFamily(kind: string): string {
+  return kind === 'openai-compatible' ? 'custom' : kind;
 }
 
 /**

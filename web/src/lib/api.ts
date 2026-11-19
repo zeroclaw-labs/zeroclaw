@@ -1610,6 +1610,7 @@ export interface SectionInfo {
     | "one_tier_alias_map"
     | "typed_family_map"
     | "backend_picker"
+    | "cost_rates"
     | null;
   /** Backend-owned cost-rate category for this section, emitted from
    *  `cost_category_for_provider_section`. One of `models` / `tts` /

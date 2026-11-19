@@ -54,7 +54,11 @@ pub fn build_model_provider_pricing(config: &Config) -> ModelProviderPricing {
                 }
             }
             if let Some(connection) = registry.connections.get(&chat.provider) {
-                apply_rate_sheet_pricing(config, connection.kind(), &mut slot);
+                apply_rate_sheet_pricing(
+                    config,
+                    zeroclaw_config::providers::rate_provider_family(connection.kind()),
+                    &mut slot,
+                );
             }
             pricing.insert(model_ref.to_string(), slot);
         }
