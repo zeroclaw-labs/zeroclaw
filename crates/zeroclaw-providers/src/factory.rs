@@ -295,7 +295,6 @@ pub fn apply_compat_options(
     mut b: crate::compatible::OpenAiCompatibleBuilder,
     opts: &ModelProviderRuntimeOptions,
 ) -> Box<dyn ModelProvider> {
-    b = b.stream_request_timeout(opts.provider_stream_request_timeout_secs.clone());
     if let Some(native_tools) = opts.native_tools {
         b = b.with_native_tools(native_tools);
     }
@@ -414,7 +413,6 @@ fn build_responses_provider_if_requested(
         return None;
     }
     let mut builder = crate::openai::OpenAiResponsesModelProvider::builder(alias)
-        .stream_request_timeout(opts.provider_stream_request_timeout_secs.clone())
         .credential(key)
         .single_tool_rounds_supported(single_tool_rounds_supported);
     if let Some(url) = base_url {
@@ -514,60 +512,6 @@ pub fn dispatch_family_factory(
         }
     }
     zeroclaw_config::for_each_model_provider_slot!(emit_dispatch)
-}
-
-/// Legacy fallback authentication admission for the pre-registry path.
-/// Canonical selections use [`canonical_auth_ready`] below; this adapter is
-/// retained only while the compatibility constructor still walks old profile
-/// entries during migration and fallback materialization.
-pub(crate) fn fallback_auth_ready_for_alias(
-    config: &zeroclaw_config::schema::Config,
-    family: &str,
-    alias: &str,
-    key: Option<&str>,
-    opts: &ModelProviderRuntimeOptions,
-) -> bool {
-    let provider_kind = opts
-        .provider_kind
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or(family);
-    if provider_kind == "openai" {
-        let default_cfg = openai_missing_entry_fallback_config();
-        return config
-            .providers
-            .models
-            .openai
-            .get(alias)
-            .unwrap_or(&default_cfg)
-            .fallback_auth_ready(key, opts);
-    }
-    macro_rules! emit_auth_ready {
-        ($(($field:ident, $type_str:literal, $cfg_ty:ty)),+ $(,)?) => {
-            match provider_kind {
-                "openai-compatible" | "openai_compatible" => {
-                    let default_cfg = zeroclaw_config::schema::ModelProviderConfig::default();
-                    config
-                        .providers
-                        .models
-                        .find("openai", alias)
-                        .unwrap_or(&default_cfg)
-                        .fallback_auth_ready(key, opts)
-                }
-                $($type_str => {
-                    let default_cfg: $cfg_ty;
-                    let cfg = match config.providers.models.$field.get(alias) {
-                        Some(config) => config,
-                        None => { default_cfg = <$cfg_ty>::default(); &default_cfg }
-                    };
-                    cfg.fallback_auth_ready(key, opts)
-                })+
-                _ => has_api_key(key),
-            }
-        };
-    }
-    zeroclaw_config::for_each_model_provider_slot!(emit_auth_ready)
 }
 
 /// Authentication admission for an exact canonical selection. Reuse each
@@ -1251,7 +1195,6 @@ impl FamilyProviderFactory for OpenRouterModelProviderConfig {
         opts: &ModelProviderRuntimeOptions,
     ) -> Result<Box<dyn ModelProvider>> {
         let mut b = crate::openrouter::OpenRouterModelProvider::builder(alias)
-            .stream_request_timeout(opts.provider_stream_request_timeout_secs.clone())
             .credential(key)
             .max_tokens(opts.provider_max_tokens);
         if let Some(t) = opts.provider_timeout_secs {
@@ -1284,7 +1227,6 @@ impl FamilyProviderFactory for AnthropicModelProviderConfig {
         opts: &ModelProviderRuntimeOptions,
     ) -> Result<Box<dyn ModelProvider>> {
         let mut b = crate::anthropic::AnthropicModelProvider::builder(alias)
-            .stream_request_timeout(opts.provider_stream_request_timeout_secs.clone())
             .credential(key)
             .server_fallback_models(self.server_fallback_models.clone())
             .single_tool_rounds_supported(
