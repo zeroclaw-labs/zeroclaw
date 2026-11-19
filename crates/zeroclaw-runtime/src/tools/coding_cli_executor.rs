@@ -33,6 +33,15 @@ impl RuntimeCodingCliExecutor {
 #[async_trait]
 impl CodingCliExecutor for RuntimeCodingCliExecutor {
     async fn output(&self, command: CodingCliCommand) -> Result<Output, CodingCliExecutionError> {
+        if self.sandbox.name() != "none"
+            && (zeroclaw_tools::task_ssh::current().is_some()
+                || std::env::var_os("ZEROCLAW_SSH_TASK_HELPER").is_some())
+        {
+            return Err(CodingCliExecutionError::Prepare(anyhow::Error::msg(
+                crate::i18n::get_required_cli_string("tool-shell-ssh-broker-sandbox-unsupported"),
+            )));
+        }
+
         if let Some(reason) = self.sandbox.coding_cli_unsupported_reason() {
             let backend = self.sandbox.name();
             ::zeroclaw_log::record!(

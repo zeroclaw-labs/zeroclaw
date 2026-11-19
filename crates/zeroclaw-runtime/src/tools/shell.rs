@@ -298,7 +298,10 @@ impl Tool for ShellTool {
 
         // A shared host broker must not be reachable from an OS sandbox,
         // even by discovering its socket in a shared directory such as /tmp.
-        if self.sandbox.name() != "none" && zeroclaw_tools::task_ssh::current().is_some() {
+        if self.sandbox.name() != "none"
+            && (zeroclaw_tools::task_ssh::current().is_some()
+                || std::env::var_os("ZEROCLAW_SSH_TASK_HELPER").is_some())
+        {
             return Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
