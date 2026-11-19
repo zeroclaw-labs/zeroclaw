@@ -1,7 +1,8 @@
 //! Provider-neutral embedding contract.
 
-use async_trait::async_trait;
+use std::fmt;
 
+/// Identity persisted alongside vector data.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EmbeddingIdentity {
     pub provider: String,
@@ -9,8 +10,8 @@ pub struct EmbeddingIdentity {
     pub dimensions: usize,
 }
 
-impl std::fmt::Display for EmbeddingIdentity {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for EmbeddingIdentity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
             "{}/{} ({} dims)",
@@ -19,19 +20,29 @@ impl std::fmt::Display for EmbeddingIdentity {
     }
 }
 
-/// Trait for embedding model_providers — convert text to vectors
-#[async_trait]
+/// A provider that turns text into vectors.
+#[async_trait::async_trait]
 pub trait EmbeddingProvider: Send + Sync {
-    /// ModelProvider name
+    /// Stable provider identifier.
     fn name(&self) -> &str;
 
-    /// Embedding dimensions
+    /// Vector dimensions returned by this provider.
     fn dimensions(&self) -> usize;
 
-    /// Embed a batch of texts into vectors
+    /// Vector-space identity used by storage and refresh consumers. Concrete
+    /// adapters include endpoint identity without exposing credentials.
+    fn identity(&self) -> EmbeddingIdentity {
+        EmbeddingIdentity {
+            provider: self.name().to_owned(),
+            model: String::new(),
+            dimensions: self.dimensions(),
+        }
+    }
+
+    /// Embed a batch of texts.
     async fn embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>>;
 
-    /// Embed a single text
+    /// Embed one text using the batch operation.
     async fn embed_one(&self, text: &str) -> anyhow::Result<Vec<f32>> {
         self.embed(&[text])
             .await?
