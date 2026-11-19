@@ -285,7 +285,15 @@ within their size limit. All compiler and linker diagnostics remain enabled.
 The opt-in ignored test `mcp_video_agent_to_real_qwen` uses the explicit
 `ZEROCLAW_TEST_QWEN_API_KEY`, `ZEROCLAW_TEST_QWEN_ENDPOINT`, and
 `ZEROCLAW_TEST_QWEN_VIDEO` environment variables. It runs an isolated MCP fixture
-and makes paid Qwen requests. Ordinary tests do not contact a real model.
+and makes paid Qwen requests. Run it through the live test entry point:
+
+```sh
+cargo test -p zeroclaw-runtime --features test-util --test live \
+  --config 'profile.test.package.zeroclaw-runtime.opt-level=1' \
+  mcp_video_agent_to_real_qwen -- --ignored --nocapture
+```
+
+Ordinary tests do not contact a real model.
 
 The two other binary MCP content shapes are mapped as follows. A `type: "image"`
 item (base64 `data` + `mimeType`) is materialized the same way and its content
