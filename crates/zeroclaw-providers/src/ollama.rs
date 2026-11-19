@@ -227,7 +227,7 @@ impl OllamaModelProvider {
 
         if requests_cloud && official_cloud_endpoint && self.api_key.is_none() {
             anyhow::bail!(
-                "Model '{}' requested cloud routing, but no API key is configured. Set api_key on [providers.models.ollama.<alias>] or via the schema-mirror grammar.",
+                "Model '{}' requested cloud routing, but no API key is configured. Set auth.api_key on [providers.connections.<key>] or via the schema-mirror grammar.",
                 model
             );
         }
@@ -239,71 +239,6 @@ impl OllamaModelProvider {
 
     fn parse_tool_arguments(arguments: &str) -> serde_json::Value {
         serde_json::from_str(arguments).unwrap_or_else(|_| serde_json::json!({}))
-    }
-
-    fn normalize_response_text(content: String) -> Option<String> {
-        let stripped = Self::strip_think_tags(&content);
-        if stripped.trim().is_empty() {
-            None
-        } else {
-            Some(stripped)
-        }
-    }
-
-    /// Remove `<think>...</think>` blocks from model output.
-    /// Qwen and other reasoning models may embed chain-of-thought inline
-    /// in the `content` field using `<think>` tags.  These must be stripped
-    /// before returning text to the user or parsing for tool calls.
-    fn strip_think_tags(s: &str) -> String {
-        let mut result = String::with_capacity(s.len());
-        let mut rest = s;
-        loop {
-            if let Some(start) = rest.find("<think>") {
-                result.push_str(&rest[..start]);
-                if let Some(end) = rest[start..].find("</think>") {
-                    rest = &rest[start + end + "</think>".len()..];
-                } else {
-                    // Unclosed tag: drop the rest to avoid leaking partial reasoning.
-                    break;
-                }
-            } else {
-                result.push_str(rest);
-                break;
-            }
-        }
-        result.trim().to_string()
-    }
-
-    /// Derive the effective text content from a response, stripping `<think>` tags
-    /// and falling back to the `thinking` field when `content` is empty after
-    /// stripping.  This ensures that tool-call XML tags embedded alongside (or
-    /// after) thinking blocks are preserved for downstream parsing.
-    fn effective_content(content: &str, thinking: Option<&str>) -> Option<String> {
-        // First try the content field with think tags stripped.
-        let stripped = Self::strip_think_tags(content);
-        if !stripped.trim().is_empty() {
-            return Some(stripped);
-        }
-
-        // Content was empty or only thinking — check the thinking field.
-        // Some models (Qwen) put the full output including tool-call XML in
-        // the thinking field when `think: true` is set.
-        if let Some(thinking) = thinking.map(str::trim).filter(|t| !t.is_empty()) {
-            let stripped_thinking = Self::strip_think_tags(thinking);
-            if !stripped_thinking.trim().is_empty() {
-                ::zeroclaw_log::record!(
-                    DEBUG,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-                    &format!(
-                        "Ollama: using thinking field as effective content ({} chars)",
-                        stripped_thinking.len()
-                    )
-                );
-                return Some(stripped_thinking);
-            }
-        }
-
-        None
     }
 
     fn fallback_text_for_empty_content(model: &str, thinking: Option<&str>) -> String {
@@ -553,7 +488,13 @@ impl OllamaModelProvider {
                     }
                 })
                 .collect();
-            let text = Self::normalize_response_text(response.message.content);
+            // Textual reasoning/tool extraction belongs to the runtime model
+            // policy. Preserve the wire content here so a model can opt out
+            // of `<think>` extraction without the provider discarding it.
+            let text = Self::raw_response_text(
+                &response.message.content,
+                response.message.thinking.as_deref(),
+            );
             return ChatResponse {
                 text,
                 tool_calls,
@@ -562,7 +503,7 @@ impl OllamaModelProvider {
             };
         }
 
-        let text = Self::effective_content(
+        let text = Self::raw_response_text(
             &response.message.content,
             response.message.thinking.as_deref(),
         )
@@ -576,6 +517,19 @@ impl OllamaModelProvider {
             usage,
             reasoning_content: None,
         }
+    }
+
+    fn raw_response_text(content: &str, thinking: Option<&str>) -> Option<String> {
+        // Preserve textual markup for the runtime's model-owned extractors.
+        // Some Ollama models put their complete answer in `thinking`.
+        let content = content.trim();
+        if !content.is_empty() {
+            return Some(content.to_owned());
+        }
+        thinking
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(str::to_owned)
     }
 
     /// Send a single HTTP request to Ollama and parse the response.
@@ -852,8 +806,8 @@ impl ModelProvider for OllamaModelProvider {
             return Ok(self.format_tool_calls_for_loop(&response.message.tool_calls));
         }
 
-        // Plain text response — strip <think> tags and fall back to thinking field.
-        if let Some(content) = Self::effective_content(
+        // Preserve wire text; model-owned extraction is applied by runtime.
+        if let Some(content) = Self::raw_response_text(
             &response.message.content,
             response.message.thinking.as_deref(),
         ) {
@@ -899,8 +853,8 @@ impl ModelProvider for OllamaModelProvider {
             return Ok(self.format_tool_calls_for_loop(&response.message.tool_calls));
         }
 
-        // Plain text response — strip <think> tags and fall back to thinking field.
-        if let Some(content) = Self::effective_content(
+        // Preserve wire text; model-owned extraction is applied by runtime.
+        if let Some(content) = Self::raw_response_text(
             &response.message.content,
             response.message.thinking.as_deref(),
         ) {
@@ -1115,7 +1069,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("Set api_key on [providers.models.ollama.<alias>]")
+                .contains("Set auth.api_key on [providers.connections.<key>]")
         );
     }
 
@@ -1536,34 +1490,27 @@ mod tests {
     }
 
     #[test]
-    fn normalize_response_text_rejects_whitespace_only_content() {
+    fn raw_response_text_rejects_whitespace_only_content() {
+        assert_eq!(OllamaModelProvider::raw_response_text("\n \t", None), None);
         assert_eq!(
-            OllamaModelProvider::normalize_response_text("\n \t".to_string()),
-            None
-        );
-        assert_eq!(
-            OllamaModelProvider::normalize_response_text(" hello ".to_string()),
+            OllamaModelProvider::raw_response_text(" hello ", None),
             Some("hello".to_string())
         );
     }
 
     #[test]
-    fn normalize_response_text_strips_think_tags() {
+    fn raw_response_text_preserves_think_tags_for_runtime_policy() {
         assert_eq!(
-            OllamaModelProvider::normalize_response_text(
-                "<think>reasoning</think> hello".to_string()
-            ),
-            Some("hello".to_string())
+            OllamaModelProvider::raw_response_text("<think>reasoning</think> hello", None,),
+            Some("<think>reasoning</think> hello".to_string())
         );
     }
 
     #[test]
-    fn normalize_response_text_rejects_think_only_content() {
+    fn raw_response_text_preserves_think_only_content_for_runtime_policy() {
         assert_eq!(
-            OllamaModelProvider::normalize_response_text(
-                "<think>only thinking here</think>".to_string()
-            ),
-            None
+            OllamaModelProvider::raw_response_text("<think>only thinking here</think>", None,),
+            Some("<think>only thinking here</think>".to_string())
         );
     }
 
@@ -1768,62 +1715,9 @@ mod tests {
         assert!(resp.eval_count.is_none());
     }
 
-    // ═══════════════════════════════════════════════════════════════════════
-    // <think> tag stripping tests
-    // ═══════════════════════════════════════════════════════════════════════
-
     #[test]
-    fn strip_think_tags_removes_single_block() {
-        let input = "<think>internal reasoning</think>Hello world";
-        assert_eq!(OllamaModelProvider::strip_think_tags(input), "Hello world");
-    }
-
-    #[test]
-    fn strip_think_tags_removes_multiple_blocks() {
-        let input = "<think>first</think>A<think>second</think>B";
-        assert_eq!(OllamaModelProvider::strip_think_tags(input), "AB");
-    }
-
-    #[test]
-    fn strip_think_tags_handles_unclosed_block() {
-        let input = "visible<think>hidden tail";
-        assert_eq!(OllamaModelProvider::strip_think_tags(input), "visible");
-    }
-
-    #[test]
-    fn strip_think_tags_preserves_text_without_tags() {
-        let input = "plain text response";
-        assert_eq!(
-            OllamaModelProvider::strip_think_tags(input),
-            "plain text response"
-        );
-    }
-
-    #[test]
-    fn strip_think_tags_returns_empty_for_think_only() {
-        let input = "<think>only thinking</think>";
-        assert_eq!(OllamaModelProvider::strip_think_tags(input), "");
-    }
-
-    // ═══════════════════════════════════════════════════════════════════════
-    // effective_content tests
-    // ═══════════════════════════════════════════════════════════════════════
-
-    #[test]
-    fn effective_content_strips_think_and_returns_rest() {
-        let result = OllamaModelProvider::effective_content(
-            "<think>reasoning</think>\n<tool_call>{\"name\":\"shell\",\"arguments\":{\"command\":\"ls\"}}</tool_call>",
-            None,
-        );
-        assert!(result.is_some());
-        let text = result.unwrap();
-        assert!(text.contains("<tool_call>"));
-        assert!(!text.contains("<think>"));
-    }
-
-    #[test]
-    fn effective_content_falls_back_to_thinking_field() {
-        let result = OllamaModelProvider::effective_content(
+    fn raw_response_text_falls_back_to_thinking_field() {
+        let result = OllamaModelProvider::raw_response_text(
             "",
             Some(
                 "<tool_call>{\"name\":\"shell\",\"arguments\":{\"command\":\"date\"}}</tool_call>",
@@ -1834,34 +1728,24 @@ mod tests {
     }
 
     #[test]
-    fn effective_content_returns_none_when_both_empty() {
-        assert!(OllamaModelProvider::effective_content("", None).is_none());
-        assert!(OllamaModelProvider::effective_content("", Some("")).is_none());
-        assert!(
-            OllamaModelProvider::effective_content(
-                "<think>only thinking</think>",
-                Some("<think>also only thinking</think>")
-            )
-            .is_none()
-        );
+    fn raw_response_text_returns_none_when_both_empty() {
+        assert!(OllamaModelProvider::raw_response_text("", None).is_none());
+        assert!(OllamaModelProvider::raw_response_text("", Some("")).is_none());
     }
 
     #[test]
-    fn effective_content_prefers_content_over_thinking() {
-        let result = OllamaModelProvider::effective_content("content text", Some("thinking text"));
+    fn raw_response_text_prefers_content_over_thinking() {
+        let result = OllamaModelProvider::raw_response_text("content text", Some("thinking text"));
         assert_eq!(result, Some("content text".to_string()));
     }
 
     #[test]
-    fn effective_content_uses_thinking_when_content_is_think_only() {
-        let result = OllamaModelProvider::effective_content(
+    fn raw_response_text_preserves_think_only_content_over_thinking_field() {
+        let result = OllamaModelProvider::raw_response_text(
             "<think>just reasoning</think>",
             Some("actual useful text from thinking field"),
         );
-        assert_eq!(
-            result,
-            Some("actual useful text from thinking field".to_string())
-        );
+        assert_eq!(result, Some("<think>just reasoning</think>".to_string()));
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -1874,12 +1758,12 @@ mod tests {
         // with no structured tool_calls. The <tool_call> tags must survive
         // for downstream parse_tool_calls to extract them.
         let content = "<think>I should list files</think>\n<tool_call>\n{\"name\":\"shell\",\"arguments\":{\"command\":\"ls\"}}\n</tool_call>";
-        let result = OllamaModelProvider::effective_content(content, None);
+        let result = OllamaModelProvider::raw_response_text(content, None);
         assert!(result.is_some());
         let text = result.unwrap();
         assert!(text.contains("<tool_call>"));
         assert!(text.contains("shell"));
-        assert!(!text.contains("<think>"));
+        assert!(text.contains("<think>"));
     }
 
     #[test]
@@ -1888,7 +1772,7 @@ mod tests {
         // call XML in the thinking field with empty content.
         let content = "";
         let thinking = "I need to check the date\n<tool_call>\n{\"name\":\"shell\",\"arguments\":{\"command\":\"date\"}}\n</tool_call>";
-        let result = OllamaModelProvider::effective_content(content, Some(thinking));
+        let result = OllamaModelProvider::raw_response_text(content, Some(thinking));
         assert!(result.is_some());
         let text = result.unwrap();
         assert!(text.contains("<tool_call>"));

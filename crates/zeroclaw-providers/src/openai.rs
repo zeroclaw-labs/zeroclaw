@@ -33,6 +33,9 @@ pub struct OpenAiModelProvider {
     credential: Option<String>,
     max_tokens: Option<u32>,
     timeout_secs: u64,
+    timeout_disabled: bool,
+    read_timeout_secs: Option<u64>,
+    read_timeout_disabled: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -245,6 +248,9 @@ pub struct OpenAiBuilder {
     single_tool_rounds_supported: bool,
     max_tokens: Option<u32>,
     timeout_secs: Option<u64>,
+    timeout_disabled: bool,
+    read_timeout_secs: Option<u64>,
+    read_timeout_disabled: bool,
 }
 
 impl OpenAiBuilder {
@@ -290,6 +296,23 @@ impl OpenAiBuilder {
         self
     }
 
+    pub(crate) fn without_timeout(mut self) -> Self {
+        self.timeout_disabled = true;
+        self
+    }
+
+    pub(crate) fn read_timeout_secs(mut self, secs: u64) -> Self {
+        if secs > 0 {
+            self.read_timeout_secs = Some(secs);
+        }
+        self
+    }
+
+    pub(crate) fn without_read_timeout(mut self) -> Self {
+        self.read_timeout_disabled = true;
+        self
+    }
+
     pub fn build(self) -> OpenAiModelProvider {
         OpenAiModelProvider {
             alias: self.alias,
@@ -299,6 +322,9 @@ impl OpenAiBuilder {
             credential: self.credential,
             max_tokens: self.max_tokens,
             timeout_secs: self.timeout_secs.unwrap_or(120),
+            timeout_disabled: self.timeout_disabled,
+            read_timeout_secs: self.read_timeout_secs,
+            read_timeout_disabled: self.read_timeout_disabled,
         }
     }
 }
@@ -315,6 +341,9 @@ impl OpenAiModelProvider {
             single_tool_rounds_supported: false,
             max_tokens: None,
             timeout_secs: None,
+            timeout_disabled: false,
+            read_timeout_secs: None,
+            read_timeout_disabled: false,
         }
     }
 
@@ -466,11 +495,20 @@ impl OpenAiModelProvider {
     }
 
     fn http_client(&self) -> Client {
-        zeroclaw_config::schema::build_runtime_proxy_client_with_timeouts(
+        let mut builder = Client::builder().connect_timeout(std::time::Duration::from_secs(10));
+        if !self.timeout_disabled {
+            builder = builder.timeout(std::time::Duration::from_secs(self.timeout_secs));
+        }
+        if !self.read_timeout_disabled
+            && let Some(read_timeout) = self.read_timeout_secs
+        {
+            builder = builder.read_timeout(std::time::Duration::from_secs(read_timeout));
+        }
+        let builder = zeroclaw_config::schema::apply_runtime_proxy_to_builder(
+            builder,
             "model_provider.openai",
-            self.timeout_secs,
-            10,
-        )
+        );
+        builder.build().unwrap_or_else(|_| Client::new())
     }
 }
 
@@ -883,24 +921,24 @@ fn extract_responses_api_tool_calls(body: &ResponsesApiBody) -> Vec<ProviderTool
 
 /// Drive a Responses API SSE connection to completion, emitting events on `tx`.
 /// `request_builder` must already have URL, auth headers, `Accept: text/event-stream`,
-/// and the JSON body attached. `idle_timeout` is the streaming client's
-/// read-idle bound; it names the bound that fired in timeout errors, including
-/// whether `timeout_secs` can raise it. Sends `StreamEvent::Final` on clean
-/// stream end.
+/// and the JSON body attached. `timeouts` describes the same deadlines used by
+/// that client, so errors identify the setting that fired. Sends
+/// `StreamEvent::Final` on clean stream end.
 pub(crate) async fn run_responses_sse(
     request_builder: reqwest::RequestBuilder,
     tx: &tokio::sync::mpsc::Sender<StreamResult<StreamEvent>>,
     count_tokens: bool,
-    idle_timeout: super::StreamIdleBound,
+    timeouts: super::StreamTimeouts,
 ) {
+    let timeouts = timeouts.start();
     let http_response = match request_builder.send().await {
         Ok(r) => r,
         Err(err) => {
             let _ = tx
                 .send(Err(if err.is_connect() {
-                    StreamError::ConnectFailed(super::stream_idle_error_message(&err, idle_timeout))
+                    StreamError::ConnectFailed(timeouts.error_message(&err))
                 } else {
-                    StreamError::ModelProvider(super::stream_idle_error_message(&err, idle_timeout))
+                    StreamError::ModelProvider(timeouts.error_message(&err))
                 }))
                 .await;
             return;
@@ -939,7 +977,7 @@ pub(crate) async fn run_responses_sse(
             Some(Err(err)) => {
                 let _ = tx
                     .send(Err(StreamError::ModelProvider(
-                        super::stream_idle_error_message(&err, idle_timeout),
+                        timeouts.error_message(&err),
                     )))
                     .await;
                 return;
@@ -1020,14 +1058,15 @@ pub struct OpenAiResponsesModelProvider {
     credential: Option<String>,
     max_tokens: Option<u32>,
     reasoning_effort: Option<String>,
-    /// HTTP request timeout in seconds for non-streaming LLM API calls.
-    /// Streaming SSE calls use `streaming_client`, which sets no overall
-    /// timeout (long-running responses aren't killed mid-stream) and derives
-    /// its read-idle bound as `max(300 s, timeout_secs)` via
-    /// `stream_idle_timeout`: the 300 s floor applies when this field is
-    /// unset or lower, and a higher value raises the idle bound to match.
+    /// HTTP total deadline. The default applies to non-streaming calls;
+    /// streaming applies it only when explicitly configured. Read-idle
+    /// protection is configured separately by canonical API options.
     /// Default: 120 (matches `OpenAiCompatibleModelProvider`).
     timeout_secs: u64,
+    timeout_configured: bool,
+    timeout_disabled: bool,
+    read_timeout_secs: Option<u64>,
+    read_timeout_disabled: bool,
     extra_headers: std::collections::HashMap<String, String>,
 }
 
@@ -1049,6 +1088,9 @@ pub struct OpenAiResponsesBuilder {
     max_tokens: Option<u32>,
     reasoning_effort: Option<String>,
     timeout_secs: Option<u64>,
+    timeout_disabled: bool,
+    read_timeout_secs: Option<u64>,
+    read_timeout_disabled: bool,
     extra_headers: std::collections::HashMap<String, String>,
 }
 
@@ -1085,7 +1127,7 @@ impl OpenAiResponsesBuilder {
         self
     }
 
-    /// Override the non-streaming HTTP request timeout. Values of 0 are
+    /// Override the total HTTP request timeout, including streaming. Values of 0 are
     /// ignored (the default 120 s is kept) so a stray `Some(0)` from
     /// config cannot silently disable the safety timeout — same guard
     /// applied by [`OpenAiBuilder::timeout_secs`],
@@ -1095,6 +1137,23 @@ impl OpenAiResponsesBuilder {
         if secs > 0 {
             self.timeout_secs = Some(secs);
         }
+        self
+    }
+
+    pub(crate) fn without_timeout(mut self) -> Self {
+        self.timeout_disabled = true;
+        self
+    }
+
+    pub(crate) fn read_timeout_secs(mut self, secs: u64) -> Self {
+        if secs > 0 {
+            self.read_timeout_secs = Some(secs);
+        }
+        self
+    }
+
+    pub(crate) fn without_read_timeout(mut self) -> Self {
+        self.read_timeout_disabled = true;
         self
     }
 
@@ -1127,6 +1186,10 @@ impl OpenAiResponsesBuilder {
             max_tokens: self.max_tokens,
             reasoning_effort: self.reasoning_effort,
             timeout_secs: self.timeout_secs.unwrap_or(120),
+            timeout_configured: self.timeout_secs.is_some(),
+            timeout_disabled: self.timeout_disabled,
+            read_timeout_secs: self.read_timeout_secs,
+            read_timeout_disabled: self.read_timeout_disabled,
             extra_headers: self.extra_headers,
         }
     }
@@ -1144,6 +1207,9 @@ impl OpenAiResponsesModelProvider {
             max_tokens: None,
             reasoning_effort: None,
             timeout_secs: None,
+            timeout_disabled: false,
+            read_timeout_secs: None,
+            read_timeout_disabled: false,
             extra_headers: std::collections::HashMap::new(),
         }
     }
@@ -1245,9 +1311,15 @@ impl OpenAiResponsesModelProvider {
 
     fn http_client(&self) -> Client {
         let default_headers = self.build_default_headers();
-        let mut builder = Client::builder()
-            .timeout(std::time::Duration::from_secs(self.timeout_secs))
-            .connect_timeout(std::time::Duration::from_secs(10));
+        let mut builder = Client::builder().connect_timeout(std::time::Duration::from_secs(10));
+        if !self.timeout_disabled {
+            builder = builder.timeout(std::time::Duration::from_secs(self.timeout_secs));
+        }
+        if !self.read_timeout_disabled
+            && let Some(read_timeout) = self.read_timeout_secs
+        {
+            builder = builder.read_timeout(std::time::Duration::from_secs(read_timeout));
+        }
         if !default_headers.is_empty() {
             builder = builder.default_headers(default_headers);
         }
@@ -1273,11 +1345,29 @@ impl OpenAiResponsesModelProvider {
         format!("{base}/models")
     }
 
+    fn streaming_timeouts(&self) -> super::StreamTimeouts {
+        super::StreamTimeouts {
+            request: (self.timeout_configured && !self.timeout_disabled)
+                .then(|| std::time::Duration::from_secs(self.timeout_secs)),
+            read: (!self.read_timeout_disabled).then(|| {
+                self.read_timeout_secs.map_or_else(
+                    || super::stream_idle_timeout(self.timeout_secs),
+                    |secs| super::StreamIdleBound::Read(std::time::Duration::from_secs(secs)),
+                )
+            }),
+        }
+    }
+
     fn streaming_client(&self) -> Client {
         let default_headers = self.build_default_headers();
-        let mut builder = Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(10))
-            .read_timeout(super::stream_idle_timeout(self.timeout_secs).duration());
+        let mut builder = Client::builder().connect_timeout(std::time::Duration::from_secs(10));
+        let timeouts = self.streaming_timeouts();
+        if let Some(timeout) = timeouts.request {
+            builder = builder.timeout(timeout);
+        }
+        if let Some(timeout) = timeouts.read {
+            builder = builder.read_timeout(timeout.duration());
+        }
         if !default_headers.is_empty() {
             builder = builder.default_headers(default_headers);
         }
@@ -1521,7 +1611,7 @@ impl ModelProvider for OpenAiResponsesModelProvider {
         let reasoning_effort = self.reasoning_effort.clone();
         let max_tokens = self.max_tokens;
         let client = self.streaming_client();
-        let idle_timeout = super::stream_idle_timeout(self.timeout_secs);
+        let timeouts = self.streaming_timeouts();
         let alias = ::zeroclaw_log::debug_enabled().then(|| self.alias.clone());
 
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(100);
@@ -1579,7 +1669,7 @@ impl ModelProvider for OpenAiResponsesModelProvider {
             }
             let request_builder = request_builder.json(&req);
 
-            run_responses_sse(request_builder, &tx, count_tokens, idle_timeout).await;
+            run_responses_sse(request_builder, &tx, count_tokens, timeouts).await;
         });
 
         let guard = AbortOnDrop::new(handle.abort_handle());
@@ -2252,7 +2342,7 @@ mod tests {
                 request,
                 &tx,
                 false,
-                crate::StreamIdleBound::Fixed(crate::STREAM_IDLE_TIMEOUT),
+                crate::StreamIdleBound::Fixed(crate::STREAM_IDLE_TIMEOUT).into(),
             ),
         )
         .await
@@ -3780,7 +3870,7 @@ mod tests {
                 request,
                 &tx,
                 false,
-                crate::StreamIdleBound::Configurable(crate::STREAM_IDLE_TIMEOUT),
+                crate::StreamIdleBound::Configurable(crate::STREAM_IDLE_TIMEOUT).into(),
             ),
         )
         .await
