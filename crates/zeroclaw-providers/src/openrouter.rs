@@ -21,7 +21,6 @@ pub struct OpenRouterModelProvider {
     alias: String,
     credential: Option<String>,
     timeout_secs: u64,
-    timeout_configured: bool,
     timeout_disabled: bool,
     stream_request_timeout: super::StreamRequestTimeout,
     read_timeout_secs: Option<u64>,
@@ -218,7 +217,6 @@ pub struct OpenRouterBuilder {
     alias: String,
     credential: Option<String>,
     timeout_secs: Option<u64>,
-    timeout_configured: bool,
     timeout_disabled: bool,
     stream_request_timeout: super::StreamRequestTimeout,
     read_timeout_secs: Option<u64>,
@@ -250,7 +248,6 @@ impl OpenRouterBuilder {
     pub fn timeout_secs(mut self, secs: u64) -> Self {
         if secs > 0 {
             self.timeout_secs = Some(secs);
-            self.timeout_configured = true;
         }
         self
     }
@@ -298,7 +295,6 @@ impl OpenRouterBuilder {
             timeout_secs: self
                 .timeout_secs
                 .unwrap_or(zeroclaw_api::model_provider::BASELINE_TIMEOUT_SECS),
-            timeout_configured: self.timeout_configured,
             timeout_disabled: self.timeout_disabled,
             stream_request_timeout: self.stream_request_timeout,
             read_timeout_secs: self.read_timeout_secs,
@@ -319,7 +315,6 @@ impl OpenRouterModelProvider {
             alias: alias.to_string(),
             credential: None,
             timeout_secs: None,
-            timeout_configured: false,
             timeout_disabled: false,
             stream_request_timeout: None,
             read_timeout_secs: None,

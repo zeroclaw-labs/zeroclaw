@@ -92,7 +92,6 @@ pub struct AnthropicModelProvider {
     single_tool_rounds_supported: bool,
     max_tokens: u32,
     timeout_secs: u64,
-    timeout_configured: bool,
     /// Explicitly disables the legacy request timeout when true.
     timeout_disabled: bool,
     stream_request_timeout: super::StreamRequestTimeout,
@@ -686,7 +685,6 @@ pub struct AnthropicBuilder {
     single_tool_rounds_supported: bool,
     max_tokens: Option<u32>,
     timeout_secs: Option<u64>,
-    timeout_configured: bool,
     timeout_disabled: bool,
     stream_request_timeout: super::StreamRequestTimeout,
     read_timeout_secs: Option<u64>,
@@ -735,7 +733,6 @@ impl AnthropicBuilder {
     /// [`zeroclaw_api::model_provider::BASELINE_TIMEOUT_SECS`] when unset.
     pub fn timeout_secs(mut self, timeout_secs: u64) -> Self {
         self.timeout_secs = Some(timeout_secs);
-        self.timeout_configured = true;
         self
     }
 
@@ -791,7 +788,6 @@ impl AnthropicBuilder {
             timeout_secs: self
                 .timeout_secs
                 .unwrap_or(zeroclaw_api::model_provider::BASELINE_TIMEOUT_SECS),
-            timeout_configured: self.timeout_configured,
             timeout_disabled: self.timeout_disabled,
             stream_request_timeout: self.stream_request_timeout,
             read_timeout_secs: self.read_timeout_secs,
@@ -815,7 +811,6 @@ impl AnthropicModelProvider {
             single_tool_rounds_supported: false,
             max_tokens: None,
             timeout_secs: None,
-            timeout_configured: false,
             timeout_disabled: false,
             stream_request_timeout: None,
             read_timeout_secs: None,
