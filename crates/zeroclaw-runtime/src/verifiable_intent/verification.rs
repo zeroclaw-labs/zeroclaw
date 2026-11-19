@@ -686,6 +686,18 @@ mod tests {
     }
 
     #[test]
+    fn amount_range_bounds_are_inclusive() {
+        for amount in [10_000, 40_000] {
+            let f = Fulfillment {
+                amount: Some(amount),
+                currency: Some("USD".into()),
+                ..Default::default()
+            };
+            assert!(check_payment_amount("USD", Some(10_000), Some(40_000), &f).satisfied);
+        }
+    }
+
+    #[test]
     fn amount_exceeds_max() {
         let f = Fulfillment {
             amount: Some(50000),

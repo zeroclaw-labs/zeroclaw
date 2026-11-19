@@ -173,6 +173,7 @@ tool-memory-store = Store a fact, preference, or note in long-term memory. Use c
 tool-microsoft365 = Microsoft 365 integration: manage Outlook mail, Teams messages, Calendar events, OneDrive files, and SharePoint search via Microsoft Graph API
 
 tool-model-routing-config = Manage default model settings, scenario-based provider/model routes, classification rules, and aliased agent profiles
+tool-model-routing-config-invalid-scenario = Invalid upsert_scenario arguments. Supply nonempty strings for: { $required }. Fix missing, non-string, or blank fields: { $invalid }.
 tool-model-routing-config-error-missing-risk-profile = agent `{$agent}` references missing risk profile `{$profile}`
 tool-model-routing-config-error-shared-risk-profile = risk profile `{$profile}` is shared by another agent; refusing an agent-scoped mutation
 tool-model-routing-config-error-risk-profile-collision = risk profile `{$profile}` already exists; refusing to overwrite it while isolating agent `{$agent}`
@@ -188,6 +189,8 @@ tool-project-intel = Project delivery intelligence: generate status reports, det
 tool-proxy-config = Manage ZeroClaw proxy settings (scope: environment | zeroclaw | services), including runtime and process env application
 
 tool-pushover = Send a Pushover notification to your device. Requires PUSHOVER_TOKEN and PUSHOVER_USER_KEY in .env file.
+
+tool-read-skill = Read the full source file for an available skill by name. Use this when its prompt entry says the instructions load on demand.
 
 tool-schedule = Manage scheduled shell-only tasks. Actions: create/add/once/list/get/cancel/remove/pause/resume. WARNING: This tool creates shell jobs whose output is only logged, NOT delivered to any channel. To send a scheduled message to Discord/Telegram/Slack/Matrix, use the cron_add tool with job_type='agent' and a delivery config like {"{"}"mode":"announce","channel":"discord","to":"<channel_id>"{"}"}.
 

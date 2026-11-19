@@ -1,10 +1,10 @@
 # syntax=docker/dockerfile:1.7-labs
 
 # >>> generated:base-arg-node from dev/ci/container-base-images.toml by `cargo generate installers` - do not edit <<<
-ARG ZEROCLAW_BASE_NODE=node:24-bookworm-slim@sha256:ba849c60be29959425b8734d57b8b4b7d56f98edd9504c9af091d5281095a71e
+ARG ZEROCLAW_BASE_NODE=node:24-bookworm-slim@sha256:91acba91b842bec0bf7ea6f5e09c644c7ccad72c4996ed9616d861d1c7cd60d4
 # >>> end generated:base-arg-node <<<
 # >>> generated:base-arg-rust-bookworm from dev/ci/container-base-images.toml by `cargo generate installers` - do not edit <<<
-ARG ZEROCLAW_BASE_RUST_BOOKWORM=rust:1.98-bookworm@sha256:82150a52ec202c1b14d7817e14516c392bb7f5cfebd88f1ed531cb37ebd39922
+ARG ZEROCLAW_BASE_RUST_BOOKWORM=rust:1.98-bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e
 # >>> end generated:base-arg-rust-bookworm <<<
 
 # ── Stage 0: Frontend build ─────────────────────────────────────
@@ -80,13 +80,15 @@ COPY wit/ wit/
 # no longer requires editing this file.  --parents preserves the
 # crates/<name>/Cargo.toml directory structure.
 COPY --parents crates/*/Cargo.toml ./
-# Nested workspace members (test fixture crates) are not matched by the
-# single-level crates/*/Cargo.toml glob above, so match them with their own
-# glob to keep workspace manifest parsing intact during the pre-fetch. A glob
-# rather than explicit paths means adding a fixture member does not require
-# editing this file — cargo fails the workspace load if any member manifest is
-# missing, and every such member lives at crates/*/tests/fixtures/*/.
+# Test fixture crates are workspace members too, and the single-level
+# crates/*/Cargo.toml glob above does not match them, so match them with their
+# own globs to keep workspace manifest parsing intact during the pre-fetch.
+# Globs rather than explicit paths mean adding a fixture member does not require
+# editing this file: cargo fails the workspace load if any member manifest is
+# missing, and fixture members live at crates/*/tests/fixtures/*/ or
+# tests/fixtures/*/. A member anywhere else needs its own COPY line here.
 COPY --parents crates/*/tests/fixtures/*/Cargo.toml ./
+COPY --parents tests/fixtures/*/Cargo.toml ./
 # apps/tauri: .dockerignore whitelists only Cargo.toml; src and build.rs are stubbed below.
 COPY apps/tauri/Cargo.toml apps/tauri/Cargo.toml
 # apps/zerocode: TUI app not shipped in the server image; copy only its manifest
@@ -128,6 +130,7 @@ RUN mkdir -p src src/bin benches apps/tauri/src apps/zerocode/src apps/zerorelay
     && echo "fn main() {}" > crates/zeroclaw-plugins/examples/sign_manifest.rs \
     && for d in crates/*/; do mkdir -p "${d}src" && printf '' > "${d}src/lib.rs"; done \
     && for d in crates/*/tests/fixtures/*/; do [ -f "${d}Cargo.toml" ] || continue; mkdir -p "${d}src" && printf '' > "${d}src/lib.rs"; done \
+    && for d in tests/fixtures/*/; do [ -f "${d}Cargo.toml" ] || continue; mkdir -p "${d}src" && printf '' > "${d}src/lib.rs"; done \
     && printf 'fn main() {}' > crates/zeroclaw-log/tests/fixtures/attribution-macro-consumer/src/main.rs
 RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=zeroclaw-cargo-git,target=/usr/local/cargo/git,sharing=locked \
@@ -192,16 +195,25 @@ RUN for b in zeroclaw zerocode; do \
 # mount point) so a bind mount on /zeroclaw-data cannot shadow it (#6400).
 RUN mkdir -p /zeroclaw-data/.zeroclaw /zeroclaw-data/data && \
     printf '%s\n' \
-        'api_key = ""' \
-        'default_provider = "openrouter"' \
-        'default_model = "anthropic/claude-sonnet-4-20250514"' \
-        'default_temperature = 0.7' \
+        'schema_version = 4' \
         '' \
         '[gateway]' \
         'port = 42617' \
         'host = "[::]"' \
         'allow_public_bind = true' \
         'web_dist_dir = "/usr/share/zeroclawlabs/web/dist"' \
+        '' \
+        '[providers.models.openrouter.default]' \
+        'api_key = ""' \
+        'model = "anthropic/claude-sonnet-4-20250514"' \
+        'temperature = 0.7' \
+        '' \
+        '[agents.default]' \
+        'model_provider = "openrouter.default"' \
+        'risk_profile = "default"' \
+        'runtime_profile = "default"' \
+        '' \
+        '[runtime_profiles.default]' \
         '' \
         '[risk_profiles.default]' \
         'level = "supervised"' \
@@ -219,6 +231,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         curl \
         git \
         vim-tiny \
+    && dpkg --compare-versions "$(dpkg-query -W -f='${Version}' ca-certificates)" ge '20250419~deb12u2' \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /app/zeroclaw /usr/local/bin/zeroclaw

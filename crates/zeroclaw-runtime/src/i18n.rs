@@ -1250,7 +1250,7 @@ mod tests {
         /// the substrings the rendered value must contain.
         type QuickstartPluginCase<'a> = (&'a str, &'a [(&'a str, &'a str)], &'a [&'a str]);
 
-        let cases: [QuickstartPluginCase<'_>; 47] = [
+        let cases: [QuickstartPluginCase<'_>; 46] = [
             // Any failure to fetch the registry index is printed as it reads.
             (
                 "cli-quickstart-plugins-registry-unavailable",
@@ -1366,23 +1366,6 @@ mod tests {
                     ("command", grant_to_complete.as_str()),
                 ],
                 &["weather-tool", grant_to_complete.as_str()],
-            ),
-            // Destinations declared for a transport the tool row is not
-            // seeded for are named with the command that grants them, and
-            // the line names the permission the row is seeded for.
-            (
-                "cli-quickstart-plugins-declared-hosts-not-granted",
-                &[
-                    ("name", "weather-tool"),
-                    ("hosts", "api.example.com"),
-                    ("command", grant.as_str()),
-                ],
-                &[
-                    "weather-tool",
-                    "api.example.com",
-                    "http_client",
-                    grant.as_str(),
-                ],
             ),
             // An installed package missing its row gets the fresh-install
             // decision; skipping it leaves no row. The command that creates
@@ -2590,6 +2573,8 @@ mod tests {
         const VERSION: &str = "0.0.0";
         const DESCRIPTION: &str = "a tool";
         const ERROR: &str = "failed to instantiate: type mismatch (hint: rebuild against wit/v0)";
+        const CONFIG_ERROR: &str = "invalid plugin config: plugin 'tool-fixture' has configured values but declares no config_schema";
+        const KEY: &str = "zpi1_WyJ0b29sLWZpeHR1cmUiLCJ0b29sIiwidG9vbC1maXh0dXJlIl0";
 
         let row = [
             ("name", NAME),
@@ -2605,7 +2590,7 @@ mod tests {
         /// One parity case: the Fluent key, its arguments, and the substrings
         /// every locale's rendering must contain.
         type ParityCase<'a> = (&'a str, &'a [(&'a str, &'a str)], &'a [&'a str]);
-        let cases: [ParityCase; 7] = [
+        let cases: [ParityCase; 8] = [
             (
                 "cli-plugin-list-entry-loads",
                 &row,
@@ -2623,6 +2608,11 @@ mod tests {
             ),
             ("cli-plugin-info-load-ok", &[], &["WIT"]),
             ("cli-plugin-info-load-failed", &[("error", ERROR)], &[ERROR]),
+            (
+                "cli-plugin-info-load-config-refused",
+                &[("error", CONFIG_ERROR), ("key", KEY)],
+                &["WIT", CONFIG_ERROR, KEY, "config_schema"],
+            ),
             ("cli-plugin-info-load-not-applicable", &[], &[]),
             (
                 "cli-plugin-info-load-failed-exit",
