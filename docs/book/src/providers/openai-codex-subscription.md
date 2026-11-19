@@ -140,11 +140,18 @@ first `input` item: a typed `message` with `role: "developer"` and one
 `gpt-6.1` and older keep their previous `instructions` behavior. The same rule
 applies to the API-key `openai` Responses provider, streaming and non-streaming.
 
-Reason: [hermes-agent PR 157705](https://github.com/NousResearch/hermes-agent/pull/157705)
-reported, from a real Codex OAuth A/B on `gpt-6.2-sol` and `gpt-6.2-astra`, zero
-cache reads for top-level `instructions` and cache hits for the same prompt as
-a leading developer message. Automated request tests verify this wire shape,
-not live cache-hit rates or its effect on subscription allowance.
+OpenAI's [GPT-6.2 migration guide](https://developers.openai.com/api/docs/guides/latest-model#gpt-6.2-astra-update-api-and-model-parameters)
+recommends putting reusable instructions in a `developer` message at the start
+of `input`. Starting with GPT-6.2, the Responses API appends top-level
+`instructions` after `input`, beyond eligible cache breakpoints. Earlier input
+can still hit the cache even when those trailing instructions do not. See
+[OpenAI's prompt caching guide](https://developers.openai.com/api/docs/guides/prompt-caching#how-prefix-matching-works)
+for how prefix matching works.
+
+[Hermes's Codex OAuth tests](https://github.com/NousResearch/hermes-agent/pull/157705)
+provide separate evidence for the subscription endpoint. ZeroClaw's automated
+request tests verify the wire format, not cache-hit rates, latency, or
+subscription allowance.
 
 Scope: the rule keys on the model ID only, so a custom or compatible Responses
 endpoint serving such an ID also receives the developer-message shape. Replayed
