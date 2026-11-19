@@ -369,6 +369,36 @@ mod tests {
 
     #[tokio::test]
     #[cfg(not(target_os = "windows"))]
+    async fn sandboxed_codex_cli_refuses_active_host_ssh_broker() {
+        let workspace = tempfile::TempDir::new().expect("temp workspace");
+        let seen_command = Arc::new(Mutex::new(None));
+        let runtime = Arc::new(FakeRuntime {
+            seen_command: Arc::clone(&seen_command),
+        });
+        let executor = RuntimeCodingCliExecutor::shared(runtime, Arc::new(FakeSandbox), false);
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: workspace.path().to_path_buf(),
+            ..SecurityPolicy::default()
+        });
+        let tool = CodexCliTool::new_with_executor(security, CodexCliConfig::default(), executor);
+        let task = zeroclaw_tools::task_ssh::SshTask {
+            id: "test".into(),
+            state_dir: workspace.path().display().to_string(),
+        };
+
+        let result = zeroclaw_tools::task_ssh::scope_inherited(
+            Some(task),
+            tool.execute(json!({"prompt": "test admission"})),
+        )
+        .await
+        .expect("codex_cli should return a tool result");
+        assert!(!result.success);
+        assert!(seen_command.lock().expect("fake runtime mutex").is_none());
+    }
+
+    #[tokio::test]
+    #[cfg(not(target_os = "windows"))]
     async fn codex_cli_uses_runtime_and_sandbox_executor() {
         let workspace = tempfile::TempDir::new().expect("temp workspace");
         let seen_command = Arc::new(Mutex::new(None));

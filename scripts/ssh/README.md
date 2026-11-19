@@ -47,8 +47,9 @@ connection-stage errors. Connecting one key does not hold the
 pool lock while waiting for the network; other keys and task shutdown proceed.
 
 When a turn owns a host SSH broker, the built-in shell refuses commands under
-an OS sandbox, including ordinary non-SSH commands. Unrelated turns without
-a broker remain governed by the configured sandbox policy.
+an OS sandbox. Shell and coding CLI launchers reject sandboxed execution
+while the host helper is configured or a broker lease is active. This also
+protects a broker owned by a different turn when the sandbox shares host paths.
 
 Foreground parallel delegates awaited by the current turn reuse its SSH task
 owner. Tokio workers restore the captured task identity before entering their
