@@ -2512,7 +2512,7 @@ impl AnthropicModelProvider {
     /// Streaming defaults to no total deadline. An explicit deadline covers
     /// headers and the complete body; read-idle protection is independent.
     fn streaming_http_client(&self) -> Result<Client, reqwest::Error> {
-        let mut builder = Client::builder().connect_timeout(std::time::Duration::from_secs(10));
+        let builder = Client::builder().connect_timeout(std::time::Duration::from_secs(10));
         // Legacy timeout_secs is intentionally absent from streaming clients;
         // the canonical stream total deadline is a separate option.
         let builder = if self.read_timeout_disabled {

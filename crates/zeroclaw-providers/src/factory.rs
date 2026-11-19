@@ -364,7 +364,7 @@ pub fn apply_compat_options(
     if let Some(extra) = &opts.provider_extra
         && !extra.is_object()
     {
-        let config_path = format!("providers.models.<family>.<alias>.provider_extra", p.alias);
+        let config_path = "providers.models.<family>.<alias>.provider_extra";
         ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -380,10 +380,7 @@ pub fn apply_compat_options(
     if let Some(kwargs) = &opts.chat_template_kwargs
         && !kwargs.is_object()
     {
-        let config_path = format!(
-            "providers.models.<family>.<alias>.chat_template_kwargs",
-            p.alias
-        );
+        let config_path = "providers.models.<family>.<alias>.chat_template_kwargs";
         ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
