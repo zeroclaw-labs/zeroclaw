@@ -450,16 +450,16 @@ pub fn detect_version(value: &toml::Value) -> Result<u32> {
                 );
                 let fix = match retired {
                     Some((path, reason)) => format!(
-                        "`{path}` is retired ({reason}), so if the rest of the file is current, \
-                         adding `schema_version = {CURRENT_SCHEMA_VERSION}` as its first line is the whole fix: the \
+                        "`{path}` is retired ({reason}), so if the rest of the file is in the released V4 layout, \
+                         adding `schema_version = 4` as its first line is the whole fix: the \
                          current layout then drops it with a notice. If the whole file is \
                          older, add `schema_version = 1` or `schema_version = 2` instead"
                     ),
                     None => format!(
-                        "Rewrite the older settings in the current layout and add \
-                         `schema_version = {CURRENT_SCHEMA_VERSION}` as the first line, or, if the whole file is \
+                        "Rewrite the older settings in the released V4 layout and add \
+                         `schema_version = 4` as the first line, or, if the whole file is \
                          older, add `schema_version = 1` or `schema_version = 2` instead; \
-                         `zeroclaw config migrate` then rewrites it in the current layout"
+                         `zeroclaw config migrate` then applies the V4 → V5 migration"
                     ),
                 };
                 anyhow::bail!(
@@ -480,7 +480,7 @@ pub fn detect_version(value: &toml::Value) -> Result<u32> {
                      first line of the file with the version it was written for, so it is not \
                      guessed: `schema_version = 1` or `schema_version = 2` for an older file, \
                      `schema_version = 3` or `schema_version = 4` for their released layouts, \
-                     or `schema_version = {CURRENT_SCHEMA_VERSION}` for the current layout"
+                     or `schema_version = {CURRENT_SCHEMA_VERSION}` only when the file was written by a V5-aware binary"
                 )
             }
         },
@@ -512,8 +512,8 @@ enum UnversionedShape {
     /// A section only the V3 layout has beside a setting only an older one
     /// has. Either reading reshapes or drops part of the file, so neither is
     /// chosen. `retired` names the older setting, and the reason, when the
-    /// current layout retires it anyway, so stating the current version is
-    /// the whole fix.
+    /// released V4 layout retires it anyway, so stating V4 lets the normal
+    /// V4 → V5 migration apply afterward.
     Mixed {
         current: String,
         legacy: String,
@@ -2571,9 +2571,9 @@ fn run_chain_until(
             apply_retired_keys(&mut cur, version, RETIRED_KEYS, notices);
         }
     }
-    // Caps belong to the current schema: a chain that stops at a historical
-    // version produces what that version wrote, while every route to the
-    // current one (load, migrate, `config generate`) gets the caps applied.
+    // Caps belong to V4 and later: a chain that stops at a historical version
+    // produces what that version wrote, while every route through V4 or V5
+    // (load, migrate, `config generate`) gets the caps applied.
     if target >= 4 {
         lower_capped_keys(&mut cur, notices);
     }
@@ -7750,10 +7750,10 @@ mention_only = false
                 .to_string();
             assert!(
                 err.contains("is retired (")
-                    && err.contains(&format!(
-                        "so if the rest of the file is current, adding `schema_version = {CURRENT_SCHEMA_VERSION}` \
+                    && err.contains(
+                        "so if the rest of the file is in the released V4 layout, adding `schema_version = 4` \
                          as its first line is the whole fix"
-                    )),
+                    ),
                 "{err}"
             );
         }

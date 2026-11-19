@@ -40,6 +40,7 @@
   - [Provider capability ownership](./architecture/provider-capabilities.md)
   - [Response parsing](./architecture/response-parsing.md)
   - [Chat call inputs](./architecture/chat-call-inputs.md)
+  - [Configuration V5 boundary](./architecture/config-v5.md)
   - [Crates](./architecture/crates.md)
   - [Architecture Decision Records](./architecture/decisions/index.md)
     - [ADR-001: Rust first](./architecture/decisions/ADR-001-rust-first.md)
