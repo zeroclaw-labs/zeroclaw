@@ -494,7 +494,7 @@ impl OpenAiModelProvider {
         }
     }
 
-    fn http_client(&self) -> Client {
+    fn http_client(&self) -> Result<Client, reqwest::Error> {
         let mut builder = Client::builder().connect_timeout(std::time::Duration::from_secs(10));
         if !self.timeout_disabled {
             builder = builder.timeout(std::time::Duration::from_secs(self.timeout_secs));
@@ -508,7 +508,7 @@ impl OpenAiModelProvider {
             builder,
             "model_provider.openai",
         );
-        builder.build().unwrap_or_else(|_| Client::new())
+        builder.build()
     }
 }
 
@@ -566,7 +566,7 @@ impl ModelProvider for OpenAiModelProvider {
         };
 
         let response = self
-            .http_client()
+            .http_client()?
             .post(format!("{}/chat/completions", self.base_url))
             .header("Authorization", format!("Bearer {credential}"))
             .json(&request)
@@ -666,7 +666,7 @@ impl ModelProvider for OpenAiModelProvider {
         }
 
         let response = self
-            .http_client()
+            .http_client()?
             .post(format!("{}/chat/completions", self.base_url))
             .header("Authorization", format!("Bearer {credential}"))
             .json(&native_request)
@@ -754,7 +754,7 @@ impl ModelProvider for OpenAiModelProvider {
         };
 
         let response = self
-            .http_client()
+            .http_client()?
             .post(format!("{}/chat/completions", self.base_url))
             .header("Authorization", format!("Bearer {credential}"))
             .json(&native_request)
@@ -793,7 +793,7 @@ impl ModelProvider for OpenAiModelProvider {
 
     async fn warmup(&self) -> anyhow::Result<()> {
         if let Some(credential) = self.credential.as_ref() {
-            self.http_client()
+            self.http_client()?
                 .get(format!("{}/models", self.base_url))
                 .header("Authorization", format!("Bearer {credential}"))
                 .send()
@@ -1309,7 +1309,7 @@ impl OpenAiResponsesModelProvider {
         }
     }
 
-    fn http_client(&self) -> Client {
+    fn http_client(&self) -> Result<Client, reqwest::Error> {
         let default_headers = self.build_default_headers();
         let mut builder = Client::builder().connect_timeout(std::time::Duration::from_secs(10));
         if !self.timeout_disabled {
@@ -1328,7 +1328,7 @@ impl OpenAiResponsesModelProvider {
             builder,
             "model_provider.openai",
         );
-        builder.build().unwrap_or_else(|_| Client::new())
+        builder.build()
     }
 
     /// Sibling `/models` endpoint next to the configured `/responses` URL,
@@ -1428,7 +1428,7 @@ impl ModelProvider for OpenAiResponsesModelProvider {
     /// live models instead of an unrelated public list.
     async fn list_models(&self) -> anyhow::Result<Vec<String>> {
         let url = self.models_url();
-        let mut request = self.http_client().get(&url);
+        let mut request = self.http_client()?.get(&url);
         if let Some(credential) = self.credential.as_deref() {
             request = request.header("Authorization", format!("Bearer {credential}"));
         }
@@ -1469,7 +1469,7 @@ impl ModelProvider for OpenAiResponsesModelProvider {
         let req = self.build_request(instructions, input, None, model, temperature, false);
         let response = self
             .apply_opencode_session_header(
-                self.http_client()
+                self.http_client()?
                     .post(&self.responses_url)
                     .header("Authorization", format!("Bearer {credential}")),
             )
@@ -1543,7 +1543,7 @@ impl ModelProvider for OpenAiResponsesModelProvider {
         }
         let response = self
             .apply_opencode_session_header(
-                self.http_client()
+                self.http_client()?
                     .post(&self.responses_url)
                     .header("Authorization", format!("Bearer {credential}")),
             )
@@ -2631,11 +2631,11 @@ mod tests {
         };
 
         let opencode = provider("https://opencode.ai/zen/v1");
-        assert!(has_policy(opencode.http_client()));
+        assert!(has_policy(opencode.http_client().unwrap()));
         assert!(has_policy(opencode.streaming_client()));
 
         let other = provider("https://api.openai.com/v1");
-        assert!(!has_policy(other.http_client()));
+        assert!(!has_policy(other.http_client().unwrap()));
         assert!(!has_policy(other.streaming_client()));
     }
 

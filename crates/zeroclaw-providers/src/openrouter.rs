@@ -581,7 +581,7 @@ impl OpenRouterModelProvider {
         Ok(value)
     }
 
-    fn http_client(&self) -> Client {
+    fn http_client(&self) -> Result<Client, reqwest::Error> {
         let mut builder =
             Client::builder().connect_timeout(Duration::from_secs(OPENROUTER_CONNECT_TIMEOUT_SECS));
         if !self.timeout_disabled {
@@ -594,7 +594,7 @@ impl OpenRouterModelProvider {
             builder,
             "model_provider.openrouter",
         );
-        builder.build().unwrap_or_else(|_| Client::new())
+        builder.build()
     }
 
     fn streaming_timeouts(&self) -> super::StreamTimeouts {
@@ -659,7 +659,7 @@ impl ModelProvider for OpenRouterModelProvider {
         // Hit a lightweight endpoint to establish TLS + HTTP/2 connection pool.
         // This prevents the first real chat request from timing out on cold start.
         if let Some(credential) = self.credential.as_ref() {
-            self.http_client()
+            self.http_client()?
                 .get(endpoint_url("auth/key"))
                 .header("Authorization", format!("Bearer {credential}"))
                 .send()
@@ -673,7 +673,7 @@ impl ModelProvider for OpenRouterModelProvider {
         // OpenRouter's /models endpoint is public — no credential required.
         // Returns ~300 models across every model_provider OpenRouter proxies.
         let response = self
-            .http_client()
+            .http_client()?
             .get(endpoint_url("models"))
             .send()
             .await?
@@ -728,7 +728,7 @@ impl ModelProvider for OpenRouterModelProvider {
 
         let body = self.merge_extra_body(&request)?;
         let response = self
-            .http_client()
+            .http_client()?
             .post(endpoint_url("chat/completions"))
             .header("Authorization", format!("Bearer {credential}"))
             .header("HTTP-Referer", "https://github.com/zeroclaw-labs/zeroclaw")
@@ -801,7 +801,7 @@ impl ModelProvider for OpenRouterModelProvider {
 
         let body = self.merge_extra_body(&request)?;
         let response = self
-            .http_client()
+            .http_client()?
             .post(endpoint_url("chat/completions"))
             .header("Authorization", format!("Bearer {credential}"))
             .header("HTTP-Referer", "https://github.com/zeroclaw-labs/zeroclaw")
@@ -872,7 +872,7 @@ impl ModelProvider for OpenRouterModelProvider {
 
         let body = self.merge_extra_body(&native_request)?;
         let response = self
-            .http_client()
+            .http_client()?
             .post(endpoint_url("chat/completions"))
             .header("Authorization", format!("Bearer {credential}"))
             .header("HTTP-Referer", "https://github.com/zeroclaw-labs/zeroclaw")
@@ -1111,7 +1111,7 @@ impl ModelProvider for OpenRouterModelProvider {
 
         let body = self.merge_extra_body(&native_request)?;
         let response = self
-            .http_client()
+            .http_client()?
             .post(endpoint_url("chat/completions"))
             .header("Authorization", format!("Bearer {credential}"))
             .header("HTTP-Referer", "https://github.com/zeroclaw-labs/zeroclaw")

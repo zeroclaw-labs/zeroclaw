@@ -2492,7 +2492,7 @@ impl AnthropicModelProvider {
         }
     }
 
-    fn http_client(&self) -> Client {
+    fn http_client(&self) -> Result<Client, reqwest::Error> {
         let mut builder = Client::builder().connect_timeout(std::time::Duration::from_secs(10));
         if !self.timeout_disabled {
             builder = builder.timeout(std::time::Duration::from_secs(self.timeout_secs));
@@ -2504,7 +2504,7 @@ impl AnthropicModelProvider {
             builder,
             "model_provider.anthropic",
         );
-        builder.build().unwrap_or_else(|_| Client::new())
+        builder.build()
     }
 
     /// Streaming defaults to no total deadline. An explicit deadline covers
@@ -3027,7 +3027,7 @@ impl ModelProvider for AnthropicModelProvider {
         };
 
         let mut request = self
-            .http_client()
+            .http_client()?
             .post(format!("{}/v1/messages", self.base_url))
             .header("anthropic-version", "2023-06-01")
             .header("content-type", "application/json")
@@ -3182,7 +3182,7 @@ impl ModelProvider for AnthropicModelProvider {
         };
 
         let req = self
-            .http_client()
+            .http_client()?
             .post(format!("{}/v1/messages", self.base_url))
             .header("anthropic-version", "2023-06-01")
             .header("content-type", "application/json")
@@ -3284,7 +3284,7 @@ impl ModelProvider for AnthropicModelProvider {
     async fn warmup(&self) -> anyhow::Result<()> {
         if let Some(credential) = self.credential.as_ref() {
             let mut request = self
-                .http_client()
+                .http_client()?
                 .post(format!("{}/v1/messages", self.base_url))
                 .header("anthropic-version", "2023-06-01");
             request = self.apply_auth(request, credential, false, &[]);
@@ -3423,7 +3423,15 @@ impl ModelProvider for AnthropicModelProvider {
             // across the async boundary.
             let body = serde_json::to_value(&native_request)
                 .expect("NativeChatRequest should serialize to JSON");
-            let client = self.http_client();
+            let client = match self.http_client() {
+                Ok(client) => client,
+                Err(error) => {
+                    return stream::once(async move {
+                        Err(StreamError::Http(format!("building HTTP client: {error}")))
+                    })
+                    .boxed();
+                }
+            };
             let url = format!("{}/v1/messages", self.base_url);
             let is_oauth = Self::is_setup_token(&credential);
             // Owned copy of the requested model moved into the `'static` block

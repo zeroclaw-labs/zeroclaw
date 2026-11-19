@@ -103,6 +103,9 @@ impl HttpTransportConfig {
             )
         });
         reqwest::redirect::Policy::custom(move |attempt| {
+            if attempt.previous().len() >= 10 {
+                return attempt.stop();
+            }
             let destination = attempt.url();
             let same_origin = origin.as_ref().is_some_and(|(scheme, host, port)| {
                 destination.scheme() == scheme
