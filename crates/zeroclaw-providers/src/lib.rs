@@ -873,7 +873,7 @@ pub fn model_provider_runtime_options_from_model_provider_entry(
         reasoning_enabled: config.runtime.reasoning_enabled,
         reasoning_effort: config.runtime.reasoning_effort.clone(),
         reasoning_effort_passthrough: entry.is_some_and(|e| e.reasoning_effort_passthrough),
-        provider_timeout_secs: Some(entry.and_then(|e| e.timeout_secs).unwrap_or(120)),
+        provider_timeout_secs: entry.and_then(|e| e.timeout_secs),
         provider_timeout_disabled: false,
         provider_read_timeout_secs: None,
         provider_read_timeout_disabled: false,
@@ -3129,6 +3129,21 @@ mod tests {
                     "{name}: factory-created leaves must attest to a stable request identity"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn legacy_timeout_projection_preserves_omission_and_explicit_values() {
+        use zeroclaw_config::schema::{Config, ModelProviderConfig};
+        let config = Config::default();
+        for timeout_secs in [None, Some(30), Some(600)] {
+            let entry = ModelProviderConfig {
+                timeout_secs,
+                ..Default::default()
+            };
+            let options =
+                model_provider_runtime_options_from_model_provider_entry(&config, Some(&entry));
+            assert_eq!(options.provider_timeout_secs, timeout_secs);
         }
     }
 

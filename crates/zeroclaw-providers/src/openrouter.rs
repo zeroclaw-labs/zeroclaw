@@ -587,7 +587,9 @@ impl OpenRouterModelProvider {
         if !self.timeout_disabled {
             builder = builder.timeout(Duration::from_secs(self.timeout_secs));
         }
-        if let Some(read_timeout) = self.read_timeout_secs {
+        if !self.read_timeout_disabled
+            && let Some(read_timeout) = self.read_timeout_secs
+        {
             builder = builder.read_timeout(Duration::from_secs(read_timeout));
         }
         let builder = zeroclaw_config::schema::apply_runtime_proxy_to_builder(
