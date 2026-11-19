@@ -75,9 +75,9 @@ pub fn handle(
                     &[("key", &key), ("alias", &alias)],
                 )
             );
-            std::io::stdout().flush().ok();
+            std::io::stdout().flush()?;
             let mut input = String::new();
-            std::io::stdin().read_line(&mut input).ok();
+            std::io::stdin().read_line(&mut input)?;
             if !input.trim().eq_ignore_ascii_case("y") {
                 println!(
                     "{}",
@@ -230,9 +230,9 @@ fn bulk_claim(
         "{} ",
         get_required_cli_string("cli-migrate-session-ownership-prompt-alias")
     );
-    std::io::stdout().flush().ok();
+    std::io::stdout().flush()?;
     let mut alias = String::new();
-    std::io::stdin().read_line(&mut alias).ok();
+    std::io::stdin().read_line(&mut alias)?;
     let alias = alias.trim().to_string();
     if alias.is_empty() {
         println!(

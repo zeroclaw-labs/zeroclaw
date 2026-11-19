@@ -196,6 +196,7 @@ cli-migrate-openclaw-about = Importer la mémoire d'un espace de travail OpenCla
 cli-migrate-openclaw-qdrant-unsupported = Qdrant n’est actuellement pas pris en charge comme cible de migration OpenClaw. Définissez memory.backend sur sqlite, lucid ou markdown, puis réessayez.
 
 # migrate session-ownership (commande d'administration opérateur)
+cli-migrate-session-ownership-about = Complète les métadonnées de propriété des sessions antérieures à la migration
 cli-migrate-session-ownership-err-open-backend = ouvrir le backend de sessions
 cli-migrate-session-ownership-err-backend-unsupported = le backend de sessions n'implémente pas la réclamation atomique de propriétaire ; refus d'exécution plutôt que de retomber sur un « lecture puis écrasement » non atomique (risque d'écraser silencieusement un propriétaire concurrent). Relancez la commande sur un backend qui implémente le contrat (par ex. sqlite) ou ajoutez d'abord le support de la réclamation atomique à ce backend.
 cli-migrate-session-ownership-err-missing-alias = --claim requiert --agent-alias <alias> pour enregistrer un propriétaire ; refus d'écrire sans agent cible, car la session serait définitivement inaccessible

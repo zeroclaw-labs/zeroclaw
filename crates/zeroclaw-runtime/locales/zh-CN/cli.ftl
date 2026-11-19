@@ -195,6 +195,7 @@ cli-migrate-openclaw-about = 将 OpenClaw 工作区中的记忆导入到此 Zero
 cli-migrate-openclaw-qdrant-unsupported = Qdrant 当前不支持作为 OpenClaw 迁移目标。请将 memory.backend 设置为 sqlite、lucid 或 markdown，然后重试。
 
 # migrate session-ownership（运维管理命令）
+cli-migrate-session-ownership-about = 为迁移前的会话回填所有权元数据
 cli-migrate-session-ownership-err-open-backend = 打开会话后端
 cli-migrate-session-ownership-err-backend-unsupported = 会话后端未实现原子所有者声明；与其退化为非原子的「读后覆写」（可能悄无声息地覆盖并发写入的所有者），不如直接拒绝。请改用实现了原子声明的后端（如 sqlite），或先为该后端补上原子声明能力再重试。
 cli-migrate-session-ownership-err-missing-alias = --claim 必须配合 --agent-alias <alias> 来记录所有者；没有目标代理就拒绝写入，否则会话将永久不可访问

@@ -218,6 +218,7 @@ cli-sop-show-about = Show details of an SOP
 cli-migrate-openclaw-about = Import memory from an OpenClaw workspace into this ZeroClaw workspace
 
 # migrate session-ownership (operator admin command)
+cli-migrate-session-ownership-about = Backfill session ownership metadata for pre-migration sessions
 cli-migrate-session-ownership-err-open-backend = open session backend
 cli-migrate-session-ownership-err-backend-unsupported = session backend does not implement atomic ownership claim; refusing to run rather than fall back to a non-atomic read-then-overwrite that could silently overwrite a concurrent owner. Re-run on a backend that implements the contract (e.g. sqlite) or add atomic claim support to this backend first.
 cli-migrate-session-ownership-err-missing-alias = --claim requires --agent-alias <alias> to record an owner; refusing to write ownership for an unowned session without a target agent

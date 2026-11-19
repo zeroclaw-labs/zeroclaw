@@ -194,6 +194,7 @@ cli-migrate-openclaw-about = OpenClaw ワークスペースからこの ZeroClaw
 cli-migrate-openclaw-qdrant-unsupported = Qdrant は現在、OpenClaw の移行先としてサポートされていません。memory.backend を sqlite、lucid、または markdown に設定して再試行してください。
 
 # migrate session-ownership（オペレーター管理コマンド）
+cli-migrate-session-ownership-about = 移行前のセッションの所有権メタデータをバックフィルします
 cli-migrate-session-ownership-err-open-backend = セッションバックエンドを開く
 cli-migrate-session-ownership-err-backend-unsupported = セッションバックエンドがアトミックな所有者宣言を実装していないため、非アトミックな「読み取り→上書き」（並行書き込みの所有者を静かに上書きする可能性）にフォールバックするより、実行を拒否します。契約（例: sqlite など）を実装したバックエンドで再実行するか、このバックエンドにアトミック宣言のサポートを追加してから再試行してください。
 cli-migrate-session-ownership-err-missing-alias = --claim には所有者となる --agent-alias <alias> が必要です。所有者なしで書き込むとセッションが永久にアクセス不能になるため拒否します
