@@ -476,6 +476,32 @@ mod tests {
 
     #[cfg(feature = "plugins-wasm")]
     #[test]
+    fn serialized_registry_id_is_the_origin_label_or_null() {
+        use zeroclaw_plugins::catalog::{OriginCatalogEntry, package_catalog};
+
+        let index = serde_json::from_value(serde_json::json!({
+            "plugins": [{"name": "calendar", "version": "1", "url": "https://example.invalid/p.zip"}]
+        }))
+        .unwrap();
+        let metadata = package_catalog(&[], Some(&index))[0];
+        for (origin, expected) in [
+            (
+                Some("https://example.invalid/index.json"),
+                Some("registry:b75c7012ffa635f6acd1a9bdf66cd23af440ba943f6f51f2eedb53e19d0c5131"),
+            ),
+            (None, None),
+        ] {
+            let row = OriginPluginCatalogEntry::from(OriginCatalogEntry { metadata, origin });
+            let json = serde_json::to_value(row).unwrap();
+            assert_eq!(
+                json.pointer("/available/registry_id"),
+                Some(&serde_json::json!(expected))
+            );
+        }
+    }
+
+    #[cfg(feature = "plugins-wasm")]
+    #[test]
     fn publisher_identity_is_distinct_without_exposing_source_urls() {
         let catalog: zeroclaw_plugins::registry::RegistryCollection = serde_json::from_value(serde_json::json!({"registries":[
             {"registry_url":"https://a.invalid/index?credential=private-a","plugins":[{"name":"calendar","version":"1","url":"https://download.invalid/p.zip"}]},
@@ -576,7 +602,6 @@ pub struct OriginPluginsResponse {
 #[cfg(feature = "plugins-wasm")]
 impl From<zeroclaw_plugins::catalog::OriginCatalogEntry<'_>> for OriginPluginCatalogEntry {
     fn from(row: zeroclaw_plugins::catalog::OriginCatalogEntry<'_>) -> Self {
-        use sha2::{Digest, Sha256};
         Self {
             name: row.name().to_string(),
             installed: row.installed().map(InstalledPluginPackage::from),
@@ -584,7 +609,7 @@ impl From<zeroclaw_plugins::catalog::OriginCatalogEntry<'_>> for OriginPluginCat
                 metadata: AvailablePluginPackage::from(entry),
                 registry_id: row
                     .origin
-                    .map(|origin| format!("{:x}", Sha256::digest(origin.as_bytes()))),
+                    .map(zeroclaw_plugins::registry::registry_origin_label),
             }),
         }
     }
