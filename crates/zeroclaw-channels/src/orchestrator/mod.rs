@@ -13221,6 +13221,19 @@ fn build_channel_by_id(
                 let alias = alias.clone();
                 Arc::new(move || cfg_arc.read().channel_voice_peers("telegram", &alias))
             };
+            let trusted_group_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
+                let cfg_arc = config_arc.clone();
+                let alias = alias.clone();
+                Arc::new(move || {
+                    cfg_arc
+                        .read()
+                        .channels
+                        .telegram
+                        .get(&alias)
+                        .map(|tg| tg.trusted_groups.clone())
+                        .unwrap_or_default()
+                })
+            };
             Ok(Arc::new(
                 TelegramChannel::new(
                     tg.bot_token.clone(),
@@ -13229,6 +13242,7 @@ fn build_channel_by_id(
                     tg.mention_only,
                 )
                 .with_voice_peer_resolver(voice_peer_resolver)
+                .with_trusted_group_resolver(trusted_group_resolver)
                 .with_persistence_authority(authority.clone())
                 .with_api_base(tg.api_base_url.clone())
                 .with_ack_reactions(ack)
@@ -14798,6 +14812,19 @@ fn collect_configured_channels_with_authority(
             let alias = alias.clone();
             Arc::new(move || cfg_arc.read().channel_voice_peers("telegram", &alias))
         };
+        let trusted_group_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
+            let cfg_arc = config_arc.clone();
+            let alias = alias.clone();
+            Arc::new(move || {
+                cfg_arc
+                    .read()
+                    .channels
+                    .telegram
+                    .get(&alias)
+                    .map(|tg| tg.trusted_groups.clone())
+                    .unwrap_or_default()
+            })
+        };
         channels.push(ConfiguredChannel {
             display_name: "Telegram",
             alias: Some(alias.clone()),
@@ -14810,6 +14837,7 @@ fn collect_configured_channels_with_authority(
                         tg.mention_only,
                     )
                     .with_voice_peer_resolver(voice_peer_resolver)
+                    .with_trusted_group_resolver(trusted_group_resolver)
                     .with_persistence_authority(authority.clone())
                     .with_api_base(tg.api_base_url.clone())
                     .with_ack_reactions(ack)
@@ -53530,6 +53558,7 @@ This is an example JSON object for profile settings."#;
                 multi_message_delay_ms: 800,
                 interrupt_on_new_message: false,
                 mention_only: false,
+                trusted_groups: vec![],
                 unauthorized_message: None,
                 per_user_session: true,
                 passive_group_context: false,
@@ -53563,6 +53592,7 @@ This is an example JSON object for profile settings."#;
                 multi_message_delay_ms: 800,
                 interrupt_on_new_message: false,
                 mention_only: false,
+                trusted_groups: vec![],
                 unauthorized_message: None,
                 per_user_session: true,
                 passive_group_context: false,

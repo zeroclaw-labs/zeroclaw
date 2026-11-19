@@ -17213,6 +17213,21 @@ pub struct TelegramConfig {
     #[tab(Behavior)]
     #[serde(default)]
     pub mention_only: bool,
+    /// Telegram group/supergroup `chat.id` values whose member messages are
+    /// authorized without a matching peer-group sender entry.
+    ///
+    /// This is an additional grant, not a restriction: groups absent from the
+    /// list keep using the normal peer-group sender allowlist. Entries are
+    /// negative numeric chat IDs; positive user IDs and non-numeric values are
+    /// rejected by config validation.
+    ///
+    /// The grant does not bypass `mention_only`, does not override `ignore`
+    /// deny entries, and does not grant approval authority. It applies to
+    /// text, voice, attachment, and media-group updates from groups and
+    /// supergroups only; direct messages are unaffected.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub trusted_groups: Vec<String>,
     /// Notice sent to a sender this channel has not authorized. `{identity}`
     /// expands to the sender's Telegram user ID (or username when no ID is
     /// available) and `{bind_command}` to the `zeroclaw channel bind-telegram`
@@ -17305,6 +17320,7 @@ impl Default for TelegramConfig {
             multi_message_delay_ms: default_multi_message_delay_ms(),
             interrupt_on_new_message: false,
             mention_only: false,
+            trusted_groups: Vec::new(),
             unauthorized_message: None,
             per_user_session: true,
             passive_group_context: false,
@@ -17327,6 +17343,27 @@ impl TelegramConfig {
             self.enabled,
             &self.bot_token,
         )
+    }
+
+    /// Validate `trusted_groups` entries.
+    ///
+    /// The field is a chat-level grant, so a user ID or username here would
+    /// silently authorize nothing. Reject anything that is not a negative
+    /// numeric chat ID instead of accepting a no-op entry.
+    pub fn validate_trusted_groups(&self, alias: &str) -> Result<()> {
+        for (index, entry) in self.trusted_groups.iter().enumerate() {
+            let path = format!("channels.telegram.{alias}.trusted_groups[{index}]");
+            let trimmed = entry.trim();
+            let valid = trimmed.parse::<i64>().is_ok_and(|chat_id| chat_id < 0);
+            if !valid {
+                validation_bail!(
+                    InvalidFormat,
+                    path,
+                    "{path} must be a negative numeric Telegram group chat.id (for example \"-1001234567890\"); a user ID or username is not accepted"
+                );
+            }
+        }
+        Ok(())
     }
 }
 
@@ -24833,6 +24870,7 @@ impl Config {
 
         for (alias, tg) in &self.channels.telegram {
             tg.validate_bot_token(alias)?;
+            tg.validate_trusted_groups(alias)?;
             validate_http_base_url(
                 &format!("channels.telegram.{alias}.api_base_url"),
                 &tg.api_base_url,
@@ -33798,6 +33836,62 @@ custom_ca_secret = "corp_ca"
     }
 
     #[test]
+    async fn validate_accepts_negative_trusted_group_ids() {
+        let mut config = Config::default();
+        let tg = TelegramConfig {
+            bot_token: "tok".into(),
+            trusted_groups: vec!["-1001234567890".into(), " -1009876543210 ".into()],
+            ..Default::default()
+        };
+        config.channels.telegram.insert("default".to_string(), tg);
+        config
+            .validate()
+            .expect("negative group chat IDs must be accepted");
+    }
+
+    #[test]
+    async fn validate_rejects_positive_trusted_group_id() {
+        let mut config = Config::default();
+        let tg = TelegramConfig {
+            bot_token: "tok".into(),
+            trusted_groups: vec!["8734062810".into()],
+            ..Default::default()
+        };
+        config.channels.telegram.insert("home".to_string(), tg);
+        let err = config
+            .validate()
+            .expect_err("a user ID is not a group chat ID");
+        let message = err.to_string();
+        assert!(
+            message.contains("channels.telegram.home.trusted_groups[0]"),
+            "error must name the offending entry; got: {message}"
+        );
+        assert!(
+            message.contains("negative numeric Telegram group chat.id"),
+            "error must explain the expected shape; got: {message}"
+        );
+    }
+
+    #[test]
+    async fn validate_rejects_non_numeric_trusted_group_id() {
+        let mut config = Config::default();
+        let tg = TelegramConfig {
+            bot_token: "tok".into(),
+            trusted_groups: vec!["@my_group".into()],
+            ..Default::default()
+        };
+        config.channels.telegram.insert("home".to_string(), tg);
+        let err = config
+            .validate()
+            .expect_err("a username is not a numeric chat ID");
+        assert!(
+            err.to_string()
+                .contains("channels.telegram.home.trusted_groups[0]"),
+            "error must name the offending entry; got: {err}"
+        );
+    }
+
+    #[test]
     async fn telegram_api_base_url_default_uses_official_endpoint() {
         assert_eq!(
             TelegramConfig::default().api_base_url,
@@ -34965,6 +35059,7 @@ auto_save = true
                         debounce_ms: None,
                         interrupt_on_new_message: false,
                         mention_only: false,
+                        trusted_groups: vec![],
                         unauthorized_message: None,
                         per_user_session: true,
                         passive_group_context: false,
@@ -37004,6 +37099,7 @@ default_temperature = 0.7
             multi_message_delay_ms: default_multi_message_delay_ms(),
             interrupt_on_new_message: true,
             mention_only: false,
+            trusted_groups: vec![],
             unauthorized_message: None,
             per_user_session: true,
             passive_group_context: false,
@@ -43830,6 +43926,7 @@ high_entropy_tokens = false
                 multi_message_delay_ms: default_multi_message_delay_ms(),
                 interrupt_on_new_message: false,
                 mention_only: false,
+                trusted_groups: vec![],
                 unauthorized_message: None,
                 per_user_session: true,
                 passive_group_context: false,
