@@ -101,6 +101,13 @@ fn provider_pricing_entry<'a>(
 }
 
 fn apply_rate_sheet_pricing(config: &Config, provider_type: &str, slot: &mut HashMap<String, f64>) {
+    // Canonical OpenAI-compatible connections use the shared `custom` rate
+    // family in the registry and dashboard. Keep runtime billing on that same
+    // canonical family instead of silently dropping the saved rates.
+    let provider_type = match provider_type {
+        "openai-compatible" => "custom",
+        other => other,
+    };
     for (rate_provider_type, model_id, rates) in config.cost.rates.providers.models.iter_entries() {
         if rate_provider_type != provider_type {
             continue;
@@ -1573,6 +1580,26 @@ output_per_mtok = 4.0
             Some(0.28),
             "cost.rates must remain the canonical pricing source"
         );
+    }
+
+    #[test]
+    fn compatible_connections_use_the_custom_rate_sheet_family() {
+        let mut config = Config::default();
+        config.cost.rates.providers.models.custom.insert(
+            "gpt-4o-mini".to_owned(),
+            zeroclaw_config::schema::ModelCostRates {
+                input_per_mtok: Some(0.2),
+                output_per_mtok: Some(0.8),
+                cached_input_per_mtok: None,
+                cache_write_per_mtok: None,
+            },
+        );
+        let mut slot = HashMap::new();
+
+        apply_rate_sheet_pricing(&config, "openai-compatible", &mut slot);
+
+        assert_eq!(slot.get("gpt-4o-mini.input"), Some(&0.2));
+        assert_eq!(slot.get("gpt-4o-mini.output"), Some(&0.8));
     }
 
     #[test]
