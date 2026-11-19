@@ -4,6 +4,7 @@ pub mod a2a_wire;
 pub mod agent;
 pub mod asr;
 pub mod attribution;
+pub mod capability;
 pub mod channel;
 pub mod conversation_binding;
 pub mod decision;
@@ -35,6 +36,13 @@ pub mod tts;
 pub mod turn_stop;
 pub mod vad;
 pub mod webhook;
+
+/// Admitted model policy for extracting protocol data embedded in text.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TextExtraction {
+    pub reasoning: bool,
+    pub tool_calls: bool,
+}
 
 tokio::task_local! {
     /// Current thread/sender ID for per-sender rate limiting.
