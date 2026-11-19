@@ -20,8 +20,9 @@ pub async fn with_video_read_policy<F: std::future::Future>(
 pub(crate) fn current_read_policy() -> Option<Arc<SecurityPolicy>> {
     VIDEO_READ_POLICY.try_with(Clone::clone).ok().flatten()
 }
+use zeroclaw_api::media::MarkerKind;
 use zeroclaw_api::model_provider::ChatMessage;
-use zeroclaw_api::tool_carrier::is_tool_result_carrier;
+use zeroclaw_api::tool_carrier::{classify, is_tool_result_carrier, rebuild_carrier};
 
 // Qwen's compatible API documents raw Base64 video files strictly below 7 MB.
 const MAX_VIDEO_BYTES: usize = 7_000_000 - 1;
@@ -73,7 +74,46 @@ pub(crate) async fn normalize_messages(
     let mut normalized = messages.to_vec();
     // A request-wide bound also limits repeated videos in retained history.
     let mut remaining_bytes = MAX_VIDEO_BYTES;
-    for message in &mut normalized {
+    let current_tools = crate::multimodal::current_turn_tool_result_indices(messages);
+    for (index, message) in normalized.iter_mut().enumerate() {
+        if let Some(mut carrier) = classify(&message.role, &message.content) {
+            if !carrier.declared
+                || !carrier
+                    .attachments
+                    .iter()
+                    .any(|a| a.kind == MarkerKind::Video)
+            {
+                continue;
+            }
+            let mut attachments = Vec::with_capacity(carrier.attachments.len());
+            for mut attachment in std::mem::take(&mut carrier.attachments) {
+                if attachment.kind != MarkerKind::Video {
+                    attachments.push(attachment);
+                    continue;
+                }
+                let unavailable = if !current_tools.contains(&index) {
+                    Some("video omitted from an earlier user turn".to_string())
+                } else if !supports_model(model) {
+                    Some("Qwen model does not support video-file input".to_string())
+                } else {
+                    match load_video(&attachment.target, remaining_bytes).await {
+                        Ok(bytes) => {
+                            remaining_bytes -= bytes.len();
+                            attachment.target = format!("{DATA_PREFIX}{}", STANDARD.encode(bytes));
+                            attachments.push(attachment);
+                            None
+                        }
+                        Err(error) => Some(format!("video unavailable: {error:#}")),
+                    }
+                };
+                if let Some(notice) = unavailable {
+                    carrier.text.push_str(&format!("\n[tool {notice}]"));
+                }
+            }
+            message.content =
+                rebuild_carrier(&message.role, &message.content, &carrier, &attachments);
+            continue;
+        }
         if message.role != "user" || is_tool_result_carrier(&message.role, &message.content) {
             continue;
         }
@@ -122,7 +162,7 @@ async fn load_video(source: &str, limit: usize) -> anyhow::Result<Vec<u8>> {
     };
     ensure!(bytes.len() <= limit, "Qwen video input exceeds byte budget");
     // This checks the MP4 container signature, not codec decodability.
-    if bytes.len() < 12 || &bytes[4..8] != b"ftyp" {
+    if !zeroclaw_api::media::is_mp4_container(&bytes) {
         bail!("Qwen video input is not an MP4 container");
     }
     Ok(bytes)

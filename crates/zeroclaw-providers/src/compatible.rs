@@ -20,7 +20,9 @@ use reqwest::{
 };
 use serde::{Deserialize, Serialize};
 use zeroclaw_api::media::{MarkerKind, RenderedMarker};
-use zeroclaw_api::tool_carrier::{classify, is_tool_result_carrier, rebuild_carrier};
+use zeroclaw_api::tool_carrier::{
+    classify, is_tool_result_carrier, rebuild_carrier, render_prompt_tool_carrier,
+};
 use zeroclaw_config::schema::{CacheTtl, ToolResultImagePolicy};
 
 const TOOL_RESULT_IMAGE_OMITTED_NOTICE: &str = "[tool-result image omitted by provider policy]";
@@ -3442,15 +3444,25 @@ impl OpenAiCompatibleModelProvider {
         if !allow_image_parts {
             return MessageContent::Text(body.to_string());
         }
-        let image_refs: Vec<&str> = attachments
+        let media_parts: Vec<MessagePart> = attachments
             .iter()
-            .filter(|marker| marker.kind == MarkerKind::Image)
-            .map(|marker| marker.target.as_str())
+            .filter_map(|marker| {
+                let url = ImageUrlPart {
+                    url: marker.target.clone(),
+                };
+                match marker.kind {
+                    MarkerKind::Image => Some(MessagePart::ImageUrl { image_url: url }),
+                    MarkerKind::Video if matches!(self.name.as_str(), "Qwen" | "Qwen Code") => {
+                        Some(MessagePart::VideoUrl { video_url: url })
+                    }
+                    _ => None,
+                }
+            })
             .collect();
-        if image_refs.is_empty() {
+        if media_parts.is_empty() {
             return MessageContent::Text(body.to_string());
         }
-        let mut parts = Vec::with_capacity(image_refs.len() + 1);
+        let mut parts = Vec::with_capacity(media_parts.len() + 1);
         let trimmed_body = body.trim();
         if !trimmed_body.is_empty() {
             parts.push(MessagePart::Text {
@@ -3458,13 +3470,7 @@ impl OpenAiCompatibleModelProvider {
                 cache_control: None,
             });
         }
-        for image_ref in image_refs {
-            parts.push(MessagePart::ImageUrl {
-                image_url: ImageUrlPart {
-                    url: image_ref.to_string(),
-                },
-            });
-        }
+        parts.extend(media_parts);
         MessageContent::Parts(parts)
     }
 
@@ -3509,6 +3515,21 @@ impl OpenAiCompatibleModelProvider {
                 Vec::new()
             };
             return self.tool_carrier_content(&parts.text, &attachments, allow_user_image_parts);
+        }
+        if matches!(self.name.as_str(), "Qwen" | "Qwen Code")
+            && role == "user"
+            && let Some(carrier) = classify(role, content).filter(|carrier| carrier.declared)
+        {
+            // Keep the external-tool envelope after lifting visual parts.
+            // Non-visual references still belong to the rendered carrier text.
+            let retained: Vec<_> = carrier
+                .attachments
+                .iter()
+                .filter(|marker| !matches!(marker.kind, MarkerKind::Image | MarkerKind::Video))
+                .cloned()
+                .collect();
+            let text = render_prompt_tool_carrier(&carrier.text, &retained);
+            return self.tool_carrier_content(&text, &carrier.attachments, allow_user_image_parts);
         }
         if matches!(self.name.as_str(), "Qwen" | "Qwen Code")
             && role == "user"
@@ -3802,8 +3823,9 @@ impl OpenAiCompatibleModelProvider {
                         // identical text. Framed as external tool output because
                         // relocation lands the image in a `role:"user"` message.
                         image_ordinal += 1;
+                        let kind = Self::visual_group_label(&images);
                         let marker = format!(
-                            "[external tool output - image from tool result {image_ordinal} relocated to a following user message]"
+                            "[external tool output - {kind} from tool result {image_ordinal} relocated to a following user message]"
                         );
                         text = if text.is_empty() {
                             marker
@@ -3839,6 +3861,17 @@ impl OpenAiCompatibleModelProvider {
         out
     }
 
+    fn visual_group_label(parts: &[MessagePart]) -> &'static str {
+        if parts
+            .iter()
+            .any(|part| matches!(part, MessagePart::VideoUrl { .. }))
+        {
+            "visual media"
+        } else {
+            "image"
+        }
+    }
+
     /// Flatten relocated image groups into content parts, prefixing each group
     /// with a text label carrying the same ordinal stamped into the producing
     /// tool message's text, so the model can tie each image back to its exact
@@ -3855,8 +3888,9 @@ impl OpenAiCompatibleModelProvider {
             if images.is_empty() {
                 continue;
             }
+            let kind = Self::visual_group_label(&images);
             parts.push(MessagePart::Text {
-                text: format!("[external tool output - image from tool result {ordinal}]"),
+                text: format!("[external tool output - {kind} from tool result {ordinal}]"),
                 cache_control: None,
             });
             parts.extend(images);
@@ -17763,3 +17797,7 @@ mod tests {
 #[cfg(test)]
 #[path = "compatible_qwen_video_tests.rs"]
 mod qwen_video_tests;
+
+#[cfg(test)]
+#[path = "compatible_mcp_video_tests.rs"]
+mod mcp_video_tests;

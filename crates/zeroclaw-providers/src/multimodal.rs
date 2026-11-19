@@ -1701,7 +1701,7 @@ fn warn_on_legacy_carrier_markers(messages: &[ChatMessage]) {
 /// that produced them; they are stripped once the next user message
 /// arrives, so a tool image is never replayed on every later request
 /// forever.
-fn current_turn_tool_result_indices(messages: &[ChatMessage]) -> HashSet<usize> {
+pub(crate) fn current_turn_tool_result_indices(messages: &[ChatMessage]) -> HashSet<usize> {
     let current_turn_start = messages.iter().rposition(|message| {
         message.role == "user" && !is_tool_result_carrier(&message.role, &message.content)
     });
