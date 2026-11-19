@@ -833,10 +833,6 @@ mod graceful_summary_metering_tests {
             enabled: true,
             daily_limit_usd: -1.0,
             monthly_limit_usd: -1.0,
-            enforcement: zeroclaw_config::schema::CostEnforcementConfig {
-                mode: "block".into(),
-                ..zeroclaw_config::schema::CostEnforcementConfig::default()
-            },
             ..CostConfig::default()
         };
         let tracker = Arc::new(crate::cost::CostTracker::new(cfg, tmp.path()).unwrap());

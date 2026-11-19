@@ -7532,10 +7532,10 @@ pub struct CostConfig {
 #[prefix = "cost.enforcement"]
 pub struct CostEnforcementConfig {
     /// What happens when a shared daily or monthly limit is exceeded:
-    /// "warn" (default) logs a warning and lets the request through, and
-    /// "block" refuses it. "route_down" does not substitute a model yet and
+    /// "block" (default) refuses the request, and "warn" logs a warning and
+    /// lets it through. "route_down" does not substitute a model yet and
     /// refuses like "block", as does any other value. A delegated agent's
-    /// per-hop cost ceiling refuses in every mode.
+    /// per-hop cost ceiling refuses that agent's own calls in every mode.
     #[serde(default = "default_cost_enforcement_mode")]
     pub mode: String,
     /// Model hint for "route_down" mode, which does not substitute it yet.
@@ -7547,7 +7547,7 @@ pub struct CostEnforcementConfig {
 }
 
 fn default_cost_enforcement_mode() -> String {
-    "warn".to_string()
+    "block".to_string()
 }
 
 fn default_reserve_percent() -> u8 {
@@ -47505,7 +47505,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
     #[test]
     async fn cost_enforcement_config_defaults() {
         let config = CostEnforcementConfig::default();
-        assert_eq!(config.mode, "warn");
+        assert_eq!(config.mode, "block");
         assert_eq!(config.route_down_model, None);
         assert_eq!(config.reserve_percent, 10);
     }
@@ -47513,7 +47513,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
     #[test]
     async fn cost_config_includes_enforcement() {
         let config = CostConfig::default();
-        assert_eq!(config.enforcement.mode, "warn");
+        assert_eq!(config.enforcement.mode, "block");
         assert_eq!(config.enforcement.reserve_percent, 10);
     }
 

@@ -23364,7 +23364,7 @@ command = "rm independent-delegate-marker"
     ) -> DelegateCostFixture {
         use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
         use zeroclaw_config::schema::{
-            CostConfig, CostEnforcementConfig, OllamaModelProviderConfig, RuntimeProfileConfig,
+            CostConfig, OllamaModelProviderConfig, RuntimeProfileConfig,
         };
 
         let tmp = TempDir::new().unwrap();
@@ -23375,17 +23375,11 @@ command = "rm independent-delegate-marker"
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         };
-        // These fixtures pin the hard stop; `warn` is covered at the budget
-        // gate itself.
         root_config.cost = CostConfig {
             enabled: cost_tracking_enabled,
             track_per_agent,
             daily_limit_usd,
             monthly_limit_usd: 10_000.0,
-            enforcement: CostEnforcementConfig {
-                mode: "block".into(),
-                ..CostEnforcementConfig::default()
-            },
             ..CostConfig::default()
         };
         root_config.providers.models.ollama.insert(
@@ -24056,9 +24050,7 @@ command = "rm independent-delegate-marker"
         leaf_ceiling_cents: u32,
     ) -> DelegateCostFixture {
         use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
-        use zeroclaw_config::schema::{
-            CostConfig, CostEnforcementConfig, OllamaModelProviderConfig,
-        };
+        use zeroclaw_config::schema::{CostConfig, OllamaModelProviderConfig};
 
         let tmp = TempDir::new().unwrap();
         let data_dir = tmp.path().join("data");
@@ -24073,10 +24065,6 @@ command = "rm independent-delegate-marker"
             track_per_agent: true,
             daily_limit_usd,
             monthly_limit_usd: 10_000.0,
-            enforcement: CostEnforcementConfig {
-                mode: "block".into(),
-                ..CostEnforcementConfig::default()
-            },
             ..CostConfig::default()
         };
         root_config.providers.models.ollama.insert(
@@ -25212,7 +25200,7 @@ command = "rm independent-delegate-marker"
         use crate::agent::cost::ToolLoopCostTrackingContext;
         use crate::cost::CostTracker;
         use std::collections::HashMap;
-        use zeroclaw_config::schema::{CostConfig, CostEnforcementConfig};
+        use zeroclaw_config::schema::CostConfig;
 
         // A test-owned base tracker stands in for the process-global
         // tracker a delegate derives from (owning it directly keeps this
@@ -25228,10 +25216,6 @@ command = "rm independent-delegate-marker"
                     track_per_agent: true,
                     daily_limit_usd: 1000.0,
                     monthly_limit_usd: 10_000.0,
-                    enforcement: CostEnforcementConfig {
-                        mode: "block".into(),
-                        ..CostEnforcementConfig::default()
-                    },
                     ..CostConfig::default()
                 },
                 workspace.path(),

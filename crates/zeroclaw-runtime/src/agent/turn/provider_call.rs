@@ -387,9 +387,11 @@ pub(crate) fn enforce_tool_loop_budget() -> Result<()> {
 
 /// Surface a `cost.warn_at_percent` crossing to the turn's event stream.
 /// Sends at most one [`TurnEvent::BudgetWarning`] per turn (`*sent` latches)
-/// and never blocks the turn: an exceeded limit is left to
-/// [`enforce_tool_loop_budget`], and a full or closed channel drops the
-/// notice. No-op when unscoped or when the turn has no event stream.
+/// and never blocks the turn; a full or closed channel drops the notice.
+/// Only a limit that is near but not yet exceeded sends one. Past the limit
+/// [`enforce_tool_loop_budget`] decides: it stops the turn, or under
+/// `[cost.enforcement] mode = "warn"` lets it through with a log record and
+/// no event. No-op when unscoped or when the turn has no event stream.
 pub(crate) fn announce_budget_warning(
     event_tx: Option<&tokio::sync::mpsc::Sender<zeroclaw_api::agent::TurnEvent>>,
     sent: &mut bool,
@@ -4306,10 +4308,27 @@ mod tests {
     const REJECT: &str = "tool-call loop budget exceeded";
 
     #[test]
-    fn the_default_warn_mode_lets_an_exceeded_shared_limit_through_and_records_it() {
-        // No mode set: the default is `warn`.
+    fn the_default_mode_is_block_and_stops_an_exceeded_shared_limit() {
+        // No mode set: the default is `block`, so an exceeded limit stops
+        // the turn as it did before the mode was read at all.
         let tmp = tempfile::tempdir().unwrap();
-        let (result, frames) = gate_with_records(tracker_with_spend(&tmp, 10.25), 10.25);
+        let (result, frames) = gate_with_records(tracker_with_spend(&tmp, 12.75), 12.75);
+        assert_budget_stop(result, "Budget exceeded: $12.7500 of $10.00 Day limit");
+        let reject = frame_with_message(&frames, REJECT).unwrap_or_else(|| {
+            panic!(
+                "no refusal record (capture layer active: {}): {frames:?}",
+                zeroclaw_log::__private_test_capture_layer_active()
+            )
+        });
+        assert_eq!(reject["attributes"]["enforcement_mode"], "block");
+        assert!(frame_with_message(&frames, WARN_NOTE).is_none());
+        assert!(frame_with_message(&frames, FALLBACK_NOTE).is_none());
+    }
+
+    #[test]
+    fn warn_mode_lets_an_exceeded_shared_limit_through_and_records_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (result, frames) = gate_with_records(tracker_with_mode(&tmp, 10.25, "warn"), 10.25);
         assert!(result.is_ok(), "warn must not stop the turn: {result:?}");
         let note = frame_with_message(&frames, WARN_NOTE).unwrap_or_else(|| {
             panic!(
@@ -4394,7 +4413,7 @@ mod tests {
         // $10.5 shared plus $6 of the child's own: the $10 shared limit is
         // exceeded, which `warn` lets through, so only the ceiling decides.
         let tmp = tempfile::tempdir().unwrap();
-        let base = tracker_with_spend(&tmp, 10.5);
+        let base = tracker_with_mode(&tmp, 10.5, "warn");
         base.record_usage_with_agent(
             crate::cost::types::TokenUsage::new("test/model", 1_000_000, 0, 0, 6.0, 0.0, 0.0),
             Some("child"),

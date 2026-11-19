@@ -19383,10 +19383,11 @@ Let me check the result."#;
     }
 
     /// Run one turn whose cost scope is already past a $0.001 daily limit,
-    /// with `[cost.enforcement] mode` set to `mode`. Returns the turn's
-    /// result and the lifecycle events it streamed.
+    /// with `[cost.enforcement] mode` set to `mode`, or left at its default
+    /// when `None`. Returns the turn's result and the lifecycle events it
+    /// streamed.
     async fn run_turn_past_the_daily_limit(
-        mode: &str,
+        mode: Option<&str>,
     ) -> (
         anyhow::Result<String>,
         Vec<zeroclaw_api::channel::ProgressEvent>,
@@ -19405,15 +19406,14 @@ Let me check the result."#;
             ScriptedModelProvider::from_text_responses(vec!["the provider answered"]);
         let observer = NoopObserver;
         let workspace = tempfile::TempDir::new().unwrap();
-        let cost_config = zeroclaw_config::schema::CostConfig {
+        let mut cost_config = zeroclaw_config::schema::CostConfig {
             enabled: true,
             daily_limit_usd: 0.001, // very low limit
-            enforcement: zeroclaw_config::schema::CostEnforcementConfig {
-                mode: mode.to_string(),
-                ..zeroclaw_config::schema::CostEnforcementConfig::default()
-            },
             ..zeroclaw_config::schema::CostConfig::default()
         };
+        if let Some(mode) = mode {
+            cost_config.enforcement.mode = mode.to_string();
+        }
         let tracker = Arc::new(CostTracker::new(cost_config.clone(), workspace.path()).unwrap());
         // Record a usage that already exceeds the limit
         tracker
@@ -19515,7 +19515,7 @@ Let me check the result."#;
     async fn budget_rejection_emits_no_waiting_on_model_lifecycle() {
         use zeroclaw_api::channel::ProgressEvent;
 
-        let (result, lifecycle) = run_turn_past_the_daily_limit("block").await;
+        let (result, lifecycle) = run_turn_past_the_daily_limit(None).await;
         let err = result.expect_err("should fail with budget exceeded");
         assert!(
             err.to_string().contains("Budget exceeded"),
@@ -19531,7 +19531,7 @@ Let me check the result."#;
     async fn warn_mode_turn_past_the_daily_limit_still_reaches_the_provider() {
         use zeroclaw_api::channel::ProgressEvent;
 
-        let (result, lifecycle) = run_turn_past_the_daily_limit("warn").await;
+        let (result, lifecycle) = run_turn_past_the_daily_limit(Some("warn")).await;
         assert_eq!(
             result.expect("warn must let the turn run"),
             "the provider answered"
@@ -19988,10 +19988,6 @@ Let me check the result."#;
         let cost_config = zeroclaw_config::schema::CostConfig {
             enabled: true,
             daily_limit_usd: 0.001, // very low limit
-            enforcement: zeroclaw_config::schema::CostEnforcementConfig {
-                mode: "block".into(),
-                ..zeroclaw_config::schema::CostEnforcementConfig::default()
-            },
             ..zeroclaw_config::schema::CostConfig::default()
         };
         let tracker = Arc::new(CostTracker::new(cost_config, workspace.path()).unwrap());

@@ -10922,7 +10922,6 @@ data: [DONE]\n\n";
         let fixture = spawn_chat_completion_fixture(PRODUCTION_FIXTURE_STREAM).await;
         let tmp = tempfile::tempdir().expect("production gateway temp dir");
         let (state, tracker) = production_sse_state(&tmp, &fixture.base_url(), 0.01, false);
-        set_cost_enforcement_mode(&tracker, "block");
         tracker
             .record_usage_with_agent(
                 zeroclaw_config::cost::types::TokenUsage::new(
