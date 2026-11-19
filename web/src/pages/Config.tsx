@@ -407,28 +407,6 @@ export default function Config() {
     }
 
     // /config/:section/:type — alias list (providers/channels) or direct form
-    if (typeParam && isCostRatesSection) {
-      const category = activeSection.cost_category as CostRatesCategory;
-      return (
-        <div className="flex flex-col gap-3 flex-1 min-h-0">
-          <Button
-            variant="ghost"
-            size="sm"
-            onClick={() => navigate(`/config/${encodeURIComponent(activeSection.key)}`)}
-            className="self-start"
-          >
-            <ArrowLeft className="h-4 w-4" />
-            {t("config.back_to")}{activeSection.label}
-          </Button>
-          <CostRatesEditor
-            category={category}
-            providerType={typeParam}
-            onSaved={fetchDrift}
-          />
-        </div>
-      );
-    }
-
     if (typeParam && needsAliasTier) {
       const aliasListPane = (
         <AliasListView
