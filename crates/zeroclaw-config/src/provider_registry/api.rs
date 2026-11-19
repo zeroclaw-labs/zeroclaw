@@ -83,6 +83,10 @@ pub struct LocalWhisperApiConfig {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(default, deny_unknown_fields)]
 pub struct AsrApiPatch {
+    /// Complete request endpoint override for legacy or non-standard ASR
+    /// gateways. When omitted, the connection URI derives the protocol path.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_timeout_secs: Option<Override<NonZeroU64>>,
 }
