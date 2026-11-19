@@ -87,6 +87,9 @@ pub fn build_spec() -> serde_json::Value {
             "PropResponse":     schema_value::<PropResponse>(),
             "SecretResponse":   schema_value::<SecretResponse>(),
             "ListResponse":     schema_value::<ListResponse>(),
+            "ProviderRegistry": schema_value::<zeroclaw_config::provider_registry::ProviderRegistry>(),
+            "RegistrySnapshot": schema_value::<zeroclaw_config::provider_registry::editor::RegistrySnapshot>(),
+            "RegistryEdit": schema_value::<zeroclaw_config::provider_registry::editor::RegistryEdit>(),
             "PatchOp":          schema_value::<PatchOp>(),
             "PatchResponse":    schema_value::<PatchResponse>(),
             "InitQuery":        schema_value::<InitQuery>(),
@@ -264,6 +267,21 @@ pub fn build_spec() -> serde_json::Value {
                 "parameters": [path_param.clone()],
                 "responses": prop_get_responses,
             },
+        },
+        "/api/config/provider-registry": {
+            "get": {
+                "tags": ["config"],
+                "summary": "Read the canonical provider registry",
+                "description": "Returns masked connections, exact-key capability models, presets, fallback references and an opaque concurrency revision. Preserve the complete snapshot as the expected document when saving; the revision changes when credentials change and is invalidated by a server restart.",
+                "responses": { "200": { "description": "Masked registry document with an opaque concurrency revision.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/RegistrySnapshot" } } } } }
+            },
+            "put": {
+                "tags": ["config"],
+                "summary": "Replace the canonical provider registry atomically",
+                "description": "Requires config create/update/delete grants and write access to providers. Rejects stale expected documents, including concurrent credential changes. Preserves unchanged masked credentials. Validates all references before the normal config commit and reload flow.",
+                "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/RegistryEdit" } } } },
+                "responses": { "200": { "description": "Registry saved.", "content": { "application/json": { "schema": { "type": "object", "properties": { "saved": { "type": "boolean" } }, "required": ["saved"] } } } }, "400": error_responses["400"].clone() }
+            }
         },
         "/api/config/list": {
             "get": {

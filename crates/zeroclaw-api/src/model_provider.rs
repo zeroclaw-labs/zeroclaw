@@ -220,20 +220,19 @@ impl ChatResponse {
 
     /// True when this response cannot make progress or complete a turn.
     ///
-    /// Reasoning content is intentionally excluded: it may need to be
-    /// round-tripped to a provider, but it is not a user-visible final answer.
-    /// A response containing one or more tool calls remains valid even when
-    /// its text is empty.
+    /// The caller must apply the selected text-extraction policy before this
+    /// check. Keeping this predicate policy-free is important: when a model
+    /// deliberately disables reasoning extraction, literal `<think>` text is
+    /// still user-visible content and must not be discarded here. A response
+    /// containing a tool call is valid even when its text is empty.
     pub fn is_semantically_empty_terminal(&self) -> bool {
-        strip_think_tags(self.text_or_empty()).is_empty() && self.tool_calls.is_empty()
+        self.text_or_empty().trim().is_empty() && self.tool_calls.is_empty()
     }
 }
 
-/// Remove inline `<think>...</think>` reasoning before terminal-response
-/// classification or user-visible parsing.
-///
-/// An unclosed opening tag suppresses the remainder so partial reasoning never
-/// becomes final output.
+/// Remove inline reasoning tags for callers that explicitly opt into the
+/// shared extraction policy. Terminal classification itself intentionally does
+/// not call this helper; the cleaned response must reach that boundary first.
 pub fn strip_think_tags(text: &str) -> String {
     let mut result = String::with_capacity(text.len());
     let mut remaining = text;
@@ -587,8 +586,8 @@ pub struct ModelRefusalError {
     pub attempted_candidate: Option<String>,
     /// Position of that candidate in the active reliability domain.
     ///
-    /// This disambiguates same-profile fallback models, which intentionally
-    /// share one configured candidate/cooldown identity.
+    /// This disambiguates exact-key fallback candidates even when they share
+    /// a wire model identifier or connection.
     pub attempted_candidate_index: Option<usize>,
 }
 
@@ -894,7 +893,6 @@ pub trait ModelProvider: Send + Sync + crate::attribution::Attributable {
     }
 
     /// Whether every reachable route for this model honors a native one-call control.
-    /// Prompt guidance and provider-executed tools do not establish support.
     fn supports_single_tool_rounds(&self, _model: &str) -> bool {
         false
     }
@@ -935,7 +933,7 @@ pub trait ModelProvider: Send + Sync + crate::attribution::Attributable {
     ///
     /// Ordinary providers are homogeneous and inherit `false`. Composite
     /// providers override this so callers that must select one tool protocol
-    /// before dispatch can reject an incompatible strict configuration.
+    /// before dispatch can reject an incompatible fallback chain.
     fn has_mixed_native_tool_support_for_model(&self, _model: &str) -> bool {
         false
     }
@@ -1549,12 +1547,37 @@ mod capability_tests {
         async fn chat_with_system(
             &self,
             _system_prompt: Option<&str>,
-            _message: &str,
+            message: &str,
             _model: &str,
             _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
-            Ok(String::new())
+            Ok(message.to_owned())
         }
+    }
+
+    #[tokio::test]
+    async fn default_chat_adapters_preserve_wire_text_for_candidate_normalization() {
+        let text = "<think>literal content</think>";
+        let messages = [super::ChatMessage::user(text)];
+        crate::scope_text_extraction(
+            Some(std::sync::Arc::new(|_| crate::TextExtraction {
+                reasoning: Some(true),
+                tool_calls: false,
+            })),
+            async {
+                let response = NativeAccessorOnlyProvider
+                    .chat(super::ChatRequest::new(&messages), "upstream-id", None)
+                    .await
+                    .unwrap();
+                assert_eq!(response.text.as_deref(), Some(text));
+                let response = NativeAccessorOnlyProvider
+                    .chat_with_tools(&messages, &[], "upstream-id", None)
+                    .await
+                    .unwrap();
+                assert_eq!(response.text.as_deref(), Some(text));
+            },
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -1589,97 +1612,96 @@ mod capability_tests {
 }
 
 #[cfg(test)]
-mod sampling_input_tests {
-    use super::{CallSampling, ChatMessage, ChatRequest, ChatResponse, ModelProvider};
-    use crate::attribution::{Attributable, ModelProviderKind, ProviderKind, Role};
-    use async_trait::async_trait;
-    use std::sync::Arc;
+mod combined_call_tests {
+    use super::*;
+    use futures_util::StreamExt;
+    use std::sync::{Arc, Mutex};
 
-    struct SamplingOverrideProvider;
+    #[derive(Default)]
+    struct PolicyProvider(Mutex<Vec<(ToolRoundPolicy, Option<f64>)>>);
 
-    impl Attributable for SamplingOverrideProvider {
-        fn role(&self) -> Role {
-            Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+    impl crate::attribution::Attributable for PolicyProvider {
+        fn role(&self) -> crate::attribution::Role {
+            crate::attribution::Role::Provider(crate::attribution::ProviderKind::Model(
+                crate::attribution::ModelProviderKind::Custom,
+            ))
         }
-
         fn alias(&self) -> &str {
-            "sampling_override"
+            "policy-fixture"
         }
     }
 
     #[async_trait]
-    impl ModelProvider for SamplingOverrideProvider {
+    impl ModelProvider for PolicyProvider {
         async fn chat_with_system(
             &self,
-            _system_prompt: Option<&str>,
-            _message: &str,
-            _model: &str,
-            _temperature: Option<f64>,
+            _: Option<&str>,
+            _: &str,
+            _: &str,
+            _: Option<f64>,
         ) -> anyhow::Result<String> {
-            anyhow::bail!("the sampling override should be selected before the legacy method")
+            panic!("combined calls must reach the explicit policy implementation")
         }
 
-        async fn chat_with_sampling(
+        async fn chat_with_tool_round_policy(
             &self,
-            _request: ChatRequest<'_>,
-            _model: &str,
-            sampling: CallSampling,
+            _: ChatRequest<'_>,
+            _: &str,
+            temperature: Option<f64>,
+            policy: ToolRoundPolicy,
         ) -> anyhow::Result<ChatResponse> {
+            self.0.lock().unwrap().push((policy, temperature));
             Ok(ChatResponse {
-                text: Some(format!("{:?}", sampling.resolve_for(Some("backup")))),
-                tool_calls: Vec::new(),
+                text: Some("ok".into()),
+                tool_calls: vec![],
                 usage: None,
                 reasoning_content: None,
             })
         }
-    }
 
-    #[test]
-    fn explicit_none_omits_temperature_even_for_a_target() {
-        let sampling = CallSampling::Explicit(None).for_target("backup");
-        assert_eq!(sampling.resolve_for(None), None);
-        assert_eq!(sampling.resolve_for(Some("primary")), None);
-    }
-
-    #[test]
-    fn routed_sampling_preserves_candidate_resolution() {
-        let sampling = CallSampling::for_selection(Some(0.7), |name| match name {
-            "primary" => Some(0.2),
-            "backup" => None,
-            _ => Some(0.9),
-        })
-        .for_target("primary");
-        assert_eq!(sampling.resolve_for(None), Some(0.2));
-        assert_eq!(sampling.resolve_for(Some("backup")), None);
-        assert_eq!(sampling.resolve_for(Some("other")), Some(0.9));
-    }
-
-    #[test]
-    fn request_builder_keeps_messages_and_optional_tools() {
-        let messages = [ChatMessage::user("hello")];
-        let tools = [];
-        let request = ChatRequest::new(&messages).with_tools(&tools);
-        assert_eq!(request.messages.len(), 1);
-        assert!(request.tools.unwrap().is_empty());
-        assert!(request.thinking.is_none());
+        fn stream_chat_with_tool_round_policy(
+            &self,
+            _: ChatRequest<'_>,
+            _: &str,
+            temperature: Option<f64>,
+            _: StreamOptions,
+            policy: ToolRoundPolicy,
+        ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
+            self.0.lock().unwrap().push((policy, temperature));
+            stream::empty().boxed()
+        }
     }
 
     #[tokio::test]
-    async fn arc_forwards_sampling_override_to_the_inner_provider() {
-        let provider: Arc<dyn ModelProvider> = Arc::new(SamplingOverrideProvider);
-        let messages = [ChatMessage::user("hello")];
-        let result = provider
-            .chat_with_sampling(
-                ChatRequest::new(&messages),
-                "primary",
-                CallSampling::for_selection(Some(0.7), |selection| {
-                    (selection == "backup").then_some(0.3)
-                }),
-            )
-            .await
-            .expect("Arc must preserve the inner sampling override");
-
-        assert_eq!(result.text.as_deref(), Some("Some(0.3)"));
+    async fn combined_calls_preserve_explicit_policy_for_both_transports() {
+        let provider = Arc::new(PolicyProvider::default());
+        let mut expected = Vec::new();
+        for policy in [ToolRoundPolicy::Batch, ToolRoundPolicy::Single] {
+            for temperature in [None, Some(0.4)] {
+                expected.extend([(policy, temperature); 2]);
+                provider
+                    .chat_with_sampling_and_tool_round_policy(
+                        ChatRequest::new(&[]),
+                        "model",
+                        CallSampling::Explicit(temperature),
+                        policy,
+                    )
+                    .await
+                    .unwrap();
+                let events = provider
+                    .stream_chat_with_sampling_and_tool_round_policy(
+                        ChatRequest::new(&[]),
+                        "model",
+                        CallSampling::Explicit(temperature),
+                        StreamOptions::default(),
+                        policy,
+                    )
+                    .collect::<Vec<_>>()
+                    .await;
+                assert!(events.is_empty());
+            }
+        }
+        assert_eq!(*provider.0.lock().unwrap(), expected);
     }
 }
 
@@ -1700,7 +1722,7 @@ mod turn_order_tests {
     }
 
     #[test]
-    fn semantic_empty_terminal_uses_display_text_after_think_tag_stripping() {
+    fn semantic_empty_terminal_keeps_unextracted_inline_reasoning() {
         let response = ChatResponse {
             text: Some("<think>internal reasoning</think>".to_string()),
             tool_calls: Vec::new(),
@@ -1708,7 +1730,7 @@ mod turn_order_tests {
             reasoning_content: None,
         };
 
-        assert!(response.is_semantically_empty_terminal());
+        assert!(!response.is_semantically_empty_terminal());
     }
 
     #[test]
@@ -1905,5 +1927,40 @@ mod thinking_display_tests {
             !json.contains("display"),
             "expected display field to be omitted, got: {json}"
         );
+    }
+}
+
+#[cfg(test)]
+mod sampling_input_tests {
+    use super::{CallSampling, ChatMessage, ChatRequest};
+
+    #[test]
+    fn explicit_none_omits_temperature_even_for_a_target() {
+        let sampling = CallSampling::Explicit(None).for_target("backup");
+        assert_eq!(sampling.resolve_for(None), None);
+        assert_eq!(sampling.resolve_for(Some("primary")), None);
+    }
+
+    #[test]
+    fn routed_sampling_preserves_candidate_resolution() {
+        let sampling = CallSampling::for_selection(Some(0.7), |name| match name {
+            "primary" => Some(0.2),
+            "backup" => None,
+            _ => Some(0.9),
+        })
+        .for_target("primary");
+        assert_eq!(sampling.resolve_for(None), Some(0.2));
+        assert_eq!(sampling.resolve_for(Some("backup")), None);
+        assert_eq!(sampling.resolve_for(Some("other")), Some(0.9));
+    }
+
+    #[test]
+    fn request_builder_keeps_messages_and_optional_tools() {
+        let messages = [ChatMessage::user("hello")];
+        let tools = [];
+        let request = ChatRequest::new(&messages).with_tools(&tools);
+        assert_eq!(request.messages.len(), 1);
+        assert!(request.tools.unwrap().is_empty());
+        assert!(request.thinking.is_none());
     }
 }

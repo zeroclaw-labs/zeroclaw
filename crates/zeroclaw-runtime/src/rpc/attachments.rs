@@ -710,7 +710,7 @@ mod tests {
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let mem = std::sync::Arc::from(
-            zeroclaw_memory::create_memory(&mem_cfg, &std::env::temp_dir(), None).unwrap(),
+            zeroclaw_memory::create_memory(&mem_cfg, &std::env::temp_dir()).unwrap(),
         );
 
         crate::agent::agent::Agent::builder()

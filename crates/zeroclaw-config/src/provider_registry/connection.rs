@@ -564,6 +564,24 @@ fn restore_connection_secrets(value: &mut Value, current: &Value, secret_map: bo
 }
 
 impl ProviderConnection {
+    pub fn speech_path(&self) -> Option<&str> {
+        let api = match self {
+            Self::OpenAi(connection) => connection.api.tts.as_ref(),
+            Self::OpenAiCompatible(connection) | Self::Custom(connection) => {
+                connection.api.tts.as_ref()
+            }
+            _ => None,
+        };
+        api.and_then(|api| api.path.as_deref())
+    }
+
+    pub(super) fn with_secret_json_for_editor(
+        &mut self,
+        mut visit: impl FnMut(&mut String) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        self.with_secret_json(|secret, _| visit(secret), "providers.connections")
+    }
+
     fn with_secret_json(
         &mut self,
         mut visit: impl FnMut(&mut String, &str) -> anyhow::Result<()>,
@@ -573,6 +591,23 @@ impl ProviderConnection {
         visit_connection_secrets(&mut value, field, false, &mut visit)?;
         *self = serde_json::from_value(value).context("deserialize provider connection")?;
         Ok(())
+    }
+
+    /// Collect external references through the same secret-field traversal as
+    /// encryption. The caller supplies an escaped JSON pointer for exact keys.
+    pub(crate) fn onepassword_references(
+        &self,
+        pointer: &str,
+    ) -> anyhow::Result<std::collections::HashMap<String, String>> {
+        let mut value = serde_json::to_value(self).context("serialize provider secrets")?;
+        let mut references = std::collections::HashMap::new();
+        visit_connection_secrets(&mut value, pointer, false, &mut |secret, path| {
+            if SecretStore::is_onepassword_ref(secret) {
+                references.insert(path.to_owned(), secret.clone());
+            }
+            Ok(())
+        })?;
+        Ok(references)
     }
 
     pub fn encrypt_secrets(&mut self, store: &SecretStore, field: &str) -> anyhow::Result<()> {

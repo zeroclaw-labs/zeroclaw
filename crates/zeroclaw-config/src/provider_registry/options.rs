@@ -5,10 +5,22 @@ use serde::{Deserialize, Serialize};
 use super::Override;
 use crate::schema::{CacheTtl, ToolResultImagePolicy, WireApi};
 
+pub(crate) fn option_fields(capability: &str) -> &'static [&'static str] {
+    match capability {
+        "chat" => ChatOptionsPatch::FIELDS,
+        "tts" => TtsOptionsPatch::FIELDS,
+        "asr" => AsrOptionsPatch::FIELDS,
+        _ => &[],
+    }
+}
+
 macro_rules! options_patch {
     ($name:ident { $($field:ident: $type:ty),* $(,)? }) => {
         #[derive(Debug, Clone, Default, Serialize, Deserialize)]
         #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+        // Unknown leaves deliberately remain warning-only at startup. The
+        // activation loader uses FIELDS to report them once, without emitting
+        // warnings from internal decoding or making typos fatal to startup.
         #[serde(default)]
         pub struct $name {
             $(#[serde(skip_serializing_if = "Option::is_none")]
@@ -52,7 +64,9 @@ options_patch!(ChatOptionsPatch {
 });
 
 /// Effective model-owned textual extraction policy. Missing options inherit;
-/// explicit values are ordinary booleans and never accept the `"null"` sentinel.
+/// explicit values are ordinary booleans and never accept the `"null"`
+/// sentinel. The resolved reasoning field keeps omission distinct from an
+/// explicit `false` so the historical terminal-response policy is preserved.
 pub use zeroclaw_api::TextExtraction;
 
 /// Provider-specific baselines for the two model options. This is the
@@ -64,9 +78,12 @@ pub(crate) fn text_extraction_defaults(
     native_tools: Option<bool>,
 ) -> TextExtraction {
     // MiniMax's unsplit reasoning and Groq's raw reasoning format put
-    // <think> blocks in content. Other providers must
-    // opt in when a particular model/server emits inline reasoning.
-    let reasoning = matches!(kind, "minimax" | "groq");
+    // <think> blocks in content. All other configured models default to
+    // preserving literal text; a model/provider must explicitly opt in when
+    // its server emits inline reasoning. `None` remains reserved for the
+    // legacy config-free injection path, where the caller supplies its
+    // historical policy explicitly.
+    let reasoning = Some(matches!(kind, "minimax" | "groq"));
     // These adapters currently use prompt-guided tool calls by default.
     // Several upstreams also support native tools; enabling that mode
     // removes the need to infer calls from arbitrary response text.
@@ -176,28 +193,28 @@ mod tests {
         assert_eq!(
             TextExtraction::default(),
             TextExtraction {
-                reasoning: false,
+                reasoning: None,
                 tool_calls: false
             }
         );
         for (kind, reasoning, tool_calls) in [
-            ("openai", false, false),
-            ("anthropic", false, false),
-            ("deepseek", false, false),
-            ("qwen", false, false),
-            ("vllm", false, false),
-            ("openai-compatible", false, false),
-            ("minimax", true, false),
-            ("groq", true, true),
-            ("ollama", false, true),
-            ("hailo_ollama", false, true),
-            ("gemini", false, true),
-            ("gemini_cli", false, true),
-            ("grok_cli", false, true),
-            ("kilocli", false, true),
-            ("venice", false, true),
-            ("atomic_chat", false, true),
-            ("custom", false, false),
+            ("openai", Some(false), false),
+            ("anthropic", Some(false), false),
+            ("deepseek", Some(false), false),
+            ("qwen", Some(false), false),
+            ("vllm", Some(false), false),
+            ("openai-compatible", Some(false), false),
+            ("minimax", Some(true), false),
+            ("groq", Some(true), true),
+            ("ollama", Some(false), true),
+            ("hailo_ollama", Some(false), true),
+            ("gemini", Some(false), true),
+            ("gemini_cli", Some(false), true),
+            ("grok_cli", Some(false), true),
+            ("kilocli", Some(false), true),
+            ("venice", Some(false), true),
+            ("atomic_chat", Some(false), true),
+            ("custom", Some(false), false),
         ] {
             let registry: crate::provider_registry::ProviderRegistry = toml::from_str(&format!(
                 r#"
@@ -271,12 +288,61 @@ options = { extract_text_tool_calls = true }
                     .unwrap()
                     .text_extraction(),
                 TextExtraction {
-                    reasoning: false,
+                    reasoning: Some(false),
                     tool_calls
                 },
                 "{name}"
             );
         }
+    }
+
+    #[test]
+    fn legacy_extraction_defaults_use_the_selected_driver_and_model_options() {
+        let mut config = crate::schema::Config::default();
+        let provider = config
+            .providers
+            .models
+            .ensure("openai", "proxy.prod")
+            .unwrap();
+        provider.kind = Some("groq".to_owned());
+        assert_eq!(
+            crate::migration::admit_test_input(&config).model_text_extraction("openai.proxy.prod"),
+            TextExtraction {
+                reasoning: Some(true),
+                tool_calls: true
+            }
+        );
+        let provider = config
+            .providers
+            .models
+            .ensure("openai", "proxy.prod")
+            .unwrap();
+        provider.models.insert(
+            "native.model".to_owned(),
+            crate::schema::ModelEntryConfig {
+                native_tools: Some(true),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            crate::migration::admit_test_input(&config).model_text_extraction("openai.proxy.prod"),
+            TextExtraction {
+                reasoning: Some(true),
+                tool_calls: false
+            }
+        );
+        assert_eq!(
+            crate::migration::admit_test_input(&config)
+                .model_text_extraction("openai.proxy.prod.native.model"),
+            TextExtraction {
+                reasoning: Some(true),
+                tool_calls: false
+            }
+        );
+        assert_eq!(
+            config.model_text_extraction("not-configured"),
+            TextExtraction::default()
+        );
     }
 
     #[test]

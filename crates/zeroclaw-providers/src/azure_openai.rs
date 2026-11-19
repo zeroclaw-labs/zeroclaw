@@ -10,6 +10,7 @@ use zeroclaw_api::tool::ToolSpec;
 const DEFAULT_API_VERSION: &str = "2024-08-01-preview";
 
 pub struct AzureOpenAiModelProvider {
+    http_timeouts: crate::transport::ChatHttpTimeouts,
     /// `[providers.models.azure.<alias>]` config-key alias.
     alias: String,
     credential: Option<String>,
@@ -204,6 +205,7 @@ impl NativeResponseMessage {
 /// reasoning effort have sensible defaults.
 #[must_use]
 pub struct AzureOpenAiBuilder {
+    http_timeouts: crate::transport::ChatHttpTimeouts,
     alias: String,
     resource_name: Option<String>,
     deployment_name: Option<String>,
@@ -213,6 +215,11 @@ pub struct AzureOpenAiBuilder {
 }
 
 impl AzureOpenAiBuilder {
+    pub(crate) fn http_timeouts(mut self, options: &crate::ModelProviderRuntimeOptions) -> Self {
+        self.http_timeouts = crate::transport::ChatHttpTimeouts::from_options(options);
+        self
+    }
+
     /// The `<resource>` half of Azure's deployment URL
     /// `https://<resource>.openai.azure.com/…`. Required.
     pub fn resource_name(mut self, resource: &str) -> Self {
@@ -270,6 +277,7 @@ impl AzureOpenAiBuilder {
             resource_name, deployment_name
         );
         AzureOpenAiModelProvider {
+            http_timeouts: self.http_timeouts,
             alias: self.alias,
             credential: self.credential,
             api_version: version,
@@ -285,6 +293,7 @@ impl AzureOpenAiModelProvider {
     /// via a labelled chain method on the returned [`AzureOpenAiBuilder`].
     pub fn builder(alias: &str) -> AzureOpenAiBuilder {
         AzureOpenAiBuilder {
+            http_timeouts: Default::default(),
             alias: alias.to_string(),
             resource_name: None,
             deployment_name: None,
@@ -331,7 +340,7 @@ impl AzureOpenAiModelProvider {
         let tools_count = request.tools.as_ref().map_or(0, Vec::len);
         loop {
             let response = self
-                .http_client()
+                .http_client()?
                 .post(self.chat_completions_url())
                 .header("api-key", credential)
                 .json(request)
@@ -491,12 +500,8 @@ impl AzureOpenAiModelProvider {
         }
     }
 
-    fn http_client(&self) -> Client {
-        zeroclaw_config::schema::build_runtime_proxy_client_with_timeouts(
-            "model_provider.azure_openai",
-            120,
-            10,
-        )
+    fn http_client(&self) -> anyhow::Result<Client> {
+        self.http_timeouts.client("model_provider.azure_openai")
     }
 }
 
@@ -579,7 +584,7 @@ impl ModelProvider for AzureOpenAiModelProvider {
         };
 
         let response = self
-            .http_client()
+            .http_client()?
             .post(self.chat_completions_url())
             .header("api-key", credential.as_str())
             .json(&request)

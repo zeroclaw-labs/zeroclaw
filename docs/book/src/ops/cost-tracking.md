@@ -19,10 +19,10 @@ replaced by the upstream resource being priced.
 
 ### Why the key is a resource id, not an alias
 
-A `[providers.models.anthropic.<alias>]` entry is keyed by an operator-chosen
-alias (`glados`, `production`) that follows the alias validator: lowercase
-ASCII, single underscores, no hyphens. A `[cost.rates.providers.models.anthropic.<resource>]`
-entry is keyed by the **upstream model id** as it appears in usage telemetry
+A `[providers.models."<model-ref>"]` entry is keyed by an exact model
+reference such as `chat.anthropic.production`. A
+`[cost.rates.providers.models.anthropic.<resource>]` entry is keyed by the
+**upstream model id** as it appears in usage telemetry
 (`claude-opus-4-7`, `gpt-4o-mini`, `whisper-1`): those id strings come from
 the provider's namespace and almost always contain hyphens.
 

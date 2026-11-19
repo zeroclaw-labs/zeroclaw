@@ -275,19 +275,6 @@ impl DiscordChannel {
         self
     }
 
-    /// Configure voice transcription from a `[transcription]` snapshot.
-    ///
-    /// Compatibility and test path. The daemon routes every channel through
-    /// `with_transcription_manager` with a manager built from live
-    /// config and the owning agent's resolved provider; this path can only see
-    /// the legacy section, so it binds a lone registered provider and
-    /// otherwise leaves the choice unbound (see
-    /// `transcription::manager_from_snapshot`).
-    pub fn with_transcription(self, config: zeroclaw_config::schema::TranscriptionConfig) -> Self {
-        let manager = zeroclaw_providers::transcription::manager_from_snapshot(&config);
-        self.with_transcription_manager(config, manager)
-    }
-
     /// Store an already-built transcription manager, or nothing. The config is
     /// recorded only alongside a manager, so a channel never advertises
     /// transcription it cannot perform.
@@ -7115,10 +7102,14 @@ mod tests {
             "filename": "voice.ogg",
             "url": audio_url,
         })];
-        let transcription =
-            TranscriptionManager::new(&local_whisper_transcription_config(&whisper_server))
-                .expect("transcription manager")
-                .with_agent_transcription_provider("local_whisper");
+        let transcription = TranscriptionManager::from_config_for_agent(
+            &zeroclaw_config::schema::Config::from_transcription_input(
+                &local_whisper_transcription_config(&whisper_server),
+            ),
+            None,
+        )
+        .expect("transcription manager")
+        .with_agent_transcription_provider("asr.local_whisper");
 
         let client = reqwest::Client::new();
         let (text, media) =
@@ -7162,10 +7153,14 @@ mod tests {
             "filename": "voice.ogg",
             "url": audio_url,
         })];
-        let transcription =
-            TranscriptionManager::new(&local_whisper_transcription_config(&whisper_server))
-                .expect("transcription manager")
-                .with_agent_transcription_provider("local_whisper");
+        let transcription = TranscriptionManager::from_config_for_agent(
+            &zeroclaw_config::schema::Config::from_transcription_input(
+                &local_whisper_transcription_config(&whisper_server),
+            ),
+            None,
+        )
+        .expect("transcription manager")
+        .with_agent_transcription_provider("asr.local_whisper");
 
         let client = reqwest::Client::new();
         let (text, media) =

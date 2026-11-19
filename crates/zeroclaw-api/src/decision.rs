@@ -1,13 +1,12 @@
-//! Provider-neutral decision protocol types.
+//! Provider-neutral decision-model wire contract.
+
+use std::collections::BTreeMap;
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::BTreeMap;
 
-// ── Wire protocol (TypeSafe `/v1/systemone`, also served by `laya-serve`) ──
-
-/// One typed question. Only the two shapes dispatch needs are modeled.
+/// Typed question sent to a decision model.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum Question {
@@ -20,6 +19,7 @@ pub enum Question {
     },
 }
 
+/// Typed answer returned by a decision model.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum Answer {
@@ -48,10 +48,12 @@ pub struct Usage {
     pub input_tokens: u64,
 }
 
-/// Provider-neutral decision call; SOP policy remains a consumer.
+/// A typed decision provider used by SOP policy evaluation.
 #[async_trait::async_trait]
 pub trait DecisionModel: Send + Sync {
-    /// Short identifier recorded with each decision (`jev-latest`, `laya`, ...).
+    /// Stable model identifier recorded in decision audit data.
     fn id(&self) -> &str;
+
+    /// Ask typed questions about a JSON state.
     async fn ask(&self, state: Value, questions: BTreeMap<String, Question>) -> Result<Answers>;
 }

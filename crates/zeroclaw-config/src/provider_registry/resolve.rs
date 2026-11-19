@@ -27,6 +27,15 @@ impl ProviderRegistry {
         name: &super::ProviderId,
         connection: &ProviderConnection,
     ) -> Result<(), RegistryError> {
+        if let Some(path) = connection.speech_path()
+            && (!path.starts_with('/') || path.starts_with("//") || path.contains(['?', '#']))
+        {
+            return Err(RegistryError::connection(
+                name,
+                "api.tts.path",
+                "speech path must be an absolute HTTP path without a query or fragment",
+            ));
+        }
         if let Some(uri) = connection
             .uri()
             .map(str::trim)
@@ -187,6 +196,57 @@ impl ProviderRegistry {
             ));
         }
         let effective = self.resolve_chat(name)?;
+        if effective.stream_request_timeout_secs.is_some()
+            && matches!(
+                connection.kind(),
+                "gemini_cli" | "kilocli" | "grok_cli" | "hailo_ollama"
+            )
+        {
+            return Err(RegistryError::model(
+                name,
+                "api.stream_request_timeout_secs",
+                "HTTP streaming deadlines are unsupported by this connection kind",
+            ));
+        }
+        if effective.request_timeout_secs.is_some()
+            && matches!(connection.kind(), "gemini_cli" | "kilocli")
+        {
+            return Err(RegistryError::model(
+                name,
+                "api.request_timeout_secs",
+                "request deadline is fixed by this CLI connection",
+            ));
+        }
+        if effective.read_timeout_secs.is_some()
+            && matches!(
+                connection.kind(),
+                "hailo_ollama" | "gemini_cli" | "kilocli" | "grok_cli"
+            )
+        {
+            return Err(RegistryError::model(
+                name,
+                "api.read_timeout_secs",
+                "read deadlines are unsupported by this connection kind",
+            ));
+        }
+        if connection.kind() == "hailo_ollama"
+            && matches!(effective.request_timeout_secs, Some(Override::Clear))
+        {
+            return Err(RegistryError::model(
+                name,
+                "api.request_timeout_secs",
+                "request deadline cannot be disabled for this connection kind",
+            ));
+        }
+        if matches!(connection, ProviderConnection::GrokCli(_))
+            && matches!(effective.request_timeout_secs, Some(Override::Clear))
+        {
+            return Err(RegistryError::model(
+                name,
+                "api.request_timeout_secs",
+                "subprocess deadline cannot be disabled",
+            ));
+        }
         if let Some(super::Override::Set(temperature)) = effective.options.temperature {
             crate::schema::validate_temperature(temperature)
                 .map_err(|error| RegistryError::model(name, "options.temperature", error))?;
@@ -219,6 +279,11 @@ impl ProviderRegistry {
                 "api.wire_api",
                 "connection kind does not support a model-level wire API override",
             ));
+        }
+        if let Some(extra) = &config.extra {
+            extra
+                .validate_connection(connection)
+                .map_err(|error| RegistryError::model(name, "extra", error.to_string()))?;
         }
         if let Some(preset) = config.preset.as_ref() {
             ensure_preset(self, name, preset, Capability::Chat)?;
@@ -260,11 +325,29 @@ impl ProviderRegistry {
         let mut options = ChatOptionsPatch::default();
         let mut wire_api = None;
         let mut request_timeout_secs = None;
+        let mut stream_request_timeout_secs = None;
+        if let ProviderConnection::GrokCli(connection) = selection.connection {
+            request_timeout_secs = connection
+                .api
+                .chat
+                .as_ref()
+                .and_then(|api| api.request_timeout_secs)
+                .map(Override::Set);
+        }
         let mut read_timeout_secs = None;
+        let mut queue_timeout_secs = match selection.connection {
+            ProviderConnection::HailoOllama(connection) => connection
+                .api
+                .chat
+                .as_ref()
+                .and_then(|api| api.queue_timeout_secs),
+            _ => None,
+        };
         let mut live_pricing = None;
         if let Some(api) = selection.connection.chat_api() {
             wire_api = api.wire_api;
             request_timeout_secs = api.request_timeout_secs.clone();
+            stream_request_timeout_secs = api.stream_request_timeout_secs.clone();
             read_timeout_secs = api.read_timeout_secs.clone();
             live_pricing = api.live_pricing;
         }
@@ -282,14 +365,21 @@ impl ProviderRegistry {
         if let Some(api) = &model.api {
             wire_api = api.wire_api.or(wire_api);
             request_timeout_secs = api.request_timeout_secs.clone().or(request_timeout_secs);
+            stream_request_timeout_secs = api
+                .stream_request_timeout_secs
+                .clone()
+                .or(stream_request_timeout_secs);
             read_timeout_secs = api.read_timeout_secs.clone().or(read_timeout_secs);
+            queue_timeout_secs = api.queue_timeout_secs.or(queue_timeout_secs);
         }
         options.overlay(&model.options);
         Ok(ResolvedChat {
             selection,
             wire_api,
             request_timeout_secs,
+            stream_request_timeout_secs,
             read_timeout_secs,
+            queue_timeout_secs,
             live_pricing,
             options,
         })
@@ -352,7 +442,9 @@ pub struct ResolvedChat<'a> {
     pub selection: super::ModelSelection<'a>,
     pub wire_api: Option<WireApi>,
     pub request_timeout_secs: Option<Override<NonZeroU64>>,
+    pub stream_request_timeout_secs: Option<Override<NonZeroU64>>,
     pub read_timeout_secs: Option<Override<NonZeroU64>>,
+    pub queue_timeout_secs: Option<NonZeroU64>,
     pub live_pricing: Option<bool>,
     pub options: ChatOptionsPatch,
 }
@@ -371,10 +463,7 @@ impl ResolvedChat<'_> {
             self.options.native_tools,
         );
         super::TextExtraction {
-            reasoning: self
-                .options
-                .extract_text_reasoning
-                .unwrap_or(defaults.reasoning),
+            reasoning: self.options.extract_text_reasoning.or(defaults.reasoning),
             tool_calls: self
                 .options
                 .extract_text_tool_calls
@@ -385,7 +474,7 @@ impl ResolvedChat<'_> {
     /// Whether textual `<think>` blocks are extracted from the response.
     #[must_use]
     pub fn extract_text_reasoning(&self) -> bool {
-        self.text_extraction().reasoning
+        self.text_extraction().reasoning.unwrap_or(true)
     }
 
     /// Whether textual XML/JSON tool-call envelopes are extracted from the
@@ -692,5 +781,113 @@ api = {{ wire_api = "responses" }}
                 "{kind}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod timeout_tests {
+    use super::*;
+
+    #[test]
+    fn adapters_reject_deadlines_they_cannot_apply() {
+        for (kind, field, values) in [
+            (
+                "gemini_cli",
+                "request_timeout_secs",
+                vec![serde_json::json!(600), serde_json::json!("null")],
+            ),
+            (
+                "kilocli",
+                "request_timeout_secs",
+                vec![serde_json::json!(600), serde_json::json!("null")],
+            ),
+            (
+                "hailo_ollama",
+                "request_timeout_secs",
+                vec![serde_json::json!("null")],
+            ),
+            (
+                "hailo_ollama",
+                "read_timeout_secs",
+                vec![serde_json::json!(600), serde_json::json!("null")],
+            ),
+            (
+                "gemini_cli",
+                "read_timeout_secs",
+                vec![serde_json::json!(600)],
+            ),
+            ("kilocli", "read_timeout_secs", vec![serde_json::json!(600)]),
+            (
+                "grok_cli",
+                "read_timeout_secs",
+                vec![serde_json::json!(600)],
+            ),
+        ] {
+            for value in values {
+                let mut document = serde_json::json!({
+                    "connections": {"connection": {"kind": kind}},
+                    "models": {"chat": {"capability":"chat", "provider":"connection", "model":"test", "api":{}}}
+                });
+                if kind == "grok_cli" {
+                    document["connections"]["connection"]["api"] =
+                        serde_json::json!({"chat":{"working_directory":"/workspace"}});
+                }
+                document["models"]["chat"]["api"][field] = value;
+                let error = serde_json::from_value::<ProviderRegistry>(document).unwrap_err();
+                assert!(error.to_string().contains(field), "{kind}: {error}");
+            }
+        }
+    }
+
+    #[test]
+    fn model_stream_deadline_overrides_connection_independently() {
+        let registry: ProviderRegistry = serde_json::from_value(serde_json::json!({
+            "connections": {"gateway": {"kind":"custom", "uri":"https://example.test/v1",
+                "api":{"chat":{"request_timeout_secs":30,"stream_request_timeout_secs":"null"}}}},
+            "models": {
+                "inherited":{"capability":"chat","provider":"gateway","model":"chat"},
+                "bounded":{"capability":"chat","provider":"gateway","model":"chat",
+                    "api":{"stream_request_timeout_secs":60}}
+            }
+        }))
+        .unwrap();
+        let inherited = registry.resolve_chat(&"inherited".into()).unwrap();
+        assert!(
+            matches!(inherited.request_timeout_secs, Some(Override::Set(value)) if value.get()==30)
+        );
+        assert!(matches!(
+            inherited.stream_request_timeout_secs,
+            Some(Override::Clear)
+        ));
+        let bounded = registry.resolve_chat(&"bounded".into()).unwrap();
+        assert!(
+            matches!(bounded.request_timeout_secs, Some(Override::Set(value)) if value.get()==30)
+        );
+        assert!(
+            matches!(bounded.stream_request_timeout_secs, Some(Override::Set(value)) if value.get()==60)
+        );
+    }
+
+    #[test]
+    fn grok_process_deadline_is_inherited_and_cannot_be_disabled() {
+        let document = serde_json::json!({
+            "connections":{"cli":{"kind":"grok_cli","api":{"chat":{
+                "working_directory":"/workspace","request_timeout_secs":30}}}},
+            "models":{"chat":{"capability":"chat","provider":"cli","model":"chat"}}
+        });
+        let registry: ProviderRegistry = serde_json::from_value(document.clone()).unwrap();
+        assert!(
+            matches!(registry.resolve_chat(&"chat".into()).unwrap().request_timeout_secs,
+            Some(Override::Set(value)) if value.get()==30)
+        );
+        let mut document = document;
+        document["models"]["chat"]["api"] = serde_json::json!({"request_timeout_secs":"null"});
+        let error = serde_json::from_value::<ProviderRegistry>(document).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("subprocess deadline cannot be disabled"),
+            "{error}"
+        );
     }
 }

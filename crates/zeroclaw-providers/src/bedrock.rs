@@ -721,6 +721,7 @@ struct ResponseToolUseWrapper {
 // ── BedrockModelProvider ─────────────────────────────────────────────
 
 pub struct BedrockModelProvider {
+    http_timeouts: crate::transport::ChatHttpTimeouts,
     /// `[providers.models.<family>.<alias>]` config-key alias.
     alias: String,
     auth: Option<BedrockAuth>,
@@ -745,6 +746,7 @@ pub struct BedrockModelProvider {
 /// Bedrock through the AWS environment.
 #[must_use]
 pub struct BedrockBuilder {
+    http_timeouts: crate::transport::ChatHttpTimeouts,
     alias: String,
     bearer_token: Option<String>,
     region: Option<String>,
@@ -753,6 +755,11 @@ pub struct BedrockBuilder {
 }
 
 impl BedrockBuilder {
+    pub(crate) fn http_timeouts(mut self, options: &crate::ModelProviderRuntimeOptions) -> Self {
+        self.http_timeouts = crate::transport::ChatHttpTimeouts::from_options(options);
+        self
+    }
+
     /// Override the regional service root, for example a private Bedrock endpoint.
     pub fn api_url(mut self, api_url: Option<&str>) -> Self {
         self.api_url = api_url.map(|uri| uri.trim_end_matches('/').to_owned());
@@ -795,6 +802,7 @@ impl BedrockBuilder {
             resolve_ambient_auth_blocking()
         };
         BedrockModelProvider {
+            http_timeouts: self.http_timeouts,
             alias: self.alias,
             auth,
             region: self.region,
@@ -816,6 +824,7 @@ impl BedrockBuilder {
             resolve_ambient_auth_async().await
         };
         BedrockModelProvider {
+            http_timeouts: self.http_timeouts,
             alias: self.alias,
             auth,
             region: self.region,
@@ -858,6 +867,7 @@ impl BedrockModelProvider {
     /// with no token to walk the AWS credential chain.
     pub fn builder(alias: &str) -> BedrockBuilder {
         BedrockBuilder {
+            http_timeouts: Default::default(),
             alias: alias.to_string(),
             api_url: None,
             bearer_token: None,
@@ -866,12 +876,8 @@ impl BedrockModelProvider {
         }
     }
 
-    fn http_client(&self) -> Client {
-        zeroclaw_config::schema::build_runtime_proxy_client_with_timeouts(
-            "model_provider.bedrock",
-            120,
-            10,
-        )
+    fn http_client(&self) -> anyhow::Result<Client> {
+        self.http_timeouts.client("model_provider.bedrock")
     }
 
     /// Percent-encode the model ID for URL path: only encode `:` to `%3A`.
@@ -1608,7 +1614,7 @@ impl BedrockModelProvider {
                 let region = self.region.clone().unwrap_or_else(Self::resolve_region);
                 let url = self.request_url(&region, model)?;
 
-                self.http_client()
+                self.http_client()?
                     .post(url)
                     .header("content-type", "application/json")
                     .header("Authorization", format!("Bearer {token}"))
@@ -1656,7 +1662,7 @@ impl BedrockModelProvider {
                 );
 
                 let mut request = self
-                    .http_client()
+                    .http_client()?
                     .post(url)
                     .header("content-type", "application/json")
                     .header("x-amz-date", &amz_date)
@@ -1879,7 +1885,7 @@ impl ModelProvider for BedrockModelProvider {
             .api_url
             .clone()
             .unwrap_or_else(|| format!("https://{ENDPOINT_PREFIX}.{region}.amazonaws.com/"));
-        let _ = self.http_client().get(&url).send().await;
+        let _ = self.http_client()?.get(&url).send().await;
         Ok(())
     }
 }
@@ -2076,6 +2082,7 @@ mod tests {
         let _bearer = EnvGuard::set("BEDROCK_API_KEY", None);
         let _config = EnvGuard::set("AWS_CONFIG_FILE", Some("/dev/null"));
         let model_provider = BedrockModelProvider {
+            http_timeouts: Default::default(),
             alias: "test".to_string(),
             auth: None,
             max_tokens: zeroclaw_api::model_provider::BASELINE_MAX_TOKENS,
@@ -2791,6 +2798,7 @@ mod tests {
     #[tokio::test]
     async fn warmup_without_credentials_is_noop() {
         let model_provider = BedrockModelProvider {
+            http_timeouts: Default::default(),
             alias: "test".to_string(),
             auth: None,
             max_tokens: zeroclaw_api::model_provider::BASELINE_MAX_TOKENS,
@@ -2805,6 +2813,7 @@ mod tests {
     #[test]
     fn capabilities_reports_native_tool_calling() {
         let model_provider = BedrockModelProvider {
+            http_timeouts: Default::default(),
             alias: "test".to_string(),
             auth: None,
             max_tokens: zeroclaw_api::model_provider::BASELINE_MAX_TOKENS,
@@ -3168,6 +3177,7 @@ credential_process=some-command
     #[test]
     fn cached_credentials_returns_none_when_empty() {
         let model_provider = BedrockModelProvider {
+            http_timeouts: Default::default(),
             alias: "test".to_string(),
             auth: None,
             max_tokens: zeroclaw_api::model_provider::BASELINE_MAX_TOKENS,
@@ -3182,6 +3192,7 @@ credential_process=some-command
     fn cached_credentials_returns_some_when_valid() {
         let future = chrono::Utc::now() + chrono::Duration::hours(1);
         let model_provider = BedrockModelProvider {
+            http_timeouts: Default::default(),
             alias: "test".to_string(),
             auth: None,
             max_tokens: zeroclaw_api::model_provider::BASELINE_MAX_TOKENS,
@@ -3198,6 +3209,7 @@ credential_process=some-command
     fn cached_credentials_returns_none_when_expired() {
         let past = chrono::Utc::now() - chrono::Duration::hours(1);
         let model_provider = BedrockModelProvider {
+            http_timeouts: Default::default(),
             alias: "test".to_string(),
             auth: None,
             max_tokens: zeroclaw_api::model_provider::BASELINE_MAX_TOKENS,
@@ -3212,6 +3224,7 @@ credential_process=some-command
     fn cache_credentials_stores_and_retrieves() {
         let future = chrono::Utc::now() + chrono::Duration::hours(1);
         let model_provider = BedrockModelProvider {
+            http_timeouts: Default::default(),
             alias: "test".to_string(),
             auth: None,
             max_tokens: zeroclaw_api::model_provider::BASELINE_MAX_TOKENS,

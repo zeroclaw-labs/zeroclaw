@@ -45,6 +45,35 @@ impl<'de> Deserialize<'de> for ProviderRegistry {
 }
 
 impl ProviderRegistry {
+    /// Build the associated registry without semantic validation.
+    ///
+    /// Diagnostics need to inspect invalid candidates so they can report the
+    /// offending model and field. Construction and persistence continue to
+    /// use [`Self::from_raw_parts`], which validates before publication.
+    pub(crate) fn from_raw_parts_unvalidated(
+        connections: BTreeMap<ProviderId, ProviderConnection>,
+        raw_models: BTreeMap<ModelRef, ModelDefinition<serde_json::Value>>,
+        model_presets: BTreeMap<PresetId, ModelPreset>,
+        fallback: BTreeMap<ModelRef, Vec<ModelRef>>,
+    ) -> Result<Self, RegistryError> {
+        let mut models = BTreeMap::new();
+        for (name, model) in raw_models {
+            let connection = connections.get(model.provider()).ok_or_else(|| {
+                RegistryError::model(&name, "provider", "connection does not exist")
+            })?;
+            let model = model
+                .associate(connection)
+                .map_err(|error| RegistryError::model(&name, "extra", error.to_string()))?;
+            models.insert(name, model);
+        }
+        Ok(Self {
+            connections,
+            models,
+            model_presets,
+            fallback,
+        })
+    }
+
     pub(crate) fn from_raw_parts(
         connections: BTreeMap<ProviderId, ProviderConnection>,
         raw_models: BTreeMap<ModelRef, ModelDefinition<serde_json::Value>>,
@@ -312,5 +341,53 @@ model = "backup-model"
                 .to_string()
                 .contains("fallback graph contains a cycle")
         );
+    }
+
+    #[test]
+    fn model_protocol_override_does_not_require_connection_defaults() {
+        for kind in ["openai", "custom", "vllm"] {
+            let registry: ProviderRegistry = serde_json::from_value(json!({
+                "connections": {"gateway.prod": {"kind": kind}},
+                "models": {"chat.fast": {
+                    "capability": "chat", "provider": "gateway.prod", "model": "fast",
+                    "api": {"wire_api": "responses"}
+                }}
+            }))
+            .unwrap();
+            assert_eq!(
+                registry.resolve_chat(&"chat.fast".into()).unwrap().wire_api,
+                Some(crate::schema::WireApi::Responses)
+            );
+        }
+    }
+
+    #[test]
+    fn rust_built_extras_obey_the_same_connection_contract_as_decoded_extras() {
+        use crate::provider_registry::{
+            AnthropicChatModelExtra, AzureChatModelExtra, ChatModelExtra,
+        };
+        for extra in [
+            ChatModelExtra::Azure(AzureChatModelExtra {
+                deployment: "test".into(),
+            }),
+            ChatModelExtra::Anthropic(AnthropicChatModelExtra {
+                server_fallback_models: vec![],
+            }),
+        ] {
+            let mut registry: ProviderRegistry = serde_json::from_value(json!({
+                "connections": {"gateway": {"kind": "openai"}},
+                "models": {"chat": {"capability": "chat", "provider": "gateway"}}
+            }))
+            .unwrap();
+            let ModelDefinition::Chat(model) = registry.models.get_mut("chat").unwrap() else {
+                panic!("fixture is chat")
+            };
+            model.extra = Some(extra);
+            assert!(registry.validate().is_err());
+            assert!(
+                serde_json::from_value::<ProviderRegistry>(serde_json::to_value(registry).unwrap())
+                    .is_err()
+            );
+        }
     }
 }

@@ -15,6 +15,53 @@ use reqwest::{Client, RequestBuilder};
 
 use zeroclaw_config::provider_registry::{Override, ProviderConnection};
 
+/// Immutable transport policy materialized for one admitted chat model.
+/// Clients remain owned by the shared cache so live proxy updates take effect.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ChatHttpTimeouts {
+    request: Option<Duration>,
+    read: Option<Duration>,
+}
+
+impl Default for ChatHttpTimeouts {
+    fn default() -> Self {
+        Self {
+            request: Some(Duration::from_secs(120)),
+            read: Some(crate::STREAM_IDLE_TIMEOUT),
+        }
+    }
+}
+
+impl ChatHttpTimeouts {
+    pub(crate) fn from_options(options: &crate::ModelProviderRuntimeOptions) -> Self {
+        Self {
+            request: (!options.provider_timeout_disabled)
+                .then(|| Duration::from_secs(options.provider_timeout_secs.unwrap_or(120))),
+            read: (!options.provider_read_timeout_disabled).then(|| {
+                Duration::from_secs(
+                    options
+                        .provider_read_timeout_secs
+                        .unwrap_or(crate::STREAM_IDLE_TIMEOUT.as_secs()),
+                )
+            }),
+        }
+    }
+
+    pub(crate) fn client(self, service: &str) -> Result<Client> {
+        let profile = format!("chat-timeouts:{:?}:{:?}", self.request, self.read);
+        zeroclaw_config::schema::try_build_runtime_proxy_client_with(service, &profile, |builder| {
+            let mut builder = builder.connect_timeout(Duration::from_secs(10));
+            if let Some(timeout) = self.request {
+                builder = builder.timeout(timeout);
+            }
+            if let Some(timeout) = self.read {
+                builder = builder.read_timeout(timeout);
+            }
+            Ok(builder)
+        })
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct HttpTransportConfig {
     pub(crate) base_url: String,
@@ -137,4 +184,59 @@ pub(crate) fn append_endpoint(base_url: &str, suffix: &str) -> Result<String> {
     };
     url.set_path(&path);
     Ok(url.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn chat_transport_enforces_total_and_read_deadlines_and_honors_clear() {
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_millis(150)))
+            .mount(&server)
+            .await;
+        let short = Some(Duration::from_millis(20));
+        for policy in [
+            ChatHttpTimeouts {
+                request: short,
+                read: None,
+            },
+            ChatHttpTimeouts {
+                request: None,
+                read: short,
+            },
+        ] {
+            let error = policy
+                .client("model_provider.gemini")
+                .unwrap()
+                .get(server.uri())
+                .send()
+                .await
+                .unwrap_err();
+            assert!(error.is_timeout(), "{error:#}");
+        }
+        let cleared = ChatHttpTimeouts::from_options(&crate::ModelProviderRuntimeOptions {
+            provider_timeout_secs: Some(1),
+            provider_timeout_disabled: true,
+            provider_read_timeout_secs: Some(1),
+            provider_read_timeout_disabled: true,
+            ..Default::default()
+        });
+        assert_eq!(cleared.request, None);
+        assert_eq!(cleared.read, None);
+        assert_eq!(
+            cleared
+                .client("model_provider.gemini")
+                .unwrap()
+                .get(server.uri())
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            200
+        );
+    }
 }

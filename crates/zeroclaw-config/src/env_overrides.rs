@@ -53,12 +53,23 @@ pub fn apply_env_overrides(config: &mut Config) -> Result<AppliedOverrides> {
             (!tail.is_empty()
                 && tail
                     .chars()
-                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_'))
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+                || [
+                    "providers__models__",
+                    "providers__connections__",
+                    "providers__model_presets__",
+                    "providers__fallback__",
+                ]
+                .iter()
+                .any(|prefix| tail.starts_with(prefix)))
             .then(|| (k.clone(), v, tail.to_string()))
         })
         .collect();
     entries.sort_by(|a, b| a.0.cmp(&b.0));
 
+    // One admission-time source for snapshots, including several env names
+    // that address the same field or create the same optional auth table.
+    let registry_before = serde_json::to_value(&config.providers)?;
     let mut paths: HashSet<String> = HashSet::with_capacity(entries.len());
     let mut snapshots: HashMap<String, String> = HashMap::with_capacity(entries.len());
     for (env_name, value, tail) in entries {
@@ -99,8 +110,16 @@ pub fn apply_env_overrides(config: &mut Config) -> Result<AppliedOverrides> {
                 });
             continue;
         }
+        for (path, snapshot) in
+            crate::migration::provider_inputs::prepare_memory_env_input(config, &tail)?
+        {
+            snapshots.entry(path.clone()).or_insert(snapshot);
+            paths.insert(path);
+        }
         let path = resolve_path(&tail, config)
             .with_context(|| format!("{env_name} did not resolve to a schema path"))?;
+        let value = crate::migration::provider_inputs::legacy_env_value(config, &tail, &value)
+            .with_context(|| format!("{env_name} did not resolve to a canonical override value"))?;
         if NON_OVERRIDABLE_PATHS.contains(path.as_str()) {
             ::zeroclaw_log::record!(
                 WARN,
@@ -115,12 +134,19 @@ pub fn apply_env_overrides(config: &mut Config) -> Result<AppliedOverrides> {
         // `Config::get_prop`'s unconditional secret mask: secret fields on
         // `config` carry plaintext (post-`decrypt_secrets`), so the snapshot
         // captures the real value that should be restored at save time.
-        let snapshot = raw_value_for_path(config, &path).unwrap_or_default();
-        snapshots.insert(path.clone(), snapshot);
+        let snapshot = if path.starts_with("/providers/") {
+            crate::provider_registry::env_input::snapshot_document(&registry_before, &path)?
+        } else {
+            raw_value_for_path(config, &path).unwrap_or_default()
+        };
+        snapshots.entry(path.clone()).or_insert(snapshot);
 
-        config
-            .set_prop(&path, &value)
-            .with_context(|| format!("{env_name} → {path}"))?;
+        if path.starts_with("/providers/") {
+            crate::provider_registry::env_input::set(config, &path, &value, false)
+        } else {
+            config.set_prop(&path, &value)
+        }
+        .with_context(|| format!("{env_name} → {path}"))?;
         if Config::prop_is_secret(&path) {
             ::zeroclaw_log::record!(
                 WARN,
@@ -147,13 +173,40 @@ pub fn apply_env_overrides(config: &mut Config) -> Result<AppliedOverrides> {
             "Applied env-var config overrides"
         );
     }
-    Ok(AppliedOverrides { paths, snapshots })
+    config.env_overridden_paths.extend(paths.iter().cloned());
+    for (path, snapshot) in snapshots {
+        config
+            .pre_override_snapshots
+            .entry(path)
+            .or_insert(snapshot);
+    }
+    crate::migration::provider_inputs::normalize(config)?;
+    Ok(AppliedOverrides {
+        paths: config.env_overridden_paths.clone(),
+        snapshots: config.pre_override_snapshots.clone(),
+    })
 }
 
 /// Walk an env-var tail against the schema. Map-keyed positions consume one
 /// `__`-delimited alias token (which may contain single `_` per the alias
 /// validator); everything else resolves via `prop_fields()` lookup.
 fn resolve_path(tail: &str, config: &mut Config) -> Result<String> {
+    if let Some(path) = crate::provider_registry::env_input::path(config, tail) {
+        return Ok(path);
+    }
+    if let ["providers", "models", family, alias, ..] =
+        tail.split(SEP).collect::<Vec<_>>().as_slice()
+        && config
+            .providers
+            .models
+            .canonical_model(&format!("{family}.{alias}").as_str().into())
+            .is_some()
+    {
+        anyhow::bail!(
+            "historical provider override is unsupported; use the canonical connection/model field"
+        );
+    }
+
     let mut sections = Config::map_key_sections();
     sections.sort_by_key(|s| std::cmp::Reverse(s.path.len()));
     for section in sections {
@@ -226,6 +279,30 @@ fn resolve_path(tail: &str, config: &mut Config) -> Result<String> {
 }
 
 pub(crate) fn raw_value_for_path(source: &Config, path: &str) -> Option<String> {
+    if path.starts_with("/providers/") {
+        return crate::provider_registry::env_input::snapshot(source, path).ok();
+    }
+    if let Some(rest) = path.strip_prefix("embedding_routes.") {
+        // Route entries use a natural key, not a numeric TOML array index.
+        // Match the configured key whole so dots in a hint retain their meaning.
+        let (route, leaf) = source
+            .embedding_routes
+            .iter()
+            .filter_map(|route| {
+                rest.strip_prefix(&route.hint)
+                    .and_then(|tail| tail.strip_prefix('.'))
+                    .map(|leaf| (route, leaf))
+            })
+            .max_by_key(|(route, _)| route.hint.len())?;
+        let document = serde_json::to_value(route).ok()?;
+        let value = document.get(leaf)?;
+        return Some(
+            value
+                .as_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| value.to_string()),
+        );
+    }
     let table = toml::Value::try_from(source).ok()?;
     let mut current: &toml::Value = &table;
     for segment in path.split('.') {
@@ -248,7 +325,19 @@ pub fn mask_env_overrides_for_save(
     config_to_save: &mut Config,
     snapshots: &HashMap<String, String>,
 ) -> Result<()> {
+    crate::provider_registry::env_input::restore(config_to_save, snapshots)?;
     for (path, value) in snapshots {
+        if path.starts_with("/providers/") {
+            continue;
+        }
+        // Input migration can replace route credentials and upstream IDs with
+        // canonical model references. Restore the route collection atomically;
+        // the property editor only supports individual natural-key entries.
+        if path == "embedding_routes" {
+            config_to_save.embedding_routes =
+                serde_json::from_str(value).context("restore embedding bindings before save")?;
+            continue;
+        }
         config_to_save
             .set_prop(path, value)
             .with_context(|| format!("failed to restore env-overridden path {path} before save"))?;
@@ -284,6 +373,106 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn provider_editor_promotes_override_snapshots_without_persisting_env_secrets() {
+        let _guard = super::env_test_lock().await;
+        let _key = EnvVarGuard::set(
+            "ZEROCLAW_providers__models__openai__default__api_key",
+            "env-only-secret",
+        );
+        let mut config = Config::default();
+        let entry = config.providers.models.ensure("openai", "default").unwrap();
+        entry.model = Some("wire-model".into());
+        entry.api_key = Some("original-file-key".into());
+        let applied = apply_env_overrides(&mut config).unwrap();
+        config.env_overridden_paths = applied.paths;
+        config.pre_override_snapshots = applied.snapshots;
+        crate::provider_registry::editor::update(&mut config, |_| Ok(())).unwrap();
+        assert!(config.providers.models.openai.is_empty());
+        assert!(
+            config
+                .prop_is_env_overridden("providers.connections.legacy.openai.default.auth.api_key")
+        );
+        let snapshots = config.pre_override_snapshots.clone();
+        mask_env_overrides_for_save(&mut config, &snapshots).unwrap();
+        assert!(
+            config.providers.models.openai.is_empty(),
+            "save must not recreate the retired input"
+        );
+        let registry = config.provider_registry().unwrap();
+        let model = registry.resolve_chat(&"openai.default".into()).unwrap();
+        assert_eq!(
+            model.selection.connection.api_key(),
+            Some("original-file-key")
+        );
+        assert!(
+            !serde_json::to_string(&config.providers)
+                .unwrap()
+                .contains("env-only-secret")
+        );
+    }
+
+    #[tokio::test]
+    async fn canonical_and_legacy_env_names_restore_one_original_snapshot() {
+        let _guard = super::env_test_lock().await;
+        let _legacy = EnvVarGuard::set(
+            "ZEROCLAW_providers__models__openai__default__api_key",
+            "legacy-env-key",
+        );
+        let _canonical = EnvVarGuard::set(
+            "ZEROCLAW_providers__connections__gateway.Prod__auth__api_key",
+            "canonical-env-key",
+        );
+        let _mode = EnvVarGuard::set(
+            "ZEROCLAW_providers__connections__gateway.Prod__auth__mode",
+            "api_key",
+        );
+        let _temperature = EnvVarGuard::set(
+            "ZEROCLAW_providers__models__openai.default__options__temperature",
+            "null",
+        );
+        let mut config = Config {
+            providers: serde_json::from_value(serde_json::json!({
+                "connections": {"gateway.Prod": {"kind": "custom", "uri": "https://example.invalid/v1"}},
+                "models": {"openai.default": {"capability": "chat", "provider": "gateway.Prod", "model": "wire-model"}},
+            })).unwrap(),
+            ..Config::default()
+        };
+        let original = serde_json::to_value(&config.providers).unwrap();
+        let applied = apply_env_overrides(&mut config).unwrap();
+        let registry = config.provider_registry().unwrap();
+        assert_eq!(
+            registry.connections["gateway.Prod"].api_key(),
+            Some("legacy-env-key")
+        );
+        assert_eq!(
+            applied.snapshots.len(),
+            3,
+            "two env names address one credential"
+        );
+        assert!(matches!(
+            registry
+                .resolve_chat(&"openai.default".into())
+                .unwrap()
+                .options
+                .temperature,
+            Some(crate::provider_registry::Override::Clear)
+        ));
+        // A concurrent, unrelated edit survives masking. Neither env secret
+        // nor an auth container created by env is persisted.
+        crate::provider_registry::env_input::set(
+            &mut config,
+            "/providers/connections/gateway.Prod/uri",
+            "https://updated.invalid/v1",
+            false,
+        )
+        .unwrap();
+        mask_env_overrides_for_save(&mut config, &applied.snapshots).unwrap();
+        let mut expected = original;
+        expected["connections"]["gateway.Prod"]["uri"] = "https://updated.invalid/v1".into();
+        assert_eq!(serde_json::to_value(&config.providers).unwrap(), expected);
+    }
+
+    #[tokio::test]
     async fn walker_resolves_typed_family_alias_default() {
         let _guard = super::env_test_lock().await;
         let _v = EnvVarGuard::set(
@@ -297,7 +486,7 @@ mod tests {
         assert!(
             applied
                 .paths
-                .contains("providers.models.anthropic.default.api_key"),
+                .contains("/providers/connections/legacy.anthropic.default/auth/api_key"),
             "kebab-translated path should be recorded: {:?}",
             applied.paths,
         );
@@ -305,12 +494,117 @@ mod tests {
         assert_eq!(
             config
                 .providers
-                .models
-                .anthropic
-                .get("default")
-                .and_then(|c| c.base.api_key.as_deref()),
+                .connections
+                .get("legacy.anthropic.default")
+                .and_then(|connection| connection.api_key()),
             Some("sk-ant-fixture"),
         );
+    }
+
+    #[tokio::test]
+    async fn historical_driver_and_nested_model_env_names_target_loaded_canonical_fields() {
+        let _guard = super::env_test_lock().await;
+        let _driver = EnvVarGuard::set(
+            "ZEROCLAW_providers__models__grok_cli__work__max_acp_stdout_bytes",
+            "8388608",
+        );
+        let _model = EnvVarGuard::set(
+            "ZEROCLAW_providers__models__grok_cli__work__models__fast.v2__temperature",
+            "0.25",
+        );
+        let mut config: Config = toml::from_str(
+            r#"
+[providers.models.grok_cli.work]
+model = "base-model"
+working_directory = "/fixture/workspace"
+max_acp_stdout_bytes = 1048576
+[providers.models.grok_cli.work.models."fast.v2"]
+id = "nested-model"
+temperature = 0.5
+"#,
+        )
+        .unwrap();
+        let before = serde_json::to_value(&config.providers).unwrap();
+        let applied = apply_env_overrides(&mut config).unwrap();
+        let after = serde_json::to_value(&config.providers).unwrap();
+        assert_eq!(
+            after["connections"]["legacy.grok_cli.work"]["api"]["chat"]["max_acp_stdout_bytes"],
+            8_388_608
+        );
+        assert_eq!(
+            after["models"]["grok_cli.work.fast.v2"]["options"]["temperature"],
+            0.25
+        );
+        assert!(config.providers.models.iter_entries().next().is_none());
+        mask_env_overrides_for_save(&mut config, &applied.snapshots).unwrap();
+        assert_eq!(serde_json::to_value(&config.providers).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn historical_oauth_env_preserves_the_loaded_client_and_restores_auth_before_save() {
+        let _guard = super::env_test_lock().await;
+        let _secret = EnvVarGuard::set(
+            "ZEROCLAW_providers__models__gemini__work__oauth_client_secret",
+            "env-client-secret",
+        );
+        let mut config: Config = toml::from_str(
+            r#"
+[providers.models.gemini.work]
+model = "gemini-test"
+oauth_client_id = "original-client"
+oauth_client_secret = "original-secret"
+"#,
+        )
+        .unwrap();
+        let before = serde_json::to_value(&config.providers).unwrap();
+        let applied = apply_env_overrides(&mut config).unwrap();
+        assert_eq!(
+            config
+                .gemini_oauth_client_credentials("gemini.work")
+                .unwrap(),
+            Some(("original-client".into(), "env-client-secret".into()))
+        );
+        mask_env_overrides_for_save(&mut config, &applied.snapshots).unwrap();
+        assert_eq!(serde_json::to_value(&config.providers).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn historical_memory_env_overrides_rematerialize_a_loaded_model_without_persisting_it() {
+        let _guard = super::env_test_lock().await;
+        let _model = EnvVarGuard::set("ZEROCLAW_memory__embedding_model", "env-embedding");
+        let _dims = EnvVarGuard::set("ZEROCLAW_memory__embedding_dimensions", "768");
+        let mut config: Config = toml::from_str(
+            r#"
+[providers.connections.shared]
+kind = "openai"
+auth = {mode="api_key", api_key="original-key"}
+[providers.models."embedding.main"]
+capability="embedding"
+provider="shared"
+model="original-embedding"
+metadata={dimensions=384}
+[memory]
+embedding_model_ref="embedding.main"
+"#,
+        )
+        .unwrap();
+        let before = serde_json::to_value(&config).unwrap();
+        let applied = apply_env_overrides(&mut config).unwrap();
+        let registry = config.provider_registry().unwrap();
+        let selected = registry
+            .resolve_embedding(&config.memory.embedding_model_ref.as_deref().unwrap().into())
+            .unwrap();
+        assert_eq!(selected.model, "env-embedding");
+        assert_eq!(selected.dimensions, Some(768));
+        assert_eq!(
+            registry
+                .resolve_embedding(&"embedding.main".into())
+                .unwrap()
+                .model,
+            "original-embedding"
+        );
+        mask_env_overrides_for_save(&mut config, &applied.snapshots).unwrap();
+        assert_eq!(serde_json::to_value(&config).unwrap(), before);
     }
 
     #[tokio::test]
@@ -324,19 +618,13 @@ mod tests {
         let mut config = Config::default();
         let applied = apply_env_overrides(&mut config).expect("apply succeeds");
 
-        assert!(
-            applied
-                .paths
-                .contains("providers.models.grok_cli.default.max_acp_stdout_bytes"),
-        );
+        assert!(applied.paths.contains(
+            "/providers/connections/legacy.grok_cli.default/api/chat/max_acp_stdout_bytes"
+        ),);
         assert_eq!(
-            config
-                .providers
-                .models
-                .grok_cli
-                .get("default")
-                .and_then(|entry| entry.max_acp_stdout_bytes),
-            Some(8_388_608)
+            serde_json::to_value(&config.providers).unwrap()["connections"]["legacy.grok_cli.default"]
+                ["api"]["chat"]["max_acp_stdout_bytes"],
+            8_388_608
         );
     }
 
@@ -358,23 +646,18 @@ mod tests {
         assert!(
             applied
                 .paths
-                .contains("providers.models.openrouter.prod_v2.api_key"),
+                .contains("/providers/connections/legacy.openrouter.prod_v2/auth/api_key"),
         );
         assert!(
             applied
                 .paths
-                .contains("providers.models.openrouter.prod_v2.model"),
+                .contains("/providers/models/openrouter.prod_v2/model"),
         );
-        let entry = config
-            .providers
-            .models
-            .openrouter
-            .get("prod_v2")
-            .expect("alias created");
-        assert_eq!(entry.base.api_key.as_deref(), Some("sk-or-fixture"));
+        let entry = &config.providers.connections["legacy.openrouter.prod_v2"];
+        assert_eq!(entry.api_key(), Some("sk-or-fixture"));
         assert_eq!(
-            entry.base.model.as_deref(),
-            Some("anthropic/claude-sonnet-4-6"),
+            config.resolve_model_id("openrouter.prod_v2").as_deref(),
+            Some("anthropic/claude-sonnet-4-6")
         );
     }
 
@@ -497,16 +780,15 @@ mod tests {
         assert!(
             applied
                 .paths
-                .contains("providers.models.anthropic.default.api_key"),
+                .contains("/providers/connections/legacy.anthropic.default/auth/api_key"),
         );
         // Env value is live in memory.
         assert_eq!(
             config
                 .providers
-                .models
-                .anthropic
-                .get("default")
-                .and_then(|c| c.base.api_key.as_deref()),
+                .connections
+                .get("legacy.anthropic.default")
+                .and_then(|connection| connection.api_key()),
             Some("sk-ant-from-env"),
         );
 
@@ -518,20 +800,18 @@ mod tests {
         assert_eq!(
             to_save
                 .providers
-                .models
-                .anthropic
-                .get("default")
-                .and_then(|c| c.base.api_key.as_deref()),
+                .connections
+                .get("legacy.anthropic.default")
+                .and_then(|connection| connection.api_key()),
             Some("sk-ant-on-disk"),
             "secret resets to pre-override plaintext (not the `**** (encrypted)` mask)",
         );
         assert_ne!(
             to_save
                 .providers
-                .models
-                .anthropic
-                .get("default")
-                .and_then(|c| c.base.api_key.as_deref()),
+                .connections
+                .get("legacy.anthropic.default")
+                .and_then(|connection| connection.api_key()),
             Some("**** (encrypted)"),
             "must not corrupt the field with the display mask",
         );

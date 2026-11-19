@@ -5,7 +5,10 @@
 
 mod api;
 mod connection;
+pub mod embedding_input;
+pub(crate) mod env_input;
 mod ids;
+pub(crate) mod input;
 mod model;
 mod options;
 mod override_value;
@@ -16,9 +19,11 @@ pub use api::*;
 pub use connection::*;
 pub use ids::{ModelRef, PresetId, ProviderId};
 pub use model::*;
+pub(crate) use options::option_fields;
 pub use options::{
     AsrOptionsPatch, ChatOptionsPatch, ModelPreset, Preset, TextExtraction, TtsOptionsPatch,
 };
 pub use override_value::Override;
 pub use registry::{ModelSelection, ProviderRegistry, RegistryError};
 pub use resolve::{ResolvedAsr, ResolvedChat, ResolvedDecision, ResolvedEmbedding, ResolvedTts};
+pub mod editor;

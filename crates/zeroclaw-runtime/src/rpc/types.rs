@@ -11,6 +11,91 @@ use serde::{Deserialize, Serialize};
 
 pub use zeroclaw_rpc_proto::types::*;
 
+/// UI provider editing has one canonical surface. The retained provider
+/// section entries remain visible only as rate-sheet navigation targets: the
+/// provider/model fields themselves are edited through `providers.registry`,
+/// while the cost editor still owns the historical category paths under
+/// `cost.rates.providers.*`.
+pub fn project_provider_editor_sections(roots: &mut std::collections::BTreeSet<String>) {
+    use zeroclaw_config::sections::Section;
+    for section in [
+        Section::ModelProviders,
+        Section::TtsProviders,
+        Section::TranscriptionProviders,
+        Section::DecisionModels,
+    ] {
+        roots.remove(section.as_str());
+    }
+    roots.insert("providers.registry".to_owned());
+    // These entries are intentionally synthetic. They preserve the shared
+    // cost-category metadata consumed by the dashboard and Zerocode without
+    // making the legacy provider maps the source of truth again.
+    roots.extend([
+        "providers.models".to_owned(),
+        "providers.tts".to_owned(),
+        "providers.transcription".to_owned(),
+    ]);
+}
+
+/// Keep the registry at the provider setup position in the canonical ordering.
+pub fn config_editor_section_index(key: &str) -> Option<usize> {
+    use zeroclaw_config::sections::{Section, section_index, section_index_for_key};
+    if key == "providers.registry" {
+        section_index(Section::ModelProviders)
+    } else if zeroclaw_config::schema::cost_category_for_provider_section(key).is_some() {
+        section_index(Section::ModelProviders).map(|index| index.saturating_add(1))
+    } else {
+        section_index_for_key(key)
+    }
+}
+
+/// Synthetic, cost-only navigation entry for a provider rate-sheet category.
+pub fn provider_cost_section(key: &str, category: &str) -> ConfigSectionEntry {
+    ConfigSectionEntry {
+        key: key.to_owned(),
+        label: zeroclaw_config::sections::humanize_section_key(key),
+        help: zeroclaw_config::sections::section_help(key).to_owned(),
+        has_picker: true,
+        completed: false,
+        ready: false,
+        group: zeroclaw_config::sections::SectionGroup::Foundation
+            .label()
+            .to_owned(),
+        group_key: zeroclaw_config::sections::SectionGroup::Foundation
+            .key()
+            .to_owned(),
+        is_quickstart: false,
+        shape: Some(zeroclaw_config::sections::SectionShape::CostRates),
+        cost_category: category.to_owned(),
+    }
+}
+
+/// Synthetic editor section shared by HTTP and RPC consumers. The registry
+/// stays outside legacy flattened prop paths; this is a navigation entry.
+pub fn provider_registry_section(config: &zeroclaw_config::schema::Config) -> ConfigSectionEntry {
+    ConfigSectionEntry {
+        key: "providers.registry".into(),
+        label: crate::i18n::get_required_cli_string("cli-config-provider-registry-label"),
+        help: crate::i18n::get_required_cli_string("cli-config-provider-registry-help"),
+        has_picker: false,
+        completed: config
+            .provider_registry()
+            .is_ok_and(|registry| !registry.models.is_empty()),
+        ready: config
+            .provider_registry()
+            .is_ok_and(|registry| !registry.models.is_empty()),
+        group: zeroclaw_config::sections::SectionGroup::Foundation
+            .label()
+            .into(),
+        group_key: zeroclaw_config::sections::SectionGroup::Foundation
+            .key()
+            .into(),
+        is_quickstart: false,
+        shape: Some(zeroclaw_config::sections::SectionShape::DirectForm),
+        cost_category: String::new(),
+    }
+}
+
 // ── Re-exports: runtime types that already derive Serialize + Deserialize ──
 
 pub use crate::cron::{CronJob, CronJobPatch, CronRun, DeliveryConfig, Schedule};
@@ -247,6 +332,38 @@ rpc_type! {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn provider_editor_sections_keep_rate_sheet_destinations() {
+        let mut roots = [
+            "providers.models",
+            "providers.tts",
+            "providers.transcription",
+            "decision_models",
+            "agents",
+        ]
+        .map(str::to_owned)
+        .into_iter()
+        .collect();
+        project_provider_editor_sections(&mut roots);
+        assert_eq!(
+            roots,
+            [
+                "agents",
+                "providers.models",
+                "providers.registry",
+                "providers.transcription",
+                "providers.tts",
+            ]
+            .map(str::to_owned)
+            .into_iter()
+            .collect(),
+        );
+        assert!(
+            config_editor_section_index("providers.registry")
+                < config_editor_section_index("providers.models")
+        );
+    }
 
     #[test]
     fn interaction_surface_is_closed_and_snake_case() {

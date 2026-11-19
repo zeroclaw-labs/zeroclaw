@@ -34,18 +34,25 @@ Quickstart can write the provider entry for you:
 zeroclaw quickstart --model-provider openai-codex --model gpt-5.4
 ```
 
-Manual config uses the same canonical OpenAI slot:
+Manual config uses one reusable connection and two canonical chat models:
 
 ```toml
-[providers.models.openai.coding]
-model                = "gpt-5.4"
-wire_api             = "responses"
-requires_openai_auth = true
+[providers.connections."openai.codex"]
+kind = "openai"
+auth = { mode = "codex" }
 
-[providers.models.openai.review]
-model                = "codex-auto-review"
-wire_api             = "responses"
-requires_openai_auth = true
+[providers.connections."openai.codex".api.chat]
+wire_api = "responses"
+
+[providers.models."chat.openai.coding"]
+capability = "chat"
+provider = "openai.codex"
+model = "gpt-5.4"
+
+[providers.models."chat.openai.review"]
+capability = "chat"
+provider = "openai.codex"
+model = "codex-auto-review"
 ```
 
 There is no `api_key` field; `requires_openai_auth = true` is the switch that
@@ -60,10 +67,10 @@ catalog serves the same ID, or any Astra ID, to this account. Query the live
 Codex catalog as described below, then use the exact returned string:
 
 ```toml
-[providers.models.openai.astra_subscription]
-model                = "<exact-astra-id-from-codex-catalog>"
-wire_api             = "responses"
-requires_openai_auth = true
+[providers.models."chat.openai.astra_subscription"]
+capability = "chat"
+provider = "openai.codex"
+model = "<exact-astra-id-from-codex-catalog>"
 ```
 
 Keep `api_key` and `temperature` unset. `requires_openai_auth = true` selects

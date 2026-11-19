@@ -33,10 +33,10 @@ pub async fn maybe_run_skill_review(
     provider: &dyn ModelProvider,
     provider_name: &str,
     model_name: &str,
-    // Sampling temperature for the review fork. Callers pass the same value
-    // the parent turn used (the agent's provider temperature, thinking-adjusted),
-    // so `None` keeps the field off the wire for models that reject it.
-    temperature: Option<f64>,
+    // Reuse the parent's invocation override and thinking adjustment. Each
+    // selected model still resolves its own configured default; configless
+    // calls with no override keep temperature off the wire.
+    temperature: zeroclaw_providers::temperature::Temperature,
     observer: &dyn Observer,
     multimodal: &MultimodalConfig,
     pacing: &PacingConfig,
@@ -166,7 +166,7 @@ pub async fn maybe_run_skill_review(
                         excluded_tools: &[],
                         dedup_exempt_tools: &[],
                         pacing,
-                        strict_tool_parsing: false,
+                        text_tool_calls_disabled: false,
                         // lenient for the restricted fork
                         parallel_tools: false,
                         // sequential for the mutation-capable fork
@@ -566,7 +566,7 @@ mod tests {
             &provider,
             "mock-provider",
             "mock-model",
-            temperature,
+            temperature.into(),
             &crate::observability::noop::NoopObserver,
             &MultimodalConfig::default(),
             &PacingConfig::default(),
