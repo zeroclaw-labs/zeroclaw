@@ -128,6 +128,30 @@ To avoid editing config on every model bump, resolve roles to current served
 IDs dynamically (enumerate `codex/models`, pick the newest match per role)
 rather than pinning a version.
 
+### System prompt placement on GPT-6.2 and newer
+
+For OpenAI `gpt-6.2` and newer (`gpt-6.2-sol`, `gpt-6.2-astra`, `gpt-6.10`,
+`gpt-7`), the Responses request omits the top-level `instructions` key. This
+also applies with an exact `openai/`, `openai.` or `<region>.openai.` qualifier;
+other prefixes keep the legacy shape. The same nonempty system prompt (or the
+Codex fallback identity when there is no system message) is sent once, as the
+first `input` item: a typed `message` with `role: "developer"` and one
+`input_text` part. An explicitly empty system prompt adds no developer item.
+`gpt-6.1` and older keep their previous `instructions` behavior. The same rule
+applies to the API-key `openai` Responses provider, streaming and non-streaming.
+
+Reason: [hermes-agent PR 157705](https://github.com/NousResearch/hermes-agent/pull/157705)
+reported, from a real Codex OAuth A/B on `gpt-6.2-sol` and `gpt-6.2-astra`, zero
+cache reads for top-level `instructions` and cache hits for the same prompt as
+a leading developer message. Automated request tests verify this wire shape,
+not live cache-hit rates or its effect on subscription allowance.
+
+Scope: the rule keys on the model ID only, so a custom or compatible Responses
+endpoint serving such an ID also receives the developer-message shape. Replayed
+history here contains only message, reasoning, function-call and
+function-call-output items (no compaction checkpoint items), so the developer
+item is always first.
+
 ## Cost and routing
 
 How OpenAI bills this path (follow OpenAI's current Codex / ChatGPT-plan billing
