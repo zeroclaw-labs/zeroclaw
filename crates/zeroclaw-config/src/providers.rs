@@ -1220,7 +1220,6 @@ macro_rules! for_each_tts_provider_slot {
             (google, "google"),
             (edge, "edge"),
             (piper, "piper"),
-            (custom, "custom"),
         }
     };
 }
@@ -1228,6 +1227,39 @@ macro_rules! for_each_tts_provider_slot {
 /// Slot list for transcription providers.
 #[macro_export]
 macro_rules! for_each_transcription_provider_slot {
+    ($mac:ident, $rate_ty:ty) => {
+        $mac! {
+            $rate_ty,
+            (groq, "groq"),
+            (openai, "openai"),
+            (deepgram, "deepgram"),
+            (assemblyai, "assemblyai"),
+            (google, "google"),
+            (local_whisper, "local_whisper"),
+        }
+    };
+}
+
+/// Rate-sheet families also include canonical OpenAI-compatible connections,
+/// which are represented as `custom` in the registry but do not have a
+/// legacy typed provider map under `providers.tts` or `providers.transcription`.
+#[macro_export]
+macro_rules! for_each_tts_rate_slot {
+    ($mac:ident, $rate_ty:ty) => {
+        $mac! {
+            $rate_ty,
+            (openai, "openai"),
+            (elevenlabs, "elevenlabs"),
+            (google, "google"),
+            (edge, "edge"),
+            (piper, "piper"),
+            (custom, "custom"),
+        }
+    };
+}
+
+#[macro_export]
+macro_rules! for_each_transcription_rate_slot {
     ($mac:ident, $rate_ty:ty) => {
         $mac! {
             $rate_ty,
@@ -1341,7 +1373,7 @@ macro_rules! emit_tts_cost_rates_struct {
         }
     };
 }
-for_each_tts_provider_slot!(emit_tts_cost_rates_struct, super::schema::TtsCostRates);
+for_each_tts_rate_slot!(emit_tts_cost_rates_struct, super::schema::TtsCostRates);
 
 macro_rules! emit_transcription_cost_rates_struct {
     ($rate_ty:ty, $($slot:tt),+ $(,)?) => {
@@ -1354,7 +1386,7 @@ macro_rules! emit_transcription_cost_rates_struct {
         }
     };
 }
-for_each_transcription_provider_slot!(
+for_each_transcription_rate_slot!(
     emit_transcription_cost_rates_struct,
     super::schema::TranscriptionCostRates
 );
