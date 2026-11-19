@@ -168,8 +168,9 @@ impl ModelSwitchTool {
             success: true,
             output: serde_json::to_string_pretty(&json!({
                 "pending_switch": pending,
-                "note": "To switch models, use action 'set' with an exact configured model_provider reference"
-            }))?.into(),
+                "note": crate::i18n::get_required_cli_string("model-switch-example-reference")
+            }))?
+            .into(),
             error: None,
         })
     }
