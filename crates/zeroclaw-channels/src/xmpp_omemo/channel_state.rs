@@ -483,6 +483,9 @@ impl ChannelState {
         plaintext: &[u8],
         policy: &[String],
     ) -> Result<ReservedEnvelope> {
+        let jid: jid::BareJid = peer.parse()?;
+        ensure!(jid.node().is_some() && !peer.contains('/'), "Invalid peer JID");
+        let peer = jid.as_str();
         let key = format!("omemo//eu.siacs.conversations.axolotl/{peer}/device_ids");
         let raw: Option<String> = self
             .owner

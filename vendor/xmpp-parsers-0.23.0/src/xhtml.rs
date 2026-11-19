@@ -501,7 +501,9 @@ fn parse_css(style: Option<&str>) -> Css {
     if let Some(style) = style {
         // TODO: make that parser a bit more resilient to things.
         for declaration in style.split(';') {
-            let (key, value) = declaration.split_once(':').unwrap();
+            let Some((key, value)) = declaration.split_once(':') else {
+                continue;
+            };
             properties.push(Property {
                 key: key.to_string(),
                 value: value.to_string(),
