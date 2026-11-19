@@ -253,6 +253,28 @@ impl SecretStore {
             return Ok(plaintext.to_string());
         }
 
+        self.encrypt_keyed(plaintext)
+    }
+
+    /// Encrypt a value that has to stay sealed whatever this store's setting
+    /// is. A credential whose owner refused plaintext keeps that promise even
+    /// when an unrelated writer runs with `secrets.encrypt = false`, and only
+    /// the key this value was sealed with can keep it: an unavailable key is an
+    /// error here, never a silent demotion to plaintext. Storage prefixes are
+    /// deliberately not consulted: the caller handed over plaintext, and an
+    /// attacker-chosen shape must not exempt itself - `enc2:` garbage would
+    /// break every later read of the shared store, and an `op://` reference
+    /// would be resolved into a local secret and handed to the value's
+    /// consumer. Only the empty value stays as it is, matching `encrypt`.
+    pub fn encrypt_required(&self, plaintext: &str) -> Result<String> {
+        if plaintext.is_empty() {
+            return Ok(plaintext.to_string());
+        }
+
+        self.encrypt_keyed(plaintext)
+    }
+
+    fn encrypt_keyed(&self, plaintext: &str) -> Result<String> {
         self.get_key(|key| {
             let key = Key::from_slice(key);
             let cipher = ChaCha20Poly1305::new(key);
@@ -1106,6 +1128,29 @@ mod tests {
         let store = SecretStore::new(tmp.path(), false);
         let result = store.encrypt("sk-secret").unwrap();
         assert_eq!(result, "sk-secret", "Disabled store should not encrypt");
+    }
+
+    #[test]
+    fn required_seal_seals_values_that_mimic_storage_instructions() {
+        // A required seal must not read the value's own shape as "already
+        // protected": `enc2:` garbage would break every later read of the
+        // shared store, and an `op://` reference would be resolved into a
+        // local secret and handed to the value's consumer.
+        for enabled in [true, false] {
+            let tmp = TempDir::new().unwrap();
+            let store = SecretStore::new(tmp.path(), enabled);
+            for shape in ["enc2:not-hex", "enc:aabbcc", "op://vault/item/field"] {
+                let sealed = store.encrypt_required(shape).unwrap();
+                assert!(sealed.starts_with("enc2:"), "{shape} must be sealed");
+                assert_ne!(sealed, shape, "{shape} must not pass itself through");
+                assert_eq!(
+                    store.decrypt(&sealed).unwrap(),
+                    shape,
+                    "the literal value must survive the roundtrip"
+                );
+            }
+            assert_eq!(store.encrypt_required("").unwrap(), "");
+        }
     }
 
     #[test]

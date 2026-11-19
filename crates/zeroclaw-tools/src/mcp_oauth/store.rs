@@ -9,7 +9,9 @@
 use anyhow::{Context, Result, bail};
 use reqwest::Url;
 use std::path::Path;
-use zeroclaw_providers::auth::profiles::{AuthProfile, AuthProfilesStore, TokenSet, profile_id};
+use zeroclaw_providers::auth::profiles::{
+    AuthProfile, AuthProfilesStore, REQUIRES_ENCRYPTED_STORAGE, TokenSet, profile_id,
+};
 
 use super::resource::CanonicalResource;
 
@@ -84,6 +86,11 @@ pub fn profile_name_for(canonical: &CanonicalResource) -> String {
 /// long-lived MCP refresh token in a plaintext state file is the exact leak
 /// this feature promises not to have. (Provider OAuth profiles accept
 /// plaintext by operator choice; MCP OAuth does not offer that choice.)
+///
+/// That refusal only binds writers this constructor sees, so the requirement
+/// travels with each row as [`REQUIRES_ENCRYPTED_STORAGE`] and the shared
+/// profile store writes a marked row sealed whatever its own setting is:
+/// flipping `secrets.encrypt` off afterwards cannot expose a signed-in grant.
 #[derive(Clone)]
 pub struct McpTokenStore {
     store: AuthProfilesStore,
@@ -182,6 +189,15 @@ impl McpTokenStore {
         profile
             .metadata
             .insert(META_RESOURCE.to_string(), canonical.resource().to_string());
+        // The refusal above only binds writers this constructor sees. Grants
+        // live in the profile store every other credential writes to, so the
+        // requirement travels with the row: a provider token pasted, or a
+        // different sign-in logged out, while `secrets.encrypt = false`
+        // re-saves this whole file, and a marked row is written sealed by that
+        // writer too instead of being dropped into plaintext.
+        profile
+            .metadata
+            .insert(REQUIRES_ENCRYPTED_STORAGE.to_string(), "true".to_string());
         self.store
             .upsert_profile(profile, false)
             .await
@@ -314,6 +330,56 @@ mod tests {
         let err = McpTokenStore::new(tmp.path(), false).expect_err("must fail closed");
         assert!(err.to_string().contains("secrets.encrypt"), "got: {err}");
         // The message is actionable and mentions no token material.
+    }
+
+    #[tokio::test]
+    async fn a_token_that_mimics_a_storage_instruction_is_still_sealed() {
+        // The authorization server controls these strings. One that spells
+        // itself `op://vault/item/field` must not be stored as a live
+        // 1Password reference (its resolution would leak a local secret to
+        // the AS at first use), and `enc2:not-hex` must not corrupt every
+        // later read of the shared profile file.
+        let tmp = TempDir::new().expect("tmp");
+        let store = McpTokenStore::new(tmp.path(), true).expect("store");
+        let canonical = canonical("https://mcp.example.com/mcp");
+        let tokens = TokenSet {
+            access_token: "op://vault/item/field".to_string(),
+            refresh_token: Some("enc2:not-hex".to_string()),
+            id_token: None,
+            expires_at: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+            token_type: Some("Bearer".to_string()),
+            scope: None,
+        };
+        store
+            .save_authorization(
+                &canonical,
+                "client-abc",
+                &Url::parse("https://auth.example.com").expect("url"),
+                tokens,
+            )
+            .await
+            .expect("save");
+
+        let raw = std::fs::read_to_string(tmp.path().join("auth-profiles.json")).expect("raw");
+        assert!(
+            !raw.contains("op://vault/item/field"),
+            "the op:// shape must not survive as a live reference"
+        );
+        assert!(
+            !raw.contains("enc2:not-hex"),
+            "the fake enc2: payload must not survive as a live prefix"
+        );
+        let loaded = store
+            .load_authorization(&canonical)
+            .await
+            .expect("load")
+            .expect("present");
+        assert_eq!(loaded.tokens.access_token, "op://vault/item/field");
+        assert_eq!(
+            loaded.tokens.refresh_token.as_deref(),
+            Some("enc2:not-hex"),
+            "both values must round-trip as the opaque tokens the AS issued"
+        );
     }
 
     #[tokio::test]
@@ -533,6 +599,27 @@ mod tests {
             .expect("present");
         assert_eq!(loaded.tokens.access_token, "rotated");
         assert_eq!(loaded.client_id, "cid");
+
+        // The rotation edited the row it loaded, so the storage promise the
+        // sign-in made travels with it.
+        let rows = AuthProfilesStore::new(tmp.path(), true)
+            .load()
+            .await
+            .expect("profiles");
+        let row = rows
+            .profiles
+            .get(&profile_id(
+                MCP_MODEL_PROVIDER,
+                &profile_name_for(&canonical),
+            ))
+            .expect("the MCP row");
+        assert_eq!(
+            row.metadata
+                .get(REQUIRES_ENCRYPTED_STORAGE)
+                .map(String::as_str),
+            Some("true"),
+            "a rotation must keep the storage requirement the sign-in declared"
+        );
 
         // Rotating onto a vanished profile fails closed.
         assert!(
