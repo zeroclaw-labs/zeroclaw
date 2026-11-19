@@ -24307,6 +24307,28 @@ api_key = "anthropic-key"
     }
 
     #[test]
+    fn normalize_cached_channel_turns_preserves_follow_up_after_tool_result() {
+        for result in [
+            ChatMessage {
+                role: "tool".to_string(),
+                content: "finished".to_string(),
+            },
+            ChatMessage::user("[Tool results]\nfinished"),
+        ] {
+            let normalized = normalize_cached_channel_turns(vec![
+                ChatMessage::user("first request"),
+                result.clone(),
+                ChatMessage::user("follow-up"),
+            ]);
+
+            assert_eq!(normalized.len(), 3);
+            assert_eq!(normalized[1].content, result.content);
+            assert_eq!(normalized[2].role, "user");
+            assert_eq!(normalized[2].content, "follow-up");
+        }
+    }
+
+    #[test]
     fn normalize_cached_channel_turns_merges_consecutive_user_turns() {
         let turns = vec![
             ChatMessage::user("forwarded content"),
