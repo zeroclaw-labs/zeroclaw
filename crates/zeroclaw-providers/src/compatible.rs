@@ -1067,7 +1067,7 @@ impl OpenAiCompatibleModelProvider {
         (result, true)
     }
 
-    fn http_client(&self) -> Client {
+    fn http_client(&self) -> Result<Client, reqwest::Error> {
         let timeout = self.timeout_secs;
         let has_user_agent = self.user_agent.is_some();
         let has_extra_headers = !self.extra_headers.is_empty();
@@ -1127,18 +1127,7 @@ impl OpenAiCompatibleModelProvider {
                 "model_provider.compatible",
             );
 
-            return builder.build().unwrap_or_else(|error| {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(
-                            ::serde_json::json!({"error": super::format_error_chain(&error)})
-                        ),
-                    "Failed to build proxied timeout client with custom headers or TLS certificate: "
-                );
-                Client::new()
-            });
+            return builder.build();
         }
 
         if self.timeout_disabled || self.read_timeout_disabled || self.read_timeout_secs.is_some() {
@@ -1157,23 +1146,14 @@ impl OpenAiCompatibleModelProvider {
                 builder,
                 "model_provider.compatible",
             );
-            return builder.build().unwrap_or_else(|error| {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(
-                            ::serde_json::json!({"error": super::format_error_chain(&error)})
-                        ),
-                    "Failed to build provider client with configured read timeout: "
-                );
-                Client::new()
-            });
+            return builder.build();
         }
-        zeroclaw_config::schema::build_runtime_proxy_client_with_timeouts(
-            "model_provider.compatible",
-            timeout,
-            10,
+        Ok(
+            zeroclaw_config::schema::build_runtime_proxy_client_with_timeouts(
+                "model_provider.compatible",
+                timeout,
+                10,
+            ),
         )
     }
 
@@ -1194,7 +1174,7 @@ impl OpenAiCompatibleModelProvider {
     }
 
     /// Apply the same resolved deadlines used by streaming error diagnostics.
-    fn streaming_http_client(&self) -> Client {
+    fn streaming_http_client(&self) -> Result<Client, reqwest::Error> {
         let endpoint = self.chat_completions_url();
         let timeouts = self.streaming_timeouts();
         let has_user_agent = self.user_agent.is_some();
@@ -1249,18 +1229,7 @@ impl OpenAiCompatibleModelProvider {
                 builder,
                 "provider.compatible",
             );
-            return builder.build().unwrap_or_else(|error| {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(
-                            ::serde_json::json!({"error": super::format_error_chain(&error)})
-                        ),
-                    "Failed to build proxied streaming client with custom headers or TLS certificate: "
-                );
-                Client::new()
-            });
+            return builder.build();
         }
 
         let builder = Client::builder().connect_timeout(std::time::Duration::from_secs(10));
@@ -1277,16 +1246,7 @@ impl OpenAiCompatibleModelProvider {
         let builder = crate::opencode_session::restrict_redirects(builder, &endpoint);
         let builder =
             zeroclaw_config::schema::apply_runtime_proxy_to_builder(builder, "provider.compatible");
-        builder.build().unwrap_or_else(|error| {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"error": super::format_error_chain(&error)})),
-                "Failed to build proxied streaming client: "
-            );
-            Client::new()
-        })
+        builder.build()
     }
 
     fn models_url(&self) -> String {
@@ -1688,7 +1648,7 @@ impl OpenAiCompatibleModelProvider {
         let url = self.chat_completions_url();
         let response = match self
             .apply_opencode_session_header(self.apply_auth_header(
-                self.http_client().post(&url).json(&request),
+                self.http_client()?.post(&url).json(&request),
                 credential.as_deref(),
             )?)
             .send()
@@ -4262,7 +4222,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             // it and would otherwise leak into operator logs.
             let safe_url = super::sanitize_api_error(&url);
             let response = self
-                .apply_auth_header(self.http_client().get(&url), list_credential.as_deref())?
+                .apply_auth_header(self.http_client()?.get(&url), list_credential.as_deref())?
                 .send()
                 .await
                 .map_err(|e| {
@@ -4365,7 +4325,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             // it and would otherwise leak into operator logs.
             let safe_url = super::sanitize_api_error(&url);
             let response = self
-                .apply_auth_header(self.http_client().get(&url), list_credential.as_deref())?
+                .apply_auth_header(self.http_client()?.get(&url), list_credential.as_deref())?
                 .send()
                 .await
                 .map_err(|e| {
@@ -4529,7 +4489,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
 
         let response = match self
             .apply_opencode_session_header(self.apply_auth_header(
-                self.http_client().post(&url).json(&request),
+                self.http_client()?.post(&url).json(&request),
                 credential.as_deref(),
             )?)
             .send()
@@ -4630,7 +4590,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         let response = loop {
             let response = match self
                 .apply_opencode_session_header(self.apply_auth_header(
-                    self.http_client().post(&url).json(&payload),
+                    self.http_client()?.post(&url).json(&payload),
                     credential.as_deref(),
                 )?)
                 .send()
@@ -4774,7 +4734,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         let response = loop {
             let response = match self
                 .apply_opencode_session_header(self.apply_auth_header(
-                    self.http_client().post(&url).json(&payload),
+                    self.http_client()?.post(&url).json(&payload),
                     credential.as_deref(),
                 )?)
                 .send()
@@ -5026,7 +4986,15 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             }
 
             let url = provider.chat_completions_url();
-            let client = provider.streaming_http_client();
+            let client = match provider.streaming_http_client() {
+                Ok(client) => client,
+                Err(error) => {
+                    let _ = tx
+                        .send(Err(StreamError::ModelProvider(error.to_string())))
+                        .await;
+                    return;
+                }
+            };
             let timeouts = provider.streaming_timeouts();
             let auth_header = provider.auth_header.clone();
             let credential = match provider.resolve_credential().await {
@@ -5228,7 +5196,15 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             // `StreamEvent::Usage`.
 
             let url = provider.chat_completions_url();
-            let client = provider.streaming_http_client();
+            let client = match provider.streaming_http_client() {
+                Ok(client) => client,
+                Err(error) => {
+                    let _ = tx
+                        .send(Err(StreamError::ModelProvider(error.to_string())))
+                        .await;
+                    return;
+                }
+            };
             let timeouts = provider.streaming_timeouts();
             let auth_header = provider.auth_header.clone();
             let credential = match provider.resolve_credential().await {
@@ -5380,7 +5356,15 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             // `StreamEvent::Usage`.
 
             let url = provider.chat_completions_url();
-            let client = provider.streaming_http_client();
+            let client = match provider.streaming_http_client() {
+                Ok(client) => client,
+                Err(error) => {
+                    let _ = tx
+                        .send(Err(StreamError::ModelProvider(error.to_string())))
+                        .await;
+                    return;
+                }
+            };
             let timeouts = provider.streaming_timeouts();
             let auth_header = provider.auth_header.clone();
             let credential = match provider.resolve_credential().await {
@@ -5459,7 +5443,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         let url = self.models_url();
         let credential = self.resolve_credential().await?;
         let mut response = self
-            .apply_auth_header(self.http_client().get(&url), credential.as_deref())?
+            .apply_auth_header(self.http_client()?.get(&url), credential.as_deref())?
             .send()
             .await?;
         // Drain without retaining the catalog so HTTP/1 connections can be reused.
@@ -10075,7 +10059,7 @@ mod tests {
         // http_client() must build cleanly even when PEM parse fails internally.
         // The method returns Client directly (panics on builder error), so if we
         // reach here without panic the fallback-to-system-roots path is working.
-        let _client = p.http_client();
+        let _client = p.http_client().expect("HTTP client should build");
     }
 
     #[test]
@@ -10099,7 +10083,9 @@ mod tests {
             p.tls_ca_cert_pem.is_some(),
             "readable file (even with bad PEM) must populate tls_ca_cert_pem bytes"
         );
-        let _client = p.streaming_http_client();
+        let _client = p
+            .streaming_http_client()
+            .expect("streaming HTTP client should build");
     }
 
     #[tokio::test]
@@ -10921,12 +10907,24 @@ mod tests {
         let has_policy = |client: Client| format!("{client:?}").contains("redirect_policy");
 
         let opencode = opencode_provider("https://opencode.ai/zen/v1");
-        assert!(has_policy(opencode.http_client()));
-        assert!(has_policy(opencode.streaming_http_client()));
+        assert!(has_policy(
+            opencode.http_client().expect("HTTP client should build")
+        ));
+        assert!(has_policy(
+            opencode
+                .streaming_http_client()
+                .expect("streaming HTTP client should build")
+        ));
 
         let other = opencode_provider("https://api.openai.com/v1");
-        assert!(!has_policy(other.http_client()));
-        assert!(!has_policy(other.streaming_http_client()));
+        assert!(!has_policy(
+            other.http_client().expect("HTTP client should build")
+        ));
+        assert!(!has_policy(
+            other
+                .streaming_http_client()
+                .expect("streaming HTTP client should build")
+        ));
     }
 
     #[test]
@@ -16445,14 +16443,14 @@ mod tests {
             .extra_headers(headers)
             .build();
         // Should not panic
-        let _client = p.http_client();
+        let _client = p.http_client().expect("HTTP client should build");
     }
 
     #[test]
     fn http_client_without_extra_headers_or_user_agent() {
         let p = make_model_provider("test", "https://example.com", None);
         // Should use the cached proxy client path
-        let _client = p.http_client();
+        let _client = p.http_client().expect("HTTP client should build");
     }
 
     #[test]
@@ -16470,7 +16468,7 @@ mod tests {
         assert_eq!(p.user_agent.as_deref(), Some("CustomAgent/1.0"));
         assert_eq!(p.extra_headers.len(), 1);
         // Should not panic
-        let _client = p.http_client();
+        let _client = p.http_client().expect("HTTP client should build");
     }
 
     #[test]

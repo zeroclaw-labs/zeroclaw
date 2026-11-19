@@ -1371,7 +1371,7 @@ impl OpenAiResponsesModelProvider {
         }
     }
 
-    fn streaming_client(&self) -> Client {
+    fn streaming_client(&self) -> Result<Client, reqwest::Error> {
         let default_headers = self.build_default_headers();
         let mut builder = Client::builder().connect_timeout(std::time::Duration::from_secs(10));
         let timeouts = self.streaming_timeouts();
@@ -1389,7 +1389,7 @@ impl OpenAiResponsesModelProvider {
             builder,
             "model_provider.openai",
         );
-        builder.build().unwrap_or_else(|_| Client::new())
+        builder.build()
     }
 }
 
@@ -1623,7 +1623,13 @@ impl ModelProvider for OpenAiResponsesModelProvider {
         let count_tokens = options.count_tokens;
         let reasoning_effort = self.reasoning_effort.clone();
         let max_tokens = self.max_tokens;
-        let client = self.streaming_client();
+        let client = match self.streaming_client() {
+            Ok(client) => client,
+            Err(error) => {
+                let error = StreamError::ModelProvider(error.to_string());
+                return stream::once(async move { Err(error) }).boxed();
+            }
+        };
         let timeouts = self.streaming_timeouts();
         let alias = ::zeroclaw_log::debug_enabled().then(|| self.alias.clone());
 
@@ -2490,7 +2496,9 @@ mod tests {
             .credential(Some("test-key"))
             .build();
         let client = provider.http_client().expect("HTTP client should build");
-        let streaming_client = provider.streaming_client();
+        let streaming_client = provider
+            .streaming_client()
+            .expect("streaming HTTP client should build");
         set_runtime_proxy_config(ProxyConfig::default());
 
         let response = client
@@ -2645,11 +2653,19 @@ mod tests {
 
         let opencode = provider("https://opencode.ai/zen/v1");
         assert!(has_policy(opencode.http_client().unwrap()));
-        assert!(has_policy(opencode.streaming_client()));
+        assert!(has_policy(
+            opencode
+                .streaming_client()
+                .expect("streaming HTTP client should build")
+        ));
 
         let other = provider("https://api.openai.com/v1");
         assert!(!has_policy(other.http_client().unwrap()));
-        assert!(!has_policy(other.streaming_client()));
+        assert!(!has_policy(
+            other
+                .streaming_client()
+                .expect("streaming HTTP client should build")
+        ));
     }
 
     #[test]

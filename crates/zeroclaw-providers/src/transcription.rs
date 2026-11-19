@@ -550,6 +550,7 @@ impl AsrProvider for DeepgramProvider {
 pub struct AssemblyAiProvider {
     alias: String,
     api_key: String,
+    base_url: String,
     request_timeout_secs: Option<Override<NonZeroU64>>,
 }
 
@@ -557,6 +558,7 @@ impl AssemblyAiProvider {
     fn from_canonical(
         alias: &str,
         api_key: Option<&str>,
+        endpoint: Option<String>,
         request_timeout_secs: Option<Override<NonZeroU64>>,
     ) -> Result<Self> {
         let api_key = api_key
@@ -567,6 +569,11 @@ impl AssemblyAiProvider {
         Ok(Self {
             alias: alias.to_owned(),
             api_key,
+            base_url: endpoint
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| "https://api.assemblyai.com/v2".to_owned())
+                .trim_end_matches('/')
+                .to_owned(),
             request_timeout_secs,
         })
     }
@@ -587,6 +594,7 @@ impl AssemblyAiProvider {
         Ok(Self {
             alias: alias.to_string(),
             api_key,
+            base_url: "https://api.assemblyai.com/v2".to_owned(),
             request_timeout_secs: None,
         })
     }
@@ -612,6 +620,7 @@ impl AssemblyAiProvider {
         Ok(Self {
             alias: alias.to_string(),
             api_key,
+            base_url: "https://api.assemblyai.com/v2".to_owned(),
             request_timeout_secs: None,
         })
     }
@@ -632,7 +641,7 @@ impl AsrProvider for AssemblyAiProvider {
         // Step 1: Upload the audio file.
         let upload_resp = apply_transcription_timeout(
             client
-                .post("https://api.assemblyai.com/v2/upload")
+                .post(format!("{}/upload", self.base_url))
                 .header("Authorization", &self.api_key)
                 .header("Content-Type", "application/octet-stream")
                 .body(audio_data.to_vec()),
@@ -664,7 +673,7 @@ impl AsrProvider for AssemblyAiProvider {
 
         let create_resp = apply_transcription_timeout(
             client
-                .post("https://api.assemblyai.com/v2/transcript")
+                .post(format!("{}/transcript", self.base_url))
                 .header("Authorization", &self.api_key)
                 .json(&transcript_req),
             &self.request_timeout_secs,
@@ -693,7 +702,7 @@ impl AsrProvider for AssemblyAiProvider {
             .context("AssemblyAI response missing 'id'")?;
 
         // Step 3: Poll for completion.
-        let poll_url = format!("https://api.assemblyai.com/v2/transcript/{transcript_id}");
+        let poll_url = format!("{}/transcript/{transcript_id}", self.base_url);
         let poll_interval = std::time::Duration::from_secs(3);
         let poll_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(180);
 
@@ -1167,6 +1176,7 @@ fn build_canonical_transcription_provider(
         ProviderConnection::AssemblyAi(_) => AssemblyAiProvider::from_canonical(
             model_ref,
             api_key,
+            resolved.endpoint.clone(),
             resolved.request_timeout_secs.clone(),
         )
         .map(|provider| Box::new(provider) as Box<dyn AsrProvider>),

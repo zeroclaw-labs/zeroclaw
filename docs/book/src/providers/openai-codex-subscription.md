@@ -55,8 +55,8 @@ provider = "openai.codex"
 model = "codex-auto-review"
 ```
 
-There is no `api_key` field; `requires_openai_auth = true` is the switch that
-reads the stored Codex login rather than a key on the entry. See
+There is no `api_key` field; `auth.mode = "codex"` is the setting that reads
+the stored Codex login rather than a key on the entry. See
 [Configuration → OAuth and subscription auth](./configuration.md#oauth-and-subscription-auth).
 
 ### Astra on the Codex subscription backend
@@ -73,8 +73,8 @@ provider = "openai.codex"
 model = "<exact-astra-id-from-codex-catalog>"
 ```
 
-Keep `api_key` and `temperature` unset. `requires_openai_auth = true` selects
-the stored Codex login; it is not an alternative spelling for API-key auth.
+Keep `api_key` and `temperature` unset. `auth.mode = "codex"` selects the
+stored Codex login; it is not an alternative spelling for API-key auth.
 Use a reasoning level shared by the current ZeroClaw validator and the selected
 backend, such as `low`, `medium`, `high`, or `xhigh`, and verify it with a real
 request. Follow the [Astra configuration checklist](./configuration.md#openai-astra-setup)

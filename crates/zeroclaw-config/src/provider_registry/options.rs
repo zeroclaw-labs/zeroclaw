@@ -287,7 +287,7 @@ options = { extract_text_tool_calls = true }
                     .unwrap()
                     .text_extraction(),
                 TextExtraction {
-                    reasoning: Some(false),
+                    reasoning: None,
                     tool_calls
                 },
                 "{name}"

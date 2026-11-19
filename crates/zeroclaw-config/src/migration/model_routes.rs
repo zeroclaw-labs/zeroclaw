@@ -301,7 +301,11 @@ pub(super) fn legacy_model(
         && raw
             .get("oauth_refresh_token")
             .and_then(Value::as_str)
-            .is_some_and(|token| !token.trim().is_empty()))
+            .is_some_and(|token| !token.trim().is_empty())
+        && raw
+            .get("api_key")
+            .and_then(Value::as_str)
+            .is_none_or(|key| key.trim().is_empty()))
         // Legacy Gemini selected managed/CLI OAuth when no explicit API key
         // was configured, even without auth_mode. Preserve its client
         // credentials when projecting or saving the canonical connection.
@@ -316,10 +320,16 @@ pub(super) fn legacy_model(
                     .and_then(Value::as_str)
                     .is_some_and(|value| !value.trim().is_empty())
             }))
-        || (matches!(kind, "qwen" | "minimax" | "gemini") && raw
-            .get("auth_mode")
-            .and_then(Value::as_str)
-            .is_some_and(|mode| matches!(mode, "o_auth" | "oauth")))
+        || (matches!(kind, "qwen" | "minimax" | "gemini")
+            && raw
+                .get("auth_mode")
+                .and_then(Value::as_str)
+                .is_some_and(|mode| matches!(mode, "o_auth" | "oauth"))
+            && (kind != "qwen"
+                || raw
+                    .get("api_key")
+                    .and_then(Value::as_str)
+                    .is_none_or(|key| key.trim().is_empty())))
     {
         let mut auth = json!({"mode":"oauth"});
         for &(old, new) in LEGACY_OAUTH_FIELDS {
@@ -543,6 +553,23 @@ mod tests {
                 .is_none()
         );
         serde_json::from_value::<ProviderConnection>(connection).unwrap();
+    }
+
+    #[test]
+    fn qwen_explicit_api_key_wins_over_oauth_mode_without_refresh_token() {
+        let (connection, _) = legacy_model(
+            &json!({
+                "model": "qwen-plus",
+                "auth_mode": "o_auth",
+                "api_key": "explicit-key"
+            }),
+            "qwen",
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(connection["auth"]["mode"], "api_key");
+        assert_eq!(connection["auth"]["api_key"], "explicit-key");
     }
 
     #[test]
