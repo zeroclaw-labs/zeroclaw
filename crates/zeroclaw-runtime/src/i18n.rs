@@ -2025,6 +2025,22 @@ mod tests {
 
         type ParityCase<'a> = (&'a str, &'a [(&'a str, &'a str)], &'a [&'a str]);
         let cases: &[ParityCase] = &[
+            ("cli-plugin-command-unavailable", &[], &[]),
+            (
+                "cli-plugin-displaced-command-unavailable",
+                &[("name", NAME)],
+                &[NAME],
+            ),
+            (
+                "cli-plugin-not-installed-command-unavailable",
+                &[("name", NAME)],
+                &[NAME],
+            ),
+            (
+                "cli-plugin-interrupted-command-unavailable",
+                &[("name", NAME), ("error", ERROR), ("preserved", DISPLACED)],
+                &[NAME, ERROR, DISPLACED],
+            ),
             (
                 "cli-plugin-install-already-installed",
                 &[("name", NAME), ("command", COMMAND)],

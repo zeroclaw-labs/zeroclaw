@@ -3649,7 +3649,10 @@ fn with_update_pointer(
     let zeroclaw::plugins::error::PluginError::AlreadyLoaded(name) = &error else {
         return error.into();
     };
-    let command = crate::plugins::update::update_command(config_dir, name, source, &[]);
+    let Some(command) = crate::plugins::update::update_command(config_dir, name, source, &[])
+    else {
+        return anyhow::Error::from(error).context(plugin_command_unavailable());
+    };
     let pointer = ta(
         "cli-plugin-install-already-installed",
         &[("name", name.as_str()), ("command", command.as_str())],
@@ -6388,11 +6391,11 @@ enum PluginUpdateOutcome {
     NeedsApproval {
         version: String,
         items: Vec<String>,
-        command: String,
+        command: Option<String>,
     },
     /// No package of that name is installed. `install` is the command that
     /// installs it from the source the update named.
-    NotInstalled { install: String },
+    NotInstalled { install: Option<String> },
     /// The installed package was not replaced. `kept` is its version, when
     /// one is installed. Config rows created for the replacement, and a
     /// displaced copy recovery put back, stay as they are.
@@ -6410,7 +6413,7 @@ enum PluginUpdateOutcome {
     Interrupted {
         error: String,
         preserved: std::path::PathBuf,
-        command: String,
+        command: Option<String>,
     },
 }
 
@@ -6732,6 +6735,14 @@ fn recover_before_update(
     }
 }
 
+#[cfg(feature = "plugins-wasm")]
+fn plugin_command_unavailable() -> String {
+    t(
+        "cli-plugin-command-unavailable",
+        "No copy-ready command is available. Supply the original arguments separately for the intended source.",
+    )
+}
+
 /// The note `plugin list` and `plugin update --all` print for a package an
 /// interrupted update left displaced, with both commands from
 /// [`plugin_displaced_commands`].
@@ -6744,6 +6755,13 @@ fn plugin_displaced_note(
     let (command, local) =
         plugin_displaced_commands(egress_command_config_dir(config), name, registry);
     let name = crate::plugins::update::printable(name);
+    let (Some(command), Some(local)) = (command, local) else {
+        return ta(
+            "cli-plugin-displaced-command-unavailable",
+            &[("name", &name)],
+            "Displaced package; no copy-ready recovery command.",
+        );
+    };
     ta(
         "cli-plugin-list-displaced",
         &[("name", &name), ("command", &command), ("local", &local)],
@@ -6764,7 +6782,7 @@ fn plugin_displaced_commands(
     config_dir: &std::path::Path,
     name: &str,
     registry: Option<&str>,
-) -> (String, String) {
+) -> (Option<String>, Option<String>) {
     use crate::plugins::update::{UpdateSource, update_command};
 
     (
@@ -7229,6 +7247,10 @@ fn plugin_update_outcome_text(name: &str, outcome: &PluginUpdateOutcome) -> Vec<
                     )
                 ));
             }
+            let Some(command) = command else {
+                lines.push(plugin_command_unavailable());
+                return lines;
+            };
             lines.push(ta(
                 "cli-plugin-update-approval-command",
                 &[("command", command)],
@@ -7236,7 +7258,14 @@ fn plugin_update_outcome_text(name: &str, outcome: &PluginUpdateOutcome) -> Vec<
             ));
             lines
         }
-        PluginUpdateOutcome::NotInstalled { install } => vec![ta(
+        PluginUpdateOutcome::NotInstalled { install: None } => vec![ta(
+            "cli-plugin-not-installed-command-unavailable",
+            &[("name", name)],
+            "Package not installed; no copy-ready install command.",
+        )],
+        PluginUpdateOutcome::NotInstalled {
+            install: Some(install),
+        } => vec![ta(
             "cli-plugin-update-not-installed",
             &[("name", name), ("command", install)],
             format!("Could not update '{name}': it is not installed. Install it with: {install}"),
@@ -7271,6 +7300,13 @@ fn plugin_update_outcome_text(name: &str, outcome: &PluginUpdateOutcome) -> Vec<
             command,
         } => {
             let preserved = preserved.display().to_string();
+            let Some(command) = command else {
+                return vec![ta(
+                    "cli-plugin-interrupted-command-unavailable",
+                    &[("name", name), ("error", error), ("preserved", &preserved)],
+                    "Interrupted update; no copy-ready recovery command.",
+                )];
+            };
             vec![ta(
                 "cli-plugin-update-interrupted",
                 &[
@@ -27591,6 +27627,7 @@ hosts = ["api.example.com", "api2.example.com"]
             },
             &increase,
         );
+        let command = command.unwrap();
         // The shell only tokenizes these synthetic literals into positional
         // arguments; it never runs the rendered zeroclaw command.
         let out = std::process::Command::new("/bin/sh")
@@ -27679,7 +27716,7 @@ hosts = ["api.example.com", "api2.example.com"]
                     url: "http://127.0.0.1:9/never-downloaded.zip".to_string(),
                     sha256: None,
                 }],
-                registry_url: None,
+                registry_url: Some(plugin_registry::DEFAULT_REGISTRY_URL.into()),
             },
         )
     }
@@ -27738,6 +27775,7 @@ hosts = ["api.example.com", "api2.example.com"]
             panic!("expected NeedsApproval, got {outcome:?}");
         };
         assert_eq!(version, "2.0.0");
+        let command = command.unwrap();
         assert_eq!(items, ["permission:http_client"]);
         for part in [
             "plugin update",
@@ -28281,7 +28319,7 @@ type = "integer"
             &PluginUpdateOutcome::NeedsApproval {
                 version: "2.0.0\u{1b}[2K".to_string(),
                 items: vec!["provides:tele\u{1b}[8mgram".to_string()],
-                command: "zeroclaw plugin update 'weather@2.0.0\u{1b}[2K'".to_string(),
+                command: Some("zeroclaw plugin update 'weather@2.0.0\u{1b}[2K'".to_string()),
             },
         );
         assert!(
@@ -28306,7 +28344,7 @@ type = "integer"
                     "permission:http_client".to_string(),
                     "capability:channel".to_string(),
                 ],
-                command: command.to_string(),
+                command: Some(command.to_string()),
             },
         );
         assert_eq!(lines.len(), 4, "{lines:#?}");
@@ -28364,6 +28402,7 @@ type = "integer"
         let registry = "https://registry.example/i.json";
         let (command, local) =
             plugin_displaced_commands(config_dir.path(), "weather", Some(registry));
+        let (command, local) = (command.unwrap(), local.unwrap());
 
         assert!(
             command.contains("--registry") && !command.contains("--from"),
@@ -28472,6 +28511,7 @@ type = "integer"
             },
         );
 
+        let command = command.unwrap();
         assert_eq!(lines.len(), 1, "{lines:#?}");
         assert!(
             lines[0].contains(

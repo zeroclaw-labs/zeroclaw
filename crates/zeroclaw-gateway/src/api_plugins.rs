@@ -153,6 +153,9 @@ pub async fn list_plugins(State(state): State<AppState>, headers: HeaderMap) -> 
                 signature_mode,
                 trusted_publisher_keys,
                 data_dir,
+                std::env::var(zeroclaw_plugins::registry::REGISTRY_URL_ENV)
+                    .ok()
+                    .as_deref(),
             )
         })
         .await
@@ -194,6 +197,7 @@ fn build_response(
     signature_mode: String,
     trusted_publisher_keys: Vec<String>,
     data_dir: std::path::PathBuf,
+    selection: Option<&str>,
 ) -> OriginPluginsResponse {
     use zeroclaw_plugins::catalog::origin_package_catalog as package_catalog;
 
@@ -247,7 +251,8 @@ fn build_response(
     };
 
     let registry = match zeroclaw_plugins::registry::read_cached_registry_collection(&data_dir) {
-        Ok(index) => index.filter(zeroclaw_plugins::registry::cache_matches_environment),
+        Ok(index) => index
+            .filter(|index| zeroclaw_plugins::registry::cache_matches_selection(index, selection)),
         Err(error) => {
             ::zeroclaw_log::record!(
                 ERROR,
@@ -347,6 +352,7 @@ mod tests {
                 "disabled".to_string(),
                 Vec::new(),
                 temp.path().join("missing-data-directory"),
+                None,
             )
         };
 
@@ -403,6 +409,7 @@ mod tests {
             "disabled".to_string(),
             Vec::new(),
             temp.path().to_path_buf(),
+            Some("https://example.invalid/index.json"),
         );
 
         assert_eq!(response.plugins.len(), 1);
@@ -447,6 +454,7 @@ mod tests {
             "disabled".to_string(),
             Vec::new(),
             temp.path().to_path_buf(),
+            None,
         );
 
         assert!(response.plugins.is_empty());
@@ -503,14 +511,20 @@ mod tests {
         };
         write_cached_registry_index(temp.path(), registry_url, &index).expect("registry cache");
 
-        let response = build_response(
-            true,
-            "plugins".to_string(),
-            temp.path().join("missing-plugins"),
-            "disabled".to_string(),
-            Vec::new(),
-            temp.path().to_path_buf(),
-        );
+        let response_for = |selection| {
+            build_response(
+                true,
+                "plugins".to_string(),
+                temp.path().join("missing-plugins"),
+                "disabled".to_string(),
+                Vec::new(),
+                temp.path().to_path_buf(),
+                selection,
+            )
+        };
+        assert!(response_for(None).plugins.is_empty());
+        assert!(response_for(Some(" ")).plugins.is_empty());
+        let response = response_for(Some(registry_url));
         let json = serde_json::to_string(&response).expect("catalog response JSON");
 
         assert!(json.contains("mail@1.2.3"));

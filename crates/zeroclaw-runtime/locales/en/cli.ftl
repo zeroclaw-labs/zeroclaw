@@ -1732,5 +1732,9 @@ turn-repeated-failure-recovery = The same tool call failed with the same result 
 turn-repeated-failure-exhausted = The recovery retry failed with the same result, so this turn has stopped. Completed tool results have been preserved. You can retry in a new turn.
 turn-repeated-failure-retry-skipped = Skipped an additional identical call in this recovery batch. Only one recovery retry is available.
 
-cli-plugin-registry-command-unavailable = A copy-ready install command is unavailable because these values cannot be passed literally in both cmd.exe and PowerShell. The registry entry remains available; use structured installation or quote arguments yourself for a known shell.
-cli-quickstart-plugins-load-check-command-unavailable = {$name} was not installed: it does not load against this host: {$error}. A copy-ready retry command is unavailable because these values cannot be passed literally in both cmd.exe and PowerShell. No install command was generated.
+cli-plugin-registry-command-unavailable = A copy-ready install command is unavailable. Use the original registry URL separately; the registry ID is not a URL.
+cli-quickstart-plugins-load-check-command-unavailable = {$name} was not installed: it does not load against this host: {$error}. No copy-ready retry command is available.
+cli-plugin-command-unavailable = No copy-ready command is available. Supply the original arguments separately for the intended source.
+cli-plugin-displaced-command-unavailable = An interrupted update left '{$name}' displaced. No copy-ready recovery command is available.
+cli-plugin-not-installed-command-unavailable = '{$name}' is not installed. No copy-ready install command is available.
+cli-plugin-interrupted-command-unavailable = Could not update '{$name}': {$error}. The previous version is preserved at {$preserved}. No copy-ready recovery command is available.

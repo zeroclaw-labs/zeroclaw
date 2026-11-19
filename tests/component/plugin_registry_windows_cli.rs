@@ -15,7 +15,7 @@ fn windows_plugin_list_reports_unavailable_recipe_without_hiding_metadata() {
         "schema_version = 3\nlocale = \"en\"\n",
     )
     .unwrap();
-    let origin = "https://registry.invalid/index?team=100%20one&channel=stable";
+    let origin = "https://registry.invalid/index/100%20team";
     let index = PluginRegistryIndex {
         registry_url: Some(origin.into()),
         plugins: vec![PluginRegistryEntry {
@@ -31,7 +31,7 @@ fn windows_plugin_list_reports_unavailable_recipe_without_hiding_metadata() {
     write_cached_registry_index(&data, origin, &index).unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_zeroclaw"))
         .env("ZEROCLAW_CONFIG_DIR", dir.path())
-        .env_remove("ZEROCLAW_PLUGIN_REGISTRY_URL")
+        .env("ZEROCLAW_PLUGIN_REGISTRY_URL", origin)
         .env("LANG", "en")
         .env("LC_ALL", "C")
         .args(["plugin", "list"])

@@ -577,10 +577,11 @@ doubled (`''`). This legacy marker is advisory, not an execution guard: PowerShe
 it as a comment, but cmd.exe does not, and separators later in the line may
 execute. Do not paste a marked PowerShell line into cmd.exe; use only the
 command after the marker in a known PowerShell session. Copy-ready registry
-install commands do not use this fallback: when any argument is outside the
+install and update commands do not use this fallback: when any argument is outside the
 shared Windows literal subset (including control characters), the install
 recipe is unavailable. The registry entry and structured installation remain
-available. Ordinary spaces and URL query ampersands are still supported.
+available. Origins with userinfo, queries, or fragments are not included in
+copy-ready commands on any platform.
 
 `zeroclaw plugin list` repeats the same comparison as a standing diagnostic,
 one instance at a time, for every installed plugin holding `http_client`,

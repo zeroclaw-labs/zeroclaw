@@ -8,8 +8,9 @@ use tempfile::TempDir;
 use zeroclaw::plugins::PluginManifest;
 pub(crate) use zeroclaw::plugins::registry::search_registry_entries as search_entries;
 use zeroclaw::plugins::registry::{
-    PluginRegistryEntry, PluginRegistryIndex, RegistryCollection, parse_plugin_spec,
-    resolve_registry_entry, write_cached_registry_collection,
+    PluginRegistryEntry, PluginRegistryIndex, RegistryCollection, effective_registry_selection,
+    parse_plugin_spec, registry_origin_label, registry_url_is_private, resolve_registry_entry,
+    write_cached_registry_collection,
 };
 
 pub(crate) use zeroclaw::plugins::registry::DEFAULT_REGISTRY_URL;
@@ -55,18 +56,25 @@ pub(crate) fn registry_url(override_url: Option<&str>) -> Result<String> {
 }
 
 fn select_registry_url(override_url: Option<&str>, environment: Option<&str>) -> Result<String> {
-    let value = override_url
-        .filter(|url| !url.trim().is_empty())
-        .map(ToOwned::to_owned)
-        .or_else(|| environment.map(ToOwned::to_owned))
-        .filter(|url| !url.trim().is_empty())
-        .unwrap_or_else(|| DEFAULT_REGISTRY_URL.to_string());
+    let value = effective_registry_selection(
+        override_url
+            .filter(|url| !url.trim().is_empty())
+            .or(environment),
+    );
     // Explicit overrides must be exactly one URL, regardless of the environment.
     if override_url.is_some_and(|s| !s.trim().is_empty()) && value.trim_start().starts_with('[') {
         bail!("--registry expects one HTTP(S) URL");
     }
-    validate_registry_sources(&value)?;
-    Ok(value)
+    validate_registry_sources(value)?;
+    Ok(value.to_owned())
+}
+
+fn display_url(url: &str) -> std::borrow::Cow<'_, str> {
+    if registry_url_is_private(url) {
+        registry_origin_label(url).into()
+    } else {
+        url.into()
+    }
 }
 
 fn validate_registry_sources(value: &str) -> Result<Vec<String>> {
@@ -74,9 +82,12 @@ fn validate_registry_sources(value: &str) -> Result<Vec<String>> {
     // Validate every URL before the first network request.
     for source in &sources {
         let url = reqwest::Url::parse(source)
-            .with_context(|| format!("invalid plugin registry URL {source}"))?;
+            .with_context(|| format!("invalid plugin registry URL {}", display_url(source)))?;
         if url.host_str().is_none() || !matches!(url.scheme(), "http" | "https") {
-            bail!("plugin registry must be an HTTP(S) URL: {source}");
+            bail!(
+                "plugin registry must be an HTTP(S) URL: {}",
+                display_url(source)
+            );
         }
     }
     Ok(sources)
@@ -210,7 +221,7 @@ impl RegistryClient {
         // Publish/cache nothing until the complete configured set succeeds.
         for source in sources {
             let index = self.fetch_single_index(&source).await.map_err(|error| {
-                let message = format!("fetching plugin registry {source}: {error}");
+                let message = format!("fetching plugin registry {}: {error}", display_url(&source));
                 error.context(message)
             })?;
             combined.registries.push(index);
@@ -225,13 +236,17 @@ impl RegistryClient {
             .timeout(self.timeouts.index)
             .send()
             .await
-            .with_context(|| format!("fetching plugin registry {registry_url}"))?;
+            .map_err(reqwest::Error::without_url)
+            .context("requesting plugin registry")?;
         let status = response.status();
         if !status.is_success() {
             if status == reqwest::StatusCode::NOT_FOUND && registry_url == DEFAULT_REGISTRY_URL {
                 return Err(DefaultRegistryUnpopulated.into());
             }
-            bail!("plugin registry returned HTTP {status} for {registry_url}");
+            bail!(
+                "plugin registry returned HTTP {status} for {}",
+                display_url(registry_url)
+            );
         }
         const MAX_INDEX_BYTES: usize = 4 * 1024 * 1024;
         if response
@@ -244,6 +259,7 @@ impl RegistryClient {
         while let Some(chunk) = response
             .chunk()
             .await
+            .map_err(reqwest::Error::without_url)
             .context("reading plugin registry index")?
         {
             if bytes.len().saturating_add(chunk.len()) > MAX_INDEX_BYTES {
@@ -286,10 +302,14 @@ impl RegistryClient {
             .timeout(self.timeouts.archive)
             .send()
             .await
-            .with_context(|| format!("downloading plugin archive {url}"))?;
+            .map_err(reqwest::Error::without_url)
+            .with_context(|| format!("downloading plugin archive {}", display_url(url)))?;
         let status = response.status();
         if !status.is_success() {
-            bail!("plugin archive returned HTTP {status} for {url}");
+            bail!(
+                "plugin archive returned HTTP {status} for {}",
+                display_url(url)
+            );
         }
         if let Some(len) = response.content_length()
             && len > MAX_PLUGIN_ZIP_BYTES as u64
@@ -301,6 +321,7 @@ impl RegistryClient {
         while let Some(chunk) = response
             .chunk()
             .await
+            .map_err(reqwest::Error::without_url)
             .context("reading plugin archive response body")?
         {
             append_chunk_capped(&mut bytes, &chunk, MAX_PLUGIN_ZIP_BYTES)?;
@@ -955,6 +976,23 @@ capabilities = ["tool"]
             !err.contains("not populated"),
             "only the default registry gets the unpopulated hint: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn private_registry_error_reports_status_and_label_not_url() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/index"))
+            .respond_with(ResponseTemplate::new(403))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let url = format!("{}/index?sample=private-fixture", server.uri());
+        let error = fetch_registry_index(&url).await.unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("403") && message.contains(&registry_origin_label(&url)));
+        assert!(!message.contains("private-fixture"));
+        server.verify().await;
     }
 
     #[tokio::test]

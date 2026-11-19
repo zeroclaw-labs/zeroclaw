@@ -11,10 +11,13 @@ use zeroclaw_plugins::registry::{
     ShellDialect, read_cached_registry_collection, registry_install_command_for,
 };
 
+/// A skill source / plugin command, or the safe origin label when no command can be shown.
+type SuggestionSource = Result<String, String>;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct InstallableSkillCapability {
     name: String,
-    source: Option<String>,
+    source: SuggestionSource,
     aliases: Vec<String>,
     install_kind: InstallKind,
 }
@@ -29,15 +32,21 @@ enum InstallKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct InstallSuggestion {
     name: String,
-    source: Option<String>,
+    source: SuggestionSource,
     matched: String,
     install_kind: InstallKind,
 }
 
 impl InstallSuggestion {
     pub fn render_user_message(&self) -> String {
-        let Some(source) = self.source.as_deref() else {
-            return crate::i18n::get_required_cli_string("cli-plugin-registry-command-unavailable");
+        let source = match self.source.as_deref() {
+            Ok(source) => source,
+            Err(label) => {
+                return format!(
+                    "{label}: {}",
+                    crate::i18n::get_required_cli_string("cli-plugin-registry-command-unavailable")
+                );
+            }
         };
         let (message_key, install_command) = match self.install_kind {
             InstallKind::Skill => (
@@ -242,7 +251,7 @@ fn load_toml_skill_package_metadata(
 
     Some(InstallableSkillCapability {
         name: manifest.skill.name,
-        source: Some(source.to_string()),
+        source: Ok(source.to_string()),
         aliases: manifest.skill.aliases,
         install_kind: InstallKind::Skill,
     })
@@ -257,7 +266,7 @@ fn load_markdown_skill_package_metadata(
     let meta = super::parse_simple_frontmatter(&frontmatter);
     Some(InstallableSkillCapability {
         name: meta.name.unwrap_or_else(|| fallback_name.to_string()),
-        source: Some(source.to_string()),
+        source: Ok(source.to_string()),
         aliases: Vec::new(),
         install_kind: InstallKind::Skill,
     })
@@ -267,24 +276,14 @@ fn load_markdown_skill_package_metadata(
 fn load_cached_installable_plugin_capabilities(
     workspace_dir: &Path,
 ) -> Vec<InstallableSkillCapability> {
-    let selected = std::env::var(zeroclaw_plugins::registry::REGISTRY_URL_ENV)
-        .ok()
-        .filter(|s| !s.trim().is_empty());
-    let sources = match selected
-        .as_deref()
-        .map(zeroclaw_plugins::registry::registry_sources)
-        .transpose()
-    {
-        Ok(sources) => sources,
-        Err(_) => return Vec::new(),
-    };
-    load_cached_installable_plugin_capabilities_for_sources(workspace_dir, sources.as_deref())
+    let selection = std::env::var(zeroclaw_plugins::registry::REGISTRY_URL_ENV).ok();
+    load_cached_installable_plugin_capabilities_for_selection(workspace_dir, selection.as_deref())
 }
 
 #[cfg(feature = "plugins-wasm")]
-fn load_cached_installable_plugin_capabilities_for_sources(
+fn load_cached_installable_plugin_capabilities_for_selection(
     workspace_dir: &Path,
-    sources: Option<&[String]>,
+    selection: Option<&str>,
 ) -> Vec<InstallableSkillCapability> {
     let index = match read_cached_registry_collection(workspace_dir) {
         Ok(Some(index)) => index,
@@ -300,9 +299,7 @@ fn load_cached_installable_plugin_capabilities_for_sources(
             return Vec::new();
         }
     };
-    if sources
-        .is_some_and(|sources| !zeroclaw_plugins::registry::cache_matches_sources(&index, sources))
-    {
+    if !zeroclaw_plugins::registry::cache_matches_selection(&index, selection) {
         return Vec::new();
     }
 
@@ -319,7 +316,8 @@ fn load_cached_installable_plugin_capabilities_for_sources(
                     Some(entry.origin),
                     None,
                     false,
-                ),
+                )
+                .ok_or_else(|| zeroclaw_plugins::registry::registry_origin_label(entry.origin)),
                 aliases: vec![description],
                 install_kind: InstallKind::Plugin,
             }
@@ -456,7 +454,7 @@ mod tests {
     fn catalog_entry(name: &str, aliases: &[&str]) -> InstallableSkillCapability {
         InstallableSkillCapability {
             name: name.to_string(),
-            source: Some(name.to_string()),
+            source: Ok(name.to_string()),
             aliases: aliases.iter().map(|alias| alias.to_string()).collect(),
             install_kind: InstallKind::Skill,
         }
@@ -481,53 +479,40 @@ mod tests {
 
     #[cfg(feature = "plugins-wasm")]
     #[test]
-    fn union_cache_suggestions_keep_each_publishers_explicit_install_command() {
+    fn union_cache_suggestions_pin_public_origins_and_withhold_private_commands() {
         let dir = tempfile::tempdir().unwrap();
         let catalog_data: zeroclaw_plugins::registry::RegistryCollection = serde_json::from_value(serde_json::json!({
             "registries": [
                 {"registry_url":"https://a.invalid/index", "plugins":[{"name":"calendar","version":"1","description":"personal calendar","url":"https://a.invalid/p.zip"}]},
-                {"registry_url":"https://b.invalid/index", "plugins":[{"name":"calendar","version":"2","description":"team scheduling","url":"https://b.invalid/p.zip"}]}
+                {"registry_url":"https://b.invalid/index?token=sample", "plugins":[{"name":"calendar","version":"2","description":"team scheduling","url":"https://b.invalid/p.zip"}]}
             ]
         })).unwrap();
         zeroclaw_plugins::registry::write_cached_registry_collection(dir.path(), &catalog_data)
             .unwrap();
-        let catalog = load_cached_installable_plugin_capabilities(dir.path());
-        assert_eq!(catalog.len(), 2);
-        assert!(
-            load_cached_installable_plugin_capabilities_for_sources(
-                dir.path(),
-                Some(&["https://a.invalid/index".to_string()])
-            )
-            .is_empty()
-        );
-        assert!(
-            load_cached_installable_plugin_capabilities_for_sources(
-                dir.path(),
-                Some(&["https://unrelated.invalid/index".to_string()])
-            )
-            .is_empty()
-        );
-        assert_eq!(
-            load_cached_installable_plugin_capabilities_for_sources(
-                dir.path(),
-                Some(&catalog_data.sources())
-            )
-            .len(),
-            2
-        );
-        for (prompt, expected) in [
-            (
-                "use personal calendar",
-                "calendar@1 --registry https://a.invalid/index",
-            ),
-            (
-                "use team scheduling",
-                "calendar@2 --registry https://b.invalid/index",
-            ),
-        ] {
-            let suggestion = suggest_missing_skill_install(prompt, &[], &[], &catalog).unwrap();
-            assert!(suggestion.render_user_message().contains(expected));
+        for selection in [None, Some("  "), Some("https://a.invalid/index")] {
+            assert!(
+                load_cached_installable_plugin_capabilities_for_selection(dir.path(), selection)
+                    .is_empty()
+            );
         }
+        let selected = serde_json::to_string(&catalog_data.sources()).unwrap();
+        let catalog =
+            load_cached_installable_plugin_capabilities_for_selection(dir.path(), Some(&selected));
+        assert_eq!(catalog.len(), 2);
+        let public = suggest_missing_skill_install("use personal calendar", &[], &[], &catalog)
+            .unwrap()
+            .render_user_message();
+        assert!(public.contains("calendar@1 --registry https://a.invalid/index"));
+        let private = suggest_missing_skill_install("use team scheduling", &[], &[], &catalog)
+            .unwrap()
+            .render_user_message();
+        assert!(
+            private.contains(&zeroclaw_plugins::registry::registry_origin_label(
+                "https://b.invalid/index?token=sample"
+            ))
+        );
+        assert!(!private.contains("sample"));
+        assert!(!private.contains("--registry"));
     }
 
     #[cfg(all(windows, feature = "plugins-wasm"))]
@@ -543,17 +528,19 @@ mod tests {
             }))
             .unwrap();
         zeroclaw_plugins::registry::write_cached_registry_collection(dir.path(), &data).unwrap();
-        let catalog = load_cached_installable_plugin_capabilities_for_sources(dir.path(), None);
+        let catalog = load_cached_installable_plugin_capabilities_for_selection(
+            dir.path(),
+            data.registries[0].registry_url.as_deref(),
+        );
         assert_eq!(catalog.len(), 1);
         assert_eq!(catalog[0].name, "calendar");
-        assert_eq!(catalog[0].source, None);
+        assert!(catalog[0].source.is_err());
         let suggestion =
             suggest_missing_skill_install("use personal calendar", &[], &[], &catalog).unwrap();
         let message = suggestion.render_user_message();
-        assert_eq!(
-            message,
-            crate::i18n::get_required_cli_string("cli-plugin-registry-command-unavailable")
-        );
+        assert!(message.contains(&crate::i18n::get_required_cli_string(
+            "cli-plugin-registry-command-unavailable"
+        )));
         assert!(!message.contains("ZC_REGISTRY_MARKER"));
         assert!(!message.contains("zeroclaw plugin install"));
     }
@@ -651,7 +638,7 @@ mod tests {
         .expect("missing high-confidence skill should suggest installation");
 
         assert_eq!(suggestion.name, "calendar");
-        assert_eq!(suggestion.source.as_deref(), Some("calendar"));
+        assert_eq!(suggestion.source.as_deref().ok(), Some("calendar"));
         assert_eq!(suggestion.matched, "google calendar");
         assert!(
             suggestion
@@ -713,7 +700,7 @@ tags = ["scheduling"]
 
         assert_eq!(catalog.len(), 1);
         assert_eq!(catalog[0].name, "calendar");
-        assert_eq!(catalog[0].source.as_deref(), Some("calendar"));
+        assert_eq!(catalog[0].source.as_deref().ok(), Some("calendar"));
 
         let body_only_match = suggest_missing_skill_install(
             "please use body only secret phrase for this",
@@ -763,7 +750,7 @@ aliases = ["release check"]
         );
 
         assert_eq!(catalog.len(), 1);
-        assert_eq!(catalog[0].source.as_deref(), Some("release-check"));
+        assert_eq!(catalog[0].source.as_deref().ok(), Some("release-check"));
         assert!(suggestion.is_some());
     }
 
@@ -830,11 +817,11 @@ aliases = ["team calendar"]
         assert_eq!(catalog.len(), 1);
         assert_eq!(catalog[0].name, "team-calendar");
         assert_eq!(
-            catalog[0].source.as_deref(),
+            catalog[0].source.as_deref().ok(),
             Some("registry:acme/team-calendar")
         );
         assert_eq!(
-            suggestion.source.as_deref(),
+            suggestion.source.as_deref().ok(),
             Some("registry:acme/team-calendar")
         );
         assert!(
@@ -854,7 +841,7 @@ aliases = ["team calendar"]
             registry_dir.join("registry.json"),
             r#"
 {
-  "registry_url": "https://example.invalid/registry.json",
+  "registry_url": "https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw-plugins/main/registry.json",
   "plugins": [
     {
       "name": "team-calendar",
@@ -882,7 +869,7 @@ aliases = ["team calendar"]
         assert!(suggestion.contains("team-calendar"));
         assert!(suggestion.contains("team calendar"));
         assert!(suggestion.contains(
-            "zeroclaw plugin install team-calendar@0.2.0 --registry https://example.invalid/registry.json"
+            "zeroclaw plugin install team-calendar@0.2.0 --registry https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw-plugins/main/registry.json"
         ));
     }
 
@@ -908,6 +895,7 @@ aliases = ["team calendar"]
             registry_dir.join("registry.json"),
             r#"
 {
+  "registry_url": "https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw-plugins/main/registry.json",
   "plugins": [
     {
       "name": "team-calendar-plugin",
@@ -946,6 +934,7 @@ aliases = ["team calendar"]
             registry_dir.join("registry.json"),
             r#"
 {
+  "registry_url": "https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw-plugins/main/registry.json",
   "plugins": [
     {
       "name": "team-calendar",

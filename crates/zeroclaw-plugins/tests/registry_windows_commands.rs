@@ -103,9 +103,9 @@ fn registry_windows_native_shells_preserve_safe_arguments() {
                 let fixture = Fixture::new();
                 let unicode = version == "1café日历";
                 let origin = if unicode {
-                    "https://registry.invalid/index?channel=stable&team=café日历"
+                    "https://registry.invalid/index/channel=stable&team=café日历"
                 } else {
-                    "https://registry.invalid/index?channel=stable&team=one"
+                    "https://registry.invalid/index/channel=stable&team=one"
                 };
                 let config_text = if unicode {
                     "C:/profiles/team café日历"
@@ -197,7 +197,7 @@ fn registry_windows_native_shells_have_no_recipe_for_unsafe_values() {
             let fixture = Fixture::new();
             let mut plugin = entry("1");
             plugin.name = "calendar\\".into();
-            let origin = "https://registry.invalid/index?team=one&channel=stable";
+            let origin = "https://registry.invalid/index/team=one&channel=stable";
             let config = "C:/profiles/team one";
             let line = registry_install_command_for(
                 ShellDialect::Windows,
@@ -209,7 +209,7 @@ fn registry_windows_native_shells_have_no_recipe_for_unsafe_values() {
             .unwrap();
             assert_eq!(
                 line,
-                r#"zeroclaw --config-dir "C:/profiles/team one" plugin install "calendar\@1" --registry "https://registry.invalid/index?team=one&channel=stable" --no-verify"#
+                r#"zeroclaw --config-dir "C:/profiles/team one" plugin install "calendar\@1" --registry "https://registry.invalid/index/team=one&channel=stable" --no-verify"#
             );
             let output = fixture.run(shell, &line, delayed);
             assert!(output.status.success(), "{shell}: {output:?}");
@@ -235,7 +235,7 @@ fn registry_windows_native_shells_have_no_recipe_for_unsafe_values() {
 fn registry_explicit_powershell_preserves_shell_specific_values() {
     let fixture = Fixture::new();
     let version = "1%ZC_REGISTRY_EXPAND% & echo ZC_REGISTRY_HARMLESS_MARKER_12216";
-    let origin = "https://registry.invalid/index?team=it's%20mine&channel=stable";
+    let origin = "https://registry.invalid/index/team=it's%20mine&channel=stable";
     let config = "C:/profiles/100%team";
     let line = registry_install_command_for(
         ShellDialect::PowerShell,

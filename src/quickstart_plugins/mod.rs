@@ -1519,6 +1519,21 @@ async fn install_one<P: QuickstartPrompter>(
                 ],
             )));
         } else {
+            let display_name = choice.registry_origin.as_deref().map_or_else(
+                || display_name.clone(),
+                |origin| {
+                    qta(
+                        "cli-plugin-registry-origin",
+                        &[
+                            ("name", &display_name),
+                            (
+                                "origin",
+                                &zeroclaw::plugins::registry::registry_origin_label(origin),
+                            ),
+                        ],
+                    )
+                },
+            );
             prompter.say(&indented(&qta(
                 "cli-quickstart-plugins-load-check-command-unavailable",
                 &[
@@ -4060,7 +4075,7 @@ permissions = ["http_client"]
         let mut workspace = Workspace::new();
         workspace.config.plugins.limits.max_instances = 1;
         let mut picked = selection(fixture_entry(&server, Some(archive_digest())));
-        let origin = format!("{}{INDEX_PATH}?channel=stable&team=one", server.uri());
+        let origin = format!("{}{INDEX_PATH}", server.uri());
         picked[0].registry_origin = Some(origin.clone());
         let mut prompter = ScriptedPrompter::new([]);
         let phase = run(&mut workspace, &picked, &mut prompter).await.unwrap();
@@ -4082,6 +4097,32 @@ permissions = ["http_client"]
         assert!(prompter.output().contains(&expected));
         assert!(expected.contains(&format!("{FIXTURE_NAME}@{FIXTURE_VERSION}")));
         assert!(expected.contains("--registry") && expected.contains("--no-verify"));
+        assert!(workspace.installed_packages().is_empty());
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn private_origin_load_failure_identifies_source_without_a_retry_recipe() {
+        let server = MockServer::start().await;
+        serve_valid_archive(&server, 1).await;
+        let mut workspace = Workspace::new();
+        workspace.config.plugins.limits.max_instances = 1;
+        let mut picked = selection(fixture_entry(&server, Some(archive_digest())));
+        let origin = "https://registry.invalid/index?channel=sample-private";
+        picked[0].registry_origin = Some(origin.into());
+        let mut prompter = ScriptedPrompter::new([]);
+        let phase = run(&mut workspace, &picked, &mut prompter).await.unwrap();
+        assert!(matches!(
+            phase.outcomes[0],
+            PackageOutcome::Failed {
+                stage: FailureStage::LoadCheck,
+                ..
+            }
+        ));
+        let output = prompter.output();
+        assert!(output.contains(&zeroclaw::plugins::registry::registry_origin_label(origin)));
+        assert!(!output.contains("sample-private"));
+        assert!(!output.contains("--no-verify"));
         assert!(workspace.installed_packages().is_empty());
         server.verify().await;
     }

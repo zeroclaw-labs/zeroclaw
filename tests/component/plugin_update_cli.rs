@@ -169,6 +169,16 @@ fn package_archive(manifest: &str, component: &[u8]) -> Vec<u8> {
 /// `archive`, with its digest. `downloads` is how many times the archive must
 /// be fetched, checked when the server drops.
 async fn serve_registry(server: &MockServer, version: &str, archive: Vec<u8>, downloads: u64) {
+    serve_registry_at(server, "/registry.json", version, archive, downloads).await;
+}
+
+async fn serve_registry_at(
+    server: &MockServer,
+    index_path: &str,
+    version: &str,
+    archive: Vec<u8>,
+    downloads: u64,
+) {
     let archive_path = format!("/{PACKAGE}-{version}.zip");
     let index = serde_json::json!({
         "plugins": [{
@@ -180,7 +190,7 @@ async fn serve_registry(server: &MockServer, version: &str, archive: Vec<u8>, do
         }],
     });
     Mock::given(method("GET"))
-        .and(path("/registry.json"))
+        .and(path(index_path))
         .respond_with(ResponseTemplate::new(200).set_body_json(index))
         .mount(server)
         .await;
@@ -335,6 +345,47 @@ async fn approval_from_environment_selected_origin_pins_that_origin_in_the_real_
 }
 
 #[tokio::test]
+async fn approval_withholds_non_copyable_registry_command_and_keeps_installed_version() {
+    let server = MockServer::start().await;
+    // On Windows, even a non-private origin can have no common literal form.
+    let index_path = if cfg!(windows) {
+        "/team%20calendar/index"
+    } else {
+        "/index"
+    };
+    let version = "2.0&preview";
+    let archive = package_archive(
+        &manifest(version, "permissions = [\"state_read\"]\n"),
+        &std::fs::read(fixture()).unwrap(),
+    );
+    serve_registry_at(&server, index_path, version, archive, 1).await;
+    let query = if cfg!(windows) {
+        ""
+    } else {
+        "?channel=private-fixture"
+    };
+    let origin = format!("{}{index_path}{query}", server.uri());
+    let config_dir = config_dir_with_installed_fixture();
+    let output = run_plugin_with_registries(config_dir.path(), &origin, &["update", PACKAGE]);
+    let text = combined(&output);
+    assert!(!output.status.success());
+    assert!(
+        text.contains(version) && text.contains("permission:state_read"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("--allow-token") && !text.contains("# PowerShell only"),
+        "{text}"
+    );
+    assert!(
+        !text.contains(&origin) && !text.contains("private-fixture"),
+        "{text}"
+    );
+    assert!(installed_manifest(config_dir.path()).contains("version = \"1.0.0\""));
+    server.verify().await;
+}
+
+#[tokio::test]
 async fn successful_union_search_shows_distinct_private_origin_labels_not_credentials() {
     let server = MockServer::start().await;
     serve_registry(&server, "2.0.0", b"not downloaded".to_vec(), 0).await;
@@ -362,6 +413,18 @@ async fn successful_union_search_shows_distinct_private_origin_labels_not_creden
     for secret in ["alice", "password", "token=", "secret-", "private-"] {
         assert!(!text.contains(secret), "{text}");
     }
+    let cached = run_plugin_with_registries(config_dir.path(), &selection, &["list"]);
+    let catalog = combined(&cached);
+    assert!(cached.status.success(), "{catalog}");
+    for origin in [&first, &second] {
+        assert!(catalog.contains(&zeroclaw_plugins::registry::registry_origin_label(origin)));
+    }
+    assert!(!catalog.contains("token=") && !catalog.contains("password-"));
+    let default = run_plugin_with_registries(config_dir.path(), "  ", &["list"]);
+    assert!(default.status.success());
+    assert!(
+        !combined(&default).contains(&zeroclaw_plugins::registry::registry_origin_label(&first))
+    );
     assert_eq!(server.received_requests().await.unwrap().len(), 2);
     server.verify().await;
 }

@@ -241,13 +241,8 @@ pub fn origin_package_catalog<'a>(
         );
     }
     if let Some(registry) = registry {
-        for index in &registry.registries {
-            let origin = Some(
-                index
-                    .registry_url
-                    .as_deref()
-                    .unwrap_or(crate::registry::DEFAULT_REGISTRY_URL),
-            );
+        for (origin, index) in registry.stamped_indexes() {
+            let origin = Some(origin);
             for metadata in package_catalog(installed, Some(index)) {
                 if metadata.available().is_none() {
                     continue;

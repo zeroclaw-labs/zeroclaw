@@ -98,7 +98,18 @@ fn render(entries: &[PluginCatalogEntry<'_>], config_dir: &std::path::Path) {
                     "cli-plugin-registry-command",
                     &[("command", &command)],
                 ),
-                None => get_required_cli_string("cli-plugin-registry-command-unavailable"),
+                None => {
+                    let notice = get_required_cli_string("cli-plugin-registry-command-unavailable");
+                    entry.origin.map_or_else(
+                        || notice.clone(),
+                        |origin| {
+                            format!(
+                                "{}: {notice}",
+                                zeroclaw::plugins::registry::registry_origin_label(origin)
+                            )
+                        },
+                    )
+                }
             };
             println!("{hint}");
         }

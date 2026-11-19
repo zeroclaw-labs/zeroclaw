@@ -190,7 +190,7 @@ HTTP(S) URLs. Exact duplicates are removed in configuration order, and commas
 inside URLs remain part of the URL. Every source is validated before HTTP.
 
 All indexes must succeed before search results or the canonical local cache
-are published. A failed, malformed or timed-out source reports its URL, leaves
+are published. A failed, malformed or timed-out source identifies the source (an opaque ID for private URLs), leaves
 the previous cache intact, and prevents archive downloads. Each index is capped
 at 4 MiB and uses the existing request deadlines; at most eight indexes are
 fetched sequentially. An unpopulated public index still reports the existing
@@ -214,19 +214,21 @@ union caches contain a collection of per-origin legacy indexes, including empty
 ones, without changing public entry fields or duplicating provenance on entries.
 Legacy single-index helpers refuse a union rather than flattening publishers.
 Publication uses an owner-only same-directory staged file and rename; restrictive
-existing Unix cache permissions are not widened. Offline
-consumers reject a cache from a different explicitly configured environment
-source set. Without an environment selection they retain the last deliberately
-refreshed cache, including a previous `--registry` search. Suggested commands
-include each entry's explicit origin rather than passing a JSON array as a URL,
-quoted at the host-aware POSIX/Windows/PowerShell command-rendering boundary.
-A copy-ready Windows install recipe is unavailable if any argument cannot be
-passed literally in both cmd.exe and PowerShell, such as a percent-encoded URL
-or a config path containing a literal percent sign. This does not invalidate
-registry metadata or disable structured installation.
-Successful search and Quickstart labels never print URL userinfo, query or
-fragment bytes; distinct raw URLs retain distinct opaque IDs. This does not
-claim redaction of existing error or executable-command surfaces.
+existing Unix cache permissions are not widened. Offline CLI and gateway catalogs
+and install suggestions use a cache only if its complete, stamped source set
+matches the current selection. With an unset or blank environment variable,
+only the public default matches. After a one-off private search, refresh the
+default registry to see its entries again. An old index without a recorded
+origin must be refreshed; it is not assumed to be public.
+
+For a public URL, a suggested command pins the exact origin. If the URL
+contains userinfo, a query or a fragment, no copy-ready command is offered.
+The opaque registry ID identifies the source; it is **not** a `--registry`
+value. Supply the original URL separately for a structured install or update.
+On Windows no registry recipe is offered if any argument cannot be passed
+literally in both cmd.exe and PowerShell, including a percent-encoded URL or
+a config path containing a percent sign. Neither restriction changes which
+registries can be fetched or what authority an update must obtain.
 The authenticated catalog API distinguishes publishers with opaque registry
 IDs instead of exposing custom URLs that might contain credentials.
 

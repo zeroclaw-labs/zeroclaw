@@ -66,14 +66,17 @@ pub fn install_source(entry: &PluginRegistryEntry) -> String {
     format!("{}@{}", entry.name, entry.version)
 }
 
+/// Legacy string-returning API: an empty string means no copy-ready recipe.
+/// New renderers should handle `None` from [`registry_install_command_for`].
 pub fn install_command(entry: &PluginRegistryEntry, registry_url: Option<&str>) -> String {
-    let source = install_source(entry);
-    match registry_url {
-        Some(registry_url) if !registry_url.trim().is_empty() => {
-            format!("zeroclaw plugin install {source} --registry {registry_url}")
-        }
-        _ => format!("zeroclaw plugin install {source}"),
-    }
+    registry_install_command_for(
+        ShellDialect::host(),
+        entry,
+        registry_url.filter(|url| !url.trim().is_empty()),
+        None,
+        false,
+    )
+    .unwrap_or_default()
 }
 
 pub fn parse_plugin_spec(source: &str) -> Result<PluginSpec> {
@@ -165,7 +168,7 @@ pub fn registry_sources(value: &str) -> Result<Vec<String>> {
                     .is_some_and(|s| s.eq_ignore_ascii_case("http://")))
             || value.chars().any(|c| c.is_whitespace() || c.is_control())
         {
-            bail!("plugin registry must be an HTTP(S) URL: {value}");
+            bail!("plugin registry must be an HTTP(S) URL");
         }
         if !sources.contains(&value) {
             sources.push(value);
@@ -195,29 +198,24 @@ impl std::ops::Deref for RegistryEntryView<'_> {
     }
 }
 impl RegistryCollection {
-    pub fn entries(&self) -> Vec<RegistryEntryView<'_>> {
+    pub(crate) fn stamped_indexes(&self) -> impl Iterator<Item = (&str, &PluginRegistryIndex)> {
         self.registries
             .iter()
-            .flat_map(|index| {
-                index.plugins.iter().map(move |entry| RegistryEntryView {
-                    origin: index
-                        .registry_url
-                        .as_deref()
-                        .unwrap_or(DEFAULT_REGISTRY_URL),
-                    entry,
-                })
+            .filter_map(|index| Some((index.registry_url.as_deref()?, index)))
+    }
+    pub fn entries(&self) -> Vec<RegistryEntryView<'_>> {
+        self.stamped_indexes()
+            .flat_map(|(origin, index)| {
+                index
+                    .plugins
+                    .iter()
+                    .map(move |entry| RegistryEntryView { origin, entry })
             })
             .collect()
     }
     pub fn sources(&self) -> Vec<String> {
-        self.registries
-            .iter()
-            .map(|index| {
-                index
-                    .registry_url
-                    .clone()
-                    .unwrap_or_else(|| DEFAULT_REGISTRY_URL.to_string())
-            })
+        self.stamped_indexes()
+            .map(|(origin, _)| origin.to_owned())
             .collect()
     }
 }
@@ -233,18 +231,11 @@ pub fn search_registry_entries<'a>(
     query: &str,
 ) -> Vec<RegistryEntryView<'a>> {
     catalog
-        .registries
-        .iter()
-        .flat_map(|index| {
+        .stamped_indexes()
+        .flat_map(|(origin, index)| {
             search_entries(index, query)
                 .into_iter()
-                .map(move |entry| RegistryEntryView {
-                    origin: index
-                        .registry_url
-                        .as_deref()
-                        .unwrap_or(DEFAULT_REGISTRY_URL),
-                    entry,
-                })
+                .map(move |entry| RegistryEntryView { origin, entry })
         })
         .collect()
 }
@@ -266,48 +257,52 @@ pub fn resolve_registry_entry<'a>(
     let index = *origins.first().ok_or_else(|| {
         anyhow::Error::msg(format!("plugin '{}' not found in registry", spec.name))
     })?;
+    let origin = index
+        .registry_url
+        .as_deref()
+        .context("missing registry origin")?;
     Ok(RegistryEntryView {
-        origin: index
-            .registry_url
-            .as_deref()
-            .unwrap_or(DEFAULT_REGISTRY_URL),
+        origin,
         entry: resolve_entry(index, spec)?,
     })
 }
 pub fn resolved_registry_entries(catalog: &RegistryCollection) -> Vec<RegistryEntryView<'_>> {
     catalog
-        .registries
-        .iter()
-        .flat_map(|index| {
+        .stamped_indexes()
+        .flat_map(|(origin, index)| {
             resolved_entries(index)
                 .into_iter()
-                .map(move |entry| RegistryEntryView {
-                    origin: index
-                        .registry_url
-                        .as_deref()
-                        .unwrap_or(DEFAULT_REGISTRY_URL),
-                    entry,
-                })
+                .map(move |entry| RegistryEntryView { origin, entry })
         })
         .collect()
 }
 pub fn cache_matches_sources(catalog: &RegistryCollection, sources: &[String]) -> bool {
-    let cached = catalog.sources();
-    cached.len() == sources.len() && cached.iter().all(|source| sources.contains(source))
+    let cached = catalog
+        .stamped_indexes()
+        .map(|(origin, _)| origin)
+        .collect::<std::collections::BTreeSet<_>>();
+    !cached.is_empty()
+        && cached.len() == catalog.registries.len()
+        && cached == sources.iter().map(String::as_str).collect()
+}
+/// Same unset/blank selection for fetching and all offline readers.
+pub fn effective_registry_selection(selection: Option<&str>) -> &str {
+    selection
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(DEFAULT_REGISTRY_URL)
+}
+pub fn cache_matches_selection(catalog: &RegistryCollection, selection: Option<&str>) -> bool {
+    registry_sources(effective_registry_selection(selection))
+        .is_ok_and(|sources| cache_matches_sources(catalog, &sources))
 }
 pub fn cache_matches_environment(catalog: &RegistryCollection) -> bool {
-    match std::env::var(REGISTRY_URL_ENV)
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-    {
-        Some(value) => {
-            registry_sources(&value).is_ok_and(|sources| cache_matches_sources(catalog, &sources))
-        }
-        None => true,
-    }
+    cache_matches_selection(catalog, std::env::var(REGISTRY_URL_ENV).ok().as_deref())
 }
 fn validate_collection(catalog: &RegistryCollection) -> Result<()> {
     let sources = catalog.sources();
+    if sources.len() != catalog.registries.len() {
+        bail!("cached registry index has no origin; refresh the registry");
+    }
     let parsed = registry_sources(&serde_json::to_string(&sources)?)?;
     if parsed.len() != sources.len() {
         bail!("duplicate cached registry origin");
@@ -435,8 +430,29 @@ pub fn registry_origin_label(origin: &str) -> String {
         crate::signature::sha256_hex(origin.as_bytes())
     )
 }
+/// Treat all query/fragment data and possible userinfo as private, including
+/// unusual URL spellings. This policy only controls display, not fetching.
+pub fn registry_url_is_private(url: &str) -> bool {
+    // Conservative for @ in paths too: do not partially parse or reconstruct URLs.
+    url.contains(['@', '?', '#'])
+}
+
+/// A registry recipe must not reveal a private origin. On Windows it must
+/// also preserve *every* argument in both cmd.exe and PowerShell.
+pub fn registry_command_available(
+    dialect: ShellDialect,
+    origin: Option<&str>,
+    values: &[&str],
+) -> bool {
+    !origin.is_some_and(registry_url_is_private)
+        && (dialect != ShellDialect::Windows
+            || values.iter().all(|value| {
+                windows_form_is_literal(value)
+                    && !value.contains(['\u{201c}', '\u{201d}', '\u{201e}'])
+            }))
+}
 /// Raw arguments are quoted only once, for the operator's host shell.
-/// Returns `None` when a Windows copy-ready command cannot preserve every
+/// Returns `None` for private origins, or when a Windows copy-ready command cannot preserve every
 /// argument in both cmd.exe and PowerShell. This does not reject registry data
 /// or prevent structured installation. Explicit PowerShell is shell-specific.
 pub fn registry_install_command_for(
@@ -455,15 +471,7 @@ pub fn registry_install_command_for(
     if let Some(dir) = dir.as_deref() {
         values.push(dir);
     }
-    // A marked PowerShell recipe is not inert in cmd.exe: separators can run.
-    if dialect == ShellDialect::Windows
-        && !values.iter().all(|value| {
-            windows_form_is_literal(value)
-                // PowerShell also treats these smart double quotes as string
-                // delimiters, even when the opening delimiter is ASCII.
-                && !value.chars().any(|c| matches!(c, '\u{201c}' | '\u{201d}' | '\u{201e}'))
-        })
-    {
+    if !registry_command_available(dialect, origin, &values) {
         return None;
     }
     let arg = |raw: &str| {
@@ -654,10 +662,61 @@ mod tests {
     }
 
     #[test]
+    fn offline_cache_requires_the_selected_stamped_origin() {
+        let dir = tempfile::tempdir().unwrap();
+        let private = "https://registry.invalid/index?channel=sample";
+        for origin in [private, DEFAULT_REGISTRY_URL] {
+            write_cached_registry_index(dir.path(), origin, &sample_index()).unwrap();
+            let cache = read_cached_registry_collection(dir.path())
+                .unwrap()
+                .unwrap();
+            for selection in [None, Some(""), Some("  ")] {
+                assert_eq!(
+                    cache_matches_selection(&cache, selection),
+                    origin == DEFAULT_REGISTRY_URL
+                );
+            }
+            assert!(cache_matches_selection(&cache, Some(origin)));
+            assert!(!cache_matches_selection(&cache, Some("[invalid")));
+        }
+        let unstamped = sample_index();
+        let path = registry_cache_path(dir.path());
+        std::fs::write(&path, serde_json::to_vec(&unstamped).unwrap()).unwrap();
+        assert!(read_cached_registry_collection(dir.path()).is_err());
+        let catalog = RegistryCollection::from(unstamped);
+        assert!(catalog.entries().is_empty());
+        assert!(crate::catalog::origin_package_catalog(&[], Some(&catalog)).is_empty());
+        assert!(!cache_matches_selection(&catalog, None));
+    }
+
+    #[test]
+    fn private_registry_origins_are_fetchable_but_not_copy_ready() {
+        let entry = &sample_index().plugins[0];
+        for origin in [
+            "https://sample@registry.invalid/index",
+            "https://registry.invalid/index?sample",
+            "https://registry.invalid/index#sample",
+        ] {
+            assert!(registry_sources(origin).is_ok());
+            assert!(install_command(entry, Some(origin)).is_empty());
+            for dialect in [
+                ShellDialect::Posix,
+                ShellDialect::Windows,
+                ShellDialect::PowerShell,
+            ] {
+                assert!(
+                    registry_install_command_for(dialect, entry, Some(origin), None, false)
+                        .is_none()
+                );
+            }
+        }
+    }
+
+    #[test]
     fn mixed_case_legacy_cache_and_public_command_helpers_remain_compatible() {
         let dir = tempfile::tempdir().unwrap();
         let index = sample_index();
-        let origin = "HTTPS://Example.invalid/index?channel=stable";
+        let origin = "HTTPS://Example.invalid/index";
         write_cached_registry_index(dir.path(), origin, &index).unwrap();
         let legacy = read_cached_registry_index(dir.path()).unwrap().unwrap();
         assert_eq!(legacy.registry_url.as_deref(), Some(origin));
@@ -803,7 +862,7 @@ mod tests {
     #[test]
     fn raw_registry_arguments_render_for_each_supported_shell() {
         let entry = &sample_index().plugins[0];
-        let origin = "https://registry.example/index?channel=stable&team=one";
+        let origin = "https://registry.example/index/channel=stable&team=one";
         let posix =
             registry_install_command_for(ShellDialect::Posix, entry, Some(origin), None, false)
                 .unwrap();
@@ -838,7 +897,7 @@ mod tests {
             ),
             None
         );
-        let tricky = "https://registry.example/index?team=it's%20mine";
+        let tricky = "https://registry.example/index/team=it's%20mine";
         let powershell =
             registry_install_command_for(ShellDialect::PowerShell, entry, Some(tricky), None, true)
                 .unwrap();
@@ -912,9 +971,9 @@ mod tests {
         named_entry.version = "1".into();
         assert_eq!(
             registry_install_command_for(ShellDialect::Windows, &named_entry,
-                Some("https://registry.invalid/index?team=one&channel=stable"),
+                Some("https://registry.invalid/index/team=one&channel=stable"),
                 Some(Path::new("C:/profiles/team one")), true),
-            Some(r#"zeroclaw --config-dir "C:/profiles/team one" plugin install "calendar\@1" --registry "https://registry.invalid/index?team=one&channel=stable" --no-verify"#.into())
+            Some(r#"zeroclaw --config-dir "C:/profiles/team one" plugin install "calendar\@1" --registry "https://registry.invalid/index/team=one&channel=stable" --no-verify"#.into())
         );
         // Separators, caret and parentheses remain data inside the shared
         // double-quoted subset. They do not by themselves require suppression.
