@@ -521,23 +521,20 @@ impl OllamaModelProvider {
     }
 
     fn raw_response_text(content: &str, thinking: Option<&str>) -> Option<String> {
-        // Preserve textual markup for the runtime's model-owned extractors.
-        // Some Ollama models put their complete answer in `thinking`. When
-        // `content` contains only a reasoning envelope, prefer that answer so
-        // the runtime does not classify the response as an empty terminal.
-        let content = content.trim();
-        if !content.is_empty() {
-            if strip_think_tags(content).trim().is_empty()
-                && let Some(thinking) = thinking.map(str::trim).filter(|text| !text.is_empty())
-            {
-                return Some(thinking.to_owned());
-            }
-            return Some(content.to_owned());
+        // Keep the legacy adapter contract until the runtime extraction policy
+        // is activated by the later registry-consumer layer. This also keeps
+        // tool-call XML visible after removing only the reasoning envelope.
+        let content = strip_think_tags(content);
+        if !content.trim().is_empty() {
+            return Some(content);
         }
-        thinking
-            .map(str::trim)
-            .filter(|text| !text.is_empty())
-            .map(str::to_owned)
+        if let Some(thinking) = thinking.map(str::trim).filter(|text| !text.is_empty()) {
+            let thinking = strip_think_tags(thinking);
+            if !thinking.trim().is_empty() {
+                return Some(thinking);
+            }
+        }
+        None
     }
 
     /// Send a single HTTP request to Ollama and parse the response.
@@ -1507,18 +1504,21 @@ mod tests {
     }
 
     #[test]
-    fn raw_response_text_preserves_think_tags_for_runtime_policy() {
+    fn raw_response_text_strips_think_tags_before_runtime_cutover() {
         assert_eq!(
             OllamaModelProvider::raw_response_text("<think>reasoning</think> hello", None,),
-            Some("<think>reasoning</think> hello".to_string())
+            Some(" hello".to_string())
         );
     }
 
     #[test]
-    fn raw_response_text_preserves_think_only_content_for_runtime_policy() {
+    fn raw_response_text_uses_thinking_field_for_think_only_content() {
         assert_eq!(
-            OllamaModelProvider::raw_response_text("<think>only thinking here</think>", None,),
-            Some("<think>only thinking here</think>".to_string())
+            OllamaModelProvider::raw_response_text(
+                "<think>only reasoning</think>",
+                Some("actual answer"),
+            ),
+            Some("actual answer".to_string())
         );
     }
 
@@ -1774,7 +1774,7 @@ mod tests {
         let text = result.unwrap();
         assert!(text.contains("<tool_call>"));
         assert!(text.contains("shell"));
-        assert!(text.contains("<think>"));
+        assert!(!text.contains("<think>"));
     }
 
     #[test]
