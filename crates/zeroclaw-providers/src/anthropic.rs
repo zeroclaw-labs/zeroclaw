@@ -2524,7 +2524,11 @@ impl AnthropicModelProvider {
     /// headers and the complete body; read-idle protection is independent.
     fn streaming_http_client(&self) -> Result<Client, reqwest::Error> {
         let builder = Client::builder().connect_timeout(std::time::Duration::from_secs(10));
-        let builder = match super::stream_request_timeout(&self.stream_request_timeout, None) {
+        let builder = match super::stream_request_timeout(
+            &self.stream_request_timeout,
+            (self.timeout_configured && !self.timeout_disabled)
+                .then(|| std::time::Duration::from_secs(self.timeout_secs)),
+        ) {
             Some(timeout) => builder.timeout(timeout),
             None => builder,
         };
