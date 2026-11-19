@@ -60,6 +60,13 @@ tool-data-management = Workspace data retention, purge, and storage statistics
 
 tool-delegate = Delegate a subtask to a specialized agent. Use when: a task benefits from a different model (e.g. fast summarization, deep reasoning, code generation). The sub-agent runs a single prompt by default; with agentic=true it can iterate with a filtered tool-call loop.
 
+tool-escalate-to-human-error-send-failed = Failed to send escalation to channel '{ $channel }': { $error }.
+tool-escalate-to-human-error-send-failed-alerts-failed = Failed to send escalation to channel '{ $channel }': { $error }. The configured `[escalation] alert_channels` could not deliver it either.
+tool-escalate-to-human-error-no-reply-origin-failed = Channel '{ $channel }' could not take the escalation ({ $error }), so it was sent to `[escalation] alert_channels` instead, and { $alerted } accepted it. Those channels cannot return a reply to this turn, so `wait_for_response` cannot be honored. The escalation has been delivered; do not send it again.
+tool-escalate-to-human-error-no-reply-undeliverable-origin = Channel '{ $channel }' cannot deliver an escalation message, so it was sent to `[escalation] alert_channels` instead, and { $delivered } accepted it. Those channels cannot return a reply to this turn, so `wait_for_response` cannot be honored. The escalation has been delivered; do not send it again.
+tool-escalate-to-human-note-delivered-via-alerts = Channel '{ $channel }' could not take the escalation; it was delivered to the configured alert channels instead.
+tool-escalate-to-human-note-no-alert-accepted = No configured `[escalation] alert_channels` accepted this alert; only the origin channel received it.
+
 tool-file-edit = Edit a file by replacing an exact string match with new content
 
 tool-file-download = Download a file from the configured remote endpoint and write it to the agent's workspace. Supply the identifier of the document to fetch and a workspace-relative destination path; the endpoint URL is fixed by host config and is never model-controlled. Bytes are streamed straight to disk and are not loaded into model context. Returns the HTTP status, the number of bytes written, and the destination path.

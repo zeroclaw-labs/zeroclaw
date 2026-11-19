@@ -147,6 +147,19 @@ impl EscalateToHumanTool {
     }
 }
 
+/// The escalation reached alert channels that cannot carry a reply back into
+/// this turn, so the requested wait fails. The result still lists who took it
+/// and never asks for a retry: the page is already out, and resending it
+/// would page the same people again.
+fn alerted_without_reply(mut payload: serde_json::Value, error: String) -> ToolResult {
+    payload["reply_collected"] = json!(false);
+    ToolResult {
+        success: false,
+        output: payload.to_string().into(),
+        error: Some(error),
+    }
+}
+
 #[async_trait]
 impl Tool for EscalateToHumanTool {
     fn name(&self) -> &str {
@@ -158,10 +171,13 @@ impl Tool for EscalateToHumanTool {
          Sends a structured message to the active channel. High/critical urgency \
          also notifies any channels listed in `[escalation] alert_channels`, which \
          additionally serve as a fallback when the active channel cannot deliver. \
-         The active channel is never alerted twice, and the result reports \
-         `alerted_to` so you can see which alert channels actually accepted it — \
-         an empty list means only the active channel was reached. \
-         Optionally blocks to wait for a human response."
+         The active channel is never alerted twice. A result that does not wait \
+         reports `alerted_to` so you can see which alert channels actually accepted \
+         it — an empty list means only the active channel was reached. Optionally \
+         blocks to wait for a human response; a successful wait returns only the \
+         human's reply. If only alert channels took the escalation, no reply can \
+         be collected on this turn: the result lists who received it, and the \
+         escalation must not be sent again."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -355,36 +371,35 @@ impl Tool for EscalateToHumanTool {
                 });
             }
 
+            let payload = json!({
+                "status": "escalated_via_alert_channels",
+                "urgency": urgency,
+                "channel": channel_name,
+                "delivered_to": delivered,
+                "note": format!(
+                    "Channel '{channel_name}' cannot deliver outbound messages; \
+                     escalation was routed to the configured alert channels instead."
+                ),
+            });
+
             // A human was reached, but not on the requested channel, and this
             // path cannot host a free-form reply.
             if wait_for_response {
-                return Ok(ToolResult {
-                    success: false,
-                    output: ToolOutput::default(),
-                    error: Some(format!(
-                        "Channel '{channel_name}' cannot deliver an escalation message, so the \
-                         alert was routed to `[escalation] alert_channels` ({}) instead. Those \
-                         channels cannot return a reply to this turn, so `wait_for_response` is \
-                         unsupported here. Retry with `wait_for_response: false`.",
-                        delivered.join(", ")
-                    )),
-                });
+                return Ok(alerted_without_reply(
+                    payload,
+                    crate::i18n::get_required_tool_string_with_args(
+                        "tool-escalate-to-human-error-no-reply-undeliverable-origin",
+                        &[
+                            ("channel", channel_name.as_str()),
+                            ("delivered", delivered.join(", ").as_str()),
+                        ],
+                    ),
+                ));
             }
 
             return Ok(ToolResult {
                 success: true,
-                output: json!({
-                    "status": "escalated_via_alert_channels",
-                    "urgency": urgency,
-                    "channel": channel_name,
-                    "delivered_to": delivered,
-                    "note": format!(
-                        "Channel '{channel_name}' cannot deliver outbound messages; \
-                         escalation was routed to the configured alert channels instead."
-                    ),
-                })
-                .to_string()
-                .into(),
+                output: payload.to_string().into(),
                 error: None,
             });
         }
@@ -437,51 +452,53 @@ impl Tool for EscalateToHumanTool {
             // and say plainly which one, so the model never reads this as the
             // human having seen it on the channel it was talking to.
             if alerted_to.is_empty() {
-                let remedy = if alert_requested {
-                    " The configured `[escalation] alert_channels` could not deliver it either."
+                let key = if alert_requested {
+                    "tool-escalate-to-human-error-send-failed-alerts-failed"
                 } else {
-                    ""
+                    "tool-escalate-to-human-error-send-failed"
                 };
                 return Ok(ToolResult {
                     success: false,
                     output: ToolOutput::default(),
-                    error: Some(format!(
-                        "Failed to send escalation to channel '{channel_name}': \
-                         {origin_error}.{remedy}"
+                    error: Some(crate::i18n::get_required_tool_string_with_args(
+                        key,
+                        &[
+                            ("channel", channel_name.as_str()),
+                            ("error", origin_error.as_str()),
+                        ],
                     )),
                 });
             }
 
+            let payload = json!({
+                "status": "escalated_via_alert_channels",
+                "urgency": urgency,
+                "channel": channel_name,
+                "alerted_to": alerted_to,
+                "origin_error": origin_error,
+                "note": crate::i18n::get_required_tool_string_with_args(
+                    "tool-escalate-to-human-note-delivered-via-alerts",
+                    &[("channel", channel_name.as_str())],
+                ),
+            });
+
             if wait_for_response {
-                return Ok(ToolResult {
-                    success: false,
-                    output: ToolOutput::default(),
-                    error: Some(format!(
-                        "Channel '{channel_name}' could not take the escalation \
-                         ({origin_error}), so it was routed to \
-                         `[escalation] alert_channels` ({}) instead. Those channels \
-                         cannot return a reply to this turn, so `wait_for_response` \
-                         is unsupported here. Retry with `wait_for_response: false`.",
-                        alerted_to.join(", ")
-                    )),
-                });
+                return Ok(alerted_without_reply(
+                    payload,
+                    crate::i18n::get_required_tool_string_with_args(
+                        "tool-escalate-to-human-error-no-reply-origin-failed",
+                        &[
+                            ("channel", channel_name.as_str()),
+                            ("error", origin_error.as_str()),
+                            ("alerted", alerted_to.join(", ").as_str()),
+                        ],
+                    ),
+                ));
             }
 
             return Ok(ToolResult {
                 success: true,
-                output: json!({
-                    "status": "escalated_via_alert_channels",
-                    "urgency": urgency,
-                    "channel": channel_name,
-                    "alerted_to": alerted_to,
-                    "origin_error": origin_error,
-                    "note": format!(
-                        "Channel '{channel_name}' could not take the escalation; \
-                         it was delivered to the configured alert channels instead."
-                    ),
-                })
-                .to_string()
-                .into(),
+                output: payload.to_string().into(),
                 error: None,
             });
         }
@@ -529,10 +546,9 @@ impl Tool for EscalateToHumanTool {
             if alert_requested {
                 payload["alerted_to"] = json!(alerted_to);
                 if alerted_to.is_empty() {
-                    payload["alert_note"] = json!(
-                        "No configured `[escalation] alert_channels` accepted this alert; \
-                         only the origin channel received it."
-                    );
+                    payload["alert_note"] = json!(crate::i18n::get_required_tool_string(
+                        "tool-escalate-to-human-note-no-alert-accepted"
+                    ));
                 }
             }
             Ok(ToolResult {
@@ -1548,6 +1564,140 @@ mod tests {
                 .unwrap_or_default()
                 .contains("wait_for_response"),
             "the model must be told which argument to drop",
+        );
+    }
+
+    #[tokio::test]
+    async fn alert_delivery_without_a_reply_path_never_asks_for_a_resend() {
+        // Both ways the escalation can end up only on alert channels while a
+        // wait was requested: the origin's send fails, or the origin cannot
+        // send at all. The pager already holds the page in both, so the
+        // result must say who received it and must not ask for a retry, which
+        // would page the same people a second time.
+        let congested: Arc<dyn Channel> = Arc::new(CongestedChannel::new("origin"));
+        let undeliverable: Arc<dyn Channel> = Arc::new(NoDeliveryChannel::new("origin"));
+        for (origin, receivers_key) in [(congested, "alerted_to"), (undeliverable, "delivered_to")]
+        {
+            let pager = Arc::new(SilentChannel::new("pager"));
+            let pager_sent = Arc::clone(&pager.sent);
+            let tool = make_tool_with_channels_and_alerts(
+                vec![
+                    ("origin", origin),
+                    ("pager", Arc::clone(&pager) as Arc<dyn Channel>),
+                ],
+                vec!["pager"],
+            );
+
+            let result = tool
+                .execute(json!({
+                    "summary": "Disk is full",
+                    "urgency": "critical",
+                    "channel": "origin",
+                    "wait_for_response": true,
+                    "timeout_secs": 30,
+                }))
+                .await
+                .unwrap();
+
+            assert!(!result.success, "no reply can be collected on this turn");
+            assert_eq!(pager_sent.read().len(), 1, "the pager took the page once");
+            let err = result.error.clone().unwrap_or_default();
+            assert!(
+                err.contains("pager") && err.contains("wait_for_response"),
+                "the error must name who received it and the option it cannot honor: {err}",
+            );
+            assert!(
+                err.contains("do not send it again"),
+                "the error must say the escalation is already out: {err}",
+            );
+            assert!(
+                !err.contains("Retry") && !err.contains("wait_for_response: false"),
+                "a resend would page the pager twice: {err}",
+            );
+            assert!(!err.contains("{tool-"), "unresolved Fluent key: {err}");
+            let parsed: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+            assert_eq!(parsed["status"], "escalated_via_alert_channels");
+            assert_eq!(parsed[receivers_key], json!(["pager"]));
+            assert_eq!(parsed["reply_collected"], json!(false));
+        }
+    }
+
+    #[tokio::test]
+    async fn escalation_diagnostics_come_from_the_tool_catalogue() {
+        // Each new visible diagnostic resolves from the Fluent catalogue with
+        // its arguments; a missing key would render as `{key}`.
+        let run = |origin: Arc<dyn Channel>, alerts: Vec<&str>, urgency: &str| {
+            let pager: Arc<dyn Channel> = Arc::new(SilentChannel::new("pager"));
+            let mut channels = vec![("origin", origin)];
+            if alerts.contains(&"pager") {
+                channels.push(("pager", pager));
+            }
+            let tool = make_tool_with_channels_and_alerts(channels, alerts);
+            let args =
+                json!({ "summary": "Disk is full", "urgency": urgency, "channel": "origin" });
+            async move { tool.execute(args).await.unwrap() }
+        };
+
+        // The origin fails and nothing else was asked for.
+        let result = run(
+            Arc::new(CongestedChannel::new("origin")),
+            vec!["pager"],
+            "medium",
+        )
+        .await;
+        let err = result.error.unwrap_or_default();
+        assert!(!result.success);
+        assert!(
+            err.starts_with("Failed to send escalation to channel 'origin': ")
+                && err.contains("queue full")
+                && !err.contains("alert_channels")
+                && !err.contains("{tool-"),
+            "{err}",
+        );
+
+        // The origin fails and the configured alert channel is missing.
+        let result = run(
+            Arc::new(CongestedChannel::new("origin")),
+            vec!["pager-that-is-not-configured"],
+            "high",
+        )
+        .await;
+        let err = result.error.unwrap_or_default();
+        assert!(
+            err.contains("queue full") && err.contains("alert_channels") && !err.contains("{tool-"),
+            "{err}",
+        );
+
+        // The origin fails and the pager takes it.
+        let result = run(
+            Arc::new(CongestedChannel::new("origin")),
+            vec!["pager"],
+            "high",
+        )
+        .await;
+        assert!(result.success, "error: {:?}", result.error);
+        let parsed: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+        let note = parsed["note"].as_str().unwrap_or_default();
+        assert!(
+            note.contains("'origin'")
+                && note.contains("alert channels")
+                && !note.contains("{tool-"),
+            "{note}",
+        );
+
+        // The origin takes it and no alert channel does.
+        let result = run(
+            Arc::new(SilentChannel::new("origin")),
+            vec!["pager-that-is-not-configured"],
+            "high",
+        )
+        .await;
+        assert!(result.success, "error: {:?}", result.error);
+        let parsed: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+        let alert_note = parsed["alert_note"].as_str().unwrap_or_default();
+        assert!(
+            alert_note.contains("alert_channels") && !alert_note.contains("{tool-"),
+            "{alert_note}",
         );
     }
 
