@@ -622,7 +622,8 @@ mod tests {
     fn alias_map_section_wire_keys_match_map_key_sections() {
         use crate::schema::Config;
         let sections = Config::map_key_sections();
-        let paths: std::collections::BTreeSet<&str> = sections.iter().map(|s| s.path).collect();
+        let paths: std::collections::BTreeSet<&str> =
+            sections.iter().map(|s| s.path.as_str()).collect();
         let alias_map_sections = [
             Section::PeerGroups,
             Section::DecisionModels,

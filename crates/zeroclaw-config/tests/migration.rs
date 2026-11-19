@@ -2884,10 +2884,10 @@ fn map_key_sections_exposes_typed_family_slots() {
     // Config::map_key_sections()). Verify every providers.<category>
     // typed-family root has its per-type slots registered there.
     use zeroclaw_config::schema::Config;
-    let paths: std::collections::HashSet<&'static str> = Config::map_key_sections()
+    let paths: std::collections::HashSet<String> = Config::map_key_sections()
         .iter()
         .filter(|s| matches!(s.kind, zeroclaw_config::traits::MapKeyKind::Map))
-        .map(|s| s.path)
+        .map(|s| s.path.clone())
         .collect();
     for required in [
         "providers.models.anthropic",

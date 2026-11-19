@@ -178,7 +178,7 @@ fn resolve_path(tail: &str, config: &mut Config) -> Result<String> {
         // *why* their alias was rejected (leading underscore, uppercase, …)
         // instead of the generic "Unknown property" that would surface from
         // a downstream `set_prop` against a non-existent map key.
-        config.create_map_key(section.path, alias).map_err(|e| {
+        config.create_map_key(&section.path, alias).map_err(|e| {
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
