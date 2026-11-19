@@ -594,10 +594,7 @@ fn providers_picker(cfg: &zeroclaw_config::schema::Config) -> Vec<PickerItem> {
 }
 
 fn rate_provider_family(kind: &str) -> String {
-    match kind {
-        "openai-compatible" => "custom".to_owned(),
-        other => other.to_owned(),
-    }
+    zeroclaw_config::providers::rate_provider_family(kind).to_owned()
 }
 
 fn any_usable_model_provider(cfg: &zeroclaw_config::schema::Config) -> bool {

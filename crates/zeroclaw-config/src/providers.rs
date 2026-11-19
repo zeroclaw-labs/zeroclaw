@@ -1148,6 +1148,17 @@ impl Providers {
     }
 }
 
+/// Map a connection kind to the canonical provider family used by rate
+/// sheets. OpenAI-compatible connections share the `custom` rate slot because
+/// their wire protocol does not change the billing family.
+#[must_use]
+pub fn rate_provider_family(kind: &str) -> &str {
+    match kind {
+        "openai-compatible" => "custom",
+        other => other,
+    }
+}
+
 macro_rules! emit_model_cost_rates_struct {
     ($(($field:ident, $type_str:literal, $cfg_ty:ty)),+ $(,)?) => {
         /// `[cost.rates.providers.models.<type>.<model>]` — token-cost rates
