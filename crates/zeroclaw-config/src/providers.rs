@@ -1220,6 +1220,7 @@ macro_rules! for_each_tts_provider_slot {
             (google, "google"),
             (edge, "edge"),
             (piper, "piper"),
+            (custom, "custom"),
         }
     };
 }
@@ -1236,6 +1237,7 @@ macro_rules! for_each_transcription_provider_slot {
             (assemblyai, "assemblyai"),
             (google, "google"),
             (local_whisper, "local_whisper"),
+            (custom, "custom"),
         }
     };
 }

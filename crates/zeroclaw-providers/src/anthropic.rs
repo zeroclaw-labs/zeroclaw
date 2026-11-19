@@ -4300,6 +4300,13 @@ data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"type\":\"message\"
             .expect("successful stream must finish after exceeding the request timeout");
 
             assert_eq!(text, "hi");
+            if deadline == "finite" {
+                assert!(
+                    failed,
+                    "finite total deadline should terminate the delayed stream"
+                );
+                continue;
+            }
             assert!(saw_final, "{deadline}");
             assert!(!failed, "{deadline}");
         }

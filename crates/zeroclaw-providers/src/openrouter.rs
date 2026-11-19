@@ -1390,6 +1390,13 @@ data: [DONE]
                 .await
                 .expect("request must settle")
                 .expect("stream should yield an event");
+            if deadline == "finite" {
+                assert!(
+                    second.is_err(),
+                    "finite total deadline should terminate the delayed stream"
+                );
+                continue;
+            }
             let second = second.expect("second SSE event should be readable");
             match second {
                 StreamEvent::TextDelta(chunk) => assert_eq!(chunk.delta, "second"),
