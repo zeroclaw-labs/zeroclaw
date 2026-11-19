@@ -1180,14 +1180,17 @@ impl HailoOllamaModelProvider {
         // optional `thinking` field, so this compatibility fallback is
         // deliberately returned as ordinary text and not reported as
         // `reasoning_content`.
-        // Preserve textual markup for the runtime's model-owned extractors.
-        if !response.message.content.trim().is_empty() {
-            return Ok(response.message.content.clone());
+        let content = Self::strip_think_tags(&response.message.content);
+        if !content.trim().is_empty() {
+            return Ok(content);
         }
         if let Some(thinking) = response.message.thinking.as_deref()
             && !thinking.trim().is_empty()
         {
-            return Ok(thinking.to_owned());
+            let thinking = Self::strip_think_tags(thinking);
+            if !thinking.trim().is_empty() {
+                return Ok(thinking);
+            }
         }
         anyhow::bail!("Hailo-Ollama returned an empty completed response")
     }
