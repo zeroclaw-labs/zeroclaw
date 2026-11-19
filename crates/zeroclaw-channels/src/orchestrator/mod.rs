@@ -6139,7 +6139,7 @@ fn is_partial_protocol_tag_open(rest: &str) -> bool {
 /// delivered response never keeps: reasoning traces, and — because native
 /// tool-call providers interleave narration with protocol — raw
 /// `<tool_call>` / `<tool_result>` envelopes. Final replies are cleaned by
-/// [`sanitize_channel_response_with_leak_detection`], but drafts
+/// [`sanitize_channel_response_for_format_with_leak_detection`], but drafts
 /// never reach it: `update_draft` posts straight to the channel transport, so
 /// a leaked envelope stays on screen until the final edit replaces it, and
 /// remains visible indefinitely if the turn fails first.
@@ -6441,6 +6441,10 @@ async fn run_draft_updater(
     outbound_channel: String,
     rx: tokio::sync::mpsc::Receiver<zeroclaw_runtime::agent::loop_::DraftEvent>,
 ) {
+    let content_format = outbound_content_format_for_channel(
+        &zeroclaw_config::schema::Config::default(),
+        &outbound_channel,
+    );
     run_draft_updater_with_leak_detection(
         channel,
         reply_target,
@@ -6448,6 +6452,7 @@ async fn run_draft_updater(
         known_tool_names,
         Arc::new(Mutex::new(String::new())),
         leak_detection,
+        content_format,
         turn_flush_narration,
         outbound_hooks,
         outbound_channel,
@@ -6466,6 +6471,7 @@ async fn run_draft_updater_with_leak_detection(
     known_tool_names: HashSet<String>,
     streamed_text: Arc<Mutex<String>>,
     leak_detection: zeroclaw_config::schema::LeakDetectionConfig,
+    content_format: OutboundContentFormat,
     turn_flush_narration: bool,
     outbound_hooks: Option<Arc<zeroclaw_runtime::hooks::HookRunner>>,
     outbound_channel: String,
@@ -6513,6 +6519,7 @@ async fn run_draft_updater_with_leak_detection(
                         &channel,
                         outbound_hooks.as_deref(),
                         &leak_detection,
+                        content_format,
                         &outbound_channel,
                         &reply_target,
                         &draft_id,
@@ -6567,6 +6574,7 @@ async fn run_draft_updater_with_leak_detection(
                 let visible = redact_channel_outbound_leaks(
                     &sanitize_streaming_draft_text(&accumulated, &known_tool_names),
                     &leak_detection,
+                    content_format,
                 );
                 // Keep the exact visible frame used for MultiMessage offsets;
                 // retaining the raw accumulation here could reintroduce a
@@ -6598,6 +6606,7 @@ async fn run_draft_updater_with_leak_detection(
                         &channel,
                         outbound_hooks.as_deref(),
                         &leak_detection,
+                        content_format,
                         &outbound_channel,
                         &reply_target,
                         &draft_id,
@@ -6666,10 +6675,71 @@ fn sanitize_channel_response(response: &str, tools: &[Box<dyn Tool>]) -> String 
     )
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutboundContentFormat {
+    Markdown,
+    PlainText,
+}
+
+fn outbound_content_format_for_channel(
+    config: &zeroclaw_config::schema::Config,
+    channel: &str,
+) -> OutboundContentFormat {
+    let (channel_type, alias) = channel
+        .split_once('.')
+        .map_or((channel, None), |(t, a)| (t, Some(a)));
+    if channel_type.eq_ignore_ascii_case("irc") || channel_type.eq_ignore_ascii_case("twitch") {
+        return OutboundContentFormat::PlainText;
+    }
+    if channel_type.eq_ignore_ascii_case("plugin") {
+        // Plugin bindings carry plain-text transports too (notably the `irc`
+        // and `twitch` registry packages). When an alias names a known binding,
+        // inspect its configured package; when `channel` is bare `"plugin"` or
+        // the binding is unresolved, fall back to `PlainText` when any enabled
+        // plain-text plugin binding exists so Markdown link-destination syntax
+        // cannot shield high-entropy credentials on a plain-text transport.
+        let is_plain_text_package =
+            |pkg: &str| pkg.eq_ignore_ascii_case("irc") || pkg.eq_ignore_ascii_case("twitch");
+        if let Some(alias) = alias.filter(|a| !a.is_empty())
+            && let Some(decl) = config.channels.plugin.get(alias)
+        {
+            return if is_plain_text_package(decl.package.trim()) {
+                OutboundContentFormat::PlainText
+            } else {
+                OutboundContentFormat::Markdown
+            };
+        }
+        if config
+            .channels
+            .plugin
+            .values()
+            .any(|decl| decl.enabled && is_plain_text_package(decl.package.trim()))
+        {
+            return OutboundContentFormat::PlainText;
+        }
+    }
+    OutboundContentFormat::Markdown
+}
+
+#[cfg(test)]
 fn sanitize_channel_response_with_leak_detection(
     response: &str,
     tools: &[Box<dyn Tool>],
     leak_detection: &zeroclaw_config::schema::LeakDetectionConfig,
+) -> String {
+    sanitize_channel_response_for_format_with_leak_detection(
+        response,
+        tools,
+        leak_detection,
+        OutboundContentFormat::Markdown,
+    )
+}
+
+fn sanitize_channel_response_for_format_with_leak_detection(
+    response: &str,
+    tools: &[Box<dyn Tool>],
+    leak_detection: &zeroclaw_config::schema::LeakDetectionConfig,
+    content_format: OutboundContentFormat,
 ) -> String {
     let known_tool_names: HashSet<String> = tools
         .iter()
@@ -6699,7 +6769,7 @@ fn sanitize_channel_response_with_leak_detection(
     // Strip leading narration lines that announce tool usage
     let sanitized = strip_tool_narration(&stripped_json);
 
-    redact_channel_outbound_leaks(&sanitized, leak_detection)
+    redact_channel_outbound_leaks(&sanitized, leak_detection, content_format)
 }
 
 /// Apply the same outbound security/operator boundary the final reply crosses to
@@ -6717,6 +6787,7 @@ fn sanitize_channel_response_with_leak_detection(
 async fn apply_multi_message_narration_policy(
     hooks: Option<&zeroclaw_runtime::hooks::HookRunner>,
     leak_detection: &zeroclaw_config::schema::LeakDetectionConfig,
+    content_format: OutboundContentFormat,
     channel: &str,
     reply_target: &str,
     prior_tail: &str,
@@ -6763,6 +6834,7 @@ async fn apply_multi_message_narration_policy(
         prior_tail,
         &outbound,
         leak_detection,
+        content_format,
     ))
 }
 
@@ -6783,6 +6855,7 @@ async fn flush_completed_narration_turn(
     channel: &Arc<dyn Channel>,
     hooks: Option<&zeroclaw_runtime::hooks::HookRunner>,
     leak_detection: &zeroclaw_config::schema::LeakDetectionConfig,
+    content_format: OutboundContentFormat,
     outbound_channel: &str,
     reply_target: &str,
     draft_id: &str,
@@ -6832,6 +6905,7 @@ async fn flush_completed_narration_turn(
     match apply_multi_message_narration_policy(
         hooks,
         leak_detection,
+        content_format,
         outbound_channel,
         reply_target,
         &prior_tail,
@@ -6884,6 +6958,7 @@ async fn flush_completed_narration_turn(
 fn redact_channel_outbound_leaks(
     content: &str,
     leak_detection: &zeroclaw_config::schema::LeakDetectionConfig,
+    content_format: OutboundContentFormat,
 ) -> String {
     if !leak_detection.enabled {
         return content.to_string();
@@ -6891,7 +6966,7 @@ fn redact_channel_outbound_leaks(
     // Scan for credential leaks before returning to caller. Format-specific
     // outbound layers identify parsed destinations that must remain intact and
     // pass only byte ranges to the format-agnostic detector.
-    let protected_spans = channel_outbound_protected_spans(content);
+    let protected_spans = channel_outbound_protected_spans(content, content_format);
     match zeroclaw_runtime::security::LeakDetector::with_config(leak_detection)
         .scan_with_protected_spans(content, &protected_spans)
     {
@@ -6929,9 +7004,10 @@ fn redact_channel_outbound_leaks_with_prior_context(
     prior_tail: &str,
     content: &str,
     leak_detection: &zeroclaw_config::schema::LeakDetectionConfig,
+    content_format: OutboundContentFormat,
 ) -> String {
     // First redact secrets contained entirely within this turn.
-    let self_redacted = redact_channel_outbound_leaks(content, leak_detection);
+    let self_redacted = redact_channel_outbound_leaks(content, leak_detection, content_format);
     if !leak_detection.enabled || prior_tail.is_empty() {
         return self_redacted;
     }
@@ -6939,7 +7015,8 @@ fn redact_channel_outbound_leaks_with_prior_context(
     // `prior_tail` is already-delivered narration, so on its own it holds no
     // complete secret; a change here means one spans the boundary.
     let combined = format!("{prior_tail}{self_redacted}");
-    let combined_redacted = redact_channel_outbound_leaks(&combined, leak_detection);
+    let combined_redacted =
+        redact_channel_outbound_leaks(&combined, leak_detection, content_format);
     if combined_redacted == combined {
         return self_redacted;
     }
@@ -6979,7 +7056,10 @@ fn longest_common_char_suffix<'b>(a: &str, b: &'b str) -> &'b str {
     &b[split..]
 }
 
-fn channel_outbound_protected_spans(content: &str) -> Vec<Range<usize>> {
+fn channel_outbound_protected_spans(
+    content: &str,
+    content_format: OutboundContentFormat,
+) -> Vec<Range<usize>> {
     let mut spans = Vec::new();
     // A file URI is a file reference even when punctuation inside it looks
     // like query syntax; protect it for every outbound text format.
@@ -6990,11 +7070,16 @@ fn channel_outbound_protected_spans(content: &str) -> Vec<Range<usize>> {
     {
         collect_raw_file_uri_spans(content, &mut spans);
     }
-    if content.contains("](")
-        || content.contains("]:")
-        || (content.contains('<') && content.contains("://"))
-    {
-        collect_markdown_link_destination_spans(content, &mut spans);
+    match content_format {
+        OutboundContentFormat::Markdown => {
+            if content.contains("](")
+                || content.contains("]:")
+                || (content.contains('<') && content.contains("://"))
+            {
+                collect_markdown_link_destination_spans(content, &mut spans);
+            }
+        }
+        OutboundContentFormat::PlainText => {}
     }
     spans
 }
@@ -10193,6 +10278,10 @@ async fn process_channel_message_body(
                     .collect();
                 let streamed_draft_text = Arc::clone(&streamed_draft_text);
                 let leak_detection = ctx.prompt_config.security.leak_detection.clone();
+                let content_format = outbound_content_format_for_channel(
+                    ctx.live_config.read().as_ref(),
+                    &channel_composite,
+                );
                 Some(zeroclaw_spawn::spawn!(async move {
                     let _lease = draft_lease;
                     run_draft_updater_with_leak_detection(
@@ -10202,6 +10291,7 @@ async fn process_channel_message_body(
                         known_tool_names,
                         streamed_draft_text,
                         leak_detection,
+                        content_format,
                         turn_flush_narration,
                         outbound_hooks,
                         outbound_channel,
@@ -10835,10 +10925,30 @@ async fn process_channel_message_body(
                 }
             }
 
-            let sanitized_response = sanitize_channel_response_with_leak_detection(
+            // Read the last routing instruction set by `send_via` this turn from
+            // the per-turn handle scoped into TURN_ROUTING around the loop above
+            // so outbound leak redaction uses the actual delivery destination's
+            // format when a reply is redirected to a plain-text channel.
+            let turn_route = turn_routing
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .last()
+                .cloned();
+            let outbound_format_channel = turn_route
+                .as_ref()
+                .and_then(|r| r.channel.as_deref())
+                .filter(|k| !k.is_empty())
+                .unwrap_or(channel_composite.as_str());
+            let outbound_content_format = outbound_content_format_for_channel(
+                ctx.live_config.read().as_ref(),
+                outbound_format_channel,
+            );
+
+            let sanitized_response = sanitize_channel_response_for_format_with_leak_detection(
                 &outbound_response,
                 ctx.tools_registry.as_ref(),
                 &ctx.prompt_config.security.leak_detection,
+                outbound_content_format,
             );
             let mut delivered_response =
                 if sanitized_response.is_empty() && !outbound_response.trim().is_empty() {
@@ -10941,14 +11051,6 @@ async fn process_channel_message_body(
             } else {
                 None
             };
-
-            // Read the last routing instruction set by `send_via` this turn from
-            // the per-turn handle scoped into TURN_ROUTING around the loop above.
-            let turn_route = turn_routing
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .last()
-                .cloned();
 
             // Resolve the delivery channel and modality from the routing entry.
             // `None` entry → default delivery (originating channel, no modality override).
@@ -17710,7 +17812,11 @@ pub async fn deliver_announcement(
 ) -> anyhow::Result<()> {
     use zeroclaw_api::channel::SendMessage;
 
-    let safe_output = redact_channel_outbound_leaks(output, &config.security.leak_detection);
+    let safe_output = redact_channel_outbound_leaks(
+        output,
+        &config.security.leak_detection,
+        outbound_content_format_for_channel(config, channel),
+    );
     let safe_output = ensure_nonempty_channel_reply(safe_output, output, channel, target);
 
     let make_msg = |s: &str| SendMessage::new(s, target).in_thread(thread_id.clone());
@@ -31012,6 +31118,7 @@ BTC is currently around $65,000 based on latest tool output."#
             &channel,
             Some(&hook_runner),
             &leak,
+            OutboundContentFormat::Markdown,
             "telegram",
             "123",
             "draft-1",
@@ -31025,6 +31132,7 @@ BTC is currently around $65,000 based on latest tool output."#
             &channel,
             Some(&hook_runner),
             &leak,
+            OutboundContentFormat::Markdown,
             "telegram",
             "123",
             "draft-1",
@@ -31097,6 +31205,7 @@ BTC is currently around $65,000 based on latest tool output."#
             &channel,
             None,
             &leak,
+            OutboundContentFormat::Markdown,
             "telegram",
             "123",
             "draft-1",
@@ -31111,6 +31220,7 @@ BTC is currently around $65,000 based on latest tool output."#
             &channel,
             None,
             &leak,
+            OutboundContentFormat::Markdown,
             "telegram",
             "123",
             "draft-1",
@@ -31220,6 +31330,7 @@ BTC is currently around $65,000 based on latest tool output."#
             &channel,
             Some(&hook_runner),
             &leak,
+            OutboundContentFormat::Markdown,
             "telegram",
             "123",
             "draft-1",
@@ -31234,6 +31345,7 @@ BTC is currently around $65,000 based on latest tool output."#
             &channel,
             Some(&hook_runner),
             &leak,
+            OutboundContentFormat::Markdown,
             "telegram",
             "123",
             "draft-1",
@@ -31300,6 +31412,7 @@ BTC is currently around $65,000 based on latest tool output."#
             &channel,
             None,
             &leak,
+            OutboundContentFormat::Markdown,
             "telegram",
             "123",
             "draft-1",
@@ -31315,6 +31428,7 @@ BTC is currently around $65,000 based on latest tool output."#
             &channel,
             None,
             &leak,
+            OutboundContentFormat::Markdown,
             "telegram",
             "123",
             "draft-1",
@@ -54704,7 +54818,7 @@ This is an example JSON object for profile settings."#;
         let outbound = format!("Recorded {target}.");
 
         // The entropy-protected span is still computed correctly...
-        let spans = channel_outbound_protected_spans(&outbound);
+        let spans = channel_outbound_protected_spans(&outbound, OutboundContentFormat::Markdown);
         assert_eq!(
             spans
                 .iter()
@@ -54733,7 +54847,7 @@ This is an example JSON object for profile settings."#;
         let target = "file:///tmp/report.md?token=aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG";
         let outbound = format!("Recorded path={target}.");
 
-        let spans = channel_outbound_protected_spans(&outbound);
+        let spans = channel_outbound_protected_spans(&outbound, OutboundContentFormat::Markdown);
         assert_eq!(
             spans
                 .iter()
@@ -54760,7 +54874,7 @@ This is an example JSON object for profile settings."#;
         let target = "file:///tmp/report.md?token=aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG";
         let outbound = format!(r#"{{"uri":"{target}"}}"#);
 
-        let spans = channel_outbound_protected_spans(&outbound);
+        let spans = channel_outbound_protected_spans(&outbound, OutboundContentFormat::Markdown);
         assert_eq!(
             spans
                 .iter()
@@ -54782,16 +54896,293 @@ This is an example JSON object for profile settings."#;
     }
 
     #[test]
-    fn leak_guard_preserves_raw_file_uri_filenames() {
+    fn plain_text_leak_guard_preserves_raw_file_uri_filenames() {
         let target = "file:///home/zeroclaw/.zeroclaw/agents/mission-orchestrator/workspace/tasks/inbox/2026-07-02-11-26-plan-b-for-something-useful.md";
         let outbound = format!("Recorded {target}.");
 
         let result = redact_channel_outbound_leaks(
             &outbound,
             &zeroclaw_config::schema::LeakDetectionConfig::default(),
+            OutboundContentFormat::PlainText,
         );
 
         assert_eq!(result, outbound);
+    }
+
+    #[test]
+    fn irc_family_plugin_bindings_use_plain_text_outbound_format() {
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.channels.plugin.insert(
+            "libera".to_string(),
+            zeroclaw_config::schema::PluginChannelConfig {
+                package: "irc".to_string(),
+                enabled: true,
+            },
+        );
+        config.channels.plugin.insert(
+            "stream".to_string(),
+            zeroclaw_config::schema::PluginChannelConfig {
+                package: "twitch".to_string(),
+                enabled: true,
+            },
+        );
+        config.channels.plugin.insert(
+            "chat".to_string(),
+            zeroclaw_config::schema::PluginChannelConfig {
+                package: "matrix".to_string(),
+                enabled: true,
+            },
+        );
+
+        assert_eq!(
+            outbound_content_format_for_channel(&config, "plugin.libera"),
+            OutboundContentFormat::PlainText
+        );
+        assert_eq!(
+            outbound_content_format_for_channel(&config, "plugin.stream"),
+            OutboundContentFormat::PlainText
+        );
+        assert_eq!(
+            outbound_content_format_for_channel(&config, "plugin.chat"),
+            OutboundContentFormat::Markdown
+        );
+        // Bare `"plugin"` is conservative whenever an enabled plain-text
+        // plugin binding exists.
+        assert_eq!(
+            outbound_content_format_for_channel(&config, "plugin"),
+            OutboundContentFormat::PlainText
+        );
+        assert_eq!(
+            outbound_content_format_for_channel(&config, "telegram.default"),
+            OutboundContentFormat::Markdown
+        );
+        assert_eq!(
+            outbound_content_format_for_channel(&config, "irc.default"),
+            OutboundContentFormat::PlainText
+        );
+        assert_eq!(
+            outbound_content_format_for_channel(&config, "twitch.default"),
+            OutboundContentFormat::PlainText
+        );
+
+        // When no plain-text plugin binding is enabled, bare `"plugin"` stays
+        // Markdown.
+        let mut markdown_only = zeroclaw_config::schema::Config::default();
+        markdown_only.channels.plugin.insert(
+            "chat".to_string(),
+            zeroclaw_config::schema::PluginChannelConfig {
+                package: "matrix".to_string(),
+                enabled: true,
+            },
+        );
+        assert_eq!(
+            outbound_content_format_for_channel(&markdown_only, "plugin"),
+            OutboundContentFormat::Markdown
+        );
+    }
+
+    #[tokio::test]
+    async fn irc_plugin_outbound_redacts_credentials_in_markdown_link_destinations() {
+        struct StaticReplyProvider(String);
+        impl ::zeroclaw_api::attribution::Attributable for StaticReplyProvider {
+            fn role(&self) -> ::zeroclaw_api::attribution::Role {
+                ::zeroclaw_api::attribution::Role::Provider(
+                    ::zeroclaw_api::attribution::ProviderKind::Model(
+                        ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                    ),
+                )
+            }
+            fn alias(&self) -> &str {
+                "StaticReplyProvider"
+            }
+        }
+        #[async_trait::async_trait]
+        impl ModelProvider for StaticReplyProvider {
+            async fn chat_with_system(
+                &self,
+                _system_prompt: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                Ok(self.0.clone())
+            }
+            async fn chat_with_history(
+                &self,
+                _messages: &[ChatMessage],
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                Ok(self.0.clone())
+            }
+        }
+
+        struct PluginAliasRecordingChannel {
+            sent: tokio::sync::Mutex<Vec<String>>,
+        }
+        impl ::zeroclaw_api::attribution::Attributable for PluginAliasRecordingChannel {
+            fn role(&self) -> ::zeroclaw_api::attribution::Role {
+                ::zeroclaw_api::attribution::Role::Channel(
+                    ::zeroclaw_api::attribution::ChannelKind::Plugin,
+                )
+            }
+            fn alias(&self) -> &str {
+                "libera"
+            }
+        }
+        #[async_trait::async_trait]
+        impl Channel for PluginAliasRecordingChannel {
+            fn name(&self) -> &str {
+                "plugin"
+            }
+            async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
+                self.sent.lock().await.push(message.content.clone());
+                Ok(())
+            }
+            async fn listen(
+                &self,
+                _tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
+            ) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        let secret = "aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG";
+        let secret_two = "zC9vN4mK8pQ2rL7xT5yU1hD6jF0gB3wE";
+
+        // Contrast Markdown vs PlainText directly on non-http relative and
+        // autolink-shaped destinations: Markdown link-destination protection
+        // shields non-http destinations from the high-entropy heuristic, while
+        // PlainText skips Markdown link-destination protection so visible
+        // link text on IRC/Twitch is still scanned.
+        let non_http_link = format!("[x](/download/{secret})");
+        let md_redacted = redact_channel_outbound_leaks(
+            &non_http_link,
+            &zeroclaw_config::schema::LeakDetectionConfig::default(),
+            OutboundContentFormat::Markdown,
+        );
+        assert_eq!(
+            md_redacted, non_http_link,
+            "precondition: Markdown format protects parsed link destinations from entropy false positives"
+        );
+        let plain_redacted = redact_channel_outbound_leaks(
+            &non_http_link,
+            &zeroclaw_config::schema::LeakDetectionConfig::default(),
+            OutboundContentFormat::PlainText,
+        );
+        assert!(
+            !plain_redacted.contains(secret)
+                && plain_redacted.contains("[REDACTED_HIGH_ENTROPY_TOKEN]"),
+            "PlainText format must not protect Markdown link destinations: {plain_redacted}"
+        );
+
+        // Full orchestrator turn to `plugin.libera` bound to `package = "irc"`,
+        // covering both `[x](https://h/?token=<high-entropy>)` and the relative
+        // destination above so the test exercises the real turn pipeline and
+        // fails if `plugin.libera` takes the Markdown path.
+        let mut prompt_config = zeroclaw_config::schema::Config::default();
+        prompt_config.channels.plugin.insert(
+            "libera".to_string(),
+            zeroclaw_config::schema::PluginChannelConfig {
+                package: "irc".to_string(),
+                enabled: true,
+            },
+        );
+        let channel_impl = Arc::new(PluginAliasRecordingChannel {
+            sent: tokio::sync::Mutex::new(Vec::new()),
+        });
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let reply = format!(
+            "[x](https://h/?token={secret}) and [y](/download/{secret_two}) and <ftp://h/{secret_two}>"
+        );
+        let mut ctx = test_runtime_ctx_with_observer(
+            Arc::clone(&channel),
+            Arc::new(StaticReplyProvider(reply)),
+            prompt_config,
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+            Arc::new(NoopObserver),
+        );
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert("plugin.libera".to_string(), channel);
+        Arc::get_mut(&mut ctx).unwrap().channels_by_name = Arc::new(channels_by_name);
+
+        process_channel_message(
+            ctx,
+            zeroclaw_api::channel::ChannelMessage {
+                id: "msg-irc-plugin-1".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "#ops".to_string(),
+                content: "send report".to_string(),
+                channel: "plugin".to_string(),
+                channel_alias: Some("libera".to_string()),
+                timestamp: 1,
+                ..Default::default()
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let sent = channel_impl.sent.lock().await;
+        assert_eq!(sent.len(), 1, "expected one outbound reply, got {sent:?}");
+        assert!(
+            !sent[0].contains(secret),
+            "query credential in `[x](https://h/?token=...)` sent to `plugin.libera` must be redacted: {}",
+            sent[0]
+        );
+        assert!(
+            !sent[0].contains(secret_two),
+            "high-entropy destination in Markdown link/autolink syntax sent to `plugin.libera` must not be shielded by Markdown link protection: {}",
+            sent[0]
+        );
+        assert!(sent[0].contains("[REDACTED"), "sent: {}", sent[0]);
+        drop(sent);
+
+        // Announcements (cron / peer sends) targeting `plugin.libera` must use
+        // the same PlainText format.
+        let _serial = STARTUP_REGISTRY_TEST_LOCK.lock().await;
+        let previous = CRON_CHANNEL_REGISTRY
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let _restore = CronChannelRegistryRestore(previous);
+
+        let announce_channel = Arc::new(PluginAliasRecordingChannel {
+            sent: tokio::sync::Mutex::new(Vec::new()),
+        });
+        let (_published, _lease) = publish_cron_channel_registry(&[ConfiguredChannel {
+            display_name: "Plugin",
+            alias: Some("libera".to_string()),
+            channel: announce_channel.clone(),
+        }]);
+
+        let mut announce_config = zeroclaw_config::schema::Config::default();
+        announce_config.channels.plugin.insert(
+            "libera".to_string(),
+            zeroclaw_config::schema::PluginChannelConfig {
+                package: "irc".to_string(),
+                enabled: true,
+            },
+        );
+        deliver_announcement(
+            &announce_config,
+            "plugin.libera",
+            "#ops",
+            None,
+            &format!("[x](/download/{secret_two})"),
+        )
+        .await
+        .expect("announcement delivery to published plugin channel should succeed");
+
+        let announced = announce_channel.sent.lock().await;
+        assert_eq!(announced.len(), 1);
+        assert!(
+            !announced[0].contains(secret_two)
+                && announced[0].contains("[REDACTED_HIGH_ENTROPY_TOKEN]"),
+            "announcement to `plugin.libera` must skip Markdown link protection: {}",
+            announced[0]
+        );
     }
 
     #[test]
@@ -54815,6 +55206,7 @@ This is an example JSON object for profile settings."#;
         let result = redact_channel_outbound_leaks(
             input,
             &zeroclaw_config::schema::LeakDetectionConfig::default(),
+            OutboundContentFormat::Markdown,
         );
 
         assert_eq!(result, input);
@@ -54828,6 +55220,7 @@ This is an example JSON object for profile settings."#;
         let result = redact_channel_outbound_leaks(
             &input,
             &zeroclaw_config::schema::LeakDetectionConfig::default(),
+            OutboundContentFormat::Markdown,
         );
 
         assert!(
@@ -55214,7 +55607,7 @@ Done."#;
 
     // ── Streaming draft scratchpad sanitization ───────────────────────────
     //
-    // Drafts bypass `sanitize_channel_response_with_leak_detection`
+    // Drafts bypass `sanitize_channel_response_for_format_with_leak_detection`
     // entirely (`update_draft` posts straight to the transport), so these pin
     // the draft boundary to the same preservation contract as final delivery.
 
@@ -55602,6 +55995,7 @@ Done."#;
             no_tools(),
             Arc::clone(&streamed_text),
             zeroclaw_config::schema::LeakDetectionConfig::default(),
+            OutboundContentFormat::Markdown,
             false,
             None,
             String::new(),
@@ -55681,6 +56075,7 @@ Done."#;
             no_tools(),
             Arc::clone(&streamed_text),
             zeroclaw_config::schema::LeakDetectionConfig::default(),
+            OutboundContentFormat::Markdown,
             false,
             None,
             String::new(),
@@ -55770,6 +56165,7 @@ Done."#;
             no_tools(),
             Arc::clone(&streamed_text),
             zeroclaw_config::schema::LeakDetectionConfig::default(),
+            OutboundContentFormat::Markdown,
             false,
             None,
             String::new(),
@@ -55840,6 +56236,7 @@ Done."#;
             no_tools(),
             Arc::clone(&streamed_text),
             zeroclaw_config::schema::LeakDetectionConfig::default(),
+            OutboundContentFormat::Markdown,
             false,
             None,
             String::new(),
@@ -55910,6 +56307,7 @@ Done."#;
                 no_tools(),
                 Arc::clone(&streamed),
                 zeroclaw_config::schema::LeakDetectionConfig::default(),
+                OutboundContentFormat::Markdown,
                 false,
                 None,
                 String::new(),
@@ -56021,6 +56419,7 @@ Done."#;
                 no_tools(),
                 Arc::clone(&streamed),
                 zeroclaw_config::schema::LeakDetectionConfig::default(),
+                OutboundContentFormat::Markdown,
                 false,
                 None,
                 String::new(),
@@ -56136,6 +56535,7 @@ Done."#;
             no_tools(),
             Arc::clone(&streamed),
             zeroclaw_config::schema::LeakDetectionConfig::default(),
+            OutboundContentFormat::Markdown,
             false,
             None,
             String::new(),
@@ -56286,6 +56686,7 @@ Done."#;
             no_tools(),
             Arc::clone(&streamed),
             zeroclaw_config::schema::LeakDetectionConfig::default(),
+            OutboundContentFormat::Markdown,
             false,
             None,
             String::new(),
@@ -56372,6 +56773,7 @@ Done."#;
             no_tools(),
             Arc::clone(&streamed),
             zeroclaw_config::schema::LeakDetectionConfig::default(),
+            OutboundContentFormat::Markdown,
             false,
             None,
             String::new(),
