@@ -1314,6 +1314,11 @@ impl OpenAiCompatibleModelProvider {
     /// Whether system messages should be flattened into the first user message,
     /// either because the model_provider was configured that way or the model requires it.
     fn effective_merge_system(&self, model: &str) -> bool {
+        if matches!(self.name.as_str(), "Qwen" | "Qwen Code")
+            && crate::qwen_video::supports_model(model)
+        {
+            return false;
+        }
         self.merge_system_into_user || Self::model_requires_system_merge(model)
     }
 
@@ -1527,7 +1532,7 @@ impl OpenAiCompatibleModelProvider {
     )> {
         let credential = self.resolve_credential().await?;
 
-        let normalized = self.normalize_messages_for_upstream(messages).await?;
+        let normalized = self.normalize_messages_for_model(messages, model).await?;
         let merge = self.effective_merge_system(model);
         let (effective_messages, _system_merged) =
             Self::flatten_system_messages(&normalized, merge);
@@ -1918,6 +1923,9 @@ enum MessagePart {
     },
     ImageUrl {
         image_url: ImageUrlPart,
+    },
+    VideoUrl {
+        video_url: ImageUrlPart,
     },
 }
 
@@ -3296,6 +3304,25 @@ impl OpenAiCompatibleModelProvider {
         }
     }
 
+    async fn normalize_messages_for_model(
+        &self,
+        messages: &[ChatMessage],
+        model: &str,
+    ) -> anyhow::Result<Vec<ChatMessage>> {
+        let messages = self.normalize_messages_for_upstream(messages).await?;
+        if matches!(self.name.as_str(), "Qwen" | "Qwen Code") {
+            return crate::qwen_video::normalize_messages(&messages, model)
+                .await
+                .map_err(|error| {
+                    crate::traits::NonRetryableProviderError::new(format!(
+                        "Qwen video input validation failed: {error:#}"
+                    ))
+                    .into()
+                });
+        }
+        Ok(messages)
+    }
+
     /// Normalize image markers into inline data URIs for the upstream request.
     ///
     /// Takes the configured policy rather than `MultimodalConfig::default()`:
@@ -3482,6 +3509,26 @@ impl OpenAiCompatibleModelProvider {
                 Vec::new()
             };
             return self.tool_carrier_content(&parts.text, &attachments, allow_user_image_parts);
+        }
+        if matches!(self.name.as_str(), "Qwen" | "Qwen Code")
+            && role == "user"
+            && allow_user_image_parts
+            && !is_tool_result_carrier(role, content)
+        {
+            let (text, videos) = crate::qwen_video::parse_markers(content);
+            if !videos.is_empty() {
+                let mut parts = match Self::content_with_image_parts(&text) {
+                    MessageContent::Text(text) => vec![MessagePart::Text {
+                        text,
+                        cache_control: None,
+                    }],
+                    MessageContent::Parts(parts) => parts,
+                };
+                parts.extend(videos.into_iter().map(|url| MessagePart::VideoUrl {
+                    video_url: ImageUrlPart { url },
+                }));
+                return MessageContent::Parts(parts);
+            }
         }
         Self::to_message_content(role, content, allow_user_image_parts)
     }
@@ -3735,7 +3782,9 @@ impl OpenAiCompatibleModelProvider {
                     let mut images: Vec<MessagePart> = Vec::new();
                     for part in parts {
                         match part {
-                            MessagePart::ImageUrl { .. } => images.push(part),
+                            MessagePart::ImageUrl { .. } | MessagePart::VideoUrl { .. } => {
+                                images.push(part)
+                            }
                             MessagePart::Text { text, .. } => texts.push(text),
                         }
                     }
@@ -3882,7 +3931,13 @@ impl OpenAiCompatibleModelProvider {
         let mut coalesced: Vec<ChatMessage> = Vec::with_capacity(messages.len());
         for msg in intermediate {
             match coalesced.last_mut() {
-                Some(last) if last.role == msg.role && msg.role != "system" => {
+                Some(last)
+                    if last.role == msg.role
+                        && msg.role != "system"
+                        && !(matches!(self.name.as_str(), "Qwen" | "Qwen Code")
+                            && (is_tool_result_carrier(&last.role, &last.content)
+                                || is_tool_result_carrier(&msg.role, &msg.content))) =>
+                {
                     if !last.content.is_empty() && !msg.content.is_empty() {
                         last.content.push_str("\n\n");
                     }
@@ -4363,7 +4418,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             content: message.to_string(),
         };
         let normalized_user = self
-            .normalize_messages_for_upstream(std::slice::from_ref(&user_msg))
+            .normalize_messages_for_model(std::slice::from_ref(&user_msg), model)
             .await?
             .pop()
             .unwrap_or(user_msg);
@@ -4379,7 +4434,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             };
             messages.push(Message {
                 role: "user".to_string(),
-                content: Self::to_message_content("user", &content, !merge),
+                content: self.message_content_for_role("user", &content, !merge),
                 thinking_blocks: None,
             });
         } else {
@@ -4392,7 +4447,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             }
             messages.push(Message {
                 role: "user".to_string(),
-                content: Self::to_message_content("user", &normalized_message, true),
+                content: self.message_content_for_role("user", &normalized_message, true),
                 thinking_blocks: None,
             });
         }
@@ -4494,7 +4549,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         let exact_request_replay = exact_request_replay_active();
         let credential = self.resolve_credential().await?;
 
-        let normalized = self.normalize_messages_for_upstream(messages).await?;
+        let normalized = self.normalize_messages_for_model(messages, model).await?;
         let merge = self.effective_merge_system(model);
         let (effective_messages, system_merged) = Self::flatten_system_messages(&normalized, merge);
         let effective_messages = if self.native_tool_calling {
@@ -4614,7 +4669,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         let credential = self.resolve_credential().await?;
 
         let normalized = self
-            .normalize_messages_for_upstream(request.messages)
+            .normalize_messages_for_model(request.messages, model)
             .await?;
         let merge = self.effective_merge_system(model);
         let (effective_messages, system_merged) = Self::flatten_system_messages(&normalized, merge);
@@ -4805,10 +4860,13 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
 
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(100);
 
+        let video_policy = crate::qwen_video::current_read_policy();
         let handle = ::zeroclaw_spawn::spawn!(async move {
-            let normalized = match provider
-                .normalize_messages_for_upstream(&messages_owned)
-                .await
+            let normalized = match crate::qwen_video::with_video_read_policy(
+                video_policy,
+                provider.normalize_messages_for_model(&messages_owned, &model),
+            )
+            .await
             {
                 Ok(n) => n,
                 Err(err) => {
@@ -5054,6 +5112,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         // Use a channel to bridge the async HTTP response to the stream
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamChunk>>(100);
 
+        let video_policy = crate::qwen_video::current_read_policy();
         let handle = ::zeroclaw_spawn::spawn!(async move {
             // Normalize image markers in the user-supplied message before
             // forwarding upstream — seefor the OpenAI-compatible
@@ -5062,9 +5121,11 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 role: "user".to_string(),
                 content: message_owned,
             };
-            let normalized_user = match provider
-                .normalize_messages_for_upstream(std::slice::from_ref(&user_msg))
-                .await
+            let normalized_user = match crate::qwen_video::with_video_read_policy(
+                video_policy,
+                provider.normalize_messages_for_model(std::slice::from_ref(&user_msg), &model),
+            )
+            .await
             {
                 Ok(mut msgs) => msgs.pop().unwrap_or(user_msg),
                 Err(err) => {
@@ -5085,7 +5146,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 };
                 messages.push(Message {
                     role: "user".to_string(),
-                    content: Self::to_message_content("user", &content, !merge),
+                    content: provider.message_content_for_role("user", &content, !merge),
                     thinking_blocks: None,
                 });
             } else {
@@ -5098,7 +5159,11 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 }
                 messages.push(Message {
                     role: "user".to_string(),
-                    content: Self::to_message_content("user", &normalized_message_content, !merge),
+                    content: provider.message_content_for_role(
+                        "user",
+                        &normalized_message_content,
+                        !merge,
+                    ),
                     thinking_blocks: None,
                 });
             }
@@ -5230,10 +5295,13 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
 
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamChunk>>(100);
 
+        let video_policy = crate::qwen_video::current_read_policy();
         let handle = ::zeroclaw_spawn::spawn!(async move {
-            let normalized = match provider
-                .normalize_messages_for_upstream(&messages_owned)
-                .await
+            let normalized = match crate::qwen_video::with_video_read_policy(
+                video_policy,
+                provider.normalize_messages_for_model(&messages_owned, &model),
+            )
+            .await
             {
                 Ok(n) => n,
                 Err(err) => {
@@ -17691,3 +17759,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "compatible_qwen_video_tests.rs"]
+mod qwen_video_tests;

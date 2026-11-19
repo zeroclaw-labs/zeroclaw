@@ -565,6 +565,37 @@ Variants: `cn`, `intl`, `code`.
 
 OAuth-backed Qwen accounts use the same slot with `auth_mode = "o_auth"`.
 
+Qwen video-file input uses the Chat Completions wire. For a video-capable model
+such as `qwen3.8-flash`, supply an explicit `[VIDEO:/absolute/path/clip.mp4]`
+reference or `[VIDEO:data:video/mp4;base64,...]` in the user message. ZeroClaw
+reads the MP4 under the current turn's agent filesystem policy using a bounded
+loader and sends a `video_url` content
+part containing the full Base64 Data URL. Frame sampling uses Qwen's service
+default. Existing image inputs can accompany the video.
+
+The supported IDs and dated snapshots are defined by `qwen_video::supports_model`
+in `zeroclaw-providers`. The request-wide raw-video budget is strictly below
+7,000,000 bytes, including videos retained in history. Container checks validate
+the MP4 signature; the service validates codec decodability. Missing files,
+invalid Base64, unsupported models and exhausted budgets return input errors.
+Files remain in their original location. Low-level provider callers must scope
+local reads with `with_video_read_policy`; an unscoped caller can supply inline
+video bytes. Video reference syntax in tool-result
+body text, system messages and assistant messages remains literal text.
+
+For an explicit live smoke test with a public MP4 fixture, set
+`ZEROCLAW_TEST_QWEN_API_KEY`, `ZEROCLAW_TEST_QWEN_ENDPOINT`,
+`ZEROCLAW_TEST_QWEN_VIDEO` and optionally `ZEROCLAW_TEST_QWEN_MODEL`, then run:
+
+```sh
+cargo test --locked -p zeroclaw-providers --test live \
+  qwen_video_file_factory_to_real_provider -- --ignored --nocapture
+```
+
+This test makes a paid provider request. Credentials are read only from the
+explicit test environment. See [Qwen's visual input documentation](https://platform.qianwenai.com/docs/developer-guides/multimodal/vision)
+for the service's video-file format and size requirements.
+
 ### GLM: slot `glm`
 
 ### MiniMax: slot `minimax`
