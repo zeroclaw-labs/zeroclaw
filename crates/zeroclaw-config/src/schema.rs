@@ -9058,6 +9058,8 @@ pub struct ScopedHttpCredential {
     pub origin: String,
     #[serde(default)]
     pub http_allowed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub browser_origin: Option<String>,
     #[serde(default)]
     pub source: ScopedCredentialSource,
     pub auth: ScopedHttpAuth,
@@ -9275,6 +9277,20 @@ mod scoped_credential_source_tests {
 }
 
 impl ScopedHttpCredential {
+    /// A browser grant is independent from HTTP Request and SSH permissions.
+    pub fn accepts_browser_origin(&self, origin: &str) -> bool {
+        let Some(normalized) =
+            Self::password_service(origin).filter(|value| value.starts_with("https://"))
+        else {
+            return false;
+        };
+        match &self.auth {
+            ScopedHttpAuth::UserPassword { .. } => self.origin == normalized,
+            ScopedHttpAuth::Totp { .. } => true,
+            _ => false,
+        }
+    }
+
     pub fn https_origin(raw: &str) -> Option<String> {
         let mut url = url::Url::parse(raw).ok()?;
         if url.scheme() != "https" || !url.username().is_empty() || url.password().is_some() {
@@ -9322,6 +9338,31 @@ impl ScopedHttpCredential {
                 .bytes()
                 .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
     }
+}
+
+#[test]
+fn scoped_browser_credentials_require_eligible_kind_and_https_origin() {
+    let mut record: ScopedHttpCredential = serde_json::from_value(serde_json::json!({
+        "origin": "https://login.example.test",
+        "http_allowed": true,
+        "auth": { "kind": "user_password", "username": "fixture", "password": "fixture" }
+    }))
+    .expect("existing credential record");
+    assert!(record.browser_origin.is_none());
+    assert!(record.accepts_browser_origin("https://login.example.test:443"));
+    assert!(!record.accepts_browser_origin("https://login.example.test:8443"));
+    assert!(!record.accepts_browser_origin("https://other.example.test"));
+    record.auth = ScopedHttpAuth::Totp {
+        seed: String::new(),
+    };
+    assert!(record.accepts_browser_origin("https://other.example.test:8443"));
+    assert!(!record.accepts_browser_origin("http://other.example.test"));
+    assert!(!record.accepts_browser_origin("https://other.example.test/login"));
+    record.auth = ScopedHttpAuth::ApiKey {
+        value: String::new(),
+        header: ScopedApiKeyHeader::Bearer,
+    };
+    assert!(!record.accepts_browser_origin("https://login.example.test"));
 }
 
 impl Default for HttpRequestConfig {

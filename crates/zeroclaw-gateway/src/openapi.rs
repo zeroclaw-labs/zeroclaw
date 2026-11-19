@@ -256,6 +256,7 @@ pub fn build_spec() -> serde_json::Value {
                                     "kind": {"type": "string"},
                                     "source": {"type": "string"},
                                     "http_allowed": {"type": ["boolean", "null"]},
+                                    "browser_origin": {"type": ["string", "null"]},
                                     "header": {"type": ["string", "null"]},
                                     "destinations": {"type": ["array", "null"], "items": {
                                         "type": "object",
@@ -312,6 +313,10 @@ pub fn build_spec() -> serde_json::Value {
                             "type": "object",
                             "properties": {
                                 "http_allowed": {"type": "boolean"},
+                                "browser": {
+                                    "type": "object",
+                                    "properties": {"origin": {"type": ["string", "null"]}}
+                                },
                                 "destinations": {"type": "array", "items": ssh_destination}
                             }
                         }

@@ -1486,6 +1486,7 @@ mod tests {
             ScopedHttpCredential {
                 origin: "https://example.com".into(),
                 http_allowed: true,
+                browser_origin: None,
                 source: Default::default(),
                 auth: ScopedHttpAuth::ApiKey {
                     value: "fixture-key".into(),
@@ -1528,6 +1529,7 @@ mod tests {
             ScopedHttpCredential {
                 origin: "https://example.com".into(),
                 http_allowed: false,
+                browser_origin: None,
                 source: Default::default(),
                 auth: ScopedHttpAuth::ApiKey {
                     value: "fixture-key".into(),
