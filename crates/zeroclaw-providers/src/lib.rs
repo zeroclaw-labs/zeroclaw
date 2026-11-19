@@ -16,7 +16,9 @@ pub mod gemini;
 pub mod gemini_cli;
 pub mod grok_cli;
 pub mod transcription;
+pub(crate) mod transport;
 pub mod tts;
+mod vendors;
 // glm.rs excluded — not compiled in upstream (dead code with known issues)
 pub mod hailo_ollama;
 pub mod kilocli;
@@ -31,6 +33,7 @@ pub mod opencode_session;
 pub mod openrouter;
 pub mod openrouter_catalog;
 pub mod pricing;
+mod protocols;
 pub mod reliable;
 pub mod router;
 pub mod safeguard_notice;

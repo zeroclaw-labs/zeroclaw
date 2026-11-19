@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use crate::transport::HttpTransportConfig;
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use reqwest::{
@@ -91,7 +92,7 @@ fn resolve_audio_format(file_name: &str) -> Result<(String, &'static str)> {
 
 /// Validate audio data and resolve MIME type from file name.
 /// Enforces the 25 MB cloud API cap. Returns `(normalized_filename, mime_type)` on success.
-fn validate_audio(audio_data: &[u8], file_name: &str) -> Result<(String, &'static str)> {
+pub(crate) fn validate_audio(audio_data: &[u8], file_name: &str) -> Result<(String, &'static str)> {
     if audio_data.len() > MAX_AUDIO_BYTES {
         bail!(
             "Audio file too large ({} bytes, max {MAX_AUDIO_BYTES})",
@@ -119,11 +120,7 @@ fn non_empty_prompt(prompt: Option<&str>) -> Option<String> {
 /// Groq Whisper API transcription_provider (default, backward-compatible with existing config).
 pub struct GroqProvider {
     alias: String,
-    api_url: String,
-    model: String,
-    api_key: String,
-    language: Option<String>,
-    initial_prompt: Option<String>,
+    client: crate::protocols::openai::audio::TranscriptionClient,
 }
 
 impl GroqProvider {
@@ -141,11 +138,14 @@ impl GroqProvider {
 
         Ok(Self {
             alias: alias.to_string(),
-            api_url: config.api_url.clone(),
-            model: config.model.clone(),
-            api_key,
-            language: config.language.clone(),
-            initial_prompt: non_empty_prompt(config.initial_prompt.as_deref()),
+            client: crate::protocols::openai::audio::TranscriptionClient {
+                endpoint: config.api_url.clone(),
+                service_key: "transcription.groq",
+                model: config.model.clone(),
+                transport: HttpTransportConfig::with_base_url("", Some(api_key)),
+                language: config.language.clone(),
+                initial_prompt: non_empty_prompt(config.initial_prompt.as_deref()),
+            },
         })
     }
 
@@ -168,15 +168,18 @@ impl GroqProvider {
             })?;
         Ok(Self {
             alias: alias.to_string(),
-            api_url: "https://api.groq.com/openai/v1/audio/transcriptions".to_string(),
-            model: cfg
-                .model
-                .clone()
-                .filter(|model| !model.trim().is_empty())
-                .unwrap_or_else(|| "whisper-large-v3-turbo".to_string()),
-            api_key,
-            language: cfg.base.language.clone(),
-            initial_prompt: non_empty_prompt(cfg.base.initial_prompt.as_deref()),
+            client: crate::protocols::openai::audio::TranscriptionClient {
+                endpoint: "https://api.groq.com/openai/v1/audio/transcriptions".to_string(),
+                service_key: "transcription.groq",
+                model: cfg
+                    .model
+                    .clone()
+                    .filter(|model| !model.trim().is_empty())
+                    .unwrap_or_else(|| "whisper-large-v3-turbo".to_string()),
+                transport: HttpTransportConfig::with_base_url("", Some(api_key)),
+                language: cfg.base.language.clone(),
+                initial_prompt: non_empty_prompt(cfg.base.initial_prompt.as_deref()),
+            },
         })
     }
 }
@@ -188,36 +191,7 @@ impl AsrProvider for GroqProvider {
     }
 
     async fn transcribe(&self, audio_data: &[u8], file_name: &str) -> Result<String> {
-        let (normalized_name, mime) = validate_audio(audio_data, file_name)?;
-
-        let client = zeroclaw_config::schema::build_runtime_proxy_client("transcription.groq");
-
-        let file_part = Part::bytes(audio_data.to_vec())
-            .file_name(normalized_name)
-            .mime_str(mime)?;
-
-        let mut form = Form::new()
-            .part("file", file_part)
-            .text("model", self.model.clone())
-            .text("response_format", "json");
-
-        if let Some(ref lang) = self.language {
-            form = form.text("language", lang.clone());
-        }
-        if let Some(ref prompt) = self.initial_prompt {
-            form = form.text("prompt", prompt.clone());
-        }
-
-        let resp = client
-            .post(&self.api_url)
-            .bearer_auth(&self.api_key)
-            .multipart(form)
-            .timeout(std::time::Duration::from_secs(TRANSCRIPTION_TIMEOUT_SECS))
-            .send()
-            .await
-            .context("Failed to send transcription request to Groq")?;
-
-        parse_whisper_response(resp).await
+        self.client.transcribe(audio_data, file_name).await
     }
 }
 
@@ -226,11 +200,7 @@ impl AsrProvider for GroqProvider {
 /// OpenAI Whisper API transcription_provider.
 pub struct OpenAiWhisperProvider {
     alias: String,
-    api_url: String,
-    api_key: String,
-    model: String,
-    language: Option<String>,
-    initial_prompt: Option<String>,
+    client: crate::protocols::openai::audio::TranscriptionClient,
 }
 
 impl OpenAiWhisperProvider {
@@ -248,11 +218,14 @@ impl OpenAiWhisperProvider {
 
         Ok(Self {
             alias: alias.to_string(),
-            api_url: "https://api.openai.com/v1/audio/transcriptions".to_string(),
-            api_key,
-            model: config.model.clone(),
-            language: None,
-            initial_prompt: None,
+            client: crate::protocols::openai::audio::TranscriptionClient {
+                endpoint: "https://api.openai.com/v1/audio/transcriptions".to_string(),
+                service_key: "transcription.openai",
+                transport: HttpTransportConfig::with_base_url("", Some(api_key)),
+                model: config.model.clone(),
+                language: None,
+                initial_prompt: None,
+            },
         })
     }
 
@@ -275,15 +248,18 @@ impl OpenAiWhisperProvider {
             })?;
         Ok(Self {
             alias: alias.to_string(),
-            api_url: "https://api.openai.com/v1/audio/transcriptions".to_string(),
-            api_key,
-            model: cfg
-                .model
-                .clone()
-                .filter(|model| !model.trim().is_empty())
-                .unwrap_or_else(|| "whisper-1".to_string()),
-            language: cfg.base.language.clone(),
-            initial_prompt: non_empty_prompt(cfg.base.initial_prompt.as_deref()),
+            client: crate::protocols::openai::audio::TranscriptionClient {
+                endpoint: "https://api.openai.com/v1/audio/transcriptions".to_string(),
+                service_key: "transcription.openai",
+                transport: HttpTransportConfig::with_base_url("", Some(api_key)),
+                model: cfg
+                    .model
+                    .clone()
+                    .filter(|model| !model.trim().is_empty())
+                    .unwrap_or_else(|| "whisper-1".to_string()),
+                language: cfg.base.language.clone(),
+                initial_prompt: non_empty_prompt(cfg.base.initial_prompt.as_deref()),
+            },
         })
     }
 }
@@ -295,35 +271,7 @@ impl AsrProvider for OpenAiWhisperProvider {
     }
 
     async fn transcribe(&self, audio_data: &[u8], file_name: &str) -> Result<String> {
-        let (normalized_name, mime) = validate_audio(audio_data, file_name)?;
-
-        let client = zeroclaw_config::schema::build_runtime_proxy_client("transcription.openai");
-
-        let file_part = Part::bytes(audio_data.to_vec())
-            .file_name(normalized_name)
-            .mime_str(mime)?;
-
-        let mut form = Form::new()
-            .part("file", file_part)
-            .text("model", self.model.clone())
-            .text("response_format", "json");
-        if let Some(language) = &self.language {
-            form = form.text("language", language.clone());
-        }
-        if let Some(prompt) = &self.initial_prompt {
-            form = form.text("prompt", prompt.clone());
-        }
-
-        let resp = client
-            .post(&self.api_url)
-            .bearer_auth(&self.api_key)
-            .multipart(form)
-            .timeout(std::time::Duration::from_secs(TRANSCRIPTION_TIMEOUT_SECS))
-            .send()
-            .await
-            .context("Failed to send transcription request to OpenAI")?;
-
-        parse_whisper_response(resp).await
+        self.client.transcribe(audio_data, file_name).await
     }
 }
 
@@ -1824,7 +1772,7 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(groq.model, "whisper-large-v3-turbo");
+        assert_eq!(groq.client.model, "whisper-large-v3-turbo");
 
         let mut openai = OpenAiWhisperProvider::from_typed_config(
             "default",
@@ -1834,8 +1782,8 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(openai.model, "whisper-1");
-        assert_eq!(openai.language.as_deref(), Some("it"));
+        assert_eq!(openai.client.model, "whisper-1");
+        assert_eq!(openai.client.language.as_deref(), Some("it"));
 
         let mut deepgram = DeepgramProvider::from_typed_config(
             "default",
@@ -1856,7 +1804,7 @@ mod tests {
             })))
             .mount(&server)
             .await;
-        openai.api_url = format!("{}/openai", server.uri());
+        openai.client.endpoint = format!("{}/openai", server.uri());
         deepgram.api_url = format!("{}/deepgram", server.uri());
         openai.transcribe(b"audio", "voice.wav").await.unwrap();
         deepgram.transcribe(b"audio", "voice.wav").await.unwrap();
@@ -1948,11 +1896,11 @@ mod tests {
         .unwrap();
 
         for provider in [&mut legacy_groq, &mut typed_groq] {
-            provider.api_url = format!("{}/groq", server.uri());
+            provider.client.endpoint = format!("{}/groq", server.uri());
             provider.transcribe(b"audio", "voice.wav").await.unwrap();
         }
         for provider in [&mut typed_openai, &mut blank_openai] {
-            provider.api_url = format!("{}/openai", server.uri());
+            provider.client.endpoint = format!("{}/openai", server.uri());
             provider.transcribe(b"audio", "voice.wav").await.unwrap();
         }
 
