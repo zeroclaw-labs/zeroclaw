@@ -86,7 +86,7 @@ live catalog contains the configured ID, and an agent request returns output.
 API-key verification and Codex-subscription verification are independent.
 
 The alias half (`coding`, `review`) is operator-chosen; pick whatever fits.
-Reference it from an agent with `model_provider = "openai.coding"`.
+Reference it from an agent with `model_provider = "chat.openai.coding"`.
 
 ## Models
 
