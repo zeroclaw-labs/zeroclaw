@@ -87,7 +87,7 @@ impl TryFrom<Element> for XhtmlIm {
                         return Err(Error::Other(
                             "Two identical language bodies found in XHTML-IM.",
                         )
-                        .into())
+                        .into());
                     }
                 }
             } else {
@@ -302,9 +302,7 @@ impl Tag {
                 let style = write_attr(get_style_string(style), "style");
                 format!("<ul{}>{}</ul>", style, children_to_html(children))
             }
-            Tag::Unknown(_) => {
-                panic!("No unknown element should be present in XHTML-IM after parsing.")
-            }
+            Tag::Unknown(children) => children_to_html(children),
         }
     }
 }
@@ -462,9 +460,7 @@ impl From<Tag> for Element {
                 },
                 children,
             ),
-            Tag::Unknown(_) => {
-                panic!("No unknown element should be present in XHTML-IM after parsing.")
-            }
+            Tag::Unknown(children) => ("span", vec![], children),
         };
         let mut builder = Element::builder(name, ns::XHTML).append_all(children_to_nodes(children));
         for (key, value) in attrs {
@@ -612,7 +608,10 @@ mod tests {
         assert_eq!(html, "Hello world!");
 
         let elem = Element::from(parsed2);
-        assert_eq!(String::from(&elem), "<html xmlns='http://jabber.org/protocol/xhtml-im'><body xmlns='http://www.w3.org/1999/xhtml'>Hello world!</body></html>");
+        assert_eq!(
+            String::from(&elem),
+            "<html xmlns='http://jabber.org/protocol/xhtml-im'><body xmlns='http://www.w3.org/1999/xhtml'>Hello world!</body></html>"
+        );
     }
 
     #[test]

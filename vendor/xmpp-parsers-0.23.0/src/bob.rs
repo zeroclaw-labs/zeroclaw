@@ -7,7 +7,7 @@
 use alloc::borrow::Cow;
 use core::str::FromStr;
 
-use xso::{error::Error, text::Base64, AsXml, AsXmlText, FromXml, FromXmlText};
+use xso::{AsXml, AsXmlText, FromXml, FromXmlText, error::Error, text::Base64};
 
 use crate::hashes::{Algo, Hash};
 use crate::ns;
@@ -38,7 +38,7 @@ impl FromStr for ContentId {
         let algo = match algo {
             "sha1" => Algo::Sha_1,
             "sha256" => Algo::Sha_256,
-            _ => unimplemented!(),
+            _ => return Err(Error::Other("Unsupported CID hash algorithm.")),
         };
         let hash = Hash::from_hex(algo, hex).map_err(Error::text_parse_error)?;
         Ok(ContentId { hash })
@@ -56,7 +56,7 @@ impl AsXmlText for ContentId {
         let algo = match self.hash.algo {
             Algo::Sha_1 => "sha1",
             Algo::Sha_256 => "sha256",
-            _ => unimplemented!(),
+            _ => return Err(Error::Other("Unsupported CID hash algorithm.")),
         };
         Ok(Cow::Owned(format!(
             "{}+{}@bob.xmpp.org",
@@ -71,7 +71,7 @@ impl IntoAttributeValue for ContentId {
         let algo = match self.hash.algo {
             Algo::Sha_1 => "sha1",
             Algo::Sha_256 => "sha256",
-            _ => unimplemented!(),
+            _ => return None,
         };
         Some(format!("{}+{}@bob.xmpp.org", algo, self.hash.to_hex()))
     }
