@@ -323,6 +323,27 @@ fn registry_save_rejects_deleting_a_legacy_embedding_connection_atomically() {
 }
 
 #[test]
+fn registry_save_rejects_deleting_the_configured_vision_model() {
+    let mut config = config();
+    config.multimodal.vision_model_provider = Some("chat.fast.us".into());
+    let mut config = admit(config);
+    let expected = snapshot(&config).unwrap();
+    let mut registry = expected.clone();
+    registry["models"]
+        .as_object_mut()
+        .unwrap()
+        .remove("chat.fast.us");
+
+    let error = stage(&mut config, RegistryEdit { expected, registry }).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("invalid multimodal.vision_model_provider"),
+        "{error:#}"
+    );
+}
+
+#[test]
 fn connection_presets_require_matching_capabilities_even_without_models() {
     use zeroclaw_config::provider_registry::ProviderRegistry;
 

@@ -299,7 +299,8 @@ pub struct ModelSelection<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::ProviderRegistry;
+    use super::{ModelDefinition, ProviderRegistry};
+    use serde_json::json;
 
     const CHAT_CONNECTIONS_AND_MODELS: &str = r#"
 [connections.primary]

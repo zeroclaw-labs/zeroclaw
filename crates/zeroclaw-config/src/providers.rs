@@ -1048,7 +1048,7 @@ pub(crate) mod canonical_connection_secrets {
 
     pub fn mask_secrets(providers: &mut Providers) {
         for connection in providers.connections.values_mut() {
-            connection.mask_secrets();
+            let _ = connection.mask_secrets();
         }
     }
 

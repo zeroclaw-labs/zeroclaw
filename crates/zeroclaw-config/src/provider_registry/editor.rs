@@ -46,7 +46,7 @@ pub fn snapshot(config: &Config) -> Result<Value> {
     mac.update(&serde_json::to_vec(&registry)?);
     let revision = hex::encode(mac.finalize().into_bytes());
     for connection in registry.connections.values_mut() {
-        connection.mask_secrets();
+        connection.mask_secrets()?;
     }
     let mut document = serde_json::to_value(RegistrySnapshot { registry, revision })?;
     for section in ["connections", "models", "model_presets", "fallback"] {
@@ -218,6 +218,7 @@ pub fn stage(config: &mut Config, edit: RegistryEdit) -> Result<()> {
         .onepassword_reference_snapshots
         .extend(new_references);
     candidate.validate()?;
+    let registry = candidate.provider_registry()?;
     // Memory's canonical model reference is outside the provider graph. Do
     // not admit deletion or a capability change while that consumer still
     // points at the model: its live embedder must never retain an old view.
@@ -228,10 +229,20 @@ pub fn stage(config: &mut Config, edit: RegistryEdit) -> Result<()> {
         .map(str::trim)
         .filter(|reference| !reference.is_empty())
     {
-        candidate
-            .provider_registry()?
+        registry
             .resolve_embedding(&super::ModelRef::from(reference))
             .context("invalid memory.embedding_model_ref")?;
+    }
+    if let Some(reference) = candidate
+        .multimodal
+        .vision_model_provider
+        .as_deref()
+        .map(str::trim)
+        .filter(|reference| !reference.is_empty())
+    {
+        registry
+            .resolve_chat(&super::ModelRef::from(reference))
+            .context("invalid multimodal.vision_model_provider")?;
     }
     candidate.mark_dirty("providers");
     *config = candidate;
