@@ -392,7 +392,14 @@ pub fn build_spec() -> serde_json::Value {
                     }}}
                 },
                 "responses": {
-                    "200": {"description": "Only the resulting configured state"},
+                    "200": {
+                        "description": "Only the resulting configured state",
+                        "content": {"application/json": {"schema": {
+                            "type": "object",
+                            "required": ["configured"],
+                            "properties": {"configured": {"type": "boolean"}}
+                        }}}
+                    },
                     "400": {"description": "Invalid credential request"},
                     "403": {"description": "Authenticated operator required"},
                     "404": {"description": "Binding not found"},
