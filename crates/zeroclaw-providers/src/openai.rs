@@ -1347,8 +1347,10 @@ impl OpenAiResponsesModelProvider {
 
     fn streaming_timeouts(&self) -> super::StreamTimeouts {
         super::StreamTimeouts {
-            request: (self.timeout_configured && !self.timeout_disabled)
-                .then(|| std::time::Duration::from_secs(self.timeout_secs)),
+            // Preserve the legacy stream lifetime: timeout_secs is a
+            // non-stream deadline, while stream total deadlines are a
+            // separate canonical option introduced by the cutover layer.
+            request: None,
             read: (!self.read_timeout_disabled).then(|| {
                 self.read_timeout_secs.map_or_else(
                     || super::stream_idle_timeout(self.timeout_secs),

@@ -1173,8 +1173,10 @@ impl OpenAiCompatibleModelProvider {
 
     fn streaming_timeouts(&self) -> super::StreamTimeouts {
         super::StreamTimeouts {
-            request: (self.timeout_configured && !self.timeout_disabled)
-                .then(|| std::time::Duration::from_secs(self.timeout_secs)),
+            // The legacy timeout bounds non-streaming requests and raises the
+            // read-idle floor. A streaming total deadline is supplied by the
+            // later canonical `stream_request_timeout_secs` consumer.
+            request: None,
             read: (!self.read_timeout_disabled).then(|| {
                 self.read_timeout_secs.map_or_else(
                     || super::stream_idle_timeout(self.timeout_secs),

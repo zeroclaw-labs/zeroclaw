@@ -228,7 +228,7 @@ impl OllamaModelProvider {
 
         if requests_cloud && official_cloud_endpoint && self.api_key.is_none() {
             anyhow::bail!(
-                "Model '{}' requested cloud routing, but no API key is configured. Set auth.api_key on [providers.connections.<key>] or via the schema-mirror grammar.",
+                "Model '{}' requested cloud routing, but no API key is configured. Set auth.api_key on [providers.models.ollama.<alias>] or via the schema-mirror grammar.",
                 model
             );
         }
@@ -1077,7 +1077,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("Set auth.api_key on [providers.connections.<key>]")
+                .contains("Set auth.api_key on [providers.models.ollama.<alias>]")
         );
     }
 

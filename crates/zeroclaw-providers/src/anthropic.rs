@@ -2513,9 +2513,8 @@ impl AnthropicModelProvider {
     /// headers and the complete body; read-idle protection is independent.
     fn streaming_http_client(&self) -> Result<Client, reqwest::Error> {
         let mut builder = Client::builder().connect_timeout(std::time::Duration::from_secs(10));
-        if self.timeout_configured && !self.timeout_disabled {
-            builder = builder.timeout(std::time::Duration::from_secs(self.timeout_secs));
-        }
+        // Legacy timeout_secs is intentionally absent from streaming clients;
+        // the canonical stream total deadline is a separate option.
         let builder = if self.read_timeout_disabled {
             builder
         } else if let Some(read_timeout) = self.read_timeout_secs {
@@ -4284,8 +4283,8 @@ data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"type\":\"message\"
             .expect("successful stream must finish after exceeding the request timeout");
 
             assert_eq!(text, "hi");
-            assert_eq!(saw_final, deadline != "finite", "{deadline}");
-            assert_eq!(failed, deadline == "finite", "{deadline}");
+            assert!(saw_final, "{deadline}");
+            assert!(!failed, "{deadline}");
         }
         server.abort();
     }

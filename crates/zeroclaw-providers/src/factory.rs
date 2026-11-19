@@ -364,7 +364,7 @@ pub fn apply_compat_options(
     if let Some(extra) = &opts.provider_extra
         && !extra.is_object()
     {
-        let config_path = format!("providers.models[{:?}].options.provider_extra", p.alias);
+        let config_path = format!("providers.models.<family>.<alias>.provider_extra", p.alias);
         ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -381,7 +381,7 @@ pub fn apply_compat_options(
         && !kwargs.is_object()
     {
         let config_path = format!(
-            "providers.models[{:?}].options.chat_template_kwargs",
+            "providers.models.<family>.<alias>.chat_template_kwargs",
             p.alias
         );
         ::zeroclaw_log::record!(
@@ -1600,7 +1600,7 @@ impl FamilyProviderFactory for AzureModelProviderConfig {
             );
             anyhow::Error::msg(
                 "Azure model_provider requires `resource`: set \
-                 `[providers.connections.<key>.extra] resource = \"...\"` in config.toml.",
+                 `[providers.models.<family>.<alias>] provider_extra = { resource = \"...\" }` in config.toml.",
             )
         })?;
         let deployment = self.deployment.as_deref().ok_or_else(|| {
@@ -1617,7 +1617,7 @@ impl FamilyProviderFactory for AzureModelProviderConfig {
             );
             anyhow::Error::msg(
                 "Azure model_provider requires `deployment`: set \
-                 `[providers.models.<key>.extra] deployment = \"...\"` in config.toml.",
+                 `[providers.models.<family>.<alias>] provider_extra = { deployment = \"...\" }` in config.toml.",
             )
         })?;
         let api_version = self.api_version.as_deref();
@@ -2040,7 +2040,7 @@ impl FamilyProviderFactory for CustomModelProviderConfig {
             );
             anyhow::Error::msg(
                 "Custom model_provider requires `uri`: set \
-                 `[providers.connections.<key>] uri = \"https://your-api.com\"` in config.toml.",
+                 `[providers.models.<family>.<alias>] uri = \"https://your-api.com\"` in config.toml.",
             )
         })?;
         if let Some(p) = build_responses_provider_if_requested(
@@ -2086,7 +2086,7 @@ impl FamilyProviderFactory for zeroclaw_config::schema::ModelProviderConfig {
         let base_url = api_url.ok_or_else(|| {
             anyhow::Error::msg(
                 "OpenAI-compatible model_provider requires `uri`: set \
-                 `[providers.connections.<key>] uri = \"https://your-api.com\"` in config.toml.",
+                 `[providers.models.<family>.<alias>] uri = \"https://your-api.com\"` in config.toml.",
             )
         })?;
         if let Some(p) = build_responses_provider_if_requested(
