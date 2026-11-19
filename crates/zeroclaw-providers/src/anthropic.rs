@@ -4488,6 +4488,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             .apply_auth(
                 model_provider
                     .http_client()
+                    .expect("HTTP client should build")
                     .get("https://api.anthropic.com/v1/models"),
                 "sk-ant-oat01-test-token",
                 false,
@@ -4527,6 +4528,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             .apply_auth(
                 model_provider
                     .http_client()
+                    .expect("HTTP client should build")
                     .get("https://api.anthropic.com/v1/models"),
                 "sk-ant-api-key",
                 false,
@@ -4563,6 +4565,7 @@ data: {\"type\":\"message_stop\"}\n\n";
                 .apply_auth(
                     model_provider
                         .http_client()
+                        .expect("HTTP client should build")
                         .get("https://api.anthropic.com/v1/models"),
                     credential,
                     false,
@@ -10708,6 +10711,7 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"refusal\"},\"usag
             .apply_auth(
                 model_provider
                     .http_client()
+                    .expect("HTTP client should build")
                     .get("https://api.anthropic.com/v1/models"),
                 "sk-ant-api-key",
                 true,
@@ -10733,6 +10737,7 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"refusal\"},\"usag
             .apply_auth(
                 model_provider
                     .http_client()
+                    .expect("HTTP client should build")
                     .get("https://api.anthropic.com/v1/models"),
                 "sk-ant-oat01-test-token",
                 true,
