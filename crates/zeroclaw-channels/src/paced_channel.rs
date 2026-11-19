@@ -617,6 +617,38 @@ mod tests {
         }
     }
 
+    /// A paced wrapper whose queue the test can read, built as `wrap` builds
+    /// one for a non-zero interval and depth.
+    fn inspectable(inner: Arc<dyn Channel>, cfg: &PacingFixture) -> Arc<PacedChannel> {
+        Arc::new(PacedChannel {
+            inner,
+            min_interval: Duration::from_secs(cfg.interval_secs),
+            queue_depth: usize::from(cfg.depth),
+            recipients: Arc::new(Mutex::new(RecipientMap::new())),
+        })
+    }
+
+    /// Yield until `recipient` has `depth` sends queued. Callers run on a
+    /// paused clock and this loop never sleeps, so the runtime is never idle
+    /// long enough for the clock to advance: the drain worker's pacing sleep
+    /// cannot end and empty the queue before the caller acts on it.
+    async fn wait_until_queued(paced: &PacedChannel, recipient: &str, depth: usize) {
+        for _ in 0..10_000 {
+            let queued = paced
+                .recipients
+                .lock()
+                .await
+                .inner
+                .get(recipient)
+                .map_or(0, |state| state.queue.len());
+            if queued >= depth {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("{recipient} never had {depth} sends queued");
+    }
+
     struct CountingChannel {
         sends: AtomicUsize,
         final_sends: AtomicUsize,
@@ -877,7 +909,7 @@ mod tests {
         assert_eq!(counting.sends.load(Ordering::SeqCst), 2);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn queue_overflow_drops_newest_and_reports_the_drop() {
         let counting = Arc::new(CountingChannel {
             sends: AtomicUsize::new(0),
@@ -889,7 +921,7 @@ mod tests {
             interval_secs: 1,
             depth: 2,
         };
-        let paced = PacedChannel::wrap(inner, &cfg);
+        let paced = inspectable(inner, &cfg);
         // First send fires immediately and starts the floor (next allowed
         // ~1s out). It also takes no path through the queue, so the worker
         // is not yet spawned.
@@ -911,10 +943,9 @@ mod tests {
             zeroclaw_spawn::spawn!(
                 async move { paced_b.send(&SendMessage::new("b", "alice")).await }
             );
-        // Yield enough times for both spawned tasks to make it past the
-        // lock acquire and into the queue. 50ms is well inside the 1s
-        // pacing floor so the worker hasn't drained anything yet.
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // Wait until both are queued. The clock is paused, so the worker's
+        // 1s pacing sleep cannot end and drain them in the meantime.
+        wait_until_queued(&paced, "alice", 2).await;
         // The third lands while the queue is full → dropped, and the caller is
         // told so. Reporting `Ok` here would be indistinguishable from delivery.
         let overflow = paced.send(&SendMessage::new("overflow", "alice")).await;
@@ -938,7 +969,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn queue_overflow_reports_the_drop_for_finalize_draft_too() {
         // The orchestrator falls back to sending a new message when
         // `finalize_draft` fails. That fallback only runs if the dropped
@@ -953,7 +984,7 @@ mod tests {
             interval_secs: 1,
             depth: 1,
         };
-        let paced = PacedChannel::wrap(inner, &cfg);
+        let paced = inspectable(inner, &cfg);
         paced
             .send(&SendMessage::new("first", "carol"))
             .await
@@ -962,7 +993,9 @@ mod tests {
         let queued = zeroclaw_spawn::spawn!(async move {
             paced_q.send(&SendMessage::new("queued", "carol")).await
         });
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // The queued send holds the only slot; the paused clock keeps the
+        // worker from draining it before the finalize arrives.
+        wait_until_queued(&paced, "carol", 1).await;
         let dropped = paced
             .finalize_draft("carol", "draft-1", "final text", false)
             .await;
