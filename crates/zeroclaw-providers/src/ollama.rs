@@ -1507,7 +1507,7 @@ mod tests {
     fn raw_response_text_strips_think_tags_before_runtime_cutover() {
         assert_eq!(
             OllamaModelProvider::raw_response_text("<think>reasoning</think> hello", None,),
-            Some(" hello".to_string())
+            Some("hello".to_string())
         );
     }
 
