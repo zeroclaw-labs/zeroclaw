@@ -3237,12 +3237,12 @@ fn map_key_for_section_arg<'a>(section_path: &str, section_arg: &'a str) -> Opti
 fn alias_target_for_path<'a>(
     path: &'a str,
     split: impl Fn(&str, &'a str) -> Option<&'a str>,
-) -> Option<(&'static str, &'a str)> {
+) -> Option<(String, &'a str)> {
     Config::map_key_sections()
         .into_iter()
         .filter(|section| section.kind == zeroclaw_config::traits::MapKeyKind::Map)
         .filter(|section| !section.resource_key)
-        .filter_map(|section| split(section.path, path).map(|key| (section.path, key)))
+        .filter_map(|section| split(section.path.as_str(), path).map(|key| (section.path, key)))
         .max_by_key(|(section_path, _)| section_path.len())
 }
 
@@ -3258,7 +3258,7 @@ fn init_map_alias(config: &mut Config, section_arg: &str) -> Result<Option<Strin
     else {
         return Ok(None);
     };
-    match zeroclaw_config::alias_refs::create_map_key_checked(config, section_path, alias) {
+    match zeroclaw_config::alias_refs::create_map_key_checked(config, &section_path, alias) {
         Ok(true) => Ok(Some(format!("{section_path}.{alias}"))),
         Ok(false) => Ok(None),
         Err(e) => Err(anyhow::Error::msg(e.to_string())),
@@ -3298,7 +3298,7 @@ fn ensure_map_key_for_prop_path(config: &mut Config, prop_path: &str) -> Result<
     // which also skips creation for existing keys so alias validation runs only
     // when auto-materializing a brand-new alias.
     if config
-        .get_map_keys(section_path)
+        .get_map_keys(&section_path)
         .is_some_and(|keys| keys.iter().any(|k| k == key))
     {
         return Ok(false);
@@ -3312,7 +3312,7 @@ fn ensure_map_key_for_prop_path(config: &mut Config, prop_path: &str) -> Result<
     // agents.default.enabled ...` auto-create the reserved runtime-fallback
     // agent alias, which the rename guard then refuses to ever rename.
     let created =
-        match zeroclaw_config::alias_refs::create_map_key_checked(config, section_path, key) {
+        match zeroclaw_config::alias_refs::create_map_key_checked(config, &section_path, key) {
             Ok(created) => created,
             Err(zeroclaw_config::alias_refs::CreateError::Reserved(_)) => return Ok(false),
             Err(e) => return Err(anyhow::Error::msg(e.to_string())),
@@ -3332,7 +3332,7 @@ fn ensure_map_key_for_prop_path(config: &mut Config, prop_path: &str) -> Result<
         // ALREADY-EXISTING alias would delete a legitimate, pre-existing
         // config entry that has nothing to do with this call.
         if config.get_prop(prop_path).is_err() && !Config::prop_is_secret(prop_path) {
-            let _ = config.delete_map_key(section_path, key);
+            let _ = config.delete_map_key(&section_path, key);
             return Ok(false);
         }
         config.mark_dirty(&format!("{section_path}.{key}"));
@@ -13165,9 +13165,10 @@ Add pricing to the active provider profile or supply a catalog entry."
             }
             ConfigCommands::Init { section, json } => {
                 #[cfg(feature = "agent-runtime")]
-                let _offline_ownership = if let Some(("agents", alias)) = section
+                let _offline_ownership = if let Some((_, alias)) = section
                     .as_deref()
                     .and_then(|arg| alias_target_for_path(arg, map_key_for_section_arg))
+                    .filter(|(path, _)| path == "agents")
                 {
                     match crate::alias_cli::route_agent_mutation(
                         &mut config,
