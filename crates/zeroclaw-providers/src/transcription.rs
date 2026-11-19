@@ -794,6 +794,7 @@ impl GoogleSttProvider {
         Ok(Self {
             alias: alias.to_string(),
             api_key,
+            endpoint: GOOGLE_STT_ENDPOINT.into(),
             language_code: config.language_code.clone(),
             request_timeout_secs: None,
         })
@@ -820,6 +821,7 @@ impl GoogleSttProvider {
         Ok(Self {
             alias: alias.to_string(),
             api_key,
+            endpoint: GOOGLE_STT_ENDPOINT.into(),
             language_code: cfg
                 .base
                 .language
@@ -2153,6 +2155,7 @@ mod tests {
         let provider = GoogleSttProvider {
             alias: "default".to_string(),
             api_key: "api-key-123".to_string(),
+            endpoint: GOOGLE_STT_ENDPOINT.to_string(),
             language_code: "en-US".to_string(),
             request_timeout_secs: None,
         };
@@ -2190,6 +2193,7 @@ mod tests {
         let provider = GoogleSttProvider {
             alias: "default".to_string(),
             api_key: api_key.to_string(),
+            endpoint: GOOGLE_STT_ENDPOINT.to_string(),
             language_code: "en-US".to_string(),
             request_timeout_secs: None,
         };

@@ -22,6 +22,7 @@ pub struct OpenRouterModelProvider {
     credential: Option<String>,
     timeout_secs: u64,
     timeout_disabled: bool,
+    stream_request_timeout: super::StreamRequestTimeout,
     read_timeout_secs: Option<u64>,
     read_timeout_disabled: bool,
     max_tokens: Option<u32>,
@@ -216,6 +217,7 @@ pub struct OpenRouterBuilder {
     credential: Option<String>,
     timeout_secs: Option<u64>,
     timeout_disabled: bool,
+    stream_request_timeout: super::StreamRequestTimeout,
     read_timeout_secs: Option<u64>,
     read_timeout_disabled: bool,
     max_tokens: Option<u32>,
@@ -225,6 +227,10 @@ pub struct OpenRouterBuilder {
 }
 
 impl OpenRouterBuilder {
+    pub(crate) fn stream_request_timeout(mut self, timeout: super::StreamRequestTimeout) -> Self {
+        self.stream_request_timeout = timeout;
+        self
+    }
     /// Explicit API credential. Whitespace-only inputs collapse to
     /// `None`.
     pub fn credential(mut self, credential: Option<&str>) -> Self {
@@ -289,6 +295,7 @@ impl OpenRouterBuilder {
                 .timeout_secs
                 .unwrap_or(zeroclaw_api::model_provider::BASELINE_TIMEOUT_SECS),
             timeout_disabled: self.timeout_disabled,
+            stream_request_timeout: self.stream_request_timeout,
             read_timeout_secs: self.read_timeout_secs,
             read_timeout_disabled: self.read_timeout_disabled,
             max_tokens: self.max_tokens,
@@ -308,6 +315,7 @@ impl OpenRouterModelProvider {
             credential: None,
             timeout_secs: None,
             timeout_disabled: false,
+            stream_request_timeout: None,
             read_timeout_secs: None,
             read_timeout_disabled: false,
             max_tokens: None,
@@ -593,10 +601,10 @@ impl OpenRouterModelProvider {
 
     fn streaming_timeouts(&self) -> super::StreamTimeouts {
         super::StreamTimeouts {
-            // Legacy timeout_secs must not terminate an active stream. The
-            // canonical streaming total deadline is wired by the cutover
-            // layer separately.
-            request: None,
+            request: super::stream_request_timeout(
+                &self.stream_request_timeout,
+                (!self.timeout_disabled).then(|| Duration::from_secs(self.timeout_secs)),
+            ),
             read: (!self.read_timeout_disabled).then(|| {
                 self.read_timeout_secs
                     .map_or(super::StreamIdleBound::Fixed(STREAM_IDLE_TIMEOUT), |secs| {

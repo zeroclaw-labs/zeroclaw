@@ -1059,6 +1059,7 @@ pub struct OpenAiResponsesModelProvider {
     /// is supplied by the later runtime cutover. Default: 120.
     timeout_secs: u64,
     timeout_disabled: bool,
+    stream_request_timeout: super::StreamRequestTimeout,
     read_timeout_secs: Option<u64>,
     read_timeout_disabled: bool,
     extra_headers: std::collections::HashMap<String, String>,
@@ -1083,12 +1084,17 @@ pub struct OpenAiResponsesBuilder {
     reasoning_effort: Option<String>,
     timeout_secs: Option<u64>,
     timeout_disabled: bool,
+    stream_request_timeout: super::StreamRequestTimeout,
     read_timeout_secs: Option<u64>,
     read_timeout_disabled: bool,
     extra_headers: std::collections::HashMap<String, String>,
 }
 
 impl OpenAiResponsesBuilder {
+    pub(crate) fn stream_request_timeout(mut self, timeout: super::StreamRequestTimeout) -> Self {
+        self.stream_request_timeout = timeout;
+        self
+    }
     pub(crate) fn single_tool_rounds_supported(mut self, supported: bool) -> Self {
         self.single_tool_rounds_supported = supported;
         self
@@ -1181,6 +1187,7 @@ impl OpenAiResponsesBuilder {
             reasoning_effort: self.reasoning_effort,
             timeout_secs: self.timeout_secs.unwrap_or(120),
             timeout_disabled: self.timeout_disabled,
+            stream_request_timeout: self.stream_request_timeout,
             read_timeout_secs: self.read_timeout_secs,
             read_timeout_disabled: self.read_timeout_disabled,
             extra_headers: self.extra_headers,
@@ -1201,6 +1208,7 @@ impl OpenAiResponsesModelProvider {
             reasoning_effort: None,
             timeout_secs: None,
             timeout_disabled: false,
+            stream_request_timeout: None,
             read_timeout_secs: None,
             read_timeout_disabled: false,
             extra_headers: std::collections::HashMap::new(),
@@ -1333,10 +1341,10 @@ impl OpenAiResponsesModelProvider {
 
     fn streaming_timeouts(&self) -> super::StreamTimeouts {
         super::StreamTimeouts {
-            // Preserve the legacy stream lifetime: timeout_secs is a
-            // non-stream deadline, while stream total deadlines are a
-            // separate canonical option introduced by the cutover layer.
-            request: None,
+            request: super::stream_request_timeout(
+                &self.stream_request_timeout,
+                (!self.timeout_disabled).then(|| std::time::Duration::from_secs(self.timeout_secs)),
+            ),
             read: (!self.read_timeout_disabled).then(|| {
                 self.read_timeout_secs.map_or_else(
                     || super::stream_idle_timeout(self.timeout_secs),
