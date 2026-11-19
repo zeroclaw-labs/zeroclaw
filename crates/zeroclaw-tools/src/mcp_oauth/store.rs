@@ -9,7 +9,9 @@
 use anyhow::{Context, Result, bail};
 use reqwest::Url;
 use std::path::Path;
-use zeroclaw_providers::auth::profiles::{AuthProfile, AuthProfilesStore, TokenSet, profile_id};
+use zeroclaw_providers::auth::profiles::{
+    AuthProfile, AuthProfilesStore, REQUIRES_ENCRYPTED_STORAGE, TokenSet, profile_id,
+};
 
 use super::resource::CanonicalResource;
 
@@ -84,6 +86,11 @@ pub fn profile_name_for(canonical: &CanonicalResource) -> String {
 /// long-lived MCP refresh token in a plaintext state file is the exact leak
 /// this feature promises not to have. (Provider OAuth profiles accept
 /// plaintext by operator choice; MCP OAuth does not offer that choice.)
+///
+/// That refusal only binds writers this constructor sees, so the requirement
+/// travels with each row as [`REQUIRES_ENCRYPTED_STORAGE`] and the shared
+/// profile store writes a marked row sealed whatever its own setting is:
+/// flipping `secrets.encrypt` off afterwards cannot expose a signed-in grant.
 #[derive(Clone)]
 pub struct McpTokenStore {
     store: AuthProfilesStore,
@@ -182,6 +189,15 @@ impl McpTokenStore {
         profile
             .metadata
             .insert(META_RESOURCE.to_string(), canonical.resource().to_string());
+        // The refusal above only binds writers this constructor sees. Grants
+        // live in the profile store every other credential writes to, so the
+        // requirement travels with the row: a provider token pasted, or a
+        // different sign-in logged out, while `secrets.encrypt = false`
+        // re-saves this whole file, and a marked row is written sealed by that
+        // writer too instead of being dropped into plaintext.
+        profile
+            .metadata
+            .insert(REQUIRES_ENCRYPTED_STORAGE.to_string(), "true".to_string());
         self.store
             .upsert_profile(profile, false)
             .await
@@ -533,6 +549,27 @@ mod tests {
             .expect("present");
         assert_eq!(loaded.tokens.access_token, "rotated");
         assert_eq!(loaded.client_id, "cid");
+
+        // The rotation edited the row it loaded, so the storage promise the
+        // sign-in made travels with it.
+        let rows = AuthProfilesStore::new(tmp.path(), true)
+            .load()
+            .await
+            .expect("profiles");
+        let row = rows
+            .profiles
+            .get(&profile_id(
+                MCP_MODEL_PROVIDER,
+                &profile_name_for(&canonical),
+            ))
+            .expect("the MCP row");
+        assert_eq!(
+            row.metadata
+                .get(REQUIRES_ENCRYPTED_STORAGE)
+                .map(String::as_str),
+            Some("true"),
+            "a rotation must keep the storage requirement the sign-in declared"
+        );
 
         // Rotating onto a vanished profile fails closed.
         assert!(

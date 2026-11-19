@@ -86,6 +86,17 @@ impl std::fmt::Debug for AuthProfile {
     }
 }
 
+/// Profile-metadata key marking a credential that must never be rewritten as
+/// plaintext, whichever writer saves this store. A writer configured with
+/// `secrets.encrypt = false` decrypts every profile it reloads and saves the
+/// whole file back verbatim, so a credential whose owner refused plaintext has
+/// to carry the refusal in the row itself: without it, an unrelated credential
+/// change (pasting a provider token, or logging out a different sign-in)
+/// silently drops the protection that was promised at sign-in. MCP OAuth sets
+/// it on its grants; [`AuthProfilesStore`] writes a marked row sealed whatever
+/// its own setting is.
+pub const REQUIRES_ENCRYPTED_STORAGE: &str = "requires_encrypted_storage";
+
 impl AuthProfile {
     pub fn new_oauth(model_provider: &str, profile_name: &str, token_set: TokenSet) -> Self {
         let now = Utc::now();
@@ -121,6 +132,15 @@ impl AuthProfile {
             created_at: now,
             updated_at: now,
         }
+    }
+
+    /// Whether this row declared [`REQUIRES_ENCRYPTED_STORAGE`] when it was
+    /// created. The declaration travels in `metadata`, which is persisted as
+    /// itself, so a writer that never decrypts anything can still honour it.
+    fn requires_encrypted_storage(&self) -> bool {
+        self.metadata
+            .get(REQUIRES_ENCRYPTED_STORAGE)
+            .is_some_and(|value| value.as_str() == "true")
     }
 }
 
@@ -369,6 +389,12 @@ impl AuthProfilesStore {
             );
         }
 
+        // Migration re-encrypts with this store's setting, so a marked row
+        // could in principle be carried here as plaintext. It is not: MCP rows
+        // are born `enc2:` under an encrypting writer, and this is the only
+        // write that does not consult `keep_sealed`. If that ever changes,
+        // route migrated marked values through `encrypt_required` here the way
+        // `save_locked` does.
         if migrated {
             self.write_persisted_locked(&persisted).await?;
         }
@@ -390,12 +416,19 @@ impl AuthProfilesStore {
         };
 
         for (id, profile) in &data.profiles {
+            // A row that declared [`REQUIRES_ENCRYPTED_STORAGE`] keeps that
+            // promise whatever this writer's setting is. The operator may have
+            // turned encryption off for other credentials, and an unrelated
+            // write (pasting a provider token, or logging out one sign-in
+            // while another remains) re-saves this file too: it must not
+            // rewrite these tokens as plaintext.
+            let keep_sealed = profile.requires_encrypted_storage();
             let (access_token, refresh_token, id_token, expires_at, token_type, scope) =
                 match (&profile.kind, &profile.token_set) {
                     (AuthProfileKind::OAuth, Some(token_set)) => (
-                        self.encrypt_optional(Some(&token_set.access_token))?,
-                        self.encrypt_optional(token_set.refresh_token.as_deref())?,
-                        self.encrypt_optional(token_set.id_token.as_deref())?,
+                        self.encrypt_optional(Some(&token_set.access_token), keep_sealed)?,
+                        self.encrypt_optional(token_set.refresh_token.as_deref(), keep_sealed)?,
+                        self.encrypt_optional(token_set.id_token.as_deref(), keep_sealed)?,
                         token_set.expires_at.as_ref().map(DateTime::to_rfc3339),
                         token_set.token_type.clone(),
                         token_set.scope.clone(),
@@ -403,7 +436,7 @@ impl AuthProfilesStore {
                     _ => (None, None, None, None, None, None),
                 };
 
-            let token = self.encrypt_optional(profile.token.as_deref())?;
+            let token = self.encrypt_optional(profile.token.as_deref(), keep_sealed)?;
 
             persisted.profiles.insert(
                 id.clone(),
@@ -506,9 +539,19 @@ impl AuthProfilesStore {
         Ok(())
     }
 
-    fn encrypt_optional(&self, value: Option<&str>) -> Result<Option<String>> {
+    /// Encrypt one secret field for storage. `keep_sealed` overrides this
+    /// store's own setting for a row that promised encryption: the value is
+    /// sealed with the key it was sealed with before, or the write fails
+    /// rather than putting the credential on disk in plaintext.
+    fn encrypt_optional(&self, value: Option<&str>, keep_sealed: bool) -> Result<Option<String>> {
         match value {
-            Some(value) if !value.is_empty() => self.secret_store.encrypt(value).map(Some),
+            Some(value) if !value.is_empty() => {
+                if keep_sealed {
+                    self.secret_store.encrypt_required(value).map(Some)
+                } else {
+                    self.secret_store.encrypt(value).map(Some)
+                }
+            }
             Some(_) | None => Ok(None),
         }
     }
@@ -817,6 +860,133 @@ mod tests {
 
         assert!(token_set.is_expiring_within(Duration::from_secs(15)));
         assert!(!token_set.is_expiring_within(Duration::from_secs(1)));
+    }
+
+    #[tokio::test]
+    async fn an_unencrypted_writer_keeps_a_marked_profile_sealed() {
+        // MCP OAuth keeps its grants in this file and refuses to run with
+        // encryption off; the writer that pastes a provider token must not be
+        // free to rewrite those rows as plaintext while saving the whole file.
+        let tmp = TempDir::new().unwrap();
+        let encrypted = AuthProfilesStore::new(tmp.path(), true);
+        let mut mcp = AuthProfile::new_oauth(
+            "mcp",
+            "resource",
+            TokenSet {
+                access_token: "mcp-access".into(),
+                refresh_token: Some("mcp-refresh".into()),
+                id_token: None,
+                expires_at: Some(Utc::now() + chrono::Duration::hours(1)),
+                token_type: Some("Bearer".into()),
+                scope: None,
+            },
+        );
+        mcp.metadata
+            .insert(REQUIRES_ENCRYPTED_STORAGE.to_string(), "true".into());
+        encrypted.upsert_profile(mcp.clone(), false).await.unwrap();
+
+        let plain = AuthProfilesStore::new(tmp.path(), false);
+        plain
+            .upsert_profile(
+                AuthProfile::new_token("openai", "default", "sk-new".into()),
+                false,
+            )
+            .await
+            .expect("an unrelated credential can still be saved");
+
+        // The granted tokens are still ciphertext on disk and still decrypt,
+        // while the credential this writer owns follows the writer's setting.
+        let raw = tokio::fs::read_to_string(plain.path()).await.unwrap();
+        assert!(!raw.contains("mcp-access"), "the grant must not leak");
+        assert!(
+            !raw.contains("mcp-refresh"),
+            "neither may its refresh token"
+        );
+        assert!(
+            raw.contains("sk-new"),
+            "this writer's own credential follows its setting"
+        );
+        let data = encrypted.load().await.unwrap();
+        let tokens = data
+            .profiles
+            .get(&mcp.id)
+            .and_then(|profile| profile.token_set.as_ref())
+            .expect("the grant survives the unrelated write");
+        assert_eq!(tokens.access_token, "mcp-access");
+        assert_eq!(tokens.refresh_token.as_deref(), Some("mcp-refresh"));
+    }
+
+    #[tokio::test]
+    async fn logging_out_one_marked_sign_in_leaves_the_other_sealed() {
+        // Two MCP resources signed in, then the operator turns encryption off
+        // for other credentials. Logging one out rewrites this file too: it
+        // must neither be blocked by the other marked profile nor expose it.
+        let tmp = TempDir::new().unwrap();
+        let encrypted = AuthProfilesStore::new(tmp.path(), true);
+        let first = {
+            let mut profile = AuthProfile::new_oauth(
+                "mcp",
+                "resource-a",
+                TokenSet {
+                    access_token: "at-a".into(),
+                    refresh_token: None,
+                    id_token: None,
+                    expires_at: Some(Utc::now() + chrono::Duration::hours(1)),
+                    token_type: Some("Bearer".into()),
+                    scope: None,
+                },
+            );
+            profile
+                .metadata
+                .insert(REQUIRES_ENCRYPTED_STORAGE.to_string(), "true".into());
+            profile
+        };
+        let second = {
+            let mut profile = AuthProfile::new_oauth(
+                "mcp",
+                "resource-b",
+                TokenSet {
+                    access_token: "at-b".into(),
+                    refresh_token: None,
+                    id_token: None,
+                    expires_at: Some(Utc::now() + chrono::Duration::hours(1)),
+                    token_type: Some("Bearer".into()),
+                    scope: None,
+                },
+            );
+            profile
+                .metadata
+                .insert(REQUIRES_ENCRYPTED_STORAGE.to_string(), "true".into());
+            profile
+        };
+        encrypted
+            .upsert_profile(first.clone(), false)
+            .await
+            .unwrap();
+        encrypted
+            .upsert_profile(second.clone(), false)
+            .await
+            .unwrap();
+
+        let plain = AuthProfilesStore::new(tmp.path(), false);
+        assert!(
+            plain.remove_profile(&first.id).await.unwrap(),
+            "logging out one sign-in cannot be blocked by another marked profile"
+        );
+
+        let raw = tokio::fs::read_to_string(plain.path()).await.unwrap();
+        assert!(!raw.contains("at-a"), "the signed-out grant is gone");
+        assert!(!raw.contains("at-b"), "the surviving grant must not leak");
+        let data = encrypted.load().await.unwrap();
+        assert_eq!(data.profiles.len(), 1);
+        assert_eq!(
+            data.profiles
+                .get(&second.id)
+                .and_then(|profile| profile.token_set.as_ref())
+                .map(|tokens| tokens.access_token.as_str()),
+            Some("at-b"),
+            "the remaining sign-in still decrypts for the next connect"
+        );
     }
 
     #[tokio::test]

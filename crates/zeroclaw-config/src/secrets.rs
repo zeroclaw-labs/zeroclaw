@@ -253,6 +253,23 @@ impl SecretStore {
             return Ok(plaintext.to_string());
         }
 
+        self.encrypt_keyed(plaintext)
+    }
+
+    /// Encrypt a value that has to stay sealed whatever this store's setting
+    /// is. A credential whose owner refused plaintext keeps that promise even
+    /// when an unrelated writer runs with `secrets.encrypt = false`, and only
+    /// the key this value was sealed with can keep it: an unavailable key is an
+    /// error here, never a silent demotion to plaintext.
+    pub fn encrypt_required(&self, plaintext: &str) -> Result<String> {
+        if plaintext.is_empty() || Self::is_encrypted(plaintext) {
+            return Ok(plaintext.to_string());
+        }
+
+        self.encrypt_keyed(plaintext)
+    }
+
+    fn encrypt_keyed(&self, plaintext: &str) -> Result<String> {
         self.get_key(|key| {
             let key = Key::from_slice(key);
             let cipher = ChaCha20Poly1305::new(key);

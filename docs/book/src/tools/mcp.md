@@ -238,7 +238,11 @@ issuer, returned scope) live in the encrypted auth-profile store beside your
 `config.toml`, keyed per MCP resource, and never appear in logs or errors. OAuth **refuses to run** without
 encrypted secret storage: with `secrets.encrypt = false` the manager fails
 closed with an actionable message instead of persisting plaintext refresh
-tokens. The requested `oauth_scopes` are sent verbatim; the scope string the
+tokens. While that sign-in exists every OTHER write to the profile store keeps
+its tokens sealed even if `secrets.encrypt` is turned off afterwards: pasting a
+provider token or logging out a different sign-in re-saves the same file, and a
+signed-in MCP grant is written back encrypted rather than dropped into
+plaintext. The requested `oauth_scopes` are sent verbatim; the scope string the
 AS returns is stored but not subset-checked, so the AS is the authority on
 what the token can do. A rotation the running daemon performs after you signed
 the same resource in at a DIFFERENT authorization server or with a different
