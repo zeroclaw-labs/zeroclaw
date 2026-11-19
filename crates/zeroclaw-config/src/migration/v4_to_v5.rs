@@ -22,6 +22,14 @@ mod tests {
     }
 
     #[test]
+    fn current_v5_generation_matches_fixture() {
+        assert_eq!(
+            generate(5, &GenerateOptions::default()).unwrap(),
+            include_str!("../../fixtures/v5.toml"),
+        );
+    }
+
+    #[test]
     fn v4_to_v5_preserves_values_comments_and_secret_ciphertext() {
         let input = "schema_version = 4 # released version\n\n[providers.models.openai.main]\napi_key = 'enc2:TEST_CIPHERTEXT'\nmodel = 'gpt-4o'\n\n[tools]\noptional = ['*']\n";
         let output = migrate_file(input).unwrap().unwrap();
