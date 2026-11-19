@@ -73,9 +73,7 @@ pub struct OpenAiCompatibleModelProvider {
     native_tool_calling: bool,
     /// HTTP request timeout in seconds for LLM API calls. Default: 120.
     timeout_secs: u64,
-    /// Whether the operator explicitly selected a total request timeout.
-    /// Streaming clients keep the historical no-total-timeout baseline when
-    /// this is false, while an explicit finite value applies to streaming too.
+    /// Explicitly disables the legacy request timeout when true.
     timeout_disabled: bool,
     /// Optional HTTP response-read idle timeout. `None` uses the streaming
     /// baseline; `read_timeout_disabled` explicitly removes that baseline.
@@ -10163,7 +10161,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stream_total_deadline_includes_headers_in_every_entry_point() {
+    async fn legacy_timeout_does_not_end_active_stream_in_every_entry_point() {
         use axum::{Router, body::Body, routing::post};
         use futures_util::StreamExt as _;
         let _proxy_guard = crate::RuntimeProxyTestGuard::acquire().await;
@@ -10237,20 +10235,11 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .expect("initial data must arrive before the deadline");
-            let error = tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
-                .await
-                .unwrap()
-                .unwrap()
-                .expect_err("the total deadline must end the stream");
-            let message = error.to_string();
+            let still_active =
+                tokio::time::timeout(std::time::Duration::from_millis(1200), stream.next()).await;
             assert!(
-                message.contains("request_timeout_secs"),
-                "{entry}: {message}"
-            );
-            assert!(!message.contains("read_timeout_secs"), "{entry}: {message}");
-            assert!(
-                !message.contains("no data from provider"),
-                "{entry}: {message}"
+                still_active.is_err(),
+                "{entry}: legacy timeout_secs must not terminate an active stream: {still_active:?}"
             );
         }
         server.abort();

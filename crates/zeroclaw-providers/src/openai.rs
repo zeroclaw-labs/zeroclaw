@@ -1058,10 +1058,9 @@ pub struct OpenAiResponsesModelProvider {
     credential: Option<String>,
     max_tokens: Option<u32>,
     reasoning_effort: Option<String>,
-    /// HTTP total deadline. The default applies to non-streaming calls;
-    /// streaming applies it only when explicitly configured. Read-idle
-    /// protection is configured separately by canonical API options.
-    /// Default: 120 (matches `OpenAiCompatibleModelProvider`).
+    /// HTTP request timeout for non-streaming calls. Legacy streaming calls
+    /// keep an independent read-idle bound; the canonical stream-total policy
+    /// is supplied by the later runtime cutover. Default: 120.
     timeout_secs: u64,
     timeout_disabled: bool,
     read_timeout_secs: Option<u64>,
