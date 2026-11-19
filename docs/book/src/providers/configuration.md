@@ -216,7 +216,7 @@ Family-specific entries add their own typed fields on top of these shared fields
 
 The chat `options` object accepts two ordinary boolean extraction switches:
 
-- `extract_text_reasoning`: remove `<think>...</think>` blocks from textual content. Defaults to `false`, except for the `minimax` and `groq` connection kinds, whose documented output formats can carry inline reasoning. Native reasoning fields are unaffected.
+- `extract_text_reasoning`: remove `<think>...</think>` blocks from textual content. When omitted, the historical semantic-empty handling remains active; set it to `false` only when the literal tags must be preserved. `minimax` and `groq` opt in by default because their documented output formats can carry inline reasoning. Native reasoning fields are unaffected.
 - `extract_text_tool_calls`: recognize XML/JSON tool-call envelopes in textual content. Defaults to `false`, with the adapter-specific defaults below. Native structured tool calls are unaffected.
 
 | Connection kind | Reasoning extraction | Text tool-call extraction |

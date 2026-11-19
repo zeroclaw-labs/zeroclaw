@@ -389,4 +389,31 @@ options = { extract_text_reasoning = true, extract_text_tool_calls = false }
             assert_eq!(resolved.extract_text_tool_calls(), tool_calls);
         }
     }
+
+    #[test]
+    fn ordinary_admitted_models_keep_reasoning_omitted_by_default() {
+        let registry: crate::provider_registry::ProviderRegistry = toml::from_str(
+            r#"
+[connections.ollama]
+kind = "ollama"
+
+[models."chat.ollama"]
+capability = "chat"
+provider = "ollama"
+model = "llama3"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            registry
+                .resolve_chat(&"chat.ollama".into())
+                .unwrap()
+                .text_extraction(),
+            TextExtraction {
+                reasoning: None,
+                tool_calls: true,
+            }
+        );
+    }
 }
