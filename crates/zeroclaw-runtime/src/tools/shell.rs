@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use zeroclaw_api::platform::is_android;
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult, with_ephemeral_workspace_warning};
+use zeroclaw_config::policy::ShellTarget;
 
 /// Maximum output size in bytes (1MB).
 const MAX_OUTPUT_BYTES: usize = 1_048_576;
@@ -230,11 +231,24 @@ impl Tool for ShellTool {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
-        match self.security.validate_command_execution_for_shell(
-            command,
-            approved,
-            self.runtime.shell_dialect(),
-        ) {
+        // The forwarded map is immutable for the session incarnation, so the
+        // policy's choice of grammar, launcher resolution and the child
+        // process all read the same `PATH`.
+        let tui_env_snapshot = self.tui_env.as_ref();
+        let effective_path = tui_env_snapshot
+            .and_then(|env| env.get("PATH"))
+            .map(OsStr::new);
+        // The policy reads the command in the grammar of the program this
+        // runtime will resolve on that `PATH`. Nothing is built until the
+        // policy accepts the command.
+        let shell = self
+            .security
+            .command_shell(ShellTarget::of(self.runtime.as_ref(), effective_path));
+
+        match self
+            .security
+            .validate_command_execution_in(command, approved, shell)
+        {
             Ok(_) => {}
             Err(reason) => {
                 return Ok(ToolResult {
@@ -251,7 +265,7 @@ impl Tool for ShellTool {
         // null device only on the native Windows execution path.
         if let Some(path) = self
             .security
-            .forbidden_workspace_path_argument_for_shell(command, self.runtime.shell_dialect())
+            .forbidden_workspace_path_argument_in(command, shell)
         {
             return Ok(ToolResult {
                 success: false,
@@ -263,12 +277,6 @@ impl Tool for ShellTool {
         // Execute with timeout to prevent hanging commands.
         // Clear the environment to prevent leaking API keys and other secrets
         // (CWE-200), then re-add only safe, functional variables.
-        // The forwarded map is immutable for the session incarnation, so
-        // launcher resolution and the child process read the same values.
-        let tui_env_snapshot = self.tui_env.as_ref();
-        let effective_path = tui_env_snapshot
-            .and_then(|env| env.get("PATH"))
-            .map(OsStr::new);
         let mut cmd = match self.runtime.build_shell_command_with_effective_path(
             command,
             &self.security.workspace_dir,
@@ -285,6 +293,19 @@ impl Tool for ShellTool {
                 });
             }
         };
+
+        // Hold the built program to the grammar the command was checked in,
+        // before a host sandbox replaces it with its own launcher.
+        if let Err(reason) = self
+            .security
+            .confirm_built_shell(shell, cmd.as_std().get_program())
+        {
+            return Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(reason),
+            });
+        }
 
         // Apply sandbox wrapping before execution.
         // The Sandbox trait operates on std::process::Command, so use as_std_mut
@@ -558,6 +579,115 @@ fn android_child_path(tui_path: Option<&str>, ambient_path: &str) -> String {
         "/system/bin:/system/xbin".to_string()
     } else {
         format!("/system/bin:/system/xbin:{base}")
+    }
+}
+
+/// Doubles for the regressions that hold a command's grammar to the shell
+/// that runs it, shared by the shell tool, the shell-backed skill tool and
+/// the cron scheduler.
+#[cfg(all(test, unix))]
+pub(crate) mod shell_grammar_test_support {
+    use crate::platform::RuntimeAdapter;
+    use crate::security::SecurityPolicy;
+    use std::ffi::OsStr;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use zeroclaw_api::runtime_traits::ShellDialect;
+
+    /// Bash ends `<<$'EOF'` at the `EOF` line and prints the `echo` line as
+    /// heredoc body. Any other POSIX shell ends it at the literal `$EOF`
+    /// line and runs the `echo`, printing [`RAN_OUTSIDE_BASH`]. The portable
+    /// grammar refuses it.
+    pub(crate) const BASH_ONLY_HEREDOC: &str =
+        "cat <<$'EOF'\nheredoc body\n$EOF\necho OUTSIDE_BASH_$((40+2))\nEOF";
+    /// Printed only when [`BASH_ONLY_HEREDOC`] runs outside bash.
+    pub(crate) const RAN_OUTSIDE_BASH: &str = "OUTSIDE_BASH_42";
+
+    /// The host's canonical bash.
+    pub(crate) fn host_bash() -> Option<PathBuf> {
+        zeroclaw_config::platform::resolve_executable(OsStr::new("bash")).ok()
+    }
+
+    /// A canonical POSIX shell on this host that is not bash.
+    pub(crate) fn host_shell_other_than_bash() -> Option<PathBuf> {
+        ["/bin/sh", "dash", "zsh", "ksh", "mksh"]
+            .into_iter()
+            .find_map(|shell| {
+                let resolved =
+                    zeroclaw_config::platform::resolve_executable(OsStr::new(shell)).ok()?;
+                (resolved.file_name() != Some(OsStr::new("bash"))).then_some(resolved)
+            })
+    }
+
+    /// A wildcard policy with no sandbox, rooted at `workspace`.
+    pub(crate) fn wildcard_policy(workspace: &Path) -> SecurityPolicy {
+        SecurityPolicy {
+            autonomy: zeroclaw_config::policy::AutonomyLevel::Full,
+            workspace_dir: workspace.to_path_buf(),
+            allowed_commands: vec!["*".into()],
+            block_high_risk_commands: false,
+            sandbox_enabled: Some(false),
+            ..SecurityPolicy::default()
+        }
+    }
+
+    /// A runtime that reports one shell program and builds another, as one
+    /// whose shell was resolved earlier, on another `PATH`, can.
+    pub(crate) struct MispredictingRuntime {
+        reported: PathBuf,
+        built: PathBuf,
+        builds: AtomicUsize,
+    }
+
+    impl MispredictingRuntime {
+        pub(crate) fn new(reported: PathBuf, built: PathBuf) -> Self {
+            Self {
+                reported,
+                built,
+                builds: AtomicUsize::new(0),
+            }
+        }
+
+        pub(crate) fn builds(&self) -> usize {
+            self.builds.load(Ordering::SeqCst)
+        }
+    }
+
+    impl RuntimeAdapter for MispredictingRuntime {
+        fn name(&self) -> &str {
+            "mispredicting"
+        }
+
+        fn has_filesystem_access(&self) -> bool {
+            true
+        }
+
+        fn storage_path(&self) -> PathBuf {
+            std::env::temp_dir()
+        }
+
+        fn supports_long_running(&self) -> bool {
+            true
+        }
+
+        fn shell_dialect(&self) -> ShellDialect {
+            ShellDialect::Posix
+        }
+
+        fn shell_program(&self) -> Option<&OsStr> {
+            Some(self.reported.as_os_str())
+        }
+
+        fn build_shell_command(
+            &self,
+            command: &str,
+            workspace_dir: &Path,
+        ) -> anyhow::Result<tokio::process::Command> {
+            self.builds.fetch_add(1, Ordering::SeqCst);
+            let mut process = tokio::process::Command::new(&self.built);
+            process.arg("-c").arg(command).current_dir(workspace_dir);
+            Ok(process)
+        }
     }
 }
 
@@ -2494,5 +2624,173 @@ mod tests {
             env_output_contains_assignment(&result.output, "SSH_AUTH_SOCK", "/tmp/fake.sock"),
             "SSH_AUTH_SOCK from tui_env must reach subprocess"
         );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod shell_grammar_tests {
+    use super::shell_grammar_test_support::{
+        BASH_ONLY_HEREDOC, MispredictingRuntime, RAN_OUTSIDE_BASH, host_bash,
+        host_shell_other_than_bash, wildcard_policy,
+    };
+    use super::*;
+    use crate::platform::NativeRuntime;
+
+    fn error_of(result: &ToolResult) -> &str {
+        result.error.as_deref().unwrap_or_default()
+    }
+
+    /// A command read as bash is refused when the runtime built another
+    /// shell to run it, and never spawned there.
+    #[tokio::test]
+    async fn a_bash_read_never_runs_in_the_shell_the_runtime_built_instead() {
+        let (Some(bash), Some(other)) = (host_bash(), host_shell_other_than_bash()) else {
+            eprintln!("skipping: needs bash and another POSIX shell");
+            return;
+        };
+        let workspace = tempfile::tempdir().unwrap();
+        let runtime = Arc::new(MispredictingRuntime::new(bash, other));
+        let tool = ShellTool::new(Arc::new(wildcard_policy(workspace.path())), runtime.clone());
+        let result = tool
+            .execute(json!({"command": BASH_ONLY_HEREDOC}))
+            .await
+            .unwrap();
+        assert!(!result.success, "{result:?}");
+        assert!(
+            error_of(&result).contains("checked as a bash command"),
+            "{result:?}"
+        );
+        assert!(!result.output.contains(RAN_OUTSIDE_BASH), "{result:?}");
+        assert_eq!(runtime.builds(), 1);
+    }
+
+    /// A command the policy refuses never reaches the runtime's builder
+    /// (choosing the grammar resolves the program and builds nothing).
+    #[tokio::test]
+    async fn a_refused_command_never_reaches_the_builder() {
+        let Some(other) = host_shell_other_than_bash() else {
+            eprintln!("skipping: needs a POSIX shell other than bash");
+            return;
+        };
+        let workspace = tempfile::tempdir().unwrap();
+        let runtime = Arc::new(MispredictingRuntime::new(other.clone(), other));
+        let tool = ShellTool::new(Arc::new(wildcard_policy(workspace.path())), runtime.clone());
+        let result = tool
+            .execute(json!({"command": BASH_ONLY_HEREDOC}))
+            .await
+            .unwrap();
+        assert!(!result.success, "{result:?}");
+        assert_eq!(runtime.builds(), 0);
+    }
+
+    /// A host sandbox that puts its own launcher in front of the shell, as
+    /// Firejail, Bubblewrap and Seatbelt do.
+    struct LauncherSandbox {
+        launcher: std::path::PathBuf,
+    }
+
+    impl Sandbox for LauncherSandbox {
+        fn wrap_command(&self, cmd: &mut std::process::Command) -> std::io::Result<()> {
+            let mut wrapped = std::process::Command::new(&self.launcher);
+            wrapped.arg(cmd.get_program()).args(cmd.get_args());
+            if let Some(dir) = cmd.get_current_dir() {
+                wrapped.current_dir(dir);
+            }
+            *cmd = wrapped;
+            Ok(())
+        }
+
+        fn is_available(&self) -> bool {
+            true
+        }
+
+        fn name(&self) -> &str {
+            "launcher"
+        }
+
+        fn description(&self) -> &str {
+            "runs the command through a launcher"
+        }
+    }
+
+    /// The built program is checked before a host sandbox wraps it, so its
+    /// launcher does not stand in for the shell and refuse a bash command.
+    #[tokio::test]
+    async fn the_built_shell_is_checked_before_a_host_sandbox_wraps_it() {
+        let (Some(bash), Ok(env)) = (
+            host_bash(),
+            zeroclaw_config::platform::resolve_executable(OsStr::new("env")),
+        ) else {
+            eprintln!("skipping: needs bash and env");
+            return;
+        };
+        let workspace = tempfile::tempdir().unwrap();
+        let policy = SecurityPolicy {
+            sandbox_enabled: Some(true),
+            sandbox_backend: Some("firejail".into()),
+            ..wildcard_policy(workspace.path())
+        };
+        let tool = ShellTool::new_with_sandbox(
+            Arc::new(policy),
+            Arc::new(NativeRuntime::with_shell(
+                bash.to_string_lossy().into_owned(),
+            )),
+            Arc::new(LauncherSandbox { launcher: env }),
+        );
+        let result = tool
+            .execute(json!({"command": BASH_ONLY_HEREDOC}))
+            .await
+            .unwrap();
+        assert!(result.success, "{result:?}");
+        assert!(result.output.contains("heredoc body"), "{result:?}");
+        assert!(!result.output.contains(RAN_OUTSIDE_BASH), "{result:?}");
+    }
+
+    /// The forwarded `PATH`, with a directory holding `bash` linked to
+    /// `target` ahead of this process's own.
+    fn forwarded_path_with_bash(dir: &std::path::Path, target: &std::path::Path) -> String {
+        std::os::unix::fs::symlink(target, dir.join("bash")).unwrap();
+        let own = std::env::var_os("PATH").unwrap_or_default();
+        let entries = std::iter::once(dir.to_path_buf())
+            .chain(std::env::split_paths(&own).collect::<Vec<_>>());
+        std::env::join_paths(entries)
+            .unwrap()
+            .into_string()
+            .unwrap()
+    }
+
+    /// A bare `bash` is read as whatever it names on the TUI's forwarded
+    /// `PATH`: bash's grammar when that is bash, and the portable grammar
+    /// when it is a link to another shell, which would run the hidden line.
+    #[tokio::test]
+    async fn a_bare_bash_is_read_as_what_it_names_on_the_forwarded_path() {
+        let (Some(bash), Some(other)) = (host_bash(), host_shell_other_than_bash()) else {
+            eprintln!("skipping: needs bash and another POSIX shell");
+            return;
+        };
+        for (target, runs) in [(&bash, true), (&other, false)] {
+            let workspace = tempfile::tempdir().unwrap();
+            let bin = tempfile::tempdir().unwrap();
+            let path = forwarded_path_with_bash(bin.path(), target);
+            let tool = ShellTool::new(
+                Arc::new(wildcard_policy(workspace.path())),
+                Arc::new(NativeRuntime::with_shell("bash".into())),
+            )
+            .with_tui_env(Some(HashMap::from([("PATH".to_string(), path)])));
+            let result = tool
+                .execute(json!({"command": BASH_ONLY_HEREDOC}))
+                .await
+                .unwrap();
+            assert_eq!(result.success, runs, "{target:?}: {result:?}");
+            assert!(!result.output.contains(RAN_OUTSIDE_BASH), "{result:?}");
+            if runs {
+                assert!(result.output.contains("heredoc body"), "{result:?}");
+            } else {
+                assert!(
+                    error_of(&result).contains("security policy"),
+                    "{target:?}: {result:?}"
+                );
+            }
+        }
     }
 }
