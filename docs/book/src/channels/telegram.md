@@ -133,7 +133,7 @@ channel instance. This includes a wildcard peer group.
 
 `trusted_groups` is a group-level grant: messages from a listed group or
 supergroup are accepted from **any** member, even when that sender has no
-peer-group entry. It is additive, not a restriction — groups absent from the
+peer-group entry. It is additive, not a restriction: groups absent from the
 list keep using the normal sender allowlist.
 
 ```toml
