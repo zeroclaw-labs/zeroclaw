@@ -293,9 +293,9 @@ pub async fn handle_sections(State(state): State<AppState>) -> Response {
         roots.remove(*hidden);
     }
 
-    let all_map_paths: Vec<&'static str> = zeroclaw_config::schema::Config::map_key_sections()
+    let all_map_paths: Vec<String> = zeroclaw_config::schema::Config::map_key_sections()
         .iter()
-        .map(|s| s.path)
+        .map(|s| s.path.clone())
         .collect();
     let section_has_picker_for_key = |key: &str| -> bool {
         let key_dot = format!("{key}.");
@@ -310,7 +310,7 @@ pub async fn handle_sections(State(state): State<AppState>) -> Response {
     // HashMap is empty (prop_fields() only yields paths for populated
     // entries). First segments only — the prefix-dedup pass below drops
     // bare parent segments when a multi-segment child is present.
-    let map_keyed_roots: std::collections::HashSet<&'static str> = all_map_paths
+    let map_keyed_roots: std::collections::HashSet<&str> = all_map_paths
         .iter()
         .filter_map(|p| p.split('.').next())
         .collect();
