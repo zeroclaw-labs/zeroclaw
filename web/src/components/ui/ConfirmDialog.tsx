@@ -28,7 +28,7 @@ export interface ConfirmDialogProps {
  * buttons receive focus on open; Esc and a backdrop click close it; Tab is
  * trapped within the panel and focus is restored to the trigger on close.
  *
- * Mirrors the modal conventions in `SettingsModal`/`AliasPromptDialog` and works
+ * Mirrors the modal conventions in `SettingsModal` and works
  * in both operator-dark and operator-light via the token classes.
  */
 export function ConfirmDialog({

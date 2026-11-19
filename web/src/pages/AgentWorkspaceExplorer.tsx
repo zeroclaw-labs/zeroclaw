@@ -26,7 +26,7 @@ import { t } from '@/lib/i18n';
 
 /**
  * Minimal in-app prompt modal — a token-themed, focus-trapped replacement for
- * `window.prompt`. Mirrors the modal conventions in `AliasPromptDialog`.
+ * `window.prompt`. Mirrors the modal conventions in `ConfirmDialog`.
  */
 function PromptDialog({
   open,

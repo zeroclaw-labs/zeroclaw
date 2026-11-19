@@ -42,7 +42,7 @@ export interface UseFocusTrapOptions {
 
 /**
  * Shared modal focus trap, extracted from the near-identical hand-rolled effects
- * in AgentDrawer / AliasPromptDialog / DoctorFixModal (and mirrored by
+ * in AgentDrawer / DoctorFixModal (and mirrored by
  * ui/ConfirmDialog). While `enabled`:
  *
  * - remembers `document.activeElement` on enable and restores focus to it on
