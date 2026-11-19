@@ -44,7 +44,7 @@ model = "laya"
 ```
 
 `base_url` and `model` override the provider defaults. A `custom` entry without
-a `base_url` is ignored, and SOPs selecting it fall back to their strictest mode.
+a `base_url` is ignored, and SOPs selecting it fall back to their fail-closed mode (see [Safety](#safety)).
 The aliases can also be managed from the dashboard's Config page.
 
 ## Select a model in an SOP
@@ -74,7 +74,7 @@ min_confidence = 0.7
 | `gate_on_error` | `run_strict` | When the model cannot answer: `run_strict` starts the run in its fail-closed mode, `skip` does not start it. |
 | `modes` | empty | Modes the model may choose for this run. Only `auto`, `supervised`, and `step_by_step`. Empty keeps the authored `execution_mode`. |
 | `mode_instructions` | generic | Guidance for the mode choice. |
-| `min_confidence` | `0.7` | A mode choice below this confidence uses the fail-closed mode. |
+| `min_confidence` | `0.7` | A mode choice below this confidence uses the fail-closed mode, and the model's step answers are ignored. |
 | `part_threshold` | `0.5` | Minimum "yes" probability to run a step with a `decide` question. See [Conditional steps](#conditional-steps). |
 
 A `[decision]` table needs a `gate`, `modes`, or a step with `decide`. `modes`
@@ -113,9 +113,15 @@ each ask the model whether to start.
   continues with the next step in order. The next step receives the input the
   skipped step would have received.
 - When the model cannot answer, or answers a step's question with a malformed
-  value, that step runs. Skipping is never the fail-safe.
+  value, that step runs. Skipping is never the fail-safe. The same holds for
+  the whole answer set when the gate answer is missing or malformed, or when
+  the mode answer (with `modes` set) is missing, rejected, or below
+  `min_confidence`: none of its step answers is used and every step runs.
 - Routing guards can read the answers: `$.decisions.2` is step 2's "yes"
-  probability in a `when:` condition.
+  probability in a `when:` condition. A guard that reads an answer that is not
+  there is false, so when answers are missing or ignored (see above), a
+  `switch` whose ports all read `$.decisions` matches no port and completes
+  the run without its remaining steps.
 - Another step cannot `depends_on` a conditional step, because a skipped step
   produces no output. Read `$.steps.N` in a `when:` condition instead.
 - A step is skipped before its approval gate, so a skipped step never asks for
@@ -131,7 +137,9 @@ each ask the model whether to start.
 - **Fail-closed:** an unconfigured alias, a network or HTTP error, a malformed
   answer, or a low-confidence answer never reduces supervision. The run uses the
   strictest of its listed modes, its authored `execution_mode`, and
-  `supervised`.
+  `supervised`. A `priority_based` SOP keeps its own gating unless `step_by_step`
+  is listed, and a `deterministic` SOP keeps its executor. A missing or
+  malformed gate answer also discards the model's mode choice.
 - Event payloads are sent to the model framed as untrusted content, capped at
   8,000 characters. Choose a self-hosted model when event content must not leave
   the host.

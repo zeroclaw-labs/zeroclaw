@@ -164,17 +164,36 @@ fn load_tls_ca_pem(config: &McpServerConfig, path: &str) -> Result<Vec<u8>> {
     Ok(pem)
 }
 
-/// Build the shared HTTP client for remote MCP transports.
+/// Build a remote MCP client. Only SSE GET requests can follow redirects, and
+/// only within the configured server origin.
 ///
 /// The optional server-specific CA is additive: system/default roots remain
 /// enabled, and normal chain and hostname verification stay in force.
-fn build_remote_http_client(config: &McpServerConfig) -> Result<reqwest::Client> {
-    // A remote MCP POST may execute a side effect before a 307/308 redirect.
-    // If following that redirect then fails to connect, reqwest reports a
-    // connect error even though the first server already received the POST.
-    // Do not automatically follow redirects for MCP transports: the original
-    // response is handled as an HTTP status, never by replaying the body.
-    let mut builder = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
+fn build_remote_http_client(
+    config: &McpServerConfig,
+    sse_origin: Option<reqwest::Url>,
+) -> Result<reqwest::Client> {
+    let mut builder = reqwest::Client::builder();
+
+    if let Some(origin) = sse_origin {
+        let server_name = config.name.clone();
+        builder = builder.redirect(reqwest::redirect::Policy::custom(move |attempt| {
+            if attempt.previous().len() >= 10 {
+                attempt.error(std::io::Error::other(format!(
+                    "MCP server `{server_name}`: too many redirects"
+                )))
+            } else {
+                match require_sse_origin(&origin, attempt.url()) {
+                    Ok(()) => attempt.follow(),
+                    Err(error) => attempt.error(std::io::Error::other(error.to_string())),
+                }
+            }
+        }));
+    } else {
+        // A redirect response can arrive after the server executed the POST.
+        // Never resend the request body to the redirect target.
+        builder = builder.redirect(reqwest::redirect::Policy::none());
+    }
 
     if let Some(path) = config.tls_ca_cert_path.as_deref() {
         if !std::path::Path::new(path).is_absolute() {
@@ -1167,7 +1186,7 @@ impl HttpTransport {
         if config.tls_ca_cert_path.is_some() {
             require_https_url(&config.name, &url, "configured remote URL")?;
         }
-        let client = build_remote_http_client(config)?;
+        let client = build_remote_http_client(config, None)?;
 
         Ok(Self {
             url,
@@ -1350,7 +1369,8 @@ pub struct SseTransport {
     tool_timeout_secs: Option<u64>,
     /// Per-server response-body byte cap, enforced at read time before parsing.
     max_response_bytes: u64,
-    client: reqwest::Client,
+    sse_get_client: reqwest::Client,
+    post_client: reqwest::Client,
     headers: std::collections::HashMap<String, String>,
     require_https: bool,
     conn: Mutex<SseConnState>,
@@ -1389,14 +1409,18 @@ impl SseTransport {
         if require_https {
             require_https_url(&config.name, &sse_url, "configured remote URL")?;
         }
-        let client = build_remote_http_client(config)?;
+        let origin = reqwest::Url::parse(&sse_url).context("invalid configured MCP SSE URL")?;
+        require_sse_origin(&origin, &origin)?;
+        let sse_get_client = build_remote_http_client(config, Some(origin))?;
+        let post_client = build_remote_http_client(config, None)?;
 
         Ok(Self {
             sse_url,
             server_name: config.name.clone(),
             tool_timeout_secs: config.tool_timeout_secs,
             max_response_bytes: resolve_max_response_bytes(config),
-            client,
+            sse_get_client,
+            post_client,
             headers: config.headers.clone(),
             require_https,
             conn: Mutex::new(SseConnState {
@@ -1428,7 +1452,7 @@ impl SseTransport {
             .any(|k| k.eq_ignore_ascii_case("Accept"));
 
         let mut req = self
-            .client
+            .sse_get_client
             .get(&self.sse_url)
             .header("Cache-Control", "no-cache");
         for (key, value) in &self.headers {
@@ -1438,7 +1462,11 @@ impl SseTransport {
             req = req.header("Accept", MCP_STREAMABLE_ACCEPT);
         }
 
-        let resp = req.send().await.context("SSE GET to MCP server failed")?;
+        let resp = req
+            .send()
+            .await
+            .map_err(reqwest::Error::without_url)
+            .context("SSE GET to MCP server failed")?;
         if resp.status() == reqwest::StatusCode::NOT_FOUND
             || resp.status() == reqwest::StatusCode::METHOD_NOT_ALLOWED
         {
@@ -1766,6 +1794,9 @@ async fn handle_sse_event(
 }
 
 fn parse_endpoint_from_data(sse_url: &str, data: &str) -> Option<String> {
+    // Decode the advertisement here; validate its resolved destination at the
+    // write boundary. Keeping a refused advertisement makes the call fail
+    // explicitly instead of silently posting to the legacy fallback URL.
     if data.starts_with('{') {
         let v: serde_json::Value = serde_json::from_str(data).ok()?;
         let endpoint = v.get("endpoint")?.as_str()?;
@@ -1776,6 +1807,22 @@ fn parse_endpoint_from_data(sse_url: &str, data: &str) -> Option<String> {
     }
     let base = reqwest::Url::parse(sse_url).ok()?;
     base.join(data).ok().map(|u| u.to_string())
+}
+
+fn require_sse_origin(configured: &reqwest::Url, target: &reqwest::Url) -> Result<()> {
+    if !matches!(target.scheme(), "http" | "https")
+        || configured.origin() != target.origin()
+        || !target.username().is_empty()
+        || target.password().is_some()
+    {
+        // Neither endpoint queries nor URL userinfo are safe to echo in errors.
+        bail!(
+            "MCP SSE endpoint must use the configured server origin {} without URL credentials (received origin {})",
+            configured.origin().ascii_serialization(),
+            target.origin().ascii_serialization(),
+        );
+    }
+    Ok(())
 }
 
 fn extract_json_from_sse_text(resp_text: &str) -> Cow<'_, str> {
@@ -1978,6 +2025,12 @@ impl SharedMcpTransportConn for SseTransport {
         if self.require_https {
             require_https_url(&self.server_name, &message_url, "SSE message endpoint")?;
         }
+        // Validate the final resolved URL before attaching credentials or
+        // acquiring a write permit. This also covers legacy endpoint fallback.
+        require_sse_origin(
+            &reqwest::Url::parse(&self.sse_url).context("invalid configured MCP SSE URL")?,
+            &reqwest::Url::parse(&message_url).context("invalid MCP SSE message endpoint")?,
+        )?;
 
         // Acquire the epoch permit before registering a response waiter.
         // Cancellation while waiting for the permit is provably pre-write and
@@ -2014,7 +2067,7 @@ impl SharedMcpTransportConn for SseTransport {
             .keys()
             .any(|k| k.eq_ignore_ascii_case("Content-Type"));
         let mut req = apply_request_timeout(
-            self.client.post(&message_url).body(body),
+            self.post_client.post(&message_url).body(body),
             http_request_timeout_secs(request, self.tool_timeout_secs),
         );
         if !has_content_type {
@@ -2034,7 +2087,7 @@ impl SharedMcpTransportConn for SseTransport {
                 return anyhow::Error::new(McpTransportError::TransportClosed)
                     .context("SSE POST to MCP server failed");
             }
-            anyhow::Error::new(error).context("SSE POST to MCP server failed")
+            anyhow::Error::new(error.without_url()).context("SSE POST to MCP server failed")
         })?;
         let status = resp.status();
         let mut got_direct = None;
@@ -2088,6 +2141,9 @@ impl SharedMcpTransportConn for SseTransport {
         }
 
         if !status.is_success() {
+            if status.is_redirection() {
+                lifecycle.mark_completed();
+            }
             if status == reqwest::StatusCode::NOT_FOUND || status == reqwest::StatusCode::GONE {
                 return Err(McpTransportError::StaleSession {
                     status: status.as_u16(),
@@ -3386,15 +3442,341 @@ mod tests {
     // ── parse_endpoint_from_data tests ───────────────────────────────────────
 
     #[test]
-    fn parse_endpoint_absolute_http_url_returned_as_is() {
-        let result = parse_endpoint_from_data("http://base/sse", "http://other/messages");
-        assert_eq!(result, Some("http://other/messages".to_string()));
+    fn sse_origin_uses_scheme_host_and_effective_port_without_userinfo() {
+        let base = reqwest::Url::parse("https://example.test/sse").unwrap();
+        for target in [
+            "https://example.test/messages",
+            "https://EXAMPLE.test:443/messages?session=synthetic",
+        ] {
+            require_sse_origin(&base, &reqwest::Url::parse(target).unwrap()).unwrap();
+        }
+        for target in [
+            "http://example.test/messages",
+            "https://example.test:444/messages",
+            "https://other.test/messages",
+            "https://example.test.other.test/messages",
+            "https://synthetic:secret@example.test/messages",
+            "file:///messages",
+            "data:text/plain,synthetic",
+        ] {
+            let error = require_sse_origin(&base, &reqwest::Url::parse(target).unwrap())
+                .expect_err("untrusted endpoint must be refused");
+            assert!(!error.to_string().contains(target));
+            assert!(!error.to_string().contains("secret"));
+        }
+    }
+
+    #[tokio::test]
+    async fn sse_endpoint_foreign_targets_receive_no_headers_or_body() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let destination = MockServer::start().await;
+        for data in [
+            format!("{}/capture?secret=synthetic", destination.uri()),
+            format!("{}/capture", destination.uri().trim_start_matches("http:")),
+            serde_json::json!({"endpoint": format!("{}/capture", destination.uri())}).to_string(),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/sse"))
+                .respond_with(ResponseTemplate::new(200).set_body_raw(
+                    format!("event: endpoint\ndata: {data}\n\n"),
+                    "text/event-stream",
+                ))
+                .mount(&server)
+                .await;
+            let transport = SseTransport::new(&McpServerConfig {
+                name: "origin-test".into(),
+                transport: McpTransport::Sse,
+                url: Some(format!("{}/sse", server.uri())),
+                headers: HashMap::from([
+                    ("Authorization".into(), "Bearer synthetic-test-token".into()),
+                    ("X-Api-Key".into(), "synthetic-test-key".into()),
+                ]),
+                ..Default::default()
+            })
+            .unwrap();
+            let lifecycle = McpRequestLifecycle::uncoordinated(0);
+            let error = timeout(
+                Duration::from_secs(5),
+                SharedMcpTransportConn::send_and_recv(
+                    &transport,
+                    &JsonRpcRequest::new(1, "initialize", serde_json::json!({})),
+                    &lifecycle,
+                ),
+            )
+            .await
+            .unwrap()
+            .expect_err("foreign endpoint must fail before POST");
+            let received = destination.received_requests().await.unwrap();
+            assert!(
+                received.is_empty(),
+                "foreign endpoint received {} requests",
+                received.len()
+            );
+            assert!(error.to_string().contains("configured server origin"));
+            assert!(!format!("{error:#}").contains("synthetic"));
+            assert_eq!(lifecycle.outcome_unknown_epoch(), None);
+            assert!(transport.pending.lock().is_empty());
+            assert!(
+                server
+                    .received_requests()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .all(|r| r.method == "GET")
+            );
+            transport.close().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn sse_endpoint_same_origin_forms_deliver_credentials_and_result() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        for data in [
+            "/messages".to_string(),
+            format!("{}/messages", server.uri()),
+            serde_json::json!({"endpoint": "/messages"}).to_string(),
+        ] {
+            server.reset().await;
+            Mock::given(method("GET"))
+                .and(path("/sse"))
+                .respond_with(ResponseTemplate::new(200).set_body_raw(
+                    format!("event: mcp-endpoint\ndata: {data}\n\n"),
+                    "text/event-stream",
+                ))
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/messages"))
+                .and(header("Authorization", "Bearer synthetic-test-token"))
+                .and(header("X-Api-Key", "synthetic-test-key"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({"jsonrpc":"2.0", "id":1, "result":{"ok":true}}),
+                ))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let transport = SseTransport::new(&McpServerConfig {
+                name: "origin-test".into(),
+                transport: McpTransport::Sse,
+                url: Some(format!("{}/sse", server.uri())),
+                headers: HashMap::from([
+                    ("Authorization".into(), "Bearer synthetic-test-token".into()),
+                    ("X-Api-Key".into(), "synthetic-test-key".into()),
+                ]),
+                ..Default::default()
+            })
+            .unwrap();
+            let response = timeout(
+                Duration::from_secs(5),
+                SharedMcpTransportConn::send_and_recv(
+                    &transport,
+                    &JsonRpcRequest::new(1, "initialize", serde_json::json!({})),
+                    &McpRequestLifecycle::uncoordinated(0),
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(response.result, Some(serde_json::json!({"ok":true})));
+            transport.close().await.unwrap();
+            server.verify().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn sse_redirect_foreign_targets_receive_no_headers_or_body() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let destination = MockServer::start().await;
+        for redirect_method in ["GET", "POST"] {
+            for status in [307, 308] {
+                let server = MockServer::start().await;
+                let redirect_path = if redirect_method == "GET" {
+                    "/sse"
+                } else {
+                    "/messages"
+                };
+                Mock::given(method(redirect_method))
+                    .and(path(redirect_path))
+                    .respond_with(ResponseTemplate::new(status).insert_header(
+                        "Location",
+                        format!("{}/capture?secret=synthetic", destination.uri()),
+                    ))
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+                if redirect_method == "POST" {
+                    Mock::given(method("GET"))
+                        .and(path("/sse"))
+                        .respond_with(ResponseTemplate::new(200).set_body_raw(
+                            "event: endpoint\ndata: /messages\n\n",
+                            "text/event-stream",
+                        ))
+                        .mount(&server)
+                        .await;
+                }
+                let transport = SseTransport::new(&McpServerConfig {
+                    name: "origin-test".into(),
+                    transport: McpTransport::Sse,
+                    url: Some(format!("{}/sse?session=synthetic-session", server.uri())),
+                    headers: HashMap::from([
+                        ("Authorization".into(), "Bearer synthetic-test-token".into()),
+                        ("X-Api-Key".into(), "synthetic-test-key".into()),
+                    ]),
+                    ..Default::default()
+                })
+                .unwrap();
+                let lifecycle = McpRequestLifecycle::uncoordinated(0);
+                let error = timeout(
+                    Duration::from_secs(5),
+                    SharedMcpTransportConn::send_and_recv(
+                        &transport,
+                        &JsonRpcRequest::new(1, "initialize", serde_json::json!({})),
+                        &lifecycle,
+                    ),
+                )
+                .await
+                .unwrap()
+                .expect_err("foreign redirect must fail before forwarding");
+                let received = destination.received_requests().await.unwrap();
+                assert!(
+                    received.is_empty(),
+                    "foreign redirect received {} requests",
+                    received.len()
+                );
+                if redirect_method == "GET" {
+                    assert!(format!("{error:#}").contains("configured server origin"));
+                } else {
+                    assert!(error.to_string().contains(&format!("HTTP {status}")));
+                    assert!(lifecycle.outcome_unknown_epoch().is_none());
+                    assert!(lifecycle.pre_write_epoch().is_none());
+                }
+                assert!(!format!("{error:#}").contains("synthetic"));
+                transport.close().await.unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn sse_get_redirect_same_origin_preserves_headers() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/sse"))
+            .respond_with(ResponseTemplate::new(307).insert_header("Location", "/events"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/events"))
+            .and(header("X-Api-Key", "synthetic-test-key"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw("event: endpoint\ndata: /messages\n\n", "text/event-stream"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/messages"))
+            .and(header("X-Api-Key", "synthetic-test-key"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({"jsonrpc":"2.0", "id":1, "result":{"ok":true}}),
+                ),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let transport = SseTransport::new(&McpServerConfig {
+            name: "origin-test".into(),
+            transport: McpTransport::Sse,
+            url: Some(format!("{}/sse", server.uri())),
+            headers: HashMap::from([("X-Api-Key".into(), "synthetic-test-key".into())]),
+            ..Default::default()
+        })
+        .unwrap();
+        let response = timeout(
+            Duration::from_secs(5),
+            SharedMcpTransportConn::send_and_recv(
+                &transport,
+                &JsonRpcRequest::new(1, "initialize", serde_json::json!({})),
+                &McpRequestLifecycle::uncoordinated(0),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(response.result, Some(serde_json::json!({"ok":true})));
+        transport.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn sse_post_redirect_same_origin_is_not_followed_or_replayed() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        for status in [307, 308] {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/sse"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_raw("event: endpoint\ndata: /messages\n\n", "text/event-stream"),
+                )
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/messages"))
+                .respond_with(ResponseTemplate::new(status).insert_header("Location", "/rpc"))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let transport = SseTransport::new(&McpServerConfig {
+                name: "no-replay".into(),
+                transport: McpTransport::Sse,
+                url: Some(format!("{}/sse", server.uri())),
+                ..Default::default()
+            })
+            .unwrap();
+            let request = JsonRpcRequest::new(1, "tools/call", serde_json::json!({}));
+            let lifecycle = McpRequestLifecycle::uncoordinated(0);
+            let error = timeout(
+                Duration::from_secs(5),
+                SharedMcpTransportConn::send_and_recv(&transport, &request, &lifecycle),
+            )
+            .await
+            .unwrap()
+            .expect_err("redirected SSE POST must not be resent");
+            assert!(error.to_string().contains(&format!("HTTP {status}")));
+            assert!(lifecycle.outcome_unknown_epoch().is_none());
+            assert!(lifecycle.pre_write_epoch().is_none());
+            let received = server.received_requests().await.unwrap();
+            assert_eq!(received.iter().filter(|r| r.method == "POST").count(), 1);
+            assert!(received.iter().all(|r| r.url.path() != "/rpc"));
+            transport.close().await.unwrap();
+        }
     }
 
     #[test]
-    fn parse_endpoint_absolute_https_url_returned_as_is() {
-        let result = parse_endpoint_from_data("https://base/sse", "https://other/messages");
-        assert_eq!(result, Some("https://other/messages".to_string()));
+    fn parse_endpoint_absolute_same_origin_http_url() {
+        let result = parse_endpoint_from_data("http://base/sse", "http://base/messages");
+        assert_eq!(result, Some("http://base/messages".to_string()));
+    }
+
+    #[test]
+    fn parse_endpoint_absolute_same_origin_https_url() {
+        let result = parse_endpoint_from_data("https://base/sse", "https://base/messages");
+        assert_eq!(result, Some("https://base/messages".to_string()));
     }
 
     #[test]
