@@ -5,6 +5,7 @@ pub enum MemoryBackendKind {
     Postgres,
     Qdrant,
     Markdown,
+    Everos,
     None,
     Unknown,
 }
@@ -32,6 +33,15 @@ const SQLITE_PROFILE: MemoryBackendProfile = MemoryBackendProfile {
 const LUCID_PROFILE: MemoryBackendProfile = MemoryBackendProfile {
     key: "lucid",
     label: "Lucid Memory bridge — sync with local lucid-memory CLI, keep SQLite fallback",
+    auto_save_default: true,
+    uses_sqlite_hygiene: true,
+    sqlite_based: true,
+    optional_dependency: true,
+};
+
+const EVEROS_PROFILE: MemoryBackendProfile = MemoryBackendProfile {
+    key: "everos",
+    label: "EverOS sidecar — Markdown-first memory via local EverOS HTTP, optional SQLite cache",
     auto_save_default: true,
     uses_sqlite_hygiene: true,
     sqlite_based: true,
@@ -106,6 +116,7 @@ pub fn classify_memory_backend(backend: &str) -> MemoryBackendKind {
         "postgres" => MemoryBackendKind::Postgres,
         "qdrant" => MemoryBackendKind::Qdrant,
         "markdown" => MemoryBackendKind::Markdown,
+        "everos" => MemoryBackendKind::Everos,
         "none" => MemoryBackendKind::None,
         _ => MemoryBackendKind::Unknown,
     }
@@ -118,6 +129,7 @@ pub fn memory_backend_profile(backend: &str) -> MemoryBackendProfile {
         MemoryBackendKind::Postgres => POSTGRES_PROFILE,
         MemoryBackendKind::Qdrant => QDRANT_PROFILE,
         MemoryBackendKind::Markdown => MARKDOWN_PROFILE,
+        MemoryBackendKind::Everos => EVEROS_PROFILE,
         MemoryBackendKind::None => NONE_PROFILE,
         MemoryBackendKind::Unknown => CUSTOM_PROFILE,
     }
@@ -176,6 +188,21 @@ mod tests {
     }
 
     #[test]
+    fn everos_profile_is_sqlite_based_optional_backend() {
+        assert_eq!(classify_memory_backend("everos"), MemoryBackendKind::Everos);
+        let profile = memory_backend_profile("everos");
+        assert!(profile.sqlite_based);
+        assert!(profile.optional_dependency);
+        assert!(profile.uses_sqlite_hygiene);
+        assert!(
+            !selectable_memory_backends()
+                .iter()
+                .any(|b| b.key == "everos"),
+            "everos is configurable but not an onboarding option"
+        );
+    }
+
+    #[test]
     fn unknown_profile_preserves_extensibility_defaults() {
         let profile = memory_backend_profile("custom-memory");
         assert_eq!(profile.key, "custom");
@@ -198,7 +225,9 @@ mod tests {
 
     #[test]
     fn each_known_backend_profile_carries_a_matching_key() {
-        for name in ["sqlite", "lucid", "postgres", "qdrant", "markdown", "none"] {
+        for name in [
+            "sqlite", "lucid", "postgres", "qdrant", "markdown", "everos", "none",
+        ] {
             assert_eq!(
                 memory_backend_profile(name).key,
                 name,

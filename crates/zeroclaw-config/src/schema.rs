@@ -5394,6 +5394,12 @@ impl Config {
                 .get(alias)
                 .map(ActiveStorage::Lucid)
                 .unwrap_or(ActiveStorage::None),
+            "everos" => self
+                .storage
+                .everos
+                .get(alias)
+                .map(ActiveStorage::Everos)
+                .unwrap_or(ActiveStorage::None),
             _ => ActiveStorage::None,
         }
     }
@@ -5417,6 +5423,8 @@ pub enum ActiveStorage<'a> {
     Markdown(&'a MarkdownStorageConfig),
     /// Lucid CLI sync instance.
     Lucid(&'a LucidStorageConfig),
+    /// EverOS HTTP sidecar instance.
+    Everos(&'a EverosStorageConfig),
 }
 
 impl ActiveStorage<'_> {
@@ -5430,6 +5438,7 @@ impl ActiveStorage<'_> {
             ActiveStorage::Qdrant(_) => "qdrant",
             ActiveStorage::Markdown(_) => "markdown",
             ActiveStorage::Lucid(_) => "lucid",
+            ActiveStorage::Everos(_) => "everos",
         }
     }
 }
@@ -12740,6 +12749,10 @@ pub struct StorageConfig {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
     pub lucid: HashMap<String, LucidStorageConfig>,
+    /// EverOS HTTP sidecar instances (`[storage.everos.<alias>]`).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[nested]
+    pub everos: HashMap<String, EverosStorageConfig>,
 }
 
 /// SQLite storage backend (`[storage.sqlite.<alias>]`).
@@ -12865,6 +12878,45 @@ pub struct LucidStorageConfig {
     /// built-in default (3000ms); `0` is rejected at validation and, if
     /// startup continues after the warning, is likewise treated as unset.
     pub store_timeout_ms: Option<u64>,
+}
+
+/// EverOS HTTP sidecar backend (`[storage.everos.<alias>]`).
+///
+/// Talks to a local EverOS server (`everos server start`) over `/api/v2/memory/*`.
+/// Optional SQLite cache keeps turn latency low when the sidecar is slow or down.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "storage_everos"]
+#[serde(default)]
+pub struct EverosStorageConfig {
+    /// EverOS base URL (e.g. `"http://127.0.0.1:8000"`). Trailing slashes are stripped.
+    pub base_url: String,
+    /// EverOS `app_id` scope for all writes and recalls.
+    pub app_id: String,
+    /// EverOS `project_id` scope for all writes and recalls.
+    pub project_id: String,
+    /// EverOS user-track id (`sender_id` / `user_id`) for chat memory.
+    pub user_id: String,
+    /// HTTP timeout for EverOS requests, in milliseconds. Unset uses 5000.
+    pub timeout_ms: Option<u64>,
+    /// Search method: `keyword`, `vector`, `hybrid`, or `agentic`. Default `hybrid`.
+    pub search_method: String,
+    /// When true (default), keep a local SQLite hot cache for offline fallback.
+    pub local_cache: bool,
+}
+
+impl Default for EverosStorageConfig {
+    fn default() -> Self {
+        Self {
+            base_url: "http://127.0.0.1:8000".into(),
+            app_id: "zeroclaw".into(),
+            project_id: "default".into(),
+            user_id: "local".into(),
+            timeout_ms: Some(5_000),
+            search_method: "hybrid".into(),
+            local_cache: true,
+        }
+    }
 }
 
 fn default_storage_schema() -> String {

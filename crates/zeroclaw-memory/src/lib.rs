@@ -18,6 +18,7 @@ pub mod consolidation;
 pub mod decay;
 pub mod dedup;
 pub mod embeddings;
+pub mod everos;
 pub mod hygiene;
 pub mod importance;
 pub mod knowledge_graph;
@@ -56,6 +57,7 @@ pub use backend::{
 };
 #[allow(unused_imports)]
 pub use embeddings::EmbeddingIdentity;
+pub use everos::EverOSMemory;
 pub use lucid::LucidMemory;
 pub use markdown::MarkdownMemory;
 pub use none::NoneMemory;
@@ -182,6 +184,12 @@ where
             anyhow::bail!(
                 "memory backend 'qdrant' is not supported by this operation; choose sqlite, lucid, \
                  or markdown"
+            )
+        }
+        MemoryBackendKind::Everos => {
+            anyhow::bail!(
+                "everos backend requires storage config; \
+                 call create_memory_with_storage_and_routes instead of create_memory_with_builders"
             )
         }
         MemoryBackendKind::Markdown => wrap_scanned_and_audit(
@@ -779,6 +787,43 @@ fn build_memory_with_storage(
         )?;
         return wrap_scanned_and_audit(
             build_lucid_memory(workspace_dir, local, active_storage),
+            &config.policy,
+            workspace_dir,
+            config.audit_enabled,
+        );
+    }
+
+    if matches!(backend_kind, MemoryBackendKind::Everos) {
+        let everos_cfg = match active_storage {
+            ActiveStorage::Everos(e) => e,
+            _ => anyhow::bail!(
+                "memory backend 'everos' requires a `[storage.everos.<alias>]` entry \
+                 referenced by `memory.backend = \"everos.<alias>\"`"
+            ),
+        };
+        if everos_cfg.base_url.trim().is_empty() {
+            anyhow::bail!("EverOS memory backend requires non-empty `base_url` in [storage.everos.<alias>]");
+        }
+        let local = if everos_cfg.local_cache {
+            Some(build_sqlite_memory(
+                config,
+                sqlite_open_timeout_secs,
+                workspace_dir,
+                resolved_embedding,
+            )?)
+        } else {
+            None
+        };
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            &format!(
+                "EverOS memory backend configured (url: {}, local_cache: {})",
+                everos_cfg.base_url, everos_cfg.local_cache
+            )
+        );
+        return wrap_scanned_and_audit(
+            EverOSMemory::from_config("everos", everos_cfg, local),
             &config.policy,
             workspace_dir,
             config.audit_enabled,

@@ -1,0 +1,46 @@
+# EverOS memory sidecar for ZeroClaw.
+#
+# Prerequisites:
+#   1. Run `everos init` once on the host (or mount a prepared config dir).
+#   2. Put an LLM api_key in ~/.everos/everos.toml (or EVEROS_ROOT).
+#
+# Start:
+#   docker compose -f docker-compose.everos.yml up -d
+#
+# Then point ZeroClaw at the sidecar:
+#   [memory]
+#   backend = "everos.default"
+#   [storage.everos.default]
+#   base_url = "http://127.0.0.1:8000"
+
+services:
+  everos:
+    image: python:3.12-slim
+    container_name: zeroclaw-everos
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8000:8000"
+    environment:
+      EVEROS_API__HOST: "0.0.0.0"
+      EVEROS_API__PORT: "8000"
+      # Optional: override the LLM key without editing the mounted toml.
+      # EVEROS_LLM__API_KEY: ${OPENROUTER_API_KEY:-}
+    volumes:
+      - ${EVEROS_ROOT:-${HOME}/.everos}:/root/.everos
+    command:
+      - bash
+      - -lc
+      - |
+        set -euo pipefail
+        pip install --no-cache-dir -q 'everos>=1.7.0'
+        if [ ! -f /root/.everos/everos.toml ]; then
+          everos init --root /root/.everos
+          echo "Created /root/.everos/everos.toml — set [llm].api_key before relying on extraction."
+        fi
+        exec everos server start --host 0.0.0.0 --port 8000
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 40s
