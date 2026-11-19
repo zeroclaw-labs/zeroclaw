@@ -10,10 +10,11 @@ use crate::policy_gate;
 use crate::traits::{
     Memory, MemoryCategory, MemoryEntry, MemoryKind, SemanticSubtype, StoreOptions,
 };
-use zeroclaw_api::model_provider::ModelProvider;
+use zeroclaw_api::model_provider::{CallSampling, ModelProvider};
 use zeroclaw_config::schema::MemoryConfig;
 use zeroclaw_providers::ProviderDispatch;
 use zeroclaw_providers::multimodal::strip_media_markers;
+use zeroclaw_providers::response::strip_think_tags;
 
 /// Output of consolidation extraction.
 #[derive(Debug, serde::Deserialize)]
@@ -66,6 +67,27 @@ pub async fn consolidate_turn(
     user_message: &str,
     assistant_response: &str,
 ) -> anyhow::Result<()> {
+    consolidate_turn_with_sampling(
+        model_provider,
+        model,
+        temperature.into(),
+        memory,
+        memory_config,
+        user_message,
+        assistant_response,
+    )
+    .await
+}
+
+pub async fn consolidate_turn_with_sampling(
+    model_provider: &dyn ModelProvider,
+    model: &str,
+    sampling: CallSampling,
+    memory: &dyn Memory,
+    memory_config: &MemoryConfig,
+    user_message: &str,
+    assistant_response: &str,
+) -> anyhow::Result<()> {
     let turn_text = format!(
         "User: {}\nAssistant: {}",
         strip_media_markers(user_message),
@@ -96,7 +118,7 @@ pub async fn consolidate_turn(
     };
 
     let raw = ProviderDispatch::from_ref(model_provider)
-        .chat_with_system(Some(system_prompt), &truncated, model, temperature)
+        .chat_with_system_with_sampling(Some(system_prompt), &truncated, model, sampling)
         .await?;
 
     let result: ConsolidationResult = parse_consolidation_response(&raw, &turn_text);
@@ -441,36 +463,43 @@ fn fact_overlaps_primary_update(
 
 /// Parse the LLM's consolidation response, with fallback for malformed JSON.
 fn parse_consolidation_response(raw: &str, fallback_text: &str) -> ConsolidationResult {
-    // Try to extract JSON from the response (LLM may wrap in markdown code blocks).
-    let cleaned = raw
-        .trim()
-        .trim_start_matches("```json")
-        .trim_start_matches("```")
-        .trim_end_matches("```")
-        .trim();
+    fn parse_json(candidate: &str) -> Option<ConsolidationResult> {
+        let cleaned = candidate
+            .trim()
+            .trim_start_matches("```json")
+            .trim_start_matches("```")
+            .trim_end_matches("```")
+            .trim();
+        serde_json::from_str(cleaned).ok()
+    }
 
-    serde_json::from_str(cleaned).unwrap_or_else(|_| {
-        // Fallback: use truncated turn text as history entry.
-        // Use char-boundary-safe slicing to prevent panic on multi-byte UTF-8.
-        let summary = if fallback_text.len() > 200 {
-            let end = fallback_text
-                .char_indices()
-                .map(|(i, _)| i)
-                .take_while(|&i| i <= 200)
-                .last()
-                .unwrap_or(0);
-            format!("{}…", &fallback_text[..end])
-        } else {
-            fallback_text.to_string()
-        };
-        ConsolidationResult {
-            history_entry: summary,
-            memory_update: None,
-            facts: Vec::new(),
-            trend: None,
-            kind: None,
-        }
-    })
+    // Preserve literal `<think>` tags when the provider already returned a
+    // valid JSON document. Only strip an outer reasoning envelope when the
+    // first parse fails.
+    parse_json(raw)
+        .or_else(|| parse_json(&strip_think_tags(raw)))
+        .unwrap_or_else(|| {
+            // Fallback: use truncated turn text as history entry.
+            // Use char-boundary-safe slicing to prevent panic on multi-byte UTF-8.
+            let summary = if fallback_text.len() > 200 {
+                let end = fallback_text
+                    .char_indices()
+                    .map(|(i, _)| i)
+                    .take_while(|&i| i <= 200)
+                    .last()
+                    .unwrap_or(0);
+                format!("{}…", &fallback_text[..end])
+            } else {
+                fallback_text.to_string()
+            };
+            ConsolidationResult {
+                history_entry: summary,
+                memory_update: None,
+                facts: Vec::new(),
+                trend: None,
+                kind: None,
+            }
+        })
 }
 
 #[cfg(test)]
@@ -486,6 +515,15 @@ mod tests {
             result.memory_update.as_deref(),
             Some("User prefers Rust over Go.")
         );
+    }
+
+    #[test]
+    fn parse_think_wrapped_json_response() {
+        let raw = r#"<think>plan the memory update</think>
+{"history_entry":"User prefers Rust.","memory_update":"User prefers Rust."}"#;
+        let result = parse_consolidation_response(raw, "fallback");
+        assert_eq!(result.history_entry, "User prefers Rust.");
+        assert_eq!(result.memory_update.as_deref(), Some("User prefers Rust."));
     }
 
     #[test]
@@ -682,6 +720,7 @@ mod tests {
     struct ScriptedProvider {
         response: &'static str,
         system_prompts: Mutex<Vec<String>>,
+        sampling: Mutex<Vec<CallSampling>>,
     }
 
     impl ScriptedProvider {
@@ -689,12 +728,26 @@ mod tests {
             Self {
                 response,
                 system_prompts: Mutex::new(Vec::new()),
+                sampling: Mutex::new(Vec::new()),
             }
         }
     }
 
     #[async_trait]
     impl ModelProvider for ScriptedProvider {
+        async fn chat_with_system_with_sampling(
+            &self,
+            system_prompt: Option<&str>,
+            message: &str,
+            model: &str,
+            sampling: CallSampling,
+        ) -> anyhow::Result<String> {
+            let temperature = sampling.resolve_for(None);
+            self.sampling.lock().push(sampling);
+            self.chat_with_system(system_prompt, message, model, temperature)
+                .await
+        }
+
         async fn chat_with_system(
             &self,
             system_prompt: Option<&str>,
@@ -751,6 +804,36 @@ mod tests {
             "We use a staged rollout.",
         )
         .await
+    }
+
+    #[tokio::test]
+    async fn consolidation_preserves_candidate_sampling_and_explicit_omission() {
+        let provider = ScriptedProvider::new(TYPED_RESPONSE);
+        let memory = RecordingMemory::default();
+        let config = MemoryConfig::default();
+        consolidate_turn_with_sampling(
+            &provider,
+            "test-model",
+            CallSampling::for_selection(Some(0.2), |reference| {
+                (reference == "custom.fallback").then_some(0.8)
+            }),
+            &memory,
+            &config,
+            "How do we deploy?",
+            "Use a staged rollout.",
+        )
+        .await
+        .unwrap();
+        run_consolidation(&provider, &memory, &config)
+            .await
+            .unwrap();
+
+        let sampling = provider.sampling.lock();
+        assert_eq!(sampling.len(), 2);
+        assert_eq!(sampling[0].resolve_for(None), Some(0.2));
+        assert_eq!(sampling[0].resolve_for(Some("custom.fallback")), Some(0.8));
+        assert_eq!(sampling[1].resolve_for(None), None);
+        assert_eq!(sampling[1].resolve_for(Some("custom.fallback")), None);
     }
 
     #[tokio::test]

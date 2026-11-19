@@ -1,8 +1,8 @@
 # Provider Catalog
 
-Every model-provider family ZeroClaw ships with. For each: config shape, notes on auth and endpoint behavior, and the slot key to use under `[providers.models.<type>.<alias>]`.
+Every model-provider family ZeroClaw ships with. For each: capability notes, auth and endpoint behavior. Define a reusable connection and reference it from a model key; the old family slot examples below are migration references.
 
-See [Configuration](./configuration.md) for universal fields (`api_key`, `uri`, `model`, ...) and resolution order.
+See [Configuration](./configuration.md) for the canonical connection/model fields and resolution order.
 
 > Examples below use `home` as the alias to underline that the alias half is operator-chosen, pick whatever name fits (`work`, `personal`, `cn`, `prod`, ...). Reference it from an agent via `model_provider = "<type>.<alias>"`.
 
@@ -570,17 +570,25 @@ OAuth-backed Qwen accounts use the same slot with `auth_mode = "o_auth"`.
 ### MiniMax: slot `minimax`
 
 ```toml
-[providers.models.minimax.intl]
-model    = "MiniMax-M3"                       # or MiniMax-M2.7, MiniMax-M2.7-highspeed
-api_key  = "..."
-endpoint = "intl"                            # variants: cn, intl
+[providers.connections."minimax.intl"]
+kind = "minimax"
+extra = { endpoint = "intl" }
+auth = { mode = "api_key", api_key = "..." }
+
+[providers.models."chat.minimax.intl"]
+capability = "chat"
+provider = "minimax.intl"
+model = "MiniMax-M3" # or MiniMax-M2.7, MiniMax-M2.7-highspeed
 ```
 
-For MiniMax's Anthropic-compatible API, use `[providers.models.anthropic.minimax]` with `uri = "https://api.minimax.io/anthropic"` (Global) or `uri = "https://api.minimaxi.com/anthropic"` (China) instead.
+For MiniMax's Anthropic-compatible API, use an `anthropic.minimax` connection
+and bind a chat model to it, with `uri = "https://api.minimax.io/anthropic"`
+(Global) or `uri = "https://api.minimaxi.com/anthropic"` (China).
 
 ### Z.AI: slot `zai`
 
-For Z.AI's Anthropic-compatible API, use `[providers.models.anthropic.zai]` with `uri = "https://api.z.ai/api/anthropic"` instead.
+For Z.AI's Anthropic-compatible API, use an `anthropic.zai` connection with
+`uri = "https://api.z.ai/api/anthropic"` instead.
 
 ### Doubao / Volcengine: slot `doubao`
 

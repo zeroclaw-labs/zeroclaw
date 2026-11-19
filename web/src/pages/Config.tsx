@@ -54,6 +54,7 @@ import CostRatesEditor, {
 } from "../components/sections/CostRatesEditor";
 import { Badge, Button, Card, PageHeader } from "@/components/ui";
 import { t } from "@/lib/i18n";
+import ProviderRegistryEditor from '../components/sections/ProviderRegistryEditor';
 
 // Display order for the curated sidebar groups. Each `SectionInfo.group`
 // from the gateway lands in one of these buckets (anything else falls
@@ -227,6 +228,10 @@ export default function Config() {
 
   const mainContent = (() => {
     if (!activeSection) return null;
+
+    if (activeSection.key === 'providers.registry') {
+      return <ProviderRegistryEditor onSaved={fetchDrift} />;
+    }
 
     if (!activeSection.has_picker) {
       return (

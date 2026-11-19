@@ -1494,7 +1494,7 @@ impl SqliteMemory {
     /// is storage layout, not an authorization mechanism.
     ///
     /// The encoding is length-prefixed (`<byte-len>:<bytes>` per segment) so
-    /// the mapping from (owner, namespace, tenant, key) to physical key is
+    /// the mapping from(owner, namespace, tenant, key) to physical key is
     /// injective: no choice of colon-bearing owner/namespace/tenant/key can
     /// produce the same string as a different tuple, and an absent tenant
     /// (`None`, encoded as `-`) is distinct from an empty one (`Some("")`,
@@ -1625,21 +1625,8 @@ impl Memory for SqliteMemory {
 
     fn refresh_embedder(
         &self,
-        model_provider: &str,
-        api_key: Option<&str>,
-        model: &str,
-        dimensions: usize,
+        embedder: std::sync::Arc<dyn zeroclaw_api::embedding::EmbeddingProvider>,
     ) {
-        // Rebuild from the freshly-resolved settings and swap in place. No
-        // provider state is duplicated into a separate cache — the endpoint/key
-        // come from the canonical config via the runtime resolver.
-        let embedder: Arc<dyn EmbeddingProvider> =
-            Arc::from(zeroclaw_providers::embedding::create_embedding_provider(
-                model_provider,
-                api_key,
-                model,
-                dimensions,
-            ));
         self.swap_embedder(embedder);
     }
 
@@ -4155,13 +4142,7 @@ mod tests {
         let (_tmp, mem) = temp_sqlite(); // NoopEmbedding, dims 0
         assert_eq!(mem.embedder_dimensions(), 0);
 
-        Memory::refresh_embedder(
-            &mem,
-            "openai",
-            Some("sk-test"),
-            "text-embedding-3-small",
-            1536,
-        );
+        Memory::refresh_embedder(&mem, crate::test_embedder(1536));
 
         assert_eq!(
             mem.embedder_dimensions(),

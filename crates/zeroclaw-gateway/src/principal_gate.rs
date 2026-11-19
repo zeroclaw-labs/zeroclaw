@@ -997,6 +997,7 @@ mod tests {
             "/api/config",
             "/api/quickstart/state",
             "/api/config/sections",
+            "/api/config/provider-registry",
         ] {
             let (status, body) = send(&router, "GET", path, None, None, None).await;
             assert_eq!(status, StatusCode::UNAUTHORIZED, "{path}");
@@ -1267,6 +1268,52 @@ mod tests {
         config.config_path = tmp.path().join("config.toml");
         config.data_dir = tmp.path().join("data");
         config
+    }
+
+    #[tokio::test]
+    async fn provider_registry_replacement_requires_all_crud_grants_and_provider_scope() {
+        let idp = introspection_idp(&["ops"]).await;
+        for (verbs, paths) in [
+            (vec![Verb::Read], vec!["providers"]),
+            (vec![Verb::Read, Verb::Update], vec!["providers"]),
+            (
+                vec![Verb::Read, Verb::Update, Verb::Create],
+                vec!["providers"],
+            ),
+            (
+                vec![Verb::Read, Verb::Update, Verb::Create, Verb::Delete],
+                vec!["agents.*"],
+            ),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let config = editor_config(&tmp, &idp.uri(), &verbs, &paths);
+            let router = router_for(config);
+            let (status, expected) = send(
+                &router,
+                "GET",
+                "/api/config/provider-registry",
+                SCOPED.0,
+                SCOPED.1,
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            let (status, _) = send(
+                &router,
+                "PUT",
+                "/api/config/provider-registry",
+                SCOPED.0,
+                SCOPED.1,
+                Some(serde_json::json!({"expected": expected, "registry": expected})),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::FORBIDDEN,
+                "verbs={verbs:?}, paths={paths:?}"
+            );
+            assert!(!tmp.path().join("config.toml").exists());
+        }
     }
 
     async fn create_agent(router: &Router, alias: &str) {

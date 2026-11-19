@@ -1455,12 +1455,21 @@ impl App {
                     && let Some(tab_rect) = self.last_tab_area
                     && mouse::in_rect(mouse.column, mouse.row, tab_rect)
                 {
-                    let labels = [ConfigTab::Aliases.label(), ConfigTab::Costs.label()];
+                    let cost_only = matches!(
+                        self.screen,
+                        Screen::AliasList { section_idx, .. }
+                            if self.is_cost_only_section(section_idx)
+                    );
+                    let labels: Vec<&str> = if cost_only {
+                        vec![ConfigTab::Costs.label()]
+                    } else {
+                        vec![ConfigTab::Aliases.label(), ConfigTab::Costs.label()]
+                    };
                     let display: Vec<String> = labels
                         .iter()
                         .enumerate()
                         .map(|(i, l)| {
-                            if i == self.alias_tab {
+                            if (cost_only && i == 0) || (!cost_only && i == self.alias_tab) {
                                 format!("▸ {l}")
                             } else {
                                 l.to_string()
@@ -1473,10 +1482,11 @@ impl App {
                         && idx < labels.len()
                     {
                         self.zeroclaw_pane = ZeroclawPane::Detail;
-                        if idx != self.alias_tab {
-                            self.alias_tab = idx;
+                        let next_tab = if cost_only { 1 } else { idx };
+                        if next_tab != self.alias_tab {
+                            self.alias_tab = next_tab;
                             self.deactivate_filter();
-                            if idx == 1 {
+                            if next_tab == 1 {
                                 self.load_cost_resources().await?;
                             }
                         }
@@ -2088,6 +2098,12 @@ impl App {
         self.sections.get(section_idx).is_some_and(|section| {
             section.shape == Some(SectionShape::TypedFamilyMap) && section.key == prefix
         })
+    }
+
+    fn is_cost_only_section(&self, section_idx: usize) -> bool {
+        self.sections
+            .get(section_idx)
+            .is_some_and(|section| section.shape == Some(SectionShape::CostRates))
     }
 
     async fn load_type_alias_counts(&mut self) -> Result<()> {
@@ -2725,6 +2741,12 @@ impl App {
                         breadcrumb: vec![section_key],
                     };
                 }
+                Some(SectionShape::CostRates) => {
+                    self.types = self.types_for_section(&section_key);
+                    self.type_cursor = 0;
+                    self.load_type_alias_counts().await?;
+                    self.screen = Screen::TypeList { section_idx: idx };
+                }
                 Some(SectionShape::DirectForm) | Some(SectionShape::BackendPicker) | None => {
                     self.load_fields(&section_key).await?;
                     self.screen = Screen::FieldList {
@@ -2815,14 +2837,24 @@ impl App {
             let Some(tmpl) = self.types.get(template_idx) else {
                 return Ok(());
             };
-            let map_path = tmpl.path.clone();
             let type_name = type_template_label(tmpl);
+            let cost_only = self.is_cost_only_section(section_idx);
+            let map_path = if cost_only {
+                let category = self.sections[section_idx].cost_category.clone();
+                format!("cost.rates.providers.{category}.{type_name}")
+            } else {
+                tmpl.path.clone()
+            };
             self.load_aliases(&map_path).await?;
             self.screen = Screen::AliasList {
                 section_idx,
                 map_path,
                 breadcrumb: vec![section_key, type_name],
             };
+            if cost_only {
+                self.alias_tab = 1;
+                self.load_cost_resources().await?;
+            }
             self.status_msg = None;
         }
         Ok(())
@@ -2831,6 +2863,12 @@ impl App {
     // ── Alias list ───────────────────────────────────────────────
 
     async fn handle_alias_list(&mut self, key: KeyEvent) -> Result<()> {
+        if let Screen::AliasList { section_idx, .. } = &self.screen
+            && self.is_cost_only_section(*section_idx)
+        {
+            self.alias_tab = 1;
+            return self.handle_cost_tab(key).await;
+        }
         use crate::keymap::ConfigTabAction;
         let has_tabs = self.alias_list_has_tabs();
 
@@ -5100,7 +5138,11 @@ impl App {
             None
         };
         if let Some(tab_rect) = tab_area {
-            let labels = [ConfigTab::Aliases.label(), ConfigTab::Costs.label()];
+            let labels: Vec<&str> = if self.is_cost_only_section(section_idx) {
+                vec![ConfigTab::Costs.label()]
+            } else {
+                vec![ConfigTab::Aliases.label(), ConfigTab::Costs.label()]
+            };
             let mut spans = Vec::new();
             for (i, label) in labels.iter().enumerate() {
                 if i > 0 {

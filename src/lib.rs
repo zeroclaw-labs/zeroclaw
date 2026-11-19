@@ -387,37 +387,55 @@ pub enum AgentsCommands {
     },
 }
 
-/// Alias CRUD for providers (`[providers.<category>.<family>.<alias>]`).
-/// `category` is one of `models`, `tts`, `transcription`.
+/// Canonical registry selected by the provider-management CLI.
+#[derive(ValueEnum, Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderRegistrySection {
+    Connections,
+    Models,
+    ModelPresets,
+    Fallback,
+}
+
+impl ProviderRegistrySection {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Connections => "connections",
+            Self::Models => "models",
+            Self::ModelPresets => "model_presets",
+            Self::Fallback => "fallback",
+        }
+    }
+}
+
+/// Manage exact keys under the canonical provider registries.
 #[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ProvidersCommands {
-    /// List provider aliases (optionally filtered by category)
+    /// List exact registry keys
     List {
-        /// Category: models | tts | transcription
-        #[arg(long)]
-        category: Option<String>,
+        #[arg(long, value_enum)]
+        registry: Option<ProviderRegistrySection>,
     },
-    /// Create a new provider alias with default config
+    /// Create a complete connection, model, preset or fallback entry from JSON
     Create {
-        /// Category: models | tts | transcription
-        category: String,
-        /// Provider family (e.g. anthropic, openai, elevenlabs)
-        family: String,
-        /// New alias
-        alias: String,
+        #[arg(value_enum)]
+        registry: ProviderRegistrySection,
+        key: String,
+        /// Complete JSON definition; quote it to preserve shell syntax
+        value: String,
     },
-    /// Rename a provider alias, rewriting every reference
+    /// Rename an exact key and its configuration references
     Rename {
-        category: String,
-        family: String,
+        #[arg(value_enum)]
+        registry: ProviderRegistrySection,
         from: String,
         to: String,
     },
-    /// Delete a provider alias, scrubbing references
+    /// Delete an unreferenced entry (referenced entries are refused)
     Delete {
-        category: String,
-        family: String,
-        alias: String,
+        #[arg(value_enum)]
+        registry: ProviderRegistrySection,
+        key: String,
         #[arg(long)]
         dry_run: bool,
         #[arg(long)]
@@ -1154,4 +1172,64 @@ pub enum SopGraphFormat {
     Adjacency,
     /// Pretty-printed JSON of the whole projection.
     Json,
+}
+
+#[cfg(test)]
+mod provider_registry_cli_tests {
+    use super::*;
+    use clap::Parser;
+
+    #[derive(Parser)]
+    struct ProviderCli {
+        #[command(subcommand)]
+        command: ProvidersCommands,
+    }
+
+    #[test]
+    fn provider_create_accepts_an_opaque_model_key_and_complete_json() {
+        let value = r#"{"capability":"chat","provider":"gateway.Prod","model":"wire-id"}"#;
+        let parsed =
+            ProviderCli::try_parse_from(["providers", "create", "models", "chat.Fast.v2", value])
+                .unwrap();
+        assert_eq!(
+            parsed.command,
+            ProvidersCommands::Create {
+                registry: ProviderRegistrySection::Models,
+                key: "chat.Fast.v2".into(),
+                value: value.into(),
+            }
+        );
+        assert!(
+            ProviderCli::try_parse_from(["providers", "create", "tts", "openai", "default"])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn provider_rename_and_list_select_canonical_registries() {
+        assert_eq!(
+            ProviderCli::try_parse_from([
+                "providers",
+                "rename",
+                "connections",
+                "gateway.Prod",
+                "gateway.Next"
+            ])
+            .unwrap()
+            .command,
+            ProvidersCommands::Rename {
+                registry: ProviderRegistrySection::Connections,
+                from: "gateway.Prod".into(),
+                to: "gateway.Next".into()
+            }
+        );
+        assert_eq!(
+            ProviderCli::try_parse_from(["providers", "list", "--registry", "model-presets"])
+                .unwrap()
+                .command,
+            ProvidersCommands::List {
+                registry: Some(ProviderRegistrySection::ModelPresets)
+            }
+        );
+    }
 }

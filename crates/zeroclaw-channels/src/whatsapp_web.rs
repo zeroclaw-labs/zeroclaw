@@ -635,15 +635,13 @@ impl WhatsAppWebChannel {
 
     /// Configure voice transcription from a `[transcription]` snapshot.
     ///
-    /// Compatibility and test path. The daemon routes every channel through
-    /// `with_transcription_manager` with a manager built from live
-    /// config and the owning agent's resolved provider; this path can only see
-    /// the legacy section, so it binds a lone registered provider and
-    /// otherwise leaves the choice unbound (see
-    /// `transcription::manager_from_snapshot`).
+    /// Test fixture only: project historical input before constructing the
+    /// canonical manager. Production injects a manager built from the live
+    /// configuration and the owning agent's exact model reference.
     #[cfg(feature = "whatsapp-web")]
-    pub fn with_transcription(self, config: zeroclaw_config::schema::TranscriptionConfig) -> Self {
-        let manager = zeroclaw_providers::transcription::manager_from_snapshot(&config);
+    #[cfg(test)]
+    fn with_transcription(self, config: zeroclaw_config::schema::TranscriptionConfig) -> Self {
+        let manager = crate::transcription_fixture(&config);
         self.with_transcription_manager(config, manager)
     }
 
@@ -665,7 +663,7 @@ impl WhatsAppWebChannel {
 
     #[cfg(feature = "whatsapp-web")]
     pub fn with_tts(mut self, config: &zeroclaw_config::schema::Config) -> Self {
-        if config.tts.enabled {
+        if zeroclaw_providers::tts::is_enabled(config) {
             let owner = config.agent_for_channel(&format!("whatsapp.{}", self.alias));
             match zeroclaw_providers::tts::TtsManager::from_config_for_agent(config, owner) {
                 Ok(m) => self.tts_manager = Some(Arc::new(m)),
@@ -4635,7 +4633,8 @@ impl WhatsAppWebChannel {
         Self { _private: () }
     }
 
-    pub fn with_transcription(self, _config: zeroclaw_config::schema::TranscriptionConfig) -> Self {
+    #[cfg(test)]
+    fn with_transcription(self, _config: zeroclaw_config::schema::TranscriptionConfig) -> Self {
         self
     }
 
@@ -6813,11 +6812,9 @@ mod tests {
                 ..Default::default()
             },
         );
-        let manager = zeroclaw_providers::transcription::build_channel_transcription_manager(
-            &config,
-            "groq.fast",
-        )
-        .expect("typed provider must build a manager");
+        let manager =
+            zeroclaw_providers::transcription::build_transcription_manager(&config, "groq.fast")
+                .expect("typed provider must build a manager");
 
         let cfg = zeroclaw_config::schema::WhatsAppConfig {
             enabled: true,

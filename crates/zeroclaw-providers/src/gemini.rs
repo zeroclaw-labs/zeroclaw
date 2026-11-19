@@ -40,6 +40,7 @@ pub struct GeminiModelProvider {
     /// from `GeminiModelProviderConfig.oauth_client_id` / `oauth_client_secret`.
     oauth_client_id: Option<String>,
     oauth_client_secret: Option<String>,
+    http_timeouts: crate::transport::ChatHttpTimeouts,
 }
 
 /// Mutable OAuth token state — supports runtime refresh for long-lived processes.
@@ -534,6 +535,7 @@ pub struct GeminiBuilder {
     oauth_project_seed: Option<String>,
     oauth_client_id: Option<String>,
     oauth_client_secret: Option<String>,
+    http_timeouts: crate::transport::ChatHttpTimeouts,
 }
 
 impl GeminiBuilder {
@@ -584,6 +586,11 @@ impl GeminiBuilder {
     ) -> Self {
         self.oauth_client_id = client_id;
         self.oauth_client_secret = client_secret;
+        self
+    }
+
+    pub(crate) fn http_timeouts(mut self, options: &crate::ModelProviderRuntimeOptions) -> Self {
+        self.http_timeouts = crate::transport::ChatHttpTimeouts::from_options(options);
         self
     }
 
@@ -653,6 +660,7 @@ impl GeminiBuilder {
             auth_profile_override: self.profile_override,
             oauth_client_id: self.oauth_client_id,
             oauth_client_secret: self.oauth_client_secret,
+            http_timeouts: self.http_timeouts,
         }
     }
 }
@@ -678,6 +686,7 @@ impl GeminiModelProvider {
             oauth_project_seed: None,
             oauth_client_id: None,
             oauth_client_secret: None,
+            http_timeouts: Default::default(),
         }
     }
 
@@ -925,12 +934,8 @@ impl GeminiModelProvider {
         }
     }
 
-    fn http_client(&self) -> Client {
-        zeroclaw_config::schema::build_runtime_proxy_client_with_timeouts(
-            "model_provider.gemini",
-            120,
-            10,
-        )
+    fn http_client(&self) -> anyhow::Result<Client> {
+        self.http_timeouts.client("model_provider.gemini")
     }
 
     /// Resolve the GCP project ID for OAuth by calling the loadCodeAssist endpoint.
@@ -949,7 +954,7 @@ impl GeminiModelProvider {
         }
 
         // Call loadCodeAssist
-        let client = self.http_client();
+        let client = self.http_client()?;
         let response = client
             .post(format!(
                 "{}:loadCodeAssist",
@@ -1023,7 +1028,7 @@ impl GeminiModelProvider {
         project: Option<&str>,
         oauth_token: Option<&str>,
     ) -> anyhow::Result<reqwest::RequestBuilder> {
-        let req = self.http_client().post(url).json(request);
+        let req = self.http_client()?.post(url).json(request);
         Ok(match auth {
             GeminiAuth::ExplicitKey(key) => {
                 req.header(GOOGLE_API_KEY_HEADER, Self::sensitive_api_key_header(key)?)
@@ -1046,7 +1051,7 @@ impl GeminiModelProvider {
                         },
                     },
                 };
-                self.http_client()
+                self.http_client()?
                     .post(url)
                     .json(&internal_request)
                     .bearer_auth(token)
@@ -1063,7 +1068,7 @@ impl GeminiModelProvider {
 
     fn build_api_key_probe_request(&self, key: &str) -> anyhow::Result<reqwest::RequestBuilder> {
         Ok(self
-            .http_client()
+            .http_client()?
             .get(format!(
                 "{}/models",
                 self.api_url.as_deref().unwrap_or(BASE_URL)
@@ -1659,6 +1664,7 @@ mod tests {
             auth_profile_override: None,
             oauth_client_id: None,
             oauth_client_secret: None,
+            http_timeouts: Default::default(),
         }
     }
 
@@ -2623,6 +2629,7 @@ mod tests {
             auth_profile_override: None,
             oauth_client_id: None,
             oauth_client_secret: None,
+            http_timeouts: Default::default(),
         };
 
         let result = model_provider.warmup().await;

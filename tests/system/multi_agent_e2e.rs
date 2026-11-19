@@ -121,10 +121,10 @@ async fn two_sqlite_agents_on_one_install_have_isolated_memory() {
         );
     }
 
-    let alpha_mem = zeroclaw_memory::create_memory_for_agent(&cfg, "alpha", None)
+    let alpha_mem = zeroclaw_memory::create_memory_for_agent(&cfg, "alpha")
         .await
         .expect("per-agent memory for alpha");
-    let beta_mem = zeroclaw_memory::create_memory_for_agent(&cfg, "beta", None)
+    let beta_mem = zeroclaw_memory::create_memory_for_agent(&cfg, "beta")
         .await
         .expect("per-agent memory for beta");
 

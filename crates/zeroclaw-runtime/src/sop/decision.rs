@@ -1,8 +1,8 @@
 //! Decision-model gating for SOP dispatch.
 //!
-//! A "System One" decision model (TypeSafe Jev, or the Jev-compatible open-weights
-//! Laya served locally) answers typed questions about a state instead of
-//! generating text. An SOP opts in with a `[decision]` table in `SOP.toml`; for
+//! A native decision model answers typed questions about a state instead of
+//! generating text. Provider adapters own OpenAI Decisions and System One
+//! protocols. An SOP opts in with a `[decision]` table in `SOP.toml`; for
 //! each event that already matched one of its triggers, dispatch asks the model:
 //!
 //! - **gate** (`noul`): should this event start this SOP at all?
@@ -18,11 +18,11 @@
 //! discards the model's step answers, because a skipped step never asks for
 //! approval.
 
-use std::collections::BTreeMap;
-
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
+pub use zeroclaw_api::decision::{Answer, Answers, DecisionModel, Question};
 
 use super::types::{Sop, SopEvent, SopExecutionMode};
 
@@ -53,7 +53,7 @@ pub enum GateOnError {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct SopDecisionSpec {
-    /// Alias of the decision model to ask, from `[decision_models.<alias>]`.
+    /// Exact decision model key in `[providers.models.<model-ref>]`.
     pub model: String,
     /// Yes/no question asked about each matching event. The run starts only
     /// when the model's "yes" probability reaches `gate_threshold`.
@@ -94,7 +94,7 @@ impl SopDecisionSpec {
     pub fn validate(&self, sop_name: &str, deterministic: bool, has_parts: bool) -> Result<()> {
         ensure!(
             !self.model.trim().is_empty(),
-            "SOP '{sop_name}': [decision] model must name a [decision_models] alias"
+            "SOP '{sop_name}': [decision] model must name a decision model reference"
         );
         ensure!(
             self.gate.is_some() || !self.modes.is_empty() || has_parts,
@@ -235,9 +235,6 @@ fn mode_description(mode: SopExecutionMode) -> &'static str {
     }
 }
 
-use zeroclaw_api::decision::{Answer, Answers, DecisionModel, Question};
-use zeroclaw_providers::decision::SystemOneClient;
-
 // ── Decision ────────────────────────────────────────────────────
 
 const GATE_QUESTION: &str = "start_sop";
@@ -305,37 +302,38 @@ pub fn decide_without_model(sop: &Sop, spec: &SopDecisionSpec) -> SopDecision {
     )
 }
 
-/// Build a client for every `[decision_models.<alias>]` entry with a known
-/// endpoint (provider defaults applied). An entry without one, or whose client
-/// cannot be built, is logged and left out, so SOPs selecting it dispatch
-/// fail-closed.
+/// Build decision clients from the canonical provider registry. The registry
+/// owns connection/auth/model resolution; the provider crate owns native wire
+/// protocols. SOP only owns the alias map consumed by the engine.
 pub fn models_from_config(
-    models: &std::collections::HashMap<String, zeroclaw_config::schema::SopDecisionModelConfig>,
+    config: &zeroclaw_config::schema::Config,
 ) -> std::collections::HashMap<String, std::sync::Arc<dyn DecisionModel>> {
-    models
-        .iter()
-        .filter_map(|(alias, cfg)| {
-            let Some((base_url, model)) = cfg.endpoint() else {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({"alias": alias})),
-                    "SOP decision model unavailable: custom provider without base_url"
-                );
+    let Ok(registry) = config.provider_registry() else {
+        return std::collections::HashMap::new();
+    };
+    config
+        .providers
+        .models
+        .canonical_model_refs()
+        .filter_map(|model_ref| {
+            let Ok(resolved) = registry.resolve_decision(model_ref) else {
                 return None;
             };
-            match SystemOneClient::new(&base_url, &model, cfg.api_key.clone()) {
-                Ok(client) => Some((alias.clone(), std::sync::Arc::new(client) as _)),
-                Err(e) => {
+            let client =
+                zeroclaw_providers::decision::DecisionProviderConfig::from_resolved(&resolved)
+                    .and_then(zeroclaw_providers::decision::build_decision_provider);
+            match client {
+                Ok(client) => Some((model_ref.to_string(), std::sync::Arc::from(client))),
+                Err(error) => {
                     ::zeroclaw_log::record!(
                         WARN,
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                             .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                            .with_attrs(
-                                ::serde_json::json!({"alias": alias, "error": e.to_string()})
-                            ),
-                        "SOP decision model unavailable: client failed to build"
+                            .with_attrs(::serde_json::json!({
+                                "model": model_ref.as_str(),
+                                "error": error.to_string(),
+                            })),
+                        "SOP canonical decision model unavailable: client failed to build"
                     );
                     None
                 }
@@ -1124,7 +1122,19 @@ mod tests {
             "#,
         )
         .unwrap();
-        let ep = |alias: &str| cfg.decision_models[alias].endpoint();
+        assert!(cfg.decision_models.is_empty());
+        let registry = cfg.provider_registry().unwrap();
+        let ep = |alias: &str| {
+            registry
+                .resolve_decision(&alias.into())
+                .ok()
+                .map(|resolved| {
+                    (
+                        resolved.selection.connection.uri().unwrap().to_string(),
+                        resolved.model.to_string(),
+                    )
+                })
+        };
         assert_eq!(
             ep("jev"),
             Some(("https://api.typesafe.ai".into(), "jev-latest".into()))
@@ -1143,7 +1153,7 @@ mod tests {
             Some(("https://api.typesafe.ai".into(), "jev-1.13.0".into()))
         );
 
-        let models = models_from_config(&cfg.decision_models);
+        let models = models_from_config(&cfg);
         let mut aliases: Vec<_> = models.keys().cloned().collect();
         aliases.sort();
         assert_eq!(aliases, ["jev", "lab", "laya", "pinned"]);
@@ -1277,7 +1287,7 @@ mod tests {
     /// Build the configured client for `alias` exactly as the daemon does.
     fn configured_model(toml_src: &str, alias: &str) -> std::sync::Arc<dyn DecisionModel> {
         let cfg: zeroclaw_config::schema::Config = toml::from_str(toml_src).unwrap();
-        models_from_config(&cfg.decision_models)
+        models_from_config(&cfg)
             .remove(alias)
             .expect("alias configured")
     }

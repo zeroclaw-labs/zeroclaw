@@ -885,7 +885,7 @@ impl EgressRequest {
 ///
 /// `EgressHostService` used to own its counts, so a clone shared them but an
 /// independently built service did not. Production builds a *fresh* service per
-/// `all_tools_with_runtime` call, and the same canonical instance is registered
+/// `build_native_registry` call, and the same canonical instance is registered
 /// by several independent paths — the agent loop, the gateway, the channels
 /// orchestrator, and the delegate tool. Each registry therefore handed the same
 /// instance a full budget, and N registries multiplied the operator's ceiling by
@@ -2216,7 +2216,7 @@ mod tests {
     /// The sharing regression.
     ///
     /// Production never clones one service around the process. It builds a
-    /// fresh [`EgressHostService`] per `all_tools_with_runtime` call, and the
+    /// fresh [`EgressHostService`] per `build_native_registry` call, and the
     /// agent loop, the gateway, the channels orchestrator, and the delegate
     /// tool each register the same canonical instance through a registry of
     /// their own. When the count lived in the service, every one of those

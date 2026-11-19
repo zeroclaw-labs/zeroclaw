@@ -1,14 +1,16 @@
 # Configuration V5 boundary
 
-V4 was released with ZeroClaw 0.9.0 and is frozen. Its committed fixture and
-`zeroclaw config generate 4` output remain unchanged. New configuration shapes
-belong to V5 and the isolated V4 → V5 migration, not to V3 → V4.
+V4 was released with ZeroClaw 0.9.0 and is frozen. Its fixture and
+`zeroclaw config generate 4` output remain unchanged. Connections, capability
+models, presets and the fallback graph are V5 configuration.
 
-The initial V5 step changes only the version stamp. Existing V1–V3 inputs run
-the existing chain through V4 before entering V5. The provider registry layer
-will extend the final step with its structural conversion.
+The V4 → V5 migration converts legacy profiles and route-owned model settings
+into independently named connections and models. Earlier V1–V3 inputs first
+run the existing migrations through V4, then the same V5 conversion.
+Runtime consumers resolve canonical references and never project old profiles.
 
-Use `zeroclaw config migrate` to write V5. Migration retains versioned backups;
-an older binary must use its pre-upgrade configuration rather than a V5 file.
-Offline edits, including the `model_routing_config` agent tool, require the
-current V5 file; migrate a released V4 file before using those paths.
+Use `zeroclaw config migrate` to persist V5. Loading also admits older input
+through the migration boundary, while offline edits, including the
+`model_routing_config` agent tool, require the current V5 file. Versioned
+backups preserve the old file; rollback to a V4 binary requires its
+pre-upgrade configuration backup.

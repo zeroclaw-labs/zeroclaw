@@ -409,7 +409,7 @@ mod tests {
         };
         let tmp = tempfile::tempdir().unwrap();
         let memory: Arc<dyn Memory> =
-            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path()).unwrap());
 
         let logger = SopAuditLogger::new(memory);
 
@@ -447,7 +447,7 @@ mod tests {
         };
         let tmp = tempfile::tempdir().unwrap();
         let memory: Arc<dyn Memory> =
-            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path()).unwrap());
 
         let logger = SopAuditLogger::new(memory);
         let result = logger.get_run("nonexistent").await.unwrap();
@@ -469,7 +469,7 @@ mod tests {
         };
         let tmp = tempfile::tempdir().unwrap();
         let memory: Arc<dyn Memory> =
-            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path()).unwrap());
         let logger = SopAuditLogger::new(memory);
         let secret = "super-secret-credential";
         let mut step = test_step_result(2);

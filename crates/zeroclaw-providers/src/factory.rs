@@ -70,7 +70,7 @@ pub trait FamilyProviderFactory {
     /// two. A family cannot be declared probeable without also declaring how
     /// its stored credential becomes an outbound header, so the generic
     /// reader can never be handed a raw credential it does not know how to
-    /// transform. [`crate::fetch_context_window`] resolves this and applies it
+    /// transform. [`crate::fetch_model_context_window`] resolves this and applies it
     /// through the compatible module's `apply_auth_to_request` — the same
     /// function the family's chat requests use. (Plain text rather than an
     /// intra-doc link: that helper is crate-private, and a public item may not
@@ -295,6 +295,7 @@ pub fn apply_compat_options(
     mut b: crate::compatible::OpenAiCompatibleBuilder,
     opts: &ModelProviderRuntimeOptions,
 ) -> Box<dyn ModelProvider> {
+    b = b.stream_request_timeout(opts.provider_stream_request_timeout_secs.clone());
     if let Some(native_tools) = opts.native_tools {
         b = b.with_native_tools(native_tools);
     }
@@ -413,6 +414,7 @@ fn build_responses_provider_if_requested(
         return None;
     }
     let mut builder = crate::openai::OpenAiResponsesModelProvider::builder(alias)
+        .stream_request_timeout(opts.provider_stream_request_timeout_secs.clone())
         .credential(key)
         .single_tool_rounds_supported(single_tool_rounds_supported);
     if let Some(url) = base_url {
@@ -458,7 +460,6 @@ pub(crate) fn build_kimi_code_compat(
 }
 
 pub fn dispatch_family_factory(
-    config: Option<&zeroclaw_config::schema::Config>,
     family: &str,
     alias: &str,
     key: Option<&str>,
@@ -471,9 +472,12 @@ pub fn dispatch_family_factory(
     // wire so existing installs don't flip wire + tool-calling mode on upgrade.
     if family == "openai" {
         let default_cfg = openai_missing_entry_fallback_config();
-        let cfg = config
-            .and_then(|c| c.providers.models.openai.get(alias))
-            .unwrap_or(&default_cfg);
+        let cfg = &default_cfg;
+        return cfg.create_provider(alias, key, api_url, opts);
+    }
+    if family == "qwen" {
+        let default_cfg = qwen_missing_entry_fallback_config();
+        let cfg = &default_cfg;
         return cfg.create_provider(alias, key, api_url, opts);
     }
     macro_rules! emit_dispatch {
@@ -481,21 +485,13 @@ pub fn dispatch_family_factory(
             match family {
                 "openai-compatible" | "openai_compatible" => {
                     let default_cfg = zeroclaw_config::schema::ModelProviderConfig::default();
-                    let cfg = config
-                        .and_then(|c| c.providers.models.find("openai", alias))
-                        .unwrap_or(&default_cfg);
+                    let cfg = &default_cfg;
                     cfg.create_provider(alias, key, api_url, opts)
                 }
                 $(
                     $type_str => {
-                        let default_cfg: $cfg_ty;
-                        let cfg: &$cfg_ty = match config.and_then(|c| c.providers.models.$field.get(alias)) {
-                            Some(c) => c,
-                            None => {
-                                default_cfg = <$cfg_ty>::default();
-                                &default_cfg
-                            }
-                        };
+                        let default_cfg = <$cfg_ty>::default();
+                        let cfg = &default_cfg;
                         cfg.create_provider(alias, key, api_url, opts)
                     }
                 )+
@@ -510,7 +506,7 @@ pub fn dispatch_family_factory(
                     Err(anyhow::Error::msg(format!(
                         "Unknown model_provider family: {family}. After the V2 to typed-family migration, \
                          only canonical family names are valid. Run `zeroclaw quickstart` to reconfigure, \
-                         or set `[providers.models.custom.<alias>] uri = \"https://your-api.com\"` for \
+                         or set `[providers.connections.<key>] uri = \"https://your-api.com\"` for \
                          OpenAI-compatible custom endpoints."
                     )))
                 },
@@ -520,6 +516,10 @@ pub fn dispatch_family_factory(
     zeroclaw_config::for_each_model_provider_slot!(emit_dispatch)
 }
 
+/// Legacy fallback authentication admission for the pre-registry path.
+/// Canonical selections use [`canonical_auth_ready`] below; this adapter is
+/// retained only while the compatibility constructor still walks old profile
+/// entries during migration and fallback materialization.
 pub(crate) fn fallback_auth_ready_for_alias(
     config: &zeroclaw_config::schema::Config,
     family: &str,
@@ -533,52 +533,82 @@ pub(crate) fn fallback_auth_ready_for_alias(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .unwrap_or(family);
-
-    // openai missing-entry fallback: keep construction symmetric with
-    // `dispatch_family_factory`. `wire_api` does not influence auth-readiness,
-    // but constructing the same chat-anchored fallback avoids any future
-    // divergence if that changes.
     if provider_kind == "openai" {
         let default_cfg = openai_missing_entry_fallback_config();
-        let cfg = config
+        return config
             .providers
             .models
             .openai
             .get(alias)
-            .unwrap_or(&default_cfg);
-        return cfg.fallback_auth_ready(key, opts);
+            .unwrap_or(&default_cfg)
+            .fallback_auth_ready(key, opts);
     }
-
     macro_rules! emit_auth_ready {
         ($(($field:ident, $type_str:literal, $cfg_ty:ty)),+ $(,)?) => {
             match provider_kind {
                 "openai-compatible" | "openai_compatible" => {
                     let default_cfg = zeroclaw_config::schema::ModelProviderConfig::default();
-                    let cfg = config
+                    config
                         .providers
                         .models
                         .find("openai", alias)
-                        .unwrap_or(&default_cfg);
-                    cfg.fallback_auth_ready(key, opts)
+                        .unwrap_or(&default_cfg)
+                        .fallback_auth_ready(key, opts)
                 }
-                $(
-                    $type_str => {
-                        let default_cfg: $cfg_ty;
-                        let cfg: &$cfg_ty = match config.providers.models.$field.get(alias) {
-                            Some(c) => c,
-                            None => {
-                                default_cfg = <$cfg_ty>::default();
-                                &default_cfg
-                            }
-                        };
-                        cfg.fallback_auth_ready(key, opts)
-                    }
-                )+
+                $($type_str => {
+                    let default_cfg: $cfg_ty;
+                    let cfg = match config.providers.models.$field.get(alias) {
+                        Some(config) => config,
+                        None => { default_cfg = <$cfg_ty>::default(); &default_cfg }
+                    };
+                    cfg.fallback_auth_ready(key, opts)
+                })+
                 _ => has_api_key(key),
             }
-        }
+        };
     }
     zeroclaw_config::for_each_model_provider_slot!(emit_auth_ready)
+}
+
+/// Authentication admission for an exact canonical selection. Reuse each
+/// family's keyless policy, with authentication modes read from the connection.
+pub(crate) fn canonical_auth_ready(
+    connection: &zeroclaw_config::provider_registry::ProviderConnection,
+) -> bool {
+    use zeroclaw_config::provider_registry::{GeminiAuth, ProviderConnection, QwenAuth};
+    let key = connection.api_key();
+    if has_api_key(key)
+        || connection
+            .extra_headers()
+            .is_some_and(|headers| !headers.is_empty())
+        || connection.uses_openai_codex_auth()
+    {
+        return true;
+    }
+    match connection {
+        ProviderConnection::Gemini(c) if matches!(c.auth, Some(GeminiAuth::OAuth { .. })) => {
+            return true;
+        }
+        ProviderConnection::Qwen(c) if matches!(c.auth, Some(QwenAuth::OAuth { .. })) => {
+            return true;
+        }
+        ProviderConnection::Minimax(c) if matches!(c.auth, Some(QwenAuth::OAuth { .. })) => {
+            return true;
+        }
+        ProviderConnection::Custom(_) | ProviderConnection::OpenAiCompatible(_) => {
+            return connection.uri().is_some();
+        }
+        _ => {}
+    }
+    macro_rules! family_auth_ready {
+        ($(($field:ident, $type_str:literal, $cfg_ty:ty)),+ $(,)?) => {
+            match connection.kind() {
+                $($type_str => <$cfg_ty>::default().fallback_auth_ready(key, &ModelProviderRuntimeOptions::default()),)+
+                _ => false,
+            }
+        };
+    }
+    zeroclaw_config::for_each_model_provider_slot!(family_auth_ready)
 }
 
 use zeroclaw_config::schema::{
@@ -642,7 +672,7 @@ pub fn get_default_url(provider_type: &str) -> Option<&'static str> {
 /// defines the typed slots — so the answer is derived from the family list
 /// instead of tracking it by hand. A family declares this beside its own spec
 /// and is classified the moment its slot exists, which is the property the
-/// previous hand-written list in [`crate::fetch_context_window`] did not have.
+/// previous hand-written list in [`crate::fetch_model_context_window`] did not have.
 ///
 /// [`for_each_model_provider_slot!`]: zeroclaw_config::for_each_model_provider_slot
 #[must_use]
@@ -1221,6 +1251,7 @@ impl FamilyProviderFactory for OpenRouterModelProviderConfig {
         opts: &ModelProviderRuntimeOptions,
     ) -> Result<Box<dyn ModelProvider>> {
         let mut b = crate::openrouter::OpenRouterModelProvider::builder(alias)
+            .stream_request_timeout(opts.provider_stream_request_timeout_secs.clone())
             .credential(key)
             .max_tokens(opts.provider_max_tokens);
         if let Some(t) = opts.provider_timeout_secs {
@@ -1253,6 +1284,7 @@ impl FamilyProviderFactory for AnthropicModelProviderConfig {
         opts: &ModelProviderRuntimeOptions,
     ) -> Result<Box<dyn ModelProvider>> {
         let mut b = crate::anthropic::AnthropicModelProvider::builder(alias)
+            .stream_request_timeout(opts.provider_stream_request_timeout_secs.clone())
             .credential(key)
             .server_fallback_models(self.server_fallback_models.clone())
             .single_tool_rounds_supported(
@@ -1544,6 +1576,7 @@ impl FamilyProviderFactory for GeminiModelProviderConfig {
                     self.oauth_client_id.clone(),
                     self.oauth_client_secret.clone(),
                 )
+                .http_timeouts(opts)
                 .build(),
         ))
     }
@@ -1620,6 +1653,7 @@ impl FamilyProviderFactory for AzureModelProviderConfig {
         let api_version = self.api_version.as_deref();
         Ok(Box::new(
             crate::azure_openai::AzureOpenAiModelProvider::builder(alias)
+                .http_timeouts(opts)
                 .resource_name(resource)
                 .deployment_name(deployment)
                 .credential(key)
@@ -1640,7 +1674,9 @@ impl FamilyProviderFactory for BedrockModelProviderConfig {
         api_url: Option<&str>,
         opts: &ModelProviderRuntimeOptions,
     ) -> Result<Box<dyn ModelProvider>> {
-        let builder = crate::bedrock::BedrockModelProvider::builder(alias).api_url(api_url);
+        let builder = crate::bedrock::BedrockModelProvider::builder(alias)
+            .http_timeouts(opts)
+            .api_url(api_url);
         // Explicit-key path stays no-probe — do not run BEDROCK_API_KEY /
         // AwsCredentials::from_env / from_credential_process (which can
         // spawn a shell command) when the operator has already resolved
@@ -1663,6 +1699,15 @@ impl FamilyProviderFactory for BedrockModelProviderConfig {
     }
 }
 
+/// Bare Qwen dispatch historically uses the CN region. Persisted profiles keep
+/// their configured endpoint, whose schema default for new entries is Intl.
+fn qwen_missing_entry_fallback_config() -> QwenModelProviderConfig {
+    QwenModelProviderConfig {
+        endpoint: zeroclaw_config::schema::QwenEndpoint::Cn,
+        ..Default::default()
+    }
+}
+
 impl FamilyProviderFactory for QwenModelProviderConfig {
     const ENDPOINT: ProviderEndpoint = ProviderEndpoint::Dynamic;
 
@@ -1673,6 +1718,8 @@ impl FamilyProviderFactory for QwenModelProviderConfig {
         api_url: Option<&str>,
         opts: &ModelProviderRuntimeOptions,
     ) -> Result<Box<dyn ModelProvider>> {
+        use zeroclaw_config::schema::ModelEndpoint;
+
         let alias_oauth: Option<crate::QwenOauthCredentials> = self
             .oauth_refresh_token
             .as_deref()
@@ -1711,7 +1758,7 @@ impl FamilyProviderFactory for QwenModelProviderConfig {
         let base_url = api_url
             .map(ToString::to_string)
             .or_else(|| oauth_context.base_url.clone())
-            .unwrap_or_else(|| crate::QWEN_OAUTH_BASE_FALLBACK_URL.to_string());
+            .unwrap_or_else(|| self.endpoint.uri().to_string());
         let b = if oauth_context.credential.is_some() {
             OpenAiCompatibleModelProvider::builder(alias)
                 .display_name("Qwen Code")
@@ -1843,7 +1890,7 @@ impl FamilyProviderFactory for GrokCliModelProviderConfig {
                 .env_passthrough(self.env_passthrough.clone())
                 .extra_args(self.extra_args.clone())
                 .max_acp_stdout_bytes(self.max_acp_stdout_bytes)
-                .timeout_secs(self.base.timeout_secs)
+                .timeout_secs(opts.provider_timeout_secs.or(self.base.timeout_secs))
                 // Optional send-path only: alias `vision = true` makes
                 // ZeroClaw emit ACP image blocks. Grok still advertises
                 // image=false through 0.2.118 and does not reliably use the
@@ -2109,10 +2156,555 @@ impl FamilyProviderFactory for zeroclaw_config::schema::ModelProviderConfig {
     }
 }
 
+/// Construct a chat provider from the canonical exact-key registry. Typed
+/// connection settings feed the same protocol constructors as legacy inputs;
+/// a model key never doubles as a legacy family/alias lookup.
+pub fn dispatch_model_ref(
+    config: &zeroclaw_config::schema::Config,
+    model_ref: &zeroclaw_config::provider_registry::ModelRef,
+    options: &ModelProviderRuntimeOptions,
+) -> Result<Box<dyn ModelProvider>> {
+    let registry = config
+        .provider_registry()
+        .map_err(|error| anyhow::Error::msg(error.to_string()))?;
+    dispatch_model_ref_with_registry(&registry, model_ref, options, None)
+}
+
+/// Materialize transport options from one admitted model selection. Shared by
+/// construction and option consumers so connection and preset fields cannot drift.
+pub(crate) fn runtime_options_for_chat(
+    resolved: &zeroclaw_config::provider_registry::ResolvedChat<'_>,
+    options: &ModelProviderRuntimeOptions,
+) -> ModelProviderRuntimeOptions {
+    use zeroclaw_config::provider_registry::{ModelDefinition, Override, ProviderConnection};
+    let mut runtime = options.clone();
+    let model_options = &resolved.options;
+    if let Some(Override::Set(value)) = &model_options.max_tokens {
+        runtime.provider_max_tokens = Some(*value);
+    }
+    if let Some(Override::Clear) = &model_options.max_tokens {
+        runtime.provider_max_tokens = None;
+    }
+    if let Some(Override::Set(value)) = &model_options.cache_ttl {
+        runtime.cache_ttl = Some(*value);
+    }
+    if let Some(Override::Clear) = &model_options.cache_ttl {
+        runtime.cache_ttl = None;
+    }
+    runtime.native_tools = model_options.native_tools;
+    runtime.think = model_options.think.as_ref().and_then(|value| match value {
+        Override::Set(value) => Some(*value),
+        Override::Clear => None,
+    });
+    runtime.merge_system_into_user = model_options.merge_system_into_user.unwrap_or(false);
+    runtime.replay_assistant_reasoning = model_options.replay_assistant_reasoning;
+    runtime.thinking_passthrough = model_options.thinking_passthrough.unwrap_or(false);
+    runtime.reasoning_effort_passthrough =
+        model_options.reasoning_effort_passthrough.unwrap_or(false);
+    runtime.cache_passthrough = model_options.cache_passthrough.unwrap_or(false);
+    runtime.provider_extra = model_options.provider_extra.clone();
+    runtime.chat_template_kwargs = model_options.chat_template_kwargs.clone();
+    runtime.tool_result_image_policy = model_options.tool_result_image_policy.unwrap_or_default();
+    runtime.wire_api = resolved.wire_api.map(|wire| wire.as_str().to_owned());
+    runtime.provider_context_window = match resolved.selection.model {
+        ModelDefinition::Chat(model) => model.metadata.context_window,
+        _ => None,
+    };
+    runtime.vision = match resolved.selection.model {
+        ModelDefinition::Chat(model) => model.metadata.vision,
+        _ => None,
+    };
+    runtime.provider_timeout_secs =
+        resolved
+            .request_timeout_secs
+            .as_ref()
+            .and_then(|value| match value {
+                Override::Set(value) => Some(value.get()),
+                Override::Clear => None,
+            });
+    runtime.provider_stream_request_timeout_secs = resolved.stream_request_timeout_secs.clone();
+    runtime.provider_timeout_disabled = matches!(
+        resolved.request_timeout_secs.as_ref(),
+        Some(Override::Clear)
+    );
+    // Canonical chat configuration has an independent read-idle baseline.
+    // Materialize the driver's baseline here instead of
+    // deriving it from request_timeout_secs; legacy family construction keeps
+    // its historical max(300, timeout) behavior in the adapter.
+    runtime.provider_read_timeout_secs = resolved
+        .read_timeout_secs
+        .as_ref()
+        .and_then(|value| match value {
+            Override::Set(value) => Some(value.get()),
+            Override::Clear => None,
+        })
+        .or_else(|| {
+            (!matches!(resolved.read_timeout_secs.as_ref(), Some(Override::Clear))).then_some(
+                match resolved.selection.connection {
+                    ProviderConnection::Anthropic(_) => {
+                        crate::anthropic::STREAM_IDLE_TIMEOUT.as_secs()
+                    }
+                    _ => crate::STREAM_IDLE_TIMEOUT.as_secs(),
+                },
+            )
+        });
+    runtime.provider_read_timeout_disabled =
+        matches!(resolved.read_timeout_secs.as_ref(), Some(Override::Clear));
+    runtime.extra_headers = resolved
+        .selection
+        .connection
+        .extra_headers()
+        .map(|headers| {
+            headers
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
+    runtime.tls_ca_cert_path = resolved
+        .selection
+        .connection
+        .tls_ca_cert_path()
+        .map(str::to_owned);
+
+    runtime.provider_kind = Some(resolved.selection.connection.kind().to_owned());
+    runtime.provider_api_url = resolved.selection.connection.uri().map(str::to_owned);
+    runtime
+}
+
+/// Construct a fresh adapter while sharing immutable registry descriptors.
+/// Model policy is materialized independently for every candidate.
+pub(crate) fn dispatch_model_ref_with_registry(
+    registry: &zeroclaw_config::provider_registry::ProviderRegistry,
+    model_ref: &zeroclaw_config::provider_registry::ModelRef,
+    options: &ModelProviderRuntimeOptions,
+    api_key_override: Option<&str>,
+) -> Result<Box<dyn ModelProvider>> {
+    let resolved = registry
+        .resolve_chat(model_ref)
+        .map_err(|error| anyhow::Error::msg(error.to_string()))?;
+    let runtime = runtime_options_for_chat(&resolved, options);
+    let vision = runtime.vision;
+    let provider = dispatch_resolved_chat(resolved, model_ref, runtime, api_key_override)?;
+    Ok(crate::apply_factory_leaf_metadata(provider, vision))
+}
+
+fn dispatch_resolved_chat(
+    resolved: zeroclaw_config::provider_registry::ResolvedChat<'_>,
+    model_ref: &zeroclaw_config::provider_registry::ModelRef,
+    runtime: ModelProviderRuntimeOptions,
+    api_key_override: Option<&str>,
+) -> Result<Box<dyn ModelProvider>> {
+    use zeroclaw_config::provider_registry::{ModelDefinition, ProviderConnection};
+
+    let api_key = api_key_override.or_else(|| resolved.selection.connection.api_key());
+    let provider_kind = resolved.selection.connection.kind();
+    crate::validate_provider_credential(
+        provider_kind,
+        api_key,
+        resolved.selection.connection.uri(),
+    )?;
+    // Canonical connections carry typed authentication and model extras. The
+    // legacy family dispatcher cannot recover either fact from `api_key` or a
+    // missing config slot, so materialize those provider-specific settings at
+    // this boundary before falling back to the common dispatcher.
+    if provider_kind == "openai" && resolved.selection.connection.uses_openai_codex_auth() {
+        let provider_config = zeroclaw_config::schema::OpenAIModelProviderConfig {
+            base: zeroclaw_config::schema::ModelProviderConfig {
+                requires_openai_auth: true,
+                wire_api: Some(zeroclaw_config::schema::WireApi::Responses),
+                ..Default::default()
+            },
+        };
+        return provider_config.create_provider(
+            model_ref.as_str(),
+            api_key,
+            resolved.selection.connection.uri(),
+            &runtime,
+        );
+    }
+    if provider_kind == "anthropic"
+        && let ModelDefinition::Chat(model) = resolved.selection.model
+        && let Some(zeroclaw_config::provider_registry::ChatModelExtra::Anthropic(extra)) =
+            model.extra.as_ref()
+    {
+        let provider_config = zeroclaw_config::schema::AnthropicModelProviderConfig {
+            server_fallback_models: extra.server_fallback_models.clone(),
+            ..Default::default()
+        };
+        return provider_config.create_provider(
+            model_ref.as_str(),
+            api_key,
+            resolved.selection.connection.uri(),
+            &runtime,
+        );
+    }
+    // The canonical connection owns vendor authentication and transport
+    // settings. Materialize these into the existing protocol constructors;
+    // never look up a legacy profile using the independently named model key.
+    let alias = model_ref.as_str();
+    let connection = resolved.selection.connection;
+    match connection {
+        ProviderConnection::Azure(connection) => {
+            let deployment = match resolved.selection.model {
+                ModelDefinition::Chat(model) => match model.extra.as_ref() {
+                    Some(zeroclaw_config::provider_registry::ChatModelExtra::Azure(extra)) => {
+                        Some(extra.deployment.clone())
+                    }
+                    _ => model.model.clone(),
+                },
+                _ => None,
+            };
+            return AzureModelProviderConfig {
+                resource: Some(connection.extra.resource.clone()),
+                deployment,
+                api_version: connection.extra.api_version.clone(),
+                ..Default::default()
+            }
+            .create_provider(alias, api_key, None, &runtime);
+        }
+        ProviderConnection::Gemini(connection) => {
+            use zeroclaw_config::provider_registry::GeminiAuth;
+            let mut config = GeminiModelProviderConfig {
+                oauth_project: connection.extra.project.clone(),
+                ..Default::default()
+            };
+            if let Some(GeminiAuth::OAuth {
+                client_id,
+                client_secret,
+            }) = &connection.auth
+            {
+                config.auth_mode = Some(AuthMode::OAuth);
+                config.oauth_client_id = client_id.clone();
+                config.oauth_client_secret = client_secret.clone();
+            }
+            return config.create_provider(alias, api_key, connection.uri.as_deref(), &runtime);
+        }
+        ProviderConnection::Qwen(connection) => {
+            use zeroclaw_config::provider_registry::QwenAuth;
+            let mut config = QwenModelProviderConfig {
+                endpoint: connection.extra.endpoint,
+                ..Default::default()
+            };
+            if let Some(QwenAuth::OAuth {
+                refresh_token,
+                client_id,
+            }) = &connection.auth
+            {
+                config.auth_mode = Some(AuthMode::OAuth);
+                config.oauth_refresh_token = refresh_token.clone();
+                config.oauth_client_id = client_id.clone();
+            }
+            // Leave the URI absent until OAuth resolution: a returned resource
+            // URL takes precedence over the configured regional default.
+            return config.create_provider(alias, api_key, connection.uri.as_deref(), &runtime);
+        }
+        ProviderConnection::Minimax(connection) => {
+            use zeroclaw_config::provider_registry::MinimaxAuth;
+            use zeroclaw_config::schema::ModelEndpoint;
+            let mut config = MinimaxModelProviderConfig {
+                endpoint: connection.extra.endpoint,
+                ..Default::default()
+            };
+            if let Some(MinimaxAuth::OAuth {
+                refresh_token,
+                client_id,
+            }) = &connection.auth
+            {
+                config.auth_mode = Some(AuthMode::OAuth);
+                config.oauth_refresh_token = refresh_token.clone();
+                config.oauth_client_id = client_id.clone();
+            }
+            return config.create_provider(
+                alias,
+                api_key,
+                connection
+                    .uri
+                    .as_deref()
+                    .or(Some(connection.extra.endpoint.uri())),
+                &runtime,
+            );
+        }
+        ProviderConnection::Bedrock(connection) => {
+            let mut builder = crate::bedrock::BedrockModelProvider::builder(alias)
+                .http_timeouts(&runtime)
+                .api_url(connection.uri.as_deref())
+                .region(connection.extra.region.as_deref());
+            if let Some(key) = api_key {
+                builder = builder.bearer_token(key);
+            }
+            if let Some(max_tokens) = runtime.provider_max_tokens {
+                builder = builder.max_tokens(max_tokens);
+            }
+            return Ok(Box::new(builder.build()));
+        }
+        ProviderConnection::GeminiCli(connection) => {
+            return GeminiCliModelProviderConfig {
+                binary_path: connection
+                    .api
+                    .chat
+                    .as_ref()
+                    .and_then(|api| api.binary_path.clone()),
+                ..Default::default()
+            }
+            .create_provider(alias, api_key, None, &runtime);
+        }
+        ProviderConnection::KiloCli(connection) => {
+            return KiloCliModelProviderConfig {
+                binary_path: connection
+                    .api
+                    .chat
+                    .as_ref()
+                    .and_then(|api| api.binary_path.clone()),
+                ..Default::default()
+            }
+            .create_provider(alias, api_key, None, &runtime);
+        }
+        ProviderConnection::GrokCli(connection) => {
+            let mut config = GrokCliModelProviderConfig::default();
+            if let Some(api) = &connection.api.chat {
+                config.binary_path = api.binary_path.clone();
+                config.working_directory = api.working_directory.clone();
+                config.env_passthrough = api.env_passthrough.clone();
+                config.extra_args = api.extra_args.clone();
+                config.max_acp_stdout_bytes = api.max_acp_stdout_bytes;
+            }
+            return config.create_provider(alias, api_key, None, &runtime);
+        }
+        ProviderConnection::HailoOllama(connection) => {
+            return HailoOllamaModelProviderConfig {
+                queue_timeout_secs: resolved.queue_timeout_secs.map(std::num::NonZeroU64::get),
+                ..Default::default()
+            }
+            .create_provider(alias, api_key, connection.uri.as_deref(), &runtime);
+        }
+        _ => {}
+    }
+    use zeroclaw_config::schema::ModelEndpoint;
+    let endpoint = connection.uri().or_else(|| match connection {
+        ProviderConnection::Moonshot(connection) => Some(connection.extra.endpoint.uri()),
+        ProviderConnection::Stepfun(connection) => Some(connection.extra.endpoint.uri()),
+        ProviderConnection::Glm(connection) => Some(connection.extra.endpoint.uri()),
+        ProviderConnection::Zai(connection) => Some(connection.extra.endpoint.uri()),
+        ProviderConnection::Kilo(connection) => Some(connection.extra.endpoint.uri()),
+        _ => None,
+    });
+    dispatch_family_factory(
+        provider_kind,
+        model_ref.as_str(),
+        api_key,
+        endpoint,
+        &runtime,
+    )
+}
+
+/// Admit historical test input before exercising the canonical factory.
+#[cfg(test)]
+pub(crate) fn dispatch_test_alias(
+    config: &zeroclaw_config::schema::Config,
+    family: &str,
+    alias: &str,
+    key: Option<&str>,
+    options: &ModelProviderRuntimeOptions,
+) -> Result<Box<dyn ModelProvider>> {
+    let (registry, reference) = config.chat_registry_for_legacy_alias(family, alias)?;
+    dispatch_model_ref_with_registry(&registry, &reference, options, key)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use zeroclaw_config::schema::{ModelProviderConfig, WireApi};
+
+    #[test]
+    fn canonical_auth_admission_preserves_keyless_and_typed_login_modes() {
+        use serde_json::json;
+        use zeroclaw_config::provider_registry::ProviderConnection;
+        for (connection, ready) in [
+            (json!({"kind": "llamacpp"}), true),
+            (json!({"kind": "vllm"}), true),
+            (json!({"kind": "gemini_cli"}), true),
+            (json!({"kind": "bedrock"}), true),
+            (json!({"kind": "gemini", "auth": {"mode": "oauth"}}), true),
+            (json!({"kind": "qwen", "auth": {"mode": "oauth"}}), true),
+            (json!({"kind": "minimax", "auth": {"mode": "oauth"}}), true),
+            (json!({"kind": "openai", "auth": {"mode": "codex"}}), true),
+            (
+                json!({"kind": "custom", "uri": "http://127.0.0.1:1/v1"}),
+                true,
+            ),
+            (
+                json!({"kind": "openai", "extra_headers": {"Authorization": "test-header"}}),
+                true,
+            ),
+            (
+                json!({"kind": "openai", "auth": {"mode": "api_key", "api_key": "  "}}),
+                false,
+            ),
+            (json!({"kind": "openai"}), false),
+            (json!({"kind": "anthropic"}), false),
+        ] {
+            let connection: ProviderConnection = serde_json::from_value(connection).unwrap();
+            assert_eq!(
+                canonical_auth_ready(&connection),
+                ready,
+                "{}",
+                connection.kind()
+            );
+        }
+    }
+
+    #[test]
+    fn every_advertised_chat_provider_constructs_from_a_canonical_connection() {
+        use serde_json::json;
+        use zeroclaw_config::provider_registry::{ModelRef, ProviderConnection, ProviderRegistry};
+        let root = tempfile::tempdir().unwrap();
+        for provider in crate::list_model_providers() {
+            let mut connection = json!({"kind": provider.name});
+            let descriptor: ProviderConnection =
+                serde_json::from_value(connection.clone()).unwrap();
+            if descriptor.accepts_connection_field("auth") {
+                connection["auth"] = json!({"mode": "api_key", "api_key": "test-key"});
+            }
+            // Operators supply the required endpoint/resource/CLI directory.
+            if provider.name == "custom" || provider.name == "openai-compatible" {
+                connection["uri"] = json!("https://example.test/v1");
+            }
+            if provider.name == "azure" {
+                connection["extra"] = json!({"resource": "test-resource"});
+            }
+            if provider.name == "grok_cli" {
+                connection["api"] = json!({"chat": {
+                    "working_directory": root.path(),
+                    "binary_path": std::env::current_exe().unwrap(),
+                }});
+            }
+            let registry: ProviderRegistry = serde_json::from_value(json!({
+                "connections": {"gateway.prod": connection},
+                "models": {"chat.fast.us": {"capability": "chat", "provider": "gateway.prod", "model": "test-model"}}
+            })).unwrap_or_else(|error| panic!("{} registry: {error}", provider.name));
+            let built = dispatch_model_ref_with_registry(
+                &registry,
+                &ModelRef::from("chat.fast.us"),
+                &ModelProviderRuntimeOptions {
+                    zeroclaw_dir: Some(root.path().to_owned()),
+                    ..Default::default()
+                },
+                None,
+            );
+            assert!(
+                built.is_ok(),
+                "{} construction: {:?}",
+                provider.name,
+                built.err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn canonical_gemini_gateway_receives_generation_and_warmup() {
+        use serde_json::json;
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use zeroclaw_config::provider_registry::{ModelRef, ProviderRegistry};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/gateway/v1beta/models"))
+            .and(header("x-goog-api-key", "test-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"models": []})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/gateway/v1beta/models/gemini-test:generateContent"))
+            .and(header("x-goog-api-key", "test-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "candidates": [{"content": {"parts": [{"text": "gateway reply"}]}}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let registry: ProviderRegistry = serde_json::from_value(json!({
+            "connections": {"gateway.prod": {"kind": "gemini",
+                "uri": format!("{}/gateway/v1beta/", server.uri()),
+                "auth": {"mode": "api_key", "api_key": "test-key"}}},
+            "models": {"chat.fast.us": {"capability": "chat", "provider": "gateway.prod", "model": "gemini-test"}}
+        })).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let provider = dispatch_model_ref_with_registry(
+            &registry,
+            &ModelRef::from("chat.fast.us"),
+            &ModelProviderRuntimeOptions {
+                zeroclaw_dir: Some(root.path().to_owned()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            provider.default_base_url(),
+            Some(format!("{}/gateway/v1beta", server.uri()).as_str())
+        );
+        provider.warmup().await.unwrap();
+        assert_eq!(
+            provider
+                .chat_with_system(None, "ping", "gemini-test", None)
+                .await
+                .unwrap(),
+            "gateway reply"
+        );
+    }
+
+    #[tokio::test]
+    async fn canonical_regional_connections_honor_explicit_uri_and_model_options_on_wire() {
+        use serde_json::json;
+        use wiremock::matchers::{body_partial_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use zeroclaw_config::provider_registry::{ModelRef, ProviderRegistry};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(body_partial_json(
+                json!({"model": "model-one", "max_tokens": 321}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "choices": [{"message": {"role": "assistant", "content": "OK"}}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+            })))
+            .expect(7)
+            .mount(&server)
+            .await;
+        for (kind, endpoint) in [
+            ("qwen", "cn"),
+            ("minimax", "cn"),
+            ("moonshot", "code"),
+            ("glm", "cn"),
+            ("zai", "cn"),
+            ("stepfun", "cn"),
+            ("kilo", "gateway"),
+        ] {
+            let registry: ProviderRegistry = serde_json::from_value(json!({
+                "connections": {"gateway.prod": {
+                    "kind": kind, "uri": format!("{}/v1", server.uri()),
+                    "auth": {"mode": "api_key", "api_key": "test-id.test-secret"},
+                    "extra": {"endpoint": endpoint}
+                }},
+                "models": {"chat.fast.us": {"capability": "chat", "provider": "gateway.prod", "model": "model-one", "options": {"max_tokens": 321}}}
+            })).unwrap();
+            let built = dispatch_model_ref_with_registry(
+                &registry,
+                &ModelRef::from("chat.fast.us"),
+                &ModelProviderRuntimeOptions::default(),
+                None,
+            )
+            .unwrap();
+            let response = built
+                .chat_with_system(None, "ping", "model-one", None)
+                .await
+                .unwrap_or_else(|error| panic!("{kind}: {error:#}"));
+            assert_eq!(response, "OK", "{kind}");
+        }
+    }
 
     #[test]
     fn cache_passthrough_runtime_option_reaches_provider_capability() {
@@ -2847,7 +3439,6 @@ mod tests {
         // must keep the historical chat-completions wire and prompt-guided tools,
         // so existing installs don't silently flip wire + tool-calling on upgrade.
         let provider = dispatch_family_factory(
-            None,
             "openai",
             "default",
             Some("sk-test"),
@@ -2881,17 +3472,29 @@ mod tests {
                 },
             },
         );
-        let provider = dispatch_family_factory(
-            Some(&config),
+        let provider = dispatch_test_alias(
+            &config,
             "openai",
             "default",
             Some("sk-test"),
-            None,
             &ModelProviderRuntimeOptions::default(),
         )
         .expect("persisted openai dispatch should build");
         assert_eq!(provider.default_wire_api(), "responses");
         assert!(provider.capabilities().native_tool_calling);
+    }
+
+    #[test]
+    fn qwen_missing_entry_preserves_cn_without_overriding_dynamic_transport() {
+        use zeroclaw_config::schema::QwenEndpoint;
+
+        let missing_entry = qwen_missing_entry_fallback_config();
+        assert_eq!(missing_entry.endpoint, QwenEndpoint::Cn);
+        assert_eq!(missing_entry.base.uri, None);
+        assert_eq!(
+            QwenModelProviderConfig::default().endpoint,
+            QwenEndpoint::Intl
+        );
     }
 
     #[tokio::test]

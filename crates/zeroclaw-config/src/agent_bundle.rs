@@ -535,9 +535,9 @@ pub fn plan_export(config: &Config, alias: &str) -> Result<ExportPlan, ExportErr
     // ── provider entries, carried keyless ────────────────────────────────
     //
     // Every provider reference the agent names is carried, together with the
-    // model-provider fallback graph the runtime can reach. `Config::validate()`
-    // fails loud on ordinary dangling provider refs, while fallback refs are
-    // warning-and-skip edges; following both here preserves the source route.
+    // canonical exact-key fallback graph the runtime can reach. `Config::validate()`
+    // owns dangling-edge diagnostics; following admitted targets here preserves
+    // the source route without reopening legacy profile-local fallback fields.
     // Credentials are scrubbed below, leaving keyless entries for the operator
     // to fill in.
     let mut model_provider_refs = vec![
@@ -552,39 +552,22 @@ pub fn plan_export(config: &Config, alias: &str) -> Result<ExportPlan, ExportErr
     if let Some(profile) = config.runtime_profiles.get(runtime_alias) {
         model_provider_refs.push(profile.context_compression.summary_provider.trim());
     }
-    carry_model_provider_closure(
-        &mut out,
-        &masked_root,
-        config,
-        &model_provider_refs,
-        &mut dropped,
-    );
+    carry_model_provider_closure(&mut out, &masked_root, config, &model_provider_refs);
 
-    let provider_refs = [
-        ("providers.tts", agent.tts_provider.trim()),
-        (
-            "providers.transcription",
-            agent.transcription_provider.trim(),
-        ),
-    ];
-    let mut carried_providers: BTreeSet<String> = BTreeSet::new();
-    for (section, reference) in provider_refs {
-        let Some((family, entry)) = split_provider_ref(reference) else {
-            continue;
-        };
-        let path = format!("{section}.{family}.{entry}");
-        if !carried_providers.insert(path) {
-            continue;
-        }
-        let mut segments: Vec<&str> = section.split('.').collect();
-        segments.push(family);
-        segments.push(entry);
-        // Provider entries are pruned against an empty default: the typed
-        // default varies per family, and an over-pruned provider entry is
-        // worse than a verbose one (a dropped `api_url` silently re-points
-        // the agent at the family's built-in endpoint).
-        carry(&mut out, &masked_root, &segments, &toml::Table::new());
-    }
+    let canonical_speech_refs: Vec<&str> = [
+        agent.tts_provider.trim(),
+        agent.transcription_provider.trim(),
+    ]
+    .into_iter()
+    .filter(|reference| {
+        config
+            .providers
+            .models
+            .canonical_model(&(*reference).into())
+            .is_some()
+    })
+    .collect();
+    carry_model_provider_closure(&mut out, &masked_root, config, &canonical_speech_refs);
 
     // ── scrub, then verify the scrub ─────────────────────────────────────
     let mut required_secrets = Vec::new();
@@ -1252,33 +1235,22 @@ fn carry(out: &mut toml::Table, masked_root: &toml::Table, path: &[&str], defaul
     insert_at(out, path, toml::Value::Table(pruned));
 }
 
-/// Carry the model-provider graph that runtime fallback can actually reach.
+/// Carry the exact-key model graph that runtime fallback can actually reach.
 ///
-/// Runtime starts fallback links at depth one, caps the walk at
-/// [`crate::providers::MAX_FALLBACK_DEPTH`], skips unresolved aliases, and
-/// prunes cycles on the current path. Mirroring those rules keeps the bundle's
-/// credential and endpoint surface no broader than the source runtime's while
-/// ensuring every reachable fallback entry is available on the target.
+/// Runtime starts fallback links at depth one and follows the validated
+/// canonical graph, skips unresolved legacy keys, and prunes cycles on the
+/// current path. Mirroring those rules keeps the bundle's connection and
+/// model surface no broader than the source runtime's.
 fn carry_model_provider_closure(
     out: &mut toml::Table,
     masked_root: &toml::Table,
     config: &Config,
     roots: &[&str],
-    dropped: &mut Vec<DroppedRef>,
 ) {
     let mut carried = BTreeSet::new();
     for root in roots {
         let mut visited = Vec::new();
-        carry_model_provider(
-            out,
-            masked_root,
-            config,
-            root,
-            0,
-            &mut visited,
-            &mut carried,
-            dropped,
-        );
+        carry_model_provider(out, masked_root, config, root, &mut visited, &mut carried);
     }
 }
 
@@ -1287,106 +1259,88 @@ fn carry_model_provider(
     masked_root: &toml::Table,
     config: &Config,
     reference: &str,
-    depth: usize,
     visited: &mut Vec<String>,
     carried: &mut BTreeSet<String>,
-    dropped: &mut Vec<DroppedRef>,
 ) {
-    if depth > crate::providers::MAX_FALLBACK_DEPTH {
-        return;
-    }
-    let Some((family, entry, provider)) = config.providers.models.find_by_name(reference.trim())
-    else {
-        return;
-    };
-    let resolved = format!("{family}.{entry}");
-    if visited.iter().any(|seen| seen == &resolved) {
+    let trimmed = reference.trim();
+    if trimmed.is_empty() || visited.iter().any(|seen| seen == trimmed) {
         return;
     }
 
-    if carried.insert(resolved.clone()) {
+    // Canonical model keys are opaque TOML keys; do not split dotted names.
+    let canonical = crate::provider_registry::ModelRef::from(trimmed);
+    if let Some(model) = config.providers.models.canonical_model(&canonical) {
+        if !carried.insert(trimmed.to_string()) {
+            return;
+        }
         carry(
             out,
             masked_root,
-            &["providers", "models", family, &entry],
+            &["providers", "models", trimmed],
             &toml::Table::new(),
         );
-        remove_unresolved_provider_fallbacks(out, config, family, &entry, provider, dropped);
-    }
-
-    visited.push(resolved);
-    for fallback in &provider.fallback {
-        carry_model_provider(
+        carry(
             out,
             masked_root,
-            config,
-            fallback.as_str(),
-            depth + 1,
-            visited,
-            carried,
-            dropped,
+            &["providers", "connections", model.provider().as_str()],
+            &toml::Table::new(),
         );
-    }
-    visited.pop();
-}
-
-/// Remove fallback edges that the source runtime cannot resolve.
-///
-/// Leaving one in the fragment would let a same-named provider that exists
-/// only on the receiving install become reachable after a manual merge,
-/// changing the exported agent's endpoint and credential binding.
-fn remove_unresolved_provider_fallbacks(
-    out: &mut toml::Table,
-    config: &Config,
-    family: &str,
-    entry: &str,
-    provider: &crate::schema::ModelProviderConfig,
-    dropped: &mut Vec<DroppedRef>,
-) {
-    let mut unresolved = Vec::new();
-    let retained = provider
-        .fallback
-        .iter()
-        .enumerate()
-        .filter_map(|(index, fallback)| {
-            let reference = fallback.as_str();
-            if reference.trim().is_empty()
-                || config
-                    .providers
-                    .models
-                    .find_by_name(reference.trim())
-                    .is_some()
-            {
-                Some(toml::Value::String(reference.to_string()))
-            } else {
-                unresolved.push((index, reference.to_string()));
-                None
-            }
-        })
-        .collect::<Vec<_>>();
-
-    if unresolved.is_empty() {
-        return;
-    }
-
-    if let Some(table) = table_at_mut(out, &["providers", "models", family, entry]) {
-        if retained.is_empty() {
-            table.remove("fallback");
-        } else {
-            table.insert("fallback".to_string(), toml::Value::Array(retained));
+        let model_preset = match model {
+            crate::provider_registry::ModelDefinition::Chat(model) => model.preset.as_ref(),
+            crate::provider_registry::ModelDefinition::Tts(model) => model.preset.as_ref(),
+            crate::provider_registry::ModelDefinition::Asr(model) => model.preset.as_ref(),
+            crate::provider_registry::ModelDefinition::Embedding(_)
+            | crate::provider_registry::ModelDefinition::Decision(_) => None,
+        };
+        // The exported connection is complete. Carry every capability preset
+        // it names, even when the root model only uses chat: validation of the
+        // copied connection still requires its tts/asr defaults to resolve.
+        let connection_presets = config
+            .providers
+            .connections
+            .get(model.provider())
+            .into_iter()
+            .flat_map(|connection| {
+                [
+                    connection.chat_defaults().and_then(|(preset, _)| preset),
+                    connection.tts_defaults().and_then(|(preset, _)| preset),
+                    connection.asr_defaults().and_then(|(preset, _)| preset),
+                ]
+            });
+        for preset in std::iter::once(model_preset)
+            .flatten()
+            .chain(connection_presets.flatten())
+        {
+            carry(
+                out,
+                masked_root,
+                &["providers", "model_presets", preset.as_str()],
+                &toml::Table::new(),
+            );
         }
-    }
-
-    for (index, reference) in unresolved {
-        dropped.push(DroppedRef {
-            path: format!("providers.models.{family}.{entry}.fallback[{index}]"),
-            reason: DropReason::SourceMissing,
-            detail: format!(
-                "fallback {reference:?} does not resolve on the exporting install, so the edge \
-                 is removed rather than allowing a same-named target-local provider to change \
-                 the imported agent's endpoint or credentials"
-            ),
-        });
+        // Fallback edges are part of the model's admitted closure. Carry the
+        // exact TOML key as one table entry; dotted model names are opaque and
+        // must never be expanded into nested tables.
+        if let Some(targets) = config.providers.fallback.get(&canonical) {
+            let value = lookup(masked_root, &["providers", "fallback", trimmed])
+                .cloned()
+                .unwrap_or_else(|| {
+                    toml::Value::Array(
+                        targets
+                            .iter()
+                            .map(|target| toml::Value::String(target.as_str().to_owned()))
+                            .collect(),
+                    )
+                });
+            insert_at(out, &["providers", "fallback", trimmed], value);
+        }
+        visited.push(trimmed.to_string());
+        if let Some(targets) = config.providers.fallback.get(&canonical) {
+            for target in targets {
+                carry_model_provider(out, masked_root, config, target.as_str(), visited, carried);
+            }
+        }
+        visited.pop();
     }
 }
 
@@ -1498,13 +1452,6 @@ fn dedup(values: &[String]) -> Vec<String> {
         .filter(|value| seen.insert((*value).to_string()))
         .map(str::to_string)
         .collect()
-}
-
-/// Split a dotted `<family>.<alias>` provider reference. Returns `None` for an
-/// empty or malformed reference — `Config::validate()` owns reporting those.
-fn split_provider_ref(reference: &str) -> Option<(&str, &str)> {
-    let (family, entry) = reference.split_once('.')?;
-    (!family.is_empty() && !entry.is_empty()).then_some((family, entry))
 }
 
 /// Walk every string leaf, passing the dotted path and a mutable handle.
@@ -1803,6 +1750,72 @@ mod tests {
     use crate::multi_agent::AgentWorkspaceConfig;
     use std::collections::HashMap;
 
+    // Historical Rust-built fixtures are admitted through the same migration
+    // boundary as loaded files. Export itself consumes only current refs.
+    fn plan_export(config: &Config, alias: &str) -> Result<ExportPlan, ExportError> {
+        let config = crate::migration::admit_test_input(config);
+        super::plan_export(&config, alias)
+    }
+
+    #[test]
+    fn canonical_export_visits_shared_fallbacks_once_and_carries_api_presets() {
+        let mut source = String::from(
+            r#"
+[connections."shared.prod"]
+kind = "custom"
+capabilities = ["chat", "tts", "asr"]
+api.chat = { preset = "chat.defaults" }
+api.tts = { preset = "tts.defaults" }
+api.asr = { preset = "asr.defaults" }
+[model_presets."chat.defaults"]
+capability = "chat"
+[model_presets."tts.defaults"]
+capability = "tts"
+[model_presets."asr.defaults"]
+capability = "asr"
+[models."speech.tts"]
+capability = "tts"
+provider = "shared.prod"
+model = "speech-model"
+[models."speech.asr"]
+capability = "asr"
+provider = "shared.prod"
+model = "asr-model"
+"#,
+        );
+        for index in 0..30 {
+            source.push_str(&format!(
+                "\n[models.\"chat.{index}\"]\ncapability = \"chat\"\nprovider = \"shared.prod\"\nmodel = \"model-{index}\"\n"
+            ));
+        }
+        source.push_str("\n[fallback]\n");
+        for index in 0..28 {
+            source.push_str(&format!(
+                "\"chat.{index}\" = [\"chat.{}\", \"chat.{}\"]\n",
+                index + 1,
+                index + 2
+            ));
+        }
+        let config = Config {
+            providers: toml::from_str(&source).unwrap(),
+            ..Config::default()
+        };
+        let masked = toml::Value::try_from(&config).unwrap();
+        let mut output = toml::Table::new();
+        carry_model_provider_closure(
+            &mut output,
+            masked.as_table().unwrap(),
+            &config,
+            &["chat.0", "speech.tts", "speech.asr"],
+        );
+        let providers = output["providers"].as_table().unwrap();
+        assert_eq!(providers["models"].as_table().unwrap().len(), 32);
+        assert_eq!(providers["fallback"].as_table().unwrap().len(), 28);
+        assert_eq!(providers["connections"].as_table().unwrap().len(), 1);
+        assert_eq!(providers["model_presets"].as_table().unwrap().len(), 3);
+        assert!(providers["models"].get("chat.29").is_some());
+    }
+
     /// Config with one agent wired to a risk profile, an MCP bundle granting
     /// two of three servers, and an Anthropic model provider carrying a key.
     fn fixture() -> Config {
@@ -1980,7 +1993,7 @@ mod tests {
         );
         assert!(
             plan.required_secrets
-                .contains(&"providers.models.anthropic.main.api_key".to_string()),
+                .contains(&"providers.connections.legacy.anthropic.main.auth.api_key".to_string()),
             "{:?}",
             plan.required_secrets
         );
@@ -1991,7 +2004,13 @@ mod tests {
         let plan = plan_export(&fixture(), "researcher").unwrap();
         let key = lookup(
             &plan.config,
-            &["providers", "models", "anthropic", "main", "api_key"],
+            &[
+                "providers",
+                "connections",
+                "legacy.anthropic.main",
+                "auth",
+                "api_key",
+            ],
         )
         .and_then(toml::Value::as_str);
         assert_eq!(key, Some(""));
@@ -2265,126 +2284,12 @@ mod tests {
         }
         let plan = plan_export(&config, "researcher").unwrap();
         assert!(
-            lookup(&plan.config, &["providers", "tts", "openai", "voice"]).is_some(),
-            "tts provider carried"
+            lookup(&plan.config, &["providers", "models", "openai.voice"]).is_some(),
+            "canonical TTS model carried"
         );
         assert!(
-            lookup(&plan.config, &["providers", "models", "anthropic", "main"]).is_some(),
-            "model provider carried"
-        );
-    }
-
-    #[test]
-    fn reachable_model_provider_fallback_is_carried_keyless_and_round_trips() {
-        let mut config = fixture();
-        config
-            .providers
-            .models
-            .anthropic
-            .get_mut("main")
-            .unwrap()
-            .base
-            .fallback = vec![crate::providers::ModelProviderRef::new("openai.backup")];
-        config.providers.models.openai.insert(
-            "backup".to_string(),
-            crate::schema::OpenAIModelProviderConfig {
-                base: crate::schema::ModelProviderConfig {
-                    api_key: Some("backup-key-not-real".to_string()),
-                    model: Some("gpt-backup".to_string()),
-                    ..Default::default()
-                },
-            },
-        );
-
-        let plan = plan_export(&config, "researcher").unwrap();
-        assert!(
-            lookup(&plan.config, &["providers", "models", "openai", "backup"]).is_some(),
-            "the runtime-reachable fallback provider must travel"
-        );
-        assert!(
-            plan.required_secrets
-                .contains(&"providers.models.openai.backup.api_key".to_string()),
-            "{:?}",
-            plan.required_secrets
-        );
-
-        let rendered = render_config_toml(&plan).unwrap();
-        assert!(!rendered.contains("backup-key-not-real"), "{rendered}");
-        let imported: Config = toml::from_str(&rendered).unwrap();
-        imported
-            .validate()
-            .expect("closure validates on a clean install");
-        let primary = imported
-            .providers
-            .models
-            .find("anthropic", "main")
-            .expect("primary provider survives");
-        assert_eq!(
-            primary
-                .fallback
-                .iter()
-                .map(crate::providers::ModelProviderRef::as_str)
-                .collect::<Vec<_>>(),
-            vec!["openai.backup"]
-        );
-        assert!(
-            imported.providers.models.find("openai", "backup").is_some(),
-            "fallback resolves after import"
-        );
-    }
-
-    #[test]
-    fn unresolved_model_provider_fallback_cannot_bind_to_a_target_local_provider() {
-        let mut config = fixture();
-        config
-            .providers
-            .models
-            .anthropic
-            .get_mut("main")
-            .unwrap()
-            .base
-            .fallback = vec![crate::providers::ModelProviderRef::new(
-            "openai.destination_only",
-        )];
-
-        let plan = plan_export(&config, "researcher").unwrap();
-        assert!(
-            plan.dropped.iter().any(|dropped| {
-                dropped.path == "providers.models.anthropic.main.fallback[0]"
-                    && dropped.reason == DropReason::SourceMissing
-            }),
-            "the unresolved source edge must be reported: {:?}",
-            plan.dropped
-        );
-
-        let rendered = render_config_toml(&plan).unwrap();
-        let mut imported: Config = toml::from_str(&rendered).unwrap();
-        imported.providers.models.openai.insert(
-            "destination_only".to_string(),
-            crate::schema::OpenAIModelProviderConfig {
-                base: crate::schema::ModelProviderConfig {
-                    api_key: Some("target-key-not-real".to_string()),
-                    uri: Some("https://target.invalid/v1".to_string()),
-                    ..Default::default()
-                },
-            },
-        );
-
-        let primary = imported
-            .providers
-            .models
-            .find("anthropic", "main")
-            .expect("primary provider survives");
-        assert!(
-            primary.fallback.is_empty(),
-            "a provider that exists only on the destination must not become reachable"
-        );
-        assert!(
-            imported
-                .collect_warnings()
-                .iter()
-                .all(|warning| warning.code != "dangling_fallback_ref"),
-            "the exported provider must not retain the unresolved edge"
+            lookup(&plan.config, &["providers", "models", "anthropic.main"]).is_some(),
+            "canonical chat model carried"
         );
     }
 
@@ -2659,7 +2564,7 @@ mod tests {
         assert!(
             lookup(
                 &plan.config,
-                &["providers", "models", "anthropic", "summarizer"]
+                &["providers", "models", "anthropic.summarizer"]
             )
             .is_some(),
             "the profile's own summarizer provider is carried"

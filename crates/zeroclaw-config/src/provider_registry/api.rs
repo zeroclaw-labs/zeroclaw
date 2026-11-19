@@ -13,6 +13,9 @@ pub struct ChatApiConfig {
     pub wire_api: Option<WireApi>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_timeout_secs: Option<Override<NonZeroU64>>,
+    /// Streaming total deadline; omission inherits the request deadline.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream_request_timeout_secs: Option<Override<NonZeroU64>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub read_timeout_secs: Option<Override<NonZeroU64>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -32,6 +35,8 @@ pub struct ChatApiPatch {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_timeout_secs: Option<Override<NonZeroU64>>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream_request_timeout_secs: Option<Override<NonZeroU64>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub read_timeout_secs: Option<Override<NonZeroU64>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub queue_timeout_secs: Option<NonZeroU64>,
@@ -45,6 +50,24 @@ pub struct TtsApiConfig {
     pub preset: Option<PresetId>,
     #[serde(skip_serializing_if = "TtsOptionsPatch::is_empty")]
     pub options: TtsOptionsPatch,
+}
+
+/// OpenAI speech permits local gateways with a nonstandard endpoint path.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(default, deny_unknown_fields)]
+pub struct SpeechApiConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(flatten)]
+    pub defaults: TtsApiConfig,
+}
+
+impl std::ops::Deref for SpeechApiConfig {
+    type Target = TtsApiConfig;
+    fn deref(&self) -> &Self::Target {
+        &self.defaults
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -130,6 +153,9 @@ pub struct GrokChatApiConfig {
     pub extra_args: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_acp_stdout_bytes: Option<usize>,
+    /// Bounded subprocess deadline; unlike HTTP requests it cannot be disabled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_timeout_secs: Option<NonZeroU64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub preset: Option<PresetId>,
     #[serde(skip_serializing_if = "ChatOptionsPatch::is_empty")]
@@ -174,7 +200,7 @@ api_tables!(ChatDecisionApi {
 });
 api_tables!(OpenAiApi {
     chat: ChatApiConfig,
-    tts: TtsApiConfig,
+    tts: SpeechApiConfig,
     asr: AsrApiConfig,
     decision: DecisionApiConfig
 });
