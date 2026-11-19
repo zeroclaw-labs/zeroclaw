@@ -16,9 +16,9 @@ const HTTP_REQUEST_PROXY_PINNING_ERROR: &str = "http_request requires direct tra
      proxy.scope = \"services\" and omit tool.http_request and tool.* from proxy.services, or disable the proxy; \
      proxy.scope = \"environment\" is incompatible with pinned HTTP requests";
 
-fn scoped_credential_message(key: &str) -> String {
-    crate::i18n::get_required_tool_string(key)
-}
+use crate::scoped_credentials::{
+    load_scoped_credential, resolve_scoped_value, scoped_credential_message,
+};
 
 /// HTTP request tool for API interactions.
 /// Supports GET, POST, PUT, DELETE methods with configurable security.
@@ -462,89 +462,6 @@ impl HttpRequestTool {
         }
     }
 
-    async fn resolve_scoped_value(
-        source: zeroclaw_config::schema::ScopedCredentialSource,
-        value: String,
-    ) -> anyhow::Result<String> {
-        use std::process::Stdio;
-        use tokio::io::AsyncReadExt;
-        use zeroclaw_config::schema::ScopedCredentialSource;
-
-        if matches!(source, ScopedCredentialSource::Local) {
-            return Ok(value);
-        }
-        let (program, args) = source.command(&value).ok_or_else(|| {
-            anyhow::Error::msg(scoped_credential_message("tool-http-credential-reference"))
-        })?;
-        let failed =
-            |_| anyhow::Error::msg(scoped_credential_message("tool-http-credential-lookup"));
-        let mut child = tokio::process::Command::new(program)
-            .args(args)
-            .stdin(Stdio::null())
-            .stderr(Stdio::null())
-            .stdout(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(failed)?;
-        let stdout = child.stdout.take().ok_or_else(|| {
-            anyhow::Error::msg(scoped_credential_message("tool-http-credential-lookup"))
-        })?;
-        let mut output = Vec::new();
-        let status = tokio::time::timeout(Duration::from_secs(15), async {
-            stdout.take(65_537).read_to_end(&mut output).await?;
-            if output.len() > 65_536 {
-                return Err(std::io::Error::other(
-                    "External credential output exceeds limit",
-                ));
-            }
-            child.wait().await
-        })
-        .await
-        .map_err(|_| anyhow::Error::msg(scoped_credential_message("tool-http-credential-timeout")))?
-        .map_err(failed)?;
-        anyhow::ensure!(
-            status.success(),
-            "{}",
-            scoped_credential_message("tool-http-credential-lookup")
-        );
-        Self::decode_scoped_value(source, output)
-    }
-
-    fn decode_scoped_value(
-        source: zeroclaw_config::schema::ScopedCredentialSource,
-        output: Vec<u8>,
-    ) -> anyhow::Result<String> {
-        use zeroclaw_config::schema::ScopedCredentialSource;
-
-        let value = if matches!(source, ScopedCredentialSource::Aws) {
-            serde_json::from_slice::<String>(&output).ok()
-        } else {
-            String::from_utf8(output).ok().map(|value| {
-                if matches!(
-                    source,
-                    ScopedCredentialSource::Google | ScopedCredentialSource::OpenBao
-                ) {
-                    value
-                } else {
-                    value
-                        .strip_suffix("\r\n")
-                        .or_else(|| value.strip_suffix('\n'))
-                        .unwrap_or(&value)
-                        .to_owned()
-                }
-            })
-        };
-        value
-            .filter(|value| {
-                !value.trim().is_empty()
-                    && value.len() <= 4096
-                    && !value.chars().any(char::is_control)
-            })
-            .ok_or_else(|| {
-                anyhow::Error::msg(scoped_credential_message("tool-http-credential-value"))
-            })
-    }
-
     async fn apply_scoped_credential(
         &self,
         headers: &mut HeaderMap,
@@ -552,45 +469,14 @@ impl HttpRequestTool {
         target: &ValidatedHttpRequestTarget,
     ) -> anyhow::Result<Vec<String>> {
         use base64::Engine as _;
-        use zeroclaw_config::{
-            schema::{Config, ScopedApiKeyHeader, ScopedHttpAuth, ScopedHttpCredential},
-            secrets::SecretStore,
-        };
+        use zeroclaw_config::schema::{ScopedApiKeyHeader, ScopedHttpAuth, ScopedHttpCredential};
 
         if headers.contains_key(HOST) {
             return Err(anyhow::Error::msg(scoped_credential_message(
                 "tool-http-credential-host",
             )));
         }
-        Self::validate_secret_name(name).map_err(|_| {
-            anyhow::Error::msg(scoped_credential_message("tool-http-credential-alias"))
-        })?;
-        let path = self.config_path.as_ref().ok_or_else(|| {
-            anyhow::Error::msg(scoped_credential_message("tool-http-credential-store"))
-        })?;
-        let contents = std::fs::read_to_string(path).map_err(|_| {
-            anyhow::Error::msg(scoped_credential_message("tool-http-credential-store"))
-        })?;
-        let config: Config = toml::from_str(&contents).map_err(|_| {
-            anyhow::Error::msg(scoped_credential_message("tool-http-credential-store"))
-        })?;
-        let stored = config
-            .http_request
-            .scoped_credentials
-            .get(name)
-            .filter(|value| config.secrets.encrypt && value.starts_with("enc2:"))
-            .ok_or_else(|| {
-                anyhow::Error::msg(scoped_credential_message("tool-http-credential-missing"))
-            })?;
-        let dir = path.parent().ok_or_else(|| {
-            anyhow::Error::msg(scoped_credential_message("tool-http-credential-store"))
-        })?;
-        let plaintext = SecretStore::new(dir, true).decrypt(stored).map_err(|_| {
-            anyhow::Error::msg(scoped_credential_message("tool-http-credential-store"))
-        })?;
-        let credential: ScopedHttpCredential = serde_json::from_str(&plaintext).map_err(|_| {
-            anyhow::Error::msg(scoped_credential_message("tool-http-credential-invalid"))
-        })?;
+        let credential = load_scoped_credential(self.config_path.as_deref(), name)?;
         if !credential.http_allowed
             || ScopedHttpCredential::https_origin(&target.url).as_deref()
                 != Some(credential.origin.as_str())
@@ -601,7 +487,7 @@ impl HttpRequestTool {
         }
         let (name, authorization, mut sensitive) = match credential.auth {
             ScopedHttpAuth::ApiKey { value, header } => {
-                let value = Self::resolve_scoped_value(credential.source, value).await?;
+                let value = resolve_scoped_value(credential.source, value).await?;
                 match header {
                     ScopedApiKeyHeader::Bearer => {
                         (AUTHORIZATION, format!("Bearer {value}"), vec![value])
@@ -617,7 +503,7 @@ impl HttpRequestTool {
                 }
             }
             ScopedHttpAuth::UserPassword { username, password } => {
-                let password = Self::resolve_scoped_value(credential.source, password).await?;
+                let password = resolve_scoped_value(credential.source, password).await?;
                 let pair = format!("{username}:{password}");
                 let encoded = base64::engine::general_purpose::STANDARD.encode(&pair);
                 (
@@ -1451,7 +1337,7 @@ mod tests {
             (Source::OpenBao, &b"fixture-bao"[..], "fixture-bao"),
         ] {
             assert_eq!(
-                HttpRequestTool::decode_scoped_value(source, output.to_vec()).unwrap(),
+                crate::scoped_credentials::decode_scoped_value(source, output.to_vec()).unwrap(),
                 expected
             );
         }
@@ -1462,7 +1348,9 @@ mod tests {
             (Source::Azure, &b"\r\n"[..]),
             (Source::OnePassword, &b"\xff"[..]),
         ] {
-            assert!(HttpRequestTool::decode_scoped_value(source, output.to_vec()).is_err());
+            assert!(
+                crate::scoped_credentials::decode_scoped_value(source, output.to_vec()).is_err()
+            );
         }
     }
 
