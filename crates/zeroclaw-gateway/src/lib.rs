@@ -691,6 +691,24 @@ pub(crate) fn client_key_from_request(
         .unwrap_or_else(|| "unknown".to_string())
 }
 
+/// Whether this request counts as a local (loopback) caller for locality guards.
+///
+/// Defined as the rate-limit key being a loopback address, so
+/// [`client_key_from_request`] and SOP-cancel locality cannot drift apart: a
+/// forwarded loopback address is never local, and a direct loopback peer with
+/// no trusted forwarded header still is.
+pub(crate) fn request_is_local(
+    peer_addr: Option<SocketAddr>,
+    headers: &HeaderMap,
+    trust_forwarded_headers: bool,
+) -> bool {
+    auth_rate_limit::is_loopback_key(&client_key_from_request(
+        peer_addr,
+        headers,
+        trust_forwarded_headers,
+    ))
+}
+
 fn normalize_max_keys(configured: usize, fallback: usize) -> usize {
     if configured == 0 {
         fallback.max(1)
@@ -9726,6 +9744,20 @@ path = "{trigger_path}"
 
         let key = client_key_from_request(Some(peer), &headers, true);
         assert_eq!(key, "unknown");
+    }
+
+    #[test]
+    fn request_is_local_matches_rate_limit_loopback_exemption() {
+        let loopback = SocketAddr::from(([127, 0, 0, 1], 42617));
+        let remote = SocketAddr::from(([203, 0, 113, 50], 42617));
+        let mut forwarded_loopback = HeaderMap::new();
+        forwarded_loopback.insert("X-Forwarded-For", HeaderValue::from_static("127.0.0.1"));
+
+        assert!(request_is_local(Some(loopback), &HeaderMap::new(), true));
+        assert!(request_is_local(Some(loopback), &HeaderMap::new(), false));
+        assert!(!request_is_local(Some(loopback), &forwarded_loopback, true));
+        assert!(!request_is_local(Some(remote), &forwarded_loopback, true));
+        assert!(!request_is_local(Some(remote), &HeaderMap::new(), true));
     }
 
     #[test]
