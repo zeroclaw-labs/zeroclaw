@@ -783,7 +783,7 @@ mod tests {
             providers: toml::from_str(&format!(
                 r#"
 [connections.gateway]
-kind = "openai"
+kind = "custom"
 uri = "{}/v1"
 auth = {{ mode = "api_key", api_key = "fixture-key" }}
 capabilities = ["chat"]
