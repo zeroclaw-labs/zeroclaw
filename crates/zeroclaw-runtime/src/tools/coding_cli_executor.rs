@@ -97,6 +97,11 @@ impl CodingCliExecutor for RuntimeCodingCliExecutor {
         for (key, value) in command.env {
             process.env(key, value);
         }
+        super::shell::configure_task_ssh_environment(
+            &mut process,
+            self.sandbox.as_ref(),
+            zeroclaw_tools::task_ssh::current(),
+        );
         process.kill_on_drop(true);
 
         tokio::time::timeout(Duration::from_secs(timeout_secs), process.output())

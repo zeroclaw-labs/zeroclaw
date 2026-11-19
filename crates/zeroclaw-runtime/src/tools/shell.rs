@@ -62,7 +62,7 @@ impl Drop for ChildGroupGuard {
 
 // The host broker executes outside OS sandboxes. Never pass that capability
 // through a sandbox, including values supplied by passthrough/TUI overlays.
-fn configure_task_ssh_environment(
+pub(super) fn configure_task_ssh_environment(
     cmd: &mut tokio::process::Command,
     sandbox: &dyn Sandbox,
     task: Option<zeroclaw_tools::task_ssh::SshTask>,
