@@ -2801,6 +2801,7 @@ mod tests {
             raw_estimated_tokens: 65_537,
             system_tokens: 0,
             tool_schema_tokens: 0,
+            window_is_compatibility_fallback: false,
         })
         .context("maximum context length; https://private.invalid/?key=secret");
         let provider =
