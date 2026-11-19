@@ -55,8 +55,21 @@ impl HttpTransportConfig {
     }
 
     pub fn client(&self, default_timeout: Duration, service_key: &str) -> Result<Client> {
+        self.client_with_policy(Some(default_timeout), false, service_key)
+    }
+
+    pub fn client_with_policy(
+        &self,
+        default_timeout: Option<Duration>,
+        follow_redirects: bool,
+        service_key: &str,
+    ) -> Result<Client> {
         let mut builder = zeroclaw_config::schema::apply_runtime_proxy_to_builder(
-            Client::builder().redirect(reqwest::redirect::Policy::none()),
+            Client::builder().redirect(if follow_redirects {
+                reqwest::redirect::Policy::default()
+            } else {
+                reqwest::redirect::Policy::none()
+            }),
             service_key,
         );
         match &self.request_timeout_secs {
@@ -65,7 +78,9 @@ impl HttpTransportConfig {
             }
             Some(Override::Clear) => {}
             None => {
-                builder = builder.timeout(default_timeout);
+                if let Some(default_timeout) = default_timeout {
+                    builder = builder.timeout(default_timeout);
+                }
             }
         }
         builder = builder.default_headers(self.headers()?);

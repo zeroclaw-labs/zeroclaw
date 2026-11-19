@@ -1753,7 +1753,10 @@ mod tests {
             "<think>just reasoning</think>",
             Some("actual useful text from thinking field"),
         );
-        assert_eq!(result, Some("actual useful text from thinking field".to_string()));
+        assert_eq!(
+            result,
+            Some("actual useful text from thinking field".to_string())
+        );
     }
 
     // ═══════════════════════════════════════════════════════════════════════
