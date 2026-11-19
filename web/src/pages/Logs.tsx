@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Activity, ChevronDown, ChevronUp, Pause, Play, Plus, RefreshCw, X } from 'lucide-react';
-import { apiFetch } from '@/lib/api';
-import type { LogEvent, LogsQueryParams, LogsResponse } from '@/lib/api';
+import { getLogs } from '@/lib/api';
+import type { LogEvent, LogsQueryParams } from '@/lib/api';
 import { usePolling } from '@/hooks/usePolling';
 import { Badge, Button, PageHeader } from '@/components/ui';
 import { t } from '@/lib/i18n';
@@ -132,23 +132,6 @@ function buildQueryParams(
   return params;
 }
 
-function fetchLogs(params: LogsQueryParams): Promise<LogsResponse> {
-  const usp = new URLSearchParams();
-  const { field_eq, ...rest } = params;
-  for (const [key, value] of Object.entries(rest)) {
-    if (value === undefined || value === null || value === '') continue;
-    usp.set(key, String(value));
-  }
-  if (field_eq) {
-    for (const [key, value] of Object.entries(field_eq)) {
-      if (value === undefined || value === null || value === '') continue;
-      usp.set(key, value);
-    }
-  }
-  const qs = usp.toString();
-  return apiFetch<LogsResponse>(`/api/logs${qs ? `?${qs}` : ''}`);
-}
-
 export default function Logs() {
   const [filter, setFilter] = useState<FilterState>(DEFAULT_FILTER);
   const [events, setEvents] = useState<LogEvent[]>([]);
@@ -217,7 +200,7 @@ export default function Logs() {
       const sinceTs = filterRef.current.sinceDaemonStart
         ? daemonStartedAtRef.current || undefined
         : undefined;
-      const response = await fetchLogs(buildQueryParams(filterRef.current, { sinceTs }));
+      const response = await getLogs(buildQueryParams(filterRef.current, { sinceTs }));
       // Superseded by a newer load (e.g. filter changed mid-flight): drop the
       // result entirely so we never overwrite the list with stale rows.
       if (seq !== loadSeqRef.current) return;
@@ -263,7 +246,7 @@ export default function Logs() {
         ? newest['@timestamp']
         : daemonStartedAtRef.current || undefined;
       try {
-        const response = await fetchLogs(
+        const response = await getLogs(
           buildQueryParams(filterRef.current, { sinceTs }),
         );
         if (isStale()) return;
@@ -316,7 +299,7 @@ export default function Logs() {
         params.until_ts = cursorOlderLegacy![0];
         params.until_id = cursorOlderLegacy![1];
       }
-      const response = await fetchLogs(params);
+      const response = await getLogs(params);
       setEvents((prev) => {
         const byId = new Map<string, LogEvent>();
         for (const event of prev) byId.set(event.id, event);
