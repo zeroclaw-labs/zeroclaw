@@ -454,7 +454,7 @@ mod tests {
             })
             .cloned()
             .collect();
-        assert_eq!(metadata_keys.len(), 72);
+        assert_eq!(metadata_keys.len(), 74);
 
         let catalogues = [
             ("es", include_str!("../locales/es/zerocode.ftl")),
