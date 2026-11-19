@@ -301,11 +301,7 @@ pub(super) fn legacy_model(
         && raw
             .get("oauth_refresh_token")
             .and_then(Value::as_str)
-            .is_some_and(|token| !token.trim().is_empty())
-        && raw
-            .get("api_key")
-            .and_then(Value::as_str)
-            .is_none_or(|key| key.trim().is_empty()))
+            .is_some_and(|token| !token.trim().is_empty()))
         // Legacy Gemini selected managed/CLI OAuth when no explicit API key
         // was configured, even without auth_mode. Preserve its client
         // credentials when projecting or saving the canonical connection.

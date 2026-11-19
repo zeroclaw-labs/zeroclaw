@@ -551,6 +551,7 @@ pub struct AssemblyAiProvider {
     alias: String,
     api_key: String,
     base_url: String,
+    transcript_url: String,
     request_timeout_secs: Option<Override<NonZeroU64>>,
 }
 
@@ -566,14 +567,21 @@ impl AssemblyAiProvider {
             .filter(|value| !value.is_empty())
             .map(ToOwned::to_owned)
             .context("Missing API key for canonical AssemblyAI transcription model")?;
+        let transcript_url = endpoint
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "https://api.assemblyai.com/v2/transcript".to_owned())
+            .trim_end_matches('/')
+            .to_owned();
+        let base_url = transcript_url
+            .strip_suffix("/transcript")
+            .unwrap_or(&transcript_url)
+            .trim_end_matches('/')
+            .to_owned();
         Ok(Self {
             alias: alias.to_owned(),
             api_key,
-            base_url: endpoint
-                .filter(|value| !value.trim().is_empty())
-                .unwrap_or_else(|| "https://api.assemblyai.com/v2".to_owned())
-                .trim_end_matches('/')
-                .to_owned(),
+            base_url,
+            transcript_url,
             request_timeout_secs,
         })
     }
@@ -595,6 +603,7 @@ impl AssemblyAiProvider {
             alias: alias.to_string(),
             api_key,
             base_url: "https://api.assemblyai.com/v2".to_owned(),
+            transcript_url: "https://api.assemblyai.com/v2/transcript".to_owned(),
             request_timeout_secs: None,
         })
     }
@@ -621,6 +630,7 @@ impl AssemblyAiProvider {
             alias: alias.to_string(),
             api_key,
             base_url: "https://api.assemblyai.com/v2".to_owned(),
+            transcript_url: "https://api.assemblyai.com/v2/transcript".to_owned(),
             request_timeout_secs: None,
         })
     }
@@ -673,7 +683,7 @@ impl AsrProvider for AssemblyAiProvider {
 
         let create_resp = apply_transcription_timeout(
             client
-                .post(format!("{}/transcript", self.base_url))
+                .post(&self.transcript_url)
                 .header("Authorization", &self.api_key)
                 .json(&transcript_req),
             &self.request_timeout_secs,
@@ -702,7 +712,7 @@ impl AsrProvider for AssemblyAiProvider {
             .context("AssemblyAI response missing 'id'")?;
 
         // Step 3: Poll for completion.
-        let poll_url = format!("{}/transcript/{transcript_id}", self.base_url);
+        let poll_url = format!("{}/{transcript_id}", self.transcript_url);
         let poll_interval = std::time::Duration::from_secs(3);
         let poll_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(180);
 

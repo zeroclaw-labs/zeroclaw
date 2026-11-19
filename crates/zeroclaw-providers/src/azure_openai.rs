@@ -63,12 +63,18 @@ impl ResponseMessage {
 /// Validate blank wire content. Candidate-specific interpretation belongs to
 /// Reliable, which knows the exact configured reference rather than only the
 /// upstream deployment ID.
-fn require_terminal_text(content: String) -> anyhow::Result<String> {
-    if content.trim().is_empty()
-        || zeroclaw_api::model_provider::strip_think_tags(&content)
-            .trim()
-            .is_empty()
-    {
+fn require_terminal_text(
+    content: String,
+    extraction: zeroclaw_api::TextExtraction,
+) -> anyhow::Result<String> {
+    let stripped_content;
+    let semantic_content = if extraction.reasoning == Some(false) {
+        content.as_str()
+    } else {
+        stripped_content = zeroclaw_api::model_provider::strip_think_tags(&content);
+        stripped_content.as_str()
+    };
+    if content.trim().is_empty() || semantic_content.trim().is_empty() {
         return Err(anyhow::Error::new(
             zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion,
         ));
@@ -601,7 +607,12 @@ impl ModelProvider for AzureOpenAiModelProvider {
             .choices
             .into_iter()
             .next()
-            .map(|c| require_terminal_text(c.message.effective_content()))
+            .map(|c| {
+                require_terminal_text(
+                    c.message.effective_content(),
+                    zeroclaw_api::text_extraction_for(model),
+                )
+            })
             .transpose()?
             .ok_or_else(|| {
                 ::zeroclaw_log::record!(
@@ -1336,8 +1347,9 @@ mod tests {
     #[test]
     fn string_completion_rejects_empty_and_think_only_text() {
         for text in ["", "  \n", "<think>internal reasoning</think>"] {
-            let error = require_terminal_text(text.to_string())
-                .expect_err("a string-only semantic-empty completion must fail");
+            let error =
+                require_terminal_text(text.to_string(), zeroclaw_api::TextExtraction::default())
+                    .expect_err("a string-only semantic-empty completion must fail");
             assert!(error.chain().any(|cause| {
                 cause.is::<zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion>()
             }));
@@ -1347,8 +1359,28 @@ mod tests {
     #[test]
     fn string_completion_keeps_visible_text() {
         assert_eq!(
-            require_terminal_text("final answer".to_string()).unwrap(),
+            require_terminal_text(
+                "final answer".to_string(),
+                zeroclaw_api::TextExtraction::default(),
+            )
+            .unwrap(),
             "final answer"
+        );
+    }
+
+    #[test]
+    fn string_completion_keeps_think_only_text_when_reasoning_extraction_is_disabled() {
+        let text = "<think>keep this literal</think>".to_string();
+        assert_eq!(
+            require_terminal_text(
+                text.clone(),
+                zeroclaw_api::TextExtraction {
+                    reasoning: Some(false),
+                    tool_calls: false,
+                },
+            )
+            .unwrap(),
+            text
         );
     }
 
