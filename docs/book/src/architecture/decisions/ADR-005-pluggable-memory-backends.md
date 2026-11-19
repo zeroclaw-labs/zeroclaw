@@ -33,7 +33,7 @@ Memory persistence is selected through a backend-neutral contract, with SQLite a
 
 ### Storage contract
 
-Concrete stores implement the `Memory` trait from `zeroclaw-api`. The trait owns backend-neutral persistence operations and entry semantics. Callers use `Memory` handles rather than branching on SQLite, Markdown, PostgreSQL, Qdrant, or Lucid in turn-processing code.
+Concrete stores implement the `Memory` trait from `zeroclaw-api`. The trait owns backend-neutral persistence operations and entry semantics. Callers use `Memory` handles rather than branching on SQLite, Markdown, PostgreSQL, or Qdrant in turn-processing code.
 
 Backend construction currently consults two overlapping configuration levels. `agents.<alias>.memory.backend` directly routes only the Markdown and `none` construction paths and supplies the kind used for same-backend sharing validation. All other per-agent values proceed through the install-wide factory, where `memory.backend` selects the concrete typed `storage.<kind>.<alias>` entry; legacy bare names resolve to the `default` alias. This ADR records that interaction without treating the overlap as an ideal end state. Runtime components must follow the current factory and validation ownership rather than infer unsupported per-agent selection or create another stored selector.
 

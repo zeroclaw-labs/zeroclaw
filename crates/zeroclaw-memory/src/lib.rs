@@ -975,9 +975,7 @@ impl AgentMemorySource {
         match backend {
             Backend::Markdown => Self::WorkspaceMarkdown,
             Backend::None => Self::Disabled,
-            Backend::Sqlite | Backend::Postgres | Backend::Qdrant | Backend::Lucid => {
-                Self::InstallWide
-            }
+            Backend::Sqlite | Backend::Postgres | Backend::Qdrant => Self::InstallWide,
         }
     }
 }
@@ -994,7 +992,12 @@ pub fn configured_memory_backend(config: &Config, agent_alias: Option<&str>) -> 
         AgentMemorySource::Disabled => "none".into(),
         AgentMemorySource::InstallWide => {
             let key = backend_kind_from_dotted(&config.memory.backend);
-            if classify_memory_backend(&key) == MemoryBackendKind::Unknown {
+            // A removed backend is refused by the factory rather than falling
+            // back to Markdown, so report the name the operator selected
+            // instead of a store that never opens.
+            if zeroclaw_config::migration::is_retired_memory_backend(&key) {
+                key
+            } else if classify_memory_backend(&key) == MemoryBackendKind::Unknown {
                 "markdown".into()
             } else {
                 key
@@ -2128,6 +2131,46 @@ url = "http://localhost:6333"
                 .unwrap();
             assert_eq!(name, expected);
             assert_eq!(memory.name(), name);
+        }
+    }
+
+    /// Load rewrites a Lucid selection to SQLite, so a `lucid` value seen
+    /// here came later (an environment override). The factory refuses it, so
+    /// the report must name it instead of the Markdown fallback.
+    #[tokio::test]
+    async fn configured_memory_backend_names_a_retired_backend_the_factory_refuses() {
+        use zeroclaw_config::multi_agent::{AgentMemoryConfig, MemoryBackendKind as AgentBackend};
+        use zeroclaw_config::schema::AliasedAgentConfig;
+
+        for shared_backend in ["lucid", "Lucid.selected"] {
+            let dir = TempDir::new().unwrap();
+            let mut config = Config {
+                config_path: dir.path().join("config.toml"),
+                data_dir: dir.path().join("data"),
+                ..Config::default()
+            };
+            config.memory.backend = shared_backend.into();
+            config.agents.insert(
+                "worker".into(),
+                AliasedAgentConfig {
+                    memory: AgentMemoryConfig {
+                        backend: AgentBackend::Sqlite,
+                    },
+                    ..AliasedAgentConfig::default()
+                },
+            );
+
+            assert_eq!(
+                configured_memory_backend(&config, Some("worker")),
+                "lucid",
+                "{shared_backend}"
+            );
+            assert_eq!(configured_memory_backend(&config, None), "lucid");
+            let refused = create_memory_for_agent(&config, "worker", None).await;
+            assert!(
+                refused.is_err(),
+                "{shared_backend}: the factory must refuse a removed backend"
+            );
         }
     }
 
