@@ -631,7 +631,7 @@ api_key = "   "
         let migrated = migrate(document).unwrap();
         assert_eq!(
             migrated["providers"]["connections"]["route.blank-key"]["auth"]["api_key"],
-            "profile-key"
+            "profile-key".into()
         );
     }
 
