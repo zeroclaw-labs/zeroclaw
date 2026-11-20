@@ -27998,7 +27998,7 @@ mod tests {
         }
 
         let changed = changed_chat_model_refs(&previous, &next).unwrap();
-        assert_eq!(changed, vec!["openai.other-provider"]);
+        assert_eq!(changed, vec!["openai.test-provider.other"]);
 
         let scope = LiveSessionRefreshScope::ModelRefs(changed);
         assert_eq!(
