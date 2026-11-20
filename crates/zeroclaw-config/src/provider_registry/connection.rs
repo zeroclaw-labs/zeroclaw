@@ -583,26 +583,21 @@ impl ProviderConnection {
         self.with_secret_json(|secret, path| secret.decrypt_in_place(store, path), field)
     }
 
-    pub fn mask_secrets(&mut self) {
-        let Ok(mut value) = serde_json::to_value(&*self) else {
-            return;
-        };
+    pub fn mask_secrets(&mut self) -> anyhow::Result<()> {
+        let mut value = serde_json::to_value(&*self).context("serialize provider connection")?;
         mask_connection_secrets(&mut value, false);
-        if let Ok(updated) = serde_json::from_value(value) {
-            *self = updated;
-        }
+        *self = serde_json::from_value(value).context("deserialize masked provider connection")?;
+        Ok(())
     }
 
-    pub fn restore_secrets_from(&mut self, current: &Self) {
-        let (Ok(mut value), Ok(current_value)) =
-            (serde_json::to_value(&*self), serde_json::to_value(current))
-        else {
-            return;
-        };
+    pub fn restore_secrets_from(&mut self, current: &Self) -> anyhow::Result<()> {
+        let mut value = serde_json::to_value(&*self).context("serialize provider connection")?;
+        let current_value =
+            serde_json::to_value(current).context("serialize current provider connection")?;
         restore_connection_secrets(&mut value, &current_value, false);
-        if let Ok(updated) = serde_json::from_value(value) {
-            *self = updated;
-        }
+        *self =
+            serde_json::from_value(value).context("deserialize restored provider connection")?;
+        Ok(())
     }
 
     pub fn has_secrets(&self) -> bool {

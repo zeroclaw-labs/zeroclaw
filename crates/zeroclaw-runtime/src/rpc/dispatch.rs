@@ -9992,7 +9992,12 @@ impl RpcDispatcher {
         } else {
             // Return full config, masked.
             let mut masked = config;
-            masked.mask_secrets();
+            masked.mask_secrets().map_err(|error| {
+                rpc_err(
+                    INTERNAL_ERROR,
+                    format!("failed to mask configuration secrets: {error}"),
+                )
+            })?;
             Ok(serde_json::to_value(&masked).unwrap_or(Value::Null))
         }
     }
