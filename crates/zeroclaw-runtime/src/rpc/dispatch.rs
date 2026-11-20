@@ -10629,7 +10629,15 @@ impl RpcDispatcher {
                         config,
                         &agent_alias,
                         &overrides,
-                    )?
+                    )
+                    .map_err(|error| {
+                        rpc_err(
+                            INVALID_PARAMS,
+                            format!(
+                                "Config update cannot scope live session `{session_id}`: {error}"
+                            ),
+                        )
+                    })?
                     .is_none()
                 {
                     continue;
