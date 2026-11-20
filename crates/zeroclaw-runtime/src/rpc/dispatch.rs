@@ -27969,22 +27969,38 @@ mod tests {
         use crate::rpc::session::SessionOverrides;
 
         let tmp = tempfile::TempDir::new().unwrap();
-        let mut previous = make_model_refresh_test_config(&tmp);
-        let other = previous
-            .providers
-            .models
-            .ensure("openai", "other-provider")
-            .expect("other provider slot exists");
-        other.api_key = Some("test-key-other".into());
-        other.uri = Some("http://127.0.0.1:1/v1".into());
-        other.model = Some("other-v1".into());
+        let mut previous =
+            zeroclaw_config::migration::admit_test_input(&make_model_refresh_test_config(&tmp));
+        let selected_ref =
+            zeroclaw_config::provider_registry::ModelRef::from("openai.test-provider");
+        let mut other = serde_json::to_value(
+            previous
+                .providers
+                .models
+                .canonical_model(&selected_ref)
+                .expect("canonical selected model exists"),
+        )
+        .unwrap();
+        other["model"] = json!("other-v1");
+        previous.providers.models.insert_canonical_model(
+            zeroclaw_config::provider_registry::ModelRef::from("openai.test-provider.other"),
+            serde_json::from_value(other).unwrap(),
+        );
 
         let mut next = previous.clone();
-        next.providers
+        let other_model = next
+            .providers
             .models
-            .ensure("openai", "other-provider")
-            .expect("other provider exists")
-            .model = Some("other-v2".into());
+            .canonical_model_mut(&zeroclaw_config::provider_registry::ModelRef::from(
+                "openai.test-provider.other",
+            ))
+            .expect("other model exists");
+        match other_model {
+            zeroclaw_config::provider_registry::ModelDefinition::Chat(model) => {
+                model.model = Some("other-v2".into());
+            }
+            _ => panic!("other model is chat"),
+        }
 
         let changed = changed_chat_model_refs(&previous, &next).unwrap();
         assert_eq!(changed, vec!["openai.other-provider"]);
