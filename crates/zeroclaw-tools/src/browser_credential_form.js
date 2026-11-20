@@ -6,9 +6,9 @@ function submitCatalogCredential({ origin, values }) {
     const matches = [...document.querySelectorAll(selector)].filter(usable);
     return matches.length === 1 ? matches[0] : null;
   };
-  const primary = values.otp
-    ? unique('input[autocomplete="one-time-code"]')
-    : unique('input[type="password"]');
+  const otpFields = 'input[autocomplete~="one-time-code"], input[name="otp"]';
+  const passwordFields = 'input[type="password"]:not([autocomplete~="one-time-code"]):not([name="otp"])';
+  const primary = values.otp ? unique(otpFields) : unique(passwordFields);
   if (!primary || !primary.form) return false;
   const form = primary.form;
   const username = values.otp ? null : unique('input[autocomplete="username"]') ??

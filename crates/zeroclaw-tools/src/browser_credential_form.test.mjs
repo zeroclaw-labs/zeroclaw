@@ -6,7 +6,7 @@ import test from "node:test";
 const source = readFileSync(new URL("./browser_credential_form.js", import.meta.url), "utf8");
 const origin = "https://login.example.test";
 
-function fixture({ action = origin + "/submit", method = "post", top = true } = {}) {
+function fixture({ action = origin + "/submit", method = "post", top = true, maskedOtp = false, duplicateOtp = false } = {}) {
   const sent = [];
   class Form { submit() { sent.push(fields.map(field => field.value)); } }
   class Input {
@@ -20,8 +20,14 @@ function fixture({ action = origin + "/submit", method = "post", top = true } = 
   const document = {
     baseURI: origin,
     querySelectorAll(selector) {
-      return [selector.includes("one-time-code") ? fields[2] :
-        selector.includes("password") ? fields[1] : fields[0]];
+      if (selector.startsWith('input[type="password"]')) {
+        return maskedOtp && selector.includes(':not([name="otp"])') ? [] : [fields[1]];
+      }
+      if (selector.includes('one-time-code')) {
+        const matches = !maskedOtp || selector.includes('input[name="otp"]') ? [fields[2]] : [];
+        return duplicateOtp ? [...matches, Object.assign(new Input(), { form })] : matches;
+      }
+      return [fields[0]];
     },
   };
   const run = vm.runInNewContext(`(${source})`, { window, document, URL, HTMLInputElement: Input, HTMLFormElement: Form });
@@ -50,3 +56,18 @@ for (const options of [{ action: "https://elsewhere.example.test" }, { method: "
     assert.deepEqual(fields.map(field => field.value), ["", "", ""]);
   });
 }
+
+
+test("fills a masked field named otp only with a one-time code", () => {
+  const { run, sent } = fixture({ maskedOtp: true });
+  assert.equal(run({ username: "fixture", password: "sentinel" }), false);
+  assert.deepEqual(sent, []);
+  assert.equal(run({ otp: "123456" }), true);
+  assert.deepEqual(sent, [["", "", "123456"]]);
+});
+
+test("rejects multiple eligible OTP fields", () => {
+  const { run, sent } = fixture({ duplicateOtp: true });
+  assert.equal(run({ otp: "123456" }), false);
+  assert.deepEqual(sent, []);
+});
