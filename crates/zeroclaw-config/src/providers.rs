@@ -1046,18 +1046,20 @@ pub(crate) mod canonical_connection_secrets {
         Ok(())
     }
 
-    pub fn mask_secrets(providers: &mut Providers) {
+    pub fn mask_secrets(providers: &mut Providers) -> anyhow::Result<()> {
         for connection in providers.connections.values_mut() {
-            let _ = connection.mask_secrets();
+            connection.mask_secrets()?;
         }
+        Ok(())
     }
 
-    pub fn restore_secrets_from(providers: &mut Providers, current: &Providers) {
+    pub fn restore_secrets_from(providers: &mut Providers, current: &Providers) -> anyhow::Result<()> {
         for (provider_id, connection) in &mut providers.connections {
             if let Some(current_connection) = current.connections.get(provider_id) {
-                connection.restore_secrets_from(current_connection);
+                connection.restore_secrets_from(current_connection)?;
             }
         }
+        Ok(())
     }
 }
 
