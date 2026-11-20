@@ -445,9 +445,18 @@ fn chat_model_construction_signature(
     };
     let provider = model.provider();
     let model_value = serde_json::to_value(model).unwrap_or(Value::Null);
-    let preset = model_value
+    let model_preset = model_value
         .get("preset")
         .and_then(Value::as_str)
+        .and_then(|name| registry.model_presets.get(name))
+        .and_then(|preset| serde_json::to_value(preset).ok());
+    let connection = registry.connections.get(provider);
+    let connection_value = connection
+        .and_then(|connection| serde_json::to_value(connection).ok())
+        .unwrap_or(Value::Null);
+    let connection_preset = connection
+        .and_then(|connection| connection.chat_defaults())
+        .and_then(|(preset, _)| preset)
         .and_then(|name| registry.model_presets.get(name))
         .and_then(|preset| serde_json::to_value(preset).ok());
     let fallback = registry
@@ -466,8 +475,9 @@ fn chat_model_construction_signature(
         .collect::<Vec<_>>();
     serde_json::json!({
         "model": model_value,
-        "connection": registry.connections.get(provider),
-        "preset": preset,
+        "connection": connection_value,
+        "connection_chat_preset": connection_preset,
+        "model_preset": model_preset,
         "fallback": fallback,
     })
 }
