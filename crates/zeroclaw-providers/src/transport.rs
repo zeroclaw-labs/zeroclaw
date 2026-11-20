@@ -28,9 +28,8 @@ impl ChatHttpTimeouts {
         Self {
             request: (!options.provider_timeout_disabled)
                 .then(|| Duration::from_secs(options.provider_timeout_secs.unwrap_or(120))),
-            read: (!options.provider_read_timeout_disabled).then(|| {
-                Duration::from_secs(options.provider_read_timeout_secs.unwrap_or(300))
-            }),
+            read: (!options.provider_read_timeout_disabled)
+                .then(|| Duration::from_secs(options.provider_read_timeout_secs.unwrap_or(300))),
         }
     }
 
