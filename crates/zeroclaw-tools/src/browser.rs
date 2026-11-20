@@ -540,12 +540,34 @@ impl BrowserTool {
             "Browser origin does not match the credential grant"
         );
 
+        let stage = args
+            .get("credential_stage")
+            .and_then(Value::as_str)
+            .unwrap_or("auto");
+        let field = args.get("credential_field").and_then(Value::as_str);
+        let frame = args.get("credential_frame").and_then(Value::as_str);
+        anyhow::ensure!(
+            [field, frame]
+                .into_iter()
+                .flatten()
+                .all(|selector| !selector.is_empty() && selector.len() <= 256),
+            "Invalid credential selector"
+        );
         let values = match record.auth {
-            ScopedHttpAuth::UserPassword { username, password } => {
-                let password = resolve_scoped_value(record.source, password).await?;
-                json!({ "username": username, "password": password })
+            ScopedHttpAuth::UserPassword { username, .. } if stage == "username" => {
+                json!({ "username": username })
             }
-            ScopedHttpAuth::Totp { seed } => {
+            ScopedHttpAuth::UserPassword { username, password }
+                if matches!(stage, "auto" | "password" | "login") =>
+            {
+                let password = resolve_scoped_value(record.source, password).await?;
+                if stage == "password" {
+                    json!({ "password": password })
+                } else {
+                    json!({ "username": username, "password": password })
+                }
+            }
+            ScopedHttpAuth::Totp { seed } if matches!(stage, "auto" | "otp") => {
                 let seed = resolve_scoped_value(record.source, seed).await?;
                 let timestamp = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)?
@@ -559,7 +581,7 @@ impl BrowserTool {
             current.permits_browser_submission(&active, &active, &active),
             "Browser credential permission was revoked"
         );
-        let payload = json!({ "origin": origin, "values": values });
+        let payload = json!({ "origin": origin, "values": values, "stage": stage, "field": field, "frame": frame });
         let script = format!(
             "({})({payload})",
             include_str!("browser_credential_form.js")
@@ -1517,6 +1539,18 @@ impl Tool for BrowserTool {
                 "url": {
                     "type": "string",
                     "description": "URL to navigate to (for 'open' action)"
+                },
+                "credential_stage": {
+                    "type": "string", "enum": ["auto", "login", "username", "password", "otp"],
+                    "description": "Credential form stage. Use username or password when the site requests them separately."
+                },
+                "credential_field": {
+                    "type": "string",
+                    "description": "Optional CSS selector for the observed field or an OTP group of one-character inputs"
+                },
+                "credential_frame": {
+                    "type": "string",
+                    "description": "Optional CSS selector for a single visible, same-origin iframe containing the form"
                 },
                 "credential": {
                     "type": "string",

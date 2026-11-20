@@ -1,30 +1,69 @@
-function submitCatalogCredential({ origin, values }) {
+function submitCatalogCredential({ origin, values, stage = "auto", field = null, frame = null }) {
   if (window.top !== window || window.location.origin !== origin) return false;
-  const usable = (element) => element instanceof HTMLInputElement &&
-    !element.disabled && !element.readOnly && element.getClientRects().length !== 0;
-  const unique = (selector) => {
-    const matches = [...document.querySelectorAll(selector)].filter(usable);
-    return matches.length === 1 ? matches[0] : null;
-  };
-  const otpFields = 'input[autocomplete~="one-time-code"], input[name="otp"]';
-  const passwordFields = 'input[type="password"]:not([autocomplete~="one-time-code"]):not([name="otp"])';
-  const primary = values.otp ? unique(otpFields) : unique(passwordFields);
-  if (!primary || !primary.form) return false;
-  const form = primary.form;
-  const username = values.otp ? null : unique('input[autocomplete="username"]') ??
-    unique('input[type="email"]');
-  if (!values.otp && (!username || username.form !== form)) return false;
-  if (form.method.toLowerCase() !== "post" ||
-      (form.target && form.target !== "_self") ||
-      new URL(form.action, document.baseURI).origin !== origin) return false;
-  const fields = username
-    ? [[username, values.username], [primary, values.password]]
-    : [[primary, values.otp]];
+  let doc = document;
   try {
-    for (const [field, value] of fields) field.value = value;
-    HTMLFormElement.prototype.submit.call(form);
-    return true;
-  } finally {
-    for (const [field] of fields) field.value = "";
+    if (frame) {
+      const frames = [...doc.querySelectorAll(frame)];
+      if (frames.length !== 1 || frames[0].tagName !== "IFRAME" ||
+          !frames[0].getClientRects().length || !frames[0].contentDocument) return false;
+      doc = frames[0].contentDocument;
+      if (new URL(doc.URL).origin !== origin) return false;
+    }
+    const view = doc.defaultView ?? window;
+    const input = view.HTMLInputElement ?? HTMLInputElement;
+    const formType = view.HTMLFormElement ?? HTMLFormElement;
+    const usable = (element) => element instanceof input && !element.disabled &&
+      !element.readOnly && element.getClientRects().length !== 0 &&
+      (!view.getComputedStyle || view.getComputedStyle(element).visibility === "visible");
+    const select = selector => [...doc.querySelectorAll(selector)].filter(usable);
+    const unique = selector => {
+      const all = select(selector);
+      return all.length === 1 ? all[0] : null;
+    };
+
+    const otpFields = 'input[autocomplete~="one-time-code"], input[name="otp"]';
+    const passwordFields = 'input[type="password"]:not([autocomplete~="one-time-code"]):not([name="otp"])';
+    const usernameFields = 'input[autocomplete~="username"], input[name="username"], input[type="email"]';
+    const kind = stage === "auto" ? (values.otp ? "otp" : "login") : stage;
+    let fields;
+    if (kind === "otp") {
+      if (typeof values.otp !== "string") return false;
+      const controls = select(field ?? otpFields);
+      if (controls.length === 1) fields = [[controls[0], values.otp]];
+      else if (field && controls.length === values.otp.length &&
+               controls.every(control => control.maxLength === 1)) {
+        fields = controls.map((control, index) => [control, values.otp[index]]);
+      } else return false;
+      if (fields.some(([control]) => !["text", "password", "tel", "number"].includes(control.type))) return false;
+    } else if (kind === "username") {
+      const control = unique(field ?? usernameFields);
+      if (!control || !["text", "email", "tel"].includes(control.type) ||
+          typeof values.username !== "string") return false;
+      fields = [[control, values.username]];
+    } else if (kind === "password" || kind === "login") {
+      const control = unique(field ?? passwordFields);
+      if (!control || control.type !== "password" || control.matches?.(otpFields) ||
+          typeof values.password !== "string") return false;
+      fields = [[control, values.password]];
+      if (kind === "login") {
+        const username = unique(usernameFields);
+        if (!username || username === control || typeof values.username !== "string") return false;
+        fields.unshift([username, values.username]);
+      }
+    } else return false;
+    const form = fields[0][0].form;
+    if (!form || fields.some(([control]) => control.form !== form) ||
+        form.method.toLowerCase() !== "post" || (form.target && form.target !== "_self") ||
+        new URL(form.action, doc.baseURI).origin !== origin) return false;
+
+    try {
+      for (const [control, value] of fields) control.value = value;
+      formType.prototype.submit.call(form);
+      return true;
+    } finally {
+      for (const [control] of fields) control.value = "";
+    }
+  } catch {
+    return false;
   }
 }
