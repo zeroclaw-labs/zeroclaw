@@ -1372,6 +1372,7 @@ struct HttpCredentialMutation {
 #[serde(deny_unknown_fields)]
 struct HttpCredentialPermissions {
     http_allowed: Option<bool>,
+    http_origins: Option<Vec<String>>,
     browser: Option<BrowserCredentialPermission>,
     destinations: Option<Vec<zeroclaw_config::schema::SshCredentialDestination>>,
 }
@@ -1469,7 +1470,7 @@ pub async fn list_http_credentials(
                 rows.push((
                     name,
                     serde_json::json!({
-                        "name": name, "origin": record.origin, "kind": kind, "source": record.source, "destinations": destinations, "header": header, "http_allowed": http_allowed, "browser_origin": record.browser_origin, "browser_origins": record.browser_grants().collect::<Vec<_>>()
+                        "name": name, "origin": record.origin, "kind": kind, "source": record.source, "destinations": destinations, "header": header, "http_allowed": http_allowed, "http_origins": record.http_grants(), "browser_origin": record.browser_origin, "browser_origins": record.browser_grants().collect::<Vec<_>>()
                     }),
                 ));
             }
@@ -1541,9 +1542,25 @@ pub async fn mutate_http_credential(
                 };
                 let grant = serde_json::json!({
                     "http_allowed": permissions.http_allowed,
+                    "http_origin_count": permissions.http_origins.as_ref().map(Vec::len),
                     "browser_grant": permissions.browser.as_ref().map(|value| value.origin.is_some() || value.origins.as_ref().is_some_and(|origins| !origins.is_empty())),
                     "ssh_destination_count": permissions.destinations.as_ref().map(Vec::len),
                 });
+                if let Some(requested) = permissions.http_origins {
+                    if permissions.browser.is_some() || permissions.http_allowed.is_some()
+                        || permissions.destinations.is_some()
+                        || !matches!(&record.auth, ScopedHttpAuth::UserPassword { .. } | ScopedHttpAuth::ApiKey { .. })
+                        || requested.len() > 32
+                        || requested.iter().any(|origin| !ScopedHttpCredential::is_https_grant_origin(origin))
+                    {
+                        return StatusCode::BAD_REQUEST.into_response();
+                    }
+                    let mut origins: Vec<_> = requested.iter().filter_map(|origin| ScopedHttpCredential::https_origin(origin)).collect();
+                    origins.sort_unstable();
+                    origins.dedup();
+                    record.http_allowed = false;
+                    record.http_origins = Some(origins);
+                } else {
                 match (
                     permissions.browser,
                     permissions.http_allowed,
@@ -1581,11 +1598,13 @@ pub async fn mutate_http_credential(
                         Some(allowed),
                         None,
                     ) if ScopedHttpCredential::https_origin(&record.origin).is_some() => {
-                        record.http_allowed = allowed
+                        record.http_allowed = allowed;
+                            record.http_origins = None;
                     }
                         _ => return StatusCode::BAD_REQUEST.into_response(),
                     },
                     _ => return StatusCode::BAD_REQUEST.into_response(),
+                }
                 }
                 let Ok(ciphertext) = serde_json::to_string(&record)
                     .map_err(anyhow::Error::from)
@@ -1644,6 +1663,7 @@ pub async fn mutate_http_credential(
             if let Some(mut credential) = mutation.credential {
                 kind = Some(scoped_credential_kind(&credential.auth));
                 credential.http_allowed = false;
+                credential.http_origins = None;
                 credential.browser_origin = None;
                 credential.browser_origins.clear();
                 if let Some(previous) = credentials.get(&mutation.name) {
@@ -1663,16 +1683,11 @@ pub async fn mutate_http_credential(
                     {
                         return StatusCode::BAD_REQUEST.into_response();
                     }
-                    credential.browser_origin = previous.browser_origin.filter(|origin| {
-                        credential.origin == previous.origin || matches!(&credential.auth, ScopedHttpAuth::Totp { .. }) && credential.accepts_browser_origin(origin)
-                    });
-                    if credential.browser_origin.is_some() {
-                        credential.browser_origins = previous.browser_origins;
+                    if previous.http_allowed || previous.http_origins.is_some() {
+                        credential.http_origins = Some(previous.http_grants().to_vec());
                     }
-                    credential.http_allowed = previous.http_allowed
-                        && (previous.origin == credential.origin
-                            || ScopedHttpCredential::https_origin(&credential.origin)
-                                .is_some_and(|origin| origin == previous.origin));
+                    credential.browser_origin = previous.browser_origin;
+                    credential.browser_origins = previous.browser_origins;
                     if let (
                         ScopedHttpAuth::SshKey {
                             destinations: current,

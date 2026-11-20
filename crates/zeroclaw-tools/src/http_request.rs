@@ -477,9 +477,8 @@ impl HttpRequestTool {
             )));
         }
         let credential = load_scoped_credential(self.config_path.as_deref(), name)?;
-        if !credential.http_allowed
-            || ScopedHttpCredential::https_origin(&target.url).as_deref()
-                != Some(credential.origin.as_str())
+        if !ScopedHttpCredential::https_origin(&target.url)
+            .is_some_and(|origin| credential.http_grants().contains(&origin))
         {
             return Err(anyhow::Error::msg(scoped_credential_message(
                 "tool-http-credential-origin",
@@ -1374,6 +1373,7 @@ mod tests {
             ScopedHttpCredential {
                 origin: "https://example.com".into(),
                 http_allowed: true,
+                http_origins: None,
                 browser_origin: None,
                 browser_origins: Vec::new(),
                 source: Default::default(),
@@ -1418,6 +1418,7 @@ mod tests {
             ScopedHttpCredential {
                 origin: "https://example.com".into(),
                 http_allowed: false,
+                http_origins: None,
                 browser_origin: None,
                 browser_origins: Vec::new(),
                 source: Default::default(),

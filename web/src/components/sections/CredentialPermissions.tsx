@@ -13,14 +13,13 @@ function consumers(row?: HttpCredentialRow): Consumer[] {
   if (!row) return [];
   if (row.kind === "ssh_key") return ["ssh"];
   if (row.kind === "totp") return ["browser"];
-  if (!row.origin.startsWith("https://")) return [];
   return row.kind === "user_password" ? ["http", "browser"] : ["http"];
 }
 
 function grantsFor(row: HttpCredentialRow): Grant[] {
   const entry = (consumer: Consumer, destination: string): Grant => ({ alias: row.name, consumer, destination });
   return [
-    ...(row.http_allowed ? [entry("http", row.origin)] : []),
+    ...(row.http_origins ?? (row.http_allowed ? [row.origin] : [])).map(origin => entry("http", origin)),
     ...(row.browser_origins ?? (row.browser_origin ? [row.browser_origin] : [])).map(origin => entry("browser", origin)),
     ...(row.destinations ?? []).map(d => entry("ssh", `${d.username}@${d.host.includes(":") ? `[${d.host}]` : d.host}:${d.port}`)),
   ];
@@ -60,7 +59,7 @@ export default function CredentialPermissions() {
         item.destination !== (remove ? entry.destination : replaced?.destination)).map(item => item.destination);
       if (!remove) siblings.push(entry.destination.trim());
       const destinations = [...new Set(siblings)];
-      const permissions = entry.consumer === "http" ? { http_allowed: !remove }
+      const permissions = entry.consumer === "http" ? { http_origins: destinations }
         : entry.consumer === "browser" ? { browser: { origins: destinations } }
         : { destinations: parseSshDestinations(destinations.join("\n")) };
       if (entry.consumer === "ssh" && "destinations" in permissions && permissions.destinations?.length !== destinations.length) {
@@ -110,7 +109,6 @@ export default function CredentialPermissions() {
           <label className="block space-y-1">
             <span>{t(draft.consumer === "ssh" ? "http_credentials.ssh_destinations" : "http_credentials.origin")}</span>
             <input className={field} type={draft.consumer === "ssh" ? "text" : "url"} required
-              readOnly={draft.consumer === "http" || (draft.consumer === "browser" && row.kind === "user_password")}
               placeholder={draft.consumer === "ssh" ? "operator@server.example.com:22" : "https://login.example.com"}
               value={draft.destination} onChange={event => setDraft({ ...draft, destination: event.target.value })} />
           </label>
@@ -129,8 +127,7 @@ export default function CredentialPermissions() {
               <p>{consumerLabel[entry.consumer]} · {entry.destination}</p>
             </div>
             <div className="flex gap-2">
-              {entry.consumer !== "http" && !(entry.consumer === "browser" && rows.find(item => item.name === entry.alias)?.kind === "user_password") &&
-                <Button type="button" disabled={busy} onClick={() => { setDraft(entry); setEditing(entry); }}>{t("http_credentials.edit_permission")}</Button>}
+              <Button type="button" disabled={busy} onClick={() => { setDraft(entry); setEditing(entry); }}>{t("http_credentials.edit_permission")}</Button>
               <Button type="button" disabled={busy} onClick={() => void save(entry, undefined, true)}>{t("http_credentials.remove_permission")}</Button>
             </div>
           </li>

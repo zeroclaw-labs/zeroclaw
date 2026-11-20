@@ -9059,6 +9059,8 @@ pub struct ScopedHttpCredential {
     #[serde(default)]
     pub http_allowed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http_origins: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub browser_origin: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub browser_origins: Vec<String>,
@@ -9281,15 +9283,26 @@ mod scoped_credential_source_tests {
 impl ScopedHttpCredential {
     /// A browser grant is independent from HTTP Request and SSH permissions.
     pub fn accepts_browser_origin(&self, origin: &str) -> bool {
-        let Some(normalized) =
-            Self::password_service(origin).filter(|value| value.starts_with("https://"))
-        else {
+        if !Self::is_https_grant_origin(origin) {
             return false;
-        };
+        }
         match &self.auth {
-            ScopedHttpAuth::UserPassword { .. } => self.origin == normalized,
-            ScopedHttpAuth::Totp { .. } => true,
+            ScopedHttpAuth::UserPassword { .. } | ScopedHttpAuth::Totp { .. } => true,
             _ => false,
+        }
+    }
+
+    pub fn is_https_grant_origin(origin: &str) -> bool {
+        Self::password_service(origin).is_some_and(|value| value.starts_with("https://"))
+    }
+
+    pub fn http_grants(&self) -> &[String] {
+        match &self.http_origins {
+            Some(grants) => grants,
+            None if self.http_allowed && Self::is_https_grant_origin(&self.origin) => {
+                std::slice::from_ref(&self.origin)
+            }
+            None => &[],
         }
     }
 
@@ -9377,9 +9390,14 @@ fn scoped_browser_credentials_require_eligible_kind_and_https_origin() {
     }))
     .expect("existing credential record");
     assert!(record.browser_origin.is_none());
+    assert_eq!(record.http_grants(), &["https://login.example.test"]);
+    record.http_origins = Some(vec!["https://other.example.test".into()]);
+    assert_eq!(record.http_grants(), &["https://other.example.test"]);
+    record.http_origins = Some(Vec::new());
+    assert!(record.http_grants().is_empty());
     assert!(record.accepts_browser_origin("https://login.example.test:443"));
-    assert!(!record.accepts_browser_origin("https://login.example.test:8443"));
-    assert!(!record.accepts_browser_origin("https://other.example.test"));
+    assert!(record.accepts_browser_origin("https://login.example.test:8443"));
+    assert!(record.accepts_browser_origin("https://other.example.test"));
     record.auth = ScopedHttpAuth::Totp {
         seed: String::new(),
     };
