@@ -14349,13 +14349,15 @@ pub struct OidcConfig {
     /// Typing is how the verifier tells an access token from an ID token.
     /// For issuers that don't type their access tokens (Okta: no `typ`;
     /// Entra ID: `typ: JWT`), set `false` and prove the difference by
-    /// audience instead: an ID token's `aud` is always the client it was
-    /// issued to, so `audience` must be an API identifier that is not
-    /// `client_id` and not any client declared here or by another entry for
-    /// the same issuer. Untyped tokens are then accepted with no header
-    /// `typ` or `typ: JWT`; any other type is still refused, as are `nonce`
-    /// and non-access purpose markers. The IdP must also never sign anyone
-    /// in AS the API registration itself, which ZeroClaw cannot check.
+    /// audience instead. An ID token's `aud` must contain the client it was
+    /// issued to and may list other audiences, so an untyped token must
+    /// carry exactly `audience` as its only `aud` value, and `audience`
+    /// must be an API identifier that is not `client_id` and not any client
+    /// declared here or by another entry for the same issuer. Untyped tokens
+    /// are then accepted with no header `typ` or `typ: JWT`; any other type
+    /// is still refused, as are `nonce` and non-access purpose markers. The
+    /// IdP must also never sign anyone in AS the API registration itself,
+    /// which ZeroClaw cannot check.
     pub require_at_jwt: bool,
     /// Top-level claim naming the OAuth client in JWKS-validated access
     /// tokens. Default `client_id` (RFC 9068), where a person's token may
