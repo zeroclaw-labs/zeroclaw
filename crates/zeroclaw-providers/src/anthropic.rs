@@ -2490,41 +2490,32 @@ impl AnthropicModelProvider {
         }
     }
 
-    fn http_client(&self) -> Result<Client, reqwest::Error> {
-        let mut builder = Client::builder().connect_timeout(std::time::Duration::from_secs(10));
-        if !self.timeout_disabled {
-            builder = builder.timeout(std::time::Duration::from_secs(self.timeout_secs));
+    fn http_client(&self) -> anyhow::Result<Client> {
+        crate::transport::ChatHttpPolicy {
+            request_timeout: (!self.timeout_disabled)
+                .then(|| std::time::Duration::from_secs(self.timeout_secs)),
+            read_timeout: self
+                .read_timeout_secs
+                .filter(|_| !self.read_timeout_disabled)
+                .map(std::time::Duration::from_secs),
+            ..Default::default()
         }
-        if !self.read_timeout_disabled
-            && let Some(read_timeout) = self.read_timeout_secs
-        {
-            builder = builder.read_timeout(std::time::Duration::from_secs(read_timeout));
-        }
-        let builder = zeroclaw_config::schema::apply_runtime_proxy_to_builder(
-            builder,
-            "model_provider.anthropic",
-        );
-        builder.build()
+        .client("model_provider.anthropic")
     }
 
     /// Streaming defaults to no total deadline. An explicit deadline covers
     /// headers and the complete body; read-idle protection is independent.
-    fn streaming_http_client(&self) -> Result<Client, reqwest::Error> {
-        let builder = Client::builder().connect_timeout(std::time::Duration::from_secs(10));
-        // Legacy timeout_secs is intentionally absent from streaming clients;
-        // the canonical stream total deadline is a separate option.
-        let builder = if self.read_timeout_disabled {
-            builder
-        } else if let Some(read_timeout) = self.read_timeout_secs {
-            builder.read_timeout(std::time::Duration::from_secs(read_timeout))
-        } else {
-            builder.read_timeout(STREAM_IDLE_TIMEOUT)
-        };
-        let builder = zeroclaw_config::schema::apply_runtime_proxy_to_builder(
-            builder,
-            "model_provider.anthropic",
-        );
-        builder.build()
+    fn streaming_http_client(&self) -> anyhow::Result<Client> {
+        crate::transport::ChatHttpPolicy {
+            request_timeout: None,
+            read_timeout: (!self.read_timeout_disabled).then(|| {
+                self.read_timeout_secs
+                    .map(std::time::Duration::from_secs)
+                    .unwrap_or(STREAM_IDLE_TIMEOUT)
+            }),
+            ..Default::default()
+        }
+        .client("model_provider.anthropic")
     }
 
     /// Build a streaming request body from a `NativeChatRequest`.
@@ -3571,7 +3562,7 @@ impl ModelProvider for AnthropicModelProvider {
             Err(error) => {
                 let message = format!(
                     "Failed to build Anthropic streaming client: {}",
-                    super::format_error_chain(&error)
+                    super::format_error_chain(error.as_ref())
                 );
                 return stream::once(async move { Err(StreamError::Http(message)) }).boxed();
             }

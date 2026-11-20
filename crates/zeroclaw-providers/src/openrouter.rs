@@ -36,7 +36,6 @@ pub(crate) const BASE_URL: &str = "https://openrouter.ai/api/v1";
 pub(crate) fn endpoint_url(path: &str) -> String {
     format!("{BASE_URL}/{}", path.trim_start_matches('/'))
 }
-const OPENROUTER_CONNECT_TIMEOUT_SECS: u64 = 10;
 /// Maximum silence between body reads for OpenRouter SSE streams.
 const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
@@ -579,22 +578,17 @@ impl OpenRouterModelProvider {
         Ok(value)
     }
 
-    fn http_client(&self) -> Result<Client, reqwest::Error> {
-        let mut builder =
-            Client::builder().connect_timeout(Duration::from_secs(OPENROUTER_CONNECT_TIMEOUT_SECS));
-        if !self.timeout_disabled {
-            builder = builder.timeout(Duration::from_secs(self.timeout_secs));
+    fn http_client(&self) -> anyhow::Result<Client> {
+        crate::transport::ChatHttpPolicy {
+            request_timeout: (!self.timeout_disabled)
+                .then(|| std::time::Duration::from_secs(self.timeout_secs)),
+            read_timeout: self
+                .read_timeout_secs
+                .filter(|_| !self.read_timeout_disabled)
+                .map(std::time::Duration::from_secs),
+            ..Default::default()
         }
-        if !self.read_timeout_disabled
-            && let Some(read_timeout) = self.read_timeout_secs
-        {
-            builder = builder.read_timeout(Duration::from_secs(read_timeout));
-        }
-        let builder = zeroclaw_config::schema::apply_runtime_proxy_to_builder(
-            builder,
-            "model_provider.openrouter",
-        );
-        builder.build()
+        .client("model_provider.openrouter")
     }
 
     fn streaming_timeouts(&self) -> super::StreamTimeouts {
@@ -613,21 +607,14 @@ impl OpenRouterModelProvider {
     }
 
     /// Use the same resolved deadlines for transport and diagnostics.
-    fn streaming_http_client(&self) -> Result<Client, reqwest::Error> {
+    fn streaming_http_client(&self) -> anyhow::Result<Client> {
         let timeouts = self.streaming_timeouts();
-        let mut builder =
-            Client::builder().connect_timeout(Duration::from_secs(OPENROUTER_CONNECT_TIMEOUT_SECS));
-        if let Some(timeout) = timeouts.request {
-            builder = builder.timeout(timeout);
+        crate::transport::ChatHttpPolicy {
+            request_timeout: timeouts.request,
+            read_timeout: timeouts.read.map(|timeout| timeout.duration()),
+            ..Default::default()
         }
-        if let Some(timeout) = timeouts.read {
-            builder = builder.read_timeout(timeout.duration());
-        }
-        zeroclaw_config::schema::apply_runtime_proxy_to_builder(
-            builder,
-            "model_provider.openrouter",
-        )
-        .build()
+        .client("model_provider.openrouter")
     }
 
     fn streaming_endpoint_url(&self, path: &str) -> String {
