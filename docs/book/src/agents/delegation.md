@@ -85,6 +85,10 @@ Choosing a route takes two permissions, and both must hold:
   provider allowlist excludes the route's provider, exactly as it would refuse
   `model_switch` to it. Unhinted spawning is unaffected.
 
+Every SubAgent, hinted or not, inherits that allowlist for all its provider
+attempts: provider fallbacks and the child's own effort routing stay inside
+it, so a local-only turn's child never falls back to a cloud provider.
+
 A parent bound to supplied capabilities resolves the route through its own
 provider source and principal, never a provider built from config.
 

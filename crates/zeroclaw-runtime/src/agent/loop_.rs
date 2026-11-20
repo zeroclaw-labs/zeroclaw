@@ -1461,6 +1461,23 @@ pub struct AgentRunOverrides {
     /// inherits the step's boundary rather than rebuilding the agent's full
     /// surface. `None` for every ordinary agent run.
     pub sop_step_scope: Option<crate::sop::active_scope::HeadlessStepScope>,
+    /// Provider profiles the parent turn may attempt, for a child run started
+    /// from inside it. Every provider attempt of the child, including fallbacks
+    /// and its own effort routing, stays inside this set. `None` for a run
+    /// with no enclosing provider restriction.
+    pub provider_allowlist: Option<Arc<HashSet<String>>>,
+}
+
+/// Narrow a run's own provider allowlist by the one it inherited, so a child
+/// never attempts a provider its parent turn could not.
+fn narrow_provider_allowlist(
+    own: Arc<HashSet<String>>,
+    inherited: Option<&Arc<HashSet<String>>>,
+) -> Arc<HashSet<String>> {
+    match inherited {
+        Some(inherited) => Arc::new(own.intersection(inherited).cloned().collect()),
+        None => own,
+    }
 }
 
 fn agent_provider_composite(
@@ -1960,6 +1977,22 @@ async fn run_inner(
                 ));
                 active_effort_provider_refs = Some(selection.allowed_provider_refs);
             }
+        }
+        let inherited_provider_allowlist = overrides.provider_allowlist.clone();
+        let allowed = match active_effort_provider_refs.take() {
+            Some(own) => Some(narrow_provider_allowlist(
+                own,
+                inherited_provider_allowlist.as_ref(),
+            )),
+            None => inherited_provider_allowlist.clone(),
+        };
+        if let Some(allowed) = allowed {
+            anyhow::ensure!(
+                allowed.contains(&provider_name),
+                "model provider `{provider_name}` is outside the enclosing turn's provider allowlist"
+            );
+            effort_provider_config = Some(effort_scoped_provider_config(&config, &allowed));
+            active_effort_provider_refs = Some(allowed);
         }
         let mut context_limits =
             config.resolved_context_limits_for_route(agent_alias, &provider_name, &model_name);
@@ -2863,15 +2896,17 @@ async fn run_inner(
                         &effective_input,
                     )?
                 {
+                    let allowed_provider_refs = narrow_provider_allowlist(
+                        selection.allowed_provider_refs,
+                        inherited_provider_allowlist.as_ref(),
+                    );
                     if provider_name != selection.model_provider
                         || model_name != selection.model
                         || active_effort_provider_refs.as_deref()
-                            != Some(selection.allowed_provider_refs.as_ref())
+                            != Some(allowed_provider_refs.as_ref())
                     {
-                        let scoped_config = effort_scoped_provider_config(
-                            &config,
-                            selection.allowed_provider_refs.as_ref(),
-                        );
+                        let scoped_config =
+                            effort_scoped_provider_config(&config, allowed_provider_refs.as_ref());
                         model_provider =
                             capabilities.model_provider(&crate::composition::ProviderRequest {
                                 config: &scoped_config,
@@ -2889,7 +2924,7 @@ async fn run_inner(
                         );
                         turn_guard.set_model_route(provider_name.clone(), model_name.clone());
                     }
-                    active_effort_provider_refs = Some(selection.allowed_provider_refs);
+                    active_effort_provider_refs = Some(allowed_provider_refs);
                 }
 
                 // Compute per-turn excluded MCP tools from tool_filter_groups

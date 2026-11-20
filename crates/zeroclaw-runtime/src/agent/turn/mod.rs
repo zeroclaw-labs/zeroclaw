@@ -56,7 +56,7 @@ pub use outcome::{
 };
 pub(crate) use outcome::{SteeringPending, StreamCancelledAfterOutput};
 pub(crate) use outcome::{
-    current_model_switch_state, model_switch_provider_allowed,
+    current_model_switch_state, current_provider_allowlist, model_switch_provider_allowed,
     scope_model_switch_provider_allowlist, scope_model_switch_state,
 };
 #[cfg(test)]

@@ -56,6 +56,15 @@ pub(crate) fn model_switch_provider_allowed(provider_ref: &str) -> bool {
         .unwrap_or(true)
 }
 
+/// The provider profiles the current tool loop may attempt, for a child run
+/// started from one of its tools to inherit. `None` outside a restricted loop.
+pub(crate) fn current_provider_allowlist() -> Option<Arc<HashSet<String>>> {
+    MODEL_SWITCH_PROVIDER_ALLOWLIST
+        .try_with(Clone::clone)
+        .ok()
+        .flatten()
+}
+
 pub(crate) async fn scope_model_switch_provider_allowlist<F>(
     allowed: Option<Arc<HashSet<String>>>,
     future: F,

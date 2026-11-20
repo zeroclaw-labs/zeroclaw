@@ -158,6 +158,9 @@ fn child_run_overrides(
         execution_capability: None,
         execution_admission: None,
         sop_step_scope: crate::sop::active_scope::active_headless_step_scope(),
+        // Every provider attempt of the child, fallbacks and its own effort
+        // routing included, stays inside the parent turn's allowlist.
+        provider_allowlist: crate::agent::turn::current_provider_allowlist(),
         // Not yet propagated: a sub-turn spawned by an internally
         // initiated parent (e.g. a cron turn delegating) loses the
         // parent's initiating principal here. Inheritance semantics for
@@ -1736,6 +1739,70 @@ mod tests {
         );
         assert!(route_received.lock().unwrap().is_empty());
         assert!(parent_received.lock().unwrap().is_empty());
+    }
+
+    /// A local-only parent turn allows only the local route's provider. The
+    /// child must stay inside that set: when the route's provider fails, its
+    /// configured cloud fallback is not attempted. Without the inherited
+    /// allowlist the same child does fall back, which is the leak.
+    #[tokio::test]
+    async fn a_routed_child_keeps_the_parent_provider_allowlist_on_fallback() {
+        use zeroclaw_config::schema::{ModelProviderConfig, OllamaModelProviderConfig};
+
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let (parent_uri, _parent_received, parent_server) = recording_provider().await;
+        let (cloud_uri, cloud_received, cloud_server) = recording_provider().await;
+        // The route's provider is unreachable, so only a fallback could answer.
+        let mut config = routed_dispatch_config(tmp.path(), &parent_uri, "http://127.0.0.1:9");
+        authorize_model_switch(&mut config);
+        config
+            .providers
+            .models
+            .ollama
+            .get_mut("light")
+            .expect("route provider")
+            .base
+            .fallback = vec![zeroclaw_config::providers::ModelProviderRef::new(
+            "ollama.cloud",
+        )];
+        config.providers.models.ollama.insert(
+            "cloud".into(),
+            OllamaModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("cloud-model".into()),
+                    uri: Some(cloud_uri),
+                    timeout_secs: Some(5),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+
+        let local_only = Arc::new(std::collections::HashSet::from([
+            "ollama.parent".to_string(),
+            "ollama.light".to_string(),
+        ]));
+        let restricted = crate::agent::turn::scope_model_switch_provider_allowlist(
+            Some(local_only),
+            Box::pin(spawn_routed(config.clone())),
+        )
+        .await;
+        assert!(
+            !restricted.success,
+            "the local route failed: {restricted:?}"
+        );
+        assert!(
+            cloud_received.lock().unwrap().is_empty(),
+            "a local-only parent's child must not fall back to cloud"
+        );
+
+        let unrestricted = Box::pin(spawn_routed(config)).await;
+        parent_server.abort();
+        cloud_server.abort();
+        assert!(
+            unrestricted.success && !cloud_received.lock().unwrap().is_empty(),
+            "control: without a parent allowlist the fallback is reachable: {unrestricted:?}"
+        );
     }
 
     /// A bound parent's routed child asks the bound provider source for the
