@@ -56,12 +56,21 @@ impl HttpTransportConfig {
     }
 
     pub fn client(&self, default_timeout: Duration, service_key: &str) -> Result<Client> {
+        self.client_with_policy(Some(default_timeout), false, service_key)
+    }
+
+    pub fn client_with_policy(
+        &self,
+        default_timeout: Option<Duration>,
+        follow_redirects: bool,
+        service_key: &str,
+    ) -> Result<Client> {
         // The shared cache owns proxy-generation invalidation. The profile
         // fingerprint only identifies this adapter's resolved transport policy.
         let timeout = match &self.request_timeout_secs {
             Some(Override::Set(seconds)) => Some(Duration::from_secs(seconds.get())),
             Some(Override::Clear) => None,
-            None => Some(default_timeout),
+            None => default_timeout,
         };
         let certificate = self
             .tls_ca_cert_path
@@ -70,6 +79,7 @@ impl HttpTransportConfig {
             .transpose()?;
         let mut fingerprint = std::collections::hash_map::DefaultHasher::new();
         timeout.hash(&mut fingerprint);
+        follow_redirects.hash(&mut fingerprint);
         self.extra_headers.hash(&mut fingerprint);
         certificate.hash(&mut fingerprint);
         let profile = format!("provider-http:{:016x}", fingerprint.finish());
@@ -78,7 +88,7 @@ impl HttpTransportConfig {
             &profile,
             |builder| {
                 let mut builder = builder
-                    .redirect(reqwest::redirect::Policy::none())
+                    .redirect(self.redirect_policy(follow_redirects))
                     .default_headers(self.headers()?);
                 if let Some(timeout) = timeout {
                     builder = builder.timeout(timeout);
@@ -93,6 +103,35 @@ impl HttpTransportConfig {
             },
         )
         .with_context(|| format!("building HTTP client for {service_key}"))
+    }
+
+    fn redirect_policy(&self, follow_redirects: bool) -> reqwest::redirect::Policy {
+        if !follow_redirects {
+            return reqwest::redirect::Policy::none();
+        }
+        let origin = reqwest::Url::parse(&self.base_url).ok().map(|url| {
+            (
+                url.scheme().to_owned(),
+                url.host_str().map(ToOwned::to_owned),
+                url.port_or_known_default(),
+            )
+        });
+        reqwest::redirect::Policy::custom(move |attempt| {
+            if attempt.previous().len() >= 10 {
+                return attempt.stop();
+            }
+            let destination = attempt.url();
+            let same_origin = origin.as_ref().is_some_and(|(scheme, host, port)| {
+                destination.scheme() == scheme
+                    && destination.host_str().map(str::to_owned) == *host
+                    && destination.port_or_known_default() == *port
+            });
+            if same_origin {
+                attempt.follow()
+            } else {
+                attempt.stop()
+            }
+        })
     }
 
     pub fn headers(&self) -> Result<HeaderMap> {
