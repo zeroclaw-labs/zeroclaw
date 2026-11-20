@@ -1563,7 +1563,7 @@ mod tests {
         assert_eq!(local.model, "laya");
         assert_eq!(
             local.selection.connection.uri(),
-            Some("http://127.0.0.1:8000")
+            Some("http://127.0.0.1:8000/v1")
         );
         assert_eq!(local.selection.connection.api_key(), Some("fixture-key"));
         assert_eq!(local.wire_api, crate::schema::DecisionWireApi::SystemOne);
