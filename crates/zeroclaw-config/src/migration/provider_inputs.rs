@@ -10,6 +10,23 @@ use serde_json::json;
 use std::collections::HashSet;
 use zeroclaw_api::capability::Capability;
 
+/// V4 decision clients always posted to `<base>/v1/systemone`. The V5
+/// transport appends the wire path to the connection URI, so preserve that
+/// version prefix while projecting the retired decision table.
+fn legacy_decision_base_url(base_url: &str) -> Result<String> {
+    let mut url = url::Url::parse(base_url).context("invalid legacy decision base URL")?;
+    let path = url.path().trim_end_matches('/');
+    if !path.ends_with("/v1") && path != "/v1" {
+        let versioned = if path.is_empty() {
+            "/v1".to_owned()
+        } else {
+            format!("{path}/v1")
+        };
+        url.set_path(&versioned);
+    }
+    Ok(url.to_string())
+}
+
 fn project_provider_tables(
     providers: &Providers,
 ) -> Result<ProviderRegistry, registry::RegistryError> {
@@ -326,6 +343,7 @@ fn providers_for_input(config: &Config) -> Result<crate::providers::Providers> {
         while providers.connections.contains_key(&provider) {
             provider = ProviderId::from(format!("legacy.{}", provider.as_str()));
         }
+        let uri = legacy_decision_base_url(&uri)?;
         let mut connection = json!({
             "kind": "system-one", "uri": uri,
             "api": {"decision": {"wire_api": "system_one"}},
@@ -1553,13 +1571,32 @@ mod tests {
         assert_eq!(hosted.model, "jev-latest");
         assert_eq!(
             hosted.selection.connection.uri(),
-            Some("https://api.typesafe.ai")
+            Some("https://api.typesafe.ai/v1")
         );
         assert!(registry.resolve_decision(&"invalid".into()).is_err());
         let serialized = serde_json::to_value(&config).unwrap();
         assert!(serialized.get("decision_models").is_none());
         let roundtrip: Config = serde_json::from_value(serialized.clone()).unwrap();
         assert_eq!(serde_json::to_value(roundtrip).unwrap(), serialized);
+    }
+
+    #[test]
+    fn decision_input_preserves_v1_for_prefixed_gateways() {
+        let config: Config = toml::from_str(
+            r#"
+            [decision_models.gateway]
+            provider = "custom"
+            base_url = "https://gateway.example/ai"
+            model = "decision-model"
+            "#,
+        )
+        .unwrap();
+        let registry = config.provider_registry().unwrap();
+        let resolved = registry.resolve_decision(&"gateway".into()).unwrap();
+        assert_eq!(
+            resolved.selection.connection.uri(),
+            Some("https://gateway.example/ai/v1")
+        );
     }
 
     #[test]
