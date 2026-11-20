@@ -3743,13 +3743,26 @@ fn split_powershell_pipeline_syntax(command: &str) -> Option<Vec<String>> {
                     segments.push(segment.to_string());
                     current.clear();
                 }
+                // PowerShell also ends a token at vertical tab, form feed, NEL,
+                // and every Unicode space, line, or paragraph separator, and it
+                // reads U+2018-U+201B as single quotes and U+201C-U+201E as
+                // double quotes. This grammar and the checks after it only know
+                // ASCII spaces, tabs, and quotes, so they would disagree with
+                // PowerShell about where a token starts. Fail closed.
+                ch if ch.is_whitespace() || ('\u{2018}'..='\u{201e}').contains(&ch) => {
+                    return None;
+                }
                 // `@` starts splatting, an array subexpression, a hashtable, or
                 // a here-string only where PowerShell starts a token: at the
-                // start of an argument, after a `-Name:` parameter, or after a
-                // `,` array separator. Inside a bare argument it is literal
-                // text (`user@example.com`); a following `(`, `{`, or quote is
-                // still rejected by its own arm or the mixed-token check.
-                '@' if token_has_bare && !token_body.ends_with([',', ':']) => {
+                // start of an argument, after a `-Name:` parameter, after a `,`
+                // array separator, or after a `$name.member` read. Inside a bare
+                // argument it is literal text (`user@example.com`); a following
+                // `(`, `{`, or quote is still rejected by its own arm or the
+                // mixed-token check.
+                '@' if token_has_bare
+                    && !token_body.ends_with([',', ':'])
+                    && !token_body.contains('$') =>
+                {
                     token_body.push(ch);
                     current.push(ch);
                 }
@@ -6908,6 +6921,15 @@ mod tests {
             "echo a@(Get-Item env:path)",
             "echo a@{a=1}",
             "echo a@\"x\"",
+            // PowerShell ends a token at these whitespace characters and at a
+            // typographic quote, and after a `$name.member` read, so the `@`
+            // that follows starts a splat.
+            "ls\u{a0}@HOME",
+            "ls\u{b}@HOME",
+            "ls\u{c}@HOME",
+            "ls\u{3000}@HOME",
+            "ls \u{2018}x\u{2019}@HOME",
+            "echo $a.b@HOME",
         ] {
             assert_eq!(
                 split_powershell_pipeline_syntax(command),
@@ -6951,6 +6973,24 @@ mod tests {
             p.validate_command_execution_for_shell(with_email, true, ShellDialect::PowerShell)
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn validate_blocks_powershell_splat_after_unicode_whitespace() {
+        // PowerShell splits `ls<U+00A0>@HOME` into `ls` and the splat `@HOME`.
+        // The default policy must refuse it rather than see one bare argument.
+        let p = default_policy();
+        for approved in [false, true] {
+            let denied = p.validate_command_execution_for_shell(
+                "ls\u{a0}@HOME",
+                approved,
+                ShellDialect::PowerShell,
+            );
+            assert!(
+                denied.is_err(),
+                "a splat after U+00A0 must be refused, approved={approved}, got {denied:?}"
+            );
+        }
     }
 
     #[test]
