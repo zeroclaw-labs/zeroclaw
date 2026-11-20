@@ -17,7 +17,7 @@ use zeroclaw_config::provider_registry::{Override, ProviderConnection};
 
 /// Native chat transport policy. The live proxy authority owns cached clients;
 /// this value only describes the builder settings used to select a pool.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct ChatHttpTimeouts {
     request: Option<Duration>,
     read: Option<Duration>,
