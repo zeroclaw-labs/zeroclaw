@@ -19,6 +19,15 @@ fn project_provider_tables(
     let legacy = serde_json::to_value(&providers.models).map_err(|error| {
         registry::RegistryError::new(["providers", "models"], error.to_string())
     })?;
+    // Reserve every explicit family/alias key before materializing nested
+    // `models.<name>` entries. TOML permits aliases containing dots, so a
+    // nested model such as `ollama.main.models.fast` must not claim the exact
+    // key `ollama.main.fast` when that key is also an explicit profile.
+    let explicit_profile_refs: HashSet<ModelRef> = providers
+        .models
+        .iter_entries()
+        .map(|(family, alias, _)| ModelRef::from(format!("{family}.{alias}")))
+        .collect();
     for (family, alias, profile) in providers.models.iter_entries() {
         let profile_ref = format!("{family}.{alias}");
         // Keep semantic validation in `ProviderRegistry::validate`. The
@@ -60,6 +69,9 @@ fn project_provider_tables(
         );
         for (reference, entry) in entries {
             let model_ref = ModelRef::from(reference.as_str());
+            if reference != profile_ref && explicit_profile_refs.contains(&model_ref) {
+                continue;
+            }
             if models.contains_key(&model_ref) {
                 continue;
             }
@@ -1968,5 +1980,33 @@ mod tests {
             "missing.model"
         );
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn explicit_dotted_profile_wins_over_nested_model_projection() {
+        let mut config: Config = toml::from_str(
+            r#"
+            schema_version = 3
+
+            [providers.models.ollama.main]
+            model = "nested-primary"
+            [providers.models.ollama.main.models.fast]
+            id = "nested-fast"
+
+            [providers.models.ollama."main.fast"]
+            model = "explicit-dotted"
+            "#,
+        )
+        .unwrap();
+
+        normalize(&mut config).unwrap();
+        let registry = config.provider_registry().unwrap();
+        assert_eq!(
+            registry
+                .models
+                .get(&ModelRef::from("ollama.main.fast"))
+                .and_then(ModelDefinition::upstream_model),
+            Some("explicit-dotted")
+        );
     }
 }

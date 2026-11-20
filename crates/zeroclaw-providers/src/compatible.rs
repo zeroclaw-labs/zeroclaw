@@ -10107,6 +10107,7 @@ mod tests {
                 .auth_style(AuthStyle::Bearer)
                 .credential(Some("fixture-key"))
                 .timeout_secs(1)
+                .stream_request_timeout(Some(zeroclaw_config::provider_registry::Override::Clear))
                 .read_timeout_secs(3);
             if entry == "events" {
                 builder = builder.extra_headers(std::collections::HashMap::from([(
