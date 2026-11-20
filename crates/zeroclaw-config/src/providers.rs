@@ -1053,7 +1053,10 @@ pub(crate) mod canonical_connection_secrets {
         Ok(())
     }
 
-    pub fn restore_secrets_from(providers: &mut Providers, current: &Providers) -> anyhow::Result<()> {
+    pub fn restore_secrets_from(
+        providers: &mut Providers,
+        current: &Providers,
+    ) -> anyhow::Result<()> {
         for (provider_id, connection) in &mut providers.connections {
             if let Some(current_connection) = current.connections.get(provider_id) {
                 connection.restore_secrets_from(current_connection)?;
