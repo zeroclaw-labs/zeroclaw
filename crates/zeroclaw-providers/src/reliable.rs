@@ -55,10 +55,6 @@ tokio::task_local! {
 }
 
 tokio::task_local! {
-    static PROVIDER_CONTEXT_TRUNCATED: RefCell<bool>;
-}
-
-tokio::task_local! {
     static RELIABLE_CALL_ACCOUNTING: Arc<ParkingMutex<ReliableCallAccounting>>;
 }
 
@@ -326,22 +322,6 @@ pub fn take_last_provider_fallback_attribution() -> Option<ProviderFallbackAttri
         .flatten()
 }
 
-/// Take whether Reliable shortened the provider-visible transcript while
-/// recovering the current request from a context-window error.
-///
-/// This is intentionally distinct from fallback attribution: retrying the
-/// same candidate must not render a fallback notice, but the caller must not
-/// cache that response under the untrimmed request transcript.
-pub fn take_last_provider_context_truncation() -> bool {
-    PROVIDER_CONTEXT_TRUNCATED
-        .try_with(|cell| std::mem::take(&mut *cell.borrow_mut()))
-        .unwrap_or(false)
-}
-
-fn record_provider_context_truncation() {
-    let _ = PROVIDER_CONTEXT_TRUNCATED.try_with(|cell| *cell.borrow_mut() = true);
-}
-
 /// Record the fallback that served the current successful provider request, or
 /// clear stale attribution when the primary served it.
 ///
@@ -368,12 +348,7 @@ pub(crate) fn commit_accepted_provider_route(route: Option<ProviderFallbackAttri
 /// `take_last_provider_fallback` (post-loop channel code) must execute
 /// within this scope for the data to be visible.
 pub async fn scope_provider_fallback<F: std::future::Future>(future: F) -> F::Output {
-    PROVIDER_FALLBACK
-        .scope(
-            RefCell::new(None),
-            PROVIDER_CONTEXT_TRUNCATED.scope(RefCell::new(false), future),
-        )
-        .await
+    PROVIDER_FALLBACK.scope(RefCell::new(None), future).await
 }
 
 /// Record a model_provider fallback event.
@@ -2457,21 +2432,6 @@ impl ReliableModelProvider {
 
 #[async_trait]
 impl ModelProvider for ReliableModelProvider {
-    fn has_stable_request_identity(&self, model: &str) -> bool {
-        if self.model_providers.len() != 1
-            || self
-                .model_fallbacks
-                .get(model)
-                .is_some_and(|fallbacks| !fallbacks.is_empty())
-        {
-            return false;
-        }
-
-        self.model_providers
-            .first()
-            .is_some_and(|entry| entry.provider().has_stable_request_identity(model))
-    }
-
     fn supports_exact_request_replay(&self, request: ChatRequest<'_>, model: &str) -> bool {
         if self.max_retries != 0
             || !self.api_keys.is_empty()
@@ -2980,7 +2940,6 @@ impl ModelProvider for ReliableModelProvider {
                                 );
                                 let dropped = truncate_for_context(&mut effective_messages);
                                 if dropped > 0 {
-                                    record_provider_context_truncation();
                                     context_truncated = true;
                                     ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": provider_name, "model": served_model, "dropped": dropped, "remaining": effective_messages.len()})), "Context window exceeded; truncated history and retrying");
                                     continue; // Retry with truncated messages (counts as an attempt)
@@ -3429,7 +3388,6 @@ impl ModelProvider for ReliableModelProvider {
                                 );
                                 let dropped = truncate_for_context(&mut effective_messages);
                                 if dropped > 0 {
-                                    record_provider_context_truncation();
                                     context_truncated = true;
                                     ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": provider_name, "model": served_model, "dropped": dropped, "remaining": effective_messages.len()})), "Context window exceeded; truncated history and retrying");
                                     continue; // Retry with truncated messages (counts as an attempt)
@@ -3806,7 +3764,6 @@ impl ModelProvider for ReliableModelProvider {
                                 );
                                 let dropped = truncate_for_context(&mut effective_messages);
                                 if dropped > 0 {
-                                    record_provider_context_truncation();
                                     context_truncated = true;
                                     ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": provider_name, "model": served_model, "dropped": dropped, "remaining": effective_messages.len()})), "Context window exceeded; truncated history and retrying");
                                     continue; // Retry with truncated messages (counts as an attempt)
@@ -4504,10 +4461,6 @@ mod tests {
 
     #[async_trait]
     impl ModelProvider for MockModelProvider {
-        fn has_stable_request_identity(&self, _model: &str) -> bool {
-            true
-        }
-
         async fn chat_with_system(
             &self,
             _system_prompt: Option<&str>,
@@ -5128,106 +5081,6 @@ mod tests {
         assert_eq!(result, "from fallback");
         assert_eq!(primary_calls.load(Ordering::SeqCst), 2);
         assert_eq!(fallback_calls.load(Ordering::SeqCst), 1);
-    }
-
-    #[test]
-    fn request_identity_is_unstable_when_provider_failover_is_possible() {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let model_provider = ReliableModelProvider::new(
-            "test",
-            vec![
-                (
-                    "primary".into(),
-                    Box::new(MockModelProvider {
-                        calls: calls.clone(),
-                        fail_until_attempt: 0,
-                        response: "primary",
-                        error: "unused",
-                    }),
-                ),
-                (
-                    "fallback".into(),
-                    Box::new(MockModelProvider {
-                        calls,
-                        fail_until_attempt: 0,
-                        response: "fallback",
-                        error: "unused",
-                    }),
-                ),
-            ],
-            0,
-            1,
-        );
-
-        assert!(!model_provider.has_stable_request_identity("model"));
-    }
-
-    #[test]
-    fn request_identity_is_unstable_when_model_fallback_is_configured() {
-        let model_provider = ReliableModelProvider::new(
-            "test",
-            vec![(
-                "primary".into(),
-                Box::new(MockModelProvider {
-                    calls: Arc::new(AtomicUsize::new(0)),
-                    fail_until_attempt: 0,
-                    response: "primary",
-                    error: "unused",
-                }),
-            )],
-            0,
-            1,
-        )
-        .with_model_fallbacks(HashMap::from([(
-            "model".to_string(),
-            vec!["fallback-model".to_string()],
-        )]));
-
-        assert!(!model_provider.has_stable_request_identity("model"));
-    }
-
-    #[test]
-    fn single_provider_request_identity_remains_stable() {
-        let model_provider = ReliableModelProvider::new(
-            "test",
-            vec![(
-                "primary".into(),
-                Box::new(MockModelProvider {
-                    calls: Arc::new(AtomicUsize::new(0)),
-                    fail_until_attempt: 0,
-                    response: "primary",
-                    error: "unused",
-                }),
-            )],
-            0,
-            1,
-        );
-
-        assert!(model_provider.has_stable_request_identity("model"));
-    }
-
-    #[test]
-    fn pinned_request_identity_is_stable_only_without_a_model_remap() {
-        let model_provider = ReliableModelProvider::new_with_entries(
-            "test",
-            vec![ReliableModelProviderEntry::new_pinned(
-                "primary",
-                "primary.default",
-                "primary.default",
-                "pinned-model",
-                Box::new(MockModelProvider {
-                    calls: Arc::new(AtomicUsize::new(0)),
-                    fail_until_attempt: 0,
-                    response: "primary",
-                    error: "unused",
-                }),
-            )],
-            0,
-            1,
-        );
-
-        assert!(model_provider.has_stable_request_identity("pinned-model"));
-        assert!(!model_provider.has_stable_request_identity("requested-model"));
     }
 
     /// A `fallback_models` downgrade uses model-PINNED entries on one
@@ -10550,16 +10403,12 @@ mod tests {
             ChatMessage::user("current question"),
         ];
 
-        let (result, fallback, context_truncated) = scope_provider_fallback(async {
+        let (result, fallback) = scope_provider_fallback(async {
             let result = model_provider
                 .chat_with_history(&messages, "local-model", Some(0.0))
                 .await
                 .unwrap();
-            (
-                result,
-                take_last_provider_fallback(),
-                take_last_provider_context_truncation(),
-            )
+            (result, take_last_provider_fallback())
         })
         .await;
         assert_eq!(result, "recovered after truncation");
@@ -10568,10 +10417,6 @@ mod tests {
         assert!(
             fallback.is_none(),
             "same-candidate context recovery is not user-visible fallback attribution"
-        );
-        assert!(
-            context_truncated,
-            "the internal provenance signal must remain available for cache safety"
         );
     }
 

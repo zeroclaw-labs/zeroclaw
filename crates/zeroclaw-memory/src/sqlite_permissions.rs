@@ -225,17 +225,10 @@ mod portable_tests {
     use super::*;
     use tempfile::TempDir;
 
-    fn open_store(root: &Path, database: &str) -> anyhow::Result<()> {
-        match database {
-            "audit.db" => {
-                crate::audit::AuditedMemory::new(crate::none::NoneMemory::new("none"), root)
-                    .map(|_| ())
-            }
-            "response_cache.db" => {
-                crate::response_cache::ResponseCache::new(root, 60, 1000).map(|_| ())
-            }
-            _ => unreachable!(),
-        }
+    const DATABASE: &str = "audit.db";
+
+    fn open_store(root: &Path) -> anyhow::Result<()> {
+        crate::audit::AuditedMemory::new(crate::none::NoneMemory::new("none"), root).map(|_| ())
     }
 
     fn create_regular_file(path: &Path) {
@@ -251,138 +244,122 @@ mod portable_tests {
 
     #[test]
     fn sqlite_storage_accepts_regular_files_and_optional_sidecars() {
-        for database in ["audit.db", "response_cache.db"] {
-            for sidecars in [&[][..], &["-wal"][..], &["-shm"][..], &["-wal", "-shm"][..]] {
-                let root = TempDir::new().unwrap();
-                let db = prepare_sqlite_storage(root.path(), database).unwrap();
-                assert!(!sqlite_sidecar_path(&db, "-wal").exists());
-                assert!(!sqlite_sidecar_path(&db, "-shm").exists());
-                for suffix in sidecars {
-                    create_regular_file(&sqlite_sidecar_path(&db, suffix));
-                }
+        for sidecars in [&[][..], &["-wal"][..], &["-shm"][..], &["-wal", "-shm"][..]] {
+            let root = TempDir::new().unwrap();
+            let db = prepare_sqlite_storage(root.path(), DATABASE).unwrap();
+            assert!(!sqlite_sidecar_path(&db, "-wal").exists());
+            assert!(!sqlite_sidecar_path(&db, "-shm").exists());
+            for suffix in sidecars {
+                create_regular_file(&sqlite_sidecar_path(&db, suffix));
+            }
 
-                check_sqlite_storage(&db).unwrap();
+            check_sqlite_storage(&db).unwrap();
+            assert_eq!(
+                prepare_existing_sqlite_storage(root.path(), DATABASE).unwrap(),
+                Some(db.clone())
+            );
+            for suffix in ["-wal", "-shm"] {
                 assert_eq!(
-                    prepare_existing_sqlite_storage(root.path(), database).unwrap(),
-                    Some(db.clone())
+                    sqlite_sidecar_path(&db, suffix).exists(),
+                    sidecars.contains(&suffix),
+                    "{DATABASE} {suffix}"
                 );
-                for suffix in ["-wal", "-shm"] {
-                    assert_eq!(
-                        sqlite_sidecar_path(&db, suffix).exists(),
-                        sidecars.contains(&suffix),
-                        "{database} {suffix}"
-                    );
-                }
             }
         }
     }
 
     #[test]
     fn sqlite_storage_rejects_directories_at_each_leaf() {
-        for database in ["audit.db", "response_cache.db"] {
-            for suffix in ["", "-wal", "-shm"] {
-                let root = TempDir::new().unwrap();
-                let db = prepare_sqlite_storage(root.path(), database).unwrap();
-                let entry = sqlite_sidecar_path(&db, suffix);
-                if suffix.is_empty() {
-                    std::fs::remove_file(&entry).unwrap();
-                }
-                std::fs::create_dir(&entry).unwrap();
-                let sentinel = entry.join("sentinel");
-                std::fs::write(&sentinel, b"unchanged").unwrap();
-
-                let error = check_sqlite_storage(&db).unwrap_err();
-                assert!(
-                    error.to_string().contains("not a regular file"),
-                    "{error:#}"
-                );
-                assert!(prepare_existing_sqlite_storage(root.path(), database).is_err());
-                assert!(
-                    open_store(root.path(), database).is_err(),
-                    "{database} {suffix}"
-                );
-                assert_eq!(std::fs::read(&sentinel).unwrap(), b"unchanged");
+        for suffix in ["", "-wal", "-shm"] {
+            let root = TempDir::new().unwrap();
+            let db = prepare_sqlite_storage(root.path(), DATABASE).unwrap();
+            let entry = sqlite_sidecar_path(&db, suffix);
+            if suffix.is_empty() {
+                std::fs::remove_file(&entry).unwrap();
             }
+            std::fs::create_dir(&entry).unwrap();
+            let sentinel = entry.join("sentinel");
+            std::fs::write(&sentinel, b"unchanged").unwrap();
+
+            let error = check_sqlite_storage(&db).unwrap_err();
+            assert!(
+                error.to_string().contains("not a regular file"),
+                "{error:#}"
+            );
+            assert!(prepare_existing_sqlite_storage(root.path(), DATABASE).is_err());
+            assert!(open_store(root.path()).is_err(), "{DATABASE} {suffix}");
+            assert_eq!(std::fs::read(&sentinel).unwrap(), b"unchanged");
         }
     }
 
     #[test]
     fn sqlite_storage_constructors_reopen_existing_databases() {
-        for database in ["audit.db", "response_cache.db"] {
-            let root = TempDir::new().unwrap();
-            open_store(root.path(), database).unwrap();
-            let db = root.path().join("memory").join(database);
-            {
-                let conn = rusqlite::Connection::open(&db).unwrap();
-                conn.execute_batch(
-                    "CREATE TABLE admission_probe (value TEXT NOT NULL);
-                     INSERT INTO admission_probe VALUES ('retained');",
-                )
-                .unwrap();
-            }
-
-            open_store(root.path(), database).unwrap();
+        let root = TempDir::new().unwrap();
+        open_store(root.path()).unwrap();
+        let db = root.path().join("memory").join(DATABASE);
+        {
             let conn = rusqlite::Connection::open(&db).unwrap();
-            let value: String = conn
-                .query_row("SELECT value FROM admission_probe", [], |row| row.get(0))
-                .unwrap();
-            assert_eq!(value, "retained", "{database}");
+            conn.execute_batch(
+                "CREATE TABLE admission_probe (value TEXT NOT NULL);
+                 INSERT INTO admission_probe VALUES ('retained');",
+            )
+            .unwrap();
         }
+
+        open_store(root.path()).unwrap();
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        let value: String = conn
+            .query_row("SELECT value FROM admission_probe", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(value, "retained", "{DATABASE}");
     }
 
     #[test]
     fn existing_sqlite_storage_does_not_create_missing_storage() {
-        for database in ["audit.db", "response_cache.db"] {
-            let root = TempDir::new().unwrap();
-            let absent_root = root.path().join("absent");
-            assert_eq!(
-                prepare_existing_sqlite_storage(&absent_root, database).unwrap(),
-                None
-            );
-            assert!(!absent_root.exists());
+        let root = TempDir::new().unwrap();
+        let absent_root = root.path().join("absent");
+        assert_eq!(
+            prepare_existing_sqlite_storage(&absent_root, DATABASE).unwrap(),
+            None
+        );
+        assert!(!absent_root.exists());
 
-            let memory_dir = root.path().join("memory");
-            assert_eq!(
-                prepare_existing_sqlite_storage(root.path(), database).unwrap(),
-                None
-            );
-            assert!(!memory_dir.exists());
-            std::fs::create_dir(&memory_dir).unwrap();
-            assert_eq!(
-                prepare_existing_sqlite_storage(root.path(), database).unwrap(),
-                None
-            );
-            assert_eq!(std::fs::read_dir(&memory_dir).unwrap().count(), 0);
-        }
+        let memory_dir = root.path().join("memory");
+        assert_eq!(
+            prepare_existing_sqlite_storage(root.path(), DATABASE).unwrap(),
+            None
+        );
+        assert!(!memory_dir.exists());
+        std::fs::create_dir(&memory_dir).unwrap();
+        assert_eq!(
+            prepare_existing_sqlite_storage(root.path(), DATABASE).unwrap(),
+            None
+        );
+        assert_eq!(std::fs::read_dir(&memory_dir).unwrap().count(), 0);
     }
 
     #[cfg(windows)]
     #[test]
     fn sqlite_storage_rejects_windows_symlink_leaves() {
-        for database in ["audit.db", "response_cache.db"] {
-            for suffix in ["", "-wal", "-shm"] {
-                let root = TempDir::new().unwrap();
-                let outside = TempDir::new().unwrap();
-                let sentinel = outside.path().join("sentinel");
-                std::fs::write(&sentinel, b"unchanged").unwrap();
-                let db = prepare_sqlite_storage(root.path(), database).unwrap();
-                let entry = sqlite_sidecar_path(&db, suffix);
-                if suffix.is_empty() {
-                    std::fs::remove_file(&entry).unwrap();
-                }
-                // A runner without symlink privileges must report missing
-                // evidence rather than pass without exercising admission.
-                std::os::windows::fs::symlink_file(&sentinel, &entry)
-                    .expect("Windows symlink admission test requires symlink privileges");
-
-                assert!(check_sqlite_storage(&db).is_err());
-                assert!(prepare_existing_sqlite_storage(root.path(), database).is_err());
-                assert!(
-                    open_store(root.path(), database).is_err(),
-                    "{database} {suffix}"
-                );
-                assert_eq!(std::fs::read(&sentinel).unwrap(), b"unchanged");
+        for suffix in ["", "-wal", "-shm"] {
+            let root = TempDir::new().unwrap();
+            let outside = TempDir::new().unwrap();
+            let sentinel = outside.path().join("sentinel");
+            std::fs::write(&sentinel, b"unchanged").unwrap();
+            let db = prepare_sqlite_storage(root.path(), DATABASE).unwrap();
+            let entry = sqlite_sidecar_path(&db, suffix);
+            if suffix.is_empty() {
+                std::fs::remove_file(&entry).unwrap();
             }
+            // A runner without symlink privileges must report missing
+            // evidence rather than pass without exercising admission.
+            std::os::windows::fs::symlink_file(&sentinel, &entry)
+                .expect("Windows symlink admission test requires symlink privileges");
+
+            assert!(check_sqlite_storage(&db).is_err());
+            assert!(prepare_existing_sqlite_storage(root.path(), DATABASE).is_err());
+            assert!(open_store(root.path()).is_err(), "{DATABASE} {suffix}");
+            assert_eq!(std::fs::read(&sentinel).unwrap(), b"unchanged");
         }
     }
 }
@@ -397,43 +374,35 @@ mod tests {
         std::fs::metadata(path).unwrap().permissions().mode() & 0o777
     }
 
-    fn open_store(root: &Path, database: &str) -> anyhow::Result<()> {
-        if database == "audit.db" {
-            crate::audit::AuditedMemory::new(crate::none::NoneMemory::new("none"), root).map(|_| ())
-        } else {
-            crate::response_cache::ResponseCache::new(root, 60, 1000).map(|_| ())
-        }
+    const DATABASE: &str = "audit.db";
+
+    fn open_store(root: &Path) -> anyhow::Result<()> {
+        crate::audit::AuditedMemory::new(crate::none::NoneMemory::new("none"), root).map(|_| ())
     }
 
     #[test]
     fn sqlite_storage_constructors_reject_symlink_leaves() {
-        for database in ["response_cache.db", "audit.db"] {
-            for suffix in ["memory", "", "-wal", "-shm"] {
-                let root = TempDir::new().unwrap();
-                let outside = TempDir::new().unwrap();
-                let sentinel = outside.path().join("sentinel");
-                std::fs::write(&sentinel, b"unchanged").unwrap();
-                std::fs::set_permissions(&sentinel, std::fs::Permissions::from_mode(0o666))
-                    .unwrap();
-                std::fs::set_permissions(outside.path(), std::fs::Permissions::from_mode(0o755))
-                    .unwrap();
-                if suffix == "memory" {
-                    symlink(outside.path(), root.path().join("memory")).unwrap();
-                } else {
-                    let db = prepare_sqlite_storage(root.path(), database).unwrap();
-                    if suffix.is_empty() {
-                        std::fs::remove_file(&db).unwrap();
-                    }
-                    symlink(&sentinel, sqlite_sidecar_path(&db, suffix)).unwrap();
+        for suffix in ["memory", "", "-wal", "-shm"] {
+            let root = TempDir::new().unwrap();
+            let outside = TempDir::new().unwrap();
+            let sentinel = outside.path().join("sentinel");
+            std::fs::write(&sentinel, b"unchanged").unwrap();
+            std::fs::set_permissions(&sentinel, std::fs::Permissions::from_mode(0o666)).unwrap();
+            std::fs::set_permissions(outside.path(), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+            if suffix == "memory" {
+                symlink(outside.path(), root.path().join("memory")).unwrap();
+            } else {
+                let db = prepare_sqlite_storage(root.path(), DATABASE).unwrap();
+                if suffix.is_empty() {
+                    std::fs::remove_file(&db).unwrap();
                 }
-                assert!(
-                    open_store(root.path(), database).is_err(),
-                    "{database} {suffix}"
-                );
-                assert_eq!(std::fs::read(&sentinel).unwrap(), b"unchanged");
-                assert_eq!(mode(&sentinel), 0o666);
-                assert_eq!(mode(outside.path()), 0o755);
+                symlink(&sentinel, sqlite_sidecar_path(&db, suffix)).unwrap();
             }
+            assert!(open_store(root.path()).is_err(), "{DATABASE} {suffix}");
+            assert_eq!(std::fs::read(&sentinel).unwrap(), b"unchanged");
+            assert_eq!(mode(&sentinel), 0o666);
+            assert_eq!(mode(outside.path()), 0o755);
         }
     }
 
@@ -441,11 +410,11 @@ mod tests {
     fn sqlite_storage_rejects_permissive_existing_files_without_chmod() {
         for suffix in ["", "-wal", "-shm"] {
             let root = TempDir::new().unwrap();
-            let db = prepare_sqlite_storage(root.path(), "response_cache.db").unwrap();
+            let db = prepare_sqlite_storage(root.path(), DATABASE).unwrap();
             let entry = sqlite_sidecar_path(&db, suffix);
             std::fs::write(&entry, b"unchanged").unwrap();
             std::fs::set_permissions(&entry, std::fs::Permissions::from_mode(0o666)).unwrap();
-            assert!(prepare_sqlite_storage(root.path(), "response_cache.db").is_err());
+            assert!(prepare_sqlite_storage(root.path(), DATABASE).is_err());
             assert_eq!(mode(&entry), 0o666);
             assert_eq!(std::fs::read(entry).unwrap(), b"unchanged");
         }
@@ -453,26 +422,23 @@ mod tests {
 
     #[test]
     fn sqlite_storage_constructors_reject_nonwritable_existing_files_without_chmod() {
-        for database in ["response_cache.db", "audit.db"] {
-            for rejected_mode in [0o400, 0o000] {
-                let root = TempDir::new().unwrap();
-                open_store(root.path(), database).unwrap();
-                let db = root.path().join("memory").join(database);
-                let original_bytes = std::fs::read(&db).unwrap();
-                std::fs::set_permissions(&db, std::fs::Permissions::from_mode(rejected_mode))
-                    .unwrap();
+        for rejected_mode in [0o400, 0o000] {
+            let root = TempDir::new().unwrap();
+            open_store(root.path()).unwrap();
+            let db = root.path().join("memory").join(DATABASE);
+            let original_bytes = std::fs::read(&db).unwrap();
+            std::fs::set_permissions(&db, std::fs::Permissions::from_mode(rejected_mode)).unwrap();
 
-                let error = open_store(root.path(), database).unwrap_err();
-                assert!(
-                    error
-                        .to_string()
-                        .contains("lacks owner read/write permissions"),
-                    "{database} {rejected_mode:o}: {error:#}"
-                );
-                assert_eq!(mode(&db), rejected_mode, "{database}");
-                std::fs::set_permissions(&db, std::fs::Permissions::from_mode(0o600)).unwrap();
-                assert_eq!(std::fs::read(&db).unwrap(), original_bytes, "{database}");
-            }
+            let error = open_store(root.path()).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("lacks owner read/write permissions"),
+                "{DATABASE} {rejected_mode:o}: {error:#}"
+            );
+            assert_eq!(mode(&db), rejected_mode, "{DATABASE}");
+            std::fs::set_permissions(&db, std::fs::Permissions::from_mode(0o600)).unwrap();
+            assert_eq!(std::fs::read(&db).unwrap(), original_bytes, "{DATABASE}");
         }
     }
 
@@ -481,7 +447,7 @@ mod tests {
         for suffix in ["", "-wal", "-shm"] {
             for kind in ["hardlink", "directory", "fifo", "socket"] {
                 let root = TempDir::new().unwrap();
-                let db = prepare_sqlite_storage(root.path(), "response_cache.db").unwrap();
+                let db = prepare_sqlite_storage(root.path(), DATABASE).unwrap();
                 let entry = sqlite_sidecar_path(&db, suffix);
                 if suffix.is_empty() {
                     std::fs::remove_file(&entry).unwrap();
@@ -510,7 +476,7 @@ mod tests {
                     _ => unreachable!(),
                 };
                 assert!(
-                    prepare_sqlite_storage(root.path(), "response_cache.db").is_err(),
+                    prepare_sqlite_storage(root.path(), DATABASE).is_err(),
                     "{suffix} {kind}"
                 );
                 assert_eq!(mode(&sentinel), 0o600);
@@ -546,26 +512,22 @@ mod tests {
         let alias_parent = TempDir::new().unwrap();
         let alias = alias_parent.path().join("alias");
         symlink(root.path(), &alias).unwrap();
-        let db = prepare_sqlite_storage(&alias, "response_cache.db").unwrap();
+        let db = prepare_sqlite_storage(&alias, DATABASE).unwrap();
         assert_eq!(
             db,
-            root.path()
-                .canonicalize()
-                .unwrap()
-                .join("memory/response_cache.db")
+            root.path().canonicalize().unwrap().join("memory/audit.db")
         );
         assert_eq!(mode(db.parent().unwrap()), 0o700);
         assert_eq!(mode(&db), 0o600);
         assert!(!sqlite_sidecar_path(&db, "-wal").exists());
         assert!(!sqlite_sidecar_path(&db, "-shm").exists());
-        open_store(&alias, "response_cache.db").unwrap();
-        open_store(&alias, "audit.db").unwrap();
+        open_store(&alias).unwrap();
     }
 
     #[test]
     fn sqlite_storage_nofollow_rejects_database_symlink_after_preparation() {
         let root = TempDir::new().unwrap();
-        let db = prepare_sqlite_storage(root.path(), "response_cache.db").unwrap();
+        let db = prepare_sqlite_storage(root.path(), DATABASE).unwrap();
         let original = root.path().join("original.db");
         std::fs::rename(&db, &original).unwrap();
         symlink(&original, &db).unwrap();
@@ -579,11 +541,11 @@ mod tests {
     fn sqlite_storage_inspection_preserves_live_database_locks() {
         for journal in ["DELETE", "WAL"] {
             let root = TempDir::new().unwrap();
-            let db = prepare_sqlite_storage(root.path(), "response_cache.db").unwrap();
+            let db = prepare_sqlite_storage(root.path(), DATABASE).unwrap();
             let conn = rusqlite::Connection::open(&db).unwrap();
             conn.execute_batch(&format!("PRAGMA journal_mode = {journal}; CREATE TABLE lock_probe (value INTEGER); BEGIN IMMEDIATE;")).unwrap();
             assert_eq!(
-                prepare_existing_sqlite_storage(root.path(), "response_cache.db").unwrap(),
+                prepare_existing_sqlite_storage(root.path(), DATABASE).unwrap(),
                 Some(db.clone())
             );
             let result = std::process::Command::new(std::env::current_exe().unwrap())

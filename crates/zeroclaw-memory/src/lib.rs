@@ -36,7 +36,6 @@ pub mod principal_plane;
 pub mod qdrant;
 pub mod redact;
 pub mod rerank;
-pub mod response_cache;
 pub mod retrieval;
 pub mod scanned;
 pub mod snapshot;
@@ -67,7 +66,6 @@ pub use postgres::PostgresMemory;
 pub use principal_plane::PrincipalPlaneMemory;
 pub use qdrant::QdrantMemory;
 pub use rerank::{RerankConfig, RerankStrategy};
-pub use response_cache::ResponseCache;
 #[allow(unused_imports)]
 pub use retrieval::{RetrievalConfig, RetrievalPipeline};
 pub use scanned::ScannedMemory;
@@ -1151,41 +1149,6 @@ pub async fn create_memory_for_agent(
 
     let scoped = AgentScopedMemory::new_with_grants(inner_arc, bound_id, grants);
     Ok(wrap_in_retrieval_pipeline(Arc::new(scoped), &config.memory))
-}
-
-/// Factory: create an optional response cache from config.
-pub fn create_response_cache(config: &MemoryConfig, workspace_dir: &Path) -> Option<ResponseCache> {
-    if !config.response_cache_enabled {
-        return None;
-    }
-
-    match ResponseCache::new(
-        workspace_dir,
-        config.response_cache_ttl_minutes,
-        config.response_cache_max_entries,
-    ) {
-        Ok(cache) => {
-            ::zeroclaw_log::record!(
-                INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-                &format!(
-                    "💾 Response cache enabled (TTL: {}min, max: {} entries)",
-                    config.response_cache_ttl_minutes, config.response_cache_max_entries
-                )
-            );
-            Some(cache)
-        }
-        Err(e) => {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                "Response cache disabled due to error"
-            );
-            None
-        }
-    }
 }
 
 #[cfg(test)]

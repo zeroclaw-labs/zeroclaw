@@ -18,9 +18,6 @@ pub struct PrometheusObserver {
     memory_audits: IntCounterVec,
     heartbeat_ticks: prometheus::IntCounter,
     errors: IntCounterVec,
-    cache_hits: IntCounterVec,
-    cache_misses: IntCounterVec,
-    cache_tokens_saved: IntCounterVec,
 
     // Histograms
     agent_duration: HistogramVec,
@@ -105,27 +102,6 @@ impl PrometheusObserver {
         )
         .expect("valid metric");
 
-        let cache_hits = IntCounterVec::new(
-            prometheus::Opts::new("zeroclaw_cache_hits_total", "Total response cache hits"),
-            &["cache_type"],
-        )
-        .expect("valid metric");
-
-        let cache_misses = IntCounterVec::new(
-            prometheus::Opts::new("zeroclaw_cache_misses_total", "Total response cache misses"),
-            &["cache_type"],
-        )
-        .expect("valid metric");
-
-        let cache_tokens_saved = IntCounterVec::new(
-            prometheus::Opts::new(
-                "zeroclaw_cache_tokens_saved_total",
-                "Total tokens saved by response cache",
-            ),
-            &["cache_type"],
-        )
-        .expect("valid metric");
-
         let agent_duration = HistogramVec::new(
             HistogramOpts::new(
                 "zeroclaw_agent_duration_seconds",
@@ -195,9 +171,6 @@ impl PrometheusObserver {
         registry.register(Box::new(memory_audits.clone())).ok();
         registry.register(Box::new(heartbeat_ticks.clone())).ok();
         registry.register(Box::new(errors.clone())).ok();
-        registry.register(Box::new(cache_hits.clone())).ok();
-        registry.register(Box::new(cache_misses.clone())).ok();
-        registry.register(Box::new(cache_tokens_saved.clone())).ok();
         registry.register(Box::new(agent_duration.clone())).ok();
         registry.register(Box::new(tool_duration.clone())).ok();
         registry
@@ -219,9 +192,6 @@ impl PrometheusObserver {
             memory_audits,
             heartbeat_ticks,
             errors,
-            cache_hits,
-            cache_misses,
-            cache_tokens_saved,
             agent_duration,
             tool_duration,
             memory_audit_duration,
@@ -346,18 +316,6 @@ impl Observer for PrometheusObserver {
             }
             ObserverEvent::HeartbeatTick => {
                 self.heartbeat_ticks.inc();
-            }
-            ObserverEvent::CacheHit {
-                cache_type,
-                tokens_saved,
-            } => {
-                self.cache_hits.with_label_values(&[cache_type]).inc();
-                self.cache_tokens_saved
-                    .with_label_values(&[cache_type])
-                    .inc_by(*tokens_saved);
-            }
-            ObserverEvent::CacheMiss { cache_type } => {
-                self.cache_misses.with_label_values(&[cache_type]).inc();
             }
             ObserverEvent::Error {
                 component,

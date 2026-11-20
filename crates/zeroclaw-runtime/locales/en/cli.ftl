@@ -1131,6 +1131,7 @@ cli-config-retired-reason-tts-default = there is no global default TTS provider;
 cli-config-retired-reason-global-transcription = there is no global default transcription provider; set `transcription_provider` on each `[agents.<alias>]` instead
 cli-config-retired-reason-identity = identity is set per agent; move it to `[agents.<alias>.identity]`
 cli-config-retired-reason-pairing-max-pending = the gateway keeps one pending pairing code at a time, and issuing a new code cancels the previous one
+cli-config-retired-reason-response-cache = the local LLM response cache was removed; provider prompt caching still applies
 cli-config-migration-inferred-v3 = warning: {$path} has no `schema_version`, but its sections are in the V3 format, so it was read as schema V3 and migrated from there. Run `zeroclaw config migrate` to write the current `schema_version` into the file.
 cli-config-env-override-retired = warning: ignored `{$variable}`, which sets a retired config key: {$reason}
 cli-config-migration-pending = warning: these changes apply to this run only. Run `zeroclaw config migrate` to write them to {$path}.

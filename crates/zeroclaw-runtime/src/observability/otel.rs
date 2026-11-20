@@ -392,9 +392,7 @@ impl Observer for OtelObserver {
                 );
                 span.end();
             }
-            ObserverEvent::TurnComplete
-            | ObserverEvent::CacheHit { .. }
-            | ObserverEvent::CacheMiss { .. } => {}
+            ObserverEvent::TurnComplete => {}
             ObserverEvent::MemoryRecall {
                 query_summary,
                 duration,

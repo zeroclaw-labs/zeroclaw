@@ -14,8 +14,7 @@ each get their own top-level directory.
 │   │   └── costs.jsonl, runtime-trace.jsonl
 │   ├── devices.db                — paired-device metadata
 │   └── memory/                   — shared instance memory
-│       └── brain.db, audit.db, response_cache.db,
-│           MEMORY_SNAPSHOT.md, archive/
+│       └── brain.db, audit.db, MEMORY_SNAPSHOT.md, archive/
 ├── shared/                       — resources agents draw on in common
 │   └── skills/<bundle>/          — skill bundles
 │       └── SKILL.md, scripts/, references/, assets/
