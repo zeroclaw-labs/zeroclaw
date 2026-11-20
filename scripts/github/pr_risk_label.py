@@ -444,12 +444,7 @@ def file_bound_to_head(item: dict[str, Any], head_sha: str) -> bool:
     return False
 
 
-def validate_files(
-    files: Any,
-    expected_count: int,
-    head_sha: str | None = None,
-    base_sha: str | None = None,
-) -> list[dict[str, Any]]:
+def validate_files(files: Any, expected_count: int, head_sha: str | None = None) -> list[dict[str, Any]]:
     require(
         0 < expected_count <= MAX_PR_FILES,
         "PR file count is incomplete or exceeds the safe API boundary",
@@ -474,14 +469,7 @@ def validate_files(
         if "patch" in item:
             require(item["patch"] is None or isinstance(item["patch"], str), "PR patch is malformed")
         if head_sha is not None:
-            # GitHub's pull-file API points a removed file at the base
-            # revision because that path no longer exists at the head. Keep
-            # the evidence binding strict while accepting that captured base
-            # revision for intentional deletions.
-            bound = file_bound_to_head(item, head_sha)
-            if not bound and status == "removed" and base_sha is not None:
-                bound = file_bound_to_head(item, base_sha)
-            require(bound, "PR file evidence is not bound to the captured head SHA")
+            require(file_bound_to_head(item, head_sha), "PR file evidence is not bound to the captured head SHA")
         result.append(item)
     return result
 
@@ -1027,7 +1015,6 @@ def evaluate(api: Any, pr_number: int, policy_path: Path) -> dict[str, Any]:
         api.paginate(repository_path(api.repository, f"pulls/{pr_number}/files"), changed_file_count),
         changed_file_count,
         head_sha,
-        base_sha,
     )
     classification = classify(files, policy, api, base_sha, head_sha)
 
