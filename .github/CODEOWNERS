@@ -52,25 +52,21 @@
 /src/main.rs              @tidux @Audacity88
 /src/lib.rs               @tidux @Audacity88
 /src/bin/**               @tidux @Audacity88
-/src/approval/**          @tidux @Audacity88
 /src/auth/**              @tidux @Audacity88
 /src/commands/**          @tidux @Audacity88
 /src/cron/**              @tidux @Audacity88
 /src/daemon/**            @tidux @Audacity88
 /src/doctor/**            @tidux @Audacity88
-/src/health/**            @tidux @Audacity88
 /src/hooks/**             @tidux @Audacity88
 /src/nodes/**             @tidux @Audacity88
 /src/observability/**     @tidux @Audacity88
 /src/peripherals/**       @tidux @Audacity88
-/src/platform/**          @tidux @Audacity88
 /src/rag/**               @tidux @Audacity88
 /src/routines/**          @tidux @Audacity88
 /src/service/**           @tidux @Audacity88
 /src/sop/**               @tidux @Audacity88
 /src/trust/**             @tidux @Audacity88
 /src/tunnel/**            @tidux @Audacity88
-/src/verifiable_intent/** @tidux @Audacity88
 /src/config/**            @Audacity88 @tidux
 /src/cost/**              @Audacity88
 /src/cli_input.rs         @Audacity88

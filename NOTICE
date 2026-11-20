@@ -45,8 +45,9 @@ See Cargo.lock for a complete dependency list.
 Verifiable Intent Specification
 ================================
 
-The src/verifiable_intent/ module is a Rust-native reimplementation based on
-the Verifiable Intent open specification and reference implementation:
+The crates/zeroclaw-runtime/src/verifiable_intent/ module is a Rust-native
+reimplementation based on the Verifiable Intent open specification and
+reference implementation:
 
   Project:  Verifiable Intent (VI)
   Author:   agent-intent
