@@ -756,6 +756,17 @@ class RiskClassifierTest(unittest.TestCase):
         self.assertEqual(report["proposed_risk"], "risk:medium")
         self.assertTrue(report["exception_9530"]["applied"])
 
+    def test_9530_proof_reads_base_side_source_at_the_merge_base(self) -> None:
+        path = "crates/zeroclaw-runtime/src/security/policy.rs"
+        api = FakeAPI(pull(), [changed_file(path, 1, 1, TEST_PATCH)])
+        api.merge_base = MERGE_BASE
+        api.add_source(path, MERGE_BASE, TEST_SOURCE)
+        api.add_source(path, BASE, "// unrelated doc line\n" + TEST_SOURCE)
+        api.add_source(path, HEAD, TEST_SOURCE.replace("assert_eq!(1, 1)", "assert_eq!(1, 2)"))
+        report = evaluate(api)
+        self.assertEqual(report["proposed_risk"], "risk:medium")
+        self.assertTrue(report["exception_9530"]["applied"])
+
     def test_9530_negative_cases_propose_high(self) -> None:
         path = "crates/zeroclaw-runtime/src/security/policy.rs"
         cases = [

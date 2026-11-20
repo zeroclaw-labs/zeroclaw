@@ -706,7 +706,7 @@ def strict_test_only_proof(
     files: list[dict[str, Any]],
     high_globs: tuple[str, ...],
     api: Any,
-    base_sha: str,
+    merge_base_sha: str,
     head_sha: str,
 ) -> tuple[bool, str]:
     high_rust_files = [
@@ -754,7 +754,7 @@ def strict_test_only_proof(
 
         path = normalize_path(item.get("filename"))
         try:
-            base_source = source_text(api.get_source(path, base_sha))
+            base_source = source_text(api.get_source(path, merge_base_sha))
             head_source = source_text(api.get_source(path, head_sha))
             base_lines = base_source.splitlines()
             head_lines = head_source.splitlines()
@@ -868,7 +868,8 @@ def classify(
     exception = False
     detail = "not applicable"
     if high_match:
-        exception, detail = strict_test_only_proof(files, policy.high_globs, api, base_sha, head_sha)
+        merge_base_sha = api.get_merge_base(base_sha, head_sha)
+        exception, detail = strict_test_only_proof(files, policy.high_globs, api, merge_base_sha, head_sha)
         proposed = "risk:medium" if exception else HIGH_LABEL
     elif all(all(is_low_path(path) for path in item_paths(item)) for item in files):
         proposed = "risk:low"
