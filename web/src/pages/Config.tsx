@@ -503,7 +503,13 @@ export default function Config() {
       <SectionOverview
         section={activeSection}
         onPickType={(typeKey) => {
-          if (needsAliasTier) {
+          if (isCostRatesSection) {
+            // Cost-rate entries are selected from the canonical rate-sheet
+            // templates. They are not provider aliases, so asking the
+            // generic selector to create an item would build a legacy
+            // providers.* prefix and leave the rate editor unreachable.
+            goToType(activeSection.key, typeKey);
+          } else if (needsAliasTier) {
             goToType(activeSection.key, typeKey);
           } else {
             void (async () => {
