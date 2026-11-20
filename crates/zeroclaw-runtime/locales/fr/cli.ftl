@@ -9,6 +9,7 @@ cli-daemon-about = Démarrer le daemon autonome à exécution longue
 cli-service-about = Gérer le cycle de vie du service OS (service utilisateur launchd/systemd)
 cli-doctor-about = Exécuter des diagnostics sur le daemon, le planificateur et l'actualisation des canaux
 cli-status-about = Afficher l'état du système (détails complets)
+cli-status-format-local-health = Format de sortie : « exit-code » renvoie 0 si le démon local répond à health avec l’état du démon « ok », et 1 sinon.
 cli-estop-about = Activer, inspecter et reprendre les états d'arrêt d'urgence
 cli-cron-about = Configurer et gérer les tâches planifiées
 cli-models-about = Gérer les catalogues de modèles des fournisseurs

@@ -10,6 +10,7 @@ cli-daemon-about = Start the long-running autonomous daemon
 cli-service-about = Manage OS service lifecycle (launchd/systemd user service)
 cli-doctor-about = Run diagnostics for daemon/scheduler/channel freshness
 cli-status-about = Show system status (full details)
+cli-status-format-local-health = Output format: "exit-code" exits 0 when the local daemon answers health with daemon status "ok", and 1 otherwise.
 cli-estop-about = Engage, inspect, and resume emergency-stop states
 cli-cron-about = Configure and manage scheduled tasks
 cli-models-about = Manage provider model catalogs
