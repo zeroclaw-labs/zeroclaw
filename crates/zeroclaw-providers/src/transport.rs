@@ -17,6 +17,38 @@ use zeroclaw_config::provider_registry::{Override, ProviderConnection};
 
 /// Native chat transport policy. The live proxy authority owns cached clients;
 /// this value only describes the builder settings used to select a pool.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ChatHttpTimeouts {
+    request: Option<Duration>,
+    read: Option<Duration>,
+}
+
+impl ChatHttpTimeouts {
+    pub(crate) fn from_options(options: &crate::ModelProviderRuntimeOptions) -> Self {
+        Self {
+            request: (!options.provider_timeout_disabled)
+                .then(|| Duration::from_secs(options.provider_timeout_secs.unwrap_or(120))),
+            read: (!options.provider_read_timeout_disabled).then(|| {
+                Duration::from_secs(options.provider_read_timeout_secs.unwrap_or(300))
+            }),
+        }
+    }
+
+    pub(crate) fn client(self, service: &str) -> Result<Client> {
+        let profile = format!("chat-timeouts:{:?}:{:?}", self.request, self.read);
+        zeroclaw_config::schema::try_build_runtime_proxy_client_with(service, &profile, |builder| {
+            let mut builder = builder.connect_timeout(Duration::from_secs(10));
+            if let Some(timeout) = self.request {
+                builder = builder.timeout(timeout);
+            }
+            if let Some(timeout) = self.read {
+                builder = builder.read_timeout(timeout);
+            }
+            Ok(builder)
+        })
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct ChatHttpPolicy<'a> {
     pub request_timeout: Option<Duration>,
