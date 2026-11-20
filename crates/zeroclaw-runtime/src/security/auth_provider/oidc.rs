@@ -300,6 +300,18 @@ fn audience_matches(aud: Option<&serde_json::Value>, expected: &str) -> bool {
     }
 }
 
+/// Whether `aud` names `expected` and no other audience: the string itself,
+/// or an array holding exactly that one value.
+fn audience_is_exactly(aud: Option<&serde_json::Value>, expected: &str) -> bool {
+    match aud {
+        Some(serde_json::Value::String(s)) => s == expected,
+        Some(serde_json::Value::Array(items)) => {
+            matches!(items.as_slice(), [only] if only.as_str() == Some(expected))
+        }
+        _ => false,
+    }
+}
+
 /// The verified top-level claim `name` when it is a nonblank string. Any
 /// other shape (absent, null, number, object, blank) counts as absent.
 fn nonblank_str_claim<'a>(
@@ -742,6 +754,13 @@ impl OidcAuthProvider {
         ) else {
             return deny(DenyReason::BadCredential);
         };
+        // An ID token's `aud` must contain its client and may list other
+        // audiences too (OIDC Core §2), so an untyped token must name the
+        // configured audience and nothing else: an identifier no client
+        // uses, alone, cannot be an ID token's `aud`.
+        if !typed && !audience_is_exactly(claims.aud.as_ref(), &self.config.audience) {
+            return deny(DenyReason::BadCredential);
+        }
         self.claims_to_identity(&claims, raw, VerifiedVia::Jwks)
     }
 
@@ -1690,6 +1709,59 @@ mod tests {
                 }
             );
         }
+    }
+
+    #[tokio::test]
+    async fn waived_typing_refuses_an_id_token_that_also_lists_the_api_audience() {
+        // OIDC Core §2: an ID token's `aud` MUST contain its client and MAY
+        // list other audiences. A nonce-free ID token naming both the
+        // signing-in client and the API identifier must not pass as an
+        // untyped access token (review finding on #12496 / #12498).
+        let idp = start_idp().await;
+        let provider = OidcAuthProvider::new("test", idp.untyped_config()).unwrap();
+        for aud in [
+            serde_json::json!(["zerocode-cli", "zeroclaw"]),
+            serde_json::json!(["zeroclaw", "zerocode-cli"]),
+            serde_json::json!(["zeroclaw", "some-other-api"]),
+            serde_json::json!(["zeroclaw", "zeroclaw"]),
+        ] {
+            let mut claims = idp.good_claims();
+            claims["aud"] = aud.clone();
+            claims["azp"] = serde_json::json!("zerocode-cli");
+            for header in [UNTYPED_JWT_HEADER, NO_TYP_HEADER] {
+                let token = idp.mint_with_header(header, &claims);
+                let outcome = provider.verify(&bearer(token)).await;
+                assert!(is_bad_credential(&outcome), "{aud} {header}: {outcome:?}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn waived_typing_accepts_exactly_the_configured_audience_as_string_or_array() {
+        let idp = start_idp().await;
+        let provider = OidcAuthProvider::new("test", idp.untyped_config()).unwrap();
+        for aud in [
+            serde_json::json!("zeroclaw"),
+            serde_json::json!(["zeroclaw"]),
+        ] {
+            let mut claims = idp.good_claims();
+            claims["aud"] = aud.clone();
+            let token = idp.mint_with_header(UNTYPED_JWT_HEADER, &claims);
+            let outcome = provider.verify(&bearer(token)).await;
+            assert!(outcome.identity().is_some(), "{aud}: {outcome:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn typed_access_tokens_keep_accepting_a_multi_valued_audience() {
+        // RFC 9068 typing already distinguishes the token's purpose, so the
+        // single-audience rule applies only to untyped tokens.
+        let idp = start_idp().await;
+        let provider = idp.provider(OidcValidation::Jwks);
+        let mut claims = idp.good_claims();
+        claims["aud"] = serde_json::json!(["zeroclaw", "some-other-api"]);
+        let outcome = provider.verify(&bearer(idp.mint(claims))).await;
+        assert!(outcome.identity().is_some(), "{outcome:?}");
     }
 
     #[tokio::test]
