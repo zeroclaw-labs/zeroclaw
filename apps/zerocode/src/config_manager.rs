@@ -8118,6 +8118,17 @@ mod tests {
             .handle_paste("{\r\n  \"connections\": {},\r\n  \"models\": {}\r\n}")
             .await;
         assert!(manager.edit_buf.contains('\n'));
+        let footer = manager.bottom_hint();
+        assert!(footer.contains(&format!(
+            "{}={}",
+            editor_key(crate::keymap::ConfigEditorAction::Confirm),
+            crate::i18n::t("zc-config-footer-action-new-line")
+        )));
+        assert!(footer.contains(&format!(
+            "{}={}",
+            editor_key(crate::keymap::ConfigEditorAction::Save),
+            crate::i18n::t("zc-config-footer-action-save")
+        )));
         let candidate: serde_json::Value = serde_json::from_str(&manager.edit_buf).unwrap();
         let answers = async {
             answer_config_request(
