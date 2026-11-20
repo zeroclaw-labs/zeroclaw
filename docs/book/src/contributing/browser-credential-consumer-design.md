@@ -37,3 +37,7 @@ A public Hetzner Console probe on Jarvis redirected to accounts.hetzner.com and 
 ## Staged HTTPS browser validation
 
 A loopback-only HTTPS fixture on Jarvis used a one-time certificate pinned to its SPKI in a disposable Chrome session. As the ZeroClaw service user, the test invoked the exact form helper through agent-browser stdin. Its server accepted the synthetic username/password POST, returned a separate TOTP form, accepted the synthetic code POST, and returned the authenticated page title. The fixture exposed neither credential values nor the submitted body in its logs. The probe reported HTTPS_PASSWORD_AND_TOTP_OK and stopped the fixture and browser session. This verifies browser transport and the form helper. The production ZeroClaw catalog-to-browser path and actual Hetzner console login require separate acceptance.
+
+## Authorization list
+
+Use Secrets → Permissions → Add authorization. Choose the catalog alias, a compatible consumer, and the destination. The saved authorization appears in the list. Edit a configurable destination or remove its authorization independently of other grants and the underlying credential. TOTP aliases can have several exact HTTPS origins, such as a production identity provider and a separate test identity provider. HTTP Request and username/password browser grants use the destination registered on the credential. SSH grants use username, hostname and port. Plugin TLS credentials are selected through a plugin's TLS profile configuration.

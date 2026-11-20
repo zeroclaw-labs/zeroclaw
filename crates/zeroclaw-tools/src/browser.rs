@@ -526,13 +526,6 @@ impl BrowserTool {
             .and_then(Value::as_str)
             .ok_or_else(|| anyhow::anyhow!("Credential alias required"))?;
         let record = load_scoped_credential(self.credential_config_path.as_deref(), alias)?;
-        let origin = record
-            .browser_origin
-            .clone()
-            .filter(|origin| record.accepts_browser_origin(origin))
-            .ok_or_else(|| anyhow::anyhow!("Browser credential permission required"))?;
-        self.validate_url(&origin)?;
-
         let active = self
             .run_command(&["get", "url"])
             .await?
@@ -540,6 +533,8 @@ impl BrowserTool {
             .and_then(|data| data.get("url").and_then(Value::as_str).map(str::to_owned))
             .ok_or_else(|| anyhow::anyhow!("Active browser URL unavailable"))?;
         let active = reqwest::Url::parse(&active)?;
+        let origin = active.origin().ascii_serialization();
+        self.validate_url(&origin)?;
         anyhow::ensure!(
             record.permits_browser_submission(&active, &active, &active),
             "Browser origin does not match the credential grant"

@@ -4,10 +4,34 @@ import { changeHttpCredential, listHttpCredentials, type HttpCredentialRow } fro
 import { t } from "@/lib/i18n";
 import { parseSshDestinations } from "./HttpCredentials";
 
+type Consumer = "http" | "browser" | "ssh";
+type Grant = { alias: string; consumer: Consumer; destination: string };
+
+const consumerLabel: Record<Consumer, string> = { http: "HTTP Request", browser: "Browser", ssh: "SSH" };
+
+function consumers(row?: HttpCredentialRow): Consumer[] {
+  if (!row) return [];
+  if (row.kind === "ssh_key") return ["ssh"];
+  if (row.kind === "totp") return ["browser"];
+  if (!row.origin.startsWith("https://")) return [];
+  return row.kind === "user_password" ? ["http", "browser"] : ["http"];
+}
+
+function grantsFor(row: HttpCredentialRow): Grant[] {
+  const entry = (consumer: Consumer, destination: string): Grant => ({ alias: row.name, consumer, destination });
+  return [
+    ...(row.http_allowed ? [entry("http", row.origin)] : []),
+    ...(row.browser_origins ?? (row.browser_origin ? [row.browser_origin] : [])).map(origin => entry("browser", origin)),
+    ...(row.destinations ?? []).map(d => entry("ssh", `${d.username}@${d.host.includes(":") ? `[${d.host}]` : d.host}:${d.port}`)),
+  ];
+}
+
 export default function CredentialPermissions() {
-  const [rows, setRows] = useState<HttpCredentialRow[]>();
+  const [rows, setRows] = useState<HttpCredentialRow[]>([]);
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState("");
+  const [draft, setDraft] = useState<Grant>();
+  const [editing, setEditing] = useState<Grant>();
   useEffect(() => {
     let active = true;
     void listHttpCredentials().then(
@@ -17,12 +41,36 @@ export default function CredentialPermissions() {
     return () => { active = false; };
   }, []);
 
-  async function save(name: string, permissions: { http_allowed: boolean } | { destinations: ReturnType<typeof parseSshDestinations> } | { browser: { origin: string | null } }) {
+  const row = rows.find(item => item.name === draft?.alias);
+  const eligible = rows.filter(item => consumers(item).length > 0);
+  const grants = rows.flatMap(grantsFor);
+
+  function select(alias: string) {
+    const selected = rows.find(item => item.name === alias);
+    const consumer = consumers(selected)[0];
+    if (selected && consumer) setDraft({ alias, consumer, destination: selected.origin });
+  }
+
+  async function save(entry: Grant, replaced?: Grant, remove = false) {
+    if (busy) return;
     setBusy(true);
     setMessage("");
     try {
-      await changeHttpCredential({ name, operation: "replace", permissions });
+      const siblings = grants.filter(item => item.alias === entry.alias && item.consumer === entry.consumer &&
+        item.destination !== (remove ? entry.destination : replaced?.destination)).map(item => item.destination);
+      if (!remove) siblings.push(entry.destination.trim());
+      const destinations = [...new Set(siblings)];
+      const permissions = entry.consumer === "http" ? { http_allowed: !remove }
+        : entry.consumer === "browser" ? { browser: { origins: destinations } }
+        : { destinations: parseSshDestinations(destinations.join("\n")) };
+      if (entry.consumer === "ssh" && "destinations" in permissions && permissions.destinations?.length !== destinations.length) {
+        setMessage(t("plugin_tls.failed"));
+        return;
+      }
+      await changeHttpCredential({ name: entry.alias, operation: "replace", permissions });
       setRows((await listHttpCredentials()).credentials);
+      setDraft(undefined);
+      setEditing(undefined);
       setMessage(t("plugin_tls.saved"));
     } catch {
       setMessage(t("plugin_tls.failed"));
@@ -31,65 +79,63 @@ export default function CredentialPermissions() {
     }
   }
 
+  const field = "block w-full rounded-md border border-border bg-background p-2";
   return (
     <section className="space-y-4">
       {message && <p role="status">{message}</p>}
-      {rows?.length === 0 && <p>{t("http_credentials.empty")}</p>}
-      {rows?.map(row => {
-        const browserEligible = row.kind === "totp" ||
-          (row.kind === "user_password" && row.origin.startsWith("https://"));
-        return (
-        <div key={row.name} className="space-y-2">
-        <form className="space-y-3 rounded-md border p-4" onSubmit={event => {
+      <Button type="button" disabled={busy || !eligible.length} onClick={() => {
+        setEditing(undefined);
+        if (eligible[0]) select(eligible[0].name);
+      }}>{t("http_credentials.add_permission")}</Button>
+      {draft && row && (
+        <form className="space-y-4 rounded-md border p-4" onSubmit={event => {
           event.preventDefault();
-          const data = new FormData(event.currentTarget);
-          if (row.kind === "ssh_key") {
-            void save(row.name, { destinations: parseSshDestinations(String(data.get("destinations") ?? "")) });
-          } else {
-            void save(row.name, { http_allowed: data.has("http") });
-          }
+          void save(draft, editing);
         }}>
-          <p className="font-medium">{row.name}</p>
-          {row.kind === "ssh_key" ? (
-            <label className="block space-y-1">
-              <span>{t("http_credentials.ssh_grants")}</span>
-              <textarea name="destinations" className="block w-full rounded-md border bg-background p-2"
-                defaultValue={row.destinations?.map(d => `${d.username}@${d.host.includes(":") ? `[${d.host}]` : d.host}:${d.port}`).join("\n")} />
-            </label>
-          ) : row.http_allowed != null ? (
-            <label className="flex items-center gap-2">
-              <input type="checkbox" name="http" defaultChecked={row.http_allowed} />
-              <span>HTTP Request · {row.origin}</span>
-            </label>
-          ) : !browserEligible && <p>{t("http_credentials.no_consumer")}</p>}
-          {(row.kind === "ssh_key" || row.http_allowed != null) && (
-            <Button type="submit" disabled={busy}>{t("http_credentials.save_permissions")}</Button>
-          )}
+          <label className="block space-y-1">
+            <span>{t("http_credentials.name")}</span>
+            <select className={field} value={draft.alias} disabled={!!editing} onChange={event => select(event.target.value)}>
+              {eligible.map(item => <option key={item.name} value={item.name}>{item.name}</option>)}
+            </select>
+          </label>
+          <label className="block space-y-1">
+            <span>{t("http_credentials.consumer")}</span>
+            <select className={field} value={draft.consumer} disabled={!!editing} onChange={event => {
+              const consumer = event.target.value as Consumer;
+              setDraft({ ...draft, consumer, destination: row.origin });
+            }}>
+              {consumers(row).map(consumer => <option key={consumer} value={consumer}>{consumerLabel[consumer]}</option>)}
+            </select>
+          </label>
+          <label className="block space-y-1">
+            <span>{t(draft.consumer === "ssh" ? "http_credentials.ssh_destinations" : "http_credentials.origin")}</span>
+            <input className={field} type={draft.consumer === "ssh" ? "text" : "url"} required
+              readOnly={draft.consumer === "http" || (draft.consumer === "browser" && row.kind === "user_password")}
+              placeholder={draft.consumer === "ssh" ? "operator@server.example.com:22" : "https://login.example.com"}
+              value={draft.destination} onChange={event => setDraft({ ...draft, destination: event.target.value })} />
+          </label>
+          <div className="flex gap-2">
+            <Button type="submit" disabled={busy}>{t(editing ? "http_credentials.save_permissions" : "http_credentials.add_permission")}</Button>
+            <Button type="button" disabled={busy} onClick={() => { setDraft(undefined); setEditing(undefined); }}>{t("http_credentials.cancel_permission")}</Button>
+          </div>
         </form>
-        {browserEligible && (
-          <form className="space-y-3 rounded-md border p-4" onSubmit={event => {
-            event.preventDefault();
-            const data = new FormData(event.currentTarget);
-            const revoke = (event.nativeEvent as SubmitEvent).submitter?.getAttribute("value") === "revoke";
-            const origin = String(data.get("browser-origin") ?? "").trim();
-            if (!revoke && !origin) return;
-            void save(row.name, { browser: { origin: revoke ? null : origin } });
-          }}>
-            <label className="block space-y-1">
-              <span>{t(row.kind === "totp" ? "http_credentials.browser_totp" : "http_credentials.browser_login")}</span>
-              <input type="url" name="browser-origin" className="block w-full rounded-md border bg-background p-2"
-                required readOnly={row.kind === "user_password"}
-                defaultValue={row.kind === "user_password" ? row.origin : row.browser_origin ?? ""} />
-            </label>
-            <div className="flex flex-wrap gap-2">
-              <Button type="submit" disabled={busy}>{t("http_credentials.browser_grant")}</Button>
-              {row.browser_origin && <Button type="submit" value="revoke" formNoValidate disabled={busy}>{t("http_credentials.browser_revoke")}</Button>}
+      )}
+      {grants.length === 0 && <p>{t("http_credentials.no_permissions")}</p>}
+      <ul className="space-y-2">
+        {grants.map(entry => (
+          <li key={JSON.stringify(entry)} className="flex flex-wrap items-center justify-between gap-3 rounded-md border p-4">
+            <div className="min-w-0 break-words">
+              <p className="font-medium">{entry.alias}</p>
+              <p>{consumerLabel[entry.consumer]} · {entry.destination}</p>
             </div>
-          </form>
-        )}
-        </div>
-        );
-      })}
+            <div className="flex gap-2">
+              {entry.consumer !== "http" && !(entry.consumer === "browser" && rows.find(item => item.name === entry.alias)?.kind === "user_password") &&
+                <Button type="button" disabled={busy} onClick={() => { setDraft(entry); setEditing(entry); }}>{t("http_credentials.edit_permission")}</Button>}
+              <Button type="button" disabled={busy} onClick={() => void save(entry, undefined, true)}>{t("http_credentials.remove_permission")}</Button>
+            </div>
+          </li>
+        ))}
+      </ul>
     </section>
   );
 }

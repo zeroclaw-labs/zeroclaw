@@ -9060,6 +9060,8 @@ pub struct ScopedHttpCredential {
     pub http_allowed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub browser_origin: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub browser_origins: Vec<String>,
     #[serde(default)]
     pub source: ScopedCredentialSource,
     pub auth: ScopedHttpAuth,
@@ -9291,6 +9293,13 @@ impl ScopedHttpCredential {
         }
     }
 
+    pub fn browser_grants(&self) -> impl Iterator<Item = &str> {
+        self.browser_origin
+            .as_deref()
+            .into_iter()
+            .chain(self.browser_origins.iter().map(String::as_str))
+    }
+
     /// Check the active document and the submission destination before
     /// resolving a browser secret. No matching grant means no vault lookup.
     pub fn permits_browser_submission(
@@ -9299,7 +9308,7 @@ impl ScopedHttpCredential {
         document: &url::Url,
         submission: &url::Url,
     ) -> bool {
-        self.browser_origin.as_deref().is_some_and(|grant| {
+        self.browser_grants().any(|grant| {
             self.accepts_browser_origin(grant)
                 && [top_level, document, submission].into_iter().all(|target| {
                     target.scheme() == "https"
@@ -9400,8 +9409,14 @@ fn scoped_browser_submission_denies_redirects_frames_and_form_origin_changes() {
     assert!(!record.permits_browser_submission(&foreign, &page, &form));
     assert!(!record.permits_browser_submission(&page, &foreign, &form));
     assert!(!record.permits_browser_submission(&page, &page, &foreign));
+    record
+        .browser_origins
+        .push(foreign.origin().ascii_serialization());
+    assert!(record.permits_browser_submission(&foreign, &foreign, &foreign));
+    assert!(record.permits_browser_submission(&page, &page, &form));
     record.browser_origin = None;
     assert!(!record.permits_browser_submission(&page, &page, &form));
+    assert!(record.permits_browser_submission(&foreign, &foreign, &foreign));
 }
 
 impl Default for HttpRequestConfig {

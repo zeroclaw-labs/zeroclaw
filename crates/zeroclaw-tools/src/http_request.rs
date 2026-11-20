@@ -1375,6 +1375,7 @@ mod tests {
                 origin: "https://example.com".into(),
                 http_allowed: true,
                 browser_origin: None,
+                browser_origins: Vec::new(),
                 source: Default::default(),
                 auth: ScopedHttpAuth::ApiKey {
                     value: "fixture-key".into(),
@@ -1418,6 +1419,7 @@ mod tests {
                 origin: "https://example.com".into(),
                 http_allowed: false,
                 browser_origin: None,
+                browser_origins: Vec::new(),
                 source: Default::default(),
                 auth: ScopedHttpAuth::ApiKey {
                     value: "fixture-key".into(),
