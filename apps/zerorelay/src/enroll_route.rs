@@ -1,5 +1,8 @@
 //! An enrollment route the RELAY itself originates against a registered daemon.
 //!
+//! [`open_route`] is the same opener for the relay-served dashboard
+//! ([`crate::dashboard`]), with the gateway hint and the browser's address.
+//!
 //! Every other route on this relay is a splice: a client asks for a node, the
 //! relay pairs it with that daemon's link, and the relay never becomes a party to
 //! the inner exchange. This module is the one deliberate exception, and it exists
@@ -20,13 +23,16 @@
 //! off by default and warns loudly when enabled. zerocode/native enrollment does
 //! not pass through here and is unaffected.
 //!
-//! What this module does NOT change: routing is still by node-id through the
-//! normal registry, and the route obeys the same per-node connect budget, the
-//! same `max_conns_per_node` cap, the same pairing deadline, and the same
-//! credit-based flow control as any client route.
+//! What this module does NOT change: the route obeys the same per-node connect
+//! budget, the same `max_conns_per_node` cap, the same pairing deadline, and the
+//! same credit-based flow control as any client route. An enrollment route is
+//! found by node-id through the normal registry; a dashboard route is opened on
+//! the registration that holds its label (`DaemonLink`), so a node-id that
+//! changes hands in between cannot redirect it.
 
 use crate::{
-    ConnEvent, ConnRoute, DAEMON_HANDOFF_BUDGET, Inner, LiveConnGuard, PAIR_TIMEOUT, release_conn,
+    ConnEvent, ConnRoute, ConnRoutes, DAEMON_HANDOFF_BUDGET, DaemonHandle, Inner, LiveConnGuard,
+    NodeMetrics, PAIR_TIMEOUT, release_conn,
 };
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -34,7 +40,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 use zeroclaw_relay_proto::{
-    ConnWindow, Control, INITIAL_WINDOW, MAX_DATA_PAYLOAD, PEER_HINT_ENROLL, encode_data,
+    ConnWindow, Control, INITIAL_WINDOW, MAX_DATA_PAYLOAD, PEER_HINT_ENROLL, TokenBucket,
+    encode_data,
 };
 
 /// Buffer between the TLS client above and the relay pump below. One credit
@@ -173,20 +180,61 @@ pub(crate) async fn open_enroll_route(
     inner: &Arc<Inner>,
     node_id: &str,
 ) -> Result<EnrollRoute, OpenError> {
-    let handle = {
-        let daemons = inner.daemons.lock().await;
-        daemons.get(node_id).map(|h| {
-            (
-                h.to_daemon.clone(),
-                h.conns.clone(),
-                h.metrics.clone(),
-                h.connect_bucket.clone(),
-            )
-        })
-    };
-    let Some((to_daemon, conns, metrics, connect_bucket)) = handle else {
+    open_route(inner, node_id, PEER_HINT_ENROLL, None).await
+}
+
+/// [`open_enroll_route`] with any peer hint: the registration that holds
+/// `node_id` now. Same budgets, same caps, same teardown.
+pub(crate) async fn open_route(
+    inner: &Arc<Inner>,
+    node_id: &str,
+    peer_hint: &str,
+    client_addr: Option<String>,
+) -> Result<EnrollRoute, OpenError> {
+    let link = inner.daemons.lock().await.get(node_id).map(DaemonLink::of);
+    let Some(link) = link else {
         return Err(OpenError::NoSuchNode);
     };
+    open_route_on(inner, link, peer_hint, client_addr).await
+}
+
+/// One daemon registration's link, taken from the registry under its lock.
+///
+/// A route opened on it reaches that registration's daemon or nobody. If the
+/// daemon goes away, the `Open` has no one to answer it and the route fails; it
+/// never moves to whichever key registers the same node-id next.
+pub(crate) struct DaemonLink {
+    to_daemon: mpsc::Sender<Message>,
+    conns: Arc<tokio::sync::Mutex<ConnRoutes>>,
+    metrics: Arc<NodeMetrics>,
+    connect_bucket: Arc<tokio::sync::Mutex<TokenBucket>>,
+}
+
+impl DaemonLink {
+    pub(crate) fn of(handle: &DaemonHandle) -> Self {
+        Self {
+            to_daemon: handle.to_daemon.clone(),
+            conns: handle.conns.clone(),
+            metrics: handle.metrics.clone(),
+            connect_bucket: handle.connect_bucket.clone(),
+        }
+    }
+}
+
+/// Open a route on one registration's link, with a peer hint and the client
+/// address an `Open` for the dashboard carries.
+pub(crate) async fn open_route_on(
+    inner: &Arc<Inner>,
+    link: DaemonLink,
+    peer_hint: &str,
+    client_addr: Option<String>,
+) -> Result<EnrollRoute, OpenError> {
+    let DaemonLink {
+        to_daemon,
+        conns,
+        metrics,
+        connect_bucket,
+    } = link;
 
     // Per-node connect cap (A6). The frontdoor is an unauthenticated HTTP
     // surface, so without this a browser could drive enrollment attempts at a
@@ -232,7 +280,8 @@ pub(crate) async fn open_enroll_route(
             to_daemon.send(Message::text(
                 Control::Open {
                     conn_id,
-                    peer_hint: Some(PEER_HINT_ENROLL.to_string()),
+                    peer_hint: Some(peer_hint.to_string()),
+                    client_addr,
                 }
                 .to_json(),
             )),

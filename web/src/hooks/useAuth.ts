@@ -55,6 +55,12 @@ export type SignOutNotice =
 
 export type ReauthAttempt = 'opened' | 'blocked';
 
+/**
+ * Whether the gateway has said how to sign in. Pairing is offered only once
+ * it has: through a relay it is refused, and only that answer says so.
+ */
+export type SignInMethods = 'known' | 'checking' | 'failed';
+
 export interface AuthState {
   /** The current bearer token, or null if not authenticated. */
   token: string | null;
@@ -75,6 +81,12 @@ export interface AuthState {
   session: OidcSession | null;
   /** Sign-in providers to offer. Empty when sign-in is off and in the desktop app. */
   providers: OidcMethod[];
+  /** The dashboard is reached through a relay that can read this session. */
+  viaRelay: boolean;
+  /** Whether the sign-in screen knows how to sign in yet. */
+  signInMethods: SignInMethods;
+  /** Ask the gateway again how to sign in, after it didn't answer. */
+  retrySignInMethods: () => void;
   /** The session expires within two minutes. */
   expiryWarning: boolean;
   /** The session expired; the page stays until the user signs in again. */
@@ -116,6 +128,9 @@ export function AuthProvider({ children }: AuthProviderProps) {
   const [session, setSession] = useState<OidcSession | null>(getOidcSession);
   const [providers, setProviders] = useState<OidcMethod[]>([]);
   const [providersKnown, setProvidersKnown] = useState(false);
+  const [viaRelay, setViaRelay] = useState(false);
+  const [methodsFailed, setMethodsFailed] = useState(false);
+  const [methodsAttempt, setMethodsAttempt] = useState(0);
   const [expiryWarning, setExpiryWarning] = useState(false);
   const [reauthRequired, setReauthRequired] = useState(false);
   const [reauthPending, setReauthPending] = useState(false);
@@ -158,13 +173,32 @@ export function AuthProvider({ children }: AuthProviderProps) {
   // On mount: decide between a stored pairing token, an open gateway, a
   // signed-in session and the sign-in screen.
   useEffect(() => {
-    if (checkAuth()) return; // already have a token, no need to check
     let cancelled = false;
+    if (checkAuth()) {
+      // A stored token needs no sign-in check, but the page still has to say
+      // when a relay carries this connection, so ask only that.
+      if (!isTauri()) {
+        fetchAuthMethods()
+          .then((methods) => {
+            if (!cancelled && methods?.via_relay) setViaRelay(true);
+          })
+          .catch(() => {
+            // The notice stays off; nothing else depends on this answer.
+          });
+      }
+      return () => {
+        cancelled = true;
+      };
+    }
     resolveInitialAuth({
       hasToken: false,
       desktop: isTauri(),
       getHealth: getPublicHealth,
-      getMethods: () => fetchAuthMethods(),
+      getMethods: () =>
+        fetchAuthMethods().then((methods) => {
+          if (methods?.via_relay) setViaRelay(true);
+          return methods;
+        }),
       getSession: () => fetchAuthSession(),
     })
       .then((initial) => {
@@ -183,7 +217,9 @@ export function AuthProvider({ children }: AuthProviderProps) {
             break;
           case 'signed-out':
             setProviders(initial.providers);
-            setProvidersKnown(true);
+            // Unknown methods are asked for again below, before anything
+            // but a retry is offered.
+            setProvidersKnown(initial.methodsKnown);
             setPhase('signed-out');
             break;
         }
@@ -196,25 +232,38 @@ export function AuthProvider({ children }: AuthProviderProps) {
     };
   }, []);
 
-  // A paired browser that lost its token never asked which providers exist.
-  // The answer marks them known: marking them before it would re-run this
-  // effect, and its cleanup would drop the answer.
+  // A paired browser that lost its token never asked which providers exist,
+  // and a first answer may not have come. The answer marks them known:
+  // marking them before it would re-run this effect, and its cleanup would
+  // drop the answer. Without one the sign-in screen offers a retry, never
+  // the pairing form, since only the answer says whether pairing is allowed.
   useEffect(() => {
     if (phase !== 'signed-out' || providersKnown || isTauri()) return;
     let cancelled = false;
     fetchAuthMethods()
       .then((methods) => {
         if (cancelled) return;
-        if (methods) setProviders(methods.oidc);
+        if (!methods) {
+          setMethodsFailed(true);
+          return;
+        }
+        setProviders(methods.oidc);
+        if (methods.via_relay) setViaRelay(true);
+        setMethodsFailed(false);
         setProvidersKnown(true);
       })
       .catch(() => {
-        // No providers to offer; the pairing form stays.
+        if (!cancelled) setMethodsFailed(true);
       });
     return () => {
       cancelled = true;
     };
-  }, [phase, providersKnown]);
+  }, [phase, providersKnown, methodsAttempt]);
+
+  const retrySignInMethods = useCallback(() => {
+    setMethodsFailed(false);
+    setMethodsAttempt((attempt) => attempt + 1);
+  }, []);
 
   const dropToSignedOut = useCallback((notice: SignOutNotice | null) => {
     setOidcSession(null);
@@ -445,6 +494,9 @@ export function AuthProvider({ children }: AuthProviderProps) {
     mode: session ? 'oidc' : 'pairing',
     session,
     providers,
+    viaRelay,
+    signInMethods: isTauri() || providersKnown ? 'known' : methodsFailed ? 'failed' : 'checking',
+    retrySignInMethods,
     expiryWarning,
     reauthRequired,
     reauthPending,

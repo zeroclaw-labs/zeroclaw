@@ -956,6 +956,25 @@ impl SessionBackend for SqliteSessionBackend {
         rows.filter_map(|r| r.ok()).collect()
     }
 
+    /// Like `load`, but a transcript that can't be read, or a row that can't be
+    /// decoded, is an error rather than a shorter history.
+    fn try_load(&self, session_key: &str) -> std::io::Result<Vec<ChatMessage>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare("SELECT role, content FROM sessions WHERE session_key = ?1 ORDER BY id ASC")
+            .map_err(std::io::Error::other)?;
+        let rows = stmt
+            .query_map(params![session_key], |row| {
+                Ok(ChatMessage {
+                    role: row.get(0)?,
+                    content: row.get(1)?,
+                })
+            })
+            .map_err(std::io::Error::other)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(std::io::Error::other)
+    }
+
     fn load_with_timestamps(
         &self,
         session_key: &str,
@@ -993,6 +1012,67 @@ impl SessionBackend for SqliteSessionBackend {
         let conn = self.conn.lock();
         let now = Utc::now().to_rfc3339();
         Self::append_on(&conn, session_key, message, &now).map_err(std::io::Error::other)
+    }
+
+    fn append_authorized(
+        &self,
+        session_key: &str,
+        message: &ChatMessage,
+        authorize: &crate::session_backend::SessionEffectAuthorization<'_>,
+        committed: &mut dyn FnMut(),
+    ) -> std::io::Result<usize> {
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(std::io::Error::other)?;
+        // Missing is not an ownerless row: never recreate a deleted session.
+        let owner: Option<String> = tx
+            .query_row(
+                "SELECT principal_id FROM session_metadata WHERE session_key = ?1",
+                params![session_key],
+                |row| row.get(0),
+            )
+            .map_err(std::io::Error::other)?;
+        let _authority = authorize(owner.as_deref())?;
+        Self::append_on(&tx, session_key, message, &Utc::now().to_rfc3339())
+            .map_err(std::io::Error::other)?;
+        let count: usize = tx
+            .query_row(
+                "SELECT COUNT(*) FROM sessions WHERE session_key = ?1",
+                params![session_key],
+                |row| row.get(0),
+            )
+            .map_err(std::io::Error::other)?;
+        tx.commit().map_err(std::io::Error::other)?;
+        committed();
+        Ok(count)
+    }
+
+    fn set_session_name_authorized(
+        &self,
+        session_key: &str,
+        name: &str,
+        authorize: &crate::session_backend::SessionEffectAuthorization<'_>,
+    ) -> std::io::Result<()> {
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(std::io::Error::other)?;
+        let owner: Option<String> = tx
+            .query_row(
+                "SELECT principal_id FROM session_metadata WHERE session_key = ?1",
+                params![session_key],
+                |row| row.get(0),
+            )
+            .map_err(std::io::Error::other)?;
+        let _authority = authorize(owner.as_deref())?;
+        let name_val = if name.is_empty() { None } else { Some(name) };
+        tx.execute(
+            "UPDATE session_metadata SET name = ?1 WHERE session_key = ?2",
+            params![name_val, session_key],
+        )
+        .map_err(std::io::Error::other)?;
+        tx.commit().map_err(std::io::Error::other)
     }
 
     fn rewrite_messages(&self, session_key: &str, messages: &[ChatMessage]) -> std::io::Result<()> {
@@ -2230,6 +2310,36 @@ mod tests {
         assert!(!backend.session_exists("ghost"));
     }
 
+    /// `try_load` is the read that refuses to guess: a transcript that can't
+    /// be read, or has a row that can't be decoded, is an error, never a
+    /// shorter history.
+    #[test]
+    fn try_load_reports_an_unreadable_transcript() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        backend.append("s", &ChatMessage::user("hello")).unwrap();
+        backend.append("s", &ChatMessage::assistant("hi")).unwrap();
+        assert_eq!(backend.try_load("s").unwrap().len(), 2);
+
+        let db = Connection::open(tmp.path().join("sessions/sessions.db")).unwrap();
+        db.execute(
+            "UPDATE sessions SET content = CAST(x'ff' AS BLOB) WHERE content = 'hi'",
+            [],
+        )
+        .unwrap();
+        assert!(
+            backend.try_load("s").is_err(),
+            "an undecodable row must not read as a shorter transcript"
+        );
+
+        db.execute_batch("ALTER TABLE sessions RENAME TO sessions_unreadable;")
+            .unwrap();
+        assert!(
+            backend.try_load("s").is_err(),
+            "an unreadable transcript must not read as an empty one"
+        );
+    }
+
     #[test]
     fn migrate_from_jsonl_imports_and_renames() {
         let tmp = TempDir::new().unwrap();
@@ -3103,6 +3213,91 @@ mod tests {
             let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
             assert_eq!(backend.list_sessions().len(), OPENERS);
         }
+    }
+
+    #[test]
+    fn authorized_append_and_rename_hold_authority_through_commit() {
+        use std::cell::Cell;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        backend
+            .append("rpc_effect", &ChatMessage::user("before"))
+            .unwrap();
+        backend
+            .set_session_principal("rpc_effect", "owner")
+            .unwrap();
+        let held = Cell::new(false);
+        struct Lease<'a>(&'a Cell<bool>);
+        impl Drop for Lease<'_> {
+            fn drop(&mut self) {
+                self.0.set(false);
+            }
+        }
+        let authorize = |owner: Option<&str>| -> std::io::Result<
+            Box<dyn crate::session_backend::SessionEffectGuard + '_>,
+        > {
+            assert_eq!(owner, Some("owner"));
+            held.set(true);
+            Ok(Box::new(Lease(&held)))
+        };
+        let committed = Cell::new(false);
+        let count = backend
+            .append_authorized(
+                "rpc_effect",
+                &ChatMessage::assistant("after"),
+                &authorize,
+                &mut || {
+                    assert!(held.get());
+                    committed.set(true);
+                },
+            )
+            .unwrap();
+        assert_eq!(count, 2);
+        assert!(committed.get());
+        assert!(!held.get());
+        backend
+            .set_session_name_authorized("rpc_effect", "accepted", &authorize)
+            .unwrap();
+        assert_eq!(
+            backend.get_session_name("rpc_effect").unwrap().as_deref(),
+            Some("accepted")
+        );
+        assert!(!held.get());
+        let deny = |_: Option<&str>| -> std::io::Result<Box<dyn crate::session_backend::SessionEffectGuard>> {
+            Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "revoked"))
+        };
+        assert!(
+            backend
+                .append_authorized(
+                    "rpc_effect",
+                    &ChatMessage::assistant("denied"),
+                    &deny,
+                    &mut || panic!("denied append must not publish live effects")
+                )
+                .is_err()
+        );
+        assert!(
+            backend
+                .set_session_name_authorized("rpc_effect", "denied", &deny)
+                .is_err()
+        );
+        assert_eq!(backend.load("rpc_effect").len(), 2);
+        assert_eq!(
+            backend.get_session_name("rpc_effect").unwrap().as_deref(),
+            Some("accepted")
+        );
+        backend.delete_session("rpc_effect").unwrap();
+        assert!(
+            backend
+                .append_authorized(
+                    "rpc_effect",
+                    &ChatMessage::assistant("recreated"),
+                    &authorize,
+                    &mut || panic!("deleted row must stay absent")
+                )
+                .is_err()
+        );
+        assert!(!backend.session_exists("rpc_effect"));
     }
 
     #[test]
