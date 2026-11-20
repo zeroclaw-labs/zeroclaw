@@ -1444,6 +1444,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn v4_embedding_identity_upgrade_through_factory_keeps_vectors() {
+        let tmp = TempDir::new().unwrap();
+        let legacy = static_sqlite(tmp.path(), 4);
+        legacy
+            .record_embedding_identity(&ident("openai", "text-embedding-3-small", 4))
+            .unwrap();
+        legacy
+            .store("legacy", "pre-existing row", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        assert_eq!(embedded_rows(&legacy), 1);
+        drop(legacy);
+
+        // This is the shape admitted from a V4 file: the chat profile carries
+        // the credential while memory still names the embedding provider and
+        // model separately.  The normalizer must promote it before the real
+        // memory factory resolves the canonical binding.
+        let mut config = Config {
+            data_dir: tmp.path().to_path_buf(),
+            ..Config::default()
+        };
+        config.memory.backend = "sqlite".into();
+        config.memory.embedding_provider = "openai".into();
+        config.memory.embedding_model = "text-embedding-3-small".into();
+        config.memory.embedding_dimensions = 4;
+        let profile = config.providers.models.ensure("openai", "work").unwrap();
+        profile.model = Some("chat-model".into());
+        profile.api_key = Some("chat-key".into());
+        zeroclaw_config::migration::normalize_test_input(&mut config);
+
+        drop(create_memory_from_config(&config).unwrap());
+        let reopened = SqliteMemory::new("test", tmp.path()).unwrap();
+        assert_eq!(embedded_rows(&reopened), 1);
+        let identity = reopened.stored_embedding_identity().unwrap().unwrap();
+        assert_ne!(identity.provider, "openai");
+        assert_eq!(identity.model, "text-embedding-3-small");
+        assert_eq!(identity.dimensions, 4);
+    }
+
+    #[tokio::test]
     async fn legacy_custom_identity_with_changed_endpoint_invalidates_vectors() {
         let tmp = TempDir::new().unwrap();
         let mem = static_sqlite(tmp.path(), 4);
