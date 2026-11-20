@@ -76,8 +76,13 @@ export default function ProviderRegistryEditor({ onSaved }: { onSaved: () => voi
   }, [setProviderRegistryDraft]);
 
   useEffect(() => () => {
+    // StrictMode replays effects after running their cleanup. Reset the
+    // mount marker so a clean shared draft starts a fresh load on the replay;
+    // otherwise the aborted request can leave the editor permanently busy.
+    loadedThisMount.current = false;
     loadGeneration.current += 1;
     loadAbort.current?.abort();
+    setLoading(false);
   }, []);
 
   useEffect(() => {

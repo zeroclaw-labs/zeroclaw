@@ -84,6 +84,35 @@ test('registry editor saves exact keys and the original masked baseline atomical
   } finally { await act(async () => renderer?.unmount()); }
 });
 
+test('registry editor reloads after StrictMode effect replay', async () => {
+  let reads = 0;
+  let releaseFirst!: () => void;
+  globalThis.fetch = async () => {
+    reads++;
+    if (reads === 1) await new Promise<void>((resolve) => { releaseFirst = resolve; });
+    return new Response(JSON.stringify(original), { headers: { 'Content-Type': 'application/json' } });
+  };
+  let renderer: ReactTestRenderer | undefined;
+  try {
+    await act(async () => {
+      renderer = create(
+        createElement(
+          React.StrictMode,
+          null,
+          createElement(
+            ConfigDraftProvider,
+            null,
+            createElement(MemoryRouter, null, createElement(Editor, { onSaved: () => undefined })),
+          ),
+        ),
+      );
+    });
+    assert.equal(reads, 2);
+    assert.equal(renderer!.root.findByType('textarea').props.disabled, false);
+    releaseFirst();
+  } finally { await act(async () => renderer?.unmount()); }
+});
+
 test('invalid registry JSON stays in the editor and never sends a write', async () => {
   let writes = 0;
   globalThis.fetch = async (_input, init) => {
