@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Button } from "@/components/ui";
+import { Button, Select } from "@/components/ui";
 import { changeHttpCredential, listHttpCredentials, type HttpCredentialRow } from "@/lib/api";
 import { t } from "@/lib/i18n";
 import { parseSshDestinations } from "./HttpCredentials";
@@ -93,18 +93,14 @@ export default function CredentialPermissions() {
         }}>
           <label className="block space-y-1">
             <span>{t("http_credentials.name")}</span>
-            <select className={field} value={draft.alias} disabled={!!editing} onChange={event => select(event.target.value)}>
-              {eligible.map(item => <option key={item.name} value={item.name}>{item.name}</option>)}
-            </select>
+            {editing ? <span className={field}>{draft.alias}</span> : <Select value={draft.alias} aria-label={t("http_credentials.name")}
+              onChange={select} options={eligible.map(item => ({ value: item.name, label: item.name }))} />}
           </label>
           <label className="block space-y-1">
             <span>{t("http_credentials.consumer")}</span>
-            <select className={field} value={draft.consumer} disabled={!!editing} onChange={event => {
-              const consumer = event.target.value as Consumer;
-              setDraft({ ...draft, consumer, destination: row.origin });
-            }}>
-              {consumers(row).map(consumer => <option key={consumer} value={consumer}>{consumerLabel[consumer]}</option>)}
-            </select>
+            {editing ? <span className={field}>{consumerLabel[draft.consumer]}</span> : <Select value={draft.consumer} aria-label={t("http_credentials.consumer")}
+              onChange={value => setDraft({ ...draft, consumer: value as Consumer, destination: row.origin })}
+              options={consumers(row).map(consumer => ({ value: consumer, label: consumerLabel[consumer] }))} />}
           </label>
           <label className="block space-y-1">
             <span>{t(draft.consumer === "ssh" ? "http_credentials.ssh_destinations" : "http_credentials.origin")}</span>
