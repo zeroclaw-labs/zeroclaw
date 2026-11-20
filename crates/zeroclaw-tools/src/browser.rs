@@ -3521,6 +3521,80 @@ mod tests {
         BrowserTool::new(security, vec!["*".into()], None).unwrap()
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn browser_catalog_submission_uses_only_stdin_and_checks_grants() {
+        use std::os::unix::fs::PermissionsExt;
+        use zeroclaw_config::{schema::Config, secrets::SecretStore};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        let mut config = Config::default();
+        config.secrets.encrypt = true;
+        let store = SecretStore::new(tmp.path(), true);
+        for (alias, record) in [
+            (
+                "LOGIN",
+                json!({
+                    "origin": "https://login.example.test",
+                    "browser_origin": "https://login.example.test",
+                    "auth": {"kind":"user_password","username":"fixture","password":"synthetic-pass"}
+                }),
+            ),
+            (
+                "TOTP",
+                json!({
+                    "origin": "",
+                    "browser_origin": "https://login.example.test",
+                    "auth": {"kind":"totp","seed":"GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ"}
+                }),
+            ),
+            (
+                "DENIED",
+                json!({
+                    "origin": "",
+                    "auth": {"kind":"totp","seed":"GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ"}
+                }),
+            ),
+        ] {
+            config
+                .http_request
+                .scoped_credentials
+                .insert(alias.into(), store.encrypt(&record.to_string()).unwrap());
+        }
+        std::fs::write(&config_path, toml::to_string(&config).unwrap()).unwrap();
+        let bin = tmp.path().join("fixture-browser");
+        std::fs::write(&bin, r#"#!/bin/sh
+case "$*" in
+  'get url --json') printf '%s\n' '{"success":true,"data":{"url":"https://login.example.test/login"}}' ;;
+  'eval --stdin --json')
+    value=$(cat)
+    case "$value" in
+      *GEZDGNBVGY3TQOJQ*) exit 1 ;;
+      *'"password":"synthetic-pass"'*|*'"otp":"'*)
+        printf '%s\n' '{"success":true,"data":{"result":true}}' ;;
+      *) exit 1 ;;
+    esac ;;
+  *) exit 1 ;;
+esac
+"#).unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let mut tool =
+            screenshot_tool_with_workspace(tmp.path()).with_credential_config(config_path);
+        tool.set_agent_browser_bin_for_tests(bin);
+        for alias in ["LOGIN", "TOTP"] {
+            tool.submit_catalog_credential(&json!({"credential":alias}))
+                .await
+                .unwrap();
+        }
+        assert!(
+            tool.submit_catalog_credential(&json!({"credential":"DENIED"}))
+                .await
+                .is_err()
+        );
+    }
+
     #[tokio::test]
     async fn validate_screenshot_path_allows_path_inside_workspace() {
         let tmp = tempfile::TempDir::new().unwrap();
