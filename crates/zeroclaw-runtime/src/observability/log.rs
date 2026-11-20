@@ -89,20 +89,6 @@ impl Observer for LogObserver {
                     "heartbeat.tick"
                 );
             }
-            ObserverEvent::CacheHit {
-                cache_type,
-                tokens_saved,
-            } => {
-                ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"cache_type": cache_type, "tokens_saved": tokens_saved})), "cache.hit");
-            }
-            ObserverEvent::CacheMiss { cache_type } => {
-                ::zeroclaw_log::record!(
-                    INFO,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_attrs(::serde_json::json!({"cache_type": cache_type})),
-                    "cache.miss"
-                );
-            }
             ObserverEvent::Error { component, message } => {
                 ::zeroclaw_log::record!(
                     INFO,

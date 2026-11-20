@@ -296,6 +296,30 @@ pub const RETIRED_KEYS: &[RetiredKey] = &[
                  code cancels the previous one",
         reason_id: "cli-config-retired-reason-pairing-max-pending",
     },
+    RetiredKey {
+        retired_in: 4,
+        path: &["memory", "response_cache_enabled"],
+        reason: RETIRED_RESPONSE_CACHE,
+        reason_id: "cli-config-retired-reason-response-cache",
+    },
+    RetiredKey {
+        retired_in: 4,
+        path: &["memory", "response_cache_ttl_minutes"],
+        reason: RETIRED_RESPONSE_CACHE,
+        reason_id: "cli-config-retired-reason-response-cache",
+    },
+    RetiredKey {
+        retired_in: 4,
+        path: &["memory", "response_cache_max_entries"],
+        reason: RETIRED_RESPONSE_CACHE,
+        reason_id: "cli-config-retired-reason-response-cache",
+    },
+    RetiredKey {
+        retired_in: 4,
+        path: &["memory", "response_cache_hot_entries"],
+        reason: RETIRED_RESPONSE_CACHE,
+        reason_id: "cli-config-retired-reason-response-cache",
+    },
 ];
 
 /// One key whose stored value the schema honours only up to a maximum.
@@ -384,6 +408,9 @@ const RETIRED_WATI: &str = "WATI support was removed; migrate to `[channels.what
 const INERT_AGENT_TUNABLE: &str = "agent-inline runtime tunables are no longer read; runtime \
      profiles are authoritative, so set this key on the agent's \
      `[runtime_profiles.<profile>]` instead";
+
+const RETIRED_RESPONSE_CACHE: &str = "the local LLM response cache was removed; provider prompt \
+     caching still applies";
 
 pub(crate) struct ConfigLoadAttribution;
 
@@ -6057,6 +6084,35 @@ mention_only = false
     }
 
     #[test]
+    fn a_current_config_loses_the_retired_response_cache_keys() {
+        let keys = [
+            "response_cache_enabled",
+            "response_cache_ttl_minutes",
+            "response_cache_max_entries",
+            "response_cache_hot_entries",
+        ];
+        let raw = format!(
+            "schema_version = {CURRENT_SCHEMA_VERSION}\n\n[memory]\nbackend = \"none\"\n{}",
+            keys.iter()
+                .map(|key| format!("{key} = 1\n"))
+                .collect::<String>()
+        );
+        let (migrated, notices) = migrate_file_with_notices(&raw).unwrap().unwrap();
+        for key in keys {
+            let path = format!("memory.{key}");
+            assert!(
+                notices.iter().any(|n| matches!(
+                    n,
+                    MigrationNotice::Removed { path: removed, .. } if *removed == path
+                )),
+                "{path} was not retired: {notices:?}"
+            );
+            assert!(!migrated.contains(key), "{migrated}");
+        }
+        assert!(migrated.contains("backend = \"none\""), "{migrated}");
+    }
+
+    #[test]
     fn an_explicit_version_is_never_reported_as_inferred() {
         let raw = format!("schema_version = 3\n{HAND_WRITTEN_V3_WITHOUT_VERSION}");
         let v: toml::Value = toml::from_str(&raw).unwrap();
@@ -7646,6 +7702,22 @@ mention_only = false
         (
             "gateway.pairing_dashboard.max_pending_codes",
             "[gateway.pairing_dashboard]\nmax_pending_codes = 3\n",
+        ),
+        (
+            "memory.response_cache_enabled",
+            "[memory]\nresponse_cache_enabled = true\n",
+        ),
+        (
+            "memory.response_cache_ttl_minutes",
+            "[memory]\nresponse_cache_ttl_minutes = 60\n",
+        ),
+        (
+            "memory.response_cache_max_entries",
+            "[memory]\nresponse_cache_max_entries = 5000\n",
+        ),
+        (
+            "memory.response_cache_hot_entries",
+            "[memory]\nresponse_cache_hot_entries = 256\n",
         ),
     ];
 

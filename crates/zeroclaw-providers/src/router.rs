@@ -355,16 +355,6 @@ impl ModelProvider for RouterModelProvider {
             })
     }
 
-    fn has_stable_request_identity(&self, model: &str) -> bool {
-        if model.starts_with("hint:") {
-            return false;
-        }
-
-        self.model_providers
-            .get(self.default_index)
-            .is_some_and(|(_, provider)| provider.has_stable_request_identity(model))
-    }
-
     async fn chat_with_system(
         &self,
         system_prompt: Option<&str>,
@@ -774,10 +764,6 @@ mod tests {
             self.vision && model == "replay-model" && request.tools.is_none()
         }
 
-        fn has_stable_request_identity(&self, _model: &str) -> bool {
-            true
-        }
-
         async fn chat_with_system(
             &self,
             _system_prompt: Option<&str>,
@@ -1133,17 +1119,6 @@ mod tests {
         let (idx, model) = router.resolve("hint:reasoning");
         assert_eq!(idx, 1);
         assert_eq!(model, "claude-opus");
-    }
-
-    #[test]
-    fn routed_hint_request_identity_is_unstable() {
-        let (router, _) = make_router(
-            vec![("fast", "ok"), ("smart", "ok")],
-            vec![("reasoning", "smart", "claude-opus")],
-        );
-
-        assert!(!router.has_stable_request_identity("hint:reasoning"));
-        assert!(router.has_stable_request_identity("claude-opus"));
     }
 
     #[test]

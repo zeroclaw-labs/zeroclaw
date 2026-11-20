@@ -671,18 +671,6 @@ pub struct ModelInfo {
 
 #[async_trait]
 pub trait ModelProvider: Send + Sync + crate::attribution::Attributable {
-    /// Whether repeated requests for `model` are dispatched to one stable
-    /// provider/model identity.
-    ///
-    /// The default is deliberately unstable. Known leaf providers are marked
-    /// stable at their construction choke point; composite and out-of-tree
-    /// providers must opt in only when they can prove one concrete dispatch
-    /// identity. Callers use this fact to fail closed for identity-sensitive
-    /// behavior such as persistent full-response caching.
-    fn has_stable_request_identity(&self, _model: &str) -> bool {
-        false
-    }
-
     /// Whether this exact request shape can be replayed for `model` on the same
     /// provider/model route without internal retries, fallback, or key
     /// mutation. Runtime fails closed when this capability is absent.
@@ -1051,10 +1039,6 @@ impl<T: ModelProvider + ?Sized> ModelProvider for Arc<T> {
             options,
             policy,
         )
-    }
-
-    fn has_stable_request_identity(&self, model: &str) -> bool {
-        self.as_ref().has_stable_request_identity(model)
     }
 
     fn supports_exact_request_replay(&self, request: ChatRequest<'_>, model: &str) -> bool {

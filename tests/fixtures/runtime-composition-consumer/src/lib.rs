@@ -395,7 +395,6 @@ mod tests {
         };
         c.memory.backend = "none".into();
         c.memory.auto_save = false;
-        c.memory.response_cache_enabled = false;
         c.channels.session_backend = "sqlite".into();
         c.providers.models.custom.insert(
             "consumer".into(),

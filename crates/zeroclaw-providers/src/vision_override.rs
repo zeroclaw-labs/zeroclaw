@@ -9,15 +9,14 @@ use async_trait::async_trait;
 use futures_util::stream::BoxStream;
 use zeroclaw_api::model_provider::ModelInfo;
 
-/// Transparent decorator for factory-owned provider metadata.
+/// Transparent decorator that applies an optional `vision` capability override
+/// and delegates everything else to the wrapped provider.
 ///
-/// At the provider-construction choke point it both applies an optional vision
-/// override and marks the result as a known leaf with a stable dispatch
-/// identity. Other callers can retain the original vision-only behavior via
-/// [`VisionOverrideProvider::new`], which delegates identity stability.
+/// The provider factory wraps every leaf it builds with
+/// [`VisionOverrideProvider::factory_leaf`]; with no override set, the wrapper
+/// passes the inner provider's capability through unchanged.
 pub struct VisionOverrideProvider {
     supports_vision: Option<bool>,
-    stable_request_identity: Option<bool>,
     inner: Box<dyn ModelProvider>,
 }
 
@@ -25,7 +24,6 @@ impl VisionOverrideProvider {
     pub fn new(inner: Box<dyn ModelProvider>, supports_vision: bool) -> Self {
         Self {
             supports_vision: Some(supports_vision),
-            stable_request_identity: None,
             inner,
         }
     }
@@ -36,7 +34,6 @@ impl VisionOverrideProvider {
     ) -> Self {
         Self {
             supports_vision,
-            stable_request_identity: Some(true),
             inner,
         }
     }
@@ -46,11 +43,6 @@ impl VisionOverrideProvider {
 impl ModelProvider for VisionOverrideProvider {
     fn supports_exact_request_replay(&self, request: ChatRequest<'_>, model: &str) -> bool {
         self.inner.supports_exact_request_replay(request, model)
-    }
-
-    fn has_stable_request_identity(&self, model: &str) -> bool {
-        self.stable_request_identity
-            .unwrap_or_else(|| self.inner.has_stable_request_identity(model))
     }
 
     fn supports_single_tool_rounds(&self, model: &str) -> bool {
@@ -315,7 +307,6 @@ mod tests {
     use super::*;
     use crate::dispatch::AccountedChatScope;
     use crate::traits::ProviderCapabilities;
-    use std::sync::Arc;
     use zeroclaw_api::attribution::{Attributable, ModelProviderKind, ProviderKind, Role};
     use zeroclaw_api::model_provider::ModelPricing;
 
@@ -445,18 +436,6 @@ mod tests {
     }
 
     #[test]
-    fn request_identity_defaults_unstable_and_arc_delegates() {
-        let unknown = PricedVisionFake;
-        assert!(!unknown.has_stable_request_identity("model"));
-
-        let stable = Arc::new(VisionOverrideProvider::factory_leaf(
-            Box::new(PricedVisionFake),
-            None,
-        ));
-        assert!(stable.has_stable_request_identity("model"));
-    }
-
-    #[test]
     fn exact_replay_preserves_inner_model_and_request_restrictions() {
         let request = ChatRequest {
             messages: &[],
@@ -476,16 +455,6 @@ mod tests {
                 "routed-model"
             ));
         }
-    }
-
-    #[test]
-    fn ordinary_vision_override_preserves_inner_request_identity() {
-        let unstable = VisionOverrideProvider::new(Box::new(PricedVisionFake), false);
-        assert!(!unstable.has_stable_request_identity("model"));
-
-        let stable_inner = VisionOverrideProvider::factory_leaf(Box::new(PricedVisionFake), None);
-        let stable = VisionOverrideProvider::new(Box::new(stable_inner), false);
-        assert!(stable.has_stable_request_identity("model"));
     }
 
     #[test]

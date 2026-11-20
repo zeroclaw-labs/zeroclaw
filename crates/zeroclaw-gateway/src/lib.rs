@@ -10778,7 +10778,6 @@ path = "{trigger_path}"
         tmp: &tempfile::TempDir,
         provider_url: &str,
         daily_limit_usd: f64,
-        response_cache_enabled: bool,
     ) -> (AppState, Arc<CostTracker>) {
         use zeroclaw_config::multi_agent::{
             AgentMemoryConfig, AgentWorkspaceConfig, MemoryBackendKind,
@@ -10797,8 +10796,6 @@ path = "{trigger_path}"
         };
         config.memory.backend = "none".to_string();
         config.memory.auto_save = false;
-        config.memory.response_cache_enabled = response_cache_enabled;
-        config.memory.response_cache_ttl_minutes = 60;
         config.cost.enabled = true;
         config.cost.track_per_agent = true;
         config.cost.daily_limit_usd = daily_limit_usd;
@@ -10940,7 +10937,7 @@ data: [DONE]\n\n";
     async fn webhook_sse_production_agent_persists_usage_with_agent_alias() {
         let fixture = spawn_chat_completion_fixture(PRODUCTION_FIXTURE_STREAM).await;
         let tmp = tempfile::tempdir().expect("production gateway temp dir");
-        let (state, tracker) = production_sse_state(&tmp, &fixture.base_url(), 1.0, false);
+        let (state, tracker) = production_sse_state(&tmp, &fixture.base_url(), 1.0);
 
         let text = collect_production_sse(&state, "production stream", "production-cost").await;
 
@@ -10977,7 +10974,7 @@ data: [DONE]\n\n";
     async fn webhook_sse_production_budget_exhaustion_skips_provider_request() {
         let fixture = spawn_chat_completion_fixture(PRODUCTION_FIXTURE_STREAM).await;
         let tmp = tempfile::tempdir().expect("production gateway temp dir");
-        let (state, tracker) = production_sse_state(&tmp, &fixture.base_url(), 0.01, false);
+        let (state, tracker) = production_sse_state(&tmp, &fixture.base_url(), 0.01);
         tracker
             .record_usage_with_agent(
                 zeroclaw_config::cost::types::TokenUsage::new(
@@ -11015,52 +11012,6 @@ data: [DONE]\n\n";
     }
 
     #[tokio::test]
-    async fn webhook_sse_production_cache_hit_reconciles_no_chunk_final_response() {
-        let fixture = spawn_chat_completion_fixture(PRODUCTION_FIXTURE_STREAM).await;
-        let tmp = tempfile::tempdir().expect("production gateway temp dir");
-        let (state, tracker) = production_sse_state(&tmp, &fixture.base_url(), 1.0, true);
-
-        let first = collect_production_sse(&state, "cache me", "production-cache-first").await;
-        assert!(
-            first.contains("event: token"),
-            "cache seed must stream a token: {first}"
-        );
-        assert!(
-            first.contains("event: done"),
-            "cache seed must complete: {first}"
-        );
-        assert_eq!(fixture.requests.load(Ordering::SeqCst), 1);
-
-        let second = collect_production_sse(&state, "cache me", "production-cache-second").await;
-        assert!(
-            second.contains("event: token")
-                && second.contains(r#"data: {"text":"fixture answer"}"#),
-            "a production cache hit has no runtime chunks, so reconciliation must emit the final response: {second}"
-        );
-        assert!(
-            second.contains("event: done"),
-            "cache hit must still terminate with done: {second}"
-        );
-        assert!(
-            !second.contains("event: error"),
-            "cache hit must not emit an error: {second}"
-        );
-        assert_eq!(
-            fixture.requests.load(Ordering::SeqCst),
-            1,
-            "cache hit must not make another provider request"
-        );
-        assert_eq!(
-            tracker
-                .get_summary_for_agent("web")
-                .expect("cache cost summary")
-                .request_count,
-            1,
-            "cache hit must not record a second usage event"
-        );
-    }
-
-    #[tokio::test]
     async fn webhook_sse_production_receipt_suffix_reconciles_before_done() {
         use zeroclaw_config::schema::ToolReceiptsConfig;
 
@@ -11070,7 +11021,7 @@ data: [DONE]\n\n";
         ])
         .await;
         let tmp = tempfile::tempdir().expect("production receipt fixture temp dir");
-        let (state, _) = production_sse_state(&tmp, &fixture.base_url(), 1.0, false);
+        let (state, _) = production_sse_state(&tmp, &fixture.base_url(), 1.0);
         state.publish_test_config(|config| {
             // Selection admits the tool; the existing allowlist still controls execution.
             config.tools.optional = vec!["calculator".into()];
@@ -11252,7 +11203,7 @@ data: [DONE]\n\n";
     async fn webhook_sse_abort_cancels_backpressured_unread_client() {
         let fixture = spawn_burst_hanging_chat_completion_fixture().await;
         let tmp = tempfile::tempdir().expect("backpressure temp dir");
-        let (state, _) = production_sse_state(&tmp, &fixture.base_url(), 1.0, false);
+        let (state, _) = production_sse_state(&tmp, &fixture.base_url(), 1.0);
         let session_id = "sse-backpressure";
         let response = start_test_sse(&state, session_id).await;
         assert_eq!(response.status(), StatusCode::OK);
@@ -11437,7 +11388,7 @@ data: [DONE]\n\n";
 
         let fixture = spawn_hanging_chat_completion_fixture().await;
         let tmp = tempfile::tempdir().expect("transport test temp dir");
-        let (state, _) = production_sse_state(&tmp, &fixture.base_url(), 1.0, false);
+        let (state, _) = production_sse_state(&tmp, &fixture.base_url(), 1.0);
         let (gateway_addr, gateway_server) = spawn_test_ws_gateway(state.clone()).await;
         let session_id = "transport.ws-to.sse";
         let session_key = gateway_cancel_key(session_id);
@@ -11540,7 +11491,7 @@ data: [DONE]\n\n";
 
         let fixture = spawn_hanging_chat_completion_fixture().await;
         let tmp = tempfile::tempdir().expect("transport test temp dir");
-        let (state, _) = production_sse_state(&tmp, &fixture.base_url(), 1.0, false);
+        let (state, _) = production_sse_state(&tmp, &fixture.base_url(), 1.0);
         let session_id = "transport-sse-to-ws";
         let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
 
@@ -11632,7 +11583,7 @@ data: [DONE]\n\n";
 
         let tmp = tempfile::tempdir().expect("legacy-resume temp dir");
         let (mut state, _) =
-            production_sse_state(&tmp, "http://127.0.0.1:9/v1/chat/completions", 1.0, false);
+            production_sse_state(&tmp, "http://127.0.0.1:9/v1/chat/completions", 1.0);
         let session_db = tempfile::tempdir().expect("legacy-resume session db");
         let backend: std::sync::Arc<dyn zeroclaw_infra::session_backend::SessionBackend> =
             std::sync::Arc::new(
@@ -11706,7 +11657,7 @@ data: [DONE]\n\n";
 
         let tmp = tempfile::tempdir().expect("api-delivery temp dir");
         let (mut state, _) =
-            production_sse_state(&tmp, "http://127.0.0.1:9/v1/chat/completions", 1.0, false);
+            production_sse_state(&tmp, "http://127.0.0.1:9/v1/chat/completions", 1.0);
         let session_db = tempfile::tempdir().expect("api-delivery session db");
         state.session_backend = Some(std::sync::Arc::new(
             zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(session_db.path())
