@@ -27965,6 +27965,46 @@ mod tests {
     }
 
     #[test]
+    fn model_registry_refresh_scope_excludes_unrelated_chat_models() {
+        use crate::rpc::session::SessionOverrides;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut previous = make_model_refresh_test_config(&tmp);
+        let other = previous
+            .providers
+            .models
+            .ensure("openai", "other-provider")
+            .expect("other provider slot exists");
+        other.api_key = Some("test-key-other".into());
+        other.uri = Some("http://127.0.0.1:1/v1".into());
+        other.model = Some("other-v1".into());
+
+        let mut next = previous.clone();
+        next.providers
+            .models
+            .ensure("openai", "other-provider")
+            .expect("other provider exists")
+            .model = Some("other-v2".into());
+
+        let changed = changed_chat_model_refs(&previous, &next).unwrap();
+        assert_eq!(changed, vec!["openai.other-provider"]);
+
+        let scope = LiveSessionRefreshScope::ModelRefs(changed);
+        assert_eq!(
+            scope
+                .resolve_provider_ref_for_update(
+                    &previous,
+                    &next,
+                    "test-agent",
+                    &SessionOverrides::default(),
+                )
+                .unwrap(),
+            None,
+            "a running chat on test-provider must not be selected when another model changes"
+        );
+    }
+
+    #[test]
     fn provider_refresh_selects_inheritors_and_matching_overrides() {
         let mut config = Config::default();
         config
