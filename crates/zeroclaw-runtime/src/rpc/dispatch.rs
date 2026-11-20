@@ -10613,6 +10613,29 @@ impl RpcDispatcher {
                 continue;
             }
 
+            // ModelRefs can be narrowed before taking the per-session turn
+            // guard. This is the important fast path for a registry edit:
+            // an unrelated running chat must not hold up the config writer
+            // merely because another model changed. We still re-read the
+            // overrides below after acquiring the guard, so a concurrent
+            // session/configure cannot make this early decision stale.
+            if let LiveSessionRefreshScope::ModelRefs(_) = scope {
+                let Some(overrides) = ctx.sessions.get_overrides(&session_id).await else {
+                    continue;
+                };
+                if scope
+                    .resolve_provider_ref_for_update(
+                        &previous_config,
+                        config,
+                        &agent_alias,
+                        &overrides,
+                    )?
+                    .is_none()
+                {
+                    continue;
+                }
+            }
+
             // Acquire the per-session ordering boundary. This serialises
             // with session/configure so the state we read afterwards
             // reflects any configure that committed before this point.
