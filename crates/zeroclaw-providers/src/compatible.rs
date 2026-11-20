@@ -5553,7 +5553,9 @@ mod tests {
             async |client: Client| client.get(&url).send().await.unwrap().text().await.unwrap();
         for custom_headers in [false, true] {
             let mut builder = OpenAiCompatibleModelProvider::builder("test")
+                .display_name("transport-test")
                 .base_url(&url)
+                .auth_style(AuthStyle::Bearer)
                 .read_timeout_secs(30);
             if custom_headers {
                 builder = builder.user_agent("transport-test");
