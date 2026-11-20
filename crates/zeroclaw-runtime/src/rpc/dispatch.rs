@@ -158,7 +158,6 @@ impl MethodAuthzExt for Method {
             M::CronTrigger => (Resource::Cron, Verb::Execute),
 
             M::ConfigGet
-            | M::ConfigRegistryGet
             | M::ConfigValidate
             | M::ConfigList
             | M::ConfigMapKeys
@@ -168,11 +167,9 @@ impl MethodAuthzExt for Method {
             | M::ConfigStatus
             | M::ConfigCatalog
             | M::ConfigCatalogModels => (Resource::Config, Verb::Read),
-            M::ConfigSet
-            | M::ConfigSetMany
-            | M::ConfigReload
-            | M::ConfigMapKeyRename
-            | M::ConfigRegistrySet => (Resource::Config, Verb::Update),
+            M::ConfigSet | M::ConfigSetMany | M::ConfigReload | M::ConfigMapKeyRename => {
+                (Resource::Config, Verb::Update)
+            }
             M::ConfigMapKeyCreate => (Resource::Config, Verb::Create),
             M::ConfigDelete | M::ConfigMapKeyDelete => (Resource::Config, Verb::Delete),
 
@@ -3596,11 +3593,6 @@ impl RpcDispatcher {
 
             // Config
             Method::ConfigGet => self.handle_config_get(params),
-            Method::ConfigRegistryGet => {
-                zeroclaw_config::provider_registry::editor::snapshot(&self.ctx.config.read())
-                    .map_err(|error| rpc_err(INVALID_PARAMS, error.to_string()))
-            }
-            Method::ConfigRegistrySet => Box::pin(self.handle_config_registry_set(params)).await,
             Method::ConfigSet => Box::pin(self.handle_config_set(params)).await,
             Method::ConfigSetMany => Box::pin(self.handle_config_set_many(params)).await,
             Method::ConfigValidate => self.handle_config_validate(),
@@ -10023,12 +10015,16 @@ impl RpcDispatcher {
 
     // ── Config handlers ──────────────────────────────────────────
 
+    // Test-only coverage for the canonical registry transaction. The shipped
+    // RPC surface is intentionally kept in the gateway/config owner; runtime
+    // must not grow a second registry-edit endpoint.
+    #[cfg(test)]
     async fn handle_config_registry_set(&self, params: &Value) -> RpcResult {
         use zeroclaw_api::grants::{Resource, Verb};
         use zeroclaw_config::provider_registry::editor;
 
         let edit: editor::RegistryEdit = parse_params(params)?;
-        let method = Method::ConfigRegistrySet;
+        let method = Method::ConfigSet;
         self.selector_config_write(method, "providers")?;
         let commit = self
             .ctx
