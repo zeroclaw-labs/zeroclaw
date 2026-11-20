@@ -195,10 +195,10 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
         quote! { #path::decrypt_secrets(self, store)?; }
     });
     let mask_secrets_hook = secret_hook.as_ref().map(|path| {
-        quote! { #path::mask_secrets(self); }
+        quote! { #path::mask_secrets(self)?; }
     });
     let restore_secrets_hook = secret_hook.as_ref().map(|path| {
-        quote! { #path::restore_secrets_from(self, current); }
+        quote! { #path::restore_secrets_from(self, current)?; }
     });
     let integration_descriptor_method = match build_integration_descriptor_method(&input.attrs) {
         Ok(method) => method,
@@ -2090,18 +2090,18 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                         for mut section in <#field_ty>::map_key_sections() {
                             let outer_prefix = Self::configurable_prefix();
                             let inner_prefix = <#field_ty>::configurable_prefix();
-                            let rebased = if outer_prefix.is_empty() {
+                            let rebased = if inner_prefix.is_empty() {
                                 Some(section.path.as_str())
                             } else {
                                 section.path
-                                    .strip_prefix(outer_prefix)
+                                    .strip_prefix(inner_prefix)
                                     .and_then(|s| s.strip_prefix('.'))
                             };
                             if let Some(leaf) = rebased {
-                                section.path = if inner_prefix.is_empty() {
+                                section.path = if outer_prefix.is_empty() {
                                     leaf.to_string()
                                 } else {
-                                    format!("{inner_prefix}.{leaf}")
+                                    format!("{outer_prefix}.{leaf}")
                                 };
                                 out.push(section);
                             }
@@ -2580,12 +2580,12 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
         impl crate::traits::MaskSecrets for #struct_name {
             fn mask_secrets(&mut self) -> anyhow::Result<()> {
                 #(#mask_ops)*
-#mask_secrets_hook
+                #mask_secrets_hook
                 Ok(())
             }
             fn restore_secrets_from(&mut self, current: &Self) -> anyhow::Result<()> {
                 #(#restore_ops)*
-#restore_secrets_hook
+                #restore_secrets_hook
                 Ok(())
             }
         }
@@ -3284,6 +3284,8 @@ fn extract_hashmap_value_type(ty: &syn::Type) -> Option<&syn::Type> {
 /// Deserialize a configuration through a transient input DTO, then normalize
 /// it before exposing the authoritative value. Both DTO and value use the
 /// original field definitions, so schema fields cannot drift between them.
+/// Only direct `serde` and `cfg` attributes are copied to the input DTO;
+/// conditional serde attributes via `cfg_attr` are not supported.
 #[proc_macro_attribute]
 pub fn normalize_config_input(args: TokenStream, item: TokenStream) -> TokenStream {
     let normalize = parse_macro_input!(args as syn::Path);
