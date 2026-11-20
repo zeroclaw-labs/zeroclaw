@@ -13141,6 +13141,24 @@ fn one_shot_channel_workspace_dir(config: &Config, channel_type: &str, alias: &s
     config.channel_workspace_dir(&format!("{channel_type}.{alias}"))
 }
 
+#[cfg(feature = "channel-telegram")]
+fn telegram_ack_reaction_emojis_resolver(
+    config: &zeroclaw_config::live::LiveConfigHandle,
+    alias: &str,
+) -> Arc<dyn Fn() -> Vec<String> + Send + Sync> {
+    let config = config.clone();
+    let alias = alias.to_string();
+    Arc::new(move || {
+        config
+            .read()
+            .channels
+            .telegram
+            .get(&alias)
+            .map(|telegram| telegram.ack_reaction_emojis.clone())
+            .unwrap_or_default()
+    })
+}
+
 #[cfg(feature = "channel-slack")]
 fn slack_thread_context_max_messages_resolver(
     config_arc: &zeroclaw_config::live::LiveConfigHandle,
@@ -13232,6 +13250,9 @@ fn build_channel_by_id(
                 .with_persistence_authority(authority.clone())
                 .with_api_base(tg.api_base_url.clone())
                 .with_ack_reactions(ack)
+                .with_ack_reaction_emojis_resolver(telegram_ack_reaction_emojis_resolver(
+                    config_arc, &alias,
+                ))
                 .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
                 .with_passive_group_context(tg.passive_group_context)
                 .with_transcription_manager(
@@ -14813,6 +14834,9 @@ fn collect_configured_channels_with_authority(
                     .with_persistence_authority(authority.clone())
                     .with_api_base(tg.api_base_url.clone())
                     .with_ack_reactions(ack)
+                    .with_ack_reaction_emojis_resolver(telegram_ack_reaction_emojis_resolver(
+                        config_arc, alias,
+                    ))
                     .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
                     .with_passive_group_context(tg.passive_group_context)
                     .with_transcription_manager(
@@ -52802,6 +52826,35 @@ This is an example JSON object for profile settings."#;
         assert_ne!(resolved, config.data_dir);
     }
 
+    #[cfg(feature = "channel-telegram")]
+    #[test]
+    fn telegram_ack_reaction_pool_tracks_live_alias_config() {
+        let mut config = Config::default();
+        config.channels.telegram.insert(
+            "work".into(),
+            zeroclaw_config::schema::TelegramConfig {
+                ack_reaction_emojis: vec!["👀".into()],
+                ..Default::default()
+            },
+        );
+        let live = zeroclaw_config::live::LiveConfig::new(config);
+        let resolver = telegram_ack_reaction_emojis_resolver(&live.handle(), "work");
+        let other = telegram_ack_reaction_emojis_resolver(&live.handle(), "other");
+
+        assert_eq!(resolver(), ["👀"]);
+        let mut updated = live.snapshot();
+        updated
+            .channels
+            .telegram
+            .get_mut("work")
+            .unwrap()
+            .ack_reaction_emojis = vec!["👍".into()];
+        live.publish(live.next_revision().unwrap(), updated)
+            .unwrap();
+        assert_eq!(resolver(), ["👍"]);
+        assert!(other().is_empty());
+    }
+
     #[cfg(feature = "channel-slack")]
     #[test]
     fn slack_thread_context_resolver_tracks_live_alias_config() {
@@ -53534,6 +53587,7 @@ This is an example JSON object for profile settings."#;
                 per_user_session: true,
                 passive_group_context: false,
                 ack_reactions: None,
+                ack_reaction_emojis: Vec::new(),
                 proxy_url: None,
                 approval_timeout_secs: 120,
                 excluded_tools: vec![],
@@ -53567,6 +53621,7 @@ This is an example JSON object for profile settings."#;
                 per_user_session: true,
                 passive_group_context: false,
                 ack_reactions: None,
+                ack_reaction_emojis: Vec::new(),
                 proxy_url: None,
                 approval_timeout_secs: 120,
                 excluded_tools: vec![],
