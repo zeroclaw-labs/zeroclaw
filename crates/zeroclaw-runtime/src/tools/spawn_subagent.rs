@@ -1805,6 +1805,96 @@ mod tests {
         );
     }
 
+    /// A local-only parent turn under `cloud_escalation = "auto"`: an unhinted
+    /// child whose detailed prompt would escalate on its own stays on the
+    /// local route instead of being refused for leaving the parent's scope.
+    #[tokio::test]
+    async fn an_unhinted_detailed_child_of_a_local_turn_runs_locally() {
+        use zeroclaw_config::scattered_types::{CloudEscalationPolicy, EffortRoutingConfig};
+        use zeroclaw_config::schema::{
+            ModelProviderConfig, ModelRouteConfig, OllamaModelProviderConfig, RuntimeProfileConfig,
+        };
+
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let (local_uri, local_received, local_server) = recording_provider().await;
+        let (cloud_uri, cloud_received, cloud_server) = recording_provider().await;
+        let mut config = routed_dispatch_config(tmp.path(), &local_uri, &cloud_uri);
+        config.providers.models.ollama.insert(
+            "cloud".into(),
+            OllamaModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("cloud-model".into()),
+                    uri: Some(cloud_uri),
+                    timeout_secs: Some(5),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        config.model_routes = vec![
+            ModelRouteConfig {
+                hint: "local".into(),
+                model_provider: "ollama.parent".into(),
+                model: "parent-model".into(),
+                ..Default::default()
+            },
+            ModelRouteConfig {
+                hint: "cloud".into(),
+                model_provider: "ollama.cloud".into(),
+                model: "cloud-model".into(),
+                ..Default::default()
+            },
+        ];
+        config.runtime_profiles.insert(
+            "effort".into(),
+            RuntimeProfileConfig {
+                effort_routing: Some(EffortRoutingConfig {
+                    local_hint: "local".into(),
+                    cloud_hint: "cloud".into(),
+                    cloud_escalation: CloudEscalationPolicy::Auto,
+                }),
+                ..Default::default()
+            },
+        );
+        config
+            .agents
+            .get_mut("alpha")
+            .expect("fixture agent")
+            .runtime_profile = "effort".into();
+        let detailed = "a".repeat(201);
+        let spawn = |config: Config| {
+            let detailed = detailed.clone();
+            async move {
+                let security =
+                    SecurityPolicy::for_agent(&config, "alpha").expect("fixture policy resolves");
+                SpawnSubagentTool::new(Arc::new(config), "alpha", Arc::new(security))
+                    .execute(json!({ "prompt": detailed }))
+                    .await
+                    .expect("structured result")
+            }
+        };
+
+        let local_only = Arc::new(std::collections::HashSet::from([
+            "ollama.parent".to_string()
+        ]));
+        let restricted = crate::agent::turn::scope_model_switch_provider_allowlist(
+            Some(local_only),
+            Box::pin(spawn(config.clone())),
+        )
+        .await;
+        assert!(restricted.success, "child must run locally: {restricted:?}");
+        assert!(!local_received.lock().unwrap().is_empty());
+        assert!(cloud_received.lock().unwrap().is_empty());
+
+        let unrestricted = Box::pin(spawn(config)).await;
+        local_server.abort();
+        cloud_server.abort();
+        assert!(
+            unrestricted.success && !cloud_received.lock().unwrap().is_empty(),
+            "control: without a parent allowlist the detailed prompt escalates: {unrestricted:?}"
+        );
+    }
+
     /// A bound parent's routed child asks the bound provider source for the
     /// route, for the bound principal, and never builds a provider from config.
     #[tokio::test]

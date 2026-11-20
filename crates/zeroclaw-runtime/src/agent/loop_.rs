@@ -277,6 +277,32 @@ fn effort_turn_route(
     }))
 }
 
+/// The effort policy a run routes by. A child whose inherited allowlist
+/// excludes the cloud route's provider routes as if escalation were off, so a
+/// detailed subtask from a local-only turn runs locally instead of failing.
+/// The cloud route is found as `resolve_effort_route` finds it: last exact hint.
+fn effort_policy_within(
+    config: &Config,
+    policy: Option<&zeroclaw_config::scattered_types::EffortRoutingConfig>,
+    inherited: Option<&Arc<HashSet<String>>>,
+) -> Option<zeroclaw_config::scattered_types::EffortRoutingConfig> {
+    let mut policy = policy?.clone();
+    if let Some(inherited) = inherited {
+        let cloud_hint = policy.cloud_hint.trim();
+        let cloud_allowed = config
+            .model_routes
+            .iter()
+            .rev()
+            .find(|route| route.hint == cloud_hint)
+            .is_some_and(|route| inherited.contains(&route.model_provider));
+        if !cloud_allowed {
+            policy.cloud_escalation =
+                zeroclaw_config::scattered_types::CloudEscalationPolicy::Never;
+        }
+    }
+    Some(policy)
+}
+
 fn effort_scoped_provider_config(
     config: &Config,
     allowed_provider_refs: &HashSet<String>,
@@ -1961,14 +1987,18 @@ async fn run_inner(
         };
         let mut effort_provider_config = None;
         let mut active_effort_provider_refs: Option<Arc<HashSet<String>>> = None;
+        let inherited_provider_allowlist = overrides.provider_allowlist.clone();
+        let effort_policy = effort_policy_within(
+            &config,
+            agent.resolved.effort_routing.as_ref(),
+            inherited_provider_allowlist.as_ref(),
+        );
         if automatic_model_routing && let Some(initial_message) = message.as_deref() {
             let effective_message =
                 crate::agent::thinking::strip_thinking_directive(initial_message);
-            if let Some(selection) = effort_turn_route(
-                &config,
-                agent.resolved.effort_routing.as_ref(),
-                effective_message.as_ref(),
-            )? {
+            if let Some(selection) =
+                effort_turn_route(&config, effort_policy.as_ref(), effective_message.as_ref())?
+            {
                 provider_name = selection.model_provider;
                 model_name = selection.model;
                 effort_provider_config = Some(effort_scoped_provider_config(
@@ -1978,7 +2008,6 @@ async fn run_inner(
                 active_effort_provider_refs = Some(selection.allowed_provider_refs);
             }
         }
-        let inherited_provider_allowlist = overrides.provider_allowlist.clone();
         let allowed = match active_effort_provider_refs.take() {
             Some(own) => Some(narrow_provider_allowlist(
                 own,
@@ -2890,11 +2919,8 @@ async fn run_inner(
                 });
 
                 if automatic_model_routing
-                    && let Some(selection) = effort_turn_route(
-                        &config,
-                        agent.resolved.effort_routing.as_ref(),
-                        &effective_input,
-                    )?
+                    && let Some(selection) =
+                        effort_turn_route(&config, effort_policy.as_ref(), &effective_input)?
                 {
                     let allowed_provider_refs = narrow_provider_allowlist(
                         selection.allowed_provider_refs,

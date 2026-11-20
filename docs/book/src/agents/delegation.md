@@ -87,7 +87,9 @@ Choosing a route takes two permissions, and both must hold:
 
 Every SubAgent, hinted or not, inherits that allowlist for all its provider
 attempts: provider fallbacks and the child's own effort routing stay inside
-it, so a local-only turn's child never falls back to a cloud provider.
+it, so a local-only turn's child never falls back to a cloud provider. When
+that allowlist excludes the cloud route's provider, the child's own effort
+routing never escalates: a detailed subtask from a local turn runs locally.
 
 A parent bound to supplied capabilities resolves the route through its own
 provider source and principal, never a provider built from config.
