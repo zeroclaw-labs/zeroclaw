@@ -3678,7 +3678,7 @@ data: {{\"type\":\"message_stop\"}}\n\n"
         /// The same gateway with the fixture agent's history capped at
         /// `max_history_messages`, so a turn trims what it replays.
         async fn spawn_with_history_cap(max_history_messages: Option<usize>) -> Self {
-            Self::spawn_with(None, move |config| {
+            Self::spawn_with(None, None, move |config| {
                 config
                     .runtime_profiles
                     .get_mut("fixture")
