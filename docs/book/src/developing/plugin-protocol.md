@@ -492,7 +492,9 @@ Every call passes five host-owned checks before spawning a turn:
    and `dispatch_rate_per_min` from live config on every call (default empty
    target list and `30` wakes/min; `"*"` allows any enabled agent). Targets
    outside the grant return `access-denied`; disabled or missing agents return
-   `unknown-agent`.
+   `unknown-agent`. A grant that names an agent follows that agent when it is
+   renamed and is removed when the agent is deleted; a `"*"` grant is left as
+   it is.
 5. **Coalescing and rate limit:** wakes for an `(instance, target)` pair already
    running a plugin wake turn coalesce into at most one pending follow-up turn
    (retaining the latest prompt and caller attribution). The first pending
