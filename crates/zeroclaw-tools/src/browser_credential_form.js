@@ -52,13 +52,23 @@ function submitCatalogCredential({ origin, values, stage = "auto", field = null,
       }
     } else return false;
     const form = fields[0][0].form;
-    if (!form || fields.some(([control]) => control.form !== form) ||
-        form.method.toLowerCase() !== "post" || (form.target && form.target !== "_self") ||
-        new URL(form.action, doc.baseURI).origin !== origin) return false;
+    if (!form || fields.some(([control]) => control.form !== form)) return false;
+    const submitters = [...form.elements].filter(control =>
+      ["submit", "image"].includes(control.type) && !control.disabled &&
+      control.getClientRects().length !== 0
+    );
+    if (submitters.length > 1) return false;
+    const submitter = submitters[0];
+    const action = submitter?.hasAttribute("formaction") ? submitter.formAction : form.action;
+    const method = submitter?.hasAttribute("formmethod") ? submitter.formMethod : form.method;
+    const target = submitter?.hasAttribute("formtarget") ? submitter.formTarget : form.target;
+    if (method.toLowerCase() !== "post" || (target && target !== "_self") ||
+        new URL(action, doc.baseURI).origin !== origin) return false;
 
     try {
       for (const [control, value] of fields) control.value = value;
-      formType.prototype.submit.call(form);
+      if (submitter) formType.prototype.requestSubmit.call(form, submitter);
+      else formType.prototype.requestSubmit.call(form);
       return true;
     } finally {
       for (const [control] of fields) control.value = "";

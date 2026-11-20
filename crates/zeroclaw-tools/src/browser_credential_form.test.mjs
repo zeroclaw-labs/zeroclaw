@@ -6,14 +6,18 @@ import test from "node:test";
 const source = readFileSync(new URL("./browser_credential_form.js", import.meta.url), "utf8");
 const origin = "https://login.example.test";
 
-function fixture({ action = origin + "/submit", method = "post", top = true, maskedOtp = false, duplicateOtp = false, frameOrigin = origin } = {}) {
+function fixture({ action = origin + "/submit", method = "post", top = true, maskedOtp = false, duplicateOtp = false, frameOrigin = origin, submitOverride } = {}) {
   const sent = [];
-  class Form { submit() { sent.push(fields.map(field => field.value)); } }
+  class Form { requestSubmit() { sent.push(fields.map(field => field.value)); } }
   class Input {
     value = "";
     getClientRects() { return [1]; }
   }
-  const form = Object.assign(new Form(), { action, method, target: "" });
+  const button = {
+    type: "submit", formAction: submitOverride, getClientRects: () => [1],
+    hasAttribute: name => name === "formaction" && !!submitOverride,
+  };
+  const form = Object.assign(new Form(), { action, method, target: "", elements: [button] });
   const fields = ["text", "password", maskedOtp ? "password" : "text"].map(type => Object.assign(new Input(), { form, type }));
   const segments = Array.from({length:6}, () => Object.assign(new Input(), { form, type:"text", maxLength:1 }));
   fields.push(...segments);
@@ -98,5 +102,13 @@ test("fills a selected six-segment OTP group", () => {
   const {run,sent,fields}=fixture();
   assert.equal(run({otp:"123456"},{stage:"otp",field:".segment"}),true);
   assert.deepEqual(sent[0].slice(3),["1","2","3","4","5","6"]);
+  assert.ok(fields.every(field=>field.value===""));
+});
+
+
+test("refuses a submit button that overrides the destination", () => {
+  const {run,sent,fields}=fixture({submitOverride:"https://elsewhere.example.test/submit"});
+  assert.equal(run({otp:"123456"}),false);
+  assert.deepEqual(sent,[]);
   assert.ok(fields.every(field=>field.value===""));
 });
