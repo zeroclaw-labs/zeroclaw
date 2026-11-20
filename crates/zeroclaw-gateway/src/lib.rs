@@ -6017,7 +6017,7 @@ mod tests {
     #[test]
     fn security_body_limit_is_64kb() {
         assert_eq!(MAX_BODY_SIZE, 65_536);
-        assert!(MAX_PROVIDER_REGISTRY_BODY_SIZE > MAX_BODY_SIZE);
+        assert_eq!(MAX_PROVIDER_REGISTRY_BODY_SIZE, 4 * 1024 * 1024);
     }
 
     #[test]
