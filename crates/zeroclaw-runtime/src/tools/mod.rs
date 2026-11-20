@@ -2754,6 +2754,7 @@ fn all_tools_with_runtime_on_thread(
             browser_config.allowed_private_hosts.clone(),
         ) {
             Ok(tool) => {
+                let tool = tool.with_credential_config(root_config.config_path.clone());
                 tool_arcs.push(Arc::new(RateLimitedTool::new(tool, security.clone())));
             }
             Err(e) => {

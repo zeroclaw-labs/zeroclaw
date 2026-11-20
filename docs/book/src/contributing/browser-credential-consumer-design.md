@@ -27,3 +27,9 @@ The initial acceptance sequence is a disposable HTTPS login with separate passwo
 A disposable browser session on Jarvis, run as the ZeroClaw service user, verified that agent-browser 0.39.1 and its installed Chrome can run with a private temporary socket directory and execute a synthetic expression supplied through standard input. The result was 42. The probe did not use a vault record, a live identity provider, or the running service's browser session.
 
 A one-shot credential-provider plugin is another supported input path for username/password. Neither the stdin probe nor the plugin API provides the full TOTP and authenticated-session contract by itself. The managed executor must bind release to the correct document, prevent generic browser observations while credentials are present, discard raw backend errors, and close the disposable session on failure or cancellation.
+
+## Draft runtime implementation
+
+The action submit_credential takes one catalog alias on the active login page. The executor rechecks the catalog after vault lookup and sends values through standard input. The form helper accepts visible top-level fields and a same-origin HTTPS POST action. Its result indicates submission, not authentication. This implementation targets standard HTML forms and six-digit SHA-1 TOTP with a 30-second step.
+
+A public Hetzner Console probe on Jarvis redirected to accounts.hetzner.com and reached an edge verification page with no login form. Production acceptance still requires real password and TOTP challenges and confirmation of the console view.
