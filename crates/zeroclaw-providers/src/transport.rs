@@ -23,6 +23,9 @@ pub(crate) struct ChatHttpPolicy<'a> {
     pub read_timeout: Option<Duration>,
     pub headers: HeaderMap,
     pub redirect_endpoint: Option<&'a str>,
+    /// Compatible adapters historically ignore malformed custom PEM and retain
+    /// system roots. Keep that policy while including the bytes in pool identity.
+    pub tls_ca_cert_pem: Option<&'a [u8]>,
 }
 
 impl ChatHttpPolicy<'_> {
@@ -31,6 +34,7 @@ impl ChatHttpPolicy<'_> {
         self.request_timeout.hash(&mut fingerprint);
         self.read_timeout.hash(&mut fingerprint);
         self.redirect_endpoint.hash(&mut fingerprint);
+        self.tls_ca_cert_pem.hash(&mut fingerprint);
         for (name, value) in &self.headers {
             name.as_str().hash(&mut fingerprint);
             value.as_bytes().hash(&mut fingerprint);
@@ -51,6 +55,21 @@ impl ChatHttpPolicy<'_> {
                 }
                 if let Some(endpoint) = self.redirect_endpoint {
                     builder = crate::opencode_session::restrict_redirects(builder, endpoint);
+                }
+                if let Some(pem) = self.tls_ca_cert_pem {
+                    match reqwest::Certificate::from_pem(pem) {
+                        Ok(cert) => builder = builder.add_root_certificate(cert),
+                        Err(error) => ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"error": error.to_string()})),
+                            "Failed to parse CA certificate — TLS will use system roots"
+                        ),
+                    }
                 }
                 Ok(builder)
             },

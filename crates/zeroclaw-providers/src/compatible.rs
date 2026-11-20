@@ -15,7 +15,7 @@ use crate::traits::{
 use async_trait::async_trait;
 use futures_util::{StreamExt, stream};
 use reqwest::{
-    Client, ClientBuilder,
+    Client,
     header::{HeaderMap, HeaderValue, USER_AGENT},
 };
 use serde::{Deserialize, Serialize};
@@ -984,24 +984,6 @@ impl OpenAiCompatibleModelProvider {
             auth_profile_override: None,
         }
     }
-    /// Add the configured custom CA certificate to a reqwest builder.
-    /// The PEM bytes were loaded at construction, so this performs no disk I/O.
-    fn add_tls_cert_to_builder(&self, builder: ClientBuilder) -> ClientBuilder {
-        if let Some(ref pem) = self.tls_ca_cert_pem {
-            match reqwest::Certificate::from_pem(pem) {
-                Ok(cert) => return builder.add_root_certificate(cert),
-                Err(e) => ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                    "Failed to parse CA certificate — TLS will use system roots"
-                ),
-            }
-        }
-        builder
-    }
-
     /// Collect all `system` role messages and keep them in a provider-safe
     /// shape. Strict OpenAI-compatible endpoints accept a leading system
     /// message but reject system messages later in the history.
@@ -1053,114 +1035,47 @@ impl OpenAiCompatibleModelProvider {
         (result, true)
     }
 
-    fn http_client(&self) -> Client {
-        let timeout = self.timeout_secs;
-        let has_user_agent = self.user_agent.is_some();
-        let has_extra_headers = !self.extra_headers.is_empty();
-        let has_tls_cert = self.tls_ca_cert_pem.is_some();
-        // An OpenCode client needs its own redirect policy, which the shared
-        // cached client below does not carry.
+    fn transport_headers(&self) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        if let Some(ua) = self.user_agent.as_deref()
+            && let Ok(value) = HeaderValue::from_str(ua)
+        {
+            headers.insert(USER_AGENT, value);
+        }
+        for (key, value) in &self.extra_headers {
+            match (
+                reqwest::header::HeaderName::from_bytes(key.as_bytes()),
+                HeaderValue::from_str(value),
+            ) {
+                (Ok(name), Ok(value)) => {
+                    headers.insert(name, value);
+                }
+                _ => ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"header": key})),
+                    "Skipping invalid extra header name or value"
+                ),
+            }
+        }
+        headers
+    }
+
+    fn http_client(&self) -> anyhow::Result<Client> {
         let endpoint = self.chat_completions_url();
-        let targets_opencode = crate::opencode_session::is_opencode_target(&endpoint);
-
-        if has_user_agent || has_extra_headers || has_tls_cert || targets_opencode {
-            let mut headers = HeaderMap::new();
-            if let Some(ua) = self.user_agent.as_deref()
-                && let Ok(value) = HeaderValue::from_str(ua)
-            {
-                headers.insert(USER_AGENT, value);
-            }
-            for (key, value) in &self.extra_headers {
-                match (
-                    reqwest::header::HeaderName::from_bytes(key.as_bytes()),
-                    HeaderValue::from_str(value),
-                ) {
-                    (Ok(name), Ok(val)) => {
-                        headers.insert(name, val);
-                    }
-                    _ => {
-                        ::zeroclaw_log::record!(
-                            WARN,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Note
-                            )
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                            .with_attrs(::serde_json::json!({"header": key})),
-                            "Skipping invalid extra header name or value"
-                        );
-                    }
-                }
-            }
-
-            let builder = Client::builder().connect_timeout(std::time::Duration::from_secs(10));
-            let builder = if self.timeout_disabled {
-                builder
-            } else {
-                builder.timeout(std::time::Duration::from_secs(timeout))
-            };
-            let builder = builder.default_headers(headers);
-            let builder = match self.read_timeout_secs {
-                Some(read_timeout) if !self.read_timeout_disabled => {
-                    builder.read_timeout(std::time::Duration::from_secs(read_timeout))
-                }
-                _ => builder,
-            };
-            let builder = crate::opencode_session::restrict_redirects(builder, &endpoint);
-            let builder = self.add_tls_cert_to_builder(builder);
-            let builder = zeroclaw_config::schema::apply_runtime_proxy_to_builder(
-                builder,
-                "model_provider.compatible",
-            );
-
-            return builder.build().unwrap_or_else(|error| {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(
-                            ::serde_json::json!({"error": super::format_error_chain(&error)})
-                        ),
-                    "Failed to build proxied timeout client with custom headers or TLS certificate: "
-                );
-                Client::new()
-            });
+        crate::transport::ChatHttpPolicy {
+            request_timeout: (!self.timeout_disabled)
+                .then(|| std::time::Duration::from_secs(self.timeout_secs)),
+            read_timeout: self
+                .read_timeout_secs
+                .filter(|_| !self.read_timeout_disabled)
+                .map(std::time::Duration::from_secs),
+            headers: self.transport_headers(),
+            redirect_endpoint: Some(&endpoint),
+            tls_ca_cert_pem: self.tls_ca_cert_pem.as_deref(),
         }
-
-        if self.timeout_disabled || self.read_timeout_disabled || self.read_timeout_secs.is_some() {
-            let builder = Client::builder().connect_timeout(std::time::Duration::from_secs(10));
-            let builder = if self.timeout_disabled {
-                builder
-            } else {
-                builder.timeout(std::time::Duration::from_secs(timeout))
-            };
-            let builder = if let Some(read_timeout) = self.read_timeout_secs {
-                builder.read_timeout(std::time::Duration::from_secs(read_timeout))
-            } else {
-                builder
-            };
-            let builder = zeroclaw_config::schema::apply_runtime_proxy_to_builder(
-                builder,
-                "model_provider.compatible",
-            );
-            return builder.build().unwrap_or_else(|error| {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(
-                            ::serde_json::json!({"error": super::format_error_chain(&error)})
-                        ),
-                    "Failed to build provider client with configured read timeout: "
-                );
-                Client::new()
-            });
-        }
-        zeroclaw_config::schema::build_runtime_proxy_client_with_timeouts(
-            "model_provider.compatible",
-            timeout,
-            10,
-        )
+        .client("model_provider.compatible")
     }
 
     fn streaming_timeouts(&self) -> super::StreamTimeouts {
@@ -1179,99 +1094,17 @@ impl OpenAiCompatibleModelProvider {
     }
 
     /// Apply the same resolved deadlines used by streaming error diagnostics.
-    fn streaming_http_client(&self) -> Client {
+    fn streaming_http_client(&self) -> anyhow::Result<Client> {
         let endpoint = self.chat_completions_url();
         let timeouts = self.streaming_timeouts();
-        let has_user_agent = self.user_agent.is_some();
-        let has_extra_headers = !self.extra_headers.is_empty();
-        let has_tls_cert = self.tls_ca_cert_pem.is_some();
-
-        if has_user_agent || has_extra_headers || has_tls_cert {
-            let mut headers = HeaderMap::new();
-            if let Some(ua) = self.user_agent.as_deref()
-                && let Ok(value) = HeaderValue::from_str(ua)
-            {
-                headers.insert(USER_AGENT, value);
-            }
-            for (key, value) in &self.extra_headers {
-                match (
-                    reqwest::header::HeaderName::from_bytes(key.as_bytes()),
-                    HeaderValue::from_str(value),
-                ) {
-                    (Ok(name), Ok(val)) => {
-                        headers.insert(name, val);
-                    }
-                    _ => {
-                        ::zeroclaw_log::record!(
-                            WARN,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Note
-                            )
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                            .with_attrs(::serde_json::json!({"header": key})),
-                            "Skipping invalid extra header name or value"
-                        );
-                    }
-                }
-            }
-
-            let builder = Client::builder().connect_timeout(std::time::Duration::from_secs(10));
-            let builder = if let Some(timeout) = timeouts.request {
-                builder.timeout(timeout)
-            } else {
-                builder
-            };
-            let builder = if let Some(timeout) = timeouts.read {
-                builder.read_timeout(timeout.duration())
-            } else {
-                builder
-            };
-            let builder = builder.default_headers(headers);
-            let builder = crate::opencode_session::restrict_redirects(builder, &endpoint);
-            let builder = self.add_tls_cert_to_builder(builder);
-            let builder = zeroclaw_config::schema::apply_runtime_proxy_to_builder(
-                builder,
-                "provider.compatible",
-            );
-            return builder.build().unwrap_or_else(|error| {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(
-                            ::serde_json::json!({"error": super::format_error_chain(&error)})
-                        ),
-                    "Failed to build proxied streaming client with custom headers or TLS certificate: "
-                );
-                Client::new()
-            });
+        crate::transport::ChatHttpPolicy {
+            request_timeout: timeouts.request,
+            read_timeout: timeouts.read.map(|timeout| timeout.duration()),
+            headers: self.transport_headers(),
+            redirect_endpoint: Some(&endpoint),
+            tls_ca_cert_pem: self.tls_ca_cert_pem.as_deref(),
         }
-
-        let builder = Client::builder().connect_timeout(std::time::Duration::from_secs(10));
-        let builder = if let Some(timeout) = timeouts.request {
-            builder.timeout(timeout)
-        } else {
-            builder
-        };
-        let builder = if let Some(timeout) = timeouts.read {
-            builder.read_timeout(timeout.duration())
-        } else {
-            builder
-        };
-        let builder = crate::opencode_session::restrict_redirects(builder, &endpoint);
-        let builder =
-            zeroclaw_config::schema::apply_runtime_proxy_to_builder(builder, "provider.compatible");
-        builder.build().unwrap_or_else(|error| {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"error": super::format_error_chain(&error)})),
-                "Failed to build proxied streaming client: "
-            );
-            Client::new()
-        })
+        .client("provider.compatible")
     }
 
     fn models_url(&self) -> String {
@@ -1673,7 +1506,7 @@ impl OpenAiCompatibleModelProvider {
         let url = self.chat_completions_url();
         let response = match self
             .apply_opencode_session_header(self.apply_auth_header(
-                self.http_client().post(&url).json(&request),
+                self.http_client()?.post(&url).json(&request),
                 credential.as_deref(),
             )?)
             .send()
@@ -4247,7 +4080,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             // it and would otherwise leak into operator logs.
             let safe_url = super::sanitize_api_error(&url);
             let response = self
-                .apply_auth_header(self.http_client().get(&url), list_credential.as_deref())?
+                .apply_auth_header(self.http_client()?.get(&url), list_credential.as_deref())?
                 .send()
                 .await
                 .map_err(|e| {
@@ -4350,7 +4183,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             // it and would otherwise leak into operator logs.
             let safe_url = super::sanitize_api_error(&url);
             let response = self
-                .apply_auth_header(self.http_client().get(&url), list_credential.as_deref())?
+                .apply_auth_header(self.http_client()?.get(&url), list_credential.as_deref())?
                 .send()
                 .await
                 .map_err(|e| {
@@ -4514,7 +4347,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
 
         let response = match self
             .apply_opencode_session_header(self.apply_auth_header(
-                self.http_client().post(&url).json(&request),
+                self.http_client()?.post(&url).json(&request),
                 credential.as_deref(),
             )?)
             .send()
@@ -4615,7 +4448,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         let response = loop {
             let response = match self
                 .apply_opencode_session_header(self.apply_auth_header(
-                    self.http_client().post(&url).json(&payload),
+                    self.http_client()?.post(&url).json(&payload),
                     credential.as_deref(),
                 )?)
                 .send()
@@ -4759,7 +4592,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         let response = loop {
             let response = match self
                 .apply_opencode_session_header(self.apply_auth_header(
-                    self.http_client().post(&url).json(&payload),
+                    self.http_client()?.post(&url).json(&payload),
                     credential.as_deref(),
                 )?)
                 .send()
@@ -5011,7 +4844,13 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             }
 
             let url = provider.chat_completions_url();
-            let client = provider.streaming_http_client();
+            let client = match provider.streaming_http_client() {
+                Ok(client) => client,
+                Err(error) => {
+                    let _ = tx.send(Err(StreamError::Http(error.to_string()))).await;
+                    return;
+                }
+            };
             let timeouts = provider.streaming_timeouts();
             let auth_header = provider.auth_header.clone();
             let credential = match provider.resolve_credential().await {
@@ -5213,7 +5052,13 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             // `StreamEvent::Usage`.
 
             let url = provider.chat_completions_url();
-            let client = provider.streaming_http_client();
+            let client = match provider.streaming_http_client() {
+                Ok(client) => client,
+                Err(error) => {
+                    let _ = tx.send(Err(StreamError::Http(error.to_string()))).await;
+                    return;
+                }
+            };
             let timeouts = provider.streaming_timeouts();
             let auth_header = provider.auth_header.clone();
             let credential = match provider.resolve_credential().await {
@@ -5365,7 +5210,13 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             // `StreamEvent::Usage`.
 
             let url = provider.chat_completions_url();
-            let client = provider.streaming_http_client();
+            let client = match provider.streaming_http_client() {
+                Ok(client) => client,
+                Err(error) => {
+                    let _ = tx.send(Err(StreamError::Http(error.to_string()))).await;
+                    return;
+                }
+            };
             let timeouts = provider.streaming_timeouts();
             let auth_header = provider.auth_header.clone();
             let credential = match provider.resolve_credential().await {
@@ -5444,7 +5295,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         let url = self.models_url();
         let credential = self.resolve_credential().await?;
         let mut response = self
-            .apply_auth_header(self.http_client().get(&url), credential.as_deref())?
+            .apply_auth_header(self.http_client()?.get(&url), credential.as_deref())?
             .send()
             .await?;
         // Drain without retaining the catalog so HTTP/1 connections can be reused.
@@ -5675,6 +5526,54 @@ mod tests {
             .credential(key)
             .auth_style(AuthStyle::Bearer)
             .build()
+    }
+
+    #[tokio::test]
+    async fn compatible_transport_reuses_pools_for_headers_and_explicit_read_policy() {
+        use axum::{Router, extract::ConnectInfo, routing::get};
+        use std::net::SocketAddr;
+
+        let _proxy_guard = crate::RuntimeProxyTestGuard::acquire().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let app = Router::new().route(
+            "/",
+            get(|ConnectInfo(peer): ConnectInfo<SocketAddr>| async move { peer.to_string() }),
+        );
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+        let _server_guard = scopeguard::guard(server, |server| server.abort());
+        let peer =
+            async |client: Client| client.get(&url).send().await.unwrap().text().await.unwrap();
+        for custom_headers in [false, true] {
+            let mut builder = OpenAiCompatibleModelProvider::builder("test")
+                .base_url(&url)
+                .read_timeout_secs(30);
+            if custom_headers {
+                builder = builder.user_agent("transport-test");
+            }
+            let provider = builder.build();
+            for streaming in [false, true] {
+                let client = || {
+                    if streaming {
+                        provider.streaming_http_client().unwrap()
+                    } else {
+                        provider.http_client().unwrap()
+                    }
+                };
+                assert_eq!(
+                    peer(client()).await,
+                    peer(client()).await,
+                    "identical compatible transport settings must reuse the connection pool"
+                );
+            }
+        }
     }
 
     async fn mock_non_streaming_response(
@@ -10058,9 +9957,9 @@ mod tests {
             "readable file (even with bad PEM) must populate tls_ca_cert_pem bytes"
         );
         // http_client() must build cleanly even when PEM parse fails internally.
-        // The method returns Client directly (panics on builder error), so if we
-        // reach here without panic the fallback-to-system-roots path is working.
-        let _client = p.http_client();
+        // Malformed optional PEM retains system roots; unrelated client setup
+        // errors are returned to the caller.
+        let _client = p.http_client().unwrap();
     }
 
     #[test]
@@ -10084,7 +9983,7 @@ mod tests {
             p.tls_ca_cert_pem.is_some(),
             "readable file (even with bad PEM) must populate tls_ca_cert_pem bytes"
         );
-        let _client = p.streaming_http_client();
+        let _client = p.streaming_http_client().unwrap();
     }
 
     #[tokio::test]
@@ -10906,12 +10805,12 @@ mod tests {
         let has_policy = |client: Client| format!("{client:?}").contains("redirect_policy");
 
         let opencode = opencode_provider("https://opencode.ai/zen/v1");
-        assert!(has_policy(opencode.http_client()));
-        assert!(has_policy(opencode.streaming_http_client()));
+        assert!(has_policy(opencode.http_client().unwrap()));
+        assert!(has_policy(opencode.streaming_http_client().unwrap()));
 
         let other = opencode_provider("https://api.openai.com/v1");
-        assert!(!has_policy(other.http_client()));
-        assert!(!has_policy(other.streaming_http_client()));
+        assert!(!has_policy(other.http_client().unwrap()));
+        assert!(!has_policy(other.streaming_http_client().unwrap()));
     }
 
     #[test]
@@ -16430,14 +16329,14 @@ mod tests {
             .extra_headers(headers)
             .build();
         // Should not panic
-        let _client = p.http_client();
+        let _client = p.http_client().unwrap();
     }
 
     #[test]
     fn http_client_without_extra_headers_or_user_agent() {
         let p = make_model_provider("test", "https://example.com", None);
         // Should use the cached proxy client path
-        let _client = p.http_client();
+        let _client = p.http_client().unwrap();
     }
 
     #[test]
@@ -16455,7 +16354,7 @@ mod tests {
         assert_eq!(p.user_agent.as_deref(), Some("CustomAgent/1.0"));
         assert_eq!(p.extra_headers.len(), 1);
         // Should not panic
-        let _client = p.http_client();
+        let _client = p.http_client().unwrap();
     }
 
     #[test]

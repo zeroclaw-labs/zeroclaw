@@ -2503,8 +2503,8 @@ impl AnthropicModelProvider {
         .client("model_provider.anthropic")
     }
 
-    /// Streaming defaults to no total deadline. An explicit deadline covers
-    /// headers and the complete body; read-idle protection is independent.
+    /// Successful streams have no total deadline; read-idle protection is
+    /// independent of the deadlines for headers and unsuccessful responses.
     fn streaming_http_client(&self) -> anyhow::Result<Client> {
         crate::transport::ChatHttpPolicy {
             request_timeout: None,
@@ -2516,6 +2516,19 @@ impl AnthropicModelProvider {
             ..Default::default()
         }
         .client("model_provider.anthropic")
+    }
+
+    async fn streaming_phase<F: std::future::Future>(
+        timeout: Option<std::time::Duration>,
+        phase: &str,
+        future: F,
+    ) -> Result<F::Output, String> {
+        match timeout {
+            Some(timeout) => tokio::time::timeout(timeout, future)
+                .await
+                .map_err(|_| format!("{phase} not received within {}s", timeout.as_secs())),
+            None => Ok(future.await),
+        }
     }
 
     /// Build a streaming request body from a `NativeChatRequest`.
@@ -3570,6 +3583,8 @@ impl ModelProvider for AnthropicModelProvider {
         let url = format!("{}/v1/messages", self.base_url);
         let is_oauth = Self::is_setup_token(&credential);
         let requested_model = model.to_string();
+        let phase_timeout =
+            (!self.timeout_disabled).then(|| std::time::Duration::from_secs(self.timeout_secs));
 
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
 
@@ -3604,9 +3619,15 @@ impl ModelProvider for AnthropicModelProvider {
                 req = req.header("anthropic-beta", beta_features);
             }
 
-            let response = match req.send().await {
-                Ok(r) => r,
-                Err(e) => {
+            let response = match Self::streaming_phase(
+                phase_timeout,
+                "streaming response headers",
+                req.send(),
+            )
+            .await
+            {
+                Ok(Ok(r)) => r,
+                Ok(Err(e)) => {
                     // Tag the transport's verdict at the send site: a connect
                     // failure gets the typed variant Reliable reads for its
                     // recovery exception (the variant's doc carries the
@@ -3620,14 +3641,25 @@ impl ModelProvider for AnthropicModelProvider {
                     let _ = tx.send(Err(error)).await;
                     return;
                 }
+                Err(message) => {
+                    let _ = tx.send(Err(StreamError::Http(message))).await;
+                    return;
+                }
             };
 
             if !response.status().is_success() {
                 let status = response.status();
-                let error = response
-                    .text()
-                    .await
-                    .unwrap_or_else(|error| format!("error response body read failed: {error}"));
+                let error = match Self::streaming_phase(
+                    phase_timeout,
+                    "error response body",
+                    response.text(),
+                )
+                .await
+                {
+                    Ok(Ok(body)) => body,
+                    Ok(Err(error)) => format!("error response body read failed: {error}"),
+                    Err(message) => message,
+                };
                 let _ = tx
                     .send(Err(StreamError::HttpStatus {
                         status: status.as_u16(),
@@ -4276,6 +4308,98 @@ data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"type\":\"message\"
             assert!(!failed, "{deadline}");
         }
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn streaming_failure_phases_keep_request_timeout_and_allow_clear() {
+        use axum::{Router, body::Body, http::StatusCode, routing::post};
+
+        let app = Router::new().route(
+            "/v1/messages",
+            post(
+                |axum::extract::State(slow_body): axum::extract::State<bool>| async move {
+                    if slow_body {
+                        // Keep delivering bytes inside the read-idle limit, while
+                        // exceeding the separate unsuccessful-body phase limit.
+                        let chunks = stream::unfold(0, |index| async move {
+                            if index == 6 {
+                                return None;
+                            }
+                            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                            Some((Ok::<_, std::convert::Infallible>("rejected "), index + 1))
+                        });
+                        (StatusCode::BAD_REQUEST, Body::from_stream(chunks))
+                    } else {
+                        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+                        (StatusCode::BAD_REQUEST, Body::from("rejected"))
+                    }
+                },
+            ),
+        );
+        let _proxy_guard = crate::RuntimeProxyTestGuard::acquire().await;
+        for slow_body in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let app = app.clone().with_state(slow_body);
+            let server = ::zeroclaw_spawn::spawn!(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            let _server_guard = scopeguard::guard(server, |server| server.abort());
+            for clear in [false, true] {
+                let mut builder = AnthropicModelProvider::builder("test")
+                    .credential(Some("test-key"))
+                    .base_url(&format!("http://{addr}"))
+                    .timeout_secs(1);
+                if clear {
+                    builder = builder.without_timeout();
+                }
+                let provider = builder.build();
+                let messages = vec![ChatMessage::user("hi")];
+                let mut events = provider.stream_chat(
+                    ProviderChatRequest {
+                        messages: &messages,
+                        tools: None,
+                        thinking: None,
+                    },
+                    "claude",
+                    None,
+                    StreamOptions {
+                        enabled: true,
+                        count_tokens: false,
+                    },
+                );
+                let error = tokio::time::timeout(std::time::Duration::from_secs(5), events.next())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap_err();
+                let message = match error {
+                    StreamError::Http(message) => {
+                        assert!(!slow_body && !clear);
+                        message
+                    }
+                    StreamError::HttpStatus { status, message } => {
+                        assert_eq!(status, 400);
+                        message
+                    }
+                    other => panic!("unexpected failure phase error: {other}"),
+                };
+                if clear {
+                    assert!(message.contains("rejected"), "{message}");
+                    assert!(!message.contains("not received within"), "{message}");
+                } else {
+                    let phase = if slow_body {
+                        "error response body"
+                    } else {
+                        "streaming response headers"
+                    };
+                    assert!(
+                        message.contains(&format!("{phase} not received within 1s")),
+                        "{message}"
+                    );
+                }
+            }
+        }
     }
 
     #[tokio::test]

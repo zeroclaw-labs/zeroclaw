@@ -1312,6 +1312,7 @@ impl OpenAiResponsesModelProvider {
                 .map(std::time::Duration::from_secs),
             headers: self.build_default_headers(),
             redirect_endpoint: Some(&self.responses_url),
+            ..Default::default()
         }
         .client("model_provider.openai")
     }
@@ -1352,6 +1353,7 @@ impl OpenAiResponsesModelProvider {
             read_timeout: timeouts.read.map(|timeout| timeout.duration()),
             headers: self.build_default_headers(),
             redirect_endpoint: Some(&self.responses_url),
+            ..Default::default()
         }
         .client("model_provider.openai")
     }
