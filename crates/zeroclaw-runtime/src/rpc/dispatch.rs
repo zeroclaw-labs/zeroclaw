@@ -10623,12 +10623,29 @@ impl RpcDispatcher {
                 let Some(overrides) = ctx.sessions.get_overrides(&session_id).await else {
                     continue;
                 };
+                // A running tool may have selected a provider/model without
+                // persisting it in SessionOverrides. Include that transient
+                // identity when it is immediately observable; if the agent
+                // is busy, retain the conservative old path and acquire the
+                // ordering guard below, where the authoritative state is
+                // re-read under the session boundary.
+                let mut selection = overrides.clone();
+                if let Some(agent) = ctx.sessions.get_agent(&session_id).await
+                    && let Ok(agent) = agent.try_lock()
+                    && let Some((active_ref, active_model)) = agent.model_selection_override(
+                        overrides.model_provider.as_deref(),
+                        overrides.model.as_deref(),
+                    )
+                {
+                    selection.model_provider = Some(active_ref);
+                    selection.model = active_model;
+                }
                 if scope
                     .resolve_provider_ref_for_update(
                         &previous_config,
                         config,
                         &agent_alias,
-                        &overrides,
+                        &selection,
                     )
                     .map_err(|error| {
                         rpc_err(
