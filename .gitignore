@@ -34,6 +34,8 @@
 /docs/book/theme/pc-themes.css
 /docs/superpowers/plans
 /docs/superpowers/specs
+# PR screenshots belong in the pull request, not in the tree.
+/.pr-evidence/
 .secrets
 firmware/*/target
 web/dist/*

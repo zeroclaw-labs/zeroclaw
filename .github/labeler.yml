@@ -80,13 +80,11 @@
 "channel:bluesky":
   - changed-files:
       - any-glob-to-any-file:
-          - "src/channels/bluesky.rs"
           - "crates/zeroclaw-channels/src/bluesky.rs"
 
 "channel:clawdtalk":
   - changed-files:
       - any-glob-to-any-file:
-          - "src/channels/clawdtalk.rs"
           - "crates/zeroclaw-channels/src/clawdtalk.rs"
 
 "channel:cli":
@@ -97,40 +95,33 @@
 "channel:dingtalk":
   - changed-files:
       - any-glob-to-any-file:
-          - "src/channels/dingtalk.rs"
           - "crates/zeroclaw-channels/src/dingtalk.rs"
 
 "channel:discord":
   - changed-files:
       - any-glob-to-any-file:
-          - "src/channels/discord.rs"
           - "crates/zeroclaw-channels/src/discord/**"
           - "crates/zeroclaw-channels/src/discord_slash_state.rs"
 
 "channel:email":
   - changed-files:
       - any-glob-to-any-file:
-          - "src/channels/email_channel.rs"
-          - "src/channels/gmail_push.rs"
           - "crates/zeroclaw-channels/src/email_channel.rs"
           - "crates/zeroclaw-channels/src/gmail_push.rs"
 
 "channel:imessage":
   - changed-files:
       - any-glob-to-any-file:
-          - "src/channels/imessage.rs"
           - "crates/zeroclaw-channels/src/imessage.rs"
 
 "channel:irc":
   - changed-files:
       - any-glob-to-any-file:
-          - "src/channels/irc.rs"
           - "crates/zeroclaw-channels/src/irc.rs"
 
 "channel:lark":
   - changed-files:
       - any-glob-to-any-file:
-          - "src/channels/lark.rs"
           - "crates/zeroclaw-channels/src/lark.rs"
 
 "channel:line":
@@ -142,7 +133,6 @@
 "channel:linq":
   - changed-files:
       - any-glob-to-any-file:
-          - "src/channels/linq.rs"
           - "crates/zeroclaw-channels/src/linq.rs"
 
 "channel:matrix":
@@ -154,13 +144,11 @@
 "channel:mattermost":
   - changed-files:
       - any-glob-to-any-file:
-          - "src/channels/mattermost.rs"
           - "crates/zeroclaw-channels/src/mattermost.rs"
 
 "channel:mochat":
   - changed-files:
       - any-glob-to-any-file:
-          - "src/channels/mochat.rs"
           - "crates/zeroclaw-channels/src/mochat.rs"
 
 "channel:mqtt":
@@ -171,43 +159,36 @@
 "channel:nextcloud-talk":
   - changed-files:
       - any-glob-to-any-file:
-          - "src/channels/nextcloud_talk.rs"
           - "crates/zeroclaw-channels/src/nextcloud_talk.rs"
 
 "channel:nostr":
   - changed-files:
       - any-glob-to-any-file:
-          - "src/channels/nostr.rs"
           - "crates/zeroclaw-channels/src/nostr.rs"
 
 "channel:notion":
   - changed-files:
       - any-glob-to-any-file:
-          - "src/channels/notion.rs"
           - "crates/zeroclaw-channels/src/notion.rs"
 
 "channel:qq":
   - changed-files:
       - any-glob-to-any-file:
-          - "src/channels/qq.rs"
           - "crates/zeroclaw-channels/src/qq.rs"
 
 "channel:reddit":
   - changed-files:
       - any-glob-to-any-file:
-          - "src/channels/reddit.rs"
           - "crates/zeroclaw-channels/src/reddit.rs"
 
 "channel:signal":
   - changed-files:
       - any-glob-to-any-file:
-          - "src/channels/signal.rs"
           - "crates/zeroclaw-channels/src/signal.rs"
 
 "channel:slack":
   - changed-files:
       - any-glob-to-any-file:
-          - "src/channels/slack.rs"
           - "crates/zeroclaw-channels/src/slack.rs"
 
 "channel:telegram":
@@ -219,7 +200,6 @@
 "channel:twitter":
   - changed-files:
       - any-glob-to-any-file:
-          - "src/channels/twitter.rs"
           - "crates/zeroclaw-channels/src/twitter.rs"
 
 "channel:wechat":
@@ -230,22 +210,17 @@
 "channel:webhook":
   - changed-files:
       - any-glob-to-any-file:
-          - "src/channels/webhook.rs"
           - "crates/zeroclaw-channels/src/webhook.rs"
 
 "channel:wecom":
   - changed-files:
       - any-glob-to-any-file:
-          - "src/channels/wecom.rs"
           - "crates/zeroclaw-channels/src/wecom.rs"
           - "crates/zeroclaw-channels/src/wecom_ws.rs"
 
 "channel:whatsapp":
   - changed-files:
       - any-glob-to-any-file:
-          - "src/channels/whatsapp.rs"
-          - "src/channels/whatsapp_storage.rs"
-          - "src/channels/whatsapp_web.rs"
           - "crates/zeroclaw-channels/src/whatsapp.rs"
           - "crates/zeroclaw-channels/src/whatsapp_storage.rs"
           - "crates/zeroclaw-channels/src/whatsapp_web.rs"
@@ -349,7 +324,6 @@
   - changed-files:
       - any-glob-to-any-file:
           - "crates/zeroclaw-runtime/src/security/policy.rs"
-          - "crates/zeroclaw-runtime/src/security/iam_policy.rs"
           - "crates/zeroclaw-config/src/policy.rs"
 
 "security:secrets":

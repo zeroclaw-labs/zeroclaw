@@ -56,11 +56,11 @@ gh pr view <N> --repo zeroclaw-labs/zeroclaw --json files,title,baseRefName,labe
 
 | Files touched | Also load |
 |---|---|
-| `crates/zeroclaw-api/` | Extension examples: `docs/book/src/developing/extension-examples.md` |
+| `crates/zeroclaw-api/` | Crate map: `docs/book/src/architecture/crates.md` |
 | `crates/zeroclaw-runtime/` | FND-001 §Phase 2 (runtime extraction) |
 | `crates/zeroclaw-gateway/` | FND-001 §Phase 3 (gateway separation) |
 | `crates/zeroclaw-plugins/` | FND-001 §Phase 4 (plugin platform) |
-| `crates/zeroclaw-channels/` or `crates/zeroclaw-tools/` | Extension examples doc |
+| `crates/zeroclaw-channels/` or `crates/zeroclaw-tools/` | Plugin guides: `docs/book/src/plugins/index.md` |
 | `crates/zeroclaw-config/` or `crates/zeroclaw-macros/` | Config schema conventions in AGENTS.md |
 | `.github/workflows/` | FND-003 governance, CI risk tier (high risk per AGENTS.md) |
 

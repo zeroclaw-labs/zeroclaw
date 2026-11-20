@@ -60,7 +60,6 @@
 /src/doctor/**            @tidux @Audacity88
 /src/health/**            @tidux @Audacity88
 /src/hooks/**             @tidux @Audacity88
-/src/nodes/**             @tidux @Audacity88
 /src/observability/**     @tidux @Audacity88
 /src/peripherals/**       @tidux @Audacity88
 /src/platform/**          @tidux @Audacity88
@@ -76,7 +75,6 @@
 /src/cli_input.rs         @Audacity88
 /src/identity.rs          @Audacity88
 /src/migration.rs         @Audacity88
-/src/schema_markdown.rs   @Audacity88
 
 # ---------------------------------------------------------------------------
 # Tests, benches, fuzzing, and examples (shared maintainer triage)
@@ -94,7 +92,6 @@
 /.editorconfig             @JordanTheJet @Audacity88
 /.env.example              @JordanTheJet @Audacity88
 /.envrc                    @JordanTheJet @Audacity88
-/.gemini/**                @JordanTheJet @Audacity88
 /.gitattributes            @JordanTheJet @Audacity88
 /.githooks/**              @JordanTheJet @Audacity88
 /.gitignore                @JordanTheJet @Audacity88
@@ -118,7 +115,6 @@
 # ---------------------------------------------------------------------------
 /crates/zeroclaw-plugins/**                @JordanTheJet @Audacity88
 /crates/zeroclaw-runtime/src/skills/**     @JordanTheJet @Audacity88
-/plugins/**                                @JordanTheJet @Audacity88
 /src/plugins/**                            @JordanTheJet @Audacity88
 /src/skills/**                             @JordanTheJet @Audacity88
 /.claude/skills/**                         @JordanTheJet @Audacity88
