@@ -1251,7 +1251,14 @@ mod tests {
         let cfg_data = tempfile::TempDir::new().unwrap();
         let config_home = tempfile::TempDir::new().unwrap();
         let config_path = config_home.path().join("config.toml");
-        std::fs::write(&config_path, "schema_version = 3\n").unwrap();
+        std::fs::write(
+            &config_path,
+            format!(
+                "schema_version = {}\n",
+                zeroclaw_config::migration::CURRENT_SCHEMA_VERSION
+            ),
+        )
+        .unwrap();
         let mut config = Config {
             config_path,
             data_dir: cfg_data.path().to_path_buf(),
