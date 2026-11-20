@@ -41,3 +41,7 @@ A loopback-only HTTPS fixture on Jarvis used a one-time certificate pinned to it
 ## Authorization list
 
 Use Secrets → Permissions → Add authorization. Choose the catalog alias, a compatible consumer, and the destination. The saved authorization appears in the list. Edit or remove any authorization independently of other grants and the underlying credential. The alias identifies the secret. The destination shown when adding a grant is only a suggestion. Browser and HTTP Request grants each support multiple explicit, exact HTTPS origins for their compatible credential types. Changing the suggested service does not grant access or retarget a saved authorization. SSH grants use username, hostname and port. Plugin TLS credentials are selected through a plugin's TLS profile configuration.
+
+## Console acceptance
+
+Ask the agent to open the console with the browser, submit the allowed username/password alias, submit the independently allowed TOTP alias when that challenge appears, and list server names read from the authenticated Servers view. The test succeeds only when the displayed server list was observed in that browser session. A password submission acknowledgement or a previous server inventory cannot substitute for the authenticated view. If the identity provider presents an access verification screen, keep credential submission pending until the operator can complete the site's normal verification in that session.

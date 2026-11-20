@@ -1493,7 +1493,11 @@ impl Tool for BrowserTool {
             "Web/browser automation with pluggable backends (agent-browser, rust-native, computer_use). ",
             "Supports DOM actions plus optional OS-level actions (mouse_move, mouse_click, mouse_drag, ",
             "key_type, key_press, screen_capture) through a computer-use sidecar. Use 'snapshot' to map ",
-            "interactive elements to refs (@e1, @e2). Enforces browser.allowed_domains for open actions."
+            "interactive elements to refs (@e1, @e2). Enforces browser.allowed_domains for open actions. ",
+            "For a saved login use submit_credential with the username/password alias on the sign-in form. ",
+            "If a separate one-time-code form appears, call submit_credential again with the TOTP alias. ",
+            "After each submission inspect the new page. Submission alone does not prove authentication. ",
+            "If an access verification or human challenge prevents the form from appearing, report the blocker."
         )
     }
 
