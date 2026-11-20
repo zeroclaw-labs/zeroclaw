@@ -591,6 +591,23 @@ class RiskClassifierTest(unittest.TestCase):
                 )
             )
 
+    def test_removed_file_evidence_matches_captured_base(self) -> None:
+        removed = changed_file(
+            "crates/zeroclaw-memory/src/embeddings.rs",
+            additions=0,
+            deletions=1,
+            status="removed",
+            contents_url=(
+                "https://api.github.com/repos/zeroclaw-labs/zeroclaw/contents/"
+                "crates/zeroclaw-memory/src/embeddings.rs?ref="
+                + BASE
+            ),
+        )
+        self.assertEqual(
+            classifier.validate_files([removed], 1, HEAD, BASE),
+            [removed],
+        )
+
     def test_pagination_stops_at_expected_count_and_fails_on_overflow(self) -> None:
         api = PaginatedAPI([[{}] * 100, [{}] * 50, [{}]])
         self.assertEqual(len(api.paginate("/repos/zeroclaw-labs/zeroclaw/pulls/1/files", 150)), 150)
