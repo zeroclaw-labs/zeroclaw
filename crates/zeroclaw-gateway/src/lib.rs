@@ -182,6 +182,10 @@ use zeroclaw_runtime::tools::scoped;
 
 /// Maximum request body size (64KB) — prevents memory exhaustion
 pub const MAX_BODY_SIZE: usize = 65_536;
+/// Provider registry snapshots contain the complete connection/model catalog,
+/// so they need a route-specific ceiling instead of the small JSON control
+/// plane limit applied to ordinary config mutations.
+pub const MAX_PROVIDER_REGISTRY_BODY_SIZE: usize = 4 * 1024 * 1024;
 /// Default request timeout (30s) — prevents slow-loris attacks.
 pub const REQUEST_TIMEOUT_SECS: u64 = 30;
 
@@ -999,7 +1003,9 @@ async fn create_gateway_boot_provider(
 /// never per handler: every route whose handler lives in `api_config`,
 /// `api_quickstart`, or `api_sections` MUST be registered on THIS router,
 /// whatever its URL prefix.
-fn config_admin_router(route_auth: principal_gate::ConfigRouteAuth) -> Router<AppState> {
+fn config_admin_router_without_registry(
+    route_auth: principal_gate::ConfigRouteAuth,
+) -> Router<AppState> {
     Router::new()
         .route(
             "/api/config",
@@ -1015,10 +1021,6 @@ fn config_admin_router(route_auth: principal_gate::ConfigRouteAuth) -> Router<Ap
                 .options(api_config::handle_options_prop),
         )
         .route("/api/config/list", get(api_config::handle_list))
-        .route(
-            "/api/config/provider-registry",
-            get(api_config::handle_registry_get).put(api_config::handle_registry_put),
-        )
         .route("/api/config/drift", get(api_config::handle_drift))
         .route(
             "/api/config/reload-status",
@@ -1092,6 +1094,39 @@ fn config_admin_router(route_auth: principal_gate::ConfigRouteAuth) -> Router<Ap
             route_auth,
             principal_gate::config_route_auth,
         ))
+}
+
+/// The provider registry is a complete snapshot rather than a small control
+/// plane patch. Keep its authentication and route registration identical to
+/// the other config routes, but give it an explicit larger body ceiling.
+fn config_registry_router(
+    route_auth: principal_gate::ConfigRouteAuth,
+    timeout_secs: u64,
+) -> Router<AppState> {
+    Router::new()
+        .route(
+            "/api/config/provider-registry",
+            get(api_config::handle_registry_get).put(api_config::handle_registry_put),
+        )
+        .route_layer(axum::middleware::from_fn_with_state(
+            route_auth,
+            principal_gate::config_route_auth,
+        ))
+        .layer(RequestBodyLimitLayer::new(MAX_PROVIDER_REGISTRY_BODY_SIZE))
+        .layer(TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            Duration::from_secs(timeout_secs),
+        ))
+}
+
+/// Standard config-router helper used by embedded/test assemblies. The
+/// supervised gateway uses the two pieces separately so the registry route is
+/// merged after the gateway-wide 64 KiB body layer.
+#[cfg(test)]
+fn config_admin_router(route_auth: principal_gate::ConfigRouteAuth) -> Router<AppState> {
+    let registry_auth = route_auth.clone();
+    config_admin_router_without_registry(route_auth)
+        .merge(config_registry_router(registry_auth, REQUEST_TIMEOUT_SECS))
 }
 
 /// How long a stopping gateway lets its connections finish the requests in
@@ -2579,11 +2614,9 @@ pub async fn run_gateway_with_plugin_webhooks(
     let no_relayed_pairing = axum::middleware::from_fn(relay_ingress::no_pairing_through_a_relay);
 
     // Build router with middleware
+    let config_route_auth = principal_gate::ConfigRouteAuth::new(&inbound_auth, &state.config);
     let inner = Router::new()
-        .merge(config_admin_router(principal_gate::ConfigRouteAuth::new(
-            &inbound_auth,
-            &state.config,
-        )))
+        .merge(config_admin_router_without_registry(config_route_auth.clone()))
         .merge(api_oidc::routes())
         .merge(api_oidc_enroll::routes(Arc::clone(&inbound_auth), shared_cert_audit))
         // ── Admin routes (for CLI management) ──
@@ -2896,7 +2929,17 @@ pub async fn run_gateway_with_plugin_webhooks(
             StatusCode::REQUEST_TIMEOUT,
             Duration::from_secs(gateway_request_timeout_secs(&config.gateway)),
         ));
-    let inner = inner.merge(upload_router);
+    let inner = inner
+        .merge(upload_router)
+        // Keep this merge after the gateway-wide body limit: the registry
+        // router carries its own larger, route-specific limit.
+        .merge(
+            config_registry_router(
+                config_route_auth,
+                gateway_request_timeout_secs(&config.gateway),
+            )
+            .with_state(state.clone()),
+        );
 
     // Manual cron-trigger and A2A task routes live on their own sub-router so
     // they can opt out of the 30s gateway-wide TimeoutLayer. Both run a
@@ -5971,6 +6014,7 @@ mod tests {
     #[test]
     fn security_body_limit_is_64kb() {
         assert_eq!(MAX_BODY_SIZE, 65_536);
+        assert!(MAX_PROVIDER_REGISTRY_BODY_SIZE > MAX_BODY_SIZE);
     }
 
     #[test]
