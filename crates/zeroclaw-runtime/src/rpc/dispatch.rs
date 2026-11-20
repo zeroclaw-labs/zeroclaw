@@ -407,6 +407,71 @@ fn touches_provider_registry(prop: &str) -> bool {
     prop == "providers" || prop.starts_with("providers.")
 }
 
+/// Return the exact chat model references whose materialized construction
+/// inputs changed between two registry generations. Registry edits may touch
+/// one model while unrelated sessions continue using another model on the
+/// same process, so live refresh must be scoped before acquiring their turn
+/// guards.
+fn changed_chat_model_refs(previous: &Config, next: &Config) -> Result<Vec<String>, String> {
+    let previous = previous
+        .provider_registry()
+        .map_err(|error| format!("cannot inspect previous provider registry: {error}"))?;
+    let next = next
+        .provider_registry()
+        .map_err(|error| format!("cannot inspect candidate provider registry: {error}"))?;
+    let mut refs = std::collections::BTreeSet::new();
+    for (model_ref, model) in previous.models.iter().chain(next.models.iter()) {
+        if model.capability() == zeroclaw_api::capability::Capability::Chat {
+            refs.insert(model_ref.as_str().to_owned());
+        }
+    }
+    let mut changed = Vec::new();
+    for model_ref in refs {
+        let previous_signature = chat_model_construction_signature(&previous, &model_ref);
+        let next_signature = chat_model_construction_signature(&next, &model_ref);
+        if previous_signature != next_signature {
+            changed.push(model_ref);
+        }
+    }
+    Ok(changed)
+}
+
+fn chat_model_construction_signature(
+    registry: &zeroclaw_config::provider_registry::ProviderRegistry,
+    model_ref: &str,
+) -> Value {
+    let Some(model) = registry.models.get(model_ref) else {
+        return Value::Null;
+    };
+    let provider = model.provider();
+    let model_value = serde_json::to_value(model).unwrap_or(Value::Null);
+    let preset = model_value
+        .get("preset")
+        .and_then(Value::as_str)
+        .and_then(|name| registry.model_presets.get(name))
+        .and_then(|preset| serde_json::to_value(preset).ok());
+    let fallback = registry
+        .fallback_chain(&model_ref.into())
+        .ok()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|reference| {
+            let model = registry.models.get(&reference)?;
+            Some(serde_json::json!({
+                "reference": reference,
+                "model": model,
+                "connection": registry.connections.get(model.provider()),
+            }))
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "model": model_value,
+        "connection": registry.connections.get(provider),
+        "preset": preset,
+        "fallback": fallback,
+    })
+}
+
 fn touches_embedding_config(prop: &str) -> bool {
     touches_provider_registry(prop)
         || prop == "memory"
@@ -471,6 +536,8 @@ enum LiveSessionRefreshScope {
     Agent(String),
     ModelRoutes,
     SharedConstruction,
+    /// Exact chat model references changed by one atomic registry edit.
+    ModelRefs(Vec<String>),
     /// Transient union derived from one atomic config/set-many request.
     Batch(Vec<Self>),
     /// A provider alias rename (`providers.models.<family>.<from>` ->
@@ -538,6 +605,29 @@ impl LiveSessionRefreshScope {
                 }
             }
             return Ok(None);
+        }
+        if let Self::ModelRefs(changed) = self {
+            let effective_ref = overrides.model_provider.as_deref().or_else(|| {
+                next.agent(session_agent)
+                    .map(|agent| agent.model_provider.as_str())
+            });
+            let Some(effective_ref) = effective_ref else {
+                return Err(format!("agent `{session_agent}` is not configured"));
+            };
+            let affected = changed.iter().any(|changed_ref| {
+                zeroclaw_providers::model::routed_selection_depends_on_model_ref(
+                    next,
+                    session_agent,
+                    effective_ref,
+                    changed_ref,
+                ) || zeroclaw_providers::model::routed_selection_depends_on_model_ref(
+                    previous,
+                    session_agent,
+                    effective_ref,
+                    changed_ref,
+                )
+            });
+            return Ok(affected.then(|| effective_ref.to_owned()));
         }
         if let Some(provider) = self.resolve_provider_ref(next, session_agent, overrides)? {
             return Ok(Some(provider));
@@ -630,6 +720,9 @@ impl LiveSessionRefreshScope {
                 })
                 .map(Some)
                 .ok_or_else(|| format!("agent `{session_agent}` is not configured")),
+            // ModelRefs is resolved against both generations by
+            // `resolve_provider_ref_for_update` before this helper is used.
+            Self::ModelRefs(_) => Ok(None),
             Self::ProviderAliasRename { old_ref, new_ref } => {
                 let effective_ref = overrides
                     .model_provider
@@ -10041,7 +10134,8 @@ impl RpcDispatcher {
         for verb in [Verb::Create, Verb::Delete] {
             self.require_additional_grant(method, Resource::Config, verb)?;
         }
-        let mut candidate = Box::new(self.ctx.config.read().clone());
+        let previous = self.ctx.config.read().clone();
+        let mut candidate = Box::new(previous.clone());
         editor::stage_persisted(&mut candidate, edit)
             .await
             .map_err(|error| rpc_err(INVALID_PARAMS, format!("{error:#}")))?;
@@ -10049,10 +10143,12 @@ impl RpcDispatcher {
         // embedding consumer (including routes), then rebuild its entire view
         // once rather than refreshing once per model on a shared connection.
         let memory_embedder = Some(prepare_memory_embedder(&candidate)?);
+        let changed_models = changed_chat_model_refs(&previous, &candidate)
+            .map_err(|error| rpc_err(INVALID_PARAMS, error))?;
         let revision = Box::pin(self.commit_config_with_live_session_refresh(
             *candidate,
             commit,
-            &LiveSessionRefreshScope::SharedConstruction,
+            &LiveSessionRefreshScope::ModelRefs(changed_models),
             RpcConfigCommitEffects {
                 memory_embedder,
                 ..RpcConfigCommitEffects::default()
