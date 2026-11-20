@@ -2,6 +2,7 @@ use super::spec::{
     self, AppPolicy, BranchPolicy, FeaturePolicy, InstallRoute, InstallVariant, Interaction,
     Invocation, PathEffect, Platform, QuickstartHandoff, RouteId, RustPolicy,
 };
+use anyhow::Context;
 use std::path::Path;
 
 fn route_title(id: RouteId) -> &'static str {
@@ -288,7 +289,14 @@ pub fn render_readme_unix_fast_zone(_root: &Path, current: &str) -> anyhow::Resu
     splice_markdown(current, README_UNIX_FAST_ZONE, &body)
 }
 
-fn render_windows_prebuilt_block(routes: &[InstallRoute]) -> anyhow::Result<String> {
+/// The Windows prebuilt installer, relative to the repository root. `setup.bat`
+/// runs this script and the Windows guide renders it, so it stays the one copy.
+const WINDOWS_PREBUILT_INSTALLER: &str = "scripts/install_windows_prebuilt.ps1";
+
+/// Reads the installer from `root` when the guide is rendered. Embedding it at
+/// compile time would make every `xtask` binary, including `cargo web build`,
+/// need the script in build contexts that carry no `scripts/` directory.
+fn render_windows_prebuilt_block(root: &Path, routes: &[InstallRoute]) -> anyhow::Result<String> {
     let route = routes
         .iter()
         .find(|route| route.id == RouteId::WindowsPrebuilt)
@@ -312,7 +320,8 @@ fn render_windows_prebuilt_block(routes: &[InstallRoute]) -> anyhow::Result<Stri
         .filter(|subcommand| !subcommand.is_empty() && !subcommand.contains(char::is_whitespace))
         .ok_or_else(|| anyhow::Error::msg("Windows Quickstart command must be one subcommand"))?;
 
-    let installer = include_str!("../../../scripts/install_windows_prebuilt.ps1")
+    let installer = std::fs::read_to_string(root.join(WINDOWS_PREBUILT_INSTALLER))
+        .with_context(|| format!("read {WINDOWS_PREBUILT_INSTALLER}"))?
         .lines()
         .map(|line| {
             if line.is_empty() {
@@ -359,8 +368,8 @@ if (($env:Path -split ';') -notcontains $dst) {
         .replace("__WINDOWS_PREBUILT_INSTALLER__", &installer))
 }
 
-pub fn render_windows_guide(_root: &Path, current: &str) -> anyhow::Result<String> {
-    let body = render_windows_prebuilt_block(&spec::install_routes()?)?;
+pub fn render_windows_guide(root: &Path, current: &str) -> anyhow::Result<String> {
+    let body = render_windows_prebuilt_block(root, &spec::install_routes()?)?;
     splice_markdown(current, WINDOWS_PREBUILT_ZONE, &body)
 }
 
@@ -512,8 +521,42 @@ mod tests {
     }
 
     #[test]
+    fn windows_prebuilt_guide_renders_the_installer_under_the_given_root() {
+        let guide = std::fs::read_to_string(root().join("docs/book/src/setup/windows.md")).unwrap();
+        let checkout = tempfile::tempdir().unwrap();
+        let installer = checkout.path().join("scripts/install_windows_prebuilt.ps1");
+        std::fs::create_dir_all(installer.parent().unwrap()).unwrap();
+        std::fs::write(&installer, "Write-Host 'stand-in installer'\r\n").unwrap();
+
+        let rendered = render_windows_guide(checkout.path(), &guide).unwrap();
+
+        assert!(
+            rendered.contains("        Write-Host 'stand-in installer'"),
+            "the guide must embed the installer found under the given root"
+        );
+        assert!(
+            !rendered.contains("Expand-Archive"),
+            "the guide must not carry an installer from anywhere but the given root"
+        );
+    }
+
+    #[test]
+    fn windows_prebuilt_guide_reports_a_missing_installer() {
+        let guide = std::fs::read_to_string(root().join("docs/book/src/setup/windows.md")).unwrap();
+        let checkout = tempfile::tempdir().unwrap();
+
+        let error = render_windows_guide(checkout.path(), &guide).unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("scripts/install_windows_prebuilt.ps1"),
+            "the error must name the missing installer: {error:#}"
+        );
+    }
+
+    #[test]
     fn windows_prebuilt_idempotency_claim_excludes_quickstart() {
-        let block = render_windows_prebuilt_block(&spec::install_routes().unwrap()).unwrap();
+        let block =
+            render_windows_prebuilt_block(&root(), &spec::install_routes().unwrap()).unwrap();
         let markdown = render_markdown().unwrap();
         assert!(block.contains("Installation and PATH setup are idempotent"));
         assert!(!block.contains("re-running this block is a no-op"));

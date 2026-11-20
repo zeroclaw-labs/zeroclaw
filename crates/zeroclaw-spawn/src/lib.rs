@@ -52,13 +52,39 @@ pub fn scope_plugin_wake_depth<F: Future>(
 /// of recomputing it.
 pub const TASK_EVENT_NAME: &str = "runtime.task.spawn";
 
+/// Emit one lifecycle record at a runtime-selected level.
+///
+/// `record!` needs the level as a literal identifier, so each supported level
+/// gets its own arm. Lives in a function so [`spawn!`] call sites stay small.
+macro_rules! record_at {
+    ($level:expr, $event:expr, $msg:expr) => {{
+        let level: ::tracing::Level = $level;
+        if level == ::tracing::Level::TRACE {
+            ::zeroclaw_log::record!(TRACE, $event, $msg);
+        } else if level == ::tracing::Level::DEBUG {
+            ::zeroclaw_log::record!(DEBUG, $event, $msg);
+        } else if level == ::tracing::Level::WARN {
+            ::zeroclaw_log::record!(WARN, $event, $msg);
+        } else if level == ::tracing::Level::ERROR {
+            ::zeroclaw_log::record!(ERROR, $event, $msg);
+        } else {
+            ::zeroclaw_log::record!(INFO, $event, $msg);
+        }
+    }};
+}
+
 /// Record the `Spawn` lifecycle event for [`spawn!`] in a single non-generic
 /// function so macro call sites do not duplicate `serde_json::json!` and
 /// `tracing::event!` expansion code across hundreds of spawns.
 #[doc(hidden)]
-pub fn record_task_spawn(module: &'static str, file: &'static str, line: u32) {
-    ::zeroclaw_log::record!(
-        INFO,
+pub fn record_task_spawn(
+    level: tracing::Level,
+    module: &'static str,
+    file: &'static str,
+    line: u32,
+) {
+    record_at!(
+        level,
         ::zeroclaw_log::Event::new(TASK_EVENT_NAME, ::zeroclaw_log::Action::Spawn).with_attrs(
             ::serde_json::json!({
                 "task_site": format!("{file}:{line}"),
@@ -75,14 +101,15 @@ pub fn record_task_spawn(module: &'static str, file: &'static str, line: u32) {
 /// non-generic function.
 #[doc(hidden)]
 pub fn record_task_complete(
+    level: tracing::Level,
     module: &'static str,
     file: &'static str,
     line: u32,
     started_at: tokio::time::Instant,
 ) {
     let elapsed_ms = started_at.elapsed().as_millis() as u64;
-    ::zeroclaw_log::record!(
-        INFO,
+    record_at!(
+        level,
         ::zeroclaw_log::Event::new(TASK_EVENT_NAME, ::zeroclaw_log::Action::Complete)
             .with_outcome(::zeroclaw_log::EventOutcome::Success)
             .with_duration(elapsed_ms)
@@ -96,9 +123,15 @@ pub fn record_task_complete(
     );
 }
 
+/// Spawn a task that inherits the caller's span, recording its spawn and
+/// its completion at INFO.
+///
+/// `spawn!(level = DEBUG, future)` records them at that level instead, for
+/// tasks spawned so often that their lifecycle at INFO would crowd out
+/// everything else.
 #[macro_export]
 macro_rules! spawn {
-    ($body:expr) => {{
+    (level = $level:ident, $body:expr) => {{
         #[allow(unused_imports)]
         use $crate::__private::tracing::Instrument as _;
 
@@ -112,7 +145,12 @@ macro_rules! spawn {
         // Spawn-time record — fires synchronously on the caller's
         // thread, attributed to whatever span the caller currently has
         // entered.
-        $crate::record_task_spawn(__ZC_TASK_MODULE, __ZC_TASK_FILE, __ZC_TASK_LINE);
+        $crate::record_task_spawn(
+            $crate::__private::tracing::Level::$level,
+            __ZC_TASK_MODULE,
+            __ZC_TASK_FILE,
+            __ZC_TASK_LINE,
+        );
 
         // Wrap the user's future so we can stamp a Complete record when
         // it resolves, and carry any active plugin wake-dispatch hop depth
@@ -126,6 +164,7 @@ macro_rules! spawn {
             $crate::scope_plugin_wake_depth(__zc_inherited_wake_depth, async move {
                 let __zc_task_output = { $body }.await;
                 $crate::record_task_complete(
+                    $crate::__private::tracing::Level::$level,
                     __ZC_TASK_MODULE,
                     __ZC_TASK_FILE,
                     __ZC_TASK_LINE,
@@ -138,6 +177,9 @@ macro_rules! spawn {
         let __zc_spawn_handle = $crate::__private::tokio::spawn(__zc_task_future.in_current_span());
         __zc_spawn_handle
     }};
+    ($body:expr) => {
+        $crate::spawn!(level = INFO, $body)
+    };
 }
 
 #[cfg(test)]
@@ -169,6 +211,58 @@ mod tests {
             }
             self.events.lock().unwrap().push(stack);
         }
+    }
+
+    /// Layer that records the level and message of every lifecycle record
+    /// it sees.
+    #[derive(Clone, Default)]
+    struct LifecycleCapture {
+        records: Arc<Mutex<Vec<(tracing::Level, String)>>>,
+    }
+
+    impl<S: Subscriber> Layer<S> for LifecycleCapture {
+        fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+            struct Message(String);
+            impl tracing::field::Visit for Message {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "message" {
+                        self.0 = format!("{value:?}");
+                    }
+                }
+            }
+            let mut message = Message(String::new());
+            event.record(&mut message);
+            if message.0.starts_with("task ") {
+                self.records
+                    .lock()
+                    .unwrap()
+                    .push((*event.metadata().level(), message.0));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn spawn_records_its_lifecycle_at_info_unless_given_a_level() {
+        let capture = LifecycleCapture::default();
+        let _guard = tracing::subscriber::set_default(Registry::default().with(capture.clone()));
+
+        crate::spawn!(async {}).await.unwrap();
+        crate::spawn!(level = DEBUG, async {}).await.unwrap();
+
+        let records = capture.records.lock().unwrap();
+        assert_eq!(
+            *records,
+            [
+                (tracing::Level::INFO, "task spawned".to_string()),
+                (tracing::Level::INFO, "task complete".to_string()),
+                (tracing::Level::DEBUG, "task spawned".to_string()),
+                (tracing::Level::DEBUG, "task complete".to_string()),
+            ]
+        );
     }
 
     #[tokio::test]
