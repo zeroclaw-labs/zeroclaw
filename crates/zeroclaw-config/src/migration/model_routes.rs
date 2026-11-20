@@ -143,7 +143,7 @@ pub(super) fn migrate(mut document: toml::Value) -> Result<toml::Value> {
             if let Some(model_id) = explicit_model {
                 model["model"] = model_id.into();
             }
-            if let Some(key) = key {
+            if let Some(key) = key.filter(|key| !key.trim().is_empty()) {
                 connection["auth"] = json!({"mode": "api_key", "api_key": key});
             }
             let base = format!("route.{hint}");
@@ -609,6 +609,30 @@ mod tests {
         let (_, model) = legacy_model(&raw, "openai", None, None).unwrap();
         assert_eq!(model["metadata"]["pricing"]["input_per_mtok"], 1.0);
         assert_eq!(model["metadata"]["pricing"]["output_per_mtok"], 1.0);
+    }
+
+    #[test]
+    fn blank_route_api_key_keeps_the_inherited_connection_key() {
+        let document: toml::Value = toml::from_str(
+            r#"
+schema_version = 4
+
+[providers.models.openai.main]
+model = "gpt-4o"
+api_key = "profile-key"
+
+[[model_routes]]
+hint = "blank-key"
+model_provider = "openai.main"
+api_key = "   "
+"#,
+        )
+        .unwrap();
+        let migrated = migrate(document).unwrap();
+        assert_eq!(
+            migrated["providers"]["connections"]["route.blank-key"]["auth"]["api_key"],
+            "profile-key"
+        );
     }
 
     #[test]
