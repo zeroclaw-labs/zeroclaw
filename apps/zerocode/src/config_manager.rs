@@ -7183,8 +7183,8 @@ mod tests {
         App::new(rpc, std::path::Path::new("/tmp"))
     }
 
-    #[test]
-    fn cost_type_picker_uses_rate_slots_including_custom() {
+    #[tokio::test]
+    async fn cost_type_picker_uses_rate_slots_including_custom() {
         let mut manager = test_manager();
         manager.templates = vec![
             ConfigTemplateEntry {
