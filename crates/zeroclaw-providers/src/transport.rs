@@ -181,3 +181,64 @@ pub(crate) fn append_endpoint(base_url: &str, suffix: &str) -> Result<String> {
     url.set_path(&path);
     Ok(url.into())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::ChatHttpPolicy;
+    use std::{net::SocketAddr, time::Duration};
+
+    #[tokio::test]
+    async fn native_chat_reuses_connections_and_respects_policy_and_proxy_changes() {
+        use axum::{Router, extract::ConnectInfo, routing::get};
+
+        let _proxy_guard = crate::RuntimeProxyTestGuard::acquire().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let app = Router::new().route(
+            "/",
+            get(|ConnectInfo(address): ConnectInfo<SocketAddr>| async move { address.to_string() }),
+        );
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+        let _server_guard = scopeguard::guard(server, |server| server.abort());
+
+        let build = |seconds| {
+            ChatHttpPolicy {
+                request_timeout: Some(Duration::from_secs(seconds)),
+                ..Default::default()
+            }
+            .client("model_provider.openai")
+            .unwrap()
+        };
+        let peer = async |client: &reqwest::Client| {
+            client.get(&url).send().await.unwrap().text().await.unwrap()
+        };
+        let first = build(60);
+        let first_peer = peer(&first).await;
+        let second = build(60);
+        assert_eq!(
+            first_peer,
+            peer(&second).await,
+            "same policy reuses its TCP connection"
+        );
+        let changed = build(61);
+        assert_ne!(
+            first_peer,
+            peer(&changed).await,
+            "different timeouts select a different pool"
+        );
+        zeroclaw_config::schema::set_runtime_proxy_config(Default::default());
+        let after_proxy_publication = build(60);
+        assert_ne!(
+            first_peer,
+            peer(&after_proxy_publication).await,
+            "proxy publication invalidates the old pool"
+        );
+    }
+}
