@@ -750,7 +750,7 @@ class RiskClassifierTest(unittest.TestCase):
     def test_9530_positive_test_only_rust_high_path_proposes_medium(self) -> None:
         path = "crates/zeroclaw-runtime/src/security/policy.rs"
         api = FakeAPI(pull(), [changed_file(path, 1, 1, TEST_PATCH)])
-        api.add_source(path, BASE, TEST_SOURCE)
+        api.add_source(path, MERGE_BASE, TEST_SOURCE)
         api.add_source(path, HEAD, TEST_SOURCE.replace("assert_eq!(1, 1)", "assert_eq!(1, 2)"))
         report = evaluate(api)
         self.assertEqual(report["proposed_risk"], "risk:medium")
@@ -766,6 +766,69 @@ class RiskClassifierTest(unittest.TestCase):
         report = evaluate(api)
         self.assertEqual(report["proposed_risk"], "risk:medium")
         self.assertTrue(report["exception_9530"]["applied"])
+
+    def test_9530_proof_skips_merge_base_lookup_when_ineligible(self) -> None:
+        class CountingAPI(FakeAPI):
+            merge_base_lookups = 0
+
+            def get_merge_base(self, base_sha: str, head_sha: str) -> str:
+                self.merge_base_lookups += 1
+                return self.merge_base
+
+        # High matches that cannot qualify for the proof (no canonical
+        # high-risk Rust file) must not spend the compare request at all.
+        api = CountingAPI(pull(["risk:high"]), [changed_file("wit/plugin.wit")])
+        report = evaluate(api)
+        self.assertEqual(report["proposed_risk"], "risk:high")
+        self.assertEqual(api.merge_base_lookups, 0)
+
+    def test_9530_lookup_failure_degrades_to_high(self) -> None:
+        class FailingLookupAPI(FakeAPI):
+            def get_merge_base(self, base_sha: str, head_sha: str) -> str:
+                raise classifier.RiskReportError("GitHub comparison request timed out")
+
+        # A failed compare request reads as unavailable source evidence
+        # instead of aborting the whole report.
+        path = "crates/zeroclaw-runtime/src/security/policy.rs"
+        api = FailingLookupAPI(pull(["risk:high"]), [changed_file(path, 1, 1, TEST_PATCH)])
+        report = evaluate(api)
+        self.assertEqual(report["proposed_risk"], "risk:high")
+        self.assertFalse(report["exception_9530"]["applied"])
+        self.assertIn("source evidence is unavailable", report["exception_9530"]["detail"])
+
+    def test_get_merge_base_reads_the_compare_merge_base_commit(self) -> None:
+        class CompareAPI(classifier.GitHubAPI):
+            def __init__(self, payload: object) -> None:
+                super().__init__("zeroclaw-labs/zeroclaw", "token")
+                self.payload = payload
+                self.calls: list[str] = []
+
+            def request(self, method: str, path: str) -> object:
+                self.calls.append(path)
+                return self.payload
+
+        api = CompareAPI({"base_commit": {"sha": BASE}, "merge_base_commit": {"sha": MERGE_BASE}})
+        self.assertEqual(api.get_merge_base(BASE, HEAD), MERGE_BASE)
+        self.assertEqual(api.calls, [f"/repos/zeroclaw-labs/zeroclaw/compare/{BASE}...{HEAD}?per_page=1"])
+
+    def test_get_merge_base_rejects_unusable_comparisons(self) -> None:
+        class CompareAPI(classifier.GitHubAPI):
+            def __init__(self, payload: object) -> None:
+                super().__init__("zeroclaw-labs/zeroclaw", "token")
+                self.payload = payload
+
+            def request(self, method: str, path: str) -> object:
+                return self.payload
+
+        payloads = [
+            "not a dict",
+            {"base_commit": {"sha": HEAD}, "merge_base_commit": {"sha": MERGE_BASE}},
+            {"base_commit": {"sha": BASE}},
+            {"base_commit": {"sha": BASE}, "merge_base_commit": {"sha": "short"}},
+        ]
+        for payload in payloads:
+            with self.subTest(payload=payload), self.assertRaises(classifier.RiskReportError):
+                CompareAPI(payload).get_merge_base(BASE, HEAD)
 
     def test_9530_negative_cases_propose_high(self) -> None:
         path = "crates/zeroclaw-runtime/src/security/policy.rs"
@@ -882,7 +945,7 @@ pub fn allowed() -> bool {
         for name, file, base_source, head_source in cases:
             with self.subTest(name=name):
                 api = FakeAPI(pull(), [file])
-                api.add_source(path, BASE, base_source)
+                api.add_source(path, MERGE_BASE, base_source)
                 api.add_source(path, HEAD, head_source)
                 report = evaluate(api)
                 self.assertEqual(report["proposed_risk"], "risk:high")
@@ -898,7 +961,7 @@ pub fn allowed() -> bool {
                 if status in {"renamed", "copied"}:
                     file["previous_filename"] = path
                 api = FakeAPI(pull(), [file])
-                api.add_source(path, BASE, TEST_SOURCE)
+                api.add_source(path, MERGE_BASE, TEST_SOURCE)
                 api.add_source(path, HEAD, TEST_SOURCE.replace("assert_eq!(1, 1)", "assert_eq!(1, 2)"))
                 self.assertEqual(evaluate(api)["proposed_risk"], "risk:high")
 
@@ -909,7 +972,7 @@ pub fn allowed() -> bool {
                 changed_file("crates/zeroclaw-runtime/src/policy.rs"),
             ],
         )
-        api.add_source(path, BASE, TEST_SOURCE)
+        api.add_source(path, MERGE_BASE, TEST_SOURCE)
         api.add_source(path, HEAD, TEST_SOURCE.replace("assert_eq!(1, 1)", "assert_eq!(1, 2)"))
         self.assertEqual(evaluate(api)["proposed_risk"], "risk:high")
 
@@ -929,7 +992,7 @@ pub fn allowed() -> bool {
         self.assertEqual(report["proposed_risk"], "risk:high")
 
         api = FakeAPI(pull(), [changed_file(path, 1, 1, TEST_PATCH)])
-        api.add_source(path, BASE, "fn broken() {\n")
+        api.add_source(path, MERGE_BASE, "fn broken() {\n")
         api.add_source(path, HEAD, "fn broken() {\n")
         report = evaluate(api)
         self.assertEqual(report["proposed_risk"], "risk:high")
@@ -954,14 +1017,14 @@ pub fn allowed() -> bool {
         head_source = base_source.replace("run_old();", "run_new();")
         patch = "@@ -11,1 +11,1 @@\n-        run_old();\n+        run_new();\n"
         api = FakeAPI(pull(), [changed_file(path, 1, 1, patch)])
-        api.add_source(path, BASE, base_source)
+        api.add_source(path, MERGE_BASE, base_source)
         api.add_source(path, HEAD, head_source)
         report = evaluate(api)
         self.assertEqual(report["proposed_risk"], "risk:high")
         self.assertFalse(report["exception_9530"]["applied"])
 
         api = FakeAPI(pull(), [changed_file(path, 1, 1, TEST_PATCH)])
-        api.add_source(path, BASE, TEST_SOURCE.replace("assert_eq!(1, 1)", "assert_eq!(9, 9)"))
+        api.add_source(path, MERGE_BASE, TEST_SOURCE.replace("assert_eq!(1, 1)", "assert_eq!(9, 9)"))
         api.add_source(path, HEAD, TEST_SOURCE.replace("assert_eq!(1, 1)", "assert_eq!(1, 2)"))
         report = evaluate(api)
         self.assertEqual(report["proposed_risk"], "risk:high")

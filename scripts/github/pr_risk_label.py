@@ -706,7 +706,7 @@ def strict_test_only_proof(
     files: list[dict[str, Any]],
     high_globs: tuple[str, ...],
     api: Any,
-    merge_base_sha: str,
+    base_sha: str,
     head_sha: str,
 ) -> tuple[bool, str]:
     high_rust_files = [
@@ -728,6 +728,14 @@ def strict_test_only_proof(
             continue
         if not all(is_low_path(path) for path in paths):
             return False, "non-low or mixed production file is present"
+
+    # The compare request only pays for itself once the proof is eligible;
+    # a failed lookup reads like unavailable source evidence instead of
+    # losing the whole report.
+    try:
+        merge_base_sha = api.get_merge_base(base_sha, head_sha)
+    except Exception as exc:
+        return False, f"source evidence is unavailable: {exc}"
 
     for item in high_rust_files:
         patch = item.get("patch")
@@ -868,8 +876,7 @@ def classify(
     exception = False
     detail = "not applicable"
     if high_match:
-        merge_base_sha = api.get_merge_base(base_sha, head_sha)
-        exception, detail = strict_test_only_proof(files, policy.high_globs, api, merge_base_sha, head_sha)
+        exception, detail = strict_test_only_proof(files, policy.high_globs, api, base_sha, head_sha)
         proposed = "risk:medium" if exception else HIGH_LABEL
     elif all(all(is_low_path(path) for path in item_paths(item)) for item in files):
         proposed = "risk:low"
