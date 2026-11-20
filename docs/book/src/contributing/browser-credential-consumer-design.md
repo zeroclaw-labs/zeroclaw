@@ -21,3 +21,9 @@ Use disposable HTTPS fixtures. Cover password-only, TOTP-only, both grants and n
 The draft implements separate catalog grants and a Rust predicate over the top-level URL, credential document, and submission target. The predicate is evaluated against their HTTPS origins. It does not establish that the URLs were collected atomically or that the browser prevents subsequent script-driven transmission. Those guarantees belong to the managed browser executor. The ordinary fill action remains separate from the credential flow.
 
 The initial acceptance sequence is a disposable HTTPS login with separate password and TOTP steps, followed by a read-only confirmation that the configured operator can reach their intended console. Live validation records the authentication outcome without copying account data, credentials, cookies, or identity-provider responses.
+
+## Agent-browser transport probe
+
+A disposable browser session on Jarvis, run as the ZeroClaw service user, verified that agent-browser 0.39.1 and its installed Chrome can run with a private temporary socket directory and execute a synthetic expression supplied through standard input. The result was 42. The probe did not use a vault record, a live identity provider, or the running service's browser session.
+
+A one-shot credential-provider plugin is another supported input path for username/password. Neither the stdin probe nor the plugin API provides the full TOTP and authenticated-session contract by itself. The managed executor must bind release to the correct document, prevent generic browser observations while credentials are present, discard raw backend errors, and close the disposable session on failure or cancellation.
