@@ -15,10 +15,11 @@ see [Configuration](./configuration.md); for the one-line catalog entry see the
 
 ## Config
 
-Codex subscription auth lives on the `openai` slot. Set `wire_api = "responses"`
-to route through `POST /v1/responses` (the Codex backend, not the chat
-completions API) and `requires_openai_auth = true` to pull credentials from
-ZeroClaw's stored `openai-codex` auth profile instead of an `api_key` field:
+Codex subscription auth lives on an OpenAI connection. Set
+`api.chat.wire_api = "responses"` to route through `POST /v1/responses` (the
+Codex backend, not the chat completions API) and `auth.mode = "codex"` to pull
+credentials from ZeroClaw's stored `openai-codex` auth profile instead of an
+`api_key` field:
 
 ```bash
 # Reuse an existing Codex CLI login:
@@ -315,8 +316,8 @@ A healthy run returns model output with `exit_code=0`. Two failure signatures:
    (move aside any foreign `auth-profiles.json` first).
 3. `zeroclaw auth status` shows `openai-codex:default ... kind=OAuth ...
    expires=<future>`.
-4. An `openai` entry with `wire_api = "responses"`, `requires_openai_auth =
-   true`, and an exact served model ID.
+4. An OpenAI connection with `api.chat.wire_api = "responses"`,
+   `auth.mode = "codex"`, and a canonical model bound to an exact served ID.
 5. Daemon on `--config-dir ~/.zeroclaw` (the default).
 6. Drive the agent once → `exit_code=0` with real output.
 7. Router maps roles to current served IDs (don't pin a version you will have
