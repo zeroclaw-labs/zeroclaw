@@ -22,6 +22,12 @@ pub struct PersistedRun {
     pub redacted: bool,
     /// Origin of the run, for per-source caps + audit.
     pub trigger_source: SopTriggerSource,
+    /// The engine that wrote this revision. The store accepts a same-revision
+    /// write only as a byte-identical retry, so two engines that build the
+    /// same state from the same revision still conflict, while a retry from
+    /// the writing engine matches. `None` on records written without one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub writer: Option<String>,
 }
 
 impl PersistedRun {
@@ -34,6 +40,7 @@ impl PersistedRun {
             last_progress_at,
             redacted: false,
             trigger_source,
+            writer: None,
         }
     }
 

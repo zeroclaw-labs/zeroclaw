@@ -5,8 +5,8 @@ pub mod icon;
 pub mod menu;
 
 use tauri::{
-    App, Manager, Runtime,
-    tray::{TrayIcon, TrayIconBuilder, TrayIconEvent},
+    App, Runtime,
+    tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent},
 };
 
 /// Set up the system tray icon and menu.
@@ -20,14 +20,14 @@ pub fn setup_tray<R: Runtime>(app: &App<R>) -> Result<TrayIcon<R>, tauri::Error>
         .show_menu_on_left_click(false)
         .on_menu_event(events::handle_menu_event)
         .on_tray_icon_event(|tray, event| {
-            if let TrayIconEvent::Click { button, .. } = event
-                && button == tauri::tray::MouseButton::Left
+            // A left click arrives as a press and then a release; act once.
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } = event
             {
-                let app = tray.app_handle();
-                if let Some(window) = app.get_webview_window("main") {
-                    let _ = window.show();
-                    let _ = window.set_focus();
-                }
+                crate::window::show_main_window(tray.app_handle(), None);
             }
         })
         .build(app)

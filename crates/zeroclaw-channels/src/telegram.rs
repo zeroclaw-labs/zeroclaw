@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use zeroclaw_api::channel::{
     Channel, ChannelMessage, ChannelModelPickerRequest, ListenerHealth, ProgressEvent, SendMessage,
@@ -38,6 +39,13 @@ const POLL_HEALTH_STALE_AFTER: Duration = Duration::from_secs(90);
 /// notice is abandoned, not retried.
 const VOICE_DROP_NOTICE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Ceiling on one `remove_reaction` clear. The clear runs while the
+/// orchestrator still holds the conversation permit, and
+/// `build_channel_proxy_client` sets no request timeout, so this bounds both
+/// the wait for an in-flight acknowledgement and the clear request itself
+/// (including its error-body read). A stalled Telegram must not pin the turn.
+const REACTION_CLEAR_TIMEOUT: Duration = Duration::from_secs(5);
+
 static ORPHAN_THINK_TAG_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
     regex::Regex::new(r"</?(?:redacted_)?think(?:ing)?>").expect("ORPHAN_THINK_TAG_RE must compile")
 });
@@ -61,6 +69,9 @@ struct MultiDraftKey {
 #[derive(Debug)]
 struct SendChunksError {
     delivered: usize,
+    /// The chunk failed because Telegram is still flood-limiting this chat.
+    /// Callers must not resume or resend inside the penalty window.
+    rate_limited: bool,
     source: anyhow::Error,
 }
 
@@ -72,6 +83,45 @@ impl std::fmt::Display for SendChunksError {
             self.delivered, self.source
         )
     }
+}
+
+/// Longest `retry_after` the send path waits out inline before retrying the
+/// same request. A longer penalty fails the send instead of blocking the reply
+/// task for many minutes; either way no request is fired into an active limit.
+const TELEGRAM_MAX_INLINE_RETRY_AFTER: Duration = Duration::from_secs(60);
+
+/// How many times one `sendMessage` request is retried after HTTP 429.
+const TELEGRAM_RATE_LIMIT_RETRIES: u32 = 2;
+
+/// Server-directed wait for a Telegram flood-limit response.
+///
+/// Returns `None` unless `status` is HTTP 429. Telegram reports the penalty in
+/// `parameters.retry_after` (seconds); a 429 without it waits one second.
+fn telegram_retry_after(status: reqwest::StatusCode, body: &str) -> Option<Duration> {
+    if status != reqwest::StatusCode::TOO_MANY_REQUESTS {
+        return None;
+    }
+    let secs = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v.get("parameters")?.get("retry_after")?.as_u64())
+        .unwrap_or(1);
+    Some(Duration::from_secs(secs))
+}
+
+/// Result of one logical `sendMessage` call after rate-limit handling.
+enum SendMessageAttempt {
+    Sent,
+    /// Still flood-limited after waiting, or the penalty was too long to wait.
+    /// Callers must not retry with a different format: that is another request
+    /// into the same limit.
+    RateLimited {
+        status: reqwest::StatusCode,
+        body: String,
+    },
+    Failed {
+        status: reqwest::StatusCode,
+        body: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -680,6 +730,129 @@ fn build_telegram_ack_reaction_request(
     })
 }
 
+/// Build the `setMessageReaction` body that withdraws the bot's reaction.
+///
+/// Telegram gives a bot a single reaction slot per message, so an empty
+/// `reaction` list clears whatever emoji the bot set there, whichever one it was.
+fn build_telegram_clear_reaction_request(chat_id: &str, message_id: i64) -> serde_json::Value {
+    serde_json::json!({
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "reaction": []
+    })
+}
+
+/// Scrub Telegram credentials from a clear-path error before it reaches a log
+/// or a tool result. The shared leak detector redacts the `/bot<token>/` URL
+/// form; the literal token is also removed because a failed response body may
+/// echo it without the surrounding URL.
+fn scrub_clear_error(text: &str, bot_token: &str) -> String {
+    let scrubbed = zeroclaw_runtime::security::scrub(text);
+    if bot_token.is_empty() {
+        return scrubbed;
+    }
+    scrubbed.replace(bot_token, "[REDACTED_BOT_TOKEN]")
+}
+
+/// Send the `setMessageReaction` clear that withdraws the bot's reaction.
+///
+/// Bounded by `timeout` because the caller awaits it while holding the
+/// conversation permit and `build_channel_proxy_client` sets no request timeout.
+/// Returns an error on a non-success response or when the bound elapses: an
+/// unconfirmed clear must not be reported as a withdrawn reaction.
+async fn clear_telegram_reaction(
+    client: &reqwest::Client,
+    url: &str,
+    bot_token: &str,
+    chat_id: &str,
+    message_id: i64,
+    timeout: Duration,
+) -> anyhow::Result<()> {
+    let body = build_telegram_clear_reaction_request(chat_id, message_id);
+    let request = async {
+        // `api_url` embeds the bot token, and reqwest puts the URL in transport
+        // errors. Neither those errors nor a reflected error body may reach a
+        // log or a tool result unscrubbed: the token grants control of the bot.
+        let response = client.post(url).json(&body).send().await.map_err(|err| {
+            anyhow::Error::msg(format!(
+                "Telegram setMessageReaction (clear) failed: {}",
+                scrub_clear_error(&err.without_url().to_string(), bot_token)
+            ))
+        })?;
+        let status = response.status();
+        let body = response.text().await.map_err(|err| {
+            anyhow::Error::msg(format!(
+                "Telegram setMessageReaction (clear) response read failed: {}",
+                scrub_clear_error(&err.without_url().to_string(), bot_token)
+            ))
+        })?;
+        if !status.is_success() {
+            anyhow::bail!(
+                "Telegram setMessageReaction (clear) failed ({status}): {}",
+                scrub_clear_error(&body, bot_token)
+            );
+        }
+        let result: serde_json::Value = serde_json::from_str(&body).map_err(|err| {
+            anyhow::Error::msg(format!(
+                "Telegram setMessageReaction (clear) returned invalid JSON: {err}"
+            ))
+        })?;
+        if !result["ok"].as_bool().unwrap_or(false) {
+            anyhow::bail!(
+                "Telegram setMessageReaction (clear) rejected: {}",
+                scrub_clear_error(&body, bot_token)
+            );
+        }
+        Ok(())
+    };
+    match tokio::time::timeout(timeout, request).await {
+        Ok(result) => result,
+        Err(_) => anyhow::bail!(
+            "Telegram setMessageReaction (clear) timed out after {timeout:?} \
+             (chat_id={chat_id}, message_id={message_id})"
+        ),
+    }
+}
+
+/// Shared state for one in-flight acknowledgement reaction.
+///
+/// `try_add_ack_reaction_nonblocking` fires the add request in a detached task;
+/// `remove_reaction` needs the clear to land *after* that request. A request
+/// already on the wire cannot be recalled by aborting the task, so ordering is
+/// kept by handing the clear to the ack task instead of racing it: the task
+/// sends the clear itself, right after the add response, once it observes
+/// `clear_requested`.
+#[derive(Default)]
+struct AckReactionState {
+    /// Set by `remove_reaction` when the reaction should be withdrawn. The ack
+    /// task checks it once its add request has settled.
+    clear_requested: AtomicBool,
+    /// Set by the ack task only once it has *confirmed* the clear, so
+    /// `remove_reaction` skips its own clear only when the withdraw actually
+    /// landed. A failed deferred clear leaves this false, and `remove_reaction`
+    /// retries it (and reports the failure) instead of claiming success.
+    cleared: AtomicBool,
+}
+
+/// In-flight acknowledgements keyed by `(chat_id, message_id)`: the shared
+/// state and the detached task that `remove_reaction` settles before clearing.
+type InFlightAckReactions =
+    Mutex<HashMap<(String, i64), (Arc<AckReactionState>, tokio::task::JoinHandle<()>)>>;
+
+/// The numeric message id inside a `telegram_{chat_id}_{message_id}` channel id.
+///
+/// Returns `None` for ids that are not in that shape, so a caller can skip the
+/// API call instead of reacting against a guessed message. The chat id may be
+/// negative, which is why the split is on the last `_`.
+fn parse_telegram_message_id(message_id: &str) -> Option<i64> {
+    message_id
+        .strip_prefix("telegram_")?
+        .rsplit_once('_')?
+        .1
+        .parse()
+        .ok()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TelegramAttachmentKind {
     Image,
@@ -992,6 +1165,20 @@ pub struct TelegramChannel {
     /// [`VOICE_DROP_NOTICE_TIMEOUT`] in production; tests shrink it so a
     /// stalled-notice regression does not have to wait out the real ceiling.
     voice_drop_notice_timeout: Duration,
+    /// Bound on one `remove_reaction` clear. Always [`REACTION_CLEAR_TIMEOUT`]
+    /// in production; tests shrink it so a stalled-clear regression does not
+    /// have to wait out the real ceiling.
+    reaction_clear_timeout: Duration,
+    /// In-flight acknowledgement reactions keyed by `(chat_id, message_id)`.
+    ///
+    /// `try_add_ack_reaction_nonblocking` sends the real `setMessageReaction`
+    /// request in a detached task, so the orchestrator's `early_ack_task` -
+    /// which calls the no-op `add_reaction` - does not wait for it.
+    /// `remove_reaction` settles the entry for the message before clearing, so
+    /// the clear cannot overtake the ack and strand the emoji. When the ack
+    /// outlives the settle bound the task keeps the clear, ordered after the
+    /// add response - see [`AckReactionState`].
+    ack_reactions_in_flight: InFlightAckReactions,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2589,6 +2776,8 @@ impl TelegramChannel {
             pending_model_pickers: tokio::sync::Mutex::new(HashMap::new()),
             approval_timeout_secs: 120,
             voice_drop_notice_timeout: VOICE_DROP_NOTICE_TIMEOUT,
+            reaction_clear_timeout: REACTION_CLEAR_TIMEOUT,
+            ack_reactions_in_flight: Mutex::new(HashMap::new()),
         }
     }
 
@@ -2598,6 +2787,15 @@ impl TelegramChannel {
     #[cfg(test)]
     fn with_voice_drop_notice_timeout(mut self, timeout: Duration) -> Self {
         self.voice_drop_notice_timeout = timeout;
+        self
+    }
+
+    /// Shrink the `remove_reaction` clear bound so a stalled-clear test does
+    /// not wait out the production ceiling. Test-only: the ceiling protects
+    /// the turn, it is not operator-tunable.
+    #[cfg(test)]
+    fn with_reaction_clear_timeout(mut self, timeout: Duration) -> Self {
+        self.reaction_clear_timeout = timeout;
         self
     }
 
@@ -3056,6 +3254,37 @@ impl TelegramChannel {
                             if e.delivered > skip {
                                 skip = e.delivered;
                                 last_sent_at = Some(std::time::Instant::now());
+                            }
+                            // Telegram is flood-limiting this chat: neither
+                            // another narration attempt nor the final-answer
+                            // send below may go out inside `retry_after`. The
+                            // accepted narration chunks stay posted (never
+                            // resent); the final answer was not delivered, so
+                            // report it as undelivered and not to be resent.
+                            if e.rate_limited {
+                                ::zeroclaw_log::record!(
+                                    WARN,
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Fail
+                                    )
+                                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                    .with_attrs(
+                                        ::serde_json::json!({
+                                            "error": format!("{}", e.source),
+                                            "chunks_delivered": skip,
+                                        })
+                                    ),
+                                    "Telegram flood limit during multi-message pending narration; not sending more narration or the final answer"
+                                );
+                                return Err(zeroclaw_api::channel::FinalizeUndelivered {
+                                    reason: format!(
+                                        "flood-limited while delivering pending narration \
+                                         ({skip} chunk(s) accepted): {:#}",
+                                        e.source
+                                    ),
+                                }
+                                .into());
                             }
                             attempt += 1;
                             if attempt >= MULTI_MESSAGE_FINALIZE_RETRIES {
@@ -3529,24 +3758,67 @@ impl TelegramChannel {
     fn try_add_ack_reaction_nonblocking(&self, chat_id: String, message_id: i64) {
         let client = self.http_client();
         let url = self.api_url("setMessageReaction");
+        let bot_token = self.bot_token.clone();
         let emoji = random_telegram_ack_reaction().to_string();
         let body = build_telegram_ack_reaction_request(&chat_id, message_id, &emoji);
+        let clear_timeout = self.reaction_clear_timeout;
+        let key = (chat_id.clone(), message_id);
+        let state = Arc::new(AckReactionState::default());
+        let task_state = Arc::clone(&state);
 
-        zeroclaw_spawn::spawn!(async move {
-            let response = match client.post(&url).json(&body).send().await {
-                Ok(resp) => resp,
+        let handle = zeroclaw_spawn::spawn!(async move {
+            match client.post(&url).json(&body).send().await {
+                Ok(response) => {
+                    if !response.status().is_success() {
+                        let status = response.status();
+                        let err_body = response.text().await.unwrap_or_default();
+                        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"chat_id": chat_id, "message_id": message_id, "status": status.to_string(), "err_body": err_body})), "add ACK reaction failed for chat_id=, message_id=: status=, body=");
+                    }
+                }
                 Err(err) => {
                     ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"chat_id": chat_id, "message_id": message_id, "err": err.to_string()})), "failed to add ACK reaction to chat_id=, message_id=");
-                    return;
                 }
-            };
+            }
 
-            if !response.status().is_success() {
-                let status = response.status();
-                let err_body = response.text().await.unwrap_or_default();
-                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"chat_id": chat_id, "message_id": message_id, "status": status.to_string(), "err_body": err_body})), "add ACK reaction failed for chat_id=, message_id=: status=, body=");
+            // The add request has settled - success, error response, or
+            // transport failure. Only now is it safe to withdraw: the clear runs
+            // after the add response, so it cannot be overtaken by an add that
+            // is still on the wire. `remove_reaction` sets `clear_requested`
+            // when it cannot wait the add out, and returns without clearing;
+            // the clear it requested is run here instead.
+            if task_state.clear_requested.load(Ordering::Acquire) {
+                match clear_telegram_reaction(
+                    &client,
+                    &url,
+                    &bot_token,
+                    &chat_id,
+                    message_id,
+                    clear_timeout,
+                )
+                .await
+                {
+                    Ok(()) => task_state.cleared.store(true, Ordering::Release),
+                    Err(err) => {
+                        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"chat_id": chat_id, "message_id": message_id, "err": err.to_string()})), "deferred ACK reaction clear failed for chat_id=, message_id=");
+                    }
+                }
             }
         });
+        self.track_ack_reaction(key, state, handle);
+    }
+
+    /// Remember a freshly spawned acknowledgement so `remove_reaction` can
+    /// settle it before clearing. Finished entries are dropped here, so the map
+    /// stays bounded by the acknowledgements still in flight.
+    fn track_ack_reaction(
+        &self,
+        key: (String, i64),
+        state: Arc<AckReactionState>,
+        handle: tokio::task::JoinHandle<()>,
+    ) {
+        let mut inflight = self.ack_reactions_in_flight.lock();
+        inflight.retain(|_, (_, task)| !task.is_finished());
+        inflight.insert(key, (state, handle));
     }
 
     fn http_client(&self) -> reqwest::Client {
@@ -3598,7 +3870,11 @@ impl TelegramChannel {
         )
     }
 
-    async fn persist_allowed_identity(&self, identity: &str) -> anyhow::Result<()> {
+    async fn persist_allowed_identity(
+        &self,
+        identity: &str,
+        identities: &[String],
+    ) -> anyhow::Result<()> {
         let Some(authority) = &self.persist else {
             ::zeroclaw_log::record!(
                 WARN,
@@ -3618,12 +3894,36 @@ impl TelegramChannel {
         // `peer_groups` map key. Selecting by key wrote the grant into whatever
         // group happened to be named `telegram_<alias>`, even one whose
         // `channel` points at a different instance, and reported success.
-        crate::identity_persist::persist_external_peer(
+        crate::identity_persist::persist_external_peer_checked(
             Some(authority),
             "telegram",
             &self.alias,
             &normalized,
             |entry, user| Self::normalize_identity(entry) == user,
+            None,
+            |config| {
+                anyhow::ensure!(
+                    !crate::allowlist::grants_anyone(
+                        &config.channel_external_peers("telegram", &self.alias)
+                    ),
+                    "Telegram startup pairing is no longer available"
+                );
+                let normalized: Vec<String> = identities
+                    .iter()
+                    .map(|id| Self::normalize_identity(id))
+                    .collect();
+                let borrowed: Vec<&str> = normalized.iter().map(String::as_str).collect();
+                if let Some(conflict) = crate::identity_persist::external_peer_deny_conflict(
+                    config,
+                    "telegram",
+                    &self.alias,
+                    &borrowed,
+                    |entry, user| Self::normalize_identity(entry) == user,
+                ) {
+                    anyhow::bail!(conflict);
+                }
+                Ok(())
+            },
         )
         .await
     }
@@ -3645,6 +3945,20 @@ impl TelegramChannel {
             .is_some()
     }
 
+    /// Whether first-user pairing is still the live authorization path: a
+    /// one-time code is outstanding and no effective grant authorizes a peer.
+    ///
+    /// Resolved on every call, never from the guard's mere existence. The
+    /// guard outlives the code it issued — `try_pair` clears the code, not
+    /// the guard — and peers can start resolving at any time, so a channel
+    /// that began empty is not still pairing once either happens. The
+    /// unauthorized notice, the `/bind` hint, and the `/bind` redemption
+    /// branch all read this one predicate, so what the channel says about
+    /// the authorization path and what it accepts cannot disagree.
+    fn startup_pairing_available(&self) -> bool {
+        self.pairing_code_active() && !self.has_authorized_peer()
+    }
+
     /// Whether any peer group has authorized someone on this channel.
     ///
     /// Effective grants only. The resolved list also carries the denies for
@@ -3664,6 +3978,58 @@ impl TelegramChannel {
             format!("zeroclaw channel bind-telegram {identity}")
         } else {
             format!("zeroclaw channel bind-telegram {identity} --alias {alias}")
+        }
+    }
+
+    /// `channels.telegram.<alias>.unauthorized_message` for this alias, read
+    /// from the shared config handle at send time rather than copied into
+    /// this struct, so nothing here can go stale against that handle.
+    ///
+    /// Read the same published config that the channel's persistence authority
+    /// updates. Changes published through that authority reach the next notice;
+    /// edits made only to disk still need a daemon reload or process restart.
+    /// Return `None` when persistence is unwired or this alias has no override.
+    fn configured_unauthorized_message(&self) -> Option<String> {
+        self.persist
+            .as_ref()?
+            .live_handle()
+            .read()
+            .channels
+            .telegram
+            .get(&self.alias)?
+            .unauthorized_message
+            .clone()
+    }
+
+    /// Compose the notice an unauthorized sender receives.
+    ///
+    /// A blank `custom` falls back to the built-in copy, which has two
+    /// forms. While startup pairing is still available the deployment is
+    /// being onboarded by whoever holds the terminal, so the bind command is
+    /// the actionable next step. Once the code is redeemed or peers resolve,
+    /// authorization comes from configuration — possibly written by a
+    /// control plane the sender and the operator never touch by hand — and a
+    /// terminal command is noise; naming the identity to authorize is what
+    /// the operator needs. `startup_pairing_available` is the caller's live
+    /// reading of [`Self::startup_pairing_available`].
+    fn unauthorized_notice(
+        custom: Option<&str>,
+        startup_pairing_available: bool,
+        bind_command: &str,
+        identity: &str,
+    ) -> String {
+        match custom.map(str::trim).filter(|text| !text.is_empty()) {
+            Some(text) => text
+                .replace("{bind_command}", bind_command)
+                .replace("{identity}", identity),
+            None if startup_pairing_available => i18n::get_required_cli_string_with_args(
+                "channel-telegram-unauthorized-bind",
+                &[("bindCommand", bind_command)],
+            ),
+            None => i18n::get_required_cli_string_with_args(
+                "channel-telegram-unauthorized-allowlist",
+                &[("identity", identity)],
+            ),
         }
     }
 
@@ -4486,7 +4852,19 @@ impl TelegramChannel {
         }
 
         if let Some(code) = Self::extract_bind_code(text) {
-            if let Some(pairing) = self.pairing.as_ref() {
+            // Redemption reads the same live predicate the notice and the
+            // `/bind` hint read. The guard's existence is not proof that
+            // startup pairing is still the authorization path: `try_pair`
+            // clears the code and leaves the guard, and a peer set can fill
+            // in while the channel runs. Without this the channel would tell
+            // a sender that pairing is inactive and still accept the
+            // outstanding code from them, writing the peer group that
+            // configuration — possibly a control plane — already owns.
+            if let Some(pairing) = self
+                .pairing
+                .as_ref()
+                .filter(|_| self.startup_pairing_available())
+            {
                 let bind_identity = normalized_sender_id.clone().or_else(|| {
                     if normalized_username.is_empty() || normalized_username == "unknown" {
                         None
@@ -4524,7 +4902,9 @@ impl TelegramChannel {
                 match pairing.reserve_pair(code, &chat_id).await {
                     Ok(Some(reservation)) => {
                         if let Some(identity) = bind_identity {
-                            match Box::pin(self.persist_allowed_identity(&identity)).await {
+                            match Box::pin(self.persist_allowed_identity(&identity, &identities))
+                                .await
+                            {
                                 Ok(()) => {
                                     // Durable write landed, so the pairing may
                                     // now consume the code and mint the token.
@@ -4647,27 +5027,47 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         // and the bot would keep demanding approval.
         let bind_command = Self::suggested_bind_command(&self.alias, &suggested_identity);
 
-        let _ = self
-            .send(&SendMessage::new(
-                format!(
-                    "🔐 This bot requires operator approval.\n\nCopy this command to the operator terminal:\n`{bind_command}`\n\nAfter the operator runs it, send your message again."
-                ),
-                &chat_id,
-            ))
-            .await;
+        // One resolution of the pairing predicate for both messages below:
+        // the notice and the `/bind` hint must describe the same
+        // authorization path, and re-resolving would let peers appear
+        // between the two sends.
+        let startup_pairing_available = self.startup_pairing_available();
+
+        let notice = Self::unauthorized_notice(
+            self.configured_unauthorized_message().as_deref(),
+            startup_pairing_available,
+            &bind_command,
+            &suggested_identity,
+        );
+
+        let _ = self.send_unauthorized_notice(&notice, &chat_id).await;
 
         // Only offer the `/bind <code>` path while the channel is genuinely
         // unpaired. Once peers exist (resolved live), the one-time code is
         // moot and the hint just confuses an operator who already authorized
         // someone — the "already assigned but still asks" complaint.
-        if self.pairing_code_active() && !self.has_authorized_peer() {
+        if startup_pairing_available {
             let _ = self
-                .send(&SendMessage::new(
+                .send_unauthorized_notice(
                     "ℹ️ If the operator provides a one-time pairing code, you can also run `/bind <code>`.",
                     &chat_id,
-                ))
+                )
                 .await;
         }
+    }
+
+    /// Deliver the unauthorized notice, or its `/bind` hint, as text only.
+    ///
+    /// The notice is catalogue or operator copy, not agent output, so it
+    /// skips the voice routing and attachment interpretation in `send`: a
+    /// configured support URL ending in `.pdf`, a literal attachment marker,
+    /// or a voice-peer chat still receives the notice as `sendMessage` text.
+    /// Formatting and chunking stay those of every other text reply.
+    async fn send_unauthorized_notice(&self, notice: &str, chat_id: &str) -> anyhow::Result<()> {
+        self.send_text_chunks(notice, chat_id, None, 0)
+            .await
+            .map(|_| ())
+            .map_err(|e| e.source)
     }
 
     /// Get the file path for a Telegram file ID via the Bot API.
@@ -5980,26 +6380,31 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 markdown_body["message_thread_id"] = serde_json::Value::String(tid.to_string());
             }
 
-            let markdown_resp = self
-                .http_client()
-                .post(self.api_url("sendMessage"))
-                .json(&markdown_body)
-                .send()
+            let (markdown_status, markdown_err) = match self
+                .send_message_honoring_rate_limit(&markdown_body)
                 .await
                 .map_err(|e| SendChunksError {
                     delivered: index,
+                    rate_limited: false,
                     source: e.into(),
-                })?;
-
-            if markdown_resp.status().is_success() {
-                if index < chunks.len() - 1 {
-                    tokio::time::sleep(Duration::from_millis(100)).await;
+                })? {
+                SendMessageAttempt::Sent => {
+                    if index < chunks.len() - 1 {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                    continue;
                 }
-                continue;
-            }
-
-            let markdown_status = markdown_resp.status();
-            let markdown_err = markdown_resp.text().await.unwrap_or_default();
+                SendMessageAttempt::RateLimited { status, body } => {
+                    return Err(SendChunksError {
+                        delivered: index,
+                        rate_limited: true,
+                        source: anyhow::Error::msg(format!(
+                            "Telegram sendMessage rate limited ({status}): {body}"
+                        )),
+                    });
+                }
+                SendMessageAttempt::Failed { status, body } => (status, body),
+            };
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -6017,26 +6422,39 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             if let Some(tid) = thread_id {
                 plain_body["message_thread_id"] = serde_json::Value::String(tid.to_string());
             }
-            let plain_resp = self
-                .http_client()
-                .post(self.api_url("sendMessage"))
-                .json(&plain_body)
-                .send()
+            match self
+                .send_message_honoring_rate_limit(&plain_body)
                 .await
                 .map_err(|e| SendChunksError {
                     delivered: index,
+                    rate_limited: false,
                     source: e.into(),
-                })?;
-
-            if !plain_resp.status().is_success() {
-                let plain_status = plain_resp.status();
-                let plain_err = plain_resp.text().await.unwrap_or_default();
-                return Err(SendChunksError {
-                    delivered: index,
-                    source: anyhow::Error::msg(format!(
-                        "Telegram sendMessage failed (markdown {markdown_status}: {markdown_err}; plain {plain_status}: {plain_err})"
-                    )),
-                });
+                })? {
+                SendMessageAttempt::Sent => {}
+                SendMessageAttempt::RateLimited {
+                    status: plain_status,
+                    body: plain_err,
+                } => {
+                    return Err(SendChunksError {
+                        delivered: index,
+                        rate_limited: true,
+                        source: anyhow::Error::msg(format!(
+                            "Telegram sendMessage rate limited (markdown {markdown_status}: {markdown_err}; plain {plain_status}: {plain_err})"
+                        )),
+                    });
+                }
+                SendMessageAttempt::Failed {
+                    status: plain_status,
+                    body: plain_err,
+                } => {
+                    return Err(SendChunksError {
+                        delivered: index,
+                        rate_limited: false,
+                        source: anyhow::Error::msg(format!(
+                            "Telegram sendMessage failed (markdown {markdown_status}: {markdown_err}; plain {plain_status}: {plain_err})"
+                        )),
+                    });
+                }
             }
 
             if index < chunks.len() - 1 {
@@ -6045,6 +6463,58 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         }
 
         Ok(chunks.len())
+    }
+
+    /// Posts one `sendMessage` request. On HTTP 429 it waits the server's
+    /// `retry_after` (up to [`TELEGRAM_MAX_INLINE_RETRY_AFTER`]) and resends the
+    /// same body, at most [`TELEGRAM_RATE_LIMIT_RETRIES`] times, so a flood
+    /// limit is never answered with immediate extra requests.
+    async fn send_message_honoring_rate_limit(
+        &self,
+        body: &serde_json::Value,
+    ) -> Result<SendMessageAttempt, reqwest::Error> {
+        let mut retries = 0;
+        loop {
+            let resp = self
+                .http_client()
+                .post(self.api_url("sendMessage"))
+                .json(body)
+                .send()
+                .await?;
+            let status = resp.status();
+            if status.is_success() {
+                return Ok(SendMessageAttempt::Sent);
+            }
+            let text = resp.text().await.unwrap_or_default();
+            let Some(wait) = telegram_retry_after(status, &text) else {
+                return Ok(SendMessageAttempt::Failed { status, body: text });
+            };
+            if retries >= TELEGRAM_RATE_LIMIT_RETRIES || wait > TELEGRAM_MAX_INLINE_RETRY_AFTER {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "retry_after_secs": wait.as_secs(),
+                            "retries": retries,
+                        })),
+                    "Telegram sendMessage rate limited; not retrying inside the penalty window"
+                );
+                return Ok(SendMessageAttempt::RateLimited { status, body: text });
+            }
+            retries += 1;
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "retry_after_secs": wait.as_secs(),
+                        "attempt": retries,
+                    })),
+                "Telegram sendMessage rate limited; waiting retry_after before resending"
+            );
+            tokio::time::sleep(wait).await;
+        }
     }
 
     /// Finalize-time chunked send that never duplicates an accepted prefix.
@@ -6059,6 +6529,13 @@ Allowlist Telegram username (without '@') or numeric user ID.",
     /// Telegram already delivered. A failure before any chunk is accepted
     /// (`delivered == 0`) is returned as the plain source error: nothing is on
     /// the wire, so a full-message fallback is safe.
+    ///
+    /// A flood-limit failure is different: Telegram has asked for no requests
+    /// until `retry_after` has passed, so neither the resume nor the
+    /// orchestrator's full-message fallback may send. It is reported as
+    /// [`FinalizePartialDelivery`] when some chunks were accepted, and as
+    /// [`FinalizeUndelivered`] when none were, so the orchestrator neither
+    /// resends nor counts the reply as delivered.
     async fn finalize_send_chunks(
         &self,
         text: &str,
@@ -6069,7 +6546,21 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             Ok(_) => Ok(()),
             Err(SendChunksError {
                 delivered: 0,
+                rate_limited: true,
                 source,
+            }) => Err(zeroclaw_api::channel::FinalizeUndelivered {
+                reason: format!("{source:#}"),
+            }
+            .into()),
+            Err(SendChunksError {
+                delivered,
+                rate_limited: true,
+                ..
+            }) => Err(zeroclaw_api::channel::FinalizePartialDelivery { delivered }.into()),
+            Err(SendChunksError {
+                delivered: 0,
+                source,
+                ..
             }) => Err(source),
             Err(SendChunksError { delivered, .. }) => {
                 // Some chunks are already posted. Resume from the first unsent
@@ -8413,6 +8904,78 @@ Ensure only one `zeroclaw` process is using this bot token."
         Ok(())
     }
 
+    /// Withdraw the bot's acknowledgement reaction once the reply is done.
+    ///
+    /// Telegram gives a bot a single reaction slot per message, so the clear is
+    /// an empty reaction list and `_emoji` is ignored: the slot holds whichever
+    /// `TELEGRAM_ACK_REACTIONS` entry the ack path picked. A message id that is
+    /// not in the `telegram_{chat_id}_{message_id}` form is a no-op.
+    ///
+    /// The real acknowledgement is sent by `try_add_ack_reaction_nonblocking`
+    /// in a detached task, so this settles that task before clearing: otherwise
+    /// the ack can land after the clear and restore the reaction with nothing
+    /// left to remove it. The settle wait is bounded by `REACTION_CLEAR_TIMEOUT`
+    /// because the orchestrator awaits this while holding the conversation
+    /// permit. A request already on the wire cannot be recalled, so an ack that
+    /// outlives the bound keeps the clear: the ack task runs it after the add
+    /// response, and this returns an error because the withdraw is not yet
+    /// confirmed.
+    async fn remove_reaction(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+        _emoji: &str,
+    ) -> anyhow::Result<()> {
+        let Some(numeric_message_id) = parse_telegram_message_id(message_id) else {
+            return Ok(());
+        };
+        let (chat_id, _) = Self::parse_reply_target(channel_id);
+
+        // Settle the in-flight ack first. Aborting the task would not un-send a
+        // request already on the wire, so on timeout the clear is handed to the
+        // task instead of racing it here.
+        let inflight = self
+            .ack_reactions_in_flight
+            .lock()
+            .remove(&(chat_id.clone(), numeric_message_id));
+        if let Some((state, mut handle)) = inflight {
+            state.clear_requested.store(true, Ordering::Release);
+            if tokio::time::timeout(self.reaction_clear_timeout, &mut handle)
+                .await
+                .is_err()
+            {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({
+                            "chat_id": chat_id,
+                            "message_id": numeric_message_id,
+                        })),
+                    "Telegram acknowledgement still in flight; the clear is deferred to it"
+                );
+                anyhow::bail!(
+                    "Telegram acknowledgement for chat_id={chat_id} message_id={numeric_message_id} \
+                     is still in flight; the clear is deferred to that task"
+                );
+            }
+            // The ack settled and may already have confirmed the clear it was
+            // asked for; only clear here if it did not.
+            if state.cleared.load(Ordering::Acquire) {
+                return Ok(());
+            }
+        }
+
+        clear_telegram_reaction(
+            &self.http_client(),
+            &self.api_url("setMessageReaction"),
+            &self.bot_token,
+            &chat_id,
+            numeric_message_id,
+            self.reaction_clear_timeout,
+        )
+        .await
+    }
+
     /// Delegates to [`Self::request_approval_attributed`] and drops the
     /// provenance, so the prompt/timeout logic lives in exactly one place.
     async fn request_approval(
@@ -8798,7 +9361,7 @@ mod tests {
         .with_persistence_authority(authority.clone());
 
         channel
-            .persist_allowed_identity("someone")
+            .persist_allowed_identity("someone", &["someone".into()])
             .await
             .expect_err("save failure must reject paired identity");
 
@@ -9297,6 +9860,434 @@ mod tests {
         assert_eq!(body["message_id"], 42);
         assert_eq!(body["reaction"][0]["type"], "emoji");
         assert_eq!(body["reaction"][0]["emoji"], "⚡️");
+    }
+
+    #[test]
+    fn telegram_clear_reaction_request_shape() {
+        let body = build_telegram_clear_reaction_request("-100200300", 42);
+        assert_eq!(body["chat_id"], "-100200300");
+        assert_eq!(body["message_id"], 42);
+        assert_eq!(body["reaction"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn parse_telegram_message_id_reads_the_numeric_suffix() {
+        assert_eq!(
+            parse_telegram_message_id("telegram_-100200300_42"),
+            Some(42)
+        );
+        assert_eq!(parse_telegram_message_id("telegram_1234_7"), Some(7));
+    }
+
+    #[test]
+    fn parse_telegram_message_id_rejects_unrecognised_ids() {
+        assert_eq!(parse_telegram_message_id("telegram_1234"), None);
+        assert_eq!(parse_telegram_message_id("slack_1234_42"), None);
+        assert_eq!(parse_telegram_message_id("telegram_1234_abc"), None);
+    }
+
+    #[tokio::test]
+    async fn remove_reaction_skips_unparseable_message_id() {
+        // No fixture HTTP client is installed, so any network call would fail
+        // the test rather than pass silently.
+        let channel = TelegramChannel::new(
+            "fake-token".into(),
+            "default",
+            Arc::new(Vec::<String>::new),
+            false,
+        );
+        channel
+            .remove_reaction("-100200300", "not-a-telegram-id", "\u{1F440}")
+            .await
+            .expect("an unparseable message id is a no-op");
+    }
+
+    #[tokio::test]
+    async fn remove_reaction_settles_the_inflight_ack_before_clearing() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        // Only the clear reaches the server; the ack is the gated task below.
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/setMessageReaction$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": true
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let channel = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_mock_api_base(mock_server.uri());
+
+        // Stand in for the detached ack request: a task we hold open so the
+        // clear has something in flight to settle.
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let ack = zeroclaw_spawn::spawn!(async move {
+            let _ = release_rx.await;
+        });
+        channel.ack_reactions_in_flight.lock().insert(
+            ("-100200300".to_string(), 42),
+            (Arc::new(AckReactionState::default()), ack),
+        );
+
+        let clear = channel.remove_reaction("-100200300", "telegram_-100200300_42", "\u{1F440}");
+        // The clear must not be sent while the ack is still in flight; release
+        // the ack and the clear then proceeds.
+        let probe = async {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let sent = mock_server.received_requests().await.unwrap().len();
+            let _ = release_tx.send(());
+            sent
+        };
+        let (result, sent_while_ack_pending) = tokio::join!(clear, probe);
+        result.expect("the clear succeeds once the ack settles");
+        assert_eq!(
+            sent_while_ack_pending, 0,
+            "remove_reaction must not clear before the in-flight ack settles"
+        );
+        assert_eq!(mock_server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn remove_reaction_bounds_a_stalled_clear() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        // Accepts the connection but never answers, so only the timeout can
+        // release the turn.
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/setMessageReaction$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_secs(120))
+                    .set_body_json(serde_json::json!({"ok": true, "result": true})),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let channel = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_reaction_clear_timeout(std::time::Duration::from_millis(100))
+        .with_mock_api_base(mock_server.uri());
+
+        let started = std::time::Instant::now();
+        let result = channel
+            .remove_reaction("-100200300", "telegram_-100200300_42", "\u{1F440}")
+            .await;
+        // A clear that never lands is not a removed reaction: the tool must not
+        // be told the withdraw succeeded. The turn is still released by the
+        // bound, so the orchestrator's best-effort cleanup is unaffected.
+        assert!(
+            result.is_err(),
+            "a stalled clear must surface as an error, got {result:?}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(30),
+            "the clear must be bounded, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_reaction_defers_the_clear_after_an_inflight_ack() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        // Every setMessageReaction is held open long enough that the ack add
+        // outlives the settle bound; a clear must therefore never be sent from
+        // remove_reaction itself, only from the ack task once the add settles.
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/setMessageReaction$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_millis(1000))
+                    .set_body_json(serde_json::json!({"ok": true, "result": true})),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let channel = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_reaction_clear_timeout(std::time::Duration::from_millis(50))
+        .with_mock_api_base(mock_server.uri());
+
+        // The real ack path fires the add request in a detached task.
+        channel.try_add_ack_reaction_nonblocking("-100200300".to_string(), 42);
+
+        // The ack outlives the settle bound, so the clear cannot be confirmed:
+        // remove_reaction reports that and hands the clear to the ack task
+        // instead of racing an add that is still on the wire.
+        let result = channel
+            .remove_reaction("-100200300", "telegram_-100200300_42", "\u{1F440}")
+            .await;
+        assert!(
+            result.is_err(),
+            "an ack that outlives the settle bound is not a confirmed clear"
+        );
+
+        // While the add is still in flight, only the add may have reached the
+        // server; a clear sent here would be the exact overtake the fix forbids.
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        let pending = mock_server.received_requests().await.unwrap();
+        assert_eq!(
+            pending.len(),
+            1,
+            "the clear must not overtake the in-flight ack: {pending:?}"
+        );
+
+        // Once the add settles the ack task runs the deferred clear, after it.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while mock_server.received_requests().await.unwrap().len() < 2 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the deferred clear never landed"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let sent = mock_server.received_requests().await.unwrap();
+        assert_eq!(sent.len(), 2);
+        let add: serde_json::Value = serde_json::from_slice(&sent[0].body).unwrap();
+        let clear: serde_json::Value = serde_json::from_slice(&sent[1].body).unwrap();
+        assert!(
+            add["reaction"]
+                .as_array()
+                .is_some_and(|reaction| !reaction.is_empty()),
+            "the first request must be the ack add, got {add}"
+        );
+        assert_eq!(
+            clear["reaction"],
+            serde_json::json!([]),
+            "the second request must be the clear, got {clear}"
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_reaction_reports_a_failed_deferred_clear() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        // The clear (an empty reaction list) is answered with an error, so the
+        // withdraw never lands. The add is answered late, so it is still in
+        // flight when remove_reaction runs and the clear is handed to the ack
+        // task rather than sent by remove_reaction itself.
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/setMessageReaction$"))
+            .respond_with(|request: &wiremock::Request| {
+                let body: serde_json::Value =
+                    serde_json::from_slice(&request.body).unwrap_or(serde_json::Value::Null);
+                let is_clear = body
+                    .get("reaction")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|reaction| reaction.is_empty());
+                if is_clear {
+                    ResponseTemplate::new(500).set_body_string("boom")
+                } else {
+                    ResponseTemplate::new(200)
+                        .set_delay(std::time::Duration::from_millis(200))
+                        .set_body_json(serde_json::json!({"ok": true, "result": true}))
+                }
+            })
+            .mount(&mock_server)
+            .await;
+
+        let channel = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_reaction_clear_timeout(std::time::Duration::from_secs(2))
+        .with_mock_api_base(mock_server.uri());
+
+        channel.try_add_ack_reaction_nonblocking("-100200300".to_string(), 42);
+
+        // The add settles inside the settle bound, so the ack task runs the
+        // deferred clear - and that clear fails. remove_reaction must report the
+        // failure instead of returning the ack task's swallowed error as
+        // success: the reaction tool would otherwise say "Reaction removed" for
+        // a withdraw that never reached Telegram.
+        let result = channel
+            .remove_reaction("-100200300", "telegram_-100200300_42", "\u{1F440}")
+            .await;
+        assert!(
+            result.is_err(),
+            "a deferred clear that never landed must not be reported as removed, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_reaction_scrubs_bot_token_from_a_transport_error() {
+        const TOKEN: &str = "123456:TEST-TOKEN";
+
+        // Bind and immediately drop a listener to reserve a port nothing is
+        // listening on, so the request fails before any response is read.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let api_base = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+
+        let channel = TelegramChannel::new(
+            TOKEN.into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_reaction_clear_timeout(std::time::Duration::from_secs(2))
+        .with_mock_api_base(api_base);
+
+        let err = channel
+            .remove_reaction("-100200300", "telegram_-100200300_42", "\u{1F440}")
+            .await
+            .expect_err("a connection failure must surface")
+            .to_string();
+        assert!(!err.contains(TOKEN), "error leaked the bot token: {err}");
+    }
+
+    #[tokio::test]
+    async fn remove_reaction_scrubs_bot_token_reflected_in_an_error_body() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        const TOKEN: &str = "123456:TEST-TOKEN";
+        let mock_server = MockServer::start().await;
+        // A proxy or gateway can reflect the request URL - and with it the bot
+        // token - in its error body. Echo the bare token as well, which the
+        // URL-shaped leak pattern alone would not catch.
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/setMessageReaction$"))
+            .respond_with(ResponseTemplate::new(500).set_body_string(format!(
+                "upstream failed for https://api.telegram.org/bot{TOKEN}/setMessageReaction (token {TOKEN})"
+            )))
+            .mount(&mock_server)
+            .await;
+
+        let channel = TelegramChannel::new(
+            TOKEN.into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_mock_api_base(mock_server.uri());
+
+        let err = channel
+            .remove_reaction("-100200300", "telegram_-100200300_42", "\u{1F440}")
+            .await
+            .expect_err("an error response must surface")
+            .to_string();
+        assert!(!err.contains(TOKEN), "error leaked the bot token: {err}");
+        assert!(
+            err.contains("[REDACTED_BOT_TOKEN]"),
+            "expected the redaction marker: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_reaction_rejects_telegram_api_error_in_successful_http_response() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/setMessageReaction$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": false,
+                "description": "Bad Request: reaction can't be removed"
+            })))
+            .mount(&mock_server)
+            .await;
+        let channel = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_mock_api_base(mock_server.uri());
+
+        let err = channel
+            .remove_reaction("-100200300", "telegram_-100200300_42", "\u{1F440}")
+            .await
+            .expect_err("Telegram rejecting the clear must not report success")
+            .to_string();
+        assert!(err.contains("reaction can't be removed"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn remove_reaction_accepts_telegram_ok_response() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/setMessageReaction$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": true
+            })))
+            .mount(&mock_server)
+            .await;
+        let channel = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_mock_api_base(mock_server.uri());
+
+        channel
+            .remove_reaction("-100200300", "telegram_-100200300_42", "\u{1F440}")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn clear_helper_error_is_scrubbed_for_the_deferred_log() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        const TOKEN: &str = "123456:TEST-TOKEN";
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/setMessageReaction$"))
+            .respond_with(
+                ResponseTemplate::new(500).set_body_string(format!("reflected token {TOKEN}")),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let client = reqwest::Client::new();
+        let url = format!("{}/bot{TOKEN}/setMessageReaction", mock_server.uri());
+        // This is the exact error the deferred ack task formats into its log
+        // record, so a scrubbed helper keeps the log clean too.
+        let err = clear_telegram_reaction(
+            &client,
+            &url,
+            TOKEN,
+            "-100200300",
+            42,
+            std::time::Duration::from_secs(2),
+        )
+        .await
+        .expect_err("an error response must surface")
+        .to_string();
+        assert!(!err.contains(TOKEN), "error leaked the bot token: {err}");
     }
 
     #[test]
@@ -14618,6 +15609,7 @@ mod tests {
             mention_only,
         );
         assert!(ch.pairing_code_active());
+        assert!(ch.startup_pairing_available());
     }
 
     #[test]
@@ -14630,6 +15622,7 @@ mod tests {
             mention_only,
         );
         assert!(!ch.pairing_code_active());
+        assert!(!ch.startup_pairing_available());
     }
 
     #[test]
@@ -14646,6 +15639,7 @@ mod tests {
         );
         assert!(ch.pairing_code_active());
         assert!(!ch.has_authorized_peer());
+        assert!(ch.startup_pairing_available());
     }
 
     #[test]
@@ -14668,6 +15662,7 @@ mod tests {
                 "the bind code must still be issued"
             );
             assert!(!ch.has_authorized_peer());
+            assert!(ch.startup_pairing_available());
             assert!(!ch.is_any_user_allowed(["alice", "123456789"]));
         }
     }
@@ -14710,7 +15705,7 @@ mod tests {
             .with_persistence_authority(config.clone());
 
         let err = ch
-            .persist_allowed_identity("123456789")
+            .persist_allowed_identity("123456789", &["123456789".into()])
             .await
             .expect_err("an ignored identity must not be persisted as a grant");
         let message = err.to_string();
@@ -14791,9 +15786,16 @@ mod tests {
         let bind = |ignored: bool| {
             let uri = mock_server.uri();
             async move {
-                let ch = TelegramChannel::new("t".into(), "default", Arc::new(Vec::new), false)
-                    .with_persistence_authority(config_with(ignored))
-                    .with_api_base(uri);
+                let config = config_with(ignored);
+                let live = config.live_handle();
+                let ch = TelegramChannel::new(
+                    "t".into(),
+                    "default",
+                    Arc::new(move || live.read().channel_external_peers("telegram", "default")),
+                    false,
+                )
+                .with_persistence_authority(config)
+                .with_api_base(uri);
                 let code = ch
                     .pairing
                     .as_ref()
@@ -14871,9 +15873,15 @@ mod tests {
         );
         let config = LiveConfigAuthority::new(config);
 
-        let ch = TelegramChannel::new("t".into(), "default", Arc::new(Vec::new), false)
-            .with_persistence_authority(config.clone())
-            .with_api_base(mock_server.uri());
+        let live = config.live_handle();
+        let ch = TelegramChannel::new(
+            "t".into(),
+            "default",
+            Arc::new(move || live.read().channel_external_peers("telegram", "default")),
+            false,
+        )
+        .with_persistence_authority(config.clone())
+        .with_api_base(mock_server.uri());
 
         let code = ch
             .pairing
@@ -14910,6 +15918,177 @@ mod tests {
                 .is_empty(),
             "nothing was persisted for a denied account"
         );
+    }
+
+    #[tokio::test]
+    async fn telegram_bind_rechecks_policy_after_waiting_for_config_writer() {
+        use std::future::{Future, poll_fn};
+        use std::task::Poll;
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use zeroclaw_config::multi_agent::{PeerGroupConfig, PeerUsername};
+        use zeroclaw_config::providers::ChannelRef;
+
+        for (grant_channel, publish_to_live, peers, denies, expect_bound) in [
+            ("telegram", true, &["999999999"][..], &[][..], false),
+            ("telegram.default", true, &["999999999"][..], &[][..], false),
+            (
+                "telegram.default",
+                false,
+                &["999999999"][..],
+                &[][..],
+                false,
+            ),
+            ("telegram.default", true, &[][..], &["alice"][..], false),
+            (
+                "telegram.default",
+                true,
+                &["999999999"][..],
+                &["999999999"][..],
+                true,
+            ),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})),
+                )
+                .mount(&server)
+                .await;
+            let dir = tempfile::tempdir().expect("tempdir");
+            let mut config = Config {
+                config_path: dir.path().join("config.toml"),
+                data_dir: dir.path().join("data"),
+                ..Default::default()
+            };
+            config
+                .channels
+                .telegram
+                .insert("default".into(), TelegramConfig::default());
+            config.save().await.expect("save isolated config");
+            let authority = LiveConfigAuthority::new(config);
+            let live = authority.live_handle();
+            let channel = TelegramChannel::new(
+                "fake-token".into(),
+                "default",
+                Arc::new(move || live.read().channel_external_peers("telegram", "default")),
+                false,
+            )
+            .with_persistence_authority(authority.clone())
+            .with_mock_api_base(server.uri());
+            let pairing = channel.pairing.as_ref().expect("startup pairing");
+            let code = pairing.pairing_code().expect("fresh code");
+            let update = serde_json::json!({
+                "message": {
+                    "text": format!("/bind {code}"),
+                    "from": {"id": 123_456_789, "username": "alice"},
+                    "chat": {"id": 42},
+                }
+            });
+
+            // Hold serialization while the real handler passes its precheck
+            // and reserves the code, then save the competing policy.
+            let commit = authority.begin_config_commit().await.expect("hold writer");
+            let mut bind = Box::pin(channel.handle_unauthorized_message(&update));
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                poll_fn(|cx| {
+                    assert!(bind.as_mut().poll(cx).is_pending(), "bind must wait");
+                    if pairing.pairing_code().is_none() {
+                        Poll::Ready(())
+                    } else {
+                        Poll::Pending
+                    }
+                }),
+            )
+            .await
+            .expect("handler reserves code before writer is released");
+            let mut snapshot = commit.current_config();
+            snapshot.peer_groups.insert(
+                "operator_grant".into(),
+                PeerGroupConfig {
+                    channel: ChannelRef::new(grant_channel),
+                    external_peers: peers.iter().map(|peer| PeerUsername::new(*peer)).collect(),
+                    ignore: denies.iter().map(|peer| PeerUsername::new(*peer)).collect(),
+                    ..Default::default()
+                },
+            );
+            snapshot.mark_dirty("peer_groups");
+            let mut revision = authority.published_revision();
+            snapshot.save_dirty().await.expect("save competing policy");
+            let saved = std::fs::read(dir.path().join("config.toml")).expect("saved config");
+            let mut expected_live = if publish_to_live {
+                snapshot.channel_external_peers("telegram", "default")
+            } else {
+                Vec::new()
+            };
+            if publish_to_live {
+                revision = commit.next_revision().expect("revision");
+                commit.publish(revision, snapshot).expect("publish policy");
+            }
+            drop(commit);
+            tokio::time::timeout(Duration::from_secs(5), bind)
+                .await
+                .expect("bind settles after writer release");
+
+            if expect_bound {
+                expected_live.push("123456789".into());
+                assert!(
+                    authority
+                        .published_revision()
+                        .succeeds_within_epoch(&revision)
+                );
+                assert!(
+                    pairing.pairing_code().is_none(),
+                    "successful bind consumes code"
+                );
+                assert!(pairing.is_paired(), "successful bind commits the token");
+            } else {
+                assert_eq!(authority.published_revision(), revision);
+                assert_eq!(
+                    std::fs::read(dir.path().join("config.toml")).unwrap(),
+                    saved
+                );
+                assert_eq!(pairing.pairing_code().as_deref(), Some(code.as_str()));
+                assert!(!pairing.is_paired(), "rejected bind must not mint a token");
+            }
+            let mut actual_live = authority
+                .snapshot_config()
+                .channel_external_peers("telegram", "default");
+            expected_live.sort();
+            actual_live.sort();
+            assert_eq!(
+                actual_live, expected_live,
+                "only an admissible bind may add a peer"
+            );
+            if expect_bound {
+                let disk: Config = toml::from_str(
+                    &std::fs::read_to_string(dir.path().join("config.toml")).unwrap(),
+                )
+                .expect("saved config");
+                let mut actual_disk = disk.channel_external_peers("telegram", "default");
+                actual_disk.sort();
+                assert_eq!(actual_disk, expected_live);
+            }
+            if publish_to_live && !peers.is_empty() && denies.is_empty() {
+                assert!(!channel.startup_pairing_available());
+            }
+            let requests = server.received_requests().await.expect("Bot API requests");
+            assert!(
+                !requests.is_empty(),
+                "handler must reply to the rejected bind"
+            );
+            assert_eq!(
+                requests.iter().any(|request| {
+                    serde_json::from_slice::<serde_json::Value>(&request.body)
+                        .expect("request JSON")["text"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .contains("bound successfully")
+                }),
+                expect_bound
+            );
+        }
     }
 
     #[tokio::test]
@@ -15034,6 +16213,521 @@ mod tests {
         assert_eq!(
             TelegramChannel::suggested_bind_command("alerts", "123456789"),
             "zeroclaw channel bind-telegram 123456789 --alias alerts"
+        );
+    }
+
+    #[test]
+    fn unauthorized_notice_expands_placeholders_in_configured_message() {
+        // The operator's copy replaces the built-in text wholesale. Both
+        // placeholders stay available so a deployment can keep the bind
+        // command, name the identity to authorize, or carry neither.
+        assert_eq!(
+            TelegramChannel::unauthorized_notice(
+                Some("Ask support to authorize {identity}. Operator: {bind_command}"),
+                true,
+                "zeroclaw channel bind-telegram 42",
+                "42",
+            ),
+            "Ask support to authorize 42. Operator: zeroclaw channel bind-telegram 42"
+        );
+    }
+
+    #[test]
+    fn unauthorized_notice_ignores_blank_configured_message() {
+        // A blank value is an unfinished config, not a request for silence:
+        // the sender still gets the built-in notice instead of whitespace.
+        let notice = TelegramChannel::unauthorized_notice(
+            Some("   \n  "),
+            true,
+            "zeroclaw channel bind-telegram 42",
+            "42",
+        );
+        assert!(
+            notice.contains("zeroclaw channel bind-telegram 42"),
+            "expected the built-in bind notice, got: {notice}"
+        );
+    }
+
+    #[test]
+    fn unauthorized_notice_carries_bind_command_while_startup_pairing_is_available() {
+        // Startup pairing means nobody is authorized yet and whoever set the
+        // bot up holds the terminal, so the bind command is the actionable
+        // next step — the copy existing deployments already see.
+        let notice = TelegramChannel::unauthorized_notice(
+            None,
+            true,
+            "zeroclaw channel bind-telegram 42",
+            "42",
+        );
+        assert!(
+            notice.contains("zeroclaw channel bind-telegram 42"),
+            "expected the bind command in the built-in notice, got: {notice}"
+        );
+    }
+
+    #[test]
+    fn unauthorized_notice_names_identity_once_peers_resolve() {
+        // Peers resolving means authorization already comes from
+        // configuration, possibly written by a control plane no one edits by
+        // hand. A terminal command the sender cannot run is noise; the
+        // identity the operator has to authorize is the useful part.
+        let notice = TelegramChannel::unauthorized_notice(
+            None,
+            false,
+            "zeroclaw channel bind-telegram 42",
+            "42",
+        );
+        assert!(
+            !notice.contains("bind-telegram"),
+            "config-managed authorization must not instruct a terminal bind, got: {notice}"
+        );
+        assert!(
+            notice.contains("42"),
+            "expected the sender identity in the notice, got: {notice}"
+        );
+    }
+
+    #[test]
+    fn configured_unauthorized_message_reads_the_shared_config_handle() {
+        // Read through the shared handle on every call, not copied into the
+        // channel at construction: a write on that handle, which is what the
+        // runtime's own `/bind` persist path performs, is visible to the next
+        // notice. An edit made outside the handle still needs the usual
+        // reload; this pins the no-stale-copy property, not a live reload.
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.channels.telegram.insert(
+            "telegram_test_alias".to_string(),
+            zeroclaw_config::schema::TelegramConfig {
+                enabled: true,
+                unauthorized_message: Some("Ask support for access.".to_string()),
+                ..Default::default()
+            },
+        );
+        let config = LiveConfigAuthority::new(config);
+
+        let ch = TelegramChannel::new(
+            "test-token".into(),
+            "telegram_test_alias",
+            Arc::new(Vec::new),
+            false,
+        )
+        .with_persistence_authority(config.clone());
+        assert_eq!(
+            ch.configured_unauthorized_message().as_deref(),
+            Some("Ask support for access.")
+        );
+
+        let mut updated = config.snapshot_config();
+        updated
+            .channels
+            .telegram
+            .get_mut("telegram_test_alias")
+            .expect("alias configured above")
+            .unauthorized_message = Some("Now say this instead.".to_string());
+        config.publish_for_test(updated);
+        assert_eq!(
+            ch.configured_unauthorized_message().as_deref(),
+            Some("Now say this instead.")
+        );
+    }
+
+    /// The configured notice must reach the sender through the real
+    /// unauthorized path, not just the composer: config resolution,
+    /// placeholder expansion, and delivery in one pass.
+    #[tokio::test]
+    async fn handle_unauthorized_message_sends_configured_notice() {
+        use wiremock::MockServer;
+
+        let mock_server = MockServer::start().await;
+        mount_telegram_send_message_ok(
+            &mock_server,
+            1,
+            &[r#""chat_id":"3030""#, "Ask support to authorize 100050"],
+        )
+        .await;
+
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.channels.telegram.insert(
+            "telegram_test_alias".to_string(),
+            zeroclaw_config::schema::TelegramConfig {
+                enabled: true,
+                unauthorized_message: Some("Ask support to authorize {identity}.".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let ch = TelegramChannel::new(
+            "test-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["zeroclaw_user".to_string()]),
+            false,
+        )
+        .with_api_base(mock_server.uri())
+        .with_persistence_authority(LiveConfigAuthority::new(config));
+
+        let update = telegram_text_update(7_000, 50, 3_030, "zeroclaw_unauthorized", "hello");
+        ch.handle_unauthorized_message(&update).await;
+
+        let sent: Vec<serde_json::Value> = mock_server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|r| r.url.path().ends_with("/sendMessage"))
+            .filter_map(|r| serde_json::from_slice(&r.body).ok())
+            .collect();
+        assert_eq!(
+            sent.len(),
+            1,
+            "expected exactly one sendMessage request, got: {sent:?}"
+        );
+        let sent_text = sent[0]
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        assert_eq!(sent_text, "Ask support to authorize 100050.");
+    }
+
+    /// Every `sendMessage` body the mock server received, in order, reduced
+    /// to its `text` field.
+    async fn telegram_sent_message_texts(mock_server: &wiremock::MockServer) -> Vec<String> {
+        mock_server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|request| request.url.path().ends_with("/sendMessage"))
+            .filter_map(|request| serde_json::from_slice::<serde_json::Value>(&request.body).ok())
+            .map(|body| {
+                body.get("text")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    /// Run one unauthorized text update through a peer-resolving channel
+    /// configured with `unauthorized_message`, and return the path of every
+    /// Bot API request it emitted alongside the `sendMessage` texts.
+    async fn unauthorized_notice_requests(
+        configured_message: &str,
+        voice_peers: Vec<String>,
+    ) -> (Vec<String>, Vec<String>) {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"ok": true, "result": {}})),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.channels.telegram.insert(
+            "telegram_test_alias".to_string(),
+            zeroclaw_config::schema::TelegramConfig {
+                enabled: true,
+                unauthorized_message: Some(configured_message.to_string()),
+                ..Default::default()
+            },
+        );
+
+        let ch = TelegramChannel::new(
+            "test-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["zeroclaw_user".to_string()]),
+            false,
+        )
+        .with_api_base(mock_server.uri())
+        .with_persistence_authority(LiveConfigAuthority::new(config))
+        .with_voice_peer_resolver(Arc::new(move || voice_peers.clone()));
+
+        ch.handle_unauthorized_message(&telegram_text_update(
+            7_000,
+            50,
+            3_030,
+            "zeroclaw_unauthorized",
+            "hello",
+        ))
+        .await;
+
+        let paths = mock_server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|request| request.url.path().to_string())
+            .collect();
+        (paths, telegram_sent_message_texts(&mock_server).await)
+    }
+
+    fn assert_notice_sent_as_text_only(paths: &[String], texts: &[String], expected: &str) {
+        assert!(
+            paths.iter().all(|path| path.ends_with("/sendMessage")),
+            "the notice must not reach a media or voice method, got: {paths:?}"
+        );
+        assert_eq!(texts.len(), 1, "expected one notice, got: {texts:?}");
+        assert!(
+            texts[0].contains(expected),
+            "the notice must carry the configured text, got: {texts:?}"
+        );
+    }
+
+    /// A standalone document URL is support copy here, not a `sendDocument`
+    /// instruction.
+    #[tokio::test]
+    async fn unauthorized_notice_keeps_standalone_pdf_url_as_text() {
+        let (paths, texts) =
+            unauthorized_notice_requests("https://support.example/access.pdf", Vec::new()).await;
+        assert_notice_sent_as_text_only(&paths, &texts, "https://support.example/access.pdf");
+    }
+
+    /// A literal attachment marker is delivered verbatim, not parsed into
+    /// an upload.
+    #[tokio::test]
+    async fn unauthorized_notice_keeps_attachment_marker_as_text() {
+        let (paths, texts) = unauthorized_notice_requests(
+            "Access guide: [DOCUMENT:https://support.example/access.pdf]",
+            Vec::new(),
+        )
+        .await;
+        assert_notice_sent_as_text_only(
+            &paths,
+            &texts,
+            "[DOCUMENT:https://support.example/access.pdf]",
+        );
+    }
+
+    /// A chat in a voice-output peer group still receives the notice as
+    /// text: voice routing is for agent replies, and would otherwise
+    /// suppress the text entirely.
+    #[tokio::test]
+    async fn unauthorized_notice_ignores_voice_peer_routing() {
+        let (paths, texts) = unauthorized_notice_requests(
+            "Ask support to authorize {identity}.",
+            vec!["3030".to_string()],
+        )
+        .await;
+        assert_notice_sent_as_text_only(&paths, &texts, "Ask support to authorize 100050.");
+    }
+
+    /// Pairing state is a live reading, not the guard's lifetime. `try_pair`
+    /// clears the code, never the guard, so a channel that keeps its guard
+    /// after the first user redeemed the code must stop advertising the
+    /// operator bind command to the next unauthorized sender.
+    #[tokio::test]
+    async fn unauthorized_notice_drops_bind_form_once_the_code_is_redeemed() {
+        use wiremock::MockServer;
+
+        let mock_server = MockServer::start().await;
+        mount_telegram_send_message_ok(&mock_server, 3, &[]).await;
+
+        let ch = TelegramChannel::new(
+            "test-token".into(),
+            "telegram_test_alias",
+            Arc::new(Vec::new),
+            false,
+        )
+        .with_api_base(mock_server.uri());
+
+        let code = ch
+            .pairing
+            .as_ref()
+            .expect("an empty peer set provisions a pairing guard")
+            .pairing_code()
+            .expect("a fresh guard issues a one-time code");
+
+        ch.handle_unauthorized_message(&telegram_text_update(
+            7_100,
+            51,
+            3_031,
+            "zeroclaw_unauthorized",
+            "hello",
+        ))
+        .await;
+
+        // Redeem it the way `/bind` does, minus the persistence path this
+        // test deliberately leaves out: the peer resolver stays empty, so
+        // only the consumed code can flip the notice.
+        let paired = ch
+            .pairing
+            .as_ref()
+            .expect("guard asserted above")
+            .try_pair(&code, "3031")
+            .await
+            .expect("a valid code is not rate limited");
+        assert!(paired.is_some(), "the generated code must redeem");
+
+        ch.handle_unauthorized_message(&telegram_text_update(
+            7_101,
+            52,
+            3_031,
+            "zeroclaw_unauthorized",
+            "hello again",
+        ))
+        .await;
+
+        let texts = telegram_sent_message_texts(&mock_server).await;
+        assert_eq!(
+            texts.len(),
+            3,
+            "expected notice plus hint, then a single notice, got: {texts:?}"
+        );
+        assert!(
+            texts[0].contains("zeroclaw channel bind-telegram"),
+            "an outstanding code must still carry the bind command, got: {}",
+            texts[0]
+        );
+        assert!(
+            !texts[2].contains("bind-telegram"),
+            "a redeemed code must not keep advertising the operator bind, got: {}",
+            texts[2]
+        );
+        assert!(
+            texts[2].contains("100052"),
+            "the allowlist form must name the sender identity, got: {}",
+            texts[2]
+        );
+    }
+
+    /// The notice follows the live peer set, not the set the channel was
+    /// built with. A control plane that adds the first peer to a channel
+    /// which started empty must stop the terminal instruction, and the
+    /// `/bind` hint must disappear with it.
+    #[tokio::test]
+    async fn unauthorized_notice_follows_live_peer_resolution() {
+        use wiremock::MockServer;
+
+        let mock_server = MockServer::start().await;
+        mount_telegram_send_message_ok(&mock_server, 3, &[]).await;
+
+        let peers = Arc::new(Mutex::new(Vec::<String>::new()));
+        let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
+            let peers = peers.clone();
+            Arc::new(move || peers.lock().clone())
+        };
+
+        let ch = TelegramChannel::new(
+            "test-token".into(),
+            "telegram_test_alias",
+            peer_resolver,
+            false,
+        )
+        .with_api_base(mock_server.uri());
+
+        ch.handle_unauthorized_message(&telegram_text_update(
+            7_200,
+            61,
+            3_032,
+            "zeroclaw_unauthorized",
+            "hello",
+        ))
+        .await;
+
+        peers.lock().push("zeroclaw_operator".to_string());
+
+        ch.handle_unauthorized_message(&telegram_text_update(
+            7_201,
+            62,
+            3_032,
+            "zeroclaw_unauthorized",
+            "hello again",
+        ))
+        .await;
+
+        let texts = telegram_sent_message_texts(&mock_server).await;
+        assert_eq!(
+            texts.len(),
+            3,
+            "expected notice plus hint, then a single notice, got: {texts:?}"
+        );
+        assert!(
+            texts[0].contains("zeroclaw channel bind-telegram"),
+            "an unpaired channel must still carry the bind command, got: {}",
+            texts[0]
+        );
+        assert!(
+            !texts[2].contains("bind-telegram"),
+            "a resolved peer set must not instruct a terminal bind, got: {}",
+            texts[2]
+        );
+    }
+
+    /// What the channel says and what it accepts must agree. A channel that
+    /// starts empty issues a one-time code, then gains a configured peer
+    /// while it runs; from that point the notice says pairing is inactive,
+    /// so the outstanding code must stop being redeemable too. Otherwise a
+    /// sender holding the code writes themselves into the peer group that
+    /// configuration — possibly a control plane — already owns.
+    #[tokio::test]
+    async fn bind_code_stops_redeeming_once_peers_resolve() {
+        use wiremock::MockServer;
+
+        let mock_server = MockServer::start().await;
+        mount_telegram_send_message_ok(&mock_server, 1, &[]).await;
+
+        let peers = Arc::new(Mutex::new(Vec::<String>::new()));
+        let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
+            let peers = peers.clone();
+            Arc::new(move || peers.lock().clone())
+        };
+
+        let ch = TelegramChannel::new(
+            "test-token".into(),
+            "telegram_test_alias",
+            peer_resolver,
+            false,
+        )
+        .with_api_base(mock_server.uri());
+
+        let code = ch
+            .pairing
+            .as_ref()
+            .expect("an empty peer set provisions a pairing guard")
+            .pairing_code()
+            .expect("a fresh guard issues a one-time code");
+
+        // The peer arrives from configuration, not from a redemption: the
+        // code stays outstanding and the guard stays in place.
+        peers.lock().push("zeroclaw_operator".to_string());
+
+        ch.handle_unauthorized_message(&telegram_text_update(
+            7_300,
+            71,
+            3_033,
+            "zeroclaw_unauthorized",
+            &format!("/bind {code}"),
+        ))
+        .await;
+
+        let texts = telegram_sent_message_texts(&mock_server).await;
+        assert_eq!(
+            texts.len(),
+            1,
+            "expected a single reply to the rejected bind, got: {texts:?}"
+        );
+        assert!(
+            texts[0].contains("pairing is not active"),
+            "a resolved peer set must route the code to the inactive-pairing reply, got: {}",
+            texts[0]
+        );
+        assert!(
+            !texts[0].contains("bound successfully"),
+            "a valid code must not bind once peers resolve, got: {}",
+            texts[0]
+        );
+        assert_eq!(
+            ch.pairing
+                .as_ref()
+                .expect("guard asserted above")
+                .pairing_code()
+                .as_deref(),
+            Some(code.as_str()),
+            "the rejected attempt must not consume the outstanding code"
         );
     }
 
@@ -16410,6 +18104,10 @@ mod tests {
     fn telegram_contains_bot_mention_finds_mention() {
         assert!(TelegramChannel::contains_bot_mention(
             "Hello @mybot",
+            "@mybot"
+        ));
+        assert!(TelegramChannel::contains_bot_mention(
+            "Hello @mybot",
             "mybot"
         ));
         assert!(TelegramChannel::contains_bot_mention(
@@ -16422,6 +18120,10 @@ mod tests {
         ));
         assert!(TelegramChannel::contains_bot_mention(
             "Hello @MyBot, can you help?",
+            "mybot"
+        ));
+        assert!(TelegramChannel::contains_bot_mention(
+            "你好 @mybot，请处理",
             "mybot"
         ));
     }
@@ -24246,5 +25948,327 @@ mod tests {
     fn non_approval_callback_data_is_ignored() {
         let cb_data = "some_other_action:data";
         assert!(cb_data.strip_prefix("approval:").is_none());
+    }
+    fn rate_limit_test_channel(api_base: String) -> TelegramChannel {
+        TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_mock_api_base(api_base)
+    }
+
+    fn flood_limit_response(retry_after: u64) -> wiremock::ResponseTemplate {
+        wiremock::ResponseTemplate::new(429).set_body_json(serde_json::json!({
+            "ok": false,
+            "error_code": 429,
+            "description": format!("Too Many Requests: retry after {retry_after}"),
+            "parameters": { "retry_after": retry_after }
+        }))
+    }
+
+    #[test]
+    fn telegram_retry_after_reads_only_flood_limit_responses() {
+        let body = r#"{"ok":false,"error_code":429,"parameters":{"retry_after":536}}"#;
+        assert_eq!(
+            telegram_retry_after(reqwest::StatusCode::TOO_MANY_REQUESTS, body),
+            Some(Duration::from_secs(536))
+        );
+        assert_eq!(
+            telegram_retry_after(reqwest::StatusCode::TOO_MANY_REQUESTS, "not json"),
+            Some(Duration::from_secs(1))
+        );
+        assert_eq!(
+            telegram_retry_after(reqwest::StatusCode::BAD_REQUEST, body),
+            None
+        );
+    }
+
+    /// A 429 must wait out `retry_after` and resend the same
+    /// HTML request, not fire an immediate plain-text retry into the limit.
+    #[tokio::test]
+    async fn send_text_chunks_waits_retry_after_then_resends_same_format() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(flood_limit_response(1))
+            .up_to_n_times(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "message_id": 7 }
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let ch = rate_limit_test_channel(mock_server.uri());
+        let started = Instant::now();
+        let sent = ch.send_text_chunks("hello", "123", None, 0).await.unwrap();
+        assert_eq!(sent, 1);
+        assert!(
+            started.elapsed() >= Duration::from_secs(1),
+            "the resend must wait for retry_after"
+        );
+
+        let requests = mock_server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 2);
+        for request in &requests {
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            assert_eq!(body["parse_mode"], "HTML", "no plain-text retry on 429");
+        }
+    }
+
+    /// A penalty too long to wait inline fails the chunk without
+    /// sending any more requests inside the penalty window.
+    #[tokio::test]
+    async fn send_text_chunks_does_not_retry_inside_long_flood_penalty() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(flood_limit_response(536))
+            .mount(&mock_server)
+            .await;
+
+        let ch = rate_limit_test_channel(mock_server.uri());
+        let err = ch
+            .send_text_chunks("hello", "123", None, 0)
+            .await
+            .unwrap_err();
+        assert_eq!(err.delivered, 0);
+        assert!(err.to_string().contains("rate limited"), "{err}");
+
+        let requests = mock_server.received_requests().await.unwrap();
+        assert_eq!(
+            requests.len(),
+            1,
+            "no markdown or plain retry into the limit"
+        );
+    }
+
+    /// Repeated short 429s stop after the retry cap: the original request plus
+    /// `TELEGRAM_RATE_LIMIT_RETRIES` resends, all with the same body.
+    #[tokio::test]
+    async fn send_text_chunks_stops_after_rate_limit_retry_cap() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(flood_limit_response(1))
+            .mount(&mock_server)
+            .await;
+
+        let ch = rate_limit_test_channel(mock_server.uri());
+        let err = ch
+            .send_text_chunks("hello", "123", None, 0)
+            .await
+            .unwrap_err();
+        assert_eq!(err.delivered, 0);
+        assert!(err.rate_limited);
+
+        let requests = mock_server.received_requests().await.unwrap();
+        assert_eq!(
+            requests.len(),
+            1 + TELEGRAM_RATE_LIMIT_RETRIES as usize,
+            "one request plus the capped resends"
+        );
+        for request in &requests {
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            assert_eq!(body["parse_mode"], "HTML", "no plain-text retry on 429");
+        }
+    }
+
+    /// A 429 on the plain-text fallback also waits `retry_after` and resends
+    /// the same plain-text body.
+    #[tokio::test]
+    async fn plain_text_fallback_waits_retry_after_and_keeps_body() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "ok": false,
+                "error_code": 400,
+                "description": "Bad Request: can't parse entities"
+            })))
+            .up_to_n_times(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(flood_limit_response(1))
+            .up_to_n_times(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "message_id": 7 }
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let ch = rate_limit_test_channel(mock_server.uri());
+        let started = Instant::now();
+        let sent = ch.send_text_chunks("hello", "123", None, 0).await.unwrap();
+        assert_eq!(sent, 1);
+        assert!(
+            started.elapsed() >= Duration::from_secs(1),
+            "the plain-text resend must wait for retry_after"
+        );
+
+        let requests = mock_server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 3);
+        let bodies: Vec<serde_json::Value> = requests
+            .iter()
+            .map(|r| serde_json::from_slice(&r.body).unwrap())
+            .collect();
+        assert_eq!(bodies[0]["parse_mode"], "HTML");
+        assert!(bodies[1].get("parse_mode").is_none());
+        assert_eq!(bodies[1], bodies[2], "the plain-text resend keeps its body");
+    }
+
+    /// A flood-limited finalize must not resume or let the orchestrator fall
+    /// back to a full resend. With no chunk accepted it reports
+    /// `FinalizeUndelivered`, not `FinalizePartialDelivery`, so the reply is not
+    /// counted as sent.
+    #[tokio::test]
+    async fn finalize_send_chunks_does_not_resend_inside_flood_penalty() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(flood_limit_response(536))
+            .mount(&mock_server)
+            .await;
+
+        let ch = rate_limit_test_channel(mock_server.uri());
+        let err = ch
+            .finalize_send_chunks("hello", "123", None)
+            .await
+            .unwrap_err();
+        assert!(
+            err.downcast_ref::<zeroclaw_api::channel::FinalizeUndelivered>()
+                .is_some(),
+            "rate-limited finalize with nothing accepted must report FinalizeUndelivered, got: {err:#}"
+        );
+        assert!(
+            err.downcast_ref::<zeroclaw_api::channel::FinalizePartialDelivery>()
+                .is_none(),
+            "nothing was accepted, so this must not look like partial delivery"
+        );
+
+        let requests = mock_server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1, "no resume inside the penalty window");
+    }
+
+    /// Regression: a long flood limit hit while `finalize_draft` (multi-message
+    /// mode) delivers pending narration must stop the whole finalization: no
+    /// further narration attempt and no final-answer send inside `retry_after`,
+    /// reported as `FinalizeUndelivered` so the orchestrator does not resend.
+    /// `accepted_narration_chunks` covers both the zero-prefix case and a
+    /// partially accepted narration prefix, which must be posted exactly once.
+    async fn assert_finalize_stops_on_narration_flood_limit(accepted_narration_chunks: usize) {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mut narration = "N".repeat(3000);
+        narration.push_str(&"M".repeat(6000));
+        let chunks = split_message_for_telegram(narration.trim());
+        assert!(chunks.len() >= 2, "narration fixture must span two chunks");
+
+        let mock_server = MockServer::start().await;
+        if accepted_narration_chunks > 0 {
+            Mock::given(method("POST"))
+                .and(path_regex(r"/bot[^/]+/sendMessage$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({ "ok": true, "result": { "message_id": 1 } }),
+                ))
+                .up_to_n_times(accepted_narration_chunks as u64)
+                .mount(&mock_server)
+                .await;
+        }
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(flood_limit_response(536))
+            .mount(&mock_server)
+            .await;
+
+        let ch =
+            multi_message_test_channel("telegram_test_alias", 0).with_api_base(mock_server.uri());
+        let recipient = "100:7";
+        let draft_id = TelegramChannel::new_multi_message_draft_id();
+        {
+            let mut drafts = ch.multi_message_drafts.lock();
+            let mut state = MultiDraftState::new(Some("7".into()));
+            state.latest_visible = narration.clone();
+            drafts.insert(
+                TelegramChannel::multi_draft_key(recipient, &draft_id),
+                state,
+            );
+        }
+
+        let final_answer = "Distinct final answer text, unrelated to the narration.";
+        let err = ch
+            .finalize_draft(recipient, &draft_id, final_answer, true)
+            .await
+            .expect_err("a flood-limited finalize must not report success");
+        assert!(
+            err.downcast_ref::<zeroclaw_api::channel::FinalizeUndelivered>()
+                .is_some(),
+            "must report a no-resend undelivered finalization, got: {err:#}"
+        );
+
+        let bodies: Vec<String> = mock_server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.url.path().ends_with("/sendMessage"))
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .collect();
+        assert_eq!(
+            bodies.len(),
+            accepted_narration_chunks + 1,
+            "no request after the flood-limited one; final answer sent: {}",
+            bodies.iter().any(|b| b.contains(final_answer))
+        );
+        assert!(
+            !bodies.iter().any(|b| b.contains(final_answer)),
+            "the final answer must not be sent inside the flood penalty"
+        );
+        for chunk in &chunks[..accepted_narration_chunks] {
+            let posts = bodies.iter().filter(|b| b.contains(chunk.as_str())).count();
+            assert_eq!(
+                posts, 1,
+                "an accepted narration chunk is posted exactly once"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn finalize_draft_multi_message_stops_on_narration_flood_limit() {
+        assert_finalize_stops_on_narration_flood_limit(0).await;
+    }
+
+    #[tokio::test]
+    async fn finalize_draft_multi_message_stops_on_narration_flood_limit_after_accepted_prefix() {
+        assert_finalize_stops_on_narration_flood_limit(1).await;
     }
 }

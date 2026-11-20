@@ -7,7 +7,7 @@ setlocal enabledelayedexpansion
 :: Usage: setup.bat [--prebuilt | --minimal | --dist | --default | --all | --dry-run | --help]
 :: ============================================================================
 
-set "VERSION=0.8.5"
+set "VERSION=0.9.0"
 set "RUST_MIN_VERSION=1.96.0"
 set "TARGET=x86_64-pc-windows-msvc"
 set "REPO=https://github.com/zeroclaw-labs/zeroclaw"
@@ -140,7 +140,7 @@ echo %BOLD%[2/5] Choose installation method:%RESET%
 echo.
 echo   1) Prebuilt binary - Download pre-compiled release (fastest)
 echo   2) minimal build - core only, no default features
-echo   3) dist build - lean standard distribution (recommended)
+echo   3) dist build - standard distribution, minimal/full tools (recommended)
 echo   4) default build - default feature set
 echo   5) all build - every feature including hardware and browser
 echo.
@@ -163,38 +163,15 @@ echo %BOLD%[3/5] Downloading prebuilt binary...%RESET%
 
 if "%DRY_RUN%"=="true" (
     echo   [dry-run] Would download the prebuilt Windows release archive
+    echo   [dry-run] Would verify SHA256SUMS from the same release before extraction
     echo   [dry-run] Would install to %USERPROFILE%\.zeroclaw\bin
     echo   [dry-run] Would add %USERPROFILE%\.zeroclaw\bin to PATH
     goto :dry_run_done
 )
 
-:: Try to get latest release URL via gh or curl
-where gh >nul 2>&1
-if %ERRORLEVEL% EQU 0 (
-    for /f "tokens=*" %%u in ('gh release view --repo %REPO% --json assets --jq ".assets[] | select(.name | test(\"windows-msvc\")) | .url" 2^>nul') do (
-        set "DOWNLOAD_URL=%%u"
-    )
-)
-
-if not defined DOWNLOAD_URL (
-    :: Fallback: construct URL from known release pattern
-    set "DOWNLOAD_URL=https://github.com/zeroclaw-labs/zeroclaw/releases/latest/download/zeroclaw-%TARGET%.zip"
-)
-
-echo   Downloading from release...
-curl -sSfL -o "%TEMP%\zeroclaw-windows.zip" "!DOWNLOAD_URL!"
-if %ERRORLEVEL% NEQ 0 (
-    echo   %YELLOW%Prebuilt binary not available. Falling back to source build - dist%RESET%
-    goto :build_dist
-)
-
-:: Extract
-echo   Extracting...
-mkdir "%USERPROFILE%\.zeroclaw\bin" 2>nul
-tar -xf "%TEMP%\zeroclaw-windows.zip" -C "%USERPROFILE%\.zeroclaw\bin"
-if %ERRORLEVEL% NEQ 0 (
-    powershell -Command "Expand-Archive -Force '%TEMP%\zeroclaw-windows.zip' '%USERPROFILE%\.zeroclaw\bin'"
-)
+echo   Downloading and verifying the release checksum...
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\install_windows_prebuilt.ps1"
+if errorlevel 1 goto :error_exit
 
 :: Add to PATH if not already there
 echo %PATH% | findstr /I /C:".zeroclaw\bin" >nul 2>&1
@@ -218,8 +195,8 @@ set "BUILD_DESC=minimal (core only, no default features)"
 goto :do_build
 
 :build_dist
-set "FEATURES=--no-default-features --features acp-bridge,agent-runtime,channel-acp-server,channel-discord,channel-email,channel-filesystem,channel-git,channel-lark,channel-matrix,channel-telegram,channel-webhook,gateway,observability-prometheus,schema-export,whatsapp-web"
-set "BUILD_DESC=dist (lean standard distribution (recommended))"
+set "FEATURES=--no-default-features --features acp-bridge,agent-runtime,channel-acp-server,channel-discord,channel-email,channel-filesystem,channel-git,channel-lark,channel-matrix,channel-telegram,channel-webhook,gateway,observability-prometheus,plugins-wasm-cranelift,schema-export,tool-claude-code,tool-claude-code-runner,tool-codex-cli,tool-composio,tool-gemini-cli,tool-google-workspace,tool-jira,tool-linkedin,tool-microsoft365,tool-notion,tool-opencode-cli,tool-project-intel,tools-external,whatsapp-web"
+set "BUILD_DESC=dist (standard distribution, minimal/full tools (recommended))"
 goto :do_build
 
 :build_default
@@ -228,7 +205,7 @@ set "BUILD_DESC=default (default feature set)"
 goto :do_build
 
 :build_all
-set "FEATURES=--no-default-features --features acp-bridge,agent-runtime,browser-native,channel-acp-server,channel-amqp,channel-bluesky,channel-clawdtalk,channel-dingtalk,channel-discord,channel-email,channel-feishu,channel-filesystem,channel-git,channel-imessage,channel-irc,channel-lark,channel-line,channel-linq,channel-matrix,channel-mattermost,channel-mochat,channel-mqtt,channel-nextcloud,channel-nostr,channel-notion,channel-qq,channel-reddit,channel-signal,channel-slack,channel-telegram,channel-twitch,channel-twitter,channel-voice-call,channel-webhook,channel-wechat,channel-wecom,channel-wecom-ws,channel-whatsapp-cloud,dev-sim,gateway,hardware,memory-postgres,observability-otel,observability-prometheus,peripheral-rpi,plugins-wasm,plugins-wasm-cranelift,plugins-wasm-pulley,plugins-wasm-runtime-only,probe,provider-gitea,provider-github,sandbox-bubblewrap,sandbox-landlock,schema-export,webauthn,whatsapp-web"
+set "FEATURES=--no-default-features --features acp-bridge,agent-runtime,browser-native,channel-acp-server,channel-amqp,channel-bluesky,channel-clawdtalk,channel-dingtalk,channel-discord,channel-email,channel-feishu,channel-filesystem,channel-git,channel-imessage,channel-irc,channel-lark,channel-line,channel-linq,channel-matrix,channel-mattermost,channel-mochat,channel-mqtt,channel-nextcloud,channel-nostr,channel-notion,channel-qq,channel-reddit,channel-signal,channel-slack,channel-telegram,channel-twitch,channel-twitter,channel-voice-call,channel-webhook,channel-wechat,channel-wecom,channel-wecom-ws,channel-whatsapp-cloud,dev-sim,gateway,hardware,memory-postgres,observability-otel,observability-prometheus,peripheral-rpi,plugins-wasm,plugins-wasm-cranelift,plugins-wasm-pulley,plugins-wasm-runtime-only,probe,provider-gitea,provider-github,sandbox-bubblewrap,sandbox-landlock,schema-export,tool-claude-code,tool-claude-code-runner,tool-codex-cli,tool-composio,tool-gemini-cli,tool-google-workspace,tool-jira,tool-linkedin,tool-microsoft365,tool-notion,tool-opencode-cli,tool-project-intel,tools-external,webauthn,whatsapp-web"
 set "BUILD_DESC=all (every feature including hardware and browser)"
 goto :do_build
 :: >>> end generated:presets <<<
@@ -407,7 +384,7 @@ echo.
 echo Options:
 echo   --prebuilt    Download pre-compiled binary (fastest)
 echo   --minimal     Build core only ^(--no-default-features^)
-echo   --dist        Build lean standard distribution (recommended)
+echo   --dist        Build standard distribution, minimal/full tools (recommended)
 echo   --default     Build the default feature set
 echo   --all         Build every feature including hardware and browser
 echo   --dry-run     Show what would happen without building or installing

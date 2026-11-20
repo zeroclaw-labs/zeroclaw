@@ -78,6 +78,23 @@ ws-transport = [
   "dep:webpki-roots",
   "tokio/net",
 ]
+# Which opt-in tools the build carries. Each is enabled by zeroclaw-tools'
+# feature of the same name, never directly: the sections parse in every build,
+# and validation checks a tool's own settings only when the tool is compiled
+# in, reporting the section as compiled out otherwise.
+tools-external = []
+tool-jira = []
+tool-notion = []
+tool-linkedin = []
+tool-composio = []
+tool-google-workspace = []
+tool-microsoft365 = []
+tool-project-intel = []
+tool-claude-code = []
+tool-claude-code-runner = []
+tool-codex-cli = []
+tool-gemini-cli = []
+tool-opencode-cli = []
 # Test-only fault-injection hooks (post-replace sync failure). Enabled by
 # downstream dev-dependencies only; never by a production dependency.
 test-helpers = []

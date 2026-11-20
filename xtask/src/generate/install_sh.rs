@@ -220,11 +220,12 @@ fn render_route_flags() -> &'static str {
 }
 
 fn render_route_decision() -> &'static str {
-    r#"# --minimal, --features, --apps, --without-gateway, or --preset full imply
-# source. Prebuilt archives have fixed feature and app contents, so any flag
-# that changes the feature set or selects apps must force a source build.
+    r#"# --minimal, --features, --apps, --without-gateway, --cli-only, or --preset
+# full imply source. Prebuilt archives have fixed feature and app contents, so
+# any flag that changes the feature set or selects apps must force a source
+# build.
 if [ "$MINIMAL" = true ] || [ -n "$USER_FEATURES" ] || [ -n "$USER_APPS" ] ||
-  [ "$WITH_GATEWAY" = "false" ] || [ "$PRESET" = "full" ]; then
+  [ "$WITH_GATEWAY" = "false" ] || [ "$PRESET" = "full" ] || [ "$PRESET" = "cli-only" ]; then
   INSTALL_MODE="source"
 fi
 
@@ -556,6 +557,21 @@ fn render_quickstart_handoff() -> &'static str {
   if ! quickstart_needed; then
     info "Existing ZeroClaw config detected at $PREFIX/.zeroclaw/config.toml — skipping setup prompt."
     info "Run '$QUICKSTART_COMMAND' to reconfigure."
+  elif [ "$GUIDED_QUICKSTART_MODE" = "offer" ] && [ -t 0 ] && [ "$PRESET" = "cli-only" ]; then
+    # A CLI-only build has no dashboard to finish setup in, so it offers the
+    # CLI quickstart alone. Bare Enter accepts it.
+    echo
+    printf "%s" "$(bold "ZeroClaw installed. Run the CLI quickstart ($QUICKSTART_COMMAND) now? [Y/n] ")"
+    read -r quickstart_choice
+    case "${quickstart_choice:-y}" in
+    [Nn]*)
+      info "Skipped setup. Run '$QUICKSTART_COMMAND' when ready."
+      ;;
+    *)
+      echo
+      "$BIN" "$QUICKSTART_SUBCOMMAND" || warn "Quickstart exited with an error — run '$QUICKSTART_COMMAND' manually"
+      ;;
+    esac
   elif [ "$GUIDED_QUICKSTART_MODE" = "offer" ] && [ -t 0 ]; then
     # 3-way setup choice. Bare Enter accepts the [1] CLI quickstart default;
     # option [2] foregrounds the daemon so the operator can finish in the
@@ -989,6 +1005,70 @@ mod tests {
         let customized = script.replacen(&marker, &format!("# local note\n{marker}"), 1);
         let rendered = render_file(&root(), &customized).unwrap();
         assert!(rendered.contains("# local note\n"));
+    }
+
+    #[test]
+    fn cli_only_builds_from_source_and_offers_only_the_cli_quickstart() {
+        let source_route = "[ \"$PRESET\" = \"cli-only\" ]; then\n  INSTALL_MODE=\"source\"";
+        assert!(render_route_decision().contains(source_route));
+        let handoff = render_quickstart_handoff();
+        let (_, cli_only) = handoff
+            .split_once("[ -t 0 ] && [ \"$PRESET\" = \"cli-only\" ]; then")
+            .expect("CLI-only quickstart branch");
+        let (cli_only, _) = cli_only
+            .split_once("\n  elif ")
+            .expect("the three-way offer follows");
+        assert!(cli_only.contains("\"$BIN\" \"$QUICKSTART_SUBCOMMAND\""));
+        assert!(!cli_only.contains("daemon"));
+        assert!(!cli_only.contains("browser"));
+        let script = std::fs::read_to_string(root().join("install.sh")).unwrap();
+        let resolve = "cli_only_features=$(cargo run --quiet -p xtask --bin generate -- \
+                       features --selection cli-only ";
+        assert!(script.contains(resolve));
+    }
+
+    /// `install.sh` refuses every option that would change the CLI-only
+    /// feature set right after parsing, before it installs anything.
+    #[cfg(unix)]
+    #[test]
+    fn cli_only_refuses_options_that_change_its_feature_set() {
+        let cases: [(&[&str], Option<&str>, &str); 8] = [
+            (
+                &["--cli-only", "--features", "gateway"],
+                None,
+                "takes no --features",
+            ),
+            (
+                &["--cli-only", "--features", "default"],
+                None,
+                "takes no --features",
+            ),
+            (&["--cli-only"], Some("gateway"), "takes no --features"),
+            (&["--cli-only", "--full"], None, "the full preset"),
+            (&["--cli-only", "--preset", "full"], None, "the full preset"),
+            (&["--full", "--cli-only"], None, "and --full are"),
+            (
+                &["--cli-only", "--with-gateway"],
+                None,
+                "builds have no gateway",
+            ),
+            (&["--cli-only", "--minimal"], None, "and --minimal"),
+        ];
+        for (args, env_features, refusal) in cases {
+            let mut cmd = std::process::Command::new("sh");
+            cmd.arg(root().join("install.sh"))
+                .args(args)
+                .args(["--dry-run", "--skip-quickstart", "--no-modify-path"])
+                .current_dir(root())
+                .env_remove("ZEROCLAW_CARGO_FEATURES");
+            if let Some(features) = env_features {
+                cmd.env("ZEROCLAW_CARGO_FEATURES", features);
+            }
+            let out = cmd.output().expect("run install.sh");
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert_eq!(out.status.code(), Some(1), "{args:?}: {stderr}");
+            assert!(stderr.contains(refusal), "{args:?}: {stderr}");
+        }
     }
 
     #[test]

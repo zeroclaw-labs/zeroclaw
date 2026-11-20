@@ -513,8 +513,11 @@ pending you will see a **"Waiting for review"** banner in the workflow run.
 
 Approve all three when they appear. The `github-releases` gate appears only
 after the tokenless crates.io preflight, `Preflight crates.io Workspace`, has
-packaged and compiled every crate. It runs beside the binary builds, so a
-release whose crates cannot publish stops before anything becomes public. The
+packaged and compiled every crate, and after every `Plugin Smoke <target>` leg
+has installed and executed a plugin from the archive built for that target.
+The preflight runs beside the binary builds and the smoke legs right after
+them, so a release whose crates cannot publish, or whose archives cannot run a
+plugin, stops before the GitHub Release becomes public. The
 later `crates-io` job uploads what that preflight verified without repeating it:
 
 | Environment | Job | What it does |
@@ -540,6 +543,7 @@ Once `publish` completes, confirm:
 [ ] Exactly one zeroclaw-vX.Y.Z-verification.tar.gz asset is present
 [ ] No loose *.bundle, *.attestation.jsonl, or *.intoto.jsonl assets are present
 [ ] At least one binary archive is downloadable (spot-check linux x86_64)
+[ ] Every Plugin Smoke leg is green; each step summary carries its check table
 [ ] Prebuilt Docker and generated Docker matrix jobs are green
 [ ] Release notes contain the binary size table from step 1
 ```
@@ -595,8 +599,8 @@ recreate `gh-pages` or change the supported-version window.
 ### What happens automatically
 
 - The `deploy-docs` job dispatches a build that lands in `/vX.Y.Z/`.
-- "Stable" is a pointer to the release's existing docs directory. `bump-version.sh` writes `docs/book/stable-version.txt`; only a master run publishes that pointer to `gh-pages` and refreshes the root redirect and version selector. A normal master deploy builds development docs and shared assets as well. There is no duplicate `/stable/` tree.
-- **Ordering matters:** the version-bump master deploy usually precedes the release tag deploy. It retains the previous live pointer until `/vX.Y.Z/` exists. The release's `deploy-docs` job only dispatches the tag build: a green dispatch job does not prove the docs build finished. Once that run succeeds, use the promotion mode below to publish the stable pointer without another full master build.
+- "Stable" is a pointer to the release's existing docs directory. `bump-version.sh` writes `docs/book/stable-version.txt`; only a master run publishes that pointer to `gh-pages` and refreshes the root redirect and version selector. A normal master deploy builds development docs and shared assets as well. Every build deploy also writes `/stable/`, a copy of the pointer's release directory: canonical, language-alternate and sitemap URLs name `/stable/`, so they stay the same when a new release becomes Stable.
+- **Ordering matters:** the version-bump master deploy usually precedes the release tag deploy. It retains the previous live pointer until `/vX.Y.Z/` exists. The release's `deploy-docs` job only dispatches the tag build: a green dispatch job does not prove the docs build finished. Once that run succeeds, use the promotion mode below to publish the stable pointer, then run the master build that promotion requires.
 - `gh-pages` is ephemeral: publication replaces it with a single orphan commit. Normal builds enforce retention via `DOCS_KEEP_VERSIONS` (master, the stable pointer target, and the newest N final releases). Promotion preserves all existing version directories.
 - The `_shared/` directory (containing UI CSS, JS, and favicons) is updated from the build so the theme cascades to all deployed versions.
 - Translated locales (`es`, `fr`, `ja`, `zh-CN`) render from the `docs/book/po` submodule, which the deploy resolves via `submodules: recursive` at whatever commit the deployed ref pins. That pin is set during the version bump; see [Step 2](#step-2-bump-and-merge-the-version-pr) for the refresh, tag, and pin procedure. English needs no submodule.
@@ -607,10 +611,15 @@ Dispatch **Deploy mdBook docs to Pages** from branch **master**, set **mode** to
 `promote-stable`, and set **tag** to the exact final tag, for example `v0.8.5`.
 The default `build` mode retains the normal build behavior.
 
-Promotion updates `stable-version.txt`, `index.html`, `versions.json`, and the
-root `llms.txt` / `llms-full.txt` pair at the site root. That pair mirrors the
-promoted release's English copy, and is withdrawn when the release doesn't carry
-both files, so the fixed LLM URLs always describe the release `/` redirects to.
+Promotion updates `stable-version.txt`, `index.html`, `versions.json`,
+`sitemap.xml`, and the root `llms.txt` / `llms-full.txt` pair at the site
+root, and replaces `stable/` with a copy of the promoted release's
+directory. The llms pair mirrors the promoted release's English copy, and is
+withdrawn when the release doesn't carry both files, so the fixed LLM URLs
+always describe the release `/` redirects to.
+In the root `404.html`, promotion rewrites the two lines that set the
+redirect's `target` and `locales`, so links to pruned releases reach the
+promoted release's languages.
 It installs no Rust or mdBook tools and preserves every locale, the API
 reference, shared chrome, and retention state. The workflow's existing
 `gh-pages` concurrency group serializes both modes; promotion also uses an exact
@@ -628,10 +637,19 @@ fresh run. Repeating a successful promotion is safe.
 
 Deployments made before source receipts were introduced need one normal `build`
 dispatch for that release tag before promotion can verify their source. Do not
-create a receipt by hand. Promotion does not rewrite page-level canonical or
-language-alternate tags, or `sitemap.xml`; those SEO fields refresh on the next
-normal docs deploy. If an immediate SEO refresh is required, use a normal master
-build. A downgrade requires a separately reviewed manual rollback; this mode has
+create a receipt by hand.
+
+**After a promotion, run a normal master build:** dispatch **Deploy mdBook docs
+to Pages** from branch **master** with **mode** `build` and **tag** `master`.
+This is a required step. Promotion copies the release's pages to `stable/` with
+the SEO tags they were deployed with, while the release was not yet Stable, and
+it does not rerun `gen-seo`. Until the master build runs, pages new in the
+promoted release, and every page of a locale it adds, are served under
+`/stable/` with `noindex` and a canonical to `/vX.Y.Z/`, and no stable page
+carries language-alternate (`hreflang`) links. Promotion does rewrite
+`sitemap.xml` for the promoted release.
+
+A downgrade requires a separately reviewed manual rollback; this mode has
 no rollback override. Reverting the workflow change removes the manual mode but
 does not change the already published pointer.
 
@@ -689,6 +707,26 @@ release the tag does not exist yet either. Fix the packaging problem on
 `master`, then dispatch Release Stable again for the same version. Run
 `scripts/release/publish-crates.sh` locally first to confirm the fix; without
 `--execute` it only packages and verifies.
+
+**A Plugin Smoke leg failed:** On a dispatched release nothing was published:
+the GitHub Release and the release workflow's own image pushes wait for every
+leg. A release started by a tag push also triggers Docker Publish on its own,
+and that run does not wait for the smoke, so check it as well. Open the leg's
+step summary: the
+report names the check that failed and quotes the command output, and the
+`plugin-smoke-<target>` artifact holds the same report. A failure at `plugin
+install` or at the tool result means the archive built for that target cannot
+run a plugin; fix it on `master` and dispatch Release Stable again. Rehearse
+the fix first with the Cross-Platform Build workflow, which runs the same legs
+against the binaries it builds. A failure that names the provider or the
+scratch directory is a runner problem: re-run only the failed leg. Re-run a
+timeout once as well; a repeat timeout is a defect, since a binary that hangs
+on plugin load times out the same way.
+
+**A build leg failed the binary size check:** The cap is 80 MiB, set as
+`BINARY_SIZE_HARD_LIMIT` on the `Check binary size` step of the build job.
+Measure the binary sizes with the Cross-Platform Build workflow before
+raising it, and record the per-target sizes in the pull request that does.
 
 **An environment gate timed out:** Re-run only the timed-out job. No need to
 restart the workflow.

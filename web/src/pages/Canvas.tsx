@@ -3,7 +3,8 @@ import { usePolling } from '@/hooks/usePolling';
 import { Monitor, Trash2, History, RefreshCw } from 'lucide-react';
 import { apiFetch } from '@/lib/api';
 import { basePath } from '@/lib/basePath';
-import { getToken } from '@/lib/auth';
+import { AUTH_EVENTS, getToken } from '@/lib/auth';
+import { routeSessionClose } from '@/lib/ws';
 import { Badge, Button, Card, PageHeader } from '@/components/ui';
 import { t } from '@/lib/i18n';
 
@@ -65,18 +66,46 @@ export default function Canvas() {
     return `${proto}//${location.host}${base}/ws/canvas/${encodeURIComponent(id)}`;
   }, []);
 
-  // Connect to canvas WebSocket
-  const connectWs = useCallback((id: string) => {
-    if (wsRef.current) {
-      wsRef.current.close();
-    }
+  // Canvas the socket stopped for under dashboard sign-in, reconnected once the
+  // session is usable again; and the pending reconnect after a gateway reload
+  // or a refused upgrade.
+  const haltedCanvasRef = useRef<string | null>(null);
+  const reloadTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Connect to canvas WebSocket. `retrying` marks the one retry of a socket
+  // that never opened.
+  const connectWs = useCallback((id: string, retrying = false) => {
+    haltedCanvasRef.current = null;
+    if (reloadTimerRef.current) clearTimeout(reloadTimerRef.current);
+    reloadTimerRef.current = null;
+    const previous = wsRef.current;
+    wsRef.current = null;
+    previous?.close();
 
     const token = getToken();
     const protocols = token ? ['zeroclaw.v1', `bearer.${token}`] : ['zeroclaw.v1'];
     const ws = new WebSocket(getWsUrl(id), protocols);
 
-    ws.onopen = () => setConnected(true);
-    ws.onclose = () => setConnected(false);
+    let opened = false;
+    ws.onopen = () => {
+      opened = true;
+      setConnected(true);
+    };
+    ws.onclose = (event: CloseEvent) => {
+      setConnected(false);
+      // A socket this page replaced or closed on unmount needs nothing more.
+      if (wsRef.current !== ws) return;
+      if (routeSessionClose(event.code)) {
+        haltedCanvasRef.current = id;
+      } else if (event.code === 1001) {
+        // The gateway reloaded: connect to the new one.
+        reloadTimerRef.current = setTimeout(() => connectWs(id), 1000);
+      } else if (!opened && !retrying) {
+        // Refused before it opened (a gateway in the middle of a reload
+        // refuses the upgrade): try once more.
+        reloadTimerRef.current = setTimeout(() => connectWs(id, true), 1000);
+      }
+    };
     ws.onerror = () => setConnected(false);
 
     ws.onmessage = (event) => {
@@ -103,9 +132,22 @@ export default function Canvas() {
   useEffect(() => {
     connectWs(canvasId);
     return () => {
-      wsRef.current?.close();
+      haltedCanvasRef.current = null;
+      if (reloadTimerRef.current) clearTimeout(reloadTimerRef.current);
+      const ws = wsRef.current;
+      wsRef.current = null;
+      ws?.close();
     };
   }, [canvasId, connectWs]);
+
+  useEffect(() => {
+    const onResumed = () => {
+      const id = haltedCanvasRef.current;
+      if (id !== null) connectWs(id);
+    };
+    window.addEventListener(AUTH_EVENTS.resumed, onResumed);
+    return () => window.removeEventListener(AUTH_EVENTS.resumed, onResumed);
+  }, [connectWs]);
 
   // Fetch the canvas list every 5s — paused while the tab is hidden.
   usePolling(async (isStale) => {

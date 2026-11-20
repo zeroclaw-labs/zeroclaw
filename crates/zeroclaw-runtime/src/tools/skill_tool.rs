@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
+use zeroclaw_config::policy::ShellTarget;
 
 /// Default execution time for a skill shell command when the manifest does not
 /// set `timeout_secs` (seconds). A skill may raise this via `timeout_secs` in
@@ -168,13 +169,19 @@ impl Tool for SkillShellTool {
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         let command = self.substitute_args(&args);
 
+        // The runtime resolves the shell on the daemon's own `PATH`. The
+        // policy reads the command in that program's grammar, and nothing is
+        // built until the policy accepts the command.
+        let shell = self
+            .security
+            .command_shell(ShellTarget::of(self.runtime.as_ref(), None));
+
         // Security validation — always requires explicit approval (approved=true)
         // since skill tools are user-defined and should be treated as medium-risk.
-        match self.security.validate_command_execution_for_shell(
-            &command,
-            true,
-            self.runtime.shell_dialect(),
-        ) {
+        match self
+            .security
+            .validate_command_execution_in(&command, true, shell)
+        {
             Ok(_) => {}
             Err(reason) => {
                 return Ok(ToolResult {
@@ -187,7 +194,7 @@ impl Tool for SkillShellTool {
 
         if let Some(path) = self
             .security
-            .forbidden_workspace_path_argument_for_shell(&command, self.runtime.shell_dialect())
+            .forbidden_workspace_path_argument_in(&command, shell)
         {
             return Ok(ToolResult {
                 success: false,
@@ -211,6 +218,16 @@ impl Tool for SkillShellTool {
                 });
             }
         };
+        if let Err(reason) = self
+            .security
+            .confirm_built_shell(shell, cmd.as_std().get_program())
+        {
+            return Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(reason),
+            });
+        }
         cmd.env_clear();
 
         // Only pass safe environment variables
@@ -291,6 +308,31 @@ pub struct SkillBuiltinTool {
     advertised_schema: Arc<serde_json::Value>,
 }
 
+/// Assembly-local identity of the one pipeline that has not been shared yet.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SlotId(pub(crate) usize);
+
+pub(crate) enum TargetRef {
+    Existing(Arc<dyn Tool>),
+    Pipeline(SlotId),
+}
+
+/// Constructor metadata only: this cannot execute or escape as a `Tool`.
+pub(crate) struct PreparedSkillBuiltin {
+    pub(crate) tool_name: String,
+    tool_description: String,
+    locked_args: serde_json::Map<String, serde_json::Value>,
+    advertised_schema: Arc<serde_json::Value>,
+}
+
+pub(crate) enum PreparedSkill {
+    Ready(Box<dyn Tool>),
+    Elevated {
+        prepared: PreparedSkillBuiltin,
+        target: TargetRef,
+    },
+}
+
 impl SkillBuiltinTool {
     pub fn new(
         skill_name: &str,
@@ -298,17 +340,69 @@ impl SkillBuiltinTool {
         target_tool: Arc<dyn zeroclaw_api::tool::Tool>,
         locked_args: HashMap<String, String>,
     ) -> Self {
+        PreparedSkillBuiltin::prepare(skill_name, tool, locked_args, target_tool.as_ref())
+            .bind(target_tool)
+    }
+}
+
+impl PreparedSkillBuiltin {
+    pub(crate) fn prepare(
+        skill_name: &str,
+        tool: &crate::skills::SkillTool,
+        locked_args: HashMap<String, String>,
+        target: &dyn Tool,
+    ) -> Self {
         let locked: serde_json::Map<String, serde_json::Value> = locked_args
             .into_iter()
             .map(|(k, v)| (k, serde_json::Value::String(v)))
             .collect();
-        let advertised_schema = Arc::new(narrow_schema(target_tool.parameters_schema(), &locked));
+        #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
+        crate::tools::late_tool_search_observer::record(
+            "skill-schema-enter",
+            "prepare",
+            crate::tools::late_tool_search_observer::borrowed_id(target),
+            0,
+        );
+        let advertised_schema = Arc::new(narrow_schema(target.parameters_schema(), &locked));
+        #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
+        crate::tools::late_tool_search_observer::record(
+            "skill-schema-return",
+            "prepare",
+            crate::tools::late_tool_search_observer::borrowed_id(target),
+            crate::tools::late_tool_search_observer::arc_id(&advertised_schema),
+        );
         Self {
             tool_name: composed_tool_name(skill_name, &tool.name),
             tool_description: tool.description.clone(),
-            target_tool,
             locked_args: locked,
             advertised_schema,
+        }
+    }
+
+    pub(crate) fn bind(self, target_tool: Arc<dyn Tool>) -> SkillBuiltinTool {
+        #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
+        crate::tools::late_tool_search_observer::record(
+            "skill-bind",
+            &self.tool_name,
+            crate::tools::late_tool_search_observer::arc_id(&target_tool),
+            crate::tools::late_tool_search_observer::arc_id(&self.advertised_schema),
+        );
+        SkillBuiltinTool {
+            tool_name: self.tool_name,
+            tool_description: self.tool_description,
+            target_tool,
+            locked_args: self.locked_args,
+            advertised_schema: self.advertised_schema,
+        }
+    }
+
+    pub(crate) fn spec(&self) -> zeroclaw_api::tool::ToolSpec {
+        zeroclaw_api::tool::ToolSpec {
+            name: self.tool_name.clone(),
+            description: self.tool_description.clone(),
+            parameters: Arc::clone(&self.advertised_schema),
+            output: None,
+            param_domains: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -414,7 +508,10 @@ impl Tool for SkillBuiltinTool {
                 })),
             "skill-scoped elevated tool invoked"
         );
-        let merged = merge_locked_args(&self.locked_args, args);
+        let mut merged = merge_locked_args(&self.locked_args, args);
+        // The runtime approved (or not) this alias's call, not the target's,
+        // so the target runs unapproved whatever the model or manifest says.
+        zeroclaw_api::tool::clear_runtime_approval(self.target_tool.name(), &mut merged);
         self.target_tool.execute_with_context(merged, context).await
     }
 }
@@ -1011,6 +1108,52 @@ mod tests {
         assert_eq!(result.output, "mock_result:hello");
     }
 
+    /// The runtime approves, or not, a skill alias's call under the alias's
+    /// name, never the target's, so an `approved` set on the alias must not
+    /// reach a target that takes runtime approval.
+    #[tokio::test]
+    async fn skill_builtin_tool_never_forwards_approval_to_its_target() {
+        struct ApprovalEcho(&'static str);
+        zeroclaw_api::mock_tool_attribution!(ApprovalEcho);
+        #[async_trait]
+        impl Tool for ApprovalEcho {
+            fn name(&self) -> &str {
+                self.0
+            }
+            fn description(&self) -> &str {
+                "echo the approval it received"
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({"type": "object"})
+            }
+            async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+                Ok(ToolResult {
+                    success: true,
+                    output: args["approved"].to_string().into(),
+                    error: None,
+                })
+            }
+        }
+
+        for (target, expected) in [
+            ("cron_run", "false"),
+            ("shell", "false"),
+            ("calculator", "true"),
+        ] {
+            let tool = SkillBuiltinTool::new(
+                "my_skill",
+                &sample_builtin_skill_tool(),
+                Arc::new(ApprovalEcho(target)),
+                HashMap::new(),
+            );
+            let result = tool
+                .execute(serde_json::json!({"approved": true}))
+                .await
+                .unwrap();
+            assert_eq!(result.output, expected, "{target}");
+        }
+    }
+
     #[test]
     fn skill_builtin_tool_spec_roundtrip() {
         let target: Arc<dyn Tool> = Arc::new(MockBuiltinTool::new("shell"));
@@ -1355,5 +1498,69 @@ mod tests {
             registry.iter().any(|t| t.name() == "ops__use_shell"),
             "the scoped elevation wrapper must be the only callable path"
         );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod shell_grammar_tests {
+    use super::*;
+    use crate::tools::shell::shell_grammar_test_support::{
+        BASH_ONLY_HEREDOC, MispredictingRuntime, RAN_OUTSIDE_BASH, host_bash,
+        host_shell_other_than_bash, wildcard_policy,
+    };
+
+    fn skill(command: &str) -> crate::skills::SkillTool {
+        crate::skills::SkillTool {
+            name: "heredoc".to_string(),
+            description: "Print a heredoc".to_string(),
+            kind: "shell".to_string(),
+            command: command.to_string(),
+            args: HashMap::new(),
+            target: None,
+            locked_args: HashMap::new(),
+            timeout_secs: None,
+        }
+    }
+
+    /// A skill command read as bash is refused when the runtime built
+    /// another shell to run it; one the policy refuses is never built.
+    #[tokio::test]
+    async fn a_skill_command_runs_only_in_the_shell_it_was_read_for() {
+        let (Some(bash), Some(other)) = (host_bash(), host_shell_other_than_bash()) else {
+            eprintln!("skipping: needs bash and another POSIX shell");
+            return;
+        };
+        let workspace = tempfile::tempdir().unwrap();
+        let security = Arc::new(wildcard_policy(workspace.path()));
+
+        let mispredicted = Arc::new(MispredictingRuntime::new(bash, other.clone()));
+        let tool = SkillShellTool::new_with_runtime(
+            "test",
+            &skill(BASH_ONLY_HEREDOC),
+            security.clone(),
+            mispredicted.clone(),
+        );
+        let result = tool.execute(serde_json::json!({})).await.unwrap();
+        assert!(!result.success, "{result:?}");
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("checked as a bash command")),
+            "{result:?}"
+        );
+        assert!(!result.output.contains(RAN_OUTSIDE_BASH), "{result:?}");
+        assert_eq!(mispredicted.builds(), 1);
+
+        let portable = Arc::new(MispredictingRuntime::new(other.clone(), other));
+        let tool = SkillShellTool::new_with_runtime(
+            "test",
+            &skill(BASH_ONLY_HEREDOC),
+            security,
+            portable.clone(),
+        );
+        let result = tool.execute(serde_json::json!({})).await.unwrap();
+        assert!(!result.success, "{result:?}");
+        assert_eq!(portable.builds(), 0);
     }
 }

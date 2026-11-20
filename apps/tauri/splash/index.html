@@ -106,22 +106,28 @@
       // can't (e.g. the `zeroclaw` binary is missing). Once a status arrives it
       // owns the message, so the polling loop stops overwriting it.
       let statusLocked = false;
-      window.__TAURI__?.event
-        ?.listen("zeroclaw://splash-status", (event) => {
-          const { kind, message } = event.payload ?? {};
-          if (!message) return;
-          statusLocked = true;
-          statusEl.textContent = message;
-          if (kind === "error" || kind === "missing") {
-            spinnerEl.style.display = "none";
-            statusEl.classList.add("error");
-            hintEl.classList.remove("show");
-          }
-        })
-        .catch(() => {});
-
       let launching = false;
       let attempts = 0;
+
+      function showStatus(status) {
+        const { kind, message } = status ?? {};
+        if (!message || launching) return;
+        statusLocked = true;
+        statusEl.textContent = message;
+        if (kind === "error" || kind === "missing") {
+          spinnerEl.style.display = "none";
+          statusEl.classList.add("error");
+          hintEl.classList.remove("show");
+        }
+      }
+
+      window.__TAURI__?.event
+        ?.listen("zeroclaw://splash-status", (event) => showStatus(event.payload))
+        // A failure reported before this window opened, as when it is reopened
+        // from the tray, never reached that listener; the backend keeps it.
+        .then(() => invoke("get_startup_failure"))
+        .then(showStatus)
+        .catch(() => {});
 
       async function tick() {
         if (launching) return;

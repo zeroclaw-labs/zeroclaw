@@ -6,6 +6,7 @@ use std::sync::Arc;
 use zeroclaw_api::tool::{Tool, ToolExecutionContext, ToolOutput, ToolResult};
 use zeroclaw_config::schema::PipelineConfig;
 
+use crate::session_memory::SessionMemoryRoute;
 use crate::tool_search::ToolAccessPolicy;
 
 /// Errors specific to pipeline execution.
@@ -71,6 +72,10 @@ pub struct PipelineTool {
     tools: Vec<Arc<dyn Tool>>,
     allowed_set: HashSet<String>,
     access_policy: Option<ToolAccessPolicy>,
+    /// The session memory of the registry this pipeline was assembled into.
+    /// Once that session is pinned, memory steps run over its routed handle
+    /// instead of the ones captured in `tools`.
+    session_memory: Option<Arc<SessionMemoryRoute>>,
 }
 
 impl PipelineTool {
@@ -91,7 +96,26 @@ impl PipelineTool {
             tools,
             allowed_set,
             access_policy,
+            session_memory: None,
         }
+    }
+
+    /// Share the session memory route of the registry this pipeline is
+    /// assembled into.
+    #[must_use]
+    pub fn with_session_memory(mut self, route: Arc<SessionMemoryRoute>) -> Self {
+        self.session_memory = Some(route);
+        self
+    }
+
+    /// Narrow the existing context before sharing this pipeline. Surviving
+    /// children keep their identity and order; access policy is unchanged.
+    pub fn retain_context_tools(
+        mut self,
+        mut keep: impl FnMut(&dyn zeroclaw_api::tool::Tool) -> bool,
+    ) -> Self {
+        self.tools.retain(|tool| keep(tool.as_ref()));
+        self
     }
 
     /// Find a tool by name in the registry.
@@ -100,6 +124,20 @@ impl PipelineTool {
             .iter()
             .find(|t| t.name() == name)
             .map(|t| t.as_ref())
+    }
+
+    /// The tool a step named `name` runs. A memory tool of a pinned session
+    /// runs over the session's routed memory; the one captured when the
+    /// pipeline was built still points at the plane it was built over.
+    fn step_tool(&self, name: &str) -> Option<Arc<dyn Tool>> {
+        let captured = self.tools.iter().find(|t| t.name() == name)?;
+        if let Some(routed) = self.session_memory.as_ref().and_then(|r| r.routed())
+            && let Some(tool) =
+                crate::session_memory::memory_tool_over(name, &routed.memory, &routed.security)
+        {
+            return Some(tool);
+        }
+        Some(Arc::clone(captured))
     }
 
     fn policy_allows_exact_name(&self, name: &str) -> bool {
@@ -150,11 +188,13 @@ impl PipelineTool {
 
         for (i, step) in steps.iter().enumerate() {
             let tool = self
-                .find_tool(&step.tool)
+                .step_tool(&step.tool)
                 .ok_or_else(|| PipelineError::UnknownTool(step.tool.clone()))?;
 
-            // Interpolate previous step results into args.
-            let interpolated_args = interpolate_args(&step.args, &results);
+            // Interpolate previous step results into args. The step is a
+            // direct call, so it carries no approval whatever its args say.
+            let mut interpolated_args = interpolate_args(&step.args, &results);
+            zeroclaw_api::tool::clear_runtime_approval(tool.name(), &mut interpolated_args);
 
             let tool_result = tool
                 .execute_with_context(interpolated_args, &context)
@@ -197,24 +237,20 @@ impl PipelineTool {
         let context = ToolExecutionContext::current().unwrap_or_default();
 
         for (i, step) in steps.iter().enumerate() {
-            let tool = self
-                .find_tool(&step.tool)
+            let tool_arc = self
+                .step_tool(&step.tool)
                 .ok_or_else(|| PipelineError::UnknownTool(step.tool.clone()))?;
 
             // Clone what we need for the spawned task.
             let tool_name = step.tool.clone();
-            let args = step.args.clone();
+            let mut args = step.args.clone();
+            zeroclaw_api::tool::clear_runtime_approval(tool_arc.name(), &mut args);
 
-            // We need a reference that lives long enough — use Arc.
-            let tool_arc = self.tools.iter().find(|t| t.name() == tool.name()).cloned();
-
-            if let Some(tool_arc) = tool_arc {
-                let context = context.clone();
-                join_set.spawn(async move {
-                    let result = tool_arc.execute_with_context(args, &context).await;
-                    (i, tool_name, result)
-                });
-            }
+            let context = context.clone();
+            join_set.spawn(async move {
+                let result = tool_arc.execute_with_context(args, &context).await;
+                (i, tool_name, result)
+            });
         }
 
         let mut results: Vec<StepResult> = Vec::with_capacity(steps.len());
@@ -958,6 +994,89 @@ mod tests {
         }
     }
 
+    /// A pipeline allowed to run `memory_store`, captured over `shared` the
+    /// way assembly builds it, sharing `route` with its registry.
+    fn memory_pipeline(
+        shared: &Arc<dyn zeroclaw_memory::Memory>,
+        route: Arc<SessionMemoryRoute>,
+    ) -> PipelineTool {
+        let config = PipelineConfig {
+            enabled: true,
+            max_steps: 20,
+            allowed_tools: vec!["memory_store".to_string()],
+        };
+        let security = Arc::new(zeroclaw_config::policy::SecurityPolicy::default());
+        let tools: Vec<Arc<dyn Tool>> = vec![Arc::new(crate::memory_store::MemoryStoreTool::new(
+            Arc::clone(shared),
+            security,
+        ))];
+        PipelineTool::new(config, tools).with_session_memory(route)
+    }
+
+    fn store_step(key: &str, content: &str) -> serde_json::Value {
+        serde_json::json!({"tool": "memory_store", "args": {"key": key, "content": content}})
+    }
+
+    /// Once the session is pinned, a memory step run by
+    /// the pipeline lands on the owner's private plane, sequentially and in
+    /// parallel, never on the shared plane its captured tool was built over.
+    #[tokio::test]
+    async fn memory_steps_of_a_pinned_session_land_on_the_owners_plane() {
+        use zeroclaw_api::memory_traits::PrincipalScope;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let shared: Arc<dyn zeroclaw_memory::Memory> =
+            Arc::new(zeroclaw_memory::SqliteMemory::new("sqlite", tmp.path()).unwrap());
+        let route = Arc::new(SessionMemoryRoute::default());
+        let alice = PrincipalScope::new("user:alice");
+        let routed: Arc<dyn zeroclaw_memory::Memory> = Arc::new(
+            zeroclaw_memory::PrincipalPlaneMemory::new(Arc::clone(&shared), alice.clone()),
+        );
+        route
+            .pin(
+                routed,
+                Arc::new(zeroclaw_config::policy::SecurityPolicy::default()),
+            )
+            .unwrap();
+        let pipeline = memory_pipeline(&shared, route);
+
+        for (parallel, key) in [(false, "seq"), (true, "par")] {
+            let result = pipeline
+                .execute(serde_json::json!({"steps": [store_step(key, "P-MARKER")], "parallel": parallel}))
+                .await
+                .unwrap();
+            assert!(result.success, "{result:?}");
+            assert!(
+                shared.get(key).await.unwrap().is_none(),
+                "a pinned session's pipeline step must not write the shared plane ({key})"
+            );
+            let owned = shared
+                .get_for_principal(&alice, key)
+                .await
+                .unwrap()
+                .unwrap_or_else(|| panic!("the owner's plane holds the {key} step's row"));
+            assert_eq!(owned.content, "P-MARKER");
+        }
+    }
+
+    /// An unowned session never pins the route, and its pipeline keeps the
+    /// shared memory it was built over.
+    #[tokio::test]
+    async fn memory_steps_of_an_unpinned_session_keep_the_shared_plane() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let shared: Arc<dyn zeroclaw_memory::Memory> =
+            Arc::new(zeroclaw_memory::SqliteMemory::new("sqlite", tmp.path()).unwrap());
+        let pipeline = memory_pipeline(&shared, Arc::new(SessionMemoryRoute::default()));
+        let result = pipeline
+            .execute(serde_json::json!({"steps": [store_step("k", "shared-row")]}))
+            .await
+            .unwrap();
+        assert!(result.success, "{result:?}");
+        assert_eq!(
+            shared.get("k").await.unwrap().unwrap().content,
+            "shared-row"
+        );
+    }
+
     fn echo_pipeline() -> PipelineTool {
         let config = PipelineConfig {
             enabled: true,
@@ -1004,5 +1123,100 @@ mod tests {
         assert!(res.success);
         assert!(res.output.contains("FIRST_BIG_BLOB"));
         assert!(res.output.contains("final answer"));
+    }
+
+    // ── Approval ───────────────────────────────────────────
+
+    struct RecordingTool {
+        name: String,
+        seen: Arc<std::sync::Mutex<Vec<(String, serde_json::Value)>>>,
+    }
+
+    zeroclaw_api::mock_tool_attribution!(RecordingTool);
+
+    #[async_trait::async_trait]
+    impl Tool for RecordingTool {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn description(&self) -> &str {
+            "record"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn execute(&self, args: serde_json::Value) -> Result<ToolResult> {
+            self.seen.lock().unwrap().push((self.name.clone(), args));
+            Ok(ToolResult {
+                success: true,
+                output: "ok".to_string().into(),
+                error: None,
+            })
+        }
+    }
+
+    /// A step is a call the pipeline makes itself, which the runtime never
+    /// approved, so a step's `approved: true` must not reach a tool that
+    /// takes runtime approval. Other tools' arguments pass through unchanged.
+    #[tokio::test]
+    async fn steps_never_carry_approval_to_tools_that_take_runtime_approval() {
+        for parallel in [false, true] {
+            let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let names = ["cron_update", "cron_run", "a"];
+            let tools: Vec<Arc<dyn Tool>> = names
+                .iter()
+                .map(|name| {
+                    Arc::new(RecordingTool {
+                        name: (*name).to_string(),
+                        seen: Arc::clone(&seen),
+                    }) as Arc<dyn Tool>
+                })
+                .collect();
+            let config = PipelineConfig {
+                enabled: true,
+                max_steps: 20,
+                allowed_tools: names.iter().map(|name| (*name).to_string()).collect(),
+            };
+            let args = serde_json::json!({
+                "parallel": parallel,
+                "steps": [
+                    {"tool": "cron_update", "args": {
+                        "job_id": "J",
+                        "patch": {"command": "touch pipeline-proof"},
+                        "approved": true
+                    }},
+                    {"tool": "cron_run", "args": {"job_id": "J", "approved": true}},
+                    {"tool": "a", "args": {"approved": true}}
+                ]
+            });
+            let res = PipelineTool::new(config, tools)
+                .execute(args)
+                .await
+                .unwrap();
+            assert!(res.success, "{:?}", res.error);
+
+            let seen = seen.lock().unwrap();
+            let approved = |name: &str| {
+                seen.iter()
+                    .find(|(tool, _)| tool == name)
+                    .map(|(_, args)| args["approved"].clone())
+                    .unwrap_or_else(|| panic!("{name} ran"))
+            };
+            assert_eq!(
+                approved("cron_update"),
+                serde_json::json!(false),
+                "parallel={parallel}"
+            );
+            assert_eq!(
+                approved("cron_run"),
+                serde_json::json!(false),
+                "parallel={parallel}"
+            );
+            assert_eq!(
+                approved("a"),
+                serde_json::json!(true),
+                "parallel={parallel}"
+            );
+        }
     }
 }

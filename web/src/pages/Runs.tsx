@@ -3,7 +3,8 @@ import { Link } from 'react-router-dom';
 import { Activity, ExternalLink, Loader2, Square } from 'lucide-react';
 import { cancelSop, isTerminalRunStatus, runStatusBadge, type SopRunSummary } from '@/lib/sops';
 import { basePath } from '@/lib/basePath';
-import { getToken } from '@/lib/auth';
+import { AUTH_EVENTS, getToken } from '@/lib/auth';
+import { routeSessionClose } from '@/lib/ws';
 import { formatRelative } from '@/lib/format';
 import { t } from '@/lib/i18n';
 import { Badge, Card, PageHeader } from '@/components/ui';
@@ -42,16 +43,25 @@ export default function Runs() {
 
     let stopped = false;
     let retry: number | undefined;
+    // Stopped by a signed-in session's close code or a pending re-auth; one
+    // reconnect follows when the session is usable again.
+    let halted = false;
 
     const connect = () => {
       if (stopped) return;
+      halted = false;
       const ws = new WebSocket(url, protocols);
       wsRef.current = ws;
 
       ws.onopen = () => setConnected(true);
-      ws.onclose = () => {
+      ws.onclose = (event: CloseEvent) => {
         setConnected(false);
-        if (!stopped) retry = window.setTimeout(connect, 2000);
+        if (stopped) return;
+        if (routeSessionClose(event.code)) {
+          halted = true;
+          return;
+        }
+        retry = window.setTimeout(connect, 2000);
       };
       ws.onerror = () => ws.close();
 
@@ -104,9 +114,15 @@ export default function Runs() {
       };
     };
 
+    const onResumed = () => {
+      if (halted) connect();
+    };
+    window.addEventListener(AUTH_EVENTS.resumed, onResumed);
+
     connect();
     return () => {
       stopped = true;
+      window.removeEventListener(AUTH_EVENTS.resumed, onResumed);
       if (retry) window.clearTimeout(retry);
       wsRef.current?.close();
       wsRef.current = null;

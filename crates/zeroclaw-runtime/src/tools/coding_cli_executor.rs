@@ -1,5 +1,6 @@
 use crate::platform::RuntimeAdapter;
 use crate::security::traits::Sandbox;
+use crate::util::shell_escape;
 use async_trait::async_trait;
 use std::ffi::{OsStr, OsString};
 use std::process::Output;
@@ -121,19 +122,8 @@ fn shell_command(command: &CodingCliCommand) -> String {
         .join(" ")
 }
 
-fn shell_escape(value: &std::ffi::OsStr) -> String {
-    let value = value.to_string_lossy();
-    if value
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/' | ':' | '=' | '+'))
-    {
-        value.into_owned()
-    } else {
-        format!("'{}'", value.replace('\'', "'\\''"))
-    }
-}
-
-#[cfg(test)]
+// The executor's fixtures drive it through `CodexCliTool`.
+#[cfg(all(test, feature = "tool-codex-cli"))]
 mod tests {
     use super::*;
     use std::path::PathBuf;

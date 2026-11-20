@@ -81,7 +81,12 @@ Choosing a route takes two permissions, and both must hold:
   profile that does not auto-approve it, refuses the routed spawn. Being allowed
   to spawn does not stand in for that approval. Inside an SOP step, headless or
   live, an enforced step scope that excludes `model_switch` refuses the routed
-  spawn too, whatever the profile allows. Unhinted spawning is unaffected.
+  spawn too, whatever the profile allows. So does a turn whose effort-routing
+  provider allowlist excludes the route's provider, exactly as it would refuse
+  `model_switch` to it. Unhinted spawning is unaffected.
+
+A parent bound to supplied capabilities resolves the route through its own
+provider source and principal, never a provider built from config.
 
 The tool offers `model_hint` only to a parent that holds both. To let an agent
 use routes, add `model_switch` to its risk profile's `auto_approve` list (and to

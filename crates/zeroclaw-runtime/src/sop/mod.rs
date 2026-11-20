@@ -1281,7 +1281,7 @@ pub const SOP_STEP_SYNTAX_CATALOG: &[SopStepSyntaxSpec] = &[
     },
     SopStepSyntaxSpec {
         key: SopStepSyntaxKey::Decide,
-        description: "`- decide:` makes the step a conditional part: a yes/no question the SOP's `[decision]` model answers about the triggering event when the run starts. The step runs only on yes; on no it is recorded as skipped and the run continues. If the model cannot answer, the step runs.",
+        description: "`- decide:` makes the step a conditional part: a yes/no question the SOP's `[decision]` model answers about the triggering event when the run starts. The step runs only on yes; on no it is recorded as skipped and the run continues. If the model cannot answer, or its gate or mode answer is unusable, the step runs.",
     },
     SopStepSyntaxSpec {
         key: SopStepSyntaxKey::UnlessDecided,
