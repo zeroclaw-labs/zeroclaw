@@ -1108,6 +1108,9 @@ fn config_registry_router(
             "/api/config/provider-registry",
             get(api_config::handle_registry_get).put(api_config::handle_registry_put),
         )
+        .layer(axum::extract::DefaultBodyLimit::max(
+            MAX_PROVIDER_REGISTRY_BODY_SIZE,
+        ))
         .route_layer(axum::middleware::from_fn_with_state(
             route_auth,
             principal_gate::config_route_auth,

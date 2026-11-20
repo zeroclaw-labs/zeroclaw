@@ -1137,20 +1137,20 @@ mod tests {
         };
         assert_eq!(
             ep("jev"),
-            Some(("https://api.typesafe.ai".into(), "jev-latest".into()))
+            Some(("https://api.typesafe.ai/v1".into(), "jev-latest".into()))
         );
         assert_eq!(
             ep("laya"),
-            Some(("http://127.0.0.1:8000".into(), "laya".into()))
+            Some(("http://127.0.0.1:8000/v1".into(), "laya".into()))
         );
         assert_eq!(
             ep("lab"),
-            Some(("http://10.0.0.5:9000/".into(), "laya-small".into()))
+            Some(("http://10.0.0.5:9000/v1".into(), "laya-small".into()))
         );
         assert_eq!(ep("broken"), None);
         assert_eq!(
             ep("pinned"),
-            Some(("https://api.typesafe.ai".into(), "jev-1.13.0".into()))
+            Some(("https://api.typesafe.ai/v1".into(), "jev-1.13.0".into()))
         );
 
         let models = models_from_config(&cfg);

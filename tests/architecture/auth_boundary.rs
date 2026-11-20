@@ -5,8 +5,8 @@
 //! every existing test. These detectors turn both invariants into build
 //! failures.
 //!
-//! 1. The gateway config surface authenticates via a `route_layer` on
-//!    `config_admin_router`. A handler from `api_config`, `api_sections` or
+//! 1. The gateway config surface authenticates via a `route_layer` on the
+//!    config-router pieces. A handler from `api_config`, `api_sections` or
 //!    `api_quickstart` registered on any other router is unauthenticated.
 //! 2. Every RPC method that acts on a caller-supplied `session_id` must pass
 //!    it through `authorize_session_owner`, which is what keeps one
@@ -49,14 +49,25 @@ fn fn_body_span_from(src: &str, signature: &str, search_from: usize) -> (usize, 
 }
 
 /// Handlers on the config surface are authenticated by WHERE they are
-/// registered. Anything from these modules must be registered inside
-/// `config_admin_router`, whose tail carries the principal `route_layer`.
+/// registered. Anything from these modules must be registered inside one of
+/// the authenticated config-router pieces, whose tail carries the principal
+/// `route_layer`.
 #[test]
 fn config_surface_handlers_are_registered_only_on_the_authenticated_router() {
     const GUARDED_MODULES: &[&str] = &["api_config::", "api_sections::", "api_quickstart::"];
 
     let src = repo_file("crates/zeroclaw-gateway/src/lib.rs");
-    let (start, end) = fn_body_span_from(&src, "fn config_admin_router", 0);
+    let router_spans = [
+        fn_body_span_from(&src, "fn config_admin_router_without_registry", 0),
+        fn_body_span_from(&src, "fn config_registry_router", 0),
+    ];
+    for (start, end) in router_spans {
+        let body = &src[start..=end];
+        assert!(
+            body.contains("route_layer(axum::middleware::from_fn_with_state"),
+            "config router at byte {start} must carry the principal route layer"
+        );
+    }
 
     let mut stray = Vec::new();
     for module in GUARDED_MODULES {
@@ -64,7 +75,10 @@ fn config_surface_handlers_are_registered_only_on_the_authenticated_router() {
         while let Some(found) = src[from..].find(module) {
             let at = from + found;
             from = at + module.len();
-            if at >= start && at <= end {
+            if router_spans
+                .iter()
+                .any(|(start, end)| at >= *start && at <= *end)
+            {
                 continue; // inside the authenticated group
             }
             // `use` statements and doc comments name the module without
@@ -84,7 +98,7 @@ fn config_surface_handlers_are_registered_only_on_the_authenticated_router() {
         stray.is_empty(),
         "these config-surface handlers are registered OUTSIDE config_admin_router, so the \
          principal route_layer never runs for them and they are unauthenticated:\n{}\n\
-         Move the route into config_admin_router.",
+         Move the route into an authenticated config-router piece.",
         stray.join("\n")
     );
 }
