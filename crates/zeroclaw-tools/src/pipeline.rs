@@ -3,9 +3,13 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::sync::Arc;
-use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
+use zeroclaw_api::tool::{
+    GoalChildOperationError, Tool, ToolExecutionCancelled, ToolExecutionContext, ToolOutput,
+    ToolResult,
+};
 use zeroclaw_config::schema::PipelineConfig;
 
+use crate::session_memory::SessionMemoryRoute;
 use crate::tool_search::ToolAccessPolicy;
 
 /// Errors specific to pipeline execution.
@@ -23,6 +27,18 @@ pub enum PipelineError {
         tool: String,
         message: String,
     },
+}
+
+// Owned child errors must cross the composite without being flattened to text.
+enum PipelineAbort {
+    Step(PipelineError),
+    Owned(anyhow::Error),
+}
+
+impl From<PipelineError> for PipelineAbort {
+    fn from(error: PipelineError) -> Self {
+        Self::Step(error)
+    }
 }
 
 /// A single step in a pipeline.
@@ -71,6 +87,10 @@ pub struct PipelineTool {
     tools: Vec<Arc<dyn Tool>>,
     allowed_set: HashSet<String>,
     access_policy: Option<ToolAccessPolicy>,
+    /// The session memory of the registry this pipeline was assembled into.
+    /// Once that session is pinned, memory steps run over its routed handle
+    /// instead of the ones captured in `tools`.
+    session_memory: Option<Arc<SessionMemoryRoute>>,
 }
 
 impl PipelineTool {
@@ -91,7 +111,26 @@ impl PipelineTool {
             tools,
             allowed_set,
             access_policy,
+            session_memory: None,
         }
+    }
+
+    /// Share the session memory route of the registry this pipeline is
+    /// assembled into.
+    #[must_use]
+    pub fn with_session_memory(mut self, route: Arc<SessionMemoryRoute>) -> Self {
+        self.session_memory = Some(route);
+        self
+    }
+
+    /// Narrow the existing context before sharing this pipeline. Surviving
+    /// children keep their identity and order; access policy is unchanged.
+    pub fn retain_context_tools(
+        mut self,
+        mut keep: impl FnMut(&dyn zeroclaw_api::tool::Tool) -> bool,
+    ) -> Self {
+        self.tools.retain(|tool| keep(tool.as_ref()));
+        self
     }
 
     /// Find a tool by name in the registry.
@@ -100,6 +139,20 @@ impl PipelineTool {
             .iter()
             .find(|t| t.name() == name)
             .map(|t| t.as_ref())
+    }
+
+    /// The tool a step named `name` runs. A memory tool of a pinned session
+    /// runs over the session's routed memory; the one captured when the
+    /// pipeline was built still points at the plane it was built over.
+    fn step_tool(&self, name: &str) -> Option<Arc<dyn Tool>> {
+        let captured = self.tools.iter().find(|t| t.name() == name)?;
+        if let Some(routed) = self.session_memory.as_ref().and_then(|r| r.routed())
+            && let Some(tool) =
+                crate::session_memory::memory_tool_over(name, &routed.memory, &routed.security)
+        {
+            return Some(tool);
+        }
+        Some(Arc::clone(captured))
     }
 
     fn policy_allows_exact_name(&self, name: &str) -> bool {
@@ -144,25 +197,52 @@ impl PipelineTool {
     async fn execute_sequential(
         &self,
         steps: &[PipelineStep],
-    ) -> std::result::Result<Vec<StepResult>, PipelineError> {
+    ) -> std::result::Result<Vec<StepResult>, PipelineAbort> {
         let mut results: Vec<StepResult> = Vec::with_capacity(steps.len());
+        let context = ToolExecutionContext::current().unwrap_or_default();
 
         for (i, step) in steps.iter().enumerate() {
+            if context.is_goal_foreground()
+                && context
+                    .cancellation_token()
+                    .is_some_and(|t| t.is_cancelled())
+            {
+                return Err(PipelineAbort::Owned(ToolExecutionCancelled.into()));
+            }
             let tool = self
-                .find_tool(&step.tool)
+                .step_tool(&step.tool)
                 .ok_or_else(|| PipelineError::UnknownTool(step.tool.clone()))?;
 
-            // Interpolate previous step results into args.
-            let interpolated_args = interpolate_args(&step.args, &results);
+            // Interpolate previous step results into args. The step is a
+            // direct call, so it carries no approval whatever its args say.
+            let mut interpolated_args = interpolate_args(&step.args, &results);
+            zeroclaw_api::tool::clear_runtime_approval(tool.name(), &mut interpolated_args);
 
-            let tool_result =
-                tool.execute(interpolated_args)
-                    .await
-                    .map_err(|e| PipelineError::StepFailed {
+            let possible_child =
+                context.is_goal_foreground() && tool.may_invoke_agent_child(&interpolated_args);
+            let call = tool.execute_with_context(interpolated_args, &context);
+            let result = if possible_child {
+                context.scope_only(call).await
+            } else if context.is_goal_foreground() {
+                context.run(call).await
+            } else {
+                call.await
+            };
+            let tool_result = result.map_err(|e| {
+                if context.is_goal_foreground()
+                    && (e.is::<GoalChildOperationError>() || e.is::<ToolExecutionCancelled>())
+                {
+                    PipelineAbort::Owned(
+                        e.context(format!("Pipeline step {i} ({}) failed", step.tool)),
+                    )
+                } else {
+                    PipelineAbort::Step(PipelineError::StepFailed {
                         index: i,
                         tool: step.tool.clone(),
                         message: e.to_string(),
-                    })?;
+                    })
+                }
+            })?;
 
             if !tool_result.success {
                 return Err(PipelineError::StepFailed {
@@ -171,7 +251,8 @@ impl PipelineTool {
                     message: tool_result
                         .error
                         .unwrap_or_else(|| tool_result.output.clone().into_string()),
-                });
+                }
+                .into());
             }
 
             results.push(StepResult {
@@ -185,6 +266,85 @@ impl PipelineTool {
         Ok(results)
     }
 
+    /// Poll child-free Goal steps in the owning task so task-local accounting survives.
+    async fn execute_goal_parallel(
+        &self,
+        steps: &[PipelineStep],
+    ) -> std::result::Result<Vec<StepResult>, PipelineAbort> {
+        use futures_util::stream::{FuturesUnordered, StreamExt};
+        use std::future::Future;
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+
+        let context = ToolExecutionContext::current().unwrap_or_default();
+        let mut pending = FuturesUnordered::new();
+        for (index, step) in steps.iter().enumerate() {
+            let tool = self
+                .step_tool(&step.tool)
+                .ok_or_else(|| PipelineError::UnknownTool(step.tool.clone()))?;
+            let mut args = step.args.clone();
+            zeroclaw_api::tool::clear_runtime_approval(tool.name(), &mut args);
+            let context = context.clone();
+            pending.push(async move {
+                let future = context.run(tool.execute_with_context(args, &context));
+                let mut future = std::pin::pin!(future);
+                let result = std::future::poll_fn(|cx| {
+                    match catch_unwind(AssertUnwindSafe(|| future.as_mut().poll(cx))) {
+                        Ok(poll) => poll.map(Some),
+                        Err(_) => std::task::Poll::Ready(None),
+                    }
+                })
+                .await;
+                (index, step, result)
+            });
+        }
+        let mut results = Vec::with_capacity(steps.len());
+        while let Some((index, step, result)) = pending.next().await {
+            let result = match result {
+                None => {
+                    return Err(PipelineError::StepFailed {
+                        index,
+                        tool: step.tool.clone(),
+                        message: "Pipeline step panicked".into(),
+                    }
+                    .into());
+                }
+                Some(Err(error))
+                    if error.is::<GoalChildOperationError>()
+                        || error.is::<ToolExecutionCancelled>() =>
+                {
+                    return Err(PipelineAbort::Owned(error));
+                }
+                Some(Err(error)) => {
+                    return Err(PipelineError::StepFailed {
+                        index,
+                        tool: step.tool.clone(),
+                        message: error.to_string(),
+                    }
+                    .into());
+                }
+                Some(Ok(result)) => result,
+            };
+            if !result.success {
+                return Err(PipelineError::StepFailed {
+                    index,
+                    tool: step.tool.clone(),
+                    message: result
+                        .error
+                        .unwrap_or_else(|| result.output.clone().into_string()),
+                }
+                .into());
+            }
+            results.push(StepResult {
+                index,
+                tool: step.tool.clone(),
+                success: true,
+                output: result.output.into_string(),
+            });
+        }
+        results.sort_by_key(|result| result.index);
+        Ok(results)
+    }
+
     /// Execute independent steps in parallel (no interpolation between them).
     async fn execute_parallel(
         &self,
@@ -193,25 +353,23 @@ impl PipelineTool {
         use tokio::task::JoinSet;
 
         let mut join_set = JoinSet::new();
+        let context = ToolExecutionContext::current().unwrap_or_default();
 
         for (i, step) in steps.iter().enumerate() {
-            let tool = self
-                .find_tool(&step.tool)
+            let tool_arc = self
+                .step_tool(&step.tool)
                 .ok_or_else(|| PipelineError::UnknownTool(step.tool.clone()))?;
 
             // Clone what we need for the spawned task.
             let tool_name = step.tool.clone();
-            let args = step.args.clone();
+            let mut args = step.args.clone();
+            zeroclaw_api::tool::clear_runtime_approval(tool_arc.name(), &mut args);
 
-            // We need a reference that lives long enough — use Arc.
-            let tool_arc = self.tools.iter().find(|t| t.name() == tool.name()).cloned();
-
-            if let Some(tool_arc) = tool_arc {
-                join_set.spawn(async move {
-                    let result = tool_arc.execute(args).await;
-                    (i, tool_name, result)
-                });
-            }
+            let context = context.clone();
+            join_set.spawn(async move {
+                let result = tool_arc.execute_with_context(args, &context).await;
+                (i, tool_name, result)
+            });
         }
 
         let mut results: Vec<StepResult> = Vec::with_capacity(steps.len());
@@ -256,6 +414,16 @@ impl PipelineTool {
 
 #[async_trait]
 impl Tool for PipelineTool {
+    fn may_invoke_agent_child(&self, args: &serde_json::Value) -> bool {
+        let Ok(request) = serde_json::from_value::<PipelineRequest>(args.clone()) else {
+            return true;
+        };
+        request.steps.iter().any(|step| {
+            self.find_tool(&step.tool)
+                .is_none_or(|tool| tool.may_invoke_agent_child(&step.args))
+        })
+    }
+
     fn requires_unrestricted_principal(&self) -> bool {
         true
     }
@@ -311,6 +479,14 @@ impl Tool for PipelineTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> Result<ToolResult> {
+        let context = ToolExecutionContext::current().unwrap_or_default();
+        if context.is_goal_foreground()
+            && context
+                .cancellation_token()
+                .is_some_and(|t| t.is_cancelled())
+        {
+            return Err(ToolExecutionCancelled.into());
+        }
         let request: PipelineRequest = serde_json::from_value(args).map_err(|e| {
             ::zeroclaw_log::record!(
                 WARN,
@@ -331,8 +507,30 @@ impl Tool for PipelineTool {
             });
         }
 
-        let results = if request.parallel {
-            self.execute_parallel(&request.steps).await
+        if context.is_goal_foreground() && request.parallel {
+            for (index, step) in request.steps.iter().enumerate() {
+                if self
+                    .find_tool(&step.tool)
+                    .is_none_or(|tool| tool.may_invoke_agent_child(&step.args))
+                {
+                    let error = PipelineError::StepFailed {
+                        index,
+                        tool: step.tool.clone(),
+                        message: crate::i18n::get_required_tool_string(
+                            "tool-pipeline-error-goal-parallel-child",
+                        ),
+                    };
+                    return Ok(ToolResult::err(error.to_string()));
+                }
+            }
+        }
+
+        let results = if request.parallel && context.is_goal_foreground() {
+            self.execute_goal_parallel(&request.steps).await
+        } else if request.parallel {
+            self.execute_parallel(&request.steps)
+                .await
+                .map_err(PipelineAbort::Step)
         } else {
             self.execute_sequential(&request.steps).await
         };
@@ -353,11 +551,26 @@ impl Tool for PipelineTool {
                     error: None,
                 })
             }
-            Err(e) => Ok(ToolResult {
+            Err(PipelineAbort::Owned(error)) => Err(error),
+            Err(PipelineAbort::Step(e)) => Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some(e.to_string()),
             }),
+        }
+    }
+
+    async fn execute_with_context(
+        &self,
+        args: serde_json::Value,
+        context: &ToolExecutionContext,
+    ) -> Result<ToolResult> {
+        if context.is_goal_foreground()
+            || ToolExecutionContext::current().is_some_and(|outer| outer.is_goal_foreground())
+        {
+            context.scope_only(self.execute(args)).await
+        } else {
+            context.run(self.execute(args)).await
         }
     }
 }
@@ -448,6 +661,346 @@ fn resolve_template(template: &str, prior_results: &[StepResult]) -> Option<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+    tokio::task_local! { static PIPELINE_TEST_SCOPE: usize; }
+
+    struct GoalProbe {
+        name: &'static str,
+        effects: Arc<std::sync::atomic::AtomicUsize>,
+        barrier: Option<Arc<tokio::sync::Barrier>>,
+    }
+    zeroclaw_api::mock_tool_attribution!(GoalProbe);
+
+    #[async_trait]
+    impl Tool for GoalProbe {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn description(&self) -> &str {
+            "Goal pipeline probe"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+        fn may_invoke_agent_child(&self, args: &serde_json::Value) -> bool {
+            args.get("child").and_then(|v| v.as_bool()).unwrap_or(false)
+        }
+        async fn execute(&self, args: serde_json::Value) -> Result<ToolResult> {
+            assert!(
+                ToolExecutionContext::current()
+                    .unwrap()
+                    .is_goal_foreground()
+            );
+            if self.barrier.is_some() {
+                assert_eq!(PIPELINE_TEST_SCOPE.get(), 7);
+            }
+            self.effects
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let Some(barrier) = &self.barrier {
+                barrier.wait().await;
+                assert_eq!(PIPELINE_TEST_SCOPE.get(), 7);
+                assert!(
+                    ToolExecutionContext::current()
+                        .unwrap()
+                        .is_goal_foreground()
+                );
+            }
+            if args.get("panic").and_then(|v| v.as_bool()) == Some(true) {
+                panic!("private payload");
+            }
+            if args.get("error").and_then(|v| v.as_bool()) == Some(true) {
+                return Err(
+                    anyhow::Error::msg("original child cause").context(GoalChildOperationError)
+                );
+            }
+            Ok(ToolResult::ok(args.to_string()))
+        }
+    }
+
+    fn goal_probe_pipeline(
+        effects: Arc<std::sync::atomic::AtomicUsize>,
+        barrier: Option<Arc<tokio::sync::Barrier>>,
+    ) -> PipelineTool {
+        PipelineTool::new(
+            PipelineConfig {
+                enabled: true,
+                max_steps: 5,
+                allowed_tools: vec!["probe".into()],
+            },
+            vec![Arc::new(GoalProbe {
+                name: "probe",
+                effects,
+                barrier,
+            })],
+        )
+    }
+
+    #[tokio::test]
+    async fn goal_parallel_child_rejected_before_any_step_and_after_validation() {
+        let effects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let pipeline = goal_probe_pipeline(effects.clone(), None);
+        let context = ToolExecutionContext::default().with_goal_foreground();
+        let result = pipeline
+            .execute_with_context(
+                serde_json::json!({"parallel":true,"steps":[
+                    {"tool":"probe","args":{}},{"tool":"probe","args":{"child":true}}
+                ]}),
+                &context,
+            )
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result.error.unwrap().contains("Step 1"));
+        assert_eq!(effects.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let invalid = pipeline
+            .execute_with_context(
+                serde_json::json!({"parallel":true,"steps":[
+                    {"tool":"probe","args":{"child":true}},{"tool":"missing","args":{}}
+                ]}),
+                &context,
+            )
+            .await
+            .unwrap();
+        assert!(invalid.error.unwrap().contains("Unknown tool"));
+        assert_eq!(effects.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn goal_parallel_child_free_steps_overlap_in_original_task() {
+        let effects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let pipeline = goal_probe_pipeline(effects.clone(), Some(barrier));
+        let context = ToolExecutionContext::default().with_goal_foreground();
+        let result = PIPELINE_TEST_SCOPE
+            .scope(7, async {
+                pipeline
+                    .execute_with_context(
+                        serde_json::json!({"parallel":true,"steps":[
+                            {"tool":"probe","args":{}},{"tool":"probe","args":{}}
+                        ]}),
+                        &context,
+                    )
+                    .await
+                    .unwrap()
+            })
+            .await;
+        assert!(result.success);
+        assert_eq!(effects.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn goal_sequential_child_error_retains_marker_and_stops_tail() {
+        let effects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let pipeline = goal_probe_pipeline(effects.clone(), None);
+        let context = ToolExecutionContext::default().with_goal_foreground();
+        let error = pipeline
+            .execute_with_context(
+                serde_json::json!({"result":"last","steps":[
+                    {"tool":"probe","args":{"child":true,"error":true}},{"tool":"probe","args":{}}
+                ]}),
+                &context,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.is::<GoalChildOperationError>());
+        assert!(format!("{error:#}").contains("original child cause"));
+        assert_eq!(effects.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn goal_parallel_panic_is_safe_step_failure() {
+        let effects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let pipeline = goal_probe_pipeline(effects, None);
+        let result = pipeline
+            .execute_with_context(
+                serde_json::json!({"parallel":true,"steps":[
+                    {"tool":"probe","args":{"panic":true}}
+                ]}),
+                &ToolExecutionContext::default().with_goal_foreground(),
+            )
+            .await
+            .unwrap();
+        let error = result.error.unwrap();
+        assert!(error.contains("Step 0"));
+        assert!(!error.contains("private payload"));
+    }
+
+    struct DrainingChild {
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+    zeroclaw_api::mock_tool_attribution!(DrainingChild);
+    #[async_trait]
+    impl Tool for DrainingChild {
+        fn name(&self) -> &str {
+            "child"
+        }
+        fn description(&self) -> &str {
+            "cooperatively drains on cancellation"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+        fn may_invoke_agent_child(&self, _: &serde_json::Value) -> bool {
+            true
+        }
+        async fn execute(&self, _: serde_json::Value) -> Result<ToolResult> {
+            let context = ToolExecutionContext::current().unwrap();
+            self.entered.notify_one();
+            context.cancellation_token().unwrap().cancelled().await;
+            self.release.notified().await;
+            Err(anyhow::Error::new(ToolExecutionCancelled).context(GoalChildOperationError))
+        }
+        async fn execute_with_context(
+            &self,
+            args: serde_json::Value,
+            context: &ToolExecutionContext,
+        ) -> Result<ToolResult> {
+            context.scope_only(self.execute(args)).await
+        }
+    }
+
+    #[tokio::test]
+    async fn goal_pipeline_awaits_child_cleanup_after_cancellation() {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let pipeline = PipelineTool::new(
+            PipelineConfig {
+                enabled: true,
+                max_steps: 1,
+                allowed_tools: vec!["child".into()],
+            },
+            vec![Arc::new(DrainingChild {
+                entered: entered.clone(),
+                release: release.clone(),
+            })],
+        );
+        let token = tokio_util::sync::CancellationToken::new();
+        let context = ToolExecutionContext::new(Some(token.clone())).with_goal_foreground();
+        let mut call = Box::pin(pipeline.execute_with_context(
+            serde_json::json!({"steps":[{"tool":"child","args":{}}]}),
+            &context,
+        ));
+        tokio::select! {
+            () = entered.notified() => {},
+            result = &mut call => panic!("child returned before cancellation: {result:?}"),
+        }
+        token.cancel();
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(call.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        release.notify_one();
+        let error = call.await.unwrap_err();
+        assert!(error.is::<GoalChildOperationError>());
+        assert!(error.is::<ToolExecutionCancelled>());
+    }
+
+    #[tokio::test]
+    async fn goal_pipeline_pre_cancelled_starts_no_step() {
+        let effects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let pipeline = goal_probe_pipeline(effects.clone(), None);
+        let token = tokio_util::sync::CancellationToken::new();
+        token.cancel();
+        let error = pipeline
+            .execute_with_context(
+                serde_json::json!({"steps":[{"tool":"probe","args":{}}]}),
+                &ToolExecutionContext::new(Some(token)).with_goal_foreground(),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.is::<ToolExecutionCancelled>());
+        assert_eq!(effects.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    struct ContextAwareStep {
+        tokens: Arc<std::sync::Mutex<Vec<tokio_util::sync::CancellationToken>>>,
+    }
+
+    zeroclaw_api::mock_tool_attribution!(ContextAwareStep);
+
+    #[async_trait]
+    impl Tool for ContextAwareStep {
+        fn name(&self) -> &str {
+            "context_step"
+        }
+        fn description(&self) -> &str {
+            "Records a pipeline step's execution context"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+        async fn execute(&self, _args: serde_json::Value) -> Result<ToolResult> {
+            anyhow::bail!("pipeline steps must receive an explicit context")
+        }
+        async fn execute_with_context(
+            &self,
+            _args: serde_json::Value,
+            context: &ToolExecutionContext,
+        ) -> Result<ToolResult> {
+            context
+                .run(async {
+                    let token = ToolExecutionContext::current()
+                        .unwrap()
+                        .cancellation_token()
+                        .unwrap()
+                        .clone();
+                    self.tokens.lock().unwrap().push(token);
+                    Ok(ToolResult::ok("step completed"))
+                })
+                .await
+        }
+    }
+
+    async fn assert_steps_inherit_context(parallel: bool) {
+        let tokens = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let tool = PipelineTool::new(
+            PipelineConfig {
+                enabled: true,
+                max_steps: 2,
+                allowed_tools: vec!["context_step".into()],
+            },
+            vec![Arc::new(ContextAwareStep {
+                tokens: tokens.clone(),
+            })],
+        );
+        let token = tokio_util::sync::CancellationToken::new();
+        let context = ToolExecutionContext::new(Some(token.clone()));
+        let result = tool
+            .execute_with_context(
+                serde_json::json!({
+                    "steps": [
+                        {"tool": "context_step", "args": {}},
+                        {"tool": "context_step", "args": {}}
+                    ],
+                    "parallel": parallel
+                }),
+                &context,
+            )
+            .await
+            .unwrap();
+        assert!(result.success, "{:?}", result.error);
+        assert!(ToolExecutionContext::current().is_none());
+        let tokens = tokens.lock().unwrap();
+        assert_eq!(tokens.len(), 2);
+        assert!(tokens.iter().all(|token| !token.is_cancelled()));
+        token.cancel();
+        assert!(
+            tokens
+                .iter()
+                .all(tokio_util::sync::CancellationToken::is_cancelled)
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_context_pipeline_sequential_steps_inherit_token() {
+        assert_steps_inherit_context(false).await;
+    }
+
+    #[tokio::test]
+    async fn tool_context_pipeline_parallel_steps_inherit_token() {
+        assert_steps_inherit_context(true).await;
+    }
 
     // ── Interpolation ──────────────────────────────────────
 
@@ -866,6 +1419,117 @@ mod tests {
         }
     }
 
+    /// A pipeline allowed to run `memory_store`, captured over `shared` the
+    /// way assembly builds it, sharing `route` with its registry.
+    fn memory_pipeline(
+        shared: &Arc<dyn zeroclaw_memory::Memory>,
+        route: Arc<SessionMemoryRoute>,
+    ) -> PipelineTool {
+        let config = PipelineConfig {
+            enabled: true,
+            max_steps: 20,
+            allowed_tools: vec!["memory_store".to_string()],
+        };
+        let security = Arc::new(zeroclaw_config::policy::SecurityPolicy::default());
+        let tools: Vec<Arc<dyn Tool>> = vec![Arc::new(crate::memory_store::MemoryStoreTool::new(
+            Arc::clone(shared),
+            security,
+        ))];
+        PipelineTool::new(config, tools).with_session_memory(route)
+    }
+
+    fn store_step(key: &str, content: &str) -> serde_json::Value {
+        serde_json::json!({"tool": "memory_store", "args": {"key": key, "content": content}})
+    }
+
+    /// Once the session is pinned, a memory step run by
+    /// the pipeline lands on the owner's private plane, sequentially and in
+    /// parallel, never on the shared plane its captured tool was built over.
+    #[tokio::test]
+    async fn memory_steps_of_a_pinned_session_land_on_the_owners_plane() {
+        use zeroclaw_api::memory_traits::PrincipalScope;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let shared: Arc<dyn zeroclaw_memory::Memory> =
+            Arc::new(zeroclaw_memory::SqliteMemory::new("sqlite", tmp.path()).unwrap());
+        let route = Arc::new(SessionMemoryRoute::default());
+        let alice = PrincipalScope::new("user:alice");
+        let routed: Arc<dyn zeroclaw_memory::Memory> = Arc::new(
+            zeroclaw_memory::PrincipalPlaneMemory::new(Arc::clone(&shared), alice.clone()),
+        );
+        route
+            .pin(
+                routed,
+                Arc::new(zeroclaw_config::policy::SecurityPolicy::default()),
+            )
+            .unwrap();
+        let pipeline = memory_pipeline(&shared, route);
+
+        for (parallel, goal, key) in [
+            (false, false, "seq"),
+            (true, false, "par"),
+            (true, true, "goal-par"),
+        ] {
+            let mut context = ToolExecutionContext::default();
+            if goal {
+                context = context.with_goal_foreground();
+            }
+            let result = pipeline
+                .execute_with_context(
+                    serde_json::json!({
+                        "steps": [store_step(key, "P-MARKER")], "parallel": parallel
+                    }),
+                    &context,
+                )
+                .await
+                .unwrap();
+            assert!(result.success, "{result:?}");
+            assert!(
+                shared.get(key).await.unwrap().is_none(),
+                "a pinned session's pipeline step must not write the shared plane ({key})"
+            );
+            let owned = shared
+                .get_for_principal(&alice, key)
+                .await
+                .unwrap()
+                .unwrap_or_else(|| panic!("the owner's plane holds the {key} step's row"));
+            assert_eq!(owned.content, "P-MARKER");
+        }
+    }
+
+    /// An unowned session never pins the route, and its pipeline keeps the
+    /// shared memory it was built over.
+    #[tokio::test]
+    async fn memory_steps_of_an_unpinned_session_keep_the_shared_plane() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let shared: Arc<dyn zeroclaw_memory::Memory> =
+            Arc::new(zeroclaw_memory::SqliteMemory::new("sqlite", tmp.path()).unwrap());
+        let pipeline = memory_pipeline(&shared, Arc::new(SessionMemoryRoute::default()));
+        let result = pipeline
+            .execute(serde_json::json!({"steps": [store_step("k", "shared-row")]}))
+            .await
+            .unwrap();
+        assert!(result.success, "{result:?}");
+        assert_eq!(
+            shared.get("k").await.unwrap().unwrap().content,
+            "shared-row"
+        );
+
+        let result = pipeline
+            .execute_with_context(
+                serde_json::json!({
+                    "steps": [store_step("goal-par", "shared-row")], "parallel": true
+                }),
+                &ToolExecutionContext::default().with_goal_foreground(),
+            )
+            .await
+            .unwrap();
+        assert!(result.success, "{result:?}");
+        assert_eq!(
+            shared.get("goal-par").await.unwrap().unwrap().content,
+            "shared-row"
+        );
+    }
+
     fn echo_pipeline() -> PipelineTool {
         let config = PipelineConfig {
             enabled: true,
@@ -912,5 +1576,104 @@ mod tests {
         assert!(res.success);
         assert!(res.output.contains("FIRST_BIG_BLOB"));
         assert!(res.output.contains("final answer"));
+    }
+
+    // ── Approval ───────────────────────────────────────────
+
+    struct RecordingTool {
+        name: String,
+        seen: Arc<std::sync::Mutex<Vec<(String, serde_json::Value)>>>,
+    }
+
+    zeroclaw_api::mock_tool_attribution!(RecordingTool);
+
+    #[async_trait::async_trait]
+    impl Tool for RecordingTool {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn description(&self) -> &str {
+            "record"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn execute(&self, args: serde_json::Value) -> Result<ToolResult> {
+            self.seen.lock().unwrap().push((self.name.clone(), args));
+            Ok(ToolResult {
+                success: true,
+                output: "ok".to_string().into(),
+                error: None,
+            })
+        }
+    }
+
+    /// A step is a call the pipeline makes itself, which the runtime never
+    /// approved, so a step's `approved: true` must not reach a tool that
+    /// takes runtime approval. Other tools' arguments pass through unchanged.
+    #[tokio::test]
+    async fn steps_never_carry_approval_to_tools_that_take_runtime_approval() {
+        for (parallel, goal) in [(false, false), (true, false), (true, true)] {
+            let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let names = ["cron_update", "cron_run", "a"];
+            let tools: Vec<Arc<dyn Tool>> = names
+                .iter()
+                .map(|name| {
+                    Arc::new(RecordingTool {
+                        name: (*name).to_string(),
+                        seen: Arc::clone(&seen),
+                    }) as Arc<dyn Tool>
+                })
+                .collect();
+            let config = PipelineConfig {
+                enabled: true,
+                max_steps: 20,
+                allowed_tools: names.iter().map(|name| (*name).to_string()).collect(),
+            };
+            let args = serde_json::json!({
+                "parallel": parallel,
+                "steps": [
+                    {"tool": "cron_update", "args": {
+                        "job_id": "J",
+                        "patch": {"command": "touch pipeline-proof"},
+                        "approved": true
+                    }},
+                    {"tool": "cron_run", "args": {"job_id": "J", "approved": true}},
+                    {"tool": "a", "args": {"approved": true}}
+                ]
+            });
+            let mut context = ToolExecutionContext::default();
+            if goal {
+                context = context.with_goal_foreground();
+            }
+            let res = PipelineTool::new(config, tools)
+                .execute_with_context(args, &context)
+                .await
+                .unwrap();
+            assert!(res.success, "{:?}", res.error);
+
+            let seen = seen.lock().unwrap();
+            let approved = |name: &str| {
+                seen.iter()
+                    .find(|(tool, _)| tool == name)
+                    .map(|(_, args)| args["approved"].clone())
+                    .unwrap_or_else(|| panic!("{name} ran"))
+            };
+            assert_eq!(
+                approved("cron_update"),
+                serde_json::json!(false),
+                "parallel={parallel}, goal={goal}"
+            );
+            assert_eq!(
+                approved("cron_run"),
+                serde_json::json!(false),
+                "parallel={parallel}, goal={goal}"
+            );
+            assert_eq!(
+                approved("a"),
+                serde_json::json!(true),
+                "parallel={parallel}, goal={goal}"
+            );
+        }
     }
 }

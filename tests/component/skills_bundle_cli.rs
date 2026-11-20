@@ -15,7 +15,7 @@ fn skills_install_bundle_then_list_agent_shows_runtime_view() {
     let config_dir = tempfile::tempdir().expect("temp config dir");
     std::fs::write(
         config_dir.path().join("config.toml"),
-        r#"schema_version = 3
+        r#"schema_version = 4
 
 [skill_bundles.smoke]
 
@@ -90,7 +90,7 @@ fn well_known_install_requires_a_selected_skill() {
     let config_dir = tempfile::tempdir().expect("temp config dir");
     std::fs::write(
         config_dir.path().join("config.toml"),
-        "schema_version = 3\n",
+        "schema_version = 4\n",
     )
     .expect("write config");
 
@@ -115,7 +115,7 @@ fn well_known_install_rejects_non_https_and_private_sources() {
     let config_dir = tempfile::tempdir().expect("temp config dir");
     std::fs::write(
         config_dir.path().join("config.toml"),
-        "schema_version = 3\n",
+        "schema_version = 4\n",
     )
     .expect("write config");
 

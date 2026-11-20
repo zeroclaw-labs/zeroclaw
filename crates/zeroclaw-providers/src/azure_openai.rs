@@ -40,6 +40,14 @@ struct Message {
 #[derive(Debug, Deserialize)]
 struct ChatResponse {
     choices: Vec<Choice>,
+    #[serde(default)]
+    usage: Option<serde_json::Value>,
+}
+
+impl crate::dispatch::accounting::ObserveRejectedStringWire for ChatResponse {
+    fn observe_rejected_usage(wire: &serde_json::Value) {
+        crate::dispatch::accounting::observe_raw_string_usage(wire.get("usage"), false);
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -583,10 +591,15 @@ impl ModelProvider for AzureOpenAiModelProvider {
             .await?;
 
         if !response.status().is_success() {
-            return Err(super::api_error("Azure OpenAI", response).await);
+            return Err(
+                super::string_wire_api_error::<ChatResponse>("Azure OpenAI", response).await,
+            );
         }
 
-        let chat_response: ChatResponse = response.json().await?;
+        let crate::dispatch::accounting::StringWireResponse(chat_response) = response
+            .json::<crate::dispatch::accounting::StringWireResponse<ChatResponse>>()
+            .await?;
+        crate::dispatch::accounting::observe_raw_string_usage(chat_response.usage.as_ref(), false);
 
         chat_response
             .choices
@@ -863,6 +876,189 @@ mod tests {
             None,
             "ineligible router models still omit reasoning_effort"
         );
+    }
+
+    #[tokio::test]
+    async fn goal_azure_string_malformed_usage_keeps_text_and_valid_sibling() {
+        use axum::{Json, Router, routing::post};
+        use std::sync::Arc;
+        let app = Router::new().route(
+            "/chat/completions",
+            post(|| async {
+                Json(serde_json::json!({"choices":[{"message":{"content":"ok"}}],
+                "usage":{"prompt_tokens":8,"completion_tokens":-1}}))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let mut provider = AzureOpenAiModelProvider::builder("test")
+            .resource_name("resource")
+            .deployment_name("deployment")
+            .credential(Some("key"))
+            .build();
+        provider.base_url = format!("http://{addr}");
+        let dispatch = crate::dispatch::ProviderDispatch::new(Arc::new(provider));
+        let scope = crate::dispatch::AccountedChatScope::new_with_string_usage();
+        assert_eq!(
+            scope
+                .scope(dispatch.chat_with_system(None, "hello", "model", None))
+                .await
+                .unwrap(),
+            "ok"
+        );
+        let report = scope.take();
+        server.abort();
+        assert!(
+            matches!(report.attempts()[0].outcome(), crate::dispatch::AttemptUsageOutcome::Invalid {
+            reason: crate::dispatch::InvalidUsageReason::MalformedUsage, observed
+        } if observed.input_tokens == Some(8) && observed.output_tokens.is_none())
+        );
+    }
+
+    #[tokio::test]
+    async fn goal_azure_string_null_usage_matches_optional_fields() {
+        use axum::{Json, Router, routing::post};
+        use std::{
+            collections::VecDeque,
+            sync::{Arc, Mutex},
+        };
+
+        let _proxy_guard = crate::RuntimeProxyTestGuard::acquire().await;
+        let cases = VecDeque::from(vec![
+            serde_json::json!({"prompt_tokens":8,"completion_tokens":3,"prompt_tokens_details":null}),
+            serde_json::json!({"prompt_tokens":8,"completion_tokens":3,"prompt_tokens_details":{"cached_tokens":null}}),
+            serde_json::json!({"prompt_tokens":null,"completion_tokens":3}),
+            serde_json::json!({"prompt_tokens":null,"completion_tokens":null}),
+            serde_json::json!({"prompt_tokens":8,"completion_tokens":null}),
+            serde_json::json!({"prompt_tokens":0,"completion_tokens":0}),
+            serde_json::json!({}),
+        ]);
+        let cases = Arc::new(Mutex::new(cases));
+        let app = Router::new().route(
+            "/chat/completions",
+            post(move || {
+                let cases = Arc::clone(&cases);
+                async move {
+                    let usage = cases.lock().unwrap().pop_front().unwrap();
+                    Json(
+                        serde_json::json!({"choices":[{"message":{"content":"ok"}}],"usage":usage}),
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let _server = scopeguard::guard(server, |server| server.abort());
+        let mut provider = AzureOpenAiModelProvider::builder("test")
+            .resource_name("resource")
+            .deployment_name("deployment")
+            .credential(Some("key"))
+            .build();
+        provider.base_url = format!("http://{addr}");
+        let dispatch = crate::dispatch::ProviderDispatch::new(Arc::new(provider));
+        for case in 0..7 {
+            let scope = crate::dispatch::AccountedChatScope::new_with_string_usage();
+            assert_eq!(
+                scope
+                    .scope(dispatch.chat_with_system(None, "hello", "model", None))
+                    .await
+                    .unwrap(),
+                "ok"
+            );
+            let report = scope.take();
+            assert_eq!(report.attempts().len(), 1);
+            let outcome = report.attempts()[0].outcome();
+            assert!(
+                match case {
+                    0 | 1 =>
+                        matches!(outcome, crate::dispatch::AttemptUsageOutcome::Complete(usage)
+                    if usage.input_tokens == Some(8) && usage.output_tokens == Some(3)
+                        && usage.cached_input_tokens.is_none()),
+                    2 => matches!(outcome, crate::dispatch::AttemptUsageOutcome::Invalid {
+                    reason: crate::dispatch::InvalidUsageReason::MissingInput, observed
+                } if observed.output_tokens == Some(3)),
+                    3 | 6 => matches!(outcome, crate::dispatch::AttemptUsageOutcome::Missing),
+                    4 => matches!(outcome, crate::dispatch::AttemptUsageOutcome::Invalid {
+                    reason: crate::dispatch::InvalidUsageReason::MissingOutput, observed
+                } if observed.input_tokens == Some(8)),
+                    5 => matches!(outcome, crate::dispatch::AttemptUsageOutcome::Complete(usage)
+                    if usage.input_tokens == Some(0) && usage.output_tokens == Some(0)),
+                    _ => false,
+                },
+                "case {case}: {outcome:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn goal_string_usage_preserves_azure_request_and_text() {
+        use axum::{Json, Router, routing::post};
+        use std::sync::{Arc, Mutex};
+        let captured = Arc::new(Mutex::new(None));
+        let capture = Arc::clone(&captured);
+        let app = Router::new().route("/chat/completions", post(move |Json(body): Json<serde_json::Value>| {
+            let capture = Arc::clone(&capture);
+            async move {
+                let choices = if body["messages"][1]["content"] == "malformed" {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::json!([{"message":{"content":"ok"}}])
+                };
+                *capture.lock().unwrap() = Some(body);
+                Json(serde_json::json!({"choices":choices,"usage":{"prompt_tokens":8,"completion_tokens":3}}))
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let mut provider = AzureOpenAiModelProvider::builder("test")
+            .resource_name("resource")
+            .deployment_name("deployment")
+            .credential(Some("key"))
+            .reasoning_effort(Some("high".to_string()))
+            .build();
+        provider.base_url = format!("http://{addr}");
+        let dispatch = crate::dispatch::ProviderDispatch::new(Arc::new(provider));
+        let scope = crate::dispatch::AccountedChatScope::new_with_string_usage();
+        let text = scope
+            .scope(dispatch.chat_with_system(Some("system"), "hello", "gpt-5", None))
+            .await
+            .unwrap();
+        let report = scope.take();
+        assert_eq!(text, "ok");
+        assert!(
+            matches!(report.attempts()[0].outcome(), crate::dispatch::AttemptUsageOutcome::Complete(usage)
+            if usage.input_tokens == Some(8) && usage.output_tokens == Some(3))
+        );
+        let body = captured.lock().unwrap().take().unwrap();
+        assert_eq!(body["messages"][0]["content"], "system");
+        assert_eq!(body["messages"][1]["content"], "hello");
+        assert_eq!(body["reasoning_effort"], "high");
+        assert!(body.get("temperature").is_none());
+
+        let scope = crate::dispatch::AccountedChatScope::new_with_string_usage();
+        assert!(
+            scope
+                .scope(dispatch.chat_with_system(Some("system"), "malformed", "gpt-5", None))
+                .await
+                .is_err()
+        );
+        let report = scope.take();
+        assert!(report.accepted_route().is_none());
+        assert!(matches!(
+            report.attempts()[0].outcome(),
+            crate::dispatch::AttemptUsageOutcome::OutcomeUnknown { observed: Some(usage) }
+                if usage.input_tokens == Some(8) && usage.output_tokens == Some(3)
+        ));
+        server.abort();
     }
 
     #[tokio::test]

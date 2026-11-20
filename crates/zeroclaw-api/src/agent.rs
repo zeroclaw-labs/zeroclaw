@@ -62,6 +62,7 @@ impl ToolArtifact {
 /// provider-reported figure).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub enum TokenCountSource {
     /// Count comes from provider-reported usage.
     Provider,
@@ -81,6 +82,15 @@ impl TokenCountSource {
             TokenCountSource::Calibrated => "calibrated",
         }
     }
+}
+
+/// The cost-limit period a [`TurnEvent::BudgetWarning`] refers to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub enum BudgetWarningPeriod {
+    Day,
+    Month,
 }
 
 #[non_exhaustive]
@@ -157,18 +167,31 @@ pub enum TurnEvent {
         /// ignore this field; it is never serialized as a turn event.
         retained_context: Option<RetainedContextSnapshot>,
     },
-    /// Per-LLM-call token usage and cost; a turn may emit several, one per
-    /// model call. `None` means "unavailable for this call", not zero.
-    /// The `provider_ref` and `model` identify the provider and model used
-    /// for cost attribution and context window resolution.
+    /// Recorded spend has reached `cost.warn_at_percent` of a shared daily or
+    /// monthly limit. Non-blocking: the turn continues. Emitted at most once
+    /// per turn, before the first provider call that sees the warning.
+    BudgetWarning {
+        /// Spend recorded in `period` before this turn's next call.
+        current_usd: f64,
+        /// Configured limit for `period`.
+        limit_usd: f64,
+        /// Which limit is near.
+        period: BudgetWarningPeriod,
+    },
+    /// Per-attempt token usage and cost. A turn may emit several events for a
+    /// call when the provider reports server-side fallback attempts. `None`
+    /// means "unavailable for this attempt", not zero.
+    /// The `provider_ref` and `model` identify the attempt for cost
+    /// attribution; context limits remain those of the dispatched route.
     ///
     /// For vision routing and reliable fallback, these carry the actual served
     /// provider and model. For dynamic routing models (e.g. `openrouter/auto`)
     /// where the provider selects the concrete model and the `ModelProvider`
     /// trait cannot expose the response-reported model, `model` carries the
     /// requested routing model (e.g. `openrouter/auto`) rather than the
-    /// upstream-selected concrete model. This is a known limitation of the
-    /// current provider trait.
+    /// upstream-selected concrete model. An unidentified attempt can instead
+    /// use the display label `(unattributed)`, which is not proof of identity:
+    /// a real model could have the same name.
     Usage {
         input_tokens: Option<u64>,
         /// Tokens served from the provider's prompt cache (e.g. Anthropic
@@ -177,10 +200,11 @@ pub enum TurnEvent {
         cached_input_tokens: Option<u64>,
         output_tokens: Option<u64>,
         cost_usd: Option<f64>,
-        /// Proactive trim threshold resolved for the provider/model route that
-        /// produced this usage sample. Zero means proactive trimming is disabled.
+        /// Proactive trim threshold resolved for the dispatched route. It may
+        /// differ from the reported serving model's limit after server-side
+        /// fallback. Zero means proactive trimming is disabled.
         context_token_budget: Option<u64>,
-        /// Configured full context capacity for that same provider/model route.
+        /// Configured full context capacity for that same dispatched route.
         /// `None` means the runtime used the compatibility fallback because no
         /// authoritative capacity was configured.
         model_context_window: Option<u64>,
@@ -188,15 +212,45 @@ pub enum TurnEvent {
         /// this call. Used for accurate context window resolution and cost
         /// attribution when vision routing or provider switches are active.
         provider_ref: String,
-        /// The model that actually served this call. When vision routing or
-        /// a reliable fallback selects a different model, this carries the
-        /// served model — not the turn-start model.
+        /// The model attributed to this attempt. It may be `(unattributed)`
+        /// when the provider did not establish one. Vision or reliable
+        /// fallback may select a model different from the turn-start model.
         model: String,
         /// Whether this usage event corresponds to the semantically accepted
-        /// response (`true`) or a rejected physical attempt (`false`). Rejected
+        /// response (`true`) or a rejected attempt (`false`). Rejected
         /// attempts are billing-only telemetry; they do not update the accepted
         /// context snapshot (ACP session token count, context-meter ceiling).
         accepted: bool,
+        /// Locally estimated prompt size, published **only** when the provider
+        /// omitted `input_tokens`. Local OpenAI-compatible servers (llama.cpp
+        /// and similar) routinely omit `usage`, which leaves a context meter
+        /// with a budget but no numerator.
+        ///
+        /// This is **not** measured usage and carries a different contract
+        /// from every other field on this event:
+        ///
+        /// - It must never be billed, summed into provider usage totals, or
+        ///   persisted as a provider token count.
+        ///   Accounting and persistence consumers read `input_tokens`, which
+        ///   stays `None` exactly when the provider reported nothing.
+        /// - A consumer rendering a context meter may use it as a display
+        ///   numerator, and must label it as an estimate
+        ///   (`TokenCountSource::Estimated`) rather than provider-reported.
+        /// - It is an approximation in both directions, not a bound. The
+        ///   history heuristic does not price separately supplied native tool
+        ///   schemas, so a tool-heavy request reads low; its byte-count and
+        ///   fixed-per-image costs can also read high against a provider's
+        ///   real tokenizer. That is acceptable for a labelled display value
+        ///   and is not acceptable for accounting — another reason it is kept
+        ///   off `input_tokens`.
+        /// - When the provider reported `cached_input_tokens` without a total,
+        ///   that subset is a known minimum for the prompt and the estimate is
+        ///   floored at it, so the meter cannot read near-zero for a prompt
+        ///   already known to be large.
+        ///
+        /// `None` means either the provider reported a real count (use
+        /// `input_tokens`) or no estimate could be formed.
+        estimated_input_tokens: Option<u64>,
     },
 }
 

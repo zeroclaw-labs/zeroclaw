@@ -146,8 +146,9 @@ The listener binds `127.0.0.1` only, one random port, single request lifetime.
 4. **Browser token delivery: delegated.** Resolution chosen here: the gateway
    callback renders a one-time, self-contained page that hands the token to
    `window.opener` via `postMessage` with the gateway's own origin as the
-   target, plus a manual copy fallback on the same page. No cookies and no new
-   session model: the dashboard keeps authenticating per request with the
+   target, plus a manual copy fallback on the same page. A short-lived
+   per-flow cookie now binds the callback to the initiating browser (#12050);
+   it grants no API access and introduces no authenticated session model: the dashboard keeps authenticating per request with the
    `Authorization` header and `X-ZeroClaw-Auth-Provider`, exactly the
    route-layer contract already reviewed. This is the most reversible choice
    (a later cookie-session design deprecates one page, not an auth model).
@@ -247,4 +248,10 @@ One caveat on decision 4's handoff. The gateway's
 the popup has navigated through the IdP, so the `postMessage` leg does not
 reach an opener in current browsers: the manual copy on the callback page is
 the handoff that works today, and the `postMessage` contract stays in place
-for the dashboard follow-up that will own the sign-in surface.
+for clients that open the relay themselves.
+
+The dashboard no longer needs that handoff. Its opt-in sign-in
+(`[gateway.dashboard_sign_in]`, documented under "Dashboard sign-in" in
+`docs/book/src/security/authentication.md`) reuses this flow store, these
+limits and this callback, but ends the flow in a gateway-held session
+behind an `HttpOnly` cookie, so the token never reaches the browser.

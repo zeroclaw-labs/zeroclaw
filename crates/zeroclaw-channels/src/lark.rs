@@ -4073,9 +4073,21 @@ struct ParsedPostContent {
 
 fn parse_post_content_details(content: &str) -> Option<ParsedPostContent> {
     let parsed = serde_json::from_str::<serde_json::Value>(content).ok()?;
+
+    // Outbound post payloads wrap the body in a locale key
+    // (`{"zh_cn":{"title":…,"content":[…]}}`); inbound events and the message
+    // history API deliver the same body flat (`{"title":…,"content":[…]}`),
+    // which is what a formatted list typed in the Feishu client looks like.
+    // Accept both shapes.
     let locale = parsed
         .get("zh_cn")
         .or_else(|| parsed.get("en_us"))
+        .or_else(|| {
+            parsed
+                .as_object()
+                .filter(|body| body.contains_key("content") || body.contains_key("content_v2"))
+                .map(|_| &parsed)
+        })
         .or_else(|| {
             parsed
                 .as_object()
@@ -4094,7 +4106,11 @@ fn parse_post_content_details(content: &str) -> Option<ParsedPostContent> {
         text.push_str("\n\n");
     }
 
-    if let Some(paragraphs) = locale.get("content").and_then(|c| c.as_array()) {
+    if let Some(paragraphs) = locale
+        .get("content")
+        .or_else(|| locale.get("content_v2"))
+        .and_then(|c| c.as_array())
+    {
         for para in paragraphs {
             if let Some(elements) = para.as_array() {
                 for el in elements {
@@ -5599,6 +5615,63 @@ mod tests {
         let msgs = ch.parse_event_payload(&payload).await;
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].content, "* 1\n* 2");
+    }
+
+    /// Feishu delivers inbound rich-text (`post`) content in the flat
+    /// `{"title":…,"content":[…]}` shape, while *sending* a post wraps the body
+    /// in a locale key (`{"zh_cn":{…}}`). Formatted lists typed in the client
+    /// arrive as this flat shape (the bullet marker is plain text inside the
+    /// first element), so a parser that only understands the locale-wrapped
+    /// shape drops the message without replying.
+    #[tokio::test]
+    async fn lark_parse_post_message_accepts_flat_inbound_content() {
+        let ch = make_channel();
+        let payload = serde_json::json!({
+            "header": { "event_type": "im.message.receive_v1" },
+            "event": {
+                "sender": { "sender_id": { "open_id": "ou_testuser123" } },
+                "message": {
+                    "message_type": "post",
+                    "chat_type": "p2p",
+                    "chat_id": "oc_chat",
+                    "mentions": [],
+                    "content": "{\"title\":\"\",\"content\":[[{\"tag\":\"text\",\"text\":\"- \",\"style\":[]},{\"tag\":\"text\",\"text\":\"你好\",\"style\":[]}]],\"content_v2\":[[{\"tag\":\"text\",\"text\":\"- \",\"style\":[]},{\"tag\":\"text\",\"text\":\"你好\",\"style\":[]}]]}"
+                }
+            }
+        });
+
+        let msgs = ch.parse_event_payload(&payload).await;
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].content, "- 你好");
+    }
+
+    /// A flat inbound post that carries only the `content_v2` alias must still
+    /// become message text.
+    ///
+    /// The captured payload above ships `content` and `content_v2` with the
+    /// same array, so it exercises neither the alias key in the flat-shape
+    /// check nor the `content_v2` fallback: removing both would leave it
+    /// passing. This payload carries the alias alone.
+    #[tokio::test]
+    async fn lark_parse_post_message_accepts_flat_content_v2_alias() {
+        let ch = make_channel();
+        let payload = serde_json::json!({
+            "header": { "event_type": "im.message.receive_v1" },
+            "event": {
+                "sender": { "sender_id": { "open_id": "ou_testuser123" } },
+                "message": {
+                    "message_type": "post",
+                    "chat_type": "p2p",
+                    "chat_id": "oc_chat",
+                    "mentions": [],
+                    "content": "{\"title\":\"\",\"content_v2\":[[{\"tag\":\"text\",\"text\":\"- \",\"style\":[]},{\"tag\":\"text\",\"text\":\"你好\",\"style\":[]}]]}"
+                }
+            }
+        });
+
+        let msgs = ch.parse_event_payload(&payload).await;
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].content, "- 你好");
     }
 
     #[tokio::test]

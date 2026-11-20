@@ -32,7 +32,7 @@ infer = { version = "0.19", default-features = false }
 fantoccini = { version = "0.22.1", optional = true, default-features = false, features = ["rustls-tls"] }
 nanohtml2text = "0.2"
 parking_lot = "0.12"
-probe-rs = { version = "0.31", optional = true }
+probe-rs = { version = "0.32", optional = true }
 regex = "1.10"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots-no-provider", "__rustls-ring", "multipart", "stream"] }
 # Response-body decompression is done in `http_decode` for `web_fetch` and
@@ -73,8 +73,25 @@ libc = "0.2"
 
 [features]
 default = []
-browser-native = ["dep:fantoccini"]
+browser-native = ["tools-external", "dep:fantoccini"]
+tools-external = ["zeroclaw-config/tools-external"]
 probe = ["dep:probe-rs"]
+# SaaS and coding-CLI integrations. Each is opt-in; the root crate forwards
+# one `tool-*` feature per integration and bundles them as `tools-saas` and
+# `tools-coding-cli`. Each also tells zeroclaw-config the tool is compiled
+# in, so config validation and diagnostics follow the build.
+tool-jira = ["zeroclaw-config/tool-jira"]
+tool-notion = ["zeroclaw-config/tool-notion"]
+tool-linkedin = ["zeroclaw-config/tool-linkedin"]
+tool-composio = ["zeroclaw-config/tool-composio"]
+tool-google-workspace = ["zeroclaw-config/tool-google-workspace"]
+tool-microsoft365 = ["zeroclaw-config/tool-microsoft365"]
+tool-project-intel = ["zeroclaw-config/tool-project-intel"]
+tool-claude-code = ["zeroclaw-config/tool-claude-code"]
+tool-claude-code-runner = ["zeroclaw-config/tool-claude-code-runner"]
+tool-codex-cli = ["zeroclaw-config/tool-codex-cli"]
+tool-gemini-cli = ["zeroclaw-config/tool-gemini-cli"]
+tool-opencode-cli = ["zeroclaw-config/tool-opencode-cli"]
 # Exposes cross-crate test-only constructors (e.g.
 # `McpRegistry::for_test_with_server_count`) so downstream test
 # suites can build registry fixtures without spawning real stdio

@@ -1,8 +1,10 @@
 //! SQLite-backed [`GoalTaskRegistry`] implementation.
 
+use std::collections::HashSet;
+
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
-use std::collections::HashSet;
+use zeroclaw_goal::task::GoalDispatchStart;
 
 use crate::control_plane::authority::is_authoritative;
 use crate::control_plane::goal_task::{
@@ -995,8 +997,7 @@ impl GoalTaskRegistry for SqliteTaskStore {
         let mut stmt = conn
             .prepare_cached(
                 "SELECT * FROM tasks
-                  WHERE kind = 'goal' AND session_id IS NOT NULL AND TRIM(session_id) != ''
-                    AND status IN ('running', 'paused')
+                  WHERE kind = 'goal' AND status IN ('running', 'paused')
                   ORDER BY rowid ASC",
             )
             .context("prepare nonterminal session goal policy query")?;
@@ -1017,20 +1018,24 @@ impl GoalTaskRegistry for SqliteTaskStore {
 
         let mut unique = HashSet::with_capacity(targets.len());
         for target in targets {
+            target.validate()?;
             anyhow::ensure!(
-                !target.task_id.trim().is_empty()
-                    && !target.session_id.trim().is_empty()
-                    && target.execution_epoch > 0,
-                "policy cancellation target must have nonblank task/session identities and a positive epoch"
+                unique.insert(target.task_id.as_str()),
+                "policy cancellation target task id is duplicated"
             );
-            anyhow::ensure!(
-                unique.insert((
-                    target.task_id.as_str(),
-                    target.session_id.as_str(),
-                    target.execution_epoch,
-                )),
-                "policy cancellation target is duplicated"
-            );
+        }
+
+        // Use the same boundary as pause/finish. Take each session gate once,
+        // in a shared order for overlapping batches, before taking SQLite.
+        let mut sessions: Vec<_> = targets
+            .iter()
+            .map(|target| target.session_id.as_str())
+            .collect();
+        sessions.sort_unstable();
+        sessions.dedup();
+        let mut dispatch_gates = Vec::with_capacity(sessions.len());
+        for session_id in sessions {
+            dispatch_gates.push(self.goal_dispatch_gates.gate(session_id).lock_owned().await);
         }
 
         let mut conn = self.conn.lock();
@@ -1039,21 +1044,23 @@ impl GoalTaskRegistry for SqliteTaskStore {
             .context("start atomic goal policy revocation")?;
         let finished_at = chrono::Utc::now().to_rfc3339();
         for target in targets {
-            let updated = tx.execute(
-                "UPDATE tasks
+            let updated = tx
+                .execute(
+                    "UPDATE tasks
                     SET status = 'cancelled', error = 'policy_revoked',
                         finished_at = COALESCE(finished_at, ?4),
                         execution_epoch = CASE WHEN execution_epoch < 9223372036854775807
                             THEN execution_epoch + 1 ELSE execution_epoch END
                   WHERE id = ?1 AND kind = 'goal' AND session_id = ?2
                     AND status IN ('running', 'paused') AND execution_epoch = ?3",
-                params![
-                    &target.task_id,
-                    &target.session_id,
-                    target.execution_epoch,
-                    &finished_at,
-                ],
-            )?;
+                    params![
+                        &target.task_id,
+                        &target.session_id,
+                        target.execution_epoch,
+                        &finished_at,
+                    ],
+                )
+                .context("apply exact goal policy revocation")?;
             if updated == 0 {
                 return transition_failure(&tx, &target.task_id);
             }
@@ -1164,6 +1171,30 @@ impl GoalTaskRegistry for SqliteTaskStore {
         Ok(GoalTransitionResult::Applied)
     }
 
+    async fn begin_operation_dispatch(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        expected_epoch: i64,
+        pending_call_id: &str,
+    ) -> Result<Option<GoalDispatchStart>> {
+        let gate = self.goal_dispatch_gates.gate(session_id).lock_owned().await;
+        let conn = self.conn.lock();
+        let found = conn
+            .query_row(
+                "SELECT 1 FROM tasks t JOIN goal_tasks g ON g.task_id = t.id
+                  WHERE t.id = ?1 AND t.kind = 'goal' AND t.session_id = ?2
+                    AND t.status = 'running' AND t.execution_epoch = ?3
+                    AND g.pending_call_id = ?4 AND g.pending_call_epoch = ?3",
+                params![task_id, session_id, expected_epoch, pending_call_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .context("check Goal operation dispatch fence")?
+            .is_some();
+        Ok(found.then(|| GoalDispatchStart::new(gate)))
+    }
+
     async fn pause_session_goal(
         &self,
         task_id: &str,
@@ -1173,6 +1204,7 @@ impl GoalTaskRegistry for SqliteTaskStore {
     ) -> Result<GoalTransitionResult> {
         let reason = pause_reason_to_db(pause.reason)?;
         let blockers = blockers_to_db(&pause.blockers)?;
+        let dispatch_gate = self.goal_dispatch_gates.gate(session_id).lock_owned().await;
         let mut conn = self.conn.lock();
         let tx = conn.transaction().context("start guarded goal pause")?;
         let updated = tx.execute(
@@ -1197,6 +1229,8 @@ impl GoalTaskRegistry for SqliteTaskStore {
             params![reason, pause.description, blockers, task_id],
         )?;
         tx.commit().context("commit guarded goal pause")?;
+        drop(conn);
+        drop(dispatch_gate);
         Ok(GoalTransitionResult::Applied)
     }
 
@@ -1254,6 +1288,7 @@ impl GoalTaskRegistry for SqliteTaskStore {
         if !status.is_terminal() {
             anyhow::bail!("guarded goal finish requires a terminal task status");
         }
+        let dispatch_gate = self.goal_dispatch_gates.gate(session_id).lock_owned().await;
         let mut conn = self.conn.lock();
         let tx = conn.transaction().context("start guarded goal finish")?;
         let updated = tx.execute(
@@ -1276,6 +1311,8 @@ impl GoalTaskRegistry for SqliteTaskStore {
             return transition_failure(&tx, task_id);
         }
         tx.commit().context("commit guarded goal finish")?;
+        drop(conn);
+        drop(dispatch_gate);
         Ok(GoalTransitionResult::Applied)
     }
 
@@ -2172,6 +2209,427 @@ mod tests {
         assert!(
             store.list_nonterminal_session_goals().await.is_err(),
             "a policy cutover must stop rather than silently leave an unreadable Goal active"
+        );
+    }
+
+    fn policy_target(task_id: &str, session_id: &str, execution_epoch: i64) -> GoalPolicyTarget {
+        GoalPolicyTarget {
+            task_id: task_id.to_owned(),
+            session_id: session_id.to_owned(),
+            execution_epoch,
+        }
+    }
+
+    async fn create_policy_goal(store: &SqliteTaskStore, task_id: &str, session_id: &str) {
+        let mut task = rec(task_id, "main", 1, "boot-policy");
+        task.kind = TaskKind::Goal;
+        task.session_id = Some(session_id.to_owned());
+        assert_eq!(
+            store
+                .create_or_replace_session_goal(task, goal_record(task_id, "preserve this goal"))
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+    }
+
+    #[tokio::test]
+    async fn policy_revocation_rolls_back_second_sql_update_and_reopens_unchanged() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SqliteTaskStore::new(directory.path()).unwrap();
+        create_policy_goal(&store, "policy-rollback-a", "policy-rollback-session-a").await;
+        create_policy_goal(&store, "policy-rollback-b", "policy-rollback-session-b").await;
+        {
+            let conn = store.conn.lock();
+            conn.execute_batch(
+                "CREATE TRIGGER fail_second_policy_revocation
+                 BEFORE UPDATE OF status ON tasks
+                 WHEN OLD.id = 'policy-rollback-b'
+                 BEGIN SELECT RAISE(ABORT, 'injected second policy update failure'); END;",
+            )
+            .unwrap();
+        }
+
+        let error = store
+            .cancel_policy_targets(&[
+                policy_target("policy-rollback-a", "policy-rollback-session-a", 1),
+                policy_target("policy-rollback-b", "policy-rollback-session-b", 1),
+            ])
+            .await
+            .expect_err("second update trigger must fail the batch");
+        assert!(format!("{error:#}").contains("injected second policy update failure"));
+        drop(store);
+
+        let reopened = SqliteTaskStore::new(directory.path()).unwrap();
+        for task_id in ["policy-rollback-a", "policy-rollback-b"] {
+            let row = reopened.get(task_id).await.unwrap().unwrap();
+            assert_eq!(row.status, TaskStatus::Running);
+            assert_eq!(row.execution_epoch, 1);
+            assert_eq!(row.finished_at, None);
+        }
+    }
+
+    #[tokio::test]
+    async fn policy_revocation_validates_whole_batch_and_cancels_exact_rows() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SqliteTaskStore::new(directory.path()).unwrap();
+        create_policy_goal(&store, "policy-exact-a", "policy-exact-session-a").await;
+        create_policy_goal(&store, "policy-exact-b", "policy-exact-session-b").await;
+        let ordinary = rec("policy-exact-ordinary", "main", 1, "boot-policy");
+        store.create(ordinary).await.unwrap();
+        create_policy_goal(&store, "policy-exact-unselected", "policy-exact-session-c").await;
+
+        let invalid_batches = [
+            vec![
+                policy_target("policy-exact-a", "policy-exact-session-a", 1),
+                policy_target("policy-exact-a", "other-session", 2),
+            ],
+            vec![policy_target(
+                "policy-exact-a",
+                " policy-exact-session-a",
+                1,
+            )],
+            vec![policy_target("policy-exact-a", "policy-exact-session-a", 0)],
+        ];
+        for targets in invalid_batches {
+            assert!(store.cancel_policy_targets(&targets).await.is_err());
+            for task_id in ["policy-exact-a", "policy-exact-b"] {
+                let row = store.get(task_id).await.unwrap().unwrap();
+                assert_eq!(row.status, TaskStatus::Running);
+                assert_eq!(row.execution_epoch, 1);
+            }
+        }
+        assert_eq!(
+            store
+                .cancel_policy_targets(&[policy_target(
+                    "policy-exact-missing",
+                    "missing-session",
+                    1
+                )])
+                .await
+                .unwrap(),
+            GoalTransitionResult::Missing
+        );
+        assert_eq!(
+            store
+                .cancel_policy_targets(&[
+                    policy_target("policy-exact-a", "policy-exact-session-a", 1),
+                    policy_target("policy-exact-missing", "missing-session", 1),
+                ])
+                .await
+                .unwrap(),
+            GoalTransitionResult::Missing
+        );
+        for task_id in ["policy-exact-a", "policy-exact-b"] {
+            let row = store.get(task_id).await.unwrap().unwrap();
+            assert_eq!(row.status, TaskStatus::Running);
+            assert_eq!(row.execution_epoch, 1);
+        }
+        assert_eq!(
+            store
+                .cancel_policy_targets(&[policy_target("policy-exact-a", "wrong-session", 1)])
+                .await
+                .unwrap(),
+            GoalTransitionResult::Stale
+        );
+        for task_id in ["policy-exact-a", "policy-exact-b"] {
+            let row = store.get(task_id).await.unwrap().unwrap();
+            assert_eq!(row.status, TaskStatus::Running);
+            assert_eq!(row.execution_epoch, 1);
+        }
+        assert_eq!(
+            store
+                .cancel_policy_targets(&[
+                    policy_target("policy-exact-a", "policy-exact-session-a", 1),
+                    policy_target("policy-exact-b", "policy-exact-session-b", 1),
+                ])
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+        drop(store);
+
+        let reopened = SqliteTaskStore::new(directory.path()).unwrap();
+        for task_id in ["policy-exact-a", "policy-exact-b"] {
+            let row = reopened.get(task_id).await.unwrap().unwrap();
+            assert_eq!(row.status, TaskStatus::Cancelled);
+            assert_eq!(
+                reopened
+                    .terminal_reason_for_session_goal(task_id, row.session_id.as_deref().unwrap())
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some("policy_revoked")
+            );
+            assert_eq!(row.execution_epoch, 2);
+            assert!(row.finished_at.is_some());
+        }
+        for task_id in ["policy-exact-unselected", "policy-exact-ordinary"] {
+            assert_eq!(
+                reopened.get(task_id).await.unwrap().unwrap().status,
+                TaskStatus::Running
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn policy_revocation_serializes_with_dispatch_without_partial_batch() {
+        use std::future::{Future, poll_fn};
+        use std::task::Poll;
+
+        let directory = tempfile::tempdir().unwrap();
+        let store = SqliteTaskStore::new(directory.path()).unwrap();
+        let operations = [
+            ("policy-a", "session-a", "op-a"),
+            ("policy-z", "session-z", "op-z"),
+        ];
+        for (task, session, operation) in operations {
+            create_policy_goal(&store, task, session).await;
+            assert_eq!(
+                store
+                    .admit_pending_operation(task, session, 1, operation)
+                    .await
+                    .unwrap(),
+                GoalTransitionResult::Applied
+            );
+        }
+
+        let dispatch_start = store
+            .begin_operation_dispatch("policy-z", "session-z", 1, "op-z")
+            .await
+            .unwrap()
+            .unwrap();
+        let targets = [
+            policy_target("policy-a", "session-a", 1),
+            policy_target("policy-z", "session-z", 1),
+        ];
+        let mut revoke = std::pin::pin!(store.cancel_policy_targets(&targets));
+        let first_poll = poll_fn(|cx| Poll::Ready(revoke.as_mut().poll(cx))).await;
+        assert!(first_poll.is_pending());
+        for task in ["policy-a", "policy-z"] {
+            assert_eq!(
+                store.get(task).await.unwrap().unwrap().status,
+                TaskStatus::Running
+            );
+        }
+
+        // Dispatch has crossed its entry boundary; completion can settle
+        // after the batch commits, without keeping either session gate.
+        drop(dispatch_start);
+        assert_eq!(revoke.await.unwrap(), GoalTransitionResult::Applied);
+        for (task, session, operation) in operations {
+            let row = store.get(task).await.unwrap().unwrap();
+            assert_eq!(row.status, TaskStatus::Cancelled);
+            assert_eq!(row.execution_epoch, 2);
+            assert!(
+                store
+                    .begin_operation_dispatch(task, session, 1, operation)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        assert_eq!(
+            store
+                .settle_pending_operation(
+                    "policy-z",
+                    "session-z",
+                    1,
+                    "op-z",
+                    GoalAccountingState::Complete
+                )
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+    }
+
+    #[tokio::test]
+    async fn policy_revocation_preserves_pending_operation_and_settles_its_marker() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SqliteTaskStore::new(directory.path()).unwrap();
+        create_policy_goal(&store, "policy-retain", "policy-retain-session").await;
+        assert_eq!(
+            store
+                .admit_pending_operation("policy-retain", "policy-retain-session", 1, "op-1")
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+        {
+            let conn = store.conn.lock();
+            conn.execute(
+                "UPDATE goal_tasks SET blockers_json = ?2 WHERE task_id = ?1",
+                params![
+                    "policy-retain",
+                    r#"[{"kind":"needs_user_input","message":"opaque","payload":{"token":"keep"}}]"#
+                ],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO goal_control_intents
+                    (intent_id, session_id, task_id, expected_epoch, predecessor_task_id,
+                     kind, owner_pid, owner_boot_id, created_at, state, outcome_reason)
+                 VALUES ('audit-policy-retain', 'policy-retain-session', 'policy-retain',
+                         1, NULL, 'pause', 1, 'boot-policy', 'now', 'pending', NULL)",
+                [],
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            store
+                .cancel_policy_targets(&[policy_target(
+                    "policy-retain",
+                    "policy-retain-session",
+                    1,
+                )])
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+        let extension = store.get_goal_task("policy-retain").await.unwrap().unwrap();
+        assert_eq!(extension.pending_call_id.as_deref(), Some("op-1"));
+        assert_eq!(extension.pending_call_epoch, Some(1));
+        assert_eq!(extension.accounting_state, GoalAccountingState::Complete);
+        assert_eq!(extension.blockers.len(), 1);
+        assert_eq!(
+            extension.blockers[0].payload.as_ref().unwrap()["token"],
+            "keep"
+        );
+        assert_eq!(
+            store
+                .settle_pending_operation(
+                    "policy-retain",
+                    "policy-retain-session",
+                    1,
+                    "op-1",
+                    GoalAccountingState::Complete,
+                )
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+        drop(store);
+
+        let reopened = SqliteTaskStore::new(directory.path()).unwrap();
+        let row = reopened.get("policy-retain").await.unwrap().unwrap();
+        assert_eq!(row.status, TaskStatus::Cancelled);
+        assert_eq!(row.execution_epoch, 2);
+        let reopened_extension = reopened
+            .get_goal_task("policy-retain")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reopened_extension.pending_call_id, None);
+        assert_eq!(reopened_extension.pending_call_epoch, None);
+        assert_eq!(
+            reopened_extension.accounting_state,
+            GoalAccountingState::Complete
+        );
+        assert_eq!(reopened_extension.blockers.len(), 1);
+        assert_eq!(
+            reopened_extension.blockers[0].payload.as_ref().unwrap()["token"],
+            "keep"
+        );
+        let conn = reopened.conn.lock();
+        let intent_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM goal_control_intents WHERE intent_id = 'audit-policy-retain'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(intent_count, 1);
+    }
+
+    #[tokio::test]
+    async fn policy_enumeration_includes_null_and_blank_sessions_and_rejects_malformed_rows() {
+        let store = SqliteTaskStore::new_in_memory().unwrap();
+        create_policy_goal(&store, "policy-null-session", "policy-null-session-old").await;
+        create_policy_goal(&store, "policy-blank-session", "policy-blank-session-old").await;
+        {
+            let conn = store.conn.lock();
+            conn.execute_batch(
+                "DROP TRIGGER IF EXISTS trg_goal_tasks_session_immutable;
+                 DROP TRIGGER IF EXISTS trg_goal_tasks_require_session_update;",
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE tasks SET session_id = NULL WHERE id = 'policy-null-session'",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE tasks SET session_id = '   ' WHERE id = 'policy-blank-session'",
+                [],
+            )
+            .unwrap();
+        }
+        let rows = store.list_nonterminal_session_goals().await.unwrap();
+        assert_eq!(
+            rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+            ["policy-null-session", "policy-blank-session"]
+        );
+        assert_eq!(rows[0].session_id, None);
+        assert_eq!(rows[1].session_id.as_deref(), Some("   "));
+
+        {
+            let conn = store.conn.lock();
+            conn.execute_batch(
+                "DROP TRIGGER IF EXISTS trg_goal_tasks_require_epoch_update;
+                 UPDATE tasks SET execution_epoch = 'malformed'
+                  WHERE id = 'policy-null-session';",
+            )
+            .unwrap();
+        }
+        assert!(
+            store.list_nonterminal_session_goals().await.is_err(),
+            "an unreadable required field must refuse policy classification, not hide the row"
+        );
+    }
+
+    #[tokio::test]
+    async fn policy_revocation_saturates_maximum_epoch_without_reviving() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SqliteTaskStore::new(directory.path()).unwrap();
+        create_policy_goal(&store, "policy-max-epoch", "policy-max-session").await;
+        {
+            let conn = store.conn.lock();
+            conn.execute(
+                "UPDATE tasks SET execution_epoch = ?2 WHERE id = ?1",
+                params!["policy-max-epoch", i64::MAX],
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            store
+                .cancel_policy_targets(&[policy_target(
+                    "policy-max-epoch",
+                    "policy-max-session",
+                    i64::MAX,
+                )])
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+        drop(store);
+
+        let reopened = SqliteTaskStore::new(directory.path()).unwrap();
+        let cancelled = reopened.get("policy-max-epoch").await.unwrap().unwrap();
+        assert_eq!(cancelled.status, TaskStatus::Cancelled);
+        assert_eq!(cancelled.execution_epoch, i64::MAX);
+        assert_eq!(
+            reopened
+                .resume_session_goal(
+                    "policy-max-epoch",
+                    "policy-max-session",
+                    i64::MAX,
+                    2,
+                    "boot-next",
+                )
+                .await
+                .unwrap(),
+            GoalTransitionResult::Stale
         );
     }
 }

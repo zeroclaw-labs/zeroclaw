@@ -77,6 +77,31 @@ pub(super) async fn deliver_prepared_matrix_goal_command(
     }
 }
 
+/// Runs a Matrix Goal command that reached the ordinary channel body.
+///
+/// The ordinary body is polled for every channel turn. Unoptimized builds
+/// reserve each inline-awaited future in that poll frame whether or not its
+/// branch runs, so these Goal futures are built here and awaited through one
+/// heap allocation. The future is still polled inline by the caller, so
+/// ordering, cancellation and logging scope are unchanged.
+pub(super) fn boxed_matrix_goal_command(
+    context: Arc<ChannelRuntimeContext>,
+    history_key: String,
+    original: ChannelMessage,
+    parsed: std::result::Result<zeroclaw_commands::goal::GoalCommand, GoalCommandParseError>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+    Box::pin(async move {
+        let prepared = prepare_matrix_goal_command(
+            Arc::clone(&context),
+            history_key,
+            original.clone(),
+            parsed,
+        )
+        .await;
+        deliver_prepared_matrix_goal_command(context, original, prepared).await;
+    })
+}
+
 pub(super) fn should_drop_channel_message(
     channel: Option<&Arc<dyn Channel>>,
     message: &ChannelMessage,

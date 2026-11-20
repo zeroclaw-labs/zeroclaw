@@ -103,6 +103,8 @@ runs sequentially in model order to prevent stale read-modify-write results
 from overwriting a sibling mutation. One edit alongside non-mutating tools and
 two atomic full-file writes remain parallel-eligible.
 
+Goal foreground participation adds a narrow serialization rule: after preparation, every executable batch containing a Goal root/accounting context is dispatched sequentially in model order, even when ordinary parallel tools are enabled. A direct Goal parallel-executor call follows the same rule. This preserves one same-task accountant and ledger writer; it does not change ordinary callers' parallel policy.
+
 ## Approval and preparation
 
 Preparation happens before the executor runs a tool:
@@ -159,6 +161,26 @@ fills slots for cancelled, denied, replaced, or deduplicated calls; execution
 fills the remaining slots. This preserves provider history ordering even when
 some calls never execute or when parallel calls finish out of order.
 
+### Cooperative execution context
+
+`Tool::execute_with_context(args, &ToolExecutionContext)` is the cancellation-aware Rust entrypoint. Its default implementation runs the existing `execute(args)` inside the context, so existing tool implementations remain compatible. The runtime supplies the current turn's optional cancellation token and preserves interrupted-result ownership. A cancelled context returns `ToolExecutionCancelled`, which runtime dispatch converts to its normal turn-cancellation outcome. A context without a token does not inherit another call's cancellation signal.
+
+A tool may override the context-aware method when it needs explicit execution inputs. Transparent wrappers forward that method while retaining their approval, path, rate-limit, audit, and locked-argument behavior. Legacy implementations can read `ToolExecutionContext::current()` while their future runs. Tools that spawn work must capture the context or derive a child token before spawning; Tokio task-local values do not automatically follow a new task. Sequential and parallel pipeline steps forward the same context to their children.
+
+Cancellation can drop the tool future promptly. Resources owned by that future need drop guards; work that outlives it must observe the captured token. The built-in shell retains its existing child and Unix process-group guards, and HTTP cancellation drops its local request future. Cancellation does not undo an HTTP action already received by a server, await asynchronous cleanup, or add cancellation messages to MCP, WASM, or remote-node protocols. Separately implemented shell-like tools do not acquire the built-in shell's process-tree guarantees from the context alone.
+
+Goal child-capable calls use a cooperative scope rather than the default dropping `run` guard: cancellation and deadline are signalled to the owned child, and the caller awaits its settlement and exact task-row cleanup before returning. The original child error remains a terminal control-flow error through the tool-result path, so later parent tools and success-only continuation do not run. Ordinary tools and non-Goal `ToolExecutionContext::run` retain their existing cancellation-and-drop behavior.
+
+An ordinary spend-limit refusal in Goal work retains its native cause and operation-local tool-phase evidence. A structured batch becomes clean only after its actual call/result identities and order are validated, terminal handling finishes, and the paired round is appended. Open or invalid evidence cannot disappear through a successful return, child wrapper, or graceful summary and authorize a later budget pause. This local evidence does not replace durable pending-tool recovery. The Goal controller separately checks accounting, pricing, and exact execution ownership before committing a resumable budget pause.
+
+A correctly paired parent result does not prove that a spawned child's owner-bound task row settled. If that required cleanup fails, the original error carries negative refusal eligibility through the child, pipeline, and parent boundaries; a later clean outer tool phase cannot clear it. Successful cleanup or adoption of an exact terminal winner leaves the otherwise-qualified ordinary refusal resumable. Neither case adds a provider retry or changes ordinary non-Goal tool error handling.
+
+In-turn parallel and agentic delegates derive child tokens from this context. Explicit background delegates keep their separate tool-owned cancellation token and remain cancellable through `cancel_task`.
+
+### Native pipelines in Goal foreground work
+
+`execute_pipeline` keeps its ordinary full-request validation, allowed-tool and caller-policy checks, template interpolation, step order, stop-on-first-failure behavior, and `result = "all"` / `"last"` output contract. In Goal foreground work, the native pipeline and transparent or skill-locked aliases forward the child-capability predicate using the effective target and arguments, so cooperative ownership applies to the actual child rather than a visible wrapper name. A sequential pipeline may invoke an otherwise-authorized child inline. A Goal parallel pipeline is refused before any step runs if any fully validated step may invoke an agent child, including when that step follows an ordinary sibling. Child-free Goal parallel steps remain concurrent in the owning task; ordinary non-Goal pipelines retain their existing spawned parallel execution and cancellation behavior. Pipeline composition creates no additional Goal child depth or task row, and owned child errors cross the composite without being flattened into a step-failure string.
+
 ## Results, receipts, and history
 
 Successful tool executions normalize empty output to `(no output)`. When
@@ -186,6 +208,14 @@ After execution:
 - loop-detection uses result content except for configured ignored tools;
 - the next provider request sees the assistant tool-call turn plus the ordered
   tool results.
+
+Channel-facing notifications and progress are separate outbound presentations,
+not a reason to rewrite observer events or model-visible history. Their shared
+rendering owners apply the current configured leak detector to the completed
+display copy after its last mutation and before display caps and delivery,
+then recheck it at later send or draft-update boundaries. This preserves raw
+turn data, execution results, and receipts; it does not promise atomic policy
+changes across an await, retroactive retraction, or perfect secret detection.
 
 Tool results are not long-term memory unless a memory write occurs. They may be
 current-turn context, persisted session history, a streamed UI event, an

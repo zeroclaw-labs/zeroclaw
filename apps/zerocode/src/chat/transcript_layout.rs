@@ -6,8 +6,8 @@ use ratatui::text::Line;
 
 use super::{
     CachedCodeBlock, ChatEntry, MAX_RENDERED_ENTRIES, ToolDisclosure, TranscriptRowBreak,
-    UrlLineRegion, fenced_text, header_fence_lang, label_cells, offset_url_line_regions,
-    render_entry_into, row_breaks_for_lines, url_line_regions_for_lines, wrapped_rows,
+    UrlLineRegion, fenced_text, finalize_url_line_regions, header_fence_lang, label_cells,
+    offset_url_line_regions, render_entry_into, row_breaks_for_lines, wrapped_rows,
 };
 
 /// Tracks which committed entries need to be rendered again.
@@ -197,9 +197,14 @@ impl TranscriptLayoutCache {
                 .iter()
                 .position(|&(index, _, _)| index == entry_index)
             && range_pos + 1 == self.layout.cached_line_ranges.len()
+            && let Some(&(row_start, _)) = self
+                .layout
+                .cached_line_screen_ranges
+                .get(self.layout.cached_line_ranges[range_pos].1)
+            // Sanitized prefix lines cannot be used to rediscover split URLs.
+            && row_start != u16::MAX
         {
             let line_start = self.layout.cached_line_ranges[range_pos].1;
-            let row_start = self.layout.cached_line_screen_ranges[line_start].0;
             self.layout.cached_lines.truncate(line_start);
             self.layout.cached_line_ranges.truncate(range_pos);
             self.layout.cached_tool_footer_lines.remove(&entry_index);
@@ -207,19 +212,13 @@ impl TranscriptLayoutCache {
                 self.append_entry(input, show_thoughts, width);
             }
             self.layout.cached_row_breaks = row_breaks_for_lines(&self.layout.cached_lines, width);
-            if row_start == u16::MAX {
-                // Saturated offsets cannot distinguish the unchanged prefix.
-                self.layout.cached_url_regions =
-                    url_line_regions_for_lines(&self.layout.cached_lines, width);
-            } else {
-                self.layout
-                    .cached_url_regions
-                    .retain(|region| region.row < row_start);
-                let mut regions =
-                    url_line_regions_for_lines(&self.layout.cached_lines[line_start..], width);
-                offset_url_line_regions(&mut regions, row_start);
-                self.layout.cached_url_regions.extend(regions);
-            }
+            self.layout
+                .cached_url_regions
+                .retain(|region| region.row < row_start);
+            let mut regions =
+                finalize_url_line_regions(&mut self.layout.cached_lines[line_start..], width);
+            offset_url_line_regions(&mut regions, row_start);
+            self.layout.cached_url_regions.extend(regions);
         } else if self.layout.dirty == LinesDirty::Appended
             && range.start == self.layout.cached_render_start
         {
@@ -227,11 +226,11 @@ impl TranscriptLayoutCache {
             for input in inputs.skip(self.layout.cached_entry_count) {
                 self.append_entry(input, show_thoughts, width);
             }
-            let new_lines = &self.layout.cached_lines[line_start..];
+            let new_lines = &mut self.layout.cached_lines[line_start..];
             self.layout
                 .cached_row_breaks
                 .extend(row_breaks_for_lines(new_lines, width));
-            let mut regions = url_line_regions_for_lines(new_lines, width);
+            let mut regions = finalize_url_line_regions(new_lines, width);
             offset_url_line_regions(&mut regions, self.layout.cached_total_rows);
             self.layout.cached_url_regions.extend(regions);
         } else {
@@ -243,7 +242,7 @@ impl TranscriptLayoutCache {
             }
             self.layout.cached_row_breaks = row_breaks_for_lines(&self.layout.cached_lines, width);
             self.layout.cached_url_regions =
-                url_line_regions_for_lines(&self.layout.cached_lines, width);
+                finalize_url_line_regions(&mut self.layout.cached_lines, width);
         }
 
         self.layout.cached_entry_count = range.len();

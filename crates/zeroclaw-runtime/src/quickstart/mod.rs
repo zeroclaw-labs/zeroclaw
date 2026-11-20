@@ -232,8 +232,9 @@ pub enum QuickstartApplyOutcome {
     /// staged apply as a config commit) and every personality file moved
     /// into place.
     Applied(AppliedAgent),
-    /// Config persisted and published, but a post-commit side effect
-    /// (personality-file installation) failed. The committed config is
+    /// Config persisted (and published for a supervised commit), but a
+    /// post-commit side effect (personality installation or Goal cleanup)
+    /// failed. The committed config is
     /// NOT rolled back — the agent is valid without the files — and the
     /// errors are reported truthfully so the operator can repair the
     /// files.
@@ -425,8 +426,158 @@ pub async fn complete_staged_apply(
     mut staged: StagedQuickstartApply,
 ) -> Result<QuickstartApplyOutcome, Vec<QuickstartError>> {
     let ctx = RunCtx::new(staged.surface);
-    persist_staged_config(&mut staged, &ctx).await?;
-    finish_staged_apply(staged, &ctx).await
+    persist_staged_config(&mut staged, &ctx)
+        .await
+        .map_err(|failure| failure.errors)?;
+    Ok(finish_staged_apply(staged, &ctx).0)
+}
+
+/// Safe operation facts for the two Goal-policy errors on supervised apply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum QuickstartApplyDetail {
+    GoalPolicyPreparationFailed,
+    GoalPolicyCompletionFailed {
+        published: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cancelled_goals: Option<usize>,
+    },
+}
+
+impl QuickstartApplyDetail {
+    fn summary(self, surface: Surface) -> QuickstartError {
+        let (key, count) = match self {
+            Self::GoalPolicyPreparationFailed => ("cli-quickstart-goal-preparation", None),
+            Self::GoalPolicyCompletionFailed {
+                published: true,
+                cancelled_goals: None,
+            } => ("cli-quickstart-goal-published", None),
+            Self::GoalPolicyCompletionFailed {
+                published: true,
+                cancelled_goals: Some(count),
+            } => ("cli-quickstart-goal-published-count", Some(count)),
+            Self::GoalPolicyCompletionFailed {
+                published: false,
+                cancelled_goals: None,
+            } => ("cli-quickstart-goal-not-published", None),
+            Self::GoalPolicyCompletionFailed {
+                published: false,
+                cancelled_goals: Some(count),
+            } => ("cli-quickstart-goal-not-published-count", Some(count)),
+        };
+        let count = count.map(|count| count.to_string());
+        let args = count.as_deref().map(|count| [("count", count)]);
+        let args = args.as_ref().map_or(&[][..], |args| &args[..]);
+        let message = if matches!(surface, Surface::Cli) {
+            crate::i18n::get_required_cli_string_with_args(key, args)
+        } else {
+            // Older clients only understand the message. New clients render
+            // the separate typed detail with their own locale.
+            crate::i18n::get_english_cli_string_with_args(key, args)
+        };
+        QuickstartError::new(QuickstartStep::Agent, "", message)
+    }
+}
+
+/// Preserve the existing Apply result envelope, adding detail only when present.
+#[derive(serde::Serialize)]
+pub struct QuickstartApplyResponse<T> {
+    #[serde(flatten)]
+    pub result: T,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<QuickstartApplyDetail>,
+}
+
+/// Serialized Quickstart effects, with Goal cleanup still owned by the caller's
+/// retained lifecycle job. Inspect publication before accepted-auth publication
+/// under the same `ConfigCommit`, transfer it through
+/// [`Self::release_config_commit`], then call [`Self::finish`].
+#[must_use = "release config serialization and finish the retained Goal cutover"]
+pub struct QuickstartCommitCompletion {
+    /// Whether the exact staged config was published, even if personality
+    /// installation or a later Goal drain reports an error.
+    pub published: bool,
+    /// The existing saved-versus-side-effect outcome, before added Goal drains.
+    pub outcome: Result<QuickstartApplyOutcome, Vec<QuickstartError>>,
+    cutover: Option<crate::daemon::LiveGoalPolicyCutover>,
+    surface: Surface,
+}
+
+impl QuickstartCommitCompletion {
+    /// Release the writer, retaining generation participation only when this
+    /// completion owns an active Goal-policy cutover.
+    pub fn release_config_commit(&mut self, commit: crate::live_config_authority::ConfigCommit) {
+        match self.cutover.as_mut() {
+            Some(cutover) => cutover.release_config_commit(commit),
+            None => commit.release_serialization(),
+        }
+    }
+
+    /// Drain after releasing the writer. A committed configuration never turns
+    /// into an uncommitted `Err` merely because personality/Goal cleanup failed.
+    pub async fn finish(self) -> Result<QuickstartApplyOutcome, Vec<QuickstartError>> {
+        self.finish_inner(false).await.0
+    }
+
+    /// Finish supervised apply and return optional client-renderable facts.
+    /// Put that operation summary first for older first-error-only clients.
+    pub async fn finish_for_response(
+        self,
+    ) -> (
+        Result<QuickstartApplyOutcome, Vec<QuickstartError>>,
+        Option<QuickstartApplyDetail>,
+    ) {
+        self.finish_inner(true).await
+    }
+
+    async fn finish_inner(
+        mut self,
+        summary_first: bool,
+    ) -> (
+        Result<QuickstartApplyOutcome, Vec<QuickstartError>>,
+        Option<QuickstartApplyDetail>,
+    ) {
+        // No cutover exists only when policy preparation failed. An inert
+        // cutover still has an owner and uses the ordinary outcome.
+        let Some(cutover) = self.cutover.take() else {
+            return (
+                self.outcome,
+                Some(QuickstartApplyDetail::GoalPolicyPreparationFailed),
+            );
+        };
+        let cancelled_goals = cutover.cancelled_goal_count();
+        if cutover.finish(self.published, None).await.is_ok() {
+            return (self.outcome, None);
+        }
+        let detail = QuickstartApplyDetail::GoalPolicyCompletionFailed {
+            published: self.published,
+            cancelled_goals,
+        };
+        let add_summary = |mut errors: Vec<QuickstartError>| {
+            if summary_first {
+                errors.insert(0, detail.summary(self.surface));
+            } else {
+                errors.push(detail.summary(self.surface));
+            }
+            errors
+        };
+        let outcome = match self.outcome {
+            Ok(QuickstartApplyOutcome::Applied(agent)) => {
+                Ok(QuickstartApplyOutcome::CommittedWithSideEffectErrors {
+                    agent,
+                    errors: add_summary(Vec::new()),
+                })
+            }
+            Ok(QuickstartApplyOutcome::CommittedWithSideEffectErrors { agent, errors }) => {
+                Ok(QuickstartApplyOutcome::CommittedWithSideEffectErrors {
+                    agent,
+                    errors: add_summary(errors),
+                })
+            }
+            Err(errors) => Err(add_summary(errors)),
+        };
+        (outcome, Some(detail))
+    }
 }
 
 /// Complete one staged quickstart as an admitted, serialized config
@@ -439,26 +590,73 @@ pub async fn complete_staged_apply(
 /// personality failure is reported through
 /// [`QuickstartApplyOutcome::CommittedWithSideEffectErrors`] — the
 /// publication stands, the error is truthful — which is exactly the
-/// boundary the supervised transports must answer for.
+/// boundary the supervised transports must answer for. The returned completion
+/// retains the Goal cutover; callers publish accepted auth only after this
+/// function, then release `commit` through the completion before awaiting its
+/// Goal drains.
 pub async fn complete_staged_apply_as_commit(
     mut staged: StagedQuickstartApply,
     commit: &crate::live_config_authority::ConfigCommit,
     revision: zeroclaw_config::live::ConfigRevision,
-) -> Result<QuickstartApplyOutcome, Vec<QuickstartError>> {
+) -> QuickstartCommitCompletion {
     let ctx = RunCtx::new(staged.surface);
-    persist_staged_config(&mut staged, &ctx).await?;
-    let published = staged.working.clone();
-    if let Err(error) = commit.publish(revision, *published) {
-        return Err(vec![QuickstartError::for_surface(
+    let surface = staged.surface;
+    let mut cutover =
+        match crate::daemon::begin_live_goal_policy_cutover(commit, &staged.working).await {
+            Ok(cutover) => cutover,
+            Err(_) => {
+                return QuickstartCommitCompletion {
+                    published: false,
+                    outcome: Err(vec![
+                        QuickstartApplyDetail::GoalPolicyPreparationFailed.summary(surface),
+                    ]),
+                    cutover: None,
+                    surface,
+                };
+            }
+        };
+    if let Err(failure) = persist_staged_config(&mut staged, &ctx).await {
+        cutover.retain_primary_error(failure.cause);
+        return QuickstartCommitCompletion {
+            published: false,
+            outcome: Err(failure.errors),
+            cutover: Some(cutover),
+            surface,
+        };
+    }
+    if let Err(error) = commit.publish(revision, *staged.working.clone()) {
+        // Save is irreversible, but no new pair/auth policy was published.
+        let errors = vec![QuickstartError::for_surface(
             Some(&ctx),
             QuickstartStep::Agent,
             "",
             format!("failed to publish quickstart config: {error}"),
             "cli-quickstart-error-publish-config",
             &[("err", &error.to_string())],
-        )]);
+        )];
+        cutover.retain_primary_error(error.into());
+        return QuickstartCommitCompletion {
+            published: false,
+            outcome: Err(errors),
+            cutover: Some(cutover),
+            surface,
+        };
     }
-    finish_staged_apply(staged, &ctx).await
+    let (outcome, causes) = finish_staged_apply(staged, &ctx);
+    for cause in causes {
+        cutover.retain_primary_error(cause);
+    }
+    QuickstartCommitCompletion {
+        published: true,
+        outcome: Ok(outcome),
+        cutover: Some(cutover),
+        surface,
+    }
+}
+
+struct QuickstartPersistFailure {
+    cause: anyhow::Error,
+    errors: Vec<QuickstartError>,
 }
 
 /// Persist the staged working config. Shared by the one-shot and
@@ -466,7 +664,7 @@ pub async fn complete_staged_apply_as_commit(
 async fn persist_staged_config(
     staged: &mut StagedQuickstartApply,
     ctx: &RunCtx,
-) -> Result<(), Vec<QuickstartError>> {
+) -> Result<(), QuickstartPersistFailure> {
     let dirty_count = staged.working.dirty_paths.len();
     let write_started = std::time::Instant::now();
     ::zeroclaw_log::record!(
@@ -511,24 +709,26 @@ async fn persist_staged_config(
         ),
     }
     write_result.map_err(|err| {
-        vec![QuickstartError::for_surface(
+        let errors = vec![QuickstartError::for_surface(
             Some(ctx),
             QuickstartStep::Agent,
             "",
             format!("failed to persist config: {err}"),
             "cli-quickstart-error-persist-config",
             &[("err", &err.to_string())],
-        )]
+        )];
+        QuickstartPersistFailure { cause: err, errors }
     })
 }
 
-/// Move the staged personality files into place and produce the terminal
-/// outcome. Any failure here is reported but does not unwind the
+/// Move the staged personality files into place and produce their serialized
+/// outcome. Supervised Goal drain is still owned by the completion. Any
+/// failure here is reported but does not unwind the
 /// already-committed config; the agent is valid without the files.
-async fn finish_staged_apply(
+fn finish_staged_apply(
     staged: StagedQuickstartApply,
     ctx: &RunCtx,
-) -> Result<QuickstartApplyOutcome, Vec<QuickstartError>> {
+) -> (QuickstartApplyOutcome, Vec<anyhow::Error>) {
     let StagedQuickstartApply {
         working: _,
         mut staged_files,
@@ -537,16 +737,19 @@ async fn finish_staged_apply(
         started,
     } = staged;
     let mut commit_errors = Vec::new();
-    commit_personality_files(
+    let causes = commit_personality_files(
         std::mem::take(&mut staged_files),
         &mut commit_errors,
         Some(ctx),
     );
     if !commit_errors.is_empty() {
-        return Ok(QuickstartApplyOutcome::CommittedWithSideEffectErrors {
-            agent: applied,
-            errors: commit_errors,
-        });
+        return (
+            QuickstartApplyOutcome::CommittedWithSideEffectErrors {
+                agent: applied,
+                errors: commit_errors,
+            },
+            causes,
+        );
     }
     ::zeroclaw_log::record!(
         INFO,
@@ -560,9 +763,9 @@ async fn finish_staged_apply(
                     "elapsed_ms": started.elapsed().as_millis() as u64,
                 }),
             )),
-        "quickstart: apply complete"
+        "quickstart: config and personality effects complete"
     );
-    Ok(QuickstartApplyOutcome::Applied(applied))
+    (QuickstartApplyOutcome::Applied(applied), causes)
 }
 
 pub fn record_dismissed(run_id: &str, surface: Surface, last_step: Option<QuickstartStep>) {
@@ -949,8 +1152,9 @@ pub fn field_shape(section: FieldSection, type_key: &str) -> Vec<FieldDescriptor
 /// Essentials per section kind. Kept in one place so adding a
 /// provider type or channel kind lights up Quickstart for free,
 /// while keeping the modal focused on what an agent cannot start
-/// without.
-const MODEL_PROVIDER_ESSENTIALS: &[&str] = &["model", QUICKSTART_AUTH_MODE_FIELD, "api_key", "uri"];
+/// without. `model` comes last for model providers: the model catalog
+/// is listed from the endpoint and credentials asked before it.
+const MODEL_PROVIDER_ESSENTIALS: &[&str] = &[QUICKSTART_AUTH_MODE_FIELD, "api_key", "uri", "model"];
 const CHANNEL_ESSENTIALS: &[&str] = &["bot_token", "token", "webhook_url", "allowed_users"];
 const WEBHOOK_CHANNEL_ESSENTIALS: &[&str] = &[
     "bot_token",
@@ -2213,7 +2417,8 @@ fn commit_personality_files(
     staged: Vec<StagedPersonalityWrite>,
     errors: &mut Vec<QuickstartError>,
     ctx: Option<&RunCtx>,
-) {
+) -> Vec<anyhow::Error> {
+    let mut causes = Vec::new();
     for write in staged {
         if let Err(err) = write.tempfile.persist(&write.dest) {
             let path = write.dest.display().to_string();
@@ -2225,8 +2430,11 @@ fn commit_personality_files(
                 "cli-quickstart-error-personality-write-failed",
                 &[("path", &path), ("err", &err.error.to_string())],
             ));
+            causes
+                .push(anyhow::Error::new(err.error).context("install Quickstart personality file"));
         }
     }
+    causes
 }
 
 // ── Default skills bundle FTUE ─────────────────────────────────────
@@ -2347,6 +2555,42 @@ pub async fn model_catalog(
     bool,
 ) {
     model_catalog_with_config(None, model_provider).await
+}
+
+/// Catalog for a model provider Quickstart has not written yet. A `uri` or
+/// `api_key` already entered in `fields` is used for the listing, so a
+/// self-hosted server is asked at the address the operator gave rather than
+/// at the family default. With neither, this is [`model_catalog`].
+pub async fn model_catalog_for_fields(
+    type_key: &str,
+    fields: &std::collections::HashMap<String, String>,
+) -> (
+    Vec<String>,
+    Option<std::collections::HashMap<String, zeroclaw_api::model_provider::ModelPricing>>,
+    bool,
+) {
+    const PROBE_ALIAS: &str = "quickstart";
+    let entered = |key: &str| {
+        fields
+            .get(key)
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty() && *value != zeroclaw_config::traits::UNSET_DISPLAY)
+            .map(str::to_string)
+    };
+    let (uri, api_key) = (entered("uri"), entered("api_key"));
+    if uri.is_none() && api_key.is_none() {
+        return model_catalog(type_key).await;
+    }
+    let Some((provider_type, _)) = resolve_model_provider_type(type_key) else {
+        return model_catalog(type_key).await;
+    };
+    let mut probe = Config::default();
+    let Some(entry) = probe.providers.models.ensure(provider_type, PROBE_ALIAS) else {
+        return model_catalog(type_key).await;
+    };
+    entry.uri = uri;
+    entry.api_key = api_key;
+    model_catalog_with_config(Some(&probe), &format!("{provider_type}.{PROBE_ALIAS}")).await
 }
 
 /// Backward-compatible catalog projection for callers that intentionally treat
@@ -2936,6 +3180,24 @@ mod tests {
             assert!(
                 keys.contains(&"api_key"),
                 "field_shape for `{kind}` is missing `api_key` row; got {keys:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn field_shape_asks_endpoint_and_credentials_before_model() {
+        for kind in ["llamacpp", "openai", "anthropic"] {
+            let rows = super::field_shape(super::FieldSection::ModelProvider, kind);
+            let keys: Vec<&str> = rows.iter().map(|r| r.key.as_str()).collect();
+            assert!(
+                keys.contains(&"uri") && keys.contains(&"api_key"),
+                "field_shape for `{kind}` must ask for the endpoint and key; got {keys:?}",
+            );
+            assert_eq!(
+                keys.last(),
+                Some(&"model"),
+                "`{kind}` must ask for the model after its endpoint and credentials, \
+                 so the catalog is listed from them; got {keys:?}",
             );
         }
     }
@@ -3995,6 +4257,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn model_catalog_for_fields_lists_from_the_entered_uri() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // A llama.cpp server away from the family default, entered at the
+        // Quickstart `uri` prompt before the model is picked.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{"id": "served-at-the-entered-uri"}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let fields =
+            std::collections::HashMap::from([("uri".to_string(), format!("{}/v1", server.uri()))]);
+
+        let (models, _pricing, live) = model_catalog_for_fields("llamacpp", &fields).await;
+
+        assert!(
+            live,
+            "the entered endpoint answered, so the catalog is live"
+        );
+        assert!(
+            models.iter().any(|m| m == "served-at-the-entered-uri"),
+            "the catalog must come from the entered uri; got {models:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn model_catalog_with_config_rejects_unknown_dotted_alias() {
         let config = Config::default();
         let error = model_catalog_with_config_result(Some(&config), "hailo_ollama.typo")
@@ -4196,6 +4489,94 @@ mod tests {
         assert_eq!(result, None, "slow enrichment should degrade to fallback");
     }
 
+    #[tokio::test]
+    async fn supervised_quickstart_reports_goal_publication_before_ordinary_errors() {
+        use std::sync::Arc;
+
+        let directory = tempfile::tempdir().unwrap();
+        let control_plane =
+            crate::control_plane::ControlPlaneHandle::open(directory.path()).unwrap();
+        for published in [false, true] {
+            let mut config = Config::default();
+            config.goal.enabled = true;
+            let authority = crate::LiveConfigAuthority::for_tests(config.clone());
+            config.goal.enabled = false;
+            let mut cutover = crate::daemon::begin_live_goal_policy_cutover_with(
+                Arc::new(zeroclaw_goal::GoalExecutionRestartCoordinator::new()),
+                control_plane.goal_store().unwrap(),
+                &authority.live_handle(),
+                &config,
+            )
+            .await
+            .unwrap();
+            cutover.retain_primary_error(anyhow::Error::msg("internal fixture cause"));
+            let errors = vec![
+                QuickstartError::new(QuickstartStep::Agent, "first", "first original error"),
+                QuickstartError::new(QuickstartStep::Agent, "second", "second original error"),
+            ];
+            let outcome = if published {
+                Ok(QuickstartApplyOutcome::CommittedWithSideEffectErrors {
+                    agent: AppliedAgent {
+                        alias: "fixture".into(),
+                        model_provider: String::new(),
+                        risk_profile: String::new(),
+                        runtime_profile: String::new(),
+                        channels: Vec::new(),
+                        memory_backend: String::new(),
+                    },
+                    errors: errors.clone(),
+                })
+            } else {
+                Err(errors.clone())
+            };
+            let (outcome, detail) = QuickstartCommitCompletion {
+                published,
+                outcome,
+                cutover: Some(cutover),
+                surface: Surface::Tui,
+            }
+            .finish_for_response()
+            .await;
+            let rows = match (published, outcome) {
+                (
+                    true,
+                    Ok(QuickstartApplyOutcome::CommittedWithSideEffectErrors { errors, .. }),
+                )
+                | (false, Err(errors)) => errors,
+                other => panic!("outcome changed publication classification: {other:?}"),
+            };
+            assert_eq!(&rows[1..], errors.as_slice());
+            assert!(rows[0].message.contains("Goals cancelled:"));
+            assert!(!rows[0].message.contains("internal fixture cause"));
+            assert_eq!(
+                rows[0].message.contains("Agent saved and published"),
+                published
+            );
+            assert_eq!(
+                serde_json::to_value(QuickstartApplyResponse {
+                    result: serde_json::json!({"kind": "errors", "errors": rows}),
+                    detail,
+                })
+                .unwrap()["detail"],
+                serde_json::json!({
+                    "kind": "goal_policy_completion_failed",
+                    "published": published,
+                    "cancelled_goals": 0,
+                })
+            );
+        }
+        let detail = serde_json::to_value(QuickstartApplyDetail::GoalPolicyCompletionFailed {
+            published: false,
+            cancelled_goals: None,
+        })
+        .unwrap();
+        assert!(detail.get("cancelled_goals").is_none());
+        assert_eq!(
+            serde_json::to_value(QuickstartApplyDetail::GoalPolicyPreparationFailed).unwrap(),
+            serde_json::json!({"kind": "goal_policy_preparation_failed"})
+        );
+    }
+
     /// Post-commit personality failure must not strand the committed
     /// quickstart: the staged apply publishes the persisted config first,
     /// then installs the personality files. When the install fails (the
@@ -4261,7 +4642,14 @@ mod tests {
             .next_revision()
             .expect("a fresh epoch must allocate a revision");
 
-        let outcome = complete_staged_apply_as_commit(staged, &commit, revision).await;
+        let completion = complete_staged_apply_as_commit(staged, &commit, revision).await;
+        assert!(completion.published);
+        commit.release_serialization();
+        let (outcome, detail) = completion.finish_for_response().await;
+        assert!(
+            detail.is_none(),
+            "inert cutover must not label an ordinary error"
+        );
         let (agent, errors) = match outcome {
             Ok(QuickstartApplyOutcome::CommittedWithSideEffectErrors { agent, errors }) => {
                 (agent, errors)
@@ -4272,6 +4660,11 @@ mod tests {
             ),
         };
         assert_eq!(agent.alias, "pfail");
+        assert_eq!(
+            errors.len(),
+            1,
+            "ordinary failure must not be duplicated: {errors:?}"
+        );
         assert!(
             errors
                 .iter()

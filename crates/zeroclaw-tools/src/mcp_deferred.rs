@@ -148,15 +148,7 @@ impl DeferredMcpToolSet {
             .stubs
             .iter()
             .filter_map(|stub| {
-                let haystack = format!(
-                    "{} {}",
-                    stub.prefixed_name.to_ascii_lowercase(),
-                    stub.description.to_ascii_lowercase()
-                );
-                let hits = terms
-                    .iter()
-                    .filter(|t| haystack.contains(t.as_str()))
-                    .count();
+                let hits = deferred_search_score(&stub.prefixed_name, &stub.description, &terms);
                 if hits > 0 { Some((stub, hits)) } else { None }
             })
             .collect();
@@ -186,21 +178,98 @@ impl DeferredMcpToolSet {
     }
 }
 
+/// Shared keyword ranking for MCP stubs and built-in schema metadata.
+pub(crate) fn deferred_search_score(name: &str, description: &str, terms: &[String]) -> usize {
+    let haystack = format!("{name} {description}").to_ascii_lowercase();
+    terms
+        .iter()
+        .filter(|term| haystack.contains(term.as_str()))
+        .count()
+}
+
 // ── ActivatedToolSet ─────────────────────────────────────────────────────
 
-/// Per-conversation mutable state tracking which deferred tools have been
-/// activated (i.e. their full schemas have been fetched via `tool_search`).
-/// The agent loop consults this each iteration to decide which tool_specs
-/// to include in the LLM request.
+/// Per-conversation MCP activation and built-in schema selection.
+///
+/// Built-in specs are a metadata projection of the scoped registry. The
+/// registry remains their executable owner and refreshes this catalog when
+/// admitted tools change. Selecting a built-in schema grants no capability.
 pub struct ActivatedToolSet {
+    // Executable activation remains MCP-only.
     tools: HashMap<String, Arc<dyn Tool>>,
+    deferred_builtin_specs: HashMap<String, ToolSpec>,
+    selected_builtin_names: HashSet<String>,
 }
 
 impl ActivatedToolSet {
     pub fn new() -> Self {
         Self {
             tools: HashMap::new(),
+            deferred_builtin_specs: HashMap::new(),
+            selected_builtin_names: HashSet::new(),
         }
+    }
+
+    /// Install the initial metadata-only catalog of admitted deferred built-ins.
+    pub fn set_deferred_builtin_specs(&mut self, specs: Vec<ToolSpec>) {
+        self.deferred_builtin_specs = specs
+            .into_iter()
+            .map(|spec| (spec.name.clone(), spec))
+            .collect();
+        self.selected_builtin_names.clear();
+    }
+
+    /// Refresh previously deferred names from the canonical scoped registry.
+    /// New names stay eager; removed names lose their schema and selection.
+    pub fn refresh_deferred_builtin_specs(&mut self, specs: Vec<ToolSpec>) {
+        self.deferred_builtin_specs = specs
+            .into_iter()
+            .filter(|spec| self.deferred_builtin_specs.contains_key(&spec.name))
+            .map(|spec| (spec.name.clone(), spec))
+            .collect();
+        self.selected_builtin_names
+            .retain(|name| self.deferred_builtin_specs.contains_key(name));
+    }
+
+    pub fn hidden_builtin_names(&self) -> HashSet<String> {
+        self.deferred_builtin_specs
+            .keys()
+            .filter(|name| !self.selected_builtin_names.contains(*name))
+            .cloned()
+            .collect()
+    }
+
+    /// Render the current unselected built-in catalog after registry refresh
+    /// or principal narrowing, rather than retaining a startup prompt snapshot.
+    pub fn deferred_builtin_prompt_section(&self) -> String {
+        build_deferred_builtin_tools_section(self, None)
+    }
+
+    /// Render discovery for one request without narrowing shared schema metadata.
+    pub fn deferred_builtin_prompt_section_filtered(
+        &self,
+        is_allowed: impl Fn(&str) -> bool,
+    ) -> String {
+        render_deferred_builtin_tools_section(self, is_allowed)
+    }
+
+    pub fn has_deferred_builtin_schemas(&self) -> bool {
+        !self.deferred_builtin_specs.is_empty()
+    }
+
+    pub fn is_builtin_schema_exposed(&self, name: &str) -> bool {
+        !self.deferred_builtin_specs.contains_key(name)
+            || self.selected_builtin_names.contains(name)
+    }
+
+    pub(crate) fn deferred_builtin_specs(&self) -> impl Iterator<Item = &ToolSpec> {
+        self.deferred_builtin_specs.values()
+    }
+
+    pub(crate) fn select_builtin_schema(&mut self, name: &str) -> Option<ToolSpec> {
+        let spec = self.deferred_builtin_specs.get(name)?.clone();
+        self.selected_builtin_names.insert(name.to_string());
+        Some(spec)
     }
 
     pub fn activate(&mut self, name: String, tool: Arc<dyn Tool>) {
@@ -249,12 +318,16 @@ impl ActivatedToolSet {
         self.tools.keys().map(|s| s.as_str()).collect()
     }
 
-    /// Remove activated deferred tools that a newly narrowed principal may no
-    /// longer invoke. Callers resolve the principal policy from its canonical
-    /// source at the prompt boundary; this set retains no independent policy.
+    /// Remove MCP executables and built-in schema metadata outside a narrowed
+    /// principal's ceiling. Callers resolve policy from its canonical source;
+    /// this set retains no independent policy.
     pub fn retain_allowed(&mut self, allowed: &[String]) {
         self.tools
             .retain(|name, _| allowed.iter().any(|allowed_name| allowed_name == name));
+        self.deferred_builtin_specs
+            .retain(|name, _| allowed.contains(name));
+        self.selected_builtin_names
+            .retain(|name| self.deferred_builtin_specs.contains_key(name));
     }
 }
 
@@ -280,17 +353,62 @@ const DEFERRED_SUMMARY_MAX_CHARS: usize = 200;
 /// of hundred deferred tools the bodies alone cost more context per turn than
 /// every activated schema combined.
 fn deferred_summary_line(description: &str) -> String {
+    summary_line(description, DEFERRED_SUMMARY_MAX_CHARS)
+}
+
+fn summary_line(description: &str, max_chars: usize) -> String {
     let line = description
         .lines()
         .map(str::trim)
         .find(|l| !l.is_empty())
         .unwrap_or("");
-    if line.chars().count() <= DEFERRED_SUMMARY_MAX_CHARS {
+    if line.chars().count() <= max_chars {
         return line.to_string();
     }
-    let mut cut: String = line.chars().take(DEFERRED_SUMMARY_MAX_CHARS).collect();
+    let mut cut: String = line.chars().take(max_chars).collect();
     cut.push_str("...");
     cut
+}
+
+/// Advertise unselected built-in schemas without copying their JSON schemas
+/// into the prompt. Access policy is applied before any name is rendered.
+pub(crate) fn build_deferred_builtin_tools_section(
+    activated: &ActivatedToolSet,
+    policy: Option<&ToolAccessPolicy>,
+) -> String {
+    render_deferred_builtin_tools_section(activated, |name| {
+        policy.is_none_or(|p| p.is_tool_allowed(name))
+    })
+}
+
+fn render_deferred_builtin_tools_section(
+    activated: &ActivatedToolSet,
+    is_allowed: impl Fn(&str) -> bool,
+) -> String {
+    let mut specs: Vec<_> = activated
+        .deferred_builtin_specs()
+        .filter(|spec| !activated.is_builtin_schema_exposed(&spec.name))
+        .filter(|spec| is_allowed(&spec.name))
+        .collect();
+    if specs.is_empty() {
+        return String::new();
+    }
+    specs.sort_by(|a, b| a.name.cmp(&b.name));
+    let mut out = String::from(
+        "## Deferred Built-in Tools\n\n\
+         Use `tool_search` to fetch full schemas for the built-in tools below. \
+         Use `\"select:name1,name2\"` for exact tools or keywords to search. \
+         Schema selection does not change tool permissions or approval requirements.\n\n\
+         <available-deferred-builtin-tools>\n",
+    );
+    for spec in specs {
+        out.push_str(&spec.name);
+        out.push_str(" - ");
+        out.push_str(&summary_line(&spec.description, 120));
+        out.push('\n');
+    }
+    out.push_str("</available-deferred-builtin-tools>\n");
+    out
 }
 
 /// Build the `<available-deferred-tools>` section for the system prompt.
@@ -383,6 +501,92 @@ mod tests {
         };
         let stub = DeferredMcpToolStub::new("srv__mystery".into(), def);
         assert_eq!(stub.description, "MCP tool");
+    }
+
+    #[test]
+    fn builtin_catalog_refresh_updates_only_surviving_deferred_names() {
+        let make_spec = |name: &str, description: &str| {
+            ToolSpec::new(name, description, serde_json::json!({"type": "object"}))
+        };
+        let mut set = ActivatedToolSet::new();
+        set.set_deferred_builtin_specs(vec![
+            make_spec("keep", "Original description"),
+            make_spec("revoke", "Revoked description"),
+            make_spec("hidden", "Unselected description"),
+        ]);
+        assert!(set.has_deferred_builtin_schemas());
+        assert!(!set.is_builtin_schema_exposed("keep"));
+        assert!(set.is_builtin_schema_exposed("eager"));
+        set.select_builtin_schema("keep").unwrap();
+        set.select_builtin_schema("revoke").unwrap();
+
+        set.refresh_deferred_builtin_specs(vec![
+            make_spec("keep", "Rebound description"),
+            make_spec("hidden", "Updated unselected description"),
+            make_spec("new", "New tool stays eager"),
+        ]);
+        assert!(set.is_builtin_schema_exposed("keep"));
+        assert_eq!(
+            set.hidden_builtin_names(),
+            HashSet::from(["hidden".to_string()])
+        );
+        assert_eq!(
+            set.select_builtin_schema("keep").unwrap().description,
+            "Rebound description"
+        );
+        assert!(set.select_builtin_schema("revoke").is_none());
+        assert!(set.select_builtin_schema("new").is_none());
+        assert!(set.selected_builtin_names.contains("keep"));
+        assert!(!set.selected_builtin_names.contains("revoke"));
+        assert!(set.get("keep").is_none());
+        assert!(set.get_resolved("keep").is_none());
+        assert!(set.tool_names().is_empty());
+        assert!(set.tool_specs().is_empty());
+
+        set.retain_allowed(&[]);
+        assert!(!set.has_deferred_builtin_schemas());
+        assert!(set.hidden_builtin_names().is_empty());
+        assert!(set.selected_builtin_names.is_empty());
+        assert!(set.deferred_builtin_prompt_section().is_empty());
+        // A later refresh cannot revive a revoked schema.
+        set.refresh_deferred_builtin_specs(vec![make_spec("keep", "Reintroduced")]);
+        assert!(set.select_builtin_schema("keep").is_none());
+    }
+
+    #[test]
+    fn builtin_prompt_is_compact_filtered_and_omits_selected_schemas() {
+        let mut set = ActivatedToolSet::new();
+        set.set_deferred_builtin_specs(vec![
+            ToolSpec::new(
+                "calendar",
+                format!("\n  {}\nArgs: full documentation", "é".repeat(150)),
+                serde_json::json!({"properties": {"private_schema_marker": {"type": "string"}}}),
+            ),
+            ToolSpec::new("denied", "Denied description", serde_json::json!({})),
+        ]);
+        let policy = ToolAccessPolicy {
+            denied: Some(vec!["denied".to_string()]),
+            ..ToolAccessPolicy::default()
+        };
+        let prompt = build_deferred_builtin_tools_section(&set, Some(&policy));
+        assert!(prompt.contains("tool_search"));
+        assert!(prompt.contains("select:name1,name2"));
+        assert!(prompt.contains(&format!("calendar - {}...\n", "é".repeat(120))));
+        assert!(!prompt.contains("Args:"));
+        assert!(!prompt.contains("private_schema_marker"));
+        assert!(!prompt.contains("denied"));
+        let hidden_names = set.hidden_builtin_names();
+        assert_eq!(
+            set.deferred_builtin_prompt_section_filtered(|name| name == "calendar"),
+            prompt
+        );
+        assert!(
+            set.deferred_builtin_prompt_section_filtered(|_| false)
+                .is_empty()
+        );
+        assert_eq!(set.hidden_builtin_names(), hidden_names);
+        set.select_builtin_schema("calendar").unwrap();
+        assert!(build_deferred_builtin_tools_section(&set, Some(&policy)).is_empty());
     }
 
     #[test]

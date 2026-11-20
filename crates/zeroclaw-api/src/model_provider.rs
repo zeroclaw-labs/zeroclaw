@@ -253,6 +253,14 @@ pub fn strip_think_tags(text: &str) -> String {
     result.trim().to_string()
 }
 
+/// Requested tool-call cadence for one provider response.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ToolRoundPolicy {
+    #[default]
+    Batch,
+    Single,
+}
+
 /// Request payload for model_provider chat calls.
 #[derive(Debug, Clone, Copy)]
 pub struct ChatRequest<'a> {
@@ -484,10 +492,12 @@ pub type StreamResult<T> = std::result::Result<T, StreamError>;
 /// A provider safety refusal that completed at the transport layer but cannot
 /// be accepted as an assistant response.
 ///
-/// The optional usage belongs to the refusing attempt. It is carried on the
-/// typed cause so reliability and turn accounting can bill that work without
-/// treating it as accepted-response context usage. `category` is diagnostic
-/// metadata only and must not be rendered to users.
+/// The optional usage belongs to the returned refusing attempt. It is carried
+/// on the typed cause so reliability and turn accounting can bill that work
+/// without treating it as accepted-response context usage. If the provider
+/// reports multiple server-side attempts in a dispatch-accounted call, earlier
+/// attempts are accounted for separately rather than summed into this usage.
+/// `category` is diagnostic metadata only and must not be rendered to users.
 #[derive(Debug, Clone, thiserror::Error)]
 #[error("anthropic refusal: model declined this request (safety classifiers)")]
 pub struct ModelRefusalError {
@@ -629,6 +639,7 @@ pub const BASELINE_TIMEOUT_SECS: u64 = 120;
 pub const BASELINE_WIRE_API: &str = "chat_completions";
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct ModelPricing {
     /// Input/prompt tokens per-token rate (USD per token, e.g. `"0.000005"` = $5/1M tokens).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -700,6 +711,34 @@ pub trait ModelProvider: Send + Sync + crate::attribution::Attributable {
         capabilities.native_tool_calling = self.supports_native_tools();
         capabilities.vision = self.supports_vision();
         capabilities
+    }
+
+    /// Whether every reachable route for this model honors a native one-call control.
+    /// Prompt guidance and provider-executed tools do not establish support.
+    fn supports_single_tool_rounds(&self, _model: &str) -> bool {
+        false
+    }
+
+    /// Explicit per-request policy. Unsupported adapters retain their batch path.
+    async fn chat_with_tool_round_policy(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        _policy: ToolRoundPolicy,
+    ) -> anyhow::Result<ChatResponse> {
+        self.chat(request, model, temperature).await
+    }
+
+    fn stream_chat_with_tool_round_policy(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        options: StreamOptions,
+        _policy: ToolRoundPolicy,
+    ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
+        self.stream_chat(request, model, temperature, options)
     }
 
     /// Name the entry that forced `vision` to `false` on this provider's
@@ -983,6 +1022,39 @@ pub trait ModelProvider: Send + Sync + crate::attribution::Attributable {
 /// boilerplate in test and production code.
 #[async_trait]
 impl<T: ModelProvider + ?Sized> ModelProvider for Arc<T> {
+    fn supports_single_tool_rounds(&self, model: &str) -> bool {
+        self.as_ref().supports_single_tool_rounds(model)
+    }
+
+    async fn chat_with_tool_round_policy(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        policy: ToolRoundPolicy,
+    ) -> anyhow::Result<ChatResponse> {
+        self.as_ref()
+            .chat_with_tool_round_policy(request, model, temperature, policy)
+            .await
+    }
+
+    fn stream_chat_with_tool_round_policy(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        options: StreamOptions,
+        policy: ToolRoundPolicy,
+    ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
+        self.as_ref().stream_chat_with_tool_round_policy(
+            request,
+            model,
+            temperature,
+            options,
+            policy,
+        )
+    }
+
     fn has_stable_request_identity(&self, model: &str) -> bool {
         self.as_ref().has_stable_request_identity(model)
     }

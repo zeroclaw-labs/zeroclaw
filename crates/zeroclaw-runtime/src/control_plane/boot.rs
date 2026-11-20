@@ -28,9 +28,9 @@ pub struct ControlPlaneHandle {
     pub boot_id: String,
     /// Process-local Goal executor coordination for this daemon process.
     ///
-    /// This retains weak executor owners only. It is deliberately separate
-    /// from the durable task store, which remains the sole authority for Goal
-    /// identity, lifecycle, and accounting.
+    /// Registered supervisors remain owned until their exact execution and
+    /// cleanup duties permit retirement. This process-local custody is separate
+    /// from the durable store's authority over Goal identity and accounting.
     pub(crate) goal_execution_restart: Arc<GoalExecutionRestartCoordinator>,
 }
 

@@ -13,6 +13,7 @@ import {
   createContext,
   useCallback,
   useContext,
+  useEffect,
   useMemo,
   useState,
   type ReactNode,
@@ -218,7 +219,7 @@ export function ConfigDraftProvider({ children }: { children: ReactNode }) {
       return { saved: true, results: [], warnings: [] };
     }
     try {
-      const resp = await patchConfig(ops);
+      const resp = await patchConfig(ops, { warningsHandledLocally: true });
       // Successful save: clear everything that just landed.
       setDrafts({});
       setComments({});
@@ -230,6 +231,21 @@ export function ConfigDraftProvider({ children }: { children: ReactNode }) {
       throw e;
     }
   }, [drafts, comments, tombstones]);
+
+  // The drafts outlive the config form, so the warning before leaving the
+  // page lives here: a reload or a closed tab asks first while anything is
+  // unsaved, whichever page is showing.
+  const unsaved =
+    Object.keys(drafts).length > 0 || Object.keys(comments).length > 0 || tombstones.size > 0;
+  useEffect(() => {
+    if (!unsaved) return;
+    const warn = (e: BeforeUnloadEvent) => {
+      e.preventDefault();
+      e.returnValue = '';
+    };
+    window.addEventListener('beforeunload', warn);
+    return () => window.removeEventListener('beforeunload', warn);
+  }, [unsaved]);
 
   const value = useMemo<ConfigDraftCtx>(
     () => ({

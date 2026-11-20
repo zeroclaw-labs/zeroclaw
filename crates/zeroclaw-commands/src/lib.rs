@@ -66,6 +66,8 @@ pub enum CommandExecution {
     ClientLocal,
     /// The channel/runtime command handler owns the command.
     RuntimeCommand,
+    /// The surface routes the command to session-bound Goal admission.
+    GoalAdmission,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -197,7 +199,7 @@ static BUILTIN_COMMANDS: &[CommandSpec] = &[
         usage: "/goal start [--tokens N] [--cost-usd D] OBJECTIVE",
         description_key: "command-goal-description",
         surfaces: CHANNEL_AND_TUI,
-        execution: CommandExecution::RuntimeCommand,
+        execution: CommandExecution::GoalAdmission,
     },
 ];
 
@@ -339,14 +341,24 @@ mod tests {
 
     #[test]
     fn goal_is_advertised_only_on_its_channel_and_tui_surfaces() {
+        assert_eq!(BuiltinCommandId::Goal.as_str(), "goal");
         for surface in [CommandSurface::Channel, CommandSurface::Tui] {
             assert_eq!(
-                parse_command_token("/goal", surface).map(|parsed| parsed.command.id),
-                Some(BuiltinCommandId::Goal)
+                parse_command_token("/goal", surface)
+                    .map(|parsed| (parsed.command.id, parsed.command.execution)),
+                Some((BuiltinCommandId::Goal, CommandExecution::GoalAdmission))
             );
+            assert_eq!(
+                commands_for_surface(surface)
+                    .filter(|spec| spec.id == BuiltinCommandId::Goal)
+                    .count(),
+                1
+            );
+            assert!(parse_command_token("/goalkeeper", surface).is_none());
         }
         for surface in [CommandSurface::Cli, CommandSurface::Web] {
             assert!(parse_command_token("/goal", surface).is_none());
+            assert!(commands_for_surface(surface).all(|spec| spec.id != BuiltinCommandId::Goal));
         }
 
         assert_eq!(

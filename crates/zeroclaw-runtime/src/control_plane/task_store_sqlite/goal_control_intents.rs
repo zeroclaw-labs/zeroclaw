@@ -1,5 +1,6 @@
 //! Audit storage for normal Goal controls. Task rows remain lifecycle authority.
 
+use crate::control_plane::authority::is_authoritative_owner;
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
@@ -223,13 +224,48 @@ pub(super) fn settle(
 }
 
 pub(super) fn abandon_previous_boot(conn: &Connection, boot_id: &str, now: &str) -> Result<()> {
-    conn.execute(
-        "UPDATE goal_control_intents
-            SET state = 'abandoned', outcome_reason = 'restart', settled_at = ?2
-         WHERE owner_boot_id != ?1 AND state IN ('pending','claimed')",
-        params![boot_id, now],
-    )
-    .context("abandon previous-boot Goal control intents")?;
+    let owners = {
+        let mut statement = conn
+            .prepare(
+                "SELECT DISTINCT owner_pid, owner_boot_id FROM goal_control_intents
+                 WHERE owner_boot_id != ?1 AND state IN ('pending','claimed')",
+            )
+            .context("prepare previous-boot Goal intent owners")?;
+        let mut rows = statement
+            .query(params![boot_id])
+            .context("query previous-boot Goal intent owners")?;
+        let mut owners = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .context("read previous-boot Goal intent owner")?
+        {
+            match (row.get::<_, u32>(0), row.get::<_, String>(1)) {
+                (Ok(pid), Ok(owner_boot_id)) => owners.push((pid, owner_boot_id)),
+                _ => ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                    "control-plane: skipping unreadable Goal control intent owner"
+                ),
+            }
+        }
+        owners
+    };
+    let mut abandon = conn
+        .prepare(
+            "UPDATE goal_control_intents
+                SET state = 'abandoned', outcome_reason = 'restart', settled_at = ?3
+             WHERE owner_pid = ?1 AND owner_boot_id = ?2
+               AND state IN ('pending','claimed')",
+        )
+        .context("prepare previous-boot Goal control intent abandonment")?;
+    for (pid, owner_boot_id) in owners {
+        if is_authoritative_owner(pid, &owner_boot_id) {
+            abandon
+                .execute(params![pid, owner_boot_id, now])
+                .context("abandon previous-boot Goal control intents")?;
+        }
+    }
     Ok(())
 }
 

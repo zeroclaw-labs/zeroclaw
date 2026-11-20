@@ -278,4 +278,83 @@ mod tests {
         );
         assert!(value.contains("404 Not Found"));
     }
+
+    #[test]
+    fn model_routing_profile_errors_use_translation_and_english_fallback() {
+        let args = [("agent", "coder"), ("profile", "shared")];
+        for kind in ["risk", "runtime"] {
+            let cases = [
+                (
+                    format!("tool-model-routing-config-error-missing-{kind}-profile"),
+                    format!("agent `coder` references missing {kind} profile `shared`"),
+                ),
+                (
+                    format!("tool-model-routing-config-error-shared-{kind}-profile"),
+                    format!(
+                        "{kind} profile `shared` is shared by another agent; refusing an agent-scoped mutation"
+                    ),
+                ),
+                (
+                    format!("tool-model-routing-config-error-{kind}-profile-collision"),
+                    format!(
+                        "{kind} profile `shared` already exists; refusing to overwrite it while isolating agent `coder`"
+                    ),
+                ),
+            ];
+            for (key, english) in cases {
+                let mut sources = ToolFtlSources {
+                    locale: "fr".to_string(),
+                    disk: Some(format!(
+                        "{key} = Agent {{$agent}}, profil {{$profile}} : modification refusee."
+                    )),
+                };
+                assert_eq!(
+                    format_tool_string_with_args(&sources, &key, &args).as_deref(),
+                    Some("Agent coder, profil shared : modification refusee.")
+                );
+                sources.disk = Some("unrelated-key = Autre message".to_string());
+                assert_eq!(
+                    format_tool_string_with_args(&sources, &key, &args).as_deref(),
+                    Some(english.as_str())
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn goal_model_call_strings_use_translation_and_english_fallback() {
+        for (key, args, english, translated) in [
+            (
+                "tool-model-call-gate-goal-unsupported",
+                vec![],
+                "This tool cannot report its model usage to the Goal, so its model call is not available inside a Goal operation. No request was sent.",
+                "Appel indisponible.",
+            ),
+            (
+                "tool-model-routing-config-error-probe-not-admitted",
+                vec![("alias", "example.primary")],
+                "The change to `example.primary` was saved and kept, but its availability probe was not admitted, so the change is unvalidated.",
+                "Verification indisponible pour example.primary.",
+            ),
+        ] {
+            let template = if args.is_empty() {
+                "Appel indisponible."
+            } else {
+                "Verification indisponible pour {$alias}."
+            };
+            let mut sources = ToolFtlSources {
+                locale: "fr".to_string(),
+                disk: Some(format!("{key} = {template}")),
+            };
+            assert_eq!(
+                format_tool_string_with_args(&sources, key, &args).as_deref(),
+                Some(translated)
+            );
+            sources.disk = Some("unrelated-key = Autre message".to_string());
+            assert_eq!(
+                format_tool_string_with_args(&sources, key, &args).as_deref(),
+                Some(english)
+            );
+        }
+    }
 }

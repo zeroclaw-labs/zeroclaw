@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::Utc;
 use std::path::PathBuf;
 use tokio::task::JoinHandle;
@@ -393,230 +393,203 @@ impl Drop for StartupReadinessAttempt {
     }
 }
 
+mod goal_policy;
 mod registry;
+#[cfg(test)]
+pub(crate) use goal_policy::begin_live_goal_policy_cutover_with;
+pub use goal_policy::{
+    LiveGoalPolicyCutover, begin_live_goal_policy_cutover, reconcile_live_goal_policy_cutover,
+};
 pub use registry::{DaemonInboundAuthority, DaemonRegistry, GatewayReloadControls};
 
 const STATUS_FLUSH_SECONDS: u64 = 5;
 
 #[derive(Debug, Clone)]
 pub enum DaemonExit {
+    /// Exit the process without starting a replacement generation.
     Shutdown,
-    /// A fully loaded successor configuration whose Goal policy has already
-    /// been durably applied while the retiring runtime still owned workers.
+    /// The exact loaded successor whose Goal revocations committed and whose
+    /// retiring workers drained. New permission still requires replacement.
     Reload(Box<Config>),
 }
 
 /// Project the validated config into Goal's narrow policy input. Keeping this
 /// adapter here prevents the Goal component from depending on config types.
 pub(crate) fn goal_policy_snapshot(config: &Config) -> zeroclaw_goal::control::GoalPolicySnapshot {
-    use zeroclaw_goal::control::{GoalAgentPolicySnapshot, GoalPolicySnapshot};
-
-    GoalPolicySnapshot {
-        goal_mode_enabled: config.goal.enabled,
-        agents: config
-            .agents
-            .iter()
-            .map(|(alias, agent)| {
-                (
-                    alias.clone(),
-                    GoalAgentPolicySnapshot {
-                        enabled: agent.enabled,
-                        channels: agent
-                            .channels
-                            .iter()
-                            .map(|channel| channel.as_str().to_owned())
-                            .collect(),
-                    },
-                )
-            })
-            .collect(),
-        matrix_channels: config
-            .channels
-            .matrix
-            .iter()
-            .map(|(alias, channel)| (alias.clone(), channel.enabled))
-            .collect(),
-    }
+    zeroclaw_goal::control::GoalPolicySnapshot::from_config(config)
 }
 
-/// An unfinished live Goal-policy cutover.
-///
-/// A non-inert value keeps fresh Goal admission closed until [`Self::finish`]
-/// reopens it. Dropping the value schedules the same reopen and exact worker
-/// drain so cancellation cannot strand admission closed.
-pub struct LiveGoalPolicyCutover {
-    coordinator: Option<std::sync::Arc<zeroclaw_goal::GoalExecutionRestartCoordinator>>,
-    targets: Vec<zeroclaw_goal::task::GoalPolicyTarget>,
-}
-
-impl LiveGoalPolicyCutover {
-    fn inert() -> Self {
-        Self {
-            coordinator: None,
-            targets: Vec::new(),
-        }
-    }
-
-    /// Return how many Goals this cutover's policy revocation cancelled.
-    ///
-    /// `None` means the cutover is inert: the Goal policy projection did not
-    /// change, or no control plane exists, so admission was never closed and
-    /// the Goal store was not touched. `Some(n)` means the cutover is
-    /// non-inert, and `n` is the exact number of Goals its atomic revocation
-    /// cancelled, including zero. Callers read this before [`Self::finish`],
-    /// which consumes the cutover.
-    #[must_use]
-    pub fn cancelled_goal_count(&self) -> Option<usize> {
-        self.coordinator.as_ref().map(|_| self.targets.len())
-    }
-
-    /// Reopen admission and schedule the exact revoked workers for draining.
-    pub async fn finish(mut self) -> Option<JoinHandle<()>> {
-        let coordinator = self.coordinator.as_ref()?;
-        coordinator.reopen_for_generation().await;
-
-        // Keep Drop armed until the awaited reopen has completed. Cancelling
-        // this future before then must still schedule the fallback reopen.
-        let coordinator = self
-            .coordinator
-            .take()
-            .expect("non-inert Goal policy cutover lost its coordinator");
-        let targets = std::mem::take(&mut self.targets);
-        if targets.is_empty() {
-            return None;
-        }
-        Some(spawn_revoked_goal_stop(coordinator, targets))
-    }
-}
-
-impl Drop for LiveGoalPolicyCutover {
-    fn drop(&mut self) {
-        let Some(coordinator) = self.coordinator.take() else {
-            return;
-        };
-        let targets = std::mem::take(&mut self.targets);
-        let _fallback = zeroclaw_spawn::spawn!(async move {
-            coordinator.reopen_for_generation().await;
-            if !targets.is_empty() {
-                stop_revoked_goals_and_log(coordinator, targets).await;
-            }
-        });
-    }
-}
-
-fn spawn_revoked_goal_stop(
-    coordinator: std::sync::Arc<zeroclaw_goal::GoalExecutionRestartCoordinator>,
-    targets: Vec<zeroclaw_goal::task::GoalPolicyTarget>,
-) -> JoinHandle<()> {
-    zeroclaw_spawn::spawn!(async move {
-        stop_revoked_goals_and_log(coordinator, targets).await;
-    })
-}
-
-async fn stop_revoked_goals_and_log(
-    coordinator: std::sync::Arc<zeroclaw_goal::GoalExecutionRestartCoordinator>,
-    targets: Vec<zeroclaw_goal::task::GoalPolicyTarget>,
-) {
-    if let Err(error) = coordinator.stop_revoked_in_place(&targets).await {
-        let error = RuntimeGoalDiagnosticTextGuard.guard_diagnostic_text(&format!("{error:#}"));
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                .with_attrs(::serde_json::json!({"error": error})),
-            "Revoked Goal worker drain failed after a live policy cutover"
-        );
-    }
-}
-
-/// Close Goal admission and apply the prospective live policy before config
-/// persistence begins.
-///
-/// # Errors
-///
-/// Returns an error when the live control plane has no Goal registry or when
-/// prospective-policy classification or atomic revocation fails.
-pub async fn begin_live_goal_policy_cutover(
-    commit: &crate::live_config_authority::ConfigCommit,
-    prospective: &Config,
-) -> Result<LiveGoalPolicyCutover> {
-    let Some(control_plane) = crate::control_plane::control_plane() else {
-        return Ok(LiveGoalPolicyCutover::inert());
-    };
-    let coordinator = control_plane.goal_execution_restart();
-    let registry = control_plane.goal_store()?;
-    let live = commit.live_handle();
-    begin_live_goal_policy_cutover_with(coordinator, registry, &live, prospective).await
-}
-
-pub(crate) async fn begin_live_goal_policy_cutover_with(
-    coordinator: std::sync::Arc<zeroclaw_goal::GoalExecutionRestartCoordinator>,
-    registry: std::sync::Arc<dyn zeroclaw_goal::GoalTaskRegistry>,
-    live: &zeroclaw_config::live::LiveConfigHandle,
-    prospective: &Config,
-) -> Result<LiveGoalPolicyCutover> {
-    let current_policy = {
-        let current = live.read();
-        goal_policy_snapshot(&current)
-    };
-    let prospective_policy = goal_policy_snapshot(prospective);
-    if current_policy == prospective_policy {
-        return Ok(LiveGoalPolicyCutover::inert());
-    }
-
-    coordinator.begin_policy_cutover().await;
-    let revoked = match zeroclaw_goal::control::revoke_goals_under_policy(
-        registry.as_ref(),
-        &prospective_policy,
-    )
-    .await
-    {
-        Ok(revoked) => revoked,
-        Err(error) => {
-            coordinator.reopen_for_generation().await;
-            return Err(error);
-        }
-    };
-    let targets = revoked
-        .into_iter()
-        .map(|(target, _reason)| target)
-        .collect();
-    Ok(LiveGoalPolicyCutover {
-        coordinator: Some(coordinator),
-        targets,
-    })
+/// Protect a complete internal Goal lifecycle diagnostic before logging it.
+/// This is not a public-error renderer; external responses retain their existing
+/// safe categories and expose only committed-state/cancellation-count facts.
+pub fn guard_goal_diagnostic_text(text: &str) -> String {
+    RuntimeGoalDiagnosticTextGuard.guard_diagnostic_text(text)
 }
 
 const EPHEMERAL_GRACE_SECS: u64 = 1;
 
-/// Load the exact successor configuration and apply its Goal-policy cutover
-/// before the retiring runtime tears down its transports.
-///
-/// A failed load, classification, or durable cancellation reopens Goal
-/// admission and lets the current daemon continue unchanged. Once this
-/// succeeds, the caller must use this exact `Config` value for the successor
-/// generation rather than loading a second, potentially drifted file.
-fn prepare_reload_config()
--> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Config>> + Send>> {
-    Box::pin(async {
-        let successor = Config::load_or_init().await?;
-        let Some(control_plane) = crate::control_plane::control_plane() else {
-            return Ok(successor);
+/// A refusal precedes generation closure and leaves the runtime alive. Ready
+/// owns the committed policy fence through later graceful retirement; it is not
+/// a claim that required drains or replacement have succeeded.
+enum ReloadPreparation {
+    Ready(Box<Config>, LiveGoalPolicyCutover),
+    Refused(anyhow::Error),
+}
+
+/// Private custody between accepting a graceful exit and the shared all-host
+/// quiescence boundary. The public exit keeps only its exact Config carrier.
+struct PreparedDaemonExit {
+    exit: DaemonExit,
+    cutover: Option<LiveGoalPolicyCutover>,
+}
+
+impl PreparedDaemonExit {
+    fn shutdown() -> Self {
+        Self {
+            exit: DaemonExit::Shutdown,
+            cutover: None,
+        }
+    }
+}
+
+// Production always loads from disk. Lifecycle fixtures supply an explicit
+// test-owned candidate, avoiding process-global environment edits or ambient
+// operator config. Writer/load ordering has a separate first-poll latch test.
+#[derive(Clone)]
+enum ReloadConfigSource {
+    Disk,
+    #[cfg(test)]
+    Fixture(Box<Config>, crate::control_plane::ControlPlaneHandle),
+}
+
+/// Acquire the actual writer before the established loader is first polled.
+/// Its exact owned candidate survives classification, drain and main's handover.
+fn prepare_reload_config(
+    authority: crate::LiveConfigAuthority,
+    source: ReloadConfigSource,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ReloadPreparation>> + Send>> {
+    match source {
+        ReloadConfigSource::Disk => Box::pin(prepare_reload_config_with_loader(
+            authority,
+            Config::load_or_init(),
+            crate::control_plane::control_plane().cloned(),
+        )),
+        #[cfg(test)]
+        ReloadConfigSource::Fixture(config, control_plane) => {
+            Box::pin(prepare_reload_config_with_loader(
+                authority,
+                async { Ok(*config) },
+                Some(control_plane),
+            ))
+        }
+    }
+}
+
+async fn prepare_reload_config_with_loader(
+    authority: crate::LiveConfigAuthority,
+    load: impl std::future::Future<Output = Result<Config>> + Send,
+    control_plane: Option<crate::control_plane::ControlPlaneHandle>,
+) -> Result<ReloadPreparation> {
+    let commit = match authority.begin_config_commit().await {
+        Ok(commit) => commit,
+        Err(error) => return Ok(ReloadPreparation::Refused(error.into())),
+    };
+    let successor = match load.await {
+        Ok(config) => Box::new(config),
+        Err(error) => return Ok(ReloadPreparation::Refused(error)),
+    };
+    let current = commit.current_config();
+    if successor.data_dir != current.data_dir || successor.config_path != current.config_path {
+        return Ok(ReloadPreparation::Refused(anyhow::Error::msg(
+            "daemon reload candidate changed the owned config identity",
+        )));
+    }
+    let Some(control_plane) = control_plane else {
+        return Ok(ReloadPreparation::Refused(anyhow::Error::msg(
+            "canonical control plane is unavailable during daemon reload",
+        )));
+    };
+    let cutover =
+        match goal_policy::reconcile_candidate_with(&commit, &successor, &control_plane).await {
+            Ok(cutover) => cutover,
+            Err(error) => return Ok(ReloadPreparation::Refused(error)),
         };
-        let coordinator = control_plane.goal_execution_restart();
-        coordinator.begin_policy_cutover().await;
-        let policy = goal_policy_snapshot(&successor);
-        let result = async {
-            let registry = control_plane.goal_store()?;
-            zeroclaw_goal::control::revoke_goals_under_policy(registry.as_ref(), &policy).await
+    // A queued writer has no generation lease yet. Closing under the same
+    // serialization prevents publication between classification and handover.
+    authority.close_agent_lifecycle();
+    commit.release_serialization();
+    // Carry the exact policy fence to the shared Reload/Shutdown boundary.
+    // That boundary fences every other host before the first worker drain.
+    Ok(ReloadPreparation::Ready(successor, cutover))
+}
+
+async fn settle_prepared_goal_exit(
+    prepared: Result<PreparedDaemonExit>,
+    coordinator: Option<std::sync::Arc<zeroclaw_goal::GoalExecutionRestartCoordinator>>,
+) -> Result<DaemonExit> {
+    let prepared = prepared?;
+    let primary = if matches!(&prepared.exit, DaemonExit::Reload(_) | DaemonExit::Shutdown) {
+        match coordinator {
+            Some(coordinator) => coordinator.quiesce_for_restart().await.err(),
+            None => Some(anyhow::Error::msg(
+                "canonical Goal coordinator unavailable during graceful retirement",
+            )),
         }
-        .await;
-        if let Err(error) = result {
-            coordinator.reopen_for_generation().await;
-            return Err(error.context("apply prospective Goal policy"));
-        }
-        Ok(successor)
-    })
+    } else {
+        None
+    };
+    if let Some(cutover) = prepared.cutover {
+        // finish owns the first native cause before its additional waits. No
+        // ConfigCommit remains held, and restart closure cannot be reopened by
+        // this policy job's token release.
+        cutover.finish(false, primary).await?;
+    } else if let Some(error) = primary {
+        goal_policy::log_failure(&error);
+        return Err(error.context("quiesce Goal execution before graceful daemon retirement"));
+    }
+    Ok(prepared.exit)
+}
+
+/// Install recovery once, then reconcile the actual generation before any
+/// Goal-capable ingress or execution admission can become available.
+async fn initialize_goal_generation(authority: &crate::LiveConfigAuthority) -> Result<()> {
+    if crate::control_plane::control_plane().is_none() {
+        let data_dir = authority.snapshot_config().data_dir;
+        let owner = crate::control_plane::ControlPlaneRecoveryOwner::start(&data_dir)
+            .await
+            .context("initialize canonical control plane before Goal ingress")?;
+        crate::control_plane::init_control_plane(owner);
+    }
+    let control_plane = crate::control_plane::control_plane().ok_or_else(|| {
+        ::zeroclaw_log::record!(
+            ERROR,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({
+                    "error_key": "canonical_control_plane_not_installed",
+                })),
+            "Canonical control plane was not installed"
+        );
+        anyhow::Error::msg("canonical control plane was not installed")
+    })?;
+    reconcile_goal_generation(authority, control_plane).await
+}
+
+async fn reconcile_goal_generation(
+    authority: &crate::LiveConfigAuthority,
+    control_plane: &crate::control_plane::ControlPlaneHandle,
+) -> Result<()> {
+    let commit = authority.begin_config_commit().await?;
+    let cutover =
+        goal_policy::reconcile_candidate_with(&commit, &commit.current_config(), control_plane)
+            .await?;
+    commit.release_serialization();
+    cutover.finish(false, None).await?;
+    control_plane
+        .goal_execution_restart()
+        .reopen_for_generation_checked()
+        .await
+        .context("reopen reconciled Goal generation")
 }
 
 #[cfg(test)]
@@ -637,7 +610,9 @@ async fn wait_for_exit_signal(
     mut reload_rx: tokio::sync::watch::Receiver<bool>,
     ephemeral: bool,
     client_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-) -> Result<DaemonExit> {
+    authority: crate::LiveConfigAuthority,
+    reload_source: ReloadConfigSource,
+) -> Result<PreparedDaemonExit> {
     use std::sync::atomic::Ordering;
 
     // Future that resolves when ephemeral shutdown is triggered:
@@ -691,11 +666,11 @@ async fn wait_for_exit_signal(
             tokio::select! {
                 _ = sigint.recv() => {
                     ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "Received SIGINT, shutting down...");
-                    return Ok(DaemonExit::Shutdown);
+                    return Ok(PreparedDaemonExit::shutdown());
                 }
                 _ = sigterm.recv() => {
                     ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "Received SIGTERM, shutting down...");
-                    return Ok(DaemonExit::Shutdown);
+                    return Ok(PreparedDaemonExit::shutdown());
                 }
                 _ = sighup.recv() => {
                     ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "Received SIGHUP, ignoring (daemon stays running)");
@@ -703,21 +678,21 @@ async fn wait_for_exit_signal(
                 changed = reload_rx.changed() => {
                     if changed.is_err() {
                         ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), "Reload sender dropped; shutting down");
-                        return Ok(DaemonExit::Shutdown);
+                        return Ok(PreparedDaemonExit::shutdown());
                     }
                     if *reload_rx.borrow_and_update() {
                         ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "Reload requested via /admin/reload");
-                        match prepare_reload_config().await {
-                            Ok(config) => return Ok(DaemonExit::Reload(Box::new(config))),
-                            Err(error) => {
-                                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Failure).with_attrs(::serde_json::json!({"error": format!("{error:#}")})), "Reload refused: prospective Goal policy could not be applied");
-                            }
+                        match prepare_reload_config(authority.clone(), reload_source.clone()).await? {
+                            ReloadPreparation::Ready(config, cutover) => return Ok(PreparedDaemonExit {
+                                exit: DaemonExit::Reload(config), cutover: Some(cutover),
+                            }),
+                            ReloadPreparation::Refused(error) => goal_policy::log_failure(&error),
                         }
                     }
                 }
                 _ = &mut ephemeral_shutdown => {
                     ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "Ephemeral daemon: no clients remaining, shutting down");
-                    return Ok(DaemonExit::Shutdown);
+                    return Ok(PreparedDaemonExit::shutdown());
                 }
             }
         }
@@ -734,30 +709,30 @@ async fn wait_for_exit_signal(
                 res = tokio::signal::ctrl_c() => {
                     res?;
                     ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "Received Ctrl+C, shutting down...");
-                    return Ok(DaemonExit::Shutdown);
+                    return Ok(PreparedDaemonExit::shutdown());
                 }
                 _ = &mut respawn_shutdown => {
                     ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "In-process shutdown requested, shutting down...");
-                    return Ok(DaemonExit::Shutdown);
+                    return Ok(PreparedDaemonExit::shutdown());
                 }
                 changed = reload_rx.changed() => {
                     if changed.is_err() {
                         ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), "Reload sender dropped; shutting down");
-                        return Ok(DaemonExit::Shutdown);
+                        return Ok(PreparedDaemonExit::shutdown());
                     }
                     if *reload_rx.borrow_and_update() {
                         ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "Reload requested via /admin/reload");
-                        match prepare_reload_config().await {
-                            Ok(config) => return Ok(DaemonExit::Reload(Box::new(config))),
-                            Err(error) => {
-                                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Failure).with_attrs(::serde_json::json!({"error": format!("{error:#}")})), "Reload refused: prospective Goal policy could not be applied");
-                            }
+                        match prepare_reload_config(authority.clone(), reload_source.clone()).await? {
+                            ReloadPreparation::Ready(config, cutover) => return Ok(PreparedDaemonExit {
+                                exit: DaemonExit::Reload(config), cutover: Some(cutover),
+                            }),
+                            ReloadPreparation::Refused(error) => goal_policy::log_failure(&error),
                         }
                     }
                 }
                 _ = &mut ephemeral_shutdown => {
                     ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "Ephemeral daemon: no clients remaining, shutting down");
-                    return Ok(DaemonExit::Shutdown);
+                    return Ok(PreparedDaemonExit::shutdown());
                 }
             }
         }
@@ -937,13 +912,39 @@ pub async fn run(
 /// ownership retained and returned to the caller, so the next daemon
 /// generation can adopt it without an unlocked read/reacquire interval. On
 /// shutdown or error the guard is released here.
+/// Canonical recovery/policy reconciliation must succeed before ingress starts;
+/// failed required quiescence or retirement returns an error, never a reload.
 pub async fn run_with_authority(
+    live_config_authority: crate::LiveConfigAuthority,
+    host: String,
+    port: u16,
+    registry: DaemonRegistry,
+    ephemeral: bool,
+    startup_feedback_enabled: bool,
+) -> Result<(
+    DaemonExit,
+    Option<crate::live_config_authority::ConfigOwnershipGuard>,
+)> {
+    run_with_authority_and_reload_source(
+        live_config_authority,
+        host,
+        port,
+        registry,
+        ephemeral,
+        startup_feedback_enabled,
+        ReloadConfigSource::Disk,
+    )
+    .await
+}
+
+async fn run_with_authority_and_reload_source(
     live_config_authority: crate::LiveConfigAuthority,
     host: String,
     port: u16,
     mut registry: DaemonRegistry,
     ephemeral: bool,
     startup_feedback_enabled: bool,
+    reload_source: ReloadConfigSource,
 ) -> Result<(
     DaemonExit,
     Option<crate::live_config_authority::ConfigOwnershipGuard>,
@@ -980,6 +981,13 @@ pub async fn run_with_authority(
 
     crate::agent::pricing_catalog::load_global_pricing_catalog(&config.data_dir);
 
+    // No gateway, socket or channel host exists yet. Recovery errors are fatal
+    // here: warning and opening ingress would revive an ineligible old Goal.
+    if let Err(error) = initialize_goal_generation(&live_config_authority).await {
+        goal_policy::log_failure(&error);
+        return Err(error);
+    }
+
     let mut handles: Vec<JoinHandle<()>> = vec![spawn_state_writer(config.clone())];
     let mut channels_handle: Option<JoinHandle<()>> = None;
 
@@ -1005,17 +1013,25 @@ pub async fn run_with_authority(
     // Construct the TUI registry early so both the gateway (for /api/tuis)
     // and the RPC socket (for tui/list) share the same Arc.
     let tui_registry =
-        std::sync::Arc::new(crate::rpc::tui_identity::TuiRegistry::new(&config.data_dir));
+        std::sync::Arc::new(crate::rpc::tui_identity::TuiRegistry::for_config(&config));
 
     // Canonical live pairing authority for this daemon generation. The
     // gateway serves /pair, rotation, and revocation from THIS instance
     // and the RPC native auth provider verifies against it, so a pairing
     // change reaches both surfaces immediately (no boot-time snapshot).
-    let pairing_guard = std::sync::Arc::new(zeroclaw_config::pairing::PairingGuard::new(
-        config.gateway.require_pairing,
-        &config.gateway.paired_tokens,
-        config.gateway.pairing_code,
-    ));
+    // Code lifetime and brute-force limits are read from this generation's
+    // live `[gateway.pairing_dashboard]` on every use, for /pair and
+    // certificate enrollment alike.
+    let pairing_guard = std::sync::Arc::new(
+        zeroclaw_config::pairing::PairingGuard::new(
+            config.gateway.require_pairing,
+            &config.gateway.paired_tokens,
+            config.gateway.pairing_code,
+        )
+        .with_live_limits(zeroclaw_config::pairing::PairingLimits::live(
+            live_config_authority.live_handle(),
+        )),
+    );
 
     // One inbound-auth state for this daemon generation. The RPC context
     // and the supervised gateway authenticate against the same accepted
@@ -1036,6 +1052,41 @@ pub async fn run_with_authority(
         )?,
     );
 
+    // In-process RPC seam for the supervised gateway. Created before the
+    // gateway starts and bound once this generation's RPC context exists;
+    // the gateway's connect waits for that bind.
+    let inproc_connector = crate::rpc::inproc::InprocConnector::new(channels_cancel.child_token());
+
+    // THE certificate audit logger for this daemon iteration. Built once
+    // here and shared through RpcContext so enrollment, in-band renewal
+    // and the issued-cert ledger all append through a single Merkle-chain
+    // writer. A per-request logger recovers the same chain tip as its
+    // siblings and races them into duplicate sequence numbers, which makes
+    // `verify_chain` reject a file no single writer got wrong.
+    //
+    // Best-effort, like the ACP store above: a logger that cannot be
+    // constructed (e.g. `sign_events` with no usable signing key) leaves
+    // `cert_audit` unset, and the certificate paths then refuse to issue
+    // rather than issue untraceably.
+    let cert_audit: Option<std::sync::Arc<crate::security::audit::AuditLogger>> =
+        match crate::security::audit::AuditLogger::open_shared(
+            config.security.audit.clone(),
+            config.data_dir.clone(),
+        ) {
+            Ok(logger) => Some(logger),
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": e.to_string()})),
+                    "certificate audit logger unavailable: enrollment and certificate \
+                     renewal will refuse to issue"
+                );
+                None
+            }
+        };
+
     if let Some(gateway_start) = registry.take_gateway_start() {
         gateway_required = true;
         let gateway_cfg = config.clone();
@@ -1043,12 +1094,14 @@ pub async fn run_with_authority(
             pairing: pairing_guard.as_ref().clone(),
             inbound_auth: std::sync::Arc::clone(&inbound_auth),
             config: live_config.clone(),
+            cert_audit: cert_audit.clone(),
         };
         let gateway_host = host.clone();
         let gateway_event_bus = event_bus.clone();
         let gateway_reload_controls = GatewayReloadControls {
             shutdown_tx: gateway_shutdown_tx.clone(),
             reload_tx: reload_tx.clone(),
+            inproc: Some(inproc_connector.clone()),
             channel_generation_control: Some(channel_generation_control.clone()),
         };
         let gateway_tui_registry = tui_registry.clone();
@@ -1101,29 +1154,9 @@ pub async fn run_with_authority(
         ));
     }
 
-    if crate::control_plane::control_plane().is_none()
-        && let Err(e) = crate::control_plane::ControlPlaneRecoveryOwner::start(&config.data_dir)
-            .await
-            .map(crate::control_plane::init_control_plane)
-    {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                .with_attrs(::serde_json::json!({ "error": format!("{e:#}") })),
-            "control-plane failed to start; supervision disabled for this run"
-        );
-    }
     // Respawn the reaper for THIS run iteration against the INSTALLED handle, so its
     // boot_id matches what producers stamp via `control_plane()`.
-    if let Some(control_plane) = crate::control_plane::control_plane() {
-        // A control-plane handle survives in-process reload. Reopen the
-        // process-local Goal admission gate only after the prior generation
-        // has fully returned from its shutdown path.
-        control_plane
-            .goal_execution_restart()
-            .reopen_for_generation()
-            .await;
+    if crate::control_plane::control_plane().is_some() {
         let _ = crate::control_plane::spawn_control_plane_reaper(
             crate::control_plane::reaper::DEFAULT_MAX_RUNTIME_SECS,
             channels_cancel.clone(),
@@ -1231,11 +1264,16 @@ pub async fn run_with_authority(
                 }
             });
         }
-        let session_backend = zeroclaw_infra::make_session_backend(
-            &config.data_dir,
-            &config.channels.session_backend,
+        let session_backend = open_rpc_session_backend(
+            || {
+                zeroclaw_infra::make_session_backend(
+                    &config.data_dir,
+                    &config.channels.session_backend,
+                )
+            },
+            RPC_SESSION_STORE_RETRY_DELAY,
         )
-        .ok();
+        .await;
 
         // Wire the memory subsystem so `memory/list` and `memory/search`
         // work over RPC transports (same pattern as the gateway).
@@ -1276,36 +1314,6 @@ pub async fn run_with_authority(
                 None
             }
         };
-
-        // THE certificate audit logger for this daemon iteration. Built once
-        // here and shared through RpcContext so enrollment, in-band renewal
-        // and the issued-cert ledger all append through a single Merkle-chain
-        // writer. A per-request logger recovers the same chain tip as its
-        // siblings and races them into duplicate sequence numbers, which makes
-        // `verify_chain` reject a file no single writer got wrong.
-        //
-        // Best-effort, like the ACP store above: a logger that cannot be
-        // constructed (e.g. `sign_events` with no usable signing key) leaves
-        // `cert_audit` unset, and the certificate paths then refuse to issue
-        // rather than issue untraceably.
-        let cert_audit: Option<std::sync::Arc<crate::security::audit::AuditLogger>> =
-            match crate::security::audit::AuditLogger::open_shared(
-                config.security.audit.clone(),
-                config.data_dir.clone(),
-            ) {
-                Ok(logger) => Some(logger),
-                Err(e) => {
-                    ::zeroclaw_log::record!(
-                        ERROR,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                            .with_attrs(::serde_json::json!({"error": e.to_string()})),
-                        "certificate audit logger unavailable: enrollment and certificate \
-                         renewal will refuse to issue"
-                    );
-                    None
-                }
-            };
 
         let hooks: Option<std::sync::Arc<crate::hooks::HookRunner>> = if config.hooks.enabled {
             Some(std::sync::Arc::new(
@@ -1355,13 +1363,27 @@ pub async fn run_with_authority(
             sop_audit,
             sop_driver_handles,
             hooks,
-            cert_audit,
+            cert_audit: cert_audit.clone(),
             auth: rpc_auth,
             goal_runtime: std::sync::Arc::new(crate::rpc::goal::RpcGoalRuntime::default()),
         }))
     } else {
         None
     };
+
+    if let Some(ctx) = rpc_ctx.as_ref() {
+        inproc_connector.bind(std::sync::Arc::clone(ctx));
+    }
+
+    // Close remote sessions whose client has been gone for
+    // `wss.orphaned_session_timeout_secs`, so they do not hold the live
+    // session map until a restart.
+    if let Some(ctx) = rpc_ctx.as_ref() {
+        handles.push(crate::rpc::orphans::spawn_orphan_retirement(
+            ctx,
+            channels_cancel.clone(),
+        ));
+    }
 
     // Local IPC RPC listener (Unix socket on Unix, Named Pipe on Windows).
     if let Some(socket_start) = registry.take_socket_start() {
@@ -1564,7 +1586,13 @@ pub async fn run_with_authority(
     // Wait for shutdown (SIGINT/SIGTERM/Ctrl+C), reload (in-process channel),
     // or an unrecoverable initial socket ownership conflict.
     let rpc_connection_count = socket_client_count.clone();
-    let exit = wait_for_exit_signal(reload_rx, ephemeral, socket_client_count);
+    let exit = wait_for_exit_signal(
+        reload_rx,
+        ephemeral,
+        socket_client_count,
+        live_config_authority.clone(),
+        reload_source,
+    );
     tokio::pin!(exit);
 
     let startup_result = if socket_required {
@@ -1579,7 +1607,7 @@ pub async fn run_with_authority(
         Ok(None)
     };
 
-    let mut exit_result = match startup_result {
+    let prepared_exit = match startup_result {
         Err(error) => Err(error),
         Ok(Some(exit)) => Ok(exit),
         Ok(None) if startup_feedback_enabled => {
@@ -1607,6 +1635,11 @@ pub async fn run_with_authority(
             exit.await
         }
     };
+    let exit_result = settle_prepared_goal_exit(
+        prepared_exit,
+        crate::control_plane::control_plane().map(|plane| plane.goal_execution_restart()),
+    )
+    .await;
     match &exit_result {
         Ok(exit) => crate::health::mark_component_error(
             "daemon",
@@ -1615,34 +1648,20 @@ pub async fn run_with_authority(
                 DaemonExit::Reload(_) => "reload requested",
             },
         ),
-        Err(error) => crate::health::mark_component_error("daemon", format!("{error:#}")),
-    }
-
-    if matches!(
-        &exit_result,
-        Ok(DaemonExit::Reload(_) | DaemonExit::Shutdown)
-    ) && let Some(control_plane) = crate::control_plane::control_plane()
-        && let Err(error) = control_plane
-            .goal_execution_restart()
-            .quiesce_for_restart()
-            .await
-    {
-        // Reload and graceful shutdown both fence Goal work before transport
-        // teardown. The coordinator pauses running Goals before draining
-        // admitted operations; forced termination leaves unsettled work to
-        // fail-closed recovery.
-        let context = if matches!(&exit_result, Ok(DaemonExit::Reload(_))) {
-            "quiesce Goal execution before daemon reload"
-        } else {
-            "quiesce Goal execution before daemon shutdown"
-        };
-        exit_result = Err(error.context(context));
+        Err(error) => crate::health::mark_component_error(
+            "daemon",
+            RuntimeGoalDiagnosticTextGuard.guard_diagnostic_text(&format!("{error:#}")),
+        ),
     }
 
     // Freeze admission before stopping ingress; detached final writes must
     // drain as well as component workers before process ownership is released.
     live_config_authority.close_agent_lifecycle();
     channels_cancel.cancel();
+    // The gateway stops on its own shutdown signal, not the cancellation
+    // token. Without it the gateway is aborted at the grace window below and
+    // never withdraws what it published, such as its tunnel forwards.
+    let _ = gateway_shutdown_tx.send(true);
 
     // Retire the accepted RPC connections before the component handles are
     // touched. Each connection cancels and joins its prompts, and its listener
@@ -1654,7 +1673,23 @@ pub async fn run_with_authority(
     // that is refused below instead of handing over. Only this wait carries
     // the listeners' budget: the per-component grace below stays as it was, so
     // an unrelated pending component adds no reload latency.
-    let drain = await_rpc_connection_drain(&rpc_connection_count).await;
+    // The in-process seam's connections are the retiring generation's work
+    // too: the connector joins them (aborting stragglers at the same grace
+    // the socket listener uses) while the wait below counts their activity
+    // alongside the socket clients. They stay out of the ephemeral-exit count
+    // above on purpose; they are not external clients.
+    // Seal admission first, so a zero the wait below observes cannot be
+    // followed by a late in-process admission; the drain then joins what was
+    // admitted before the seal.
+    inproc_connector.close_admission();
+    let inproc_for_drain = inproc_connector.clone();
+    let (_aborted_inproc, drain) = tokio::join!(
+        inproc_connector.drain(),
+        await_rpc_connection_drain_with(|| {
+            rpc_connection_count.load(std::sync::atomic::Ordering::Relaxed)
+                + inproc_for_drain.connection_count()
+        })
+    );
     let exit_result = settle_exit_against_drain(exit_result, drain);
 
     // Channel teardown owns listener cleanup plus all accepted message work.
@@ -1883,26 +1918,28 @@ pub(crate) enum RpcDrain {
     Outstanding(usize),
 }
 
-/// Wait for the connections the RPC listeners accepted to finish draining.
+/// Wait for the connections the RPC listeners and the in-process connector
+/// accepted to finish draining.
 ///
-/// `count` is decremented when the last task started by a connection has
-/// ended: the connection task, each prompt it spawned, and the nested turn task
-/// each hold a clone of the connection's liveness token. A count of zero is
-/// therefore the daemon-visible proof that no old-generation work is still
-/// running, not merely that the connection task was aborted. The wait is
-/// bounded just past the listeners' own forced-abort deadline
-/// (`rpc::CONNECTION_DRAIN_GRACE`), the point at which a connection that
-/// ignored cancellation is aborted. Returns immediately when no connection was
-/// accepted, which is also the case when no RPC listener is running at all.
-pub(crate) async fn await_rpc_connection_drain(count: &std::sync::atomic::AtomicUsize) -> RpcDrain {
-    use std::sync::atomic::Ordering;
-
+/// `outstanding` reads the live activity: the daemon sums the socket
+/// listeners' client count with the in-process connector's count, so both
+/// kinds of accepted work gate the generation handover. Each count is
+/// decremented when the last task started by a connection has ended: the
+/// connection task, each prompt it spawned, and the nested turn task each hold
+/// a clone of the connection's liveness token. Zero is therefore the
+/// daemon-visible proof that no old-generation work is still running, not
+/// merely that the connection task was aborted. The wait is bounded just past
+/// the listeners' own forced-abort deadline (`rpc::CONNECTION_DRAIN_GRACE`),
+/// the point at which a connection that ignored cancellation is aborted.
+/// Returns immediately when nothing was accepted, which is also the case when
+/// no RPC listener is running at all.
+pub(crate) async fn await_rpc_connection_drain_with(outstanding: impl Fn() -> usize) -> RpcDrain {
     const POLL_INTERVAL: Duration = Duration::from_millis(25);
     let deadline = tokio::time::Instant::now()
         + crate::rpc::CONNECTION_DRAIN_GRACE.saturating_add(Duration::from_millis(500));
 
     loop {
-        let outstanding = count.load(Ordering::Relaxed);
+        let outstanding = outstanding();
         if outstanding == 0 {
             return RpcDrain::Complete;
         }
@@ -1922,36 +1959,44 @@ pub(crate) async fn await_rpc_connection_drain(count: &std::sync::atomic::Atomic
 
 /// Decide what a reload may do once the drain has been attempted.
 ///
-/// A reload keeps the process alive and starts a replacement generation over
-/// the same durable sessions, so it is admissible only when the retiring
-/// generation is proven finished. When the drain budget expires with work
-/// still unwinding, the reload is refused and downgraded to a shutdown: the
-/// supervisor restarts a fresh process, which cannot overlap with work this
-/// one never managed to retire. Shutdown exits and failures are returned
-/// unchanged.
+/// An otherwise successful reload with accepted work still outstanding must
+/// shut down instead of starting a replacement in this process. An unfinished
+/// graceful shutdown reports failure, and this fallback never masks an earlier
+/// retirement error.
 fn settle_exit_against_drain(exit: Result<DaemonExit>, drain: RpcDrain) -> Result<DaemonExit> {
     let RpcDrain::Outstanding(outstanding) = drain else {
         return exit;
     };
-    if !matches!(exit, Ok(DaemonExit::Reload(_))) {
-        return exit;
+    if matches!(&exit, Ok(DaemonExit::Reload(_))) {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({ "connections": outstanding })),
+            "Reload refused: accepted RPC work is still unwinding; shutting down instead"
+        );
+        return Ok(DaemonExit::Shutdown);
     }
     ::zeroclaw_log::record!(
         WARN,
         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
             .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
             .with_attrs(::serde_json::json!({ "connections": outstanding })),
-        "Reload refused: RPC work from the retiring generation is still unwinding; shutting down \
-         instead so a replacement generation cannot overlap it"
+        "Daemon retirement failed: accepted RPC work is still unwinding; replacement is refused"
     );
-    Ok(DaemonExit::Shutdown)
+    retain_exit_failure(
+        exit,
+        anyhow::Error::msg(format!(
+            "daemon retirement left {outstanding} accepted RPC task(s) outstanding"
+        )),
+    )
 }
 
 const CHANNEL_SUPERVISOR_SHUTDOWN_GRACE: Duration = Duration::from_secs(6);
 
-async fn retire_channels_supervisor(handle: Option<JoinHandle<()>>) -> bool {
+async fn retire_channels_supervisor(handle: Option<JoinHandle<()>>) -> Result<()> {
     let Some(mut handle) = handle else {
-        return true;
+        return Ok(());
     };
     tokio::select! {
         biased;
@@ -1961,43 +2006,103 @@ async fn retire_channels_supervisor(handle: Option<JoinHandle<()>>) -> bool {
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                         .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({ "error": error.to_string() })),
+                    .with_attrs(::serde_json::json!({
+                        "error": guard_goal_diagnostic_text(&format!("{error:#}")),
+                    })),
                     "Channel supervisor ended without establishing clean retirement"
                 );
-                false
+                Err(anyhow::Error::new(error).context("retire channel supervisor"))
             } else {
-                true
+                Ok(())
             }
         }
         () = tokio::time::sleep(CHANNEL_SUPERVISOR_SHUTDOWN_GRACE) => {
             handle.abort();
-            let _ = handle.await;
+            let joined = handle.await;
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                     .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
                 "Channel supervisor did not retire inside its shutdown allowance"
             );
-            false
+            let mut error = Some(anyhow::Error::msg("channel supervisor retirement allowance expired"));
+            if let Err(join_error) = joined
+                && !join_error.is_cancelled()
+            {
+                goal_policy::retain_error(&mut error, join_error.into());
+            }
+            Err(error.unwrap_or_else(|| anyhow::Error::msg("channel supervisor did not retire")))
         }
     }
 }
 
 fn settle_exit_against_channel_retirement(
     exit: Result<DaemonExit>,
-    channels_retired: bool,
+    channels_retired: Result<()>,
 ) -> Result<DaemonExit> {
-    if channels_retired || !matches!(exit, Ok(DaemonExit::Reload(_))) {
+    let Err(error) = channels_retired else {
         return exit;
-    }
+    };
     ::zeroclaw_log::record!(
         WARN,
         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
             .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-        "Reload refused: channel work from the retiring generation is still unwinding; shutting \
-         down instead so a replacement generation cannot overlap it"
+        "Daemon retirement failed: channel work did not retire cleanly; replacement is refused"
     );
-    Ok(DaemonExit::Shutdown)
+    retain_exit_failure(exit, error)
+}
+
+fn retain_exit_failure(exit: Result<DaemonExit>, secondary: anyhow::Error) -> Result<DaemonExit> {
+    let mut error = exit.err();
+    goal_policy::retain_error(&mut error, secondary);
+    Err(error.unwrap_or_else(|| anyhow::Error::msg("daemon retirement failed")))
+}
+
+/// Pause before the RPC plane's one retry of a failed session-store open.
+const RPC_SESSION_STORE_RETRY_DELAY: Duration = Duration::from_millis(250);
+
+/// Open the RPC plane's session store, retrying once.
+///
+/// Every `session/*` RPC method refuses without the store, so a failed open
+/// is reported at ERROR instead of being dropped, and retried once in case
+/// another component was creating the same fresh database at that moment.
+async fn open_rpc_session_backend<T>(
+    mut open: impl FnMut() -> std::io::Result<T>,
+    retry_delay: Duration,
+) -> Option<T> {
+    let first = match open() {
+        Ok(backend) => return Some(backend),
+        Err(error) => error,
+    };
+    ::zeroclaw_log::record!(
+        ERROR,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+            .with_attrs(::serde_json::json!({ "error": format!("{first:#}") })),
+        "RPC session store failed to open; retrying once"
+    );
+    tokio::time::sleep(retry_delay).await;
+    match open() {
+        Ok(backend) => {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Success),
+                "RPC session store opened on retry"
+            );
+            Some(backend)
+        }
+        Err(error) => {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({ "error": format!("{error:#}") })),
+                "RPC session store unavailable after a retry; session RPC methods will refuse until the daemon restarts"
+            );
+            None
+        }
+    }
 }
 
 fn spawn_component_supervisor<F, Fut>(
@@ -2574,6 +2679,53 @@ async fn retry_heartbeat_mcp_registry(
     Ok(())
 }
 
+/// The sampling temperature a heartbeat turn sends: the agent's configured
+/// provider temperature, or none, so the provider's own default applies.
+/// Never a fixed value: some models reject any temperature, and the
+/// heartbeat's turns must work wherever the agent's own turns do.
+fn heartbeat_temperature(config: &Config, agent_alias: &str) -> Option<f64> {
+    config
+        .model_provider_for_agent(agent_alias)
+        .and_then(|e| e.temperature)
+}
+
+/// Phase 1 of a two-phase tick: ask the agent which of `tasks` to run. Returns
+/// the turn itself rather than wrapping it in another `async fn`, as
+/// [`crate::agent::run`] does, so the caller's `Send` future stays shallow.
+fn heartbeat_decision_turn<'a>(
+    config: &Config,
+    agent_alias: &'a str,
+    tasks: &[crate::heartbeat::engine::HeartbeatTask],
+    mcp_registry: Option<&std::sync::Arc<crate::tools::McpRegistry>>,
+    execution_capability: &crate::live_config_authority::AgentExecutionCapability,
+) -> impl std::future::Future<Output = Result<String>> + 'a {
+    let decision_prompt = format!(
+        "[Heartbeat Task | decision] {}",
+        crate::heartbeat::engine::HeartbeatEngine::build_decision_prompt(tasks),
+    );
+    crate::agent::run(
+        config.clone(),
+        agent_alias,
+        Some(decision_prompt),
+        None,
+        None,
+        heartbeat_temperature(config, agent_alias),
+        vec![],
+        false,
+        None,
+        None,
+        zeroclaw_api::ingress::TurnOrigin::Daemon,
+        crate::agent::loop_::AgentRunOverrides {
+            mcp_registry: mcp_registry.map(std::sync::Arc::clone),
+            execution_capability: Some(execution_capability.clone()),
+            internal_principal: Some(zeroclaw_api::ingress::InternalPrincipal::Daemon {
+                task: "heartbeat:decision".to_string(),
+            }),
+            ..crate::agent::loop_::AgentRunOverrides::default()
+        },
+    )
+}
+
 async fn run_heartbeat_worker(
     config: Config,
     execution_capability: crate::live_config_authority::AgentExecutionCapability,
@@ -2721,30 +2873,12 @@ async fn run_heartbeat_worker(
 
         // ── Phase 1: LLM decision (two-phase mode) ──────────────
         let tasks_to_run = if two_phase {
-            let decision_prompt = format!(
-                "[Heartbeat Task | decision] {}",
-                HeartbeatEngine::build_decision_prompt(&tasks),
-            );
-            let phase1_fut = Box::pin(crate::agent::run(
-                config.clone(),
+            let phase1_fut = Box::pin(heartbeat_decision_turn(
+                &config,
                 &agent_alias,
-                Some(decision_prompt),
-                None,
-                None,
-                Some(0.0),
-                vec![],
-                false,
-                None,
-                None,
-                zeroclaw_api::ingress::TurnOrigin::Daemon,
-                crate::agent::loop_::AgentRunOverrides {
-                    mcp_registry: shared_mcp_registry.as_ref().map(Arc::clone),
-                    execution_capability: Some(execution_capability.clone()),
-                    internal_principal: Some(zeroclaw_api::ingress::InternalPrincipal::Daemon {
-                        task: "heartbeat:decision".to_string(),
-                    }),
-                    ..crate::agent::loop_::AgentRunOverrides::default()
-                },
+                &tasks,
+                shared_mcp_registry.as_ref(),
+                &execution_capability,
             ));
             let phase1_result = if config.heartbeat.task_timeout_secs > 0 {
                 match tokio::time::timeout(
@@ -2847,9 +2981,7 @@ async fn run_heartbeat_worker(
                 Some(sc) => format!("{sc}\n\n{task_prompt}"),
                 None => task_prompt,
             };
-            let temp: Option<f64> = config
-                .model_provider_for_agent(&agent_alias)
-                .and_then(|e| e.temperature);
+            let temp = heartbeat_temperature(&config, &agent_alias);
             let phase2_fut = Box::pin(crate::agent::run(
                 config.clone(),
                 &agent_alias,
@@ -3364,6 +3496,101 @@ mod tests {
 
     const DAEMON_DEADLOCK_GUARD: Duration = Duration::from_secs(30);
 
+    /// The reload drain must report the connections that were still unwinding
+    /// when its budget expired, not silently declare the generation retired.
+    #[tokio::test(start_paused = true)]
+    async fn rpc_drain_reports_connections_left_unwinding_when_the_budget_expires() {
+        let count = std::sync::atomic::AtomicUsize::new(2);
+        assert_eq!(
+            await_rpc_connection_drain_with(|| count.load(std::sync::atomic::Ordering::Relaxed))
+                .await,
+            RpcDrain::Outstanding(2)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rpc_drain_completes_once_the_last_connection_task_ends() {
+        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1));
+        let releaser = std::sync::Arc::clone(&count);
+        let release = zeroclaw_spawn::spawn!(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            releaser.store(0, std::sync::atomic::Ordering::Relaxed);
+        });
+        assert_eq!(
+            await_rpc_connection_drain_with(|| count.load(std::sync::atomic::Ordering::Relaxed))
+                .await,
+            RpcDrain::Complete
+        );
+        release.await.unwrap();
+    }
+
+    // Exercise the real generation/transport owner with an explicit candidate,
+    // not whatever operator install a unit-test process happens to inherit.
+    async fn run_fixture(
+        mut config: Config,
+        host: String,
+        port: u16,
+        registry: DaemonRegistry,
+        ephemeral: bool,
+        feedback: bool,
+    ) -> Result<DaemonExit> {
+        config.gateway.host = host.clone();
+        if port != 0 {
+            config.gateway.port = port;
+        }
+        let authority = crate::LiveConfigAuthority::new_owned(config)?;
+        let (exit, ownership) =
+            run_with_authority_fixture(authority, host, port, registry, ephemeral, feedback)
+                .await?;
+        drop(ownership);
+        Ok(exit)
+    }
+
+    async fn run_with_authority_fixture(
+        authority: crate::LiveConfigAuthority,
+        host: String,
+        port: u16,
+        registry: DaemonRegistry,
+        ephemeral: bool,
+        feedback: bool,
+    ) -> Result<(
+        DaemonExit,
+        Option<crate::live_config_authority::ConfigOwnershipGuard>,
+    )> {
+        let candidate = Box::new(authority.snapshot_config());
+        let control_plane = crate::control_plane::ControlPlaneHandle::open(&candidate.data_dir)?;
+        run_with_authority_and_reload_source(
+            authority,
+            host,
+            port,
+            registry,
+            ephemeral,
+            feedback,
+            ReloadConfigSource::Fixture(candidate, control_plane),
+        )
+        .await
+    }
+
+    async fn wait_for_exit_signal_fixture(
+        reload: tokio::sync::watch::Receiver<bool>,
+        ephemeral: bool,
+        count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Result<DaemonExit> {
+        let directory = tempfile::tempdir()?;
+        let config = test_config(&directory);
+        let control_plane = crate::control_plane::ControlPlaneHandle::open(&config.data_dir)?;
+        let coordinator = control_plane.goal_execution_restart();
+        let prepared = wait_for_exit_signal(
+            reload,
+            ephemeral,
+            count,
+            crate::LiveConfigAuthority::for_tests(config.clone()),
+            ReloadConfigSource::Fixture(Box::new(config), control_plane),
+        )
+        .await;
+        settle_prepared_goal_exit(prepared, Some(coordinator)).await
+    }
+
     #[test]
     fn goal_policy_snapshot_projects_validated_agent_and_matrix_routes() {
         let mut config = Config::default();
@@ -3406,9 +3633,8 @@ mod tests {
         config.goal.enabled = true;
         let live = zeroclaw_config::live::LiveConfig::new(config.clone());
 
-        let generation = coordinator.policy_generation();
         let mut prospective = config.clone();
-        prospective.goal.default_token_limit = 123_456;
+        prospective.goal.default_token_limit = Some(123_456);
         let cutover = begin_live_goal_policy_cutover_with(
             std::sync::Arc::clone(&coordinator),
             std::sync::Arc::clone(&registry),
@@ -3418,10 +3644,9 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(cutover.cancelled_goal_count(), None);
-        assert!(cutover.finish().await.is_none());
-        assert_eq!(coordinator.policy_generation(), generation);
+        cutover.finish(false, None).await.unwrap();
+        coordinator.reopen_for_generation_checked().await.unwrap();
 
-        let generation = coordinator.policy_generation();
         let mut prospective = config;
         prospective.goal.enabled = false;
         let cutover = begin_live_goal_policy_cutover_with(
@@ -3433,9 +3658,298 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(cutover.cancelled_goal_count(), Some(0));
-        assert_eq!(cutover.cancelled_goal_count(), Some(0));
-        assert!(cutover.finish().await.is_none());
-        assert!(coordinator.policy_generation() > generation);
+        assert!(coordinator.reopen_for_generation_checked().await.is_err());
+        cutover.finish(false, None).await.unwrap();
+        coordinator.reopen_for_generation_checked().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reload_loads_once_under_writer_and_closes_waiting_generation_writes() {
+        let directory = TempDir::new().unwrap();
+        let config = test_config(&directory);
+        let authority = crate::LiveConfigAuthority::for_tests(config.clone());
+        let control_plane =
+            crate::control_plane::ControlPlaneHandle::open(&config.data_dir).unwrap();
+        let coordinator = control_plane.goal_execution_restart();
+        let first_writer = authority.begin_config_commit().await.unwrap();
+        let polls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = std::sync::Arc::new(tokio::sync::Notify::new());
+        let release = std::sync::Arc::new(tokio::sync::Notify::new());
+        let mut candidate = config.clone();
+        candidate.gateway.port = 43_210;
+        let loader = {
+            let polls = polls.clone();
+            let observed = observed.clone();
+            let release = release.clone();
+            async move {
+                polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                observed.notify_one();
+                release.notified().await;
+                Ok(candidate)
+            }
+        };
+        let reload =
+            prepare_reload_config_with_loader(authority.clone(), loader, Some(control_plane));
+        tokio::pin!(reload);
+        // The loader's first effect is impossible while an earlier actual
+        // ConfigCommit retains the canonical writer.
+        tokio::select! {
+            biased;
+            result = &mut reload => panic!("reload bypassed the held writer: {}", result.is_ok()),
+            () = tokio::task::yield_now() => {}
+        }
+        assert_eq!(polls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        first_writer.release_serialization();
+        tokio::select! {
+            biased;
+            result = &mut reload => panic!("reload bypassed the held loader: {}", result.is_ok()),
+            () = observed.notified() => {}
+        }
+        let later_writer = authority.begin_config_commit();
+        tokio::pin!(later_writer);
+        tokio::select! {
+            biased;
+            result = &mut later_writer => panic!("writer interleaved during candidate load: {}", result.is_ok()),
+            () = tokio::task::yield_now() => {}
+        }
+        // Changing the fixture's disk content cannot substitute a second load
+        // after classification. This test proves carrier/order, not the real
+        // Config loader's environment/provenance boundary.
+        std::fs::write(&config.config_path, "gateway.port = 54321\n").unwrap();
+        release.notify_one();
+        let ReloadPreparation::Ready(candidate, cutover) = reload.await.unwrap() else {
+            panic!("valid exact candidate was refused");
+        };
+        assert_eq!(candidate.gateway.port, 43_210);
+        assert_eq!(polls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(later_writer.await.is_err());
+        assert_eq!(
+            authority.snapshot_config().gateway.port,
+            config.gateway.port
+        );
+        let exit = settle_prepared_goal_exit(
+            Ok(PreparedDaemonExit {
+                exit: DaemonExit::Reload(candidate),
+                cutover: Some(cutover),
+            }),
+            Some(coordinator),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(exit, DaemonExit::Reload(_)));
+    }
+
+    #[tokio::test]
+    async fn reload_load_failure_preserves_native_cause_and_old_writer_admission() {
+        let directory = TempDir::new().unwrap();
+        let config = test_config(&directory);
+        let authority = crate::LiveConfigAuthority::for_tests(config.clone());
+        let control_plane =
+            crate::control_plane::ControlPlaneHandle::open(&config.data_dir).unwrap();
+        let preparation = prepare_reload_config_with_loader(
+            authority.clone(),
+            async { Err(std::io::Error::other("distinctive config loader failure").into()) },
+            Some(control_plane),
+        )
+        .await
+        .unwrap();
+        let ReloadPreparation::Refused(error) = preparation else {
+            panic!("failed loader supplied a reload candidate");
+        };
+        assert!(error.downcast_ref::<std::io::Error>().is_some());
+        assert!(authority.begin_config_commit().await.is_ok());
+        assert_eq!(authority.snapshot_config().config_path, config.config_path);
+    }
+
+    #[tokio::test]
+    async fn fresh_goal_generation_reconciles_revoked_and_preserves_eligible_recovery() {
+        use crate::control_plane::{
+            GoalBlocker, GoalBlockerKind, GoalPauseReason, GoalPauseState, GoalTaskRecord,
+            GoalTaskRegistry, GoalTransitionResult, SqliteTaskStore, TaskKind, TaskRecord,
+            TaskStatus,
+        };
+
+        let directory = TempDir::new().unwrap();
+        let mut config = test_config(&directory);
+        config.goal.enabled = true;
+        config.agents.insert("main".into(), Default::default());
+        let opaque = GoalPauseState {
+            reason: GoalPauseReason::NeedsUserInput,
+            description: Some("retain the exact operator answer boundary".into()),
+            blockers: vec![GoalBlocker {
+                kind: GoalBlockerKind::NeedsUserInput,
+                message: "opaque blocker".into(),
+                payload: Some(serde_json::json!({"opaque": ["value", 42]})),
+            }],
+        };
+        {
+            let store = SqliteTaskStore::new(&config.data_dir).unwrap();
+            for (id, agent, paused) in [
+                ("revoked-running", "removed", false),
+                ("eligible-running", "main", false),
+                ("eligible-paused", "main", true),
+            ] {
+                let task = TaskRecord {
+                    id: id.into(),
+                    kind: TaskKind::Goal,
+                    agent: agent.into(),
+                    status: TaskStatus::Running,
+                    owner_pid: 999_999,
+                    owner_boot_id: "previous-fixture-boot".into(),
+                    heartbeat_at: None,
+                    depth: 0,
+                    parent_id: None,
+                    originator_route: Some(format!("zerocode:{id}")),
+                    originator_chain: Vec::new(),
+                    delivered: false,
+                    idem_key: None,
+                    principal_id: Some("opaque principal value".into()),
+                    session_id: Some(format!("rpc_{id}")),
+                    execution_epoch: 1,
+                    started_at: "2026-01-01T00:00:00Z".into(),
+                    finished_at: None,
+                };
+                let goal = GoalTaskRecord {
+                    task_id: id.into(),
+                    objective: "retain the declared objective".into(),
+                    effective_token_limit: Some(100),
+                    ..Default::default()
+                };
+                assert_eq!(
+                    store
+                        .create_or_replace_session_goal(task, goal)
+                        .await
+                        .unwrap(),
+                    GoalTransitionResult::Applied
+                );
+                if paused {
+                    assert_eq!(
+                        store
+                            .pause_session_goal(id, &format!("rpc_{id}"), 1, opaque.clone())
+                            .await
+                            .unwrap(),
+                        GoalTransitionResult::Applied
+                    );
+                }
+            }
+        }
+        // A fresh recovery owner, not a warmed process-global coordinator.
+        let owner = crate::control_plane::ControlPlaneRecoveryOwner::start_with_boot_id(
+            &config.data_dir,
+            "new-fixture-boot".into(),
+        )
+        .await
+        .unwrap();
+        let authority = crate::LiveConfigAuthority::for_tests(config.clone());
+        reconcile_goal_generation(&authority, owner.handle())
+            .await
+            .unwrap();
+        let reopened = SqliteTaskStore::new(&config.data_dir).unwrap();
+        let revoked = reopened
+            .current_goal_for_session("rpc_revoked-running")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(revoked.status, TaskStatus::Cancelled);
+        assert_eq!(
+            revoked.principal_id.as_deref(),
+            Some("opaque principal value")
+        );
+        let eligible = reopened
+            .current_goal_for_session("rpc_eligible-running")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(eligible.status, TaskStatus::Paused);
+        assert_eq!(
+            reopened
+                .get_goal_task(&eligible.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .pause_reason,
+            Some(GoalPauseReason::DaemonRestart)
+        );
+        let paused = reopened
+            .get_goal_task("eligible-paused")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(paused.pause_reason, Some(opaque.reason));
+        assert_eq!(paused.pause_description, opaque.description);
+        assert_eq!(paused.blockers, opaque.blockers);
+        assert_eq!(paused.objective, "retain the declared objective");
+    }
+
+    #[tokio::test]
+    async fn generation_reconciliation_refuses_an_unavailable_goal_registry() {
+        let directory = TempDir::new().unwrap();
+        let config = test_config(&directory);
+        let authority = crate::LiveConfigAuthority::for_tests(config.clone());
+        let store: std::sync::Arc<dyn crate::control_plane::TaskRegistry> = std::sync::Arc::new(
+            crate::control_plane::SqliteTaskStore::new(&config.data_dir).unwrap(),
+        );
+        // This existing task-only capability intentionally cannot admit Goal
+        // work; startup must return the actual refusal, not warn and reopen.
+        let handle = crate::control_plane::ControlPlaneHandle::task_only(store, "fixture-boot");
+        let revision = authority.published_revision();
+        let error = reconcile_goal_generation(&authority, &handle)
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("no Goal registry"));
+        assert_eq!(authority.published_revision(), revision);
+        assert!(authority.begin_config_commit().await.is_ok());
+    }
+
+    #[test]
+    fn teardown_secondary_failure_preserves_the_original_native_cause() {
+        let exit = settle_exit_against_drain(
+            Err(std::io::Error::other("original Goal quiescence failure").into()),
+            RpcDrain::Outstanding(2),
+        );
+        let error = settle_exit_against_channel_retirement(
+            exit,
+            Err(anyhow::Error::msg("distinctive channel retirement failure")),
+        )
+        .unwrap_err();
+        assert!(error.chain().any(|cause| cause.is::<std::io::Error>()));
+        let chain = format!("{error:#}");
+        assert!(chain.contains("original Goal quiescence failure"));
+        assert!(chain.contains("2 accepted RPC task(s) outstanding"));
+        assert!(chain.contains("distinctive channel retirement failure"));
+    }
+
+    #[tokio::test]
+    async fn rpc_session_store_open_is_retried_once_after_a_failure() {
+        let mut calls = 0;
+        let opened = open_rpc_session_backend(
+            || {
+                calls += 1;
+                if calls == 1 {
+                    Err(std::io::Error::other("database is locked"))
+                } else {
+                    Ok(calls)
+                }
+            },
+            Duration::ZERO,
+        )
+        .await;
+        assert_eq!(opened, Some(2));
+    }
+
+    #[tokio::test]
+    async fn rpc_session_store_open_gives_up_after_one_retry() {
+        let mut calls = 0;
+        let opened: Option<()> = open_rpc_session_backend(
+            || {
+                calls += 1;
+                Err(std::io::Error::other("unable to open database file"))
+            },
+            Duration::ZERO,
+        )
+        .await;
+        assert_eq!(opened, None);
+        assert_eq!(calls, 2);
     }
 
     #[tokio::test]
@@ -3471,6 +3985,186 @@ mod tests {
         );
     }
 
+    /// Drive the real daemon through a reload while an authenticated
+    /// in-process connection holds activity for `hold`: the connection is
+    /// initialized with a paired token over `reload_controls.inproc`, then a
+    /// prompt's activity token is held (a model turn needs a provider this
+    /// harness has none of; the token is what such a task holds). Returns the
+    /// daemon's exit and whether the token was released before it exited.
+    async fn reload_with_held_in_process_activity(hold: Duration) -> (DaemonExit, bool) {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+        let _broadcast_guard = hold_broadcast_hooks().await;
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        config.gateway.require_pairing = true;
+        config.gateway.paired_tokens = vec!["zc_daemon_inproc_token".to_string()];
+        // The in-process seam is served under the non-local session policy,
+        // whose `initialize` refuses every caller while TUI identity signing is
+        // off, so this daemon gets a signing key, as one with a `.secret_key` has.
+        std::fs::write(config.data_dir.join(".secret_key"), "42".repeat(32)).unwrap();
+
+        let released = Arc::new(AtomicBool::new(false));
+        let released_for_gateway = released.clone();
+        let mut registry = DaemonRegistry::new();
+        registry.register_socket(Box::new(move |_ctx, cancel, _client_count, readiness| {
+            Box::pin(async move {
+                if let Some(readiness) = readiness {
+                    readiness.report_ready();
+                }
+                cancel.cancelled().await;
+                Ok(())
+            })
+        }));
+        registry.register_gateway(Box::new(
+            move |_host,
+                  _port,
+                  _config,
+                  _authority,
+                  _event_bus,
+                  reload_controls,
+                  _tui_reg,
+                  _auth,
+                  _ready| {
+                let released = released_for_gateway.clone();
+                Box::pin(async move {
+                    let controls = reload_controls
+                        .expect("daemon should pass reload controls to gateway starter");
+                    let connector = controls
+                        .inproc
+                        .clone()
+                        .expect("daemon passes the connector");
+                    let client = connector.connect().await.expect("bound connector connects");
+                    let (read_half, mut write_half) = tokio::io::split(client);
+                    let mut reader = tokio::io::BufReader::new(read_half);
+                    let init = serde_json::json!({
+                        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                        "params": {"protocol_version": 1, "auth_token": "zc_daemon_inproc_token"},
+                    });
+                    write_half
+                        .write_all(format!("{init}\n").as_bytes())
+                        .await
+                        .expect("write initialize");
+                    let mut line = String::new();
+                    reader.read_line(&mut line).await.expect("read initialize");
+                    let frame: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+                    assert!(
+                        frame.get("result").is_some(),
+                        "paired token must be accepted over the in-process seam: {frame}"
+                    );
+                    // The prompt's activity, held past the reload request.
+                    let token = connector.activity_token();
+                    controls.reload_tx.send(true).expect("send reload signal");
+                    tokio::time::sleep(hold).await;
+                    drop(token);
+                    released.store(true, Ordering::SeqCst);
+                    // Keep the connection open like a real gateway would.
+                    let _keep = (reader, write_half);
+                    std::future::pending::<Result<()>>().await
+                })
+            },
+        ));
+        let exit = tokio::time::timeout(
+            Duration::from_secs(25),
+            run_fixture(config, "127.0.0.1".to_string(), 0, registry, false, false),
+        )
+        .await
+        .expect("daemon finishes inside the drain budget plus component grace")
+        .expect("daemon run should succeed");
+        (exit, released.load(Ordering::SeqCst))
+    }
+
+    /// In-process activity released within the drain budget: the generation
+    /// proves itself retired and the reload hands over.
+    #[tokio::test]
+    async fn reload_hands_over_once_held_in_process_activity_is_released() {
+        let (exit, released) =
+            reload_with_held_in_process_activity(Duration::from_millis(1200)).await;
+        assert!(
+            released,
+            "the daemon must wait for the in-process activity to end"
+        );
+        assert!(matches!(exit, DaemonExit::Reload(_)));
+    }
+
+    /// In-process activity that outlives the drain budget: the generation
+    /// cannot prove it retired, so the reload is downgraded to a shutdown.
+    /// Fails if the daemon stops counting in-process activity in its drain
+    /// (the socket count alone is zero here).
+    #[tokio::test]
+    async fn reload_is_downgraded_when_in_process_activity_outlives_the_drain_budget() {
+        let budget = crate::rpc::CONNECTION_DRAIN_GRACE + Duration::from_secs(3);
+        let (exit, _released) = reload_with_held_in_process_activity(budget).await;
+        assert!(
+            matches!(exit, DaemonExit::Shutdown),
+            "a reload must not hand over while in-process work is still live"
+        );
+    }
+
+    /// An authenticated in-process connection is the retiring generation's
+    /// work: while its activity token is live the generation drain must not
+    /// complete, so a reload is downgraded to a shutdown; once the generation
+    /// is cancelled and the connector drained, the same reload is admissible.
+    #[tokio::test(start_paused = true)]
+    async fn reload_is_refused_while_an_in_process_connection_is_still_live() {
+        use crate::rpc::inproc::InprocConnector;
+        use crate::rpc::session::SessionStore;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio_util::sync::CancellationToken;
+
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let session_queue = std::sync::Arc::new(
+            zeroclaw_infra::session_queue::SessionActorQueue::new(4, 10, 60),
+        );
+        let successor = Box::new(config.clone());
+        let ctx = crate::rpc::context::RpcContext::minimal(
+            config,
+            std::sync::Arc::new(SessionStore::new(16, session_queue)),
+        );
+        let cancel = CancellationToken::new();
+        let connector = InprocConnector::new(cancel.clone());
+        connector.bind(ctx);
+        let socket_clients = AtomicUsize::new(0);
+
+        // Hold the connection open across the drain budget.
+        let held = connector.connect().await.expect("bound connector connects");
+        tokio::task::yield_now().await;
+        assert_eq!(connector.connection_count(), 1);
+        let outstanding = || socket_clients.load(Ordering::Relaxed) + connector.connection_count();
+        let drain = await_rpc_connection_drain_with(outstanding).await;
+        assert_eq!(
+            drain,
+            RpcDrain::Outstanding(1),
+            "a live in-process connection must keep the generation undrained"
+        );
+        assert!(
+            matches!(
+                settle_exit_against_drain(Ok(DaemonExit::Reload(successor.clone())), drain)
+                    .unwrap(),
+                DaemonExit::Shutdown
+            ),
+            "a reload must not hand over while in-process work is live"
+        );
+
+        // Retire the generation: cancel, join the connection tasks, and the
+        // count reaches zero, so the same reload is now admissible.
+        cancel.cancel();
+        let aborted = connector.drain().await;
+        assert_eq!(
+            aborted, 0,
+            "a cancelled in-process connection unwinds cooperatively"
+        );
+        drop(held);
+        let drain = await_rpc_connection_drain_with(outstanding).await;
+        assert_eq!(drain, RpcDrain::Complete);
+        let expected_path = successor.config_path.clone();
+        let exit = settle_exit_against_drain(Ok(DaemonExit::Reload(successor)), drain).unwrap();
+        assert!(matches!(exit, DaemonExit::Reload(config) if config.config_path == expected_path));
+    }
+
     #[tokio::test(start_paused = true)]
     async fn daemon_channels_shutdown_allows_cleanup_past_generic_grace() {
         let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -3481,7 +4175,7 @@ mod tests {
         });
 
         assert!(
-            retire_channels_supervisor(Some(handle)).await,
+            retire_channels_supervisor(Some(handle)).await.is_ok(),
             "channel cleanup longer than the generic 500 ms grace must still retire cleanly"
         );
         assert!(
@@ -3507,27 +4201,24 @@ mod tests {
         });
 
         let retired = retire_channels_supervisor(Some(handle)).await;
-        assert!(!retired, "a timed-out channel generation is not retired");
+        assert!(
+            retired.is_err(),
+            "a timed-out channel generation is not retired"
+        );
         assert!(
             dropped.load(std::sync::atomic::Ordering::SeqCst),
             "the timed-out supervisor must be aborted and joined"
         );
         assert!(
-            matches!(
-                settle_exit_against_channel_retirement(
-                    Ok(DaemonExit::Reload(Box::default())),
-                    retired
-                )
-                .unwrap(),
-                DaemonExit::Shutdown
-            ),
+            settle_exit_against_channel_retirement(Ok(DaemonExit::Reload(Box::default())), retired)
+                .is_err(),
             "reload must be refused when channel retirement is unproven"
         );
         assert!(
             matches!(
                 settle_exit_against_channel_retirement(
                     Ok(DaemonExit::Reload(Box::default())),
-                    true
+                    Ok(())
                 )
                 .unwrap(),
                 DaemonExit::Reload(_)
@@ -3591,7 +4282,7 @@ mod tests {
             },
         ));
 
-        let daemon = zeroclaw_spawn::spawn!(run_with_authority(
+        let daemon = zeroclaw_spawn::spawn!(run_with_authority_fixture(
             authority,
             "127.0.0.1".to_string(),
             0,
@@ -3732,6 +4423,100 @@ mod tests {
 
         assert!(workspace_dir.join("HEARTBEAT.md").exists());
         assert!(!config.data_dir.join("HEARTBEAT.md").exists());
+    }
+
+    /// Phase 1's decision turn sends the agent's configured temperature, or
+    /// none when it is unset, never a fixed value a model may reject. Drives
+    /// the real decision turn against a local Messages API for
+    /// `claude-opus-5-5` and reads the request body it received.
+    #[tokio::test]
+    async fn heartbeat_decision_turn_sends_only_the_configured_temperature() {
+        use crate::heartbeat::engine::{HeartbeatTask, TaskPriority, TaskStatus};
+        use axum::{Json, Router, routing::post};
+        use std::sync::{Arc, Mutex};
+        use zeroclaw_config::schema::{AliasedAgentConfig, RiskProfileConfig};
+
+        let received: Arc<Mutex<Vec<serde_json::Value>>> = Arc::default();
+        let sink = Arc::clone(&received);
+        let app = Router::new().route(
+            "/v1/messages",
+            post(move |Json(body): Json<serde_json::Value>| {
+                let sink = Arc::clone(&sink);
+                async move {
+                    sink.lock().unwrap().push(body);
+                    Json(serde_json::json!({
+                        "id": "msg_heartbeat", "type": "message", "role": "assistant",
+                        "content": [{"type": "text", "text": "[]"}],
+                        "model": "claude-opus-5-5", "stop_reason": "end_turn",
+                        "usage": {"input_tokens": 1, "output_tokens": 1}
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let tasks = vec![HeartbeatTask {
+            text: "check the inbox".to_string(),
+            priority: TaskPriority::Medium,
+            status: TaskStatus::Active,
+        }];
+        for configured in [None, Some(0.25)] {
+            let tmp = TempDir::new().unwrap();
+            let mut config = test_config(&tmp);
+            let provider = config
+                .providers
+                .models
+                .ensure("anthropic", "heartbeat")
+                .expect("anthropic provider slot");
+            provider.api_key = Some("sk-ant-fixture".to_string());
+            provider.model = Some("claude-opus-5-5".to_string());
+            provider.uri = Some(format!("http://{addr}"));
+            provider.temperature = configured;
+            config.memory.backend = "none".to_string();
+            config.memory.auto_save = false;
+            config.risk_profiles.insert(
+                "heartbeat-profile".to_string(),
+                RiskProfileConfig {
+                    level: crate::security::AutonomyLevel::Full,
+                    ..RiskProfileConfig::default()
+                },
+            );
+            config.agents.insert(
+                "ops".to_string(),
+                AliasedAgentConfig {
+                    model_provider: "anthropic.heartbeat".into(),
+                    risk_profile: "heartbeat-profile".into(),
+                    ..Default::default()
+                },
+            );
+            let authority = crate::LiveConfigAuthority::new(config.clone());
+            heartbeat_decision_turn(
+                &config,
+                "ops",
+                &tasks,
+                None,
+                &authority.execution_capability(),
+            )
+            .await
+            .expect("the decision turn completes");
+            let body = received
+                .lock()
+                .unwrap()
+                .pop()
+                .expect("the decision turn reached the provider");
+            assert_eq!(body["model"], "claude-opus-5-5");
+            assert_eq!(
+                body.get("temperature").cloned(),
+                configured.map(|t| serde_json::json!(t)),
+                "the decision turn must send the configured temperature ({configured:?}), \
+                 and none when unset: {body}"
+            );
+        }
+        server.abort();
     }
 
     #[tokio::test]
@@ -4361,6 +5146,7 @@ mod tests {
                 multi_message_delay_ms: 800,
                 interrupt_on_new_message: false,
                 mention_only: false,
+                unauthorized_message: None,
                 per_user_session: true,
                 passive_group_context: false,
                 ack_reactions: None,
@@ -4667,6 +5453,7 @@ mod tests {
                 multi_message_delay_ms: 800,
                 interrupt_on_new_message: false,
                 mention_only: false,
+                unauthorized_message: None,
                 per_user_session: true,
                 passive_group_context: false,
                 ack_reactions: None,
@@ -4699,6 +5486,7 @@ mod tests {
                 multi_message_delay_ms: 800,
                 interrupt_on_new_message: false,
                 mention_only: false,
+                unauthorized_message: None,
                 per_user_session: true,
                 passive_group_context: false,
                 ack_reactions: None,
@@ -4754,6 +5542,7 @@ mod tests {
                 draft_update_interval_ms: 1000,
                 interrupt_on_new_message: false,
                 mention_only: false,
+                unauthorized_message: None,
                 ack_reactions: None,
                 proxy_url: None,
                 approval_timeout_secs: 120,
@@ -4790,7 +5579,7 @@ mod tests {
 
         let (_reload_tx, reload_rx) = tokio::sync::watch::channel(false);
         let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let handle = zeroclaw_spawn::spawn!(wait_for_exit_signal(reload_rx, false, count));
+        let handle = zeroclaw_spawn::spawn!(wait_for_exit_signal_fixture(reload_rx, false, count));
 
         // Give the signal handler time to register
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -4814,7 +5603,7 @@ mod tests {
 
         let (reload_tx, reload_rx) = tokio::sync::watch::channel(false);
         let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let handle = zeroclaw_spawn::spawn!(wait_for_exit_signal(reload_rx, false, count));
+        let handle = zeroclaw_spawn::spawn!(wait_for_exit_signal_fixture(reload_rx, false, count));
         tokio::time::sleep(Duration::from_millis(50)).await;
         reload_tx.send(true).expect("send reload");
 
@@ -4872,22 +5661,25 @@ mod tests {
             },
         ));
 
+        // Poll the daemon on its own task: driving it inline beneath the timeout
+        // and join! wrappers nests several large futures on the test thread and
+        // exhausts the default stack before the gateway starter runs.
+        let daemon = zeroclaw_spawn::spawn!(run_fixture(
+            config,
+            "127.0.0.1".to_string(),
+            4242,
+            registry,
+            false,
+            false,
+        ));
         let (exit, seen) = tokio::time::timeout(DAEMON_DEADLOCK_GUARD, async {
-            tokio::join!(
-                run(
-                    config,
-                    "127.0.0.1".to_string(),
-                    4242,
-                    registry,
-                    false,
-                    false,
-                ),
-                seen_rx.recv(),
-            )
+            tokio::join!(daemon, seen_rx.recv())
         })
         .await
         .expect("daemon must not deadlock after a gateway-triggered reload");
-        let exit = exit.expect("daemon run should succeed");
+        let exit = exit
+            .expect("daemon task should not panic")
+            .expect("daemon run should succeed");
 
         assert!(matches!(exit, DaemonExit::Reload(_)));
         let (
@@ -4906,6 +5698,65 @@ mod tests {
         assert!(has_gateway_shutdown_tx);
         assert!(has_reload_tx);
         assert!(has_tui_registry);
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn daemon_exit_signals_the_gateway_instead_of_aborting_it() {
+        // Exit without the RPC reload helper, which signals the gateway itself:
+        // the same teardown a SIGTERM takes. The gateway must be told to stop
+        // so it can withdraw what it published (its tunnel) before returning,
+        // rather than being aborted when the component grace window ends.
+        let _broadcast_guard = hold_broadcast_hooks().await;
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let (signalled_tx, mut signalled_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let mut registry = DaemonRegistry::new();
+        registry.register_gateway(Box::new(
+            move |_host,
+                  _port,
+                  _config,
+                  _live_config_authority,
+                  _event_tx,
+                  reload_controls,
+                  _tui_registry,
+                  _pairing,
+                  _ready_tx| {
+                let signalled_tx = signalled_tx.clone();
+                Box::pin(async move {
+                    let controls =
+                        reload_controls.expect("daemon should pass reload controls to gateway");
+                    let mut shutdown_rx = controls.shutdown_tx.subscribe();
+                    controls.reload_tx.send(true).expect("send reload signal");
+                    if shutdown_rx.wait_for(|stop| *stop).await.is_ok() {
+                        signalled_tx.send(()).ok();
+                    }
+                    Ok(())
+                })
+            },
+        ));
+
+        let exit = tokio::time::timeout(
+            DAEMON_DEADLOCK_GUARD,
+            run_fixture(
+                config,
+                "127.0.0.1".to_string(),
+                4243,
+                registry,
+                false,
+                false,
+            ),
+        )
+        .await
+        .expect("daemon must not deadlock on exit")
+        .expect("daemon run should succeed");
+
+        assert!(matches!(exit, DaemonExit::Reload(_)));
+        assert!(
+            signalled_rx.try_recv().is_ok(),
+            "the daemon aborted the gateway without signalling its shutdown"
+        );
     }
 
     #[allow(clippy::await_holding_lock)]
@@ -4936,7 +5787,7 @@ mod tests {
 
             let (result, started) = tokio::time::timeout(DAEMON_DEADLOCK_GUARD, async {
                 tokio::join!(
-                    run(
+                    run_fixture(
                         config,
                         "127.0.0.1".to_string(),
                         0,
@@ -5018,7 +5869,7 @@ mod tests {
 
         let result = tokio::time::timeout(
             DAEMON_DEADLOCK_GUARD,
-            run(config, "127.0.0.1".to_string(), 0, registry, false, false),
+            run_fixture(config, "127.0.0.1".to_string(), 0, registry, false, false),
         )
         .await
         .expect("daemon must not restart-loop an unbindable socket path");
@@ -5084,7 +5935,7 @@ mod tests {
 
         let exit = timeout(
             Duration::from_secs(8),
-            run(config, "127.0.0.1".to_string(), 0, registry, true, true),
+            run_fixture(config, "127.0.0.1".to_string(), 0, registry, true, true),
         )
         .await
         .expect("daemon should remain supervised after a post-readiness socket error")
@@ -5185,7 +6036,7 @@ mod tests {
                 })
             },
         ));
-        let mut daemon = zeroclaw_spawn::spawn!(run_with_authority(
+        let mut daemon = zeroclaw_spawn::spawn!(run_with_authority_fixture(
             authority,
             "127.0.0.1".to_string(),
             0,
@@ -5314,7 +6165,7 @@ mod tests {
 
         let exit = timeout(
             Duration::from_secs(3),
-            run(config, "127.0.0.1".to_string(), 0, registry, false, false),
+            run_fixture(config, "127.0.0.1".to_string(), 0, registry, false, false),
         )
         .await
         .expect("daemon should return after gateway-triggered reload")
@@ -5352,7 +6203,7 @@ mod tests {
 
         let (_reload_tx, reload_rx) = tokio::sync::watch::channel(false);
         let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let handle = zeroclaw_spawn::spawn!(wait_for_exit_signal(reload_rx, true, count));
+        let handle = zeroclaw_spawn::spawn!(wait_for_exit_signal_fixture(reload_rx, true, count));
 
         // No clients ever connect — should NOT shut down.
         let result = timeout(Duration::from_millis(500), handle).await;
@@ -5370,7 +6221,7 @@ mod tests {
         let (_reload_tx, reload_rx) = tokio::sync::watch::channel(false);
         let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let count2 = count.clone();
-        let handle = zeroclaw_spawn::spawn!(wait_for_exit_signal(reload_rx, true, count2));
+        let handle = zeroclaw_spawn::spawn!(wait_for_exit_signal_fixture(reload_rx, true, count2));
 
         // Simulate client connect then disconnect.
         count.store(1, Ordering::Relaxed);
@@ -5394,7 +6245,8 @@ mod tests {
         let (_reload_tx, reload_rx) = tokio::sync::watch::channel(false);
         let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let count2 = count.clone();
-        let mut handle = zeroclaw_spawn::spawn!(wait_for_exit_signal(reload_rx, true, count2));
+        let mut handle =
+            zeroclaw_spawn::spawn!(wait_for_exit_signal_fixture(reload_rx, true, count2));
 
         // Client connects, disconnects.
         count.store(1, Ordering::Relaxed);
@@ -5540,15 +6392,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn detect_gateway_bind_mode_starts_fresh_on_free_port() {
-        // Reserve an ephemeral port, then release it so the address is free.
+    async fn classify_gateway_bind_outcome_starts_fresh_on_successful_bind() {
+        // Keep the successful bind owned until classification instead of
+        // releasing the port and racing other listeners to bind it again.
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
-            .expect("reserve port");
+            .expect("bind ephemeral port");
         let port = listener.local_addr().unwrap().port();
-        drop(listener);
         assert_eq!(
-            detect_gateway_bind_mode(&Config::default(), "127.0.0.1", port).await,
+            classify_gateway_bind_outcome(Ok(listener), &Config::default(), "127.0.0.1", port)
+                .await,
             GatewayBindMode::StartFresh
         );
     }
@@ -7462,29 +8315,6 @@ mod tests {
         // and clearing the global hook for the next test.
     }
 
-    /// The reload drain must report the connections that were still unwinding
-    /// when its budget expired, not silently declare the generation retired.
-    #[tokio::test(start_paused = true)]
-    async fn rpc_drain_reports_connections_left_unwinding_when_the_budget_expires() {
-        let count = std::sync::atomic::AtomicUsize::new(2);
-        assert_eq!(
-            await_rpc_connection_drain(&count).await,
-            RpcDrain::Outstanding(2)
-        );
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn rpc_drain_completes_once_the_last_connection_task_ends() {
-        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1));
-        let releaser = std::sync::Arc::clone(&count);
-        let release = zeroclaw_spawn::spawn!(async move {
-            tokio::time::sleep(Duration::from_millis(200)).await;
-            releaser.store(0, std::sync::atomic::Ordering::Relaxed);
-        });
-        assert_eq!(await_rpc_connection_drain(&count).await, RpcDrain::Complete);
-        release.await.unwrap();
-    }
-
     /// A reload hands the same durable sessions to a replacement generation, so
     /// it is admissible only on proof that the retiring generation is finished.
     #[test]
@@ -7498,7 +8328,7 @@ mod tests {
                 .unwrap(),
                 DaemonExit::Shutdown
             ),
-            "an undrained reload must shut the process down instead of handing over"
+            "an undrained reload must shut down instead of handing over"
         );
         assert!(
             matches!(
@@ -7512,12 +8342,8 @@ mod tests {
             "a drained reload must still reload"
         );
         assert!(
-            matches!(
-                settle_exit_against_drain(Ok(DaemonExit::Shutdown), RpcDrain::Outstanding(1))
-                    .unwrap(),
-                DaemonExit::Shutdown
-            ),
-            "a shutdown is unaffected by the drain verdict"
+            settle_exit_against_drain(Ok(DaemonExit::Shutdown), RpcDrain::Outstanding(1)).is_err(),
+            "an undrained shutdown must not claim success"
         );
         assert!(
             settle_exit_against_drain(Err(anyhow::Error::msg("boom")), RpcDrain::Outstanding(1))
@@ -7526,12 +8352,14 @@ mod tests {
         );
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn reload_waits_for_rpc_connection_drain_without_holding_other_components() {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering};
         use tokio::time::{Duration, Instant, timeout};
 
+        let _broadcast_guard = hold_broadcast_hooks().await;
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp);
 
@@ -7590,7 +8418,7 @@ mod tests {
         let started = Instant::now();
         let exit = timeout(
             Duration::from_secs(8),
-            run(config, "127.0.0.1".to_string(), 0, registry, false, false),
+            run_fixture(config, "127.0.0.1".to_string(), 0, registry, false, false),
         )
         .await
         .expect("daemon should finish the reload inside the RPC connection drain budget")
@@ -7638,7 +8466,7 @@ mod tests {
         );
         // No gateway is registered: the daemon runs with the gateway disabled.
         let registry = DaemonRegistry::new();
-        let daemon = run(config, "127.0.0.1".to_string(), 0, registry, false, false);
+        let daemon = run_fixture(config, "127.0.0.1".to_string(), 0, registry, false, false);
         tokio::pin!(daemon);
 
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -7809,7 +8637,7 @@ mod tests {
             }
 
             // Startup feedback off: no readiness reporter of the daemon's own.
-            let daemon = run(config, "127.0.0.1".to_string(), 0, registry, false, false);
+            let daemon = run_fixture(config, "127.0.0.1".to_string(), 0, registry, false, false);
             tokio::pin!(daemon);
             let deadline = Instant::now() + Duration::from_secs(5);
             while received.load(Ordering::SeqCst) == 0 {
@@ -7874,7 +8702,7 @@ mod tests {
             ));
         }
 
-        let daemon = run(config, "127.0.0.1".to_string(), 0, registry, false, false);
+        let daemon = run_fixture(config, "127.0.0.1".to_string(), 0, registry, false, false);
         tokio::pin!(daemon);
         let deadline = Instant::now() + Duration::from_secs(5);
         let live = loop {

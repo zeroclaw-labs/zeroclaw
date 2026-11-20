@@ -10,7 +10,10 @@ use crate::security::policy::ToolOperation;
 use crate::subagent::{SubAgentOverrides, SubAgentSpawn};
 use anyhow::Result;
 use async_trait::async_trait;
+use futures_util::FutureExt;
 use serde_json::json;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::schema::Config;
@@ -27,7 +30,18 @@ pub struct SpawnSubagentTool {
     /// any spawn work happens. Set by the agent loop from
     /// `AgentRunOverrides.is_subagent` at registry construction time.
     is_subagent_caller: bool,
+    /// The capabilities and principal the parent turn was built from. When
+    /// bound, the child runs through them, so it uses the parent's provider,
+    /// memory and supplied tools and resolves for the same principal. Empty
+    /// only for a registry no capability entry point bound, which keeps the
+    /// config-backed child run.
+    capabilities: crate::composition::CapabilitySlot,
     execution_capability: Option<AgentExecutionCapability>,
+    /// The session memory of the registry this tool was assembled into. Once
+    /// that session is pinned to its owner's private plane, the child runs
+    /// over the same routed memory instead of building the agent's shared
+    /// memory for itself.
+    session_memory: Option<Arc<zeroclaw_tools::session_memory::SessionMemoryRoute>>,
 }
 
 impl SpawnSubagentTool {
@@ -45,8 +59,54 @@ impl SpawnSubagentTool {
             parent_alias: parent_alias.into(),
             security,
             is_subagent_caller: false,
+            capabilities: Arc::new(std::sync::OnceLock::new()),
             execution_capability: None,
+            session_memory: None,
         }
+    }
+
+    /// Share the session memory route of the registry this tool is assembled
+    /// into.
+    #[must_use]
+    pub fn with_session_memory(
+        mut self,
+        route: Arc<zeroclaw_tools::session_memory::SessionMemoryRoute>,
+    ) -> Self {
+        self.session_memory = Some(route);
+        self
+    }
+
+    /// The memory a child of this tool's session runs over: the session's
+    /// routed memory once it is pinned, or `None` for an unowned session, in
+    /// which case the child builds the agent's memory as before.
+    fn child_memory(&self) -> Option<Arc<dyn zeroclaw_memory::Memory>> {
+        self.session_memory
+            .as_ref()
+            .and_then(|route| route.routed())
+            .map(|routed| Arc::clone(&routed.memory))
+    }
+
+    /// Run children through `capabilities` for `principal`. The first
+    /// binding wins.
+    #[must_use]
+    pub fn with_capabilities(
+        self,
+        capabilities: crate::composition::RuntimeCapabilities,
+        principal: Option<zeroclaw_api::principal::PrincipalId>,
+    ) -> Self {
+        let _ = self
+            .capabilities
+            .set(crate::composition::BoundCapabilities {
+                capabilities,
+                principal,
+            });
+        self
+    }
+
+    /// The slot this tool reads its capabilities from, for the registry that
+    /// builds it to hand to the owning entry point.
+    pub(crate) fn capabilities_slot(&self) -> crate::composition::CapabilitySlot {
+        Arc::clone(&self.capabilities)
     }
 
     /// Mark this tool instance as belonging to a SubAgent's tool
@@ -76,10 +136,15 @@ impl SpawnSubagentTool {
 /// tools every step turn drops. The scope is carried, not resolved here — the
 /// child re-resolves it against its own registry, so a differently assembled
 /// child registry is narrowed by the same contract.
-fn child_run_overrides(policy: Arc<SecurityPolicy>) -> AgentRunOverrides {
+fn child_run_overrides(
+    policy: Arc<SecurityPolicy>,
+    memory: Option<Arc<dyn zeroclaw_memory::Memory>>,
+) -> AgentRunOverrides {
     AgentRunOverrides {
         security: Some(policy),
-        memory: None,
+        // A pinned session's child stays on its owner's plane. `None` only for
+        // an unowned session, whose child builds the agent's shared memory.
+        memory,
         is_subagent: true,
         // Sub-turn origin already skips memory injection; explicit for
         // the same future-proofing reason as `is_subagent` above.
@@ -105,8 +170,174 @@ fn child_run_overrides(policy: Arc<SecurityPolicy>) -> AgentRunOverrides {
     }
 }
 
+async fn settle_goal_subagent_row(
+    cp: &crate::control_plane::ControlPlaneHandle,
+    task_id: &str,
+    status: crate::control_plane::TaskStatus,
+    output: Option<String>,
+    error: Option<String>,
+) -> Result<()> {
+    let won = cp
+        .store
+        .transition_terminal_if_owner(
+            task_id,
+            std::process::id(),
+            &cp.boot_id,
+            status,
+            output,
+            error,
+        )
+        .await?;
+    if !won {
+        let snapshot = cp.store.get_snapshot(task_id).await?;
+        anyhow::ensure!(
+            snapshot.is_some_and(|snapshot| snapshot.task.status.is_terminal()),
+            "Goal subagent terminal transition lost without a terminal winner"
+        );
+    }
+    Ok(())
+}
+
+async fn run_goal_spawn_owned<F>(
+    context: &crate::goal_accounting::GoalForegroundContext,
+    task_id: &str,
+    run_future: F,
+) -> Result<ToolResult>
+where
+    F: Future<Output = Result<String>> + Send,
+{
+    let mut caught = Box::pin(std::panic::AssertUnwindSafe(run_future).catch_unwind());
+    // The poll adaptor and drain selector borrow this flag across awaits;
+    // their shared reference must remain Send in the Tool trait future.
+    let body_started = std::sync::atomic::AtomicBool::new(false);
+    let mut body = Box::pin(std::future::poll_fn(|cx| {
+        body_started.store(true, std::sync::atomic::Ordering::Relaxed);
+        caught.as_mut().poll(cx)
+    }));
+    let mut stop = None;
+    let result = tokio::select! {
+        biased;
+        () = context.token().cancelled() => {
+            stop = Some(crate::control_plane::TaskStatus::Cancelled);
+            context.token().cancel();
+            if body_started.load(std::sync::atomic::Ordering::Relaxed) { body.await } else { Ok(Err(zeroclaw_api::tool::ToolExecutionCancelled.into())) }
+        }
+        () = async {
+            match context.deadline() {
+                Some(deadline) => tokio::time::sleep_until(deadline).await,
+                None => std::future::pending::<()>().await,
+            }
+        } => {
+            stop = Some(crate::control_plane::TaskStatus::TimedOut);
+            context.token().cancel();
+            if body_started.load(std::sync::atomic::Ordering::Relaxed) { body.await } else { Ok(Err(zeroclaw_api::tool::ToolExecutionCancelled.into())) }
+        }
+        result = &mut body => result,
+    };
+    let status = stop.unwrap_or(match &result {
+        Ok(Ok(_)) => crate::control_plane::TaskStatus::Completed,
+        _ => crate::control_plane::TaskStatus::Failed,
+    });
+    let cp = context.control_plane();
+    let (output, error) = match (&result, status) {
+        (Ok(Ok(response)), crate::control_plane::TaskStatus::Completed) => {
+            (Some(response.clone()), None)
+        }
+        (Ok(Err(error)), crate::control_plane::TaskStatus::Failed) => (
+            None,
+            Some(crate::security::scrub(&format!(
+                "subagent run failed: {error}"
+            ))),
+        ),
+        _ => (None, None),
+    };
+    let cleanup = settle_goal_subagent_row(cp, task_id, status, output, error).await;
+    let run_result = match result {
+        Ok(result) => result,
+        Err(panic) => {
+            if let Err(error) = cleanup {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(serde_json::json!({
+                            "task_id": task_id,
+                            "error": crate::security::scrub(&format!("{error:#}")),
+                        })),
+                    "Goal subagent panic cleanup failed"
+                );
+            }
+            std::panic::resume_unwind(panic);
+        }
+    };
+    let run_result = match (run_result, cleanup) {
+        (Err(error), Err(cleanup)) => {
+            let error = error.context(format!("Goal subagent cleanup failed: {cleanup:#}"));
+            Err(
+                if zeroclaw_api::turn_stop::turn_stop(&error).is_some_and(|stop| {
+                    stop.code == zeroclaw_api::turn_stop::TurnStopCode::BudgetExhausted
+                }) {
+                    crate::agent::turn::wrap_goal_spend_refusal(error, false)
+                } else {
+                    error
+                },
+            )
+        }
+        (Ok(_), Err(cleanup)) => Err(cleanup),
+        (result, Ok(())) => result,
+    };
+    if let Some(status) = stop {
+        let error = run_result
+            .err()
+            .unwrap_or_else(|| anyhow::Error::new(zeroclaw_api::tool::ToolExecutionCancelled));
+        return Err(if status == crate::control_plane::TaskStatus::TimedOut {
+            error.context(zeroclaw_api::turn_stop::TurnStop::recoverable(
+                zeroclaw_api::turn_stop::TurnStopCode::TurnTimeout,
+                "Goal subagent timed out",
+            ))
+        } else {
+            error
+        });
+    }
+    run_result.map(|response| ToolResult {
+        success: true,
+        output: if response.trim().is_empty() {
+            "subagent completed without output".to_string().into()
+        } else {
+            response.into()
+        },
+        error: None,
+    })
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    /// Test-only: records the memory each child run is started with, so a
+    /// regression can observe what an assembled registry hands the child
+    /// without running a model.
+    pub(crate) static CHILD_MEMORY_SINK:
+        Arc<std::sync::Mutex<Option<Option<Arc<dyn zeroclaw_memory::Memory>>>>>;
+}
+
 #[async_trait]
 impl Tool for SpawnSubagentTool {
+    fn may_invoke_agent_child(&self, _args: &serde_json::Value) -> bool {
+        true
+    }
+
+    async fn execute_with_context(
+        &self,
+        args: serde_json::Value,
+        context: &zeroclaw_api::tool::ToolExecutionContext,
+    ) -> Result<ToolResult> {
+        if context.is_goal_foreground()
+            || crate::goal_accounting::GoalForegroundContext::is_participating()
+        {
+            context.scope_only(self.execute(args)).await
+        } else {
+            context.run(self.execute(args)).await
+        }
+    }
     fn requires_unrestricted_principal(&self) -> bool {
         true
     }
@@ -139,18 +370,44 @@ impl Tool for SpawnSubagentTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> Result<ToolResult> {
-        let _goal_child_guard =
-            match zeroclaw_goal::control::goal_child_fence::admit_goal_child().await {
-                Ok(guard) => guard,
-                Err(error) => {
-                    return Ok(ToolResult {
-                        success: false,
-                        output: ToolOutput::default(),
-                        error: Some(error.to_string()),
-                    });
-                }
-            };
+        let goal = crate::goal_accounting::GoalForegroundContext::current_for_child()
+            .map_err(|error| error.context(zeroclaw_api::tool::GoalChildOperationError))?;
+        if let Some(parent) = goal {
+            if parent.depth() >= 1 {
+                return Ok(ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some(crate::i18n::get_required_cli_string(
+                        "goal-mode-child-recursion-disallowed",
+                    )),
+                });
+            }
+            if parent.token().is_cancelled()
+                || parent
+                    .deadline()
+                    .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
+            {
+                return Err(
+                    anyhow::Error::new(zeroclaw_api::tool::ToolExecutionCancelled)
+                        .context(zeroclaw_api::tool::GoalChildOperationError),
+                );
+            }
+            let child = parent.child();
+            return child
+                .scope(self.execute_inner(args, Some(&child)))
+                .await
+                .map_err(|error| error.context(zeroclaw_api::tool::GoalChildOperationError));
+        }
+        self.execute_inner(args, None).await
+    }
+}
 
+impl SpawnSubagentTool {
+    async fn execute_inner(
+        &self,
+        args: serde_json::Value,
+        goal: Option<&crate::goal_accounting::GoalForegroundContext>,
+    ) -> Result<ToolResult> {
         // Depth-1 cap: a SubAgent may not spawn its own subagents.
         // The caller-side flag is set at registry construction time
         // from `AgentRunOverrides.is_subagent`, so the refusal fires
@@ -258,13 +515,21 @@ impl Tool for SpawnSubagentTool {
             .and_then(|e| e.temperature);
         let session_path = std::path::PathBuf::from(format!("subagent-{run_id}"));
 
-        let mut run_overrides = child_run_overrides(subagent_ctx.policy.clone());
+        let mut run_overrides =
+            child_run_overrides(subagent_ctx.policy.clone(), self.child_memory());
         run_overrides.execution_admission = execution_admission.clone();
+        #[cfg(test)]
+        let _ = CHILD_MEMORY_SINK.try_with(|sink| {
+            *sink.lock().unwrap() = Some(run_overrides.memory.clone());
+        });
         let parent_alias = subagent_ctx.parent_alias.clone();
 
         let cp_task_id = run_id.clone();
-        if let Some(cp) = crate::control_plane::control_plane() {
-            let _ = cp
+        let cp = goal
+            .map(|context| context.control_plane().clone())
+            .or_else(|| crate::control_plane::control_plane().cloned());
+        if let Some(cp) = cp.as_ref() {
+            let created = cp
                 .store
                 .create(crate::control_plane::TaskRecord {
                     id: cp_task_id.clone(),
@@ -274,8 +539,10 @@ impl Tool for SpawnSubagentTool {
                     owner_pid: std::process::id(),
                     owner_boot_id: cp.boot_id.clone(),
                     heartbeat_at: None,
-                    depth: u32::from(self.is_subagent_caller),
-                    parent_id: None,
+                    depth: goal.map_or(u32::from(self.is_subagent_caller), |context| {
+                        context.depth()
+                    }),
+                    parent_id: goal.map(|context| context.scope_identity().task_id().to_string()),
                     originator_route: None,
                     originator_chain: Vec::new(),
                     delivered: false,
@@ -287,15 +554,25 @@ impl Tool for SpawnSubagentTool {
                     finished_at: None,
                 })
                 .await;
+            if goal.is_some() {
+                created?;
+            }
         }
 
-        let run_result =
-            zeroclaw_goal::control::goal_child_fence::scope_goal_child(Box::pin(scope!(
-                agent_alias: parent_alias,
-                session_key: run_id,
-                =>
-                crate::agent::run(
-                    (*config).clone(),
+        // A bound parent passes its capabilities and principal to the child,
+        // so the child cannot reach a provider or memory store the parent's
+        // sources would not have returned.
+        let bound = self.capabilities.get().cloned();
+        let config = (*config).clone();
+        // Keep construction of the large concrete turn future out of the
+        // nested polling frame. Both routes remain lazy and are polled in
+        // the same attribution scope.
+        let make_run = move || -> Pin<Box<dyn Future<Output = Result<String>> + Send + '_>> {
+            match bound {
+                Some(bound) => Box::pin(crate::agent::run_with_capabilities(
+                    config,
+                    bound.capabilities,
+                    bound.principal,
                     &self.parent_alias,
                     Some(prompt),
                     None,
@@ -307,9 +584,29 @@ impl Tool for SpawnSubagentTool {
                     None,
                     zeroclaw_api::ingress::TurnOrigin::SubTurn,
                     run_overrides,
-                )
-            )))
-            .await;
+                )),
+                None => Box::pin(crate::agent::run(
+                    config,
+                    &self.parent_alias,
+                    Some(prompt),
+                    None,
+                    None,
+                    temperature,
+                    vec![],
+                    false,
+                    Some(session_path),
+                    None,
+                    zeroclaw_api::ingress::TurnOrigin::SubTurn,
+                    run_overrides,
+                )),
+            }
+        };
+        let run_future = scope!(agent_alias: parent_alias, session_key: run_id => make_run());
+
+        if let Some(context) = goal {
+            return run_goal_spawn_owned(context, &cp_task_id, run_future).await;
+        }
+        let run_result = run_future.await;
 
         // EPIC-A supervision: mirror the subagent's terminal state into the control-plane.
         if let Some(cp) = crate::control_plane::control_plane() {
@@ -353,6 +650,582 @@ impl Tool for SpawnSubagentTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const CLEANUP_CHILD: &str = "goal-cleanup-child";
+    const CLEANUP_SQL_ERROR: &str = "fixture C8 exact child terminal SQL abort";
+
+    async fn goal_spawn_cleanup_fixture() -> (
+        tempfile::TempDir,
+        crate::control_plane::ControlPlaneHandle,
+        crate::goal_accounting::GoalForegroundContext,
+    ) {
+        use crate::control_plane::{ControlPlaneHandle, TaskKind, TaskRecord, TaskStatus};
+        let directory = tempfile::TempDir::new().unwrap();
+        let cp = ControlPlaneHandle::open(directory.path()).unwrap();
+        let scope = zeroclaw_goal::GoalExecutionScope::new(
+            "goal-cleanup-parent",
+            "goal-cleanup-session",
+            1,
+        )
+        .unwrap();
+        let parent = TaskRecord {
+            id: scope.task_id().into(),
+            kind: TaskKind::Goal,
+            agent: "main".into(),
+            status: TaskStatus::Running,
+            owner_pid: std::process::id(),
+            owner_boot_id: cp.boot_id.clone(),
+            heartbeat_at: None,
+            depth: 0,
+            parent_id: None,
+            originator_route: None,
+            originator_chain: Vec::new(),
+            delivered: false,
+            idem_key: None,
+            principal_id: None,
+            session_id: Some(scope.session_id().into()),
+            execution_epoch: 1,
+            started_at: chrono::Utc::now().to_rfc3339(),
+            finished_at: None,
+        };
+        let child = TaskRecord {
+            id: CLEANUP_CHILD.into(),
+            kind: TaskKind::Subagent,
+            depth: 1,
+            parent_id: Some(scope.task_id().into()),
+            session_id: None,
+            execution_epoch: 0,
+            ..parent.clone()
+        };
+        assert_eq!(
+            cp.goal_store()
+                .unwrap()
+                .create_or_replace_session_goal(
+                    parent,
+                    zeroclaw_goal::GoalTaskRecord {
+                        task_id: scope.task_id().into(),
+                        objective: "owned cleanup fixture".into(),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap(),
+            zeroclaw_goal::GoalTransitionResult::Applied
+        );
+        cp.store.create(child).await.unwrap();
+        let context = crate::goal_accounting::GoalForegroundContext::new_root(
+            scope,
+            cp.clone(),
+            tokio_util::sync::CancellationToken::new(),
+            Some(tokio::time::Instant::now() + std::time::Duration::from_secs(60)),
+        )
+        .child();
+        (directory, cp, context)
+    }
+
+    fn fail_exact_child_terminal_write(directory: &std::path::Path) {
+        // A regular trigger on this test's temporary database affects the real
+        // store connection; SQLite TEMP triggers would affect only this handle.
+        rusqlite::Connection::open(directory.join("control_plane.db"))
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER fail_goal_child_terminal BEFORE UPDATE OF status ON tasks
+                WHEN OLD.id = 'goal-cleanup-child' AND OLD.kind = 'subagent'
+                  AND NEW.status IN ('completed', 'failed', 'cancelled', 'lost', 'timed_out')
+                BEGIN SELECT RAISE(ABORT, 'fixture C8 exact child terminal SQL abort'); END;",
+            )
+            .unwrap();
+    }
+
+    #[derive(Default)]
+    struct RefusedSpawnEffects {
+        provider: std::sync::atomic::AtomicUsize,
+        admit: std::sync::atomic::AtomicUsize,
+        settle: std::sync::atomic::AtomicUsize,
+    }
+
+    struct RefusedSpawnProvider(Arc<RefusedSpawnEffects>);
+
+    impl zeroclaw_api::attribution::Attributable for RefusedSpawnProvider {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Provider(
+                zeroclaw_api::attribution::ProviderKind::Model(
+                    zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "refused-spawn-provider"
+        }
+    }
+
+    #[async_trait]
+    impl zeroclaw_providers::ModelProvider for RefusedSpawnProvider {
+        async fn chat_with_system(
+            &self,
+            _: Option<&str>,
+            _: &str,
+            _: &str,
+            _: Option<f64>,
+        ) -> Result<String> {
+            self.0
+                .provider
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            anyhow::bail!("refused spawn unexpectedly dispatched a provider request")
+        }
+    }
+
+    struct RefusedSpawnAccounting(Arc<RefusedSpawnEffects>);
+
+    #[async_trait]
+    impl zeroclaw_goal::accounting::GoalOperationAccounting for RefusedSpawnAccounting {
+        fn admission_guard(&self) -> anyhow::Result<zeroclaw_goal::accounting::GoalOperationGuard> {
+            anyhow::bail!("refusal must precede accounting admission")
+        }
+
+        async fn begin_dispatch(&self) -> anyhow::Result<zeroclaw_goal::task::GoalDispatchStart> {
+            anyhow::bail!("refusal must precede provider dispatch")
+        }
+
+        async fn release_unstarted(&self) -> anyhow::Result<()> {
+            anyhow::bail!("fixture unexpectedly released an unstarted operation")
+        }
+
+        async fn admit(&self, _: zeroclaw_goal::accounting::GoalOperationRequest) -> Result<()> {
+            self.0
+                .admit
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            anyhow::bail!("refused spawn unexpectedly admitted a Goal operation")
+        }
+        async fn settle(
+            &self,
+            _: zeroclaw_goal::accounting::GoalOperationSettlement,
+        ) -> Result<()> {
+            self.0
+                .settle
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            anyhow::bail!("refused spawn unexpectedly settled a Goal operation")
+        }
+        async fn pricing_complete(&self) -> Result<bool> {
+            anyhow::bail!("pre-admission refusal unexpectedly queried pricing completeness")
+        }
+    }
+
+    async fn actual_checked_spawn_refusal(directory: &std::path::Path) -> anyhow::Error {
+        use crate::agent::cost::{TOOL_LOOP_COST_TRACKING_CONTEXT, ToolLoopCostTrackingContext};
+        use zeroclaw_api::model_provider::{ChatMessage, ChatRequest};
+        let tracker = Arc::new(
+            crate::cost::CostTracker::new(
+                zeroclaw_config::schema::CostConfig {
+                    enabled: true,
+                    daily_limit_usd: 1.0,
+                    monthly_limit_usd: 100.0,
+                    ..Default::default()
+                },
+                directory,
+            )
+            .unwrap(),
+        );
+        tracker
+            .record_usage(crate::cost::types::TokenUsage::new(
+                "ordinary-seed",
+                1_000_000,
+                0,
+                0,
+                2.0,
+                0.0,
+                0.0,
+            ))
+            .unwrap();
+        let ledger = directory.join("state/costs.jsonl");
+        let before = std::fs::read(&ledger).unwrap();
+        let effects = Arc::new(RefusedSpawnEffects::default());
+        let provider = RefusedSpawnProvider(effects.clone());
+        let accountant: Arc<dyn zeroclaw_goal::accounting::GoalOperationAccounting> =
+            Arc::new(RefusedSpawnAccounting(effects.clone()));
+        let mut summaries = Vec::new();
+        let messages = [ChatMessage::user("refuse before the child request")];
+        let error = zeroclaw_goal::accounting::GOAL_OPERATION_ACCOUNTING
+            .scope(
+                Some(accountant),
+                TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
+                    Some(ToolLoopCostTrackingContext::new(
+                        tracker,
+                        Arc::new(crate::agent::cost::ModelProviderPricing::new()),
+                    )),
+                    async {
+                        crate::agent::turn::ResolvedModelAccess {
+                            model_provider: &provider,
+                            provider_name: "custom",
+                            model: "test-model",
+                            dispatch_model: "test-model",
+                            temperature: None,
+                        }
+                        .run_model_query(
+                            ChatRequest {
+                                messages: &messages,
+                                tools: None,
+                                thinking: None,
+                            },
+                            &mut summaries,
+                        )
+                        .await
+                        .unwrap_err()
+                    },
+                ),
+            )
+            .await;
+        assert_eq!(
+            effects.provider.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        assert_eq!(effects.admit.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(effects.settle.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(summaries.is_empty());
+        assert_eq!(
+            std::fs::read(&ledger).unwrap(),
+            before,
+            "refusal writes no consumption"
+        );
+        assert_eq!(spawn_refusal_proofs(&error), vec![true]);
+        error
+    }
+
+    fn spawn_refusal_proofs(error: &anyhow::Error) -> Vec<bool> {
+        error
+            .chain()
+            .filter_map(|source| {
+                source.downcast_ref::<zeroclaw_goal::accounting::GoalOrdinarySpendRefusal>()
+            })
+            .map(zeroclaw_goal::accounting::GoalOrdinarySpendRefusal::clean_tool_phase)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn goal_settlement_spawn_refusal_cleanup_sql_abort_retains_row_and_negative_source() {
+        use crate::control_plane::{TaskKind, TaskStatus};
+        use zeroclaw_api::turn_stop::{TurnStop, TurnStopCode, turn_stop};
+        for fault in [false, true] {
+            let (directory, cp, context) = goal_spawn_cleanup_fixture().await;
+            if fault {
+                fail_exact_child_terminal_write(directory.path());
+            }
+            let error = context
+                .scope(run_goal_spawn_owned(&context, CLEANUP_CHILD, async {
+                    Err(actual_checked_spawn_refusal(directory.path()).await)
+                }))
+                .await
+                .unwrap_err();
+            assert_eq!(
+                turn_stop(&error).unwrap().code,
+                TurnStopCode::BudgetExhausted
+            );
+            assert_eq!(
+                spawn_refusal_proofs(&error),
+                if fault { vec![false, true] } else { vec![true] }
+            );
+            let row = cp.store.get_snapshot(CLEANUP_CHILD).await.unwrap().unwrap();
+            assert_eq!(row.task.kind, TaskKind::Subagent);
+            assert_eq!(
+                row.task.status,
+                if fault {
+                    TaskStatus::Running
+                } else {
+                    TaskStatus::Failed
+                }
+            );
+            assert_eq!(row.task.owner_pid, std::process::id());
+            assert_eq!(row.task.owner_boot_id, cp.boot_id);
+            assert_eq!(row.task.parent_id.as_deref(), Some("goal-cleanup-parent"));
+            assert_eq!(row.task.depth, 1);
+            assert!(row.output.is_none());
+            if fault {
+                let diagnostic = format!("{error:#}");
+                assert!(
+                    diagnostic.contains(CLEANUP_SQL_ERROR),
+                    "the exact terminal trigger must fire: {diagnostic}"
+                );
+                assert!(diagnostic.contains("transition owner-checked task terminal"));
+                assert_eq!(
+                    diagnostic.matches("Goal subagent cleanup failed:").count(),
+                    1
+                );
+                assert!(row.task.finished_at.is_none());
+                assert!(row.error.is_none());
+            } else {
+                assert!(row.task.finished_at.is_some());
+                assert!(!format!("{error:#}").contains("Goal subagent cleanup failed:"));
+            }
+            let goal = cp
+                .goal_store()
+                .unwrap()
+                .get_goal_task("goal-cleanup-parent")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                goal.accounting_state,
+                zeroclaw_goal::GoalAccountingState::Complete
+            );
+            assert!(goal.pending_call_id.is_none());
+            assert!(goal.pending_call_epoch.is_none());
+            assert_eq!(
+                cp.store
+                    .get("goal-cleanup-parent")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                TaskStatus::Running
+            );
+
+            // Actual paired-parent/composite transport is exercised by Matrix;
+            // this bounded native-source control ensures a foreign wrapper and
+            // a clean enclosing fact cannot erase this producer's negative.
+            let outer = crate::agent::turn::wrap_goal_spend_refusal(
+                error.context(zeroclaw_api::tool::GoalChildOperationError),
+                true,
+            );
+            assert!(outer.is::<zeroclaw_api::tool::GoalChildOperationError>());
+            let foreign = zeroclaw_api::turn_stop::tag(
+                outer,
+                TurnStop::fatal(TurnStopCode::BudgetExhausted, "outer native budget refusal"),
+            );
+            assert_eq!(
+                spawn_refusal_proofs(&foreign),
+                if fault {
+                    vec![true, false, true]
+                } else {
+                    vec![true, true]
+                }
+            );
+            assert_eq!(
+                turn_stop(&foreign).unwrap().code,
+                TurnStopCode::BudgetExhausted
+            );
+            if fault {
+                assert!(format!("{foreign:#}").contains(CLEANUP_SQL_ERROR));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn goal_settlement_spawn_refusal_cleanup_preserves_terminal_winner_and_rejects_owner_conflict()
+     {
+        use crate::control_plane::TaskStatus;
+        for terminal_winner in [true, false] {
+            let (directory, cp, context) = goal_spawn_cleanup_fixture().await;
+            if terminal_winner {
+                assert!(
+                    cp.store
+                        .transition_terminal_if_owner(
+                            CLEANUP_CHILD,
+                            std::process::id(),
+                            &cp.boot_id,
+                            TaskStatus::Cancelled,
+                            Some("winning output".into()),
+                            Some("winning cancellation".into()),
+                        )
+                        .await
+                        .unwrap()
+                );
+            } else {
+                cp.store
+                    .claim_owner(CLEANUP_CHILD, std::process::id(), "new-child-owner")
+                    .await
+                    .unwrap();
+            }
+            let before = cp.store.get_snapshot(CLEANUP_CHILD).await.unwrap().unwrap();
+            let error = context
+                .scope(run_goal_spawn_owned(&context, CLEANUP_CHILD, async {
+                    Err(actual_checked_spawn_refusal(directory.path()).await)
+                }))
+                .await
+                .unwrap_err();
+            assert_eq!(
+                spawn_refusal_proofs(&error),
+                if terminal_winner {
+                    vec![true]
+                } else {
+                    vec![false, true]
+                }
+            );
+            if !terminal_winner {
+                assert!(
+                    format!("{error:#}").contains(
+                        "Goal subagent terminal transition lost without a terminal winner"
+                    )
+                );
+            }
+            let after = cp.store.get_snapshot(CLEANUP_CHILD).await.unwrap().unwrap();
+            assert_eq!(
+                serde_json::to_value(&after.task).unwrap(),
+                serde_json::to_value(&before.task).unwrap()
+            );
+            assert_eq!(after.output, before.output);
+            assert_eq!(after.error, before.error);
+            assert_eq!(
+                after.task.status,
+                if terminal_winner {
+                    TaskStatus::Cancelled
+                } else {
+                    TaskStatus::Running
+                }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn goal_settlement_spawn_refusal_cleanup_preserves_accounting_source_metadata() {
+        use zeroclaw_goal::{GoalAccountingState, accounting::GoalAccountingFailure};
+        for (state, pending) in [
+            (GoalAccountingState::Missing, false),
+            (GoalAccountingState::Invalid, false),
+            (GoalAccountingState::OutcomeUnknown, true),
+            (GoalAccountingState::Complete, true),
+        ] {
+            let (directory, cp, context) = goal_spawn_cleanup_fixture().await;
+            fail_exact_child_terminal_write(directory.path());
+            let error = context
+                .scope(run_goal_spawn_owned(&context, CLEANUP_CHILD, async {
+                    // This typed context models an already exposed earlier-call
+                    // condition; this refused child still admits and bills nothing.
+                    Err(actual_checked_spawn_refusal(directory.path())
+                        .await
+                        .context(GoalAccountingFailure::incomplete(state, pending))
+                        .context(zeroclaw_api::tool::GoalChildOperationError))
+                }))
+                .await
+                .unwrap_err();
+            assert!(error.is::<zeroclaw_api::tool::GoalChildOperationError>());
+            assert_eq!(spawn_refusal_proofs(&error), vec![false, true]);
+            let accounting = error
+                .chain()
+                .find_map(|source| source.downcast_ref::<GoalAccountingFailure>())
+                .unwrap();
+            assert_eq!(accounting.accounting_state(), state);
+            assert_eq!(accounting.has_pending_operation(), pending);
+            assert!(format!("{error:#}").contains(CLEANUP_SQL_ERROR));
+            assert_eq!(
+                zeroclaw_api::turn_stop::turn_stop(&error).unwrap().code,
+                zeroclaw_api::turn_stop::TurnStopCode::BudgetExhausted
+            );
+            assert_eq!(
+                cp.store.get(CLEANUP_CHILD).await.unwrap().unwrap().status,
+                crate::control_plane::TaskStatus::Running
+            );
+
+            // A foreign native-source boundary must retain the bridge, not
+            // merely expose Anyhow's original context downcast metadata.
+            let foreign = zeroclaw_api::turn_stop::tag(
+                error,
+                zeroclaw_api::turn_stop::TurnStop::fatal(
+                    zeroclaw_api::turn_stop::TurnStopCode::BudgetExhausted,
+                    "outer budget refusal",
+                ),
+            );
+            let accounting = foreign
+                .chain()
+                .find_map(|source| source.downcast_ref::<GoalAccountingFailure>())
+                .unwrap();
+            assert_eq!(accounting.accounting_state(), state);
+            assert_eq!(accounting.has_pending_operation(), pending);
+            assert_eq!(spawn_refusal_proofs(&foreign), vec![false, true]);
+        }
+    }
+
+    #[tokio::test]
+    async fn goal_settlement_spawn_refusal_cleanup_respects_decisive_stronger_stop() {
+        use zeroclaw_api::turn_stop::{TurnStop, TurnStopCode, tag, turn_stop};
+        for code in [TurnStopCode::TurnTimeout, TurnStopCode::StepTimeout] {
+            let (directory, cp, context) = goal_spawn_cleanup_fixture().await;
+            fail_exact_child_terminal_write(directory.path());
+            let error = context
+                .scope(run_goal_spawn_owned(&context, CLEANUP_CHILD, async {
+                    Err(tag(
+                        actual_checked_spawn_refusal(directory.path()).await,
+                        TurnStop::recoverable(code, "decisive outer timeout"),
+                    ))
+                }))
+                .await
+                .unwrap_err();
+            assert_eq!(turn_stop(&error).unwrap().code, code);
+            assert_eq!(
+                spawn_refusal_proofs(&error),
+                vec![true],
+                "a stronger stop must not be relabelled by finding the inner budget stop"
+            );
+            assert!(format!("{error:#}").contains(CLEANUP_SQL_ERROR));
+            assert_eq!(
+                cp.store.get(CLEANUP_CHILD).await.unwrap().unwrap().status,
+                crate::control_plane::TaskStatus::Running
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn goal_settlement_spawn_cleanup_keeps_nonbudget_sibling_results() {
+        use crate::control_plane::TaskStatus;
+        for (success, fault) in [(true, false), (true, true), (false, true)] {
+            let (directory, cp, context) = goal_spawn_cleanup_fixture().await;
+            if fault {
+                fail_exact_child_terminal_write(directory.path());
+            }
+            let result = context
+                .scope(run_goal_spawn_owned(&context, CLEANUP_CHILD, async {
+                    if success {
+                        Ok("allowed child output".into())
+                    } else {
+                        anyhow::bail!("original nonbudget child error")
+                    }
+                }))
+                .await;
+            let row = cp.store.get_snapshot(CLEANUP_CHILD).await.unwrap().unwrap();
+            if !fault {
+                assert!(result.unwrap().success);
+                assert_eq!(row.task.status, TaskStatus::Completed);
+                assert_eq!(row.output.as_deref(), Some("allowed child output"));
+                assert!(row.task.finished_at.is_some());
+            } else {
+                let error = result.unwrap_err();
+                assert!(spawn_refusal_proofs(&error).is_empty());
+                assert!(zeroclaw_api::turn_stop::turn_stop(&error).is_none());
+                let diagnostic = format!("{error:#}");
+                assert!(diagnostic.contains(CLEANUP_SQL_ERROR));
+                if success {
+                    assert!(!diagnostic.contains("Goal subagent cleanup failed:"));
+                } else {
+                    assert!(diagnostic.contains("original nonbudget child error"));
+                    assert_eq!(
+                        diagnostic.matches("Goal subagent cleanup failed:").count(),
+                        1
+                    );
+                }
+                assert_eq!(row.task.status, TaskStatus::Running);
+                assert!(row.output.is_none());
+                assert!(row.task.finished_at.is_none());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn goal_sentinel_without_accountant_or_root_rejects_spawn_before_effects() {
+        let tool = SpawnSubagentTool::new(
+            Arc::new(Config::default()),
+            "unused",
+            Arc::new(SecurityPolicy::default()),
+        );
+        let context = zeroclaw_api::tool::ToolExecutionContext::default().with_goal_foreground();
+        let error = tool
+            .execute_with_context(serde_json::json!({"prompt": "unused"}), &context)
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<zeroclaw_api::tool::GoalChildOperationError>()
+                .is_some()
+        );
+    }
     use zeroclaw_config::schema::{AliasedAgentConfig, Config, RiskProfileConfig};
 
     fn config_with_agent(alias: &str) -> Config {
@@ -368,6 +1241,253 @@ mod tests {
             },
         );
         config
+    }
+
+    /// A bound spawn tool runs its child through the bound provider and
+    /// memory sources for the bound principal. The configured endpoint is
+    /// unroutable, so a child built from config could not answer.
+    #[tokio::test]
+    async fn a_bound_spawn_runs_the_child_on_the_bound_capabilities() {
+        use crate::composition::test_support::{
+            NoTools, RecordingMemory, RecordingProviders, STUB_REPLY, recording_capabilities,
+        };
+        use zeroclaw_config::schema::{ModelProviderConfig, OpenAIModelProviderConfig};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = config_with_agent("alpha");
+        config.data_dir = tmp.path().join("data");
+        config.config_path = tmp.path().join("config.toml");
+        config.memory.backend = "none".to_string();
+        config.providers.models.openai.insert(
+            "alpha".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("gpt-4o-mini".to_string()),
+                    uri: Some("http://127.0.0.1:9".to_string()),
+                    ..ModelProviderConfig::default()
+                },
+            },
+        );
+        if let Some(agent) = config.agents.get_mut("alpha") {
+            agent.model_provider = "openai.alpha".into();
+        }
+        let security =
+            Arc::new(SecurityPolicy::for_agent(&config, "alpha").expect("alpha has a policy"));
+        let providers = Arc::new(RecordingProviders::default());
+        let memory = Arc::new(RecordingMemory::default());
+        let principal =
+            zeroclaw_api::principal::PrincipalId::for_oidc("https://issuer.example", "subject-p");
+        let tool = SpawnSubagentTool::new(Arc::new(config), "alpha", security).with_capabilities(
+            recording_capabilities(
+                Arc::clone(&providers),
+                Arc::clone(&memory),
+                Arc::new(NoTools),
+            ),
+            Some(principal.clone()),
+        );
+
+        let result = tool
+            .execute(json!({ "prompt": "Summarize this private task" }))
+            .await
+            .expect("execute returns a result");
+
+        assert!(result.success, "child failed: {:?}", result.error);
+        assert!(result.output.contains(STUB_REPLY));
+        let seen = providers.seen.lock();
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        assert_eq!(seen[0].agent_alias, "alpha");
+        assert_eq!(seen[0].principal, Some(principal));
+        assert!(memory.agents.lock().iter().any(|alias| alias == "alpha"));
+    }
+
+    #[tokio::test]
+    async fn goal_spawn_owned_panic_settles_exact_row_then_resumes_original_payload() {
+        use crate::control_plane::{ControlPlaneHandle, TaskKind, TaskRecord, TaskStatus};
+        #[derive(Debug)]
+        struct PanicMarker;
+        async fn panic_body() -> Result<String> {
+            std::panic::panic_any(PanicMarker)
+        }
+
+        let directory = tempfile::TempDir::new().unwrap();
+        let cp = ControlPlaneHandle::open(directory.path()).unwrap();
+        let scope =
+            zeroclaw_goal::GoalExecutionScope::new("panic-parent", "panic-session", 1).unwrap();
+        let parent = TaskRecord {
+            id: scope.task_id().into(),
+            kind: TaskKind::Goal,
+            agent: "main".into(),
+            status: TaskStatus::Running,
+            owner_pid: std::process::id(),
+            owner_boot_id: cp.boot_id.clone(),
+            heartbeat_at: None,
+            depth: 0,
+            parent_id: None,
+            originator_route: None,
+            originator_chain: Vec::new(),
+            delivered: false,
+            idem_key: None,
+            principal_id: None,
+            session_id: Some(scope.session_id().into()),
+            execution_epoch: 1,
+            started_at: chrono::Utc::now().to_rfc3339(),
+            finished_at: None,
+        };
+        let goal = zeroclaw_goal::GoalTaskRecord {
+            task_id: parent.id.clone(),
+            objective: "panic boundary".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            cp.goal_store()
+                .unwrap()
+                .create_or_replace_session_goal(parent, goal)
+                .await
+                .unwrap(),
+            zeroclaw_goal::GoalTransitionResult::Applied
+        );
+        let child = TaskRecord {
+            id: "panic-child".into(),
+            kind: TaskKind::Subagent,
+            agent: "main".into(),
+            status: TaskStatus::Running,
+            owner_pid: std::process::id(),
+            owner_boot_id: cp.boot_id.clone(),
+            heartbeat_at: None,
+            depth: 1,
+            parent_id: Some(scope.task_id().into()),
+            originator_route: None,
+            originator_chain: Vec::new(),
+            delivered: false,
+            idem_key: None,
+            principal_id: None,
+            session_id: None,
+            execution_epoch: 0,
+            started_at: chrono::Utc::now().to_rfc3339(),
+            finished_at: None,
+        };
+        cp.store.create(child).await.unwrap();
+        let root = crate::goal_accounting::GoalForegroundContext::new_root(
+            scope,
+            cp.clone(),
+            tokio_util::sync::CancellationToken::new(),
+            Some(tokio::time::Instant::now() + std::time::Duration::from_secs(60)),
+        );
+        let child_context = root.child();
+        let panic = std::panic::AssertUnwindSafe(run_goal_spawn_owned(
+            &child_context,
+            "panic-child",
+            panic_body(),
+        ))
+        .catch_unwind()
+        .await
+        .unwrap_err();
+        assert!(
+            panic.downcast::<PanicMarker>().is_ok(),
+            "original panic payload must be resumed"
+        );
+        let row = cp.store.get_snapshot("panic-child").await.unwrap().unwrap();
+        assert_eq!(row.task.status, TaskStatus::Failed);
+        assert_eq!(row.task.owner_pid, std::process::id());
+        assert_eq!(row.task.owner_boot_id, cp.boot_id);
+        assert_eq!(row.task.parent_id.as_deref(), Some("panic-parent"));
+        assert!(row.task.finished_at.is_some());
+        assert!(row.output.is_none());
+    }
+
+    #[tokio::test]
+    async fn goal_subagent_row_cleanup_preserves_winner_and_rejects_lost_live_owner() {
+        use crate::control_plane::{ControlPlaneHandle, TaskKind, TaskRecord, TaskStatus};
+        let directory = tempfile::TempDir::new().unwrap();
+        let cp = ControlPlaneHandle::open(directory.path()).unwrap();
+        let record = |id: &str, owner_boot_id: String| TaskRecord {
+            id: id.into(),
+            kind: TaskKind::Subagent,
+            agent: "main".into(),
+            status: TaskStatus::Running,
+            owner_pid: std::process::id(),
+            owner_boot_id,
+            heartbeat_at: None,
+            depth: 1,
+            parent_id: Some("goal-parent".into()),
+            originator_route: None,
+            originator_chain: Vec::new(),
+            delivered: false,
+            idem_key: None,
+            principal_id: None,
+            session_id: None,
+            execution_epoch: 0,
+            started_at: chrono::Utc::now().to_rfc3339(),
+            finished_at: None,
+        };
+        cp.store
+            .create(record("owned", cp.boot_id.clone()))
+            .await
+            .unwrap();
+        settle_goal_subagent_row(
+            &cp,
+            "owned",
+            TaskStatus::Completed,
+            Some("result".into()),
+            None,
+        )
+        .await
+        .unwrap();
+        let snapshot = cp.store.get_snapshot("owned").await.unwrap().unwrap();
+        assert_eq!(snapshot.task.status, TaskStatus::Completed);
+        assert_eq!(snapshot.task.parent_id.as_deref(), Some("goal-parent"));
+        assert_eq!(snapshot.output.as_deref(), Some("result"));
+
+        cp.store
+            .create(record("winner", cp.boot_id.clone()))
+            .await
+            .unwrap();
+        assert!(
+            cp.store
+                .transition_terminal_if_owner(
+                    "winner",
+                    std::process::id(),
+                    &cp.boot_id,
+                    TaskStatus::Cancelled,
+                    None,
+                    None
+                )
+                .await
+                .unwrap()
+        );
+        settle_goal_subagent_row(&cp, "winner", TaskStatus::Completed, None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            cp.store
+                .get_snapshot("winner")
+                .await
+                .unwrap()
+                .unwrap()
+                .task
+                .status,
+            TaskStatus::Cancelled
+        );
+
+        cp.store
+            .create(record("lost-owner", "different-boot".into()))
+            .await
+            .unwrap();
+        assert!(
+            settle_goal_subagent_row(&cp, "lost-owner", TaskStatus::Failed, None, None)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            cp.store
+                .get_snapshot("lost-owner")
+                .await
+                .unwrap()
+                .unwrap()
+                .task
+                .status,
+            TaskStatus::Running
+        );
     }
 
     #[tokio::test]
@@ -774,7 +1894,7 @@ mod tests {
 
         let inherited =
             crate::sop::active_scope::with_active_headless_step_scope(scoped_step(), async {
-                child_run_overrides(Arc::new(SecurityPolicy::default())).sop_step_scope
+                child_run_overrides(Arc::new(SecurityPolicy::default()), None).sop_step_scope
             })
             .await
             .expect("a child started inside a headless step must carry that step's scope");
@@ -796,11 +1916,41 @@ mod tests {
         );
     }
 
+    /// Once the parent session is pinned, the child is
+    /// started over the session's routed memory; before the pin, and for an
+    /// unowned session, it is started with none and builds the agent's memory.
+    #[test]
+    fn a_pinned_sessions_child_is_started_over_the_routed_memory() {
+        let route = Arc::new(zeroclaw_tools::session_memory::SessionMemoryRoute::default());
+        let tool = SpawnSubagentTool::new(
+            Arc::new(config_with_agent("alpha")),
+            "alpha",
+            Arc::new(SecurityPolicy::default()),
+        )
+        .with_session_memory(Arc::clone(&route));
+        assert!(
+            tool.child_memory().is_none(),
+            "unpinned: the child builds its own"
+        );
+
+        let routed: Arc<dyn zeroclaw_memory::Memory> =
+            Arc::new(zeroclaw_memory::NoneMemory::new("routed"));
+        route
+            .pin(Arc::clone(&routed), Arc::new(SecurityPolicy::default()))
+            .unwrap();
+        let overrides =
+            child_run_overrides(Arc::new(SecurityPolicy::default()), tool.child_memory());
+        let handed = overrides
+            .memory
+            .expect("a pinned session hands its child memory");
+        assert!(Arc::ptr_eq(&handed, &routed));
+    }
+
     /// The inheritance is bounded by the step: an ordinary agent turn spawns a
     /// child with no step scope at all.
     #[tokio::test]
     async fn child_run_outside_a_headless_step_carries_no_scope() {
-        let overrides = child_run_overrides(Arc::new(SecurityPolicy::default()));
+        let overrides = child_run_overrides(Arc::new(SecurityPolicy::default()), None);
         assert!(overrides.sop_step_scope.is_none());
         assert!(
             overrides.is_subagent,

@@ -5,7 +5,7 @@ use std::{fmt, sync::Weak};
 use chrono::Utc;
 use uuid::Uuid;
 
-use super::super::{GoalControlClass, classify_goal_control};
+use super::super::{CurrentGoalFailure, GoalControlClass, classify_goal_control};
 use super::*;
 use crate::task::{GoalControlIntent, GoalControlIntentKind, GoalControlIntentSettlement};
 
@@ -43,6 +43,10 @@ enum WaitResource {
     Boundary {
         checkpoint: GoalParentTurnCheckpoint,
         settle_predecessor: bool,
+    },
+    Predecessor {
+        scope: GoalExecutionScope,
+        checkpoint: GoalParentTurnCheckpoint,
     },
 }
 
@@ -200,9 +204,11 @@ impl GoalExecutionSupervisor {
     /// A retired supervisor returns [`super::GoalSupervisorRetired`] before
     /// admission has any effects. The adapter must select a current supervisor
     /// before retrying the command.
+    /// Build settings from the current canonical config for this command;
+    /// queued controls retain intent, not these resolved settings.
     pub async fn admit_control(
         self: &Arc<Self>,
-        settings: GoalHostSettings,
+        settings: &GoalHostSettings<'_>,
         ingress: GoalIngressContext,
         driver: Arc<dyn GoalSessionDriver>,
         command: GoalCommand,
@@ -214,30 +220,50 @@ impl GoalExecutionSupervisor {
                 .await
                 .map(GoalControlAdmission::Direct);
         };
+        self.validate_settings(settings, &ingress)?;
+        if !self.settings_scope_enabled(settings, &ingress)? {
+            return Ok(GoalControlAdmission::Direct(self.execution_submission(
+                GoalRuntimeSubmission {
+                    response: GoalResponse::Disabled,
+                    execution: None,
+                    lease: None,
+                },
+                None,
+                driver,
+                ingress,
+                GoalLaunchGuard::new(self.launches.clone(), None, Some(custody)),
+                None,
+                settings,
+            )));
+        }
         let mut custody = Some(custody);
         // Restart closes admission before collecting pending waiters. Keep its
         // read guard only through registration, never through the queued wait;
         // commit obtains a fresh guard after the live boundary is reached.
         let intake_admission = match &self.restart_gate {
-            Some(gate) => {
-                let admission = gate.admit(&command).await?;
-                gate.validate_policy_generation(&settings, &command)?;
-                admission
-            }
+            Some(gate) => gate.admit(&command).await?,
             None => None,
         };
+        self.validate_settings(settings, &ingress)?;
         let submission = self
             .engine
             .runtime
             .host
-            .submit(&settings, ingress.clone(), driver.clone(), command.clone())
+            .submit(settings, ingress.clone(), driver.clone(), command.clone())
+            .await?;
+        self.validate_settings(settings, &ingress)?;
+        let retry_guard = GoalLaunchGuard::new(self.launches.clone(), None, None);
+        self.engine
+            .runtime
+            .retry_launch_cleanup(settings, &submission, &retry_guard, false)
             .await?;
         let (rejection, current) = self
             .engine
             .runtime
             .controller
-            .preflight_normal(&settings, &submission)
+            .preflight_normal(settings, &submission)
             .await?;
+        self.validate_settings(settings, &ingress)?;
         if let Some(response) = rejection {
             let result = GoalRuntimeSubmission {
                 response,
@@ -249,10 +275,41 @@ impl GoalExecutionSupervisor {
                 None,
                 driver,
                 ingress,
+                GoalLaunchGuard::new(self.launches.clone(), None, None),
                 None,
-                None,
-                &mut custody,
+                settings,
             )));
+        }
+
+        if matches!(command, GoalCommand::Resume { .. })
+            && let Some(task) = current
+                .as_ref()
+                .filter(|task| task.status == TaskStatus::Paused)
+            && let Some(scope) = self.scope_for_session(&ingress).await?
+            && task.id == scope.task_id()
+            && is_fenced_lifecycle_epoch(task, &scope)
+        {
+            // A paused row can precede the completion of its admitted worker.
+            // Preserve the exact predecessor until accounting is classified
+            // before allowing the Resume transition to advance the epoch.
+            let mut guard = self
+                .record_intent(settings, &ingress, &command, current.as_ref())
+                .await?;
+            let checkpoint = self.register_pending_boundary(&ingress, &mut guard).await;
+            drop(submission);
+            drop(intake_admission);
+            return Ok(GoalControlAdmission::Queued {
+                response: GoalResponse::Queued(kind),
+                deferred: GoalDeferredControl {
+                    supervisor: self.clone(),
+                    driver,
+                    ingress,
+                    command: Some(command),
+                    guard,
+                    resource: Some(WaitResource::Predecessor { scope, checkpoint }),
+                    custody,
+                },
+            });
         }
 
         let mut guard = None;
@@ -267,7 +324,7 @@ impl GoalExecutionSupervisor {
             )?;
             if self.owns_scope(&scope).await {
                 guard = Some(
-                    self.record_intent(&settings, &ingress, &command, current.as_ref())
+                    self.record_intent(settings, &ingress, &command, current.as_ref())
                         .await?,
                 );
                 if let Some(ticket) = self.register_deferred_control(&scope).await? {
@@ -327,38 +384,33 @@ impl GoalExecutionSupervisor {
                     .map(|commit| GoalControlAdmission::Direct(commit.into_direct()));
             }
             let previous = self.scope_for_session(&ingress).await?;
+            self.validate_settings(settings, &ingress)?;
+            let mut launch_guard =
+                GoalLaunchGuard::new(self.launches.clone(), intake_admission, custody.take());
             let result = self
                 .engine
                 .runtime
-                .apply_submission(&settings, submission)
+                .apply_submission_with_launch_guard(settings, submission, Some(&mut launch_guard))
                 .await?;
             return Ok(GoalControlAdmission::Direct(self.execution_submission(
                 result,
                 previous,
                 driver,
                 ingress,
-                intake_admission,
+                launch_guard,
                 Some(boundary),
-                &mut custody,
+                settings,
             )));
         }
 
         let mut guard = match guard {
             Some(guard) => guard,
             None => {
-                self.record_intent(&settings, &ingress, &command, current.as_ref())
+                self.record_intent(settings, &ingress, &command, current.as_ref())
                     .await?
             }
         };
-        let checkpoint = GoalParentTurnCheckpoint::new();
-        let session = ingress.session_key().durable_id();
-        self.pending_boundaries
-            .lock()
-            .await
-            .entry(session.clone())
-            .or_default()
-            .push(checkpoint.clone());
-        guard.cleanup = Some((Arc::downgrade(self), session, checkpoint.generation()));
+        let checkpoint = self.register_pending_boundary(&ingress, &mut guard).await;
         drop(submission);
         Ok(GoalControlAdmission::Queued {
             response: GoalResponse::Queued(kind),
@@ -377,9 +429,26 @@ impl GoalExecutionSupervisor {
         })
     }
 
+    async fn register_pending_boundary(
+        self: &Arc<Self>,
+        ingress: &GoalIngressContext,
+        guard: &mut IntentGuard,
+    ) -> GoalParentTurnCheckpoint {
+        let checkpoint = GoalParentTurnCheckpoint::new();
+        let session = ingress.session_key().durable_id();
+        self.pending_boundaries
+            .lock()
+            .await
+            .entry(session.clone())
+            .or_default()
+            .push(checkpoint.clone());
+        guard.cleanup = Some((Arc::downgrade(self), session, checkpoint.generation()));
+        checkpoint
+    }
+
     async fn record_intent(
         &self,
-        settings: &GoalHostSettings,
+        settings: &GoalHostSettings<'_>,
         ingress: &GoalIngressContext,
         command: &GoalCommand,
         current: Option<&TaskRecord>,
@@ -527,7 +596,7 @@ impl GoalDeferredControl {
     }
 
     async fn wait_for_lease(&mut self) -> Result<(GoalSessionLease, Option<GoalTurnBoundary>)> {
-        match self
+        let checkpoint = match self
             .resource
             .as_mut()
             .context("Goal deferred wait has no registration")?
@@ -540,12 +609,13 @@ impl GoalDeferredControl {
                     lease = self.driver.bind(&self.ingress) => lease?,
                 };
                 self.validate_lease(&lease)?;
-                Ok((lease, None))
+                return Ok((lease, None));
             }
             WaitResource::Boundary {
                 checkpoint,
                 settle_predecessor,
             } => {
+                let checkpoint = checkpoint.clone();
                 if *settle_predecessor {
                     let session_id = self.ingress.session_key().durable_id();
                     tokio::select! {
@@ -554,37 +624,46 @@ impl GoalDeferredControl {
                         result = self.supervisor.settle_failed_predecessor(&session_id) => result?,
                     }
                 }
-                loop {
-                    let lease = tokio::select! {
-                        biased;
-                        () = checkpoint.wait_closed() => return Err(GoalCheckpointClosed.into()),
-                        lease = self.driver.bind(&self.ingress) => lease?,
-                    };
-                    if lease.binding().session_key() != self.ingress.session_key()
-                        || self.driver.session_key() != self.ingress.session_key()
-                    {
-                        bail!("Goal deferred binding does not match trusted ingress");
-                    }
-                    if let Some(boundary) = self.driver.try_turn_boundary(&self.ingress).await? {
-                        // Custody and both leases are still held. Finish this
-                        // registration now rather than scheduling its removal on
-                        // Drop, which would make an idle supervisor look busy.
-                        if let Some((_, session, generation)) = self.guard.cleanup.as_ref() {
-                            self.supervisor
-                                .remove_pending_boundary(session, *generation)
-                                .await;
-                        }
-                        self.guard.cleanup = None;
-                        return Ok((lease, Some(boundary)));
-                    }
-                    drop(lease);
-                    let boundary = self
-                        .driver
-                        .await_turn_boundary(&self.ingress, checkpoint)
-                        .await?;
-                    drop(boundary);
-                }
+                checkpoint
             }
+            WaitResource::Predecessor { scope, checkpoint } => {
+                let scope = scope.clone();
+                let checkpoint = checkpoint.clone();
+                let drain = tokio::select! {
+                    biased;
+                    () = checkpoint.wait_closed() => return Err(GoalCheckpointClosed.into()),
+                    result = self.supervisor.drain_lifecycle_fence(&scope) => result?,
+                };
+                drain.deliver().await?;
+                checkpoint
+            }
+        };
+
+        loop {
+            let lease = tokio::select! {
+                biased;
+                () = checkpoint.wait_closed() => return Err(GoalCheckpointClosed.into()),
+                lease = self.driver.bind(&self.ingress) => lease?,
+            };
+            self.validate_lease(&lease)?;
+            if let Some(boundary) = self.driver.try_turn_boundary(&self.ingress).await? {
+                // Custody and both leases are still held. Finish this
+                // registration now rather than scheduling its removal on
+                // Drop, which would make an idle supervisor look busy.
+                if let Some((_, session, generation)) = self.guard.cleanup.as_ref() {
+                    self.supervisor
+                        .remove_pending_boundary(session, *generation)
+                        .await;
+                }
+                self.guard.cleanup = None;
+                return Ok((lease, Some(boundary)));
+            }
+            drop(lease);
+            let boundary = self
+                .driver
+                .await_turn_boundary(&self.ingress, &checkpoint)
+                .await?;
+            drop(boundary);
         }
     }
 
@@ -606,7 +685,7 @@ impl GoalDeferredControl {
             .current(&self.ingress, &self.guard.intent.session_id)
             .await?;
         Ok(match (&self.guard.intent.kind, current) {
-            (GoalControlIntentKind::Start { .. }, None) => {
+            (GoalControlIntentKind::Start { .. }, Err(CurrentGoalFailure::Missing)) => {
                 self.guard.intent.predecessor_task_id.is_none()
                     && self
                         .supervisor
@@ -616,11 +695,11 @@ impl GoalDeferredControl {
                         .await?
                         .is_none()
             }
-            (GoalControlIntentKind::Start { .. }, Some(task)) => {
+            (GoalControlIntentKind::Start { .. }, Ok(task)) => {
                 task.status.is_terminal()
                     && self.guard.intent.predecessor_task_id.as_deref() == Some(task.id.as_str())
             }
-            (kind, Some(task)) => {
+            (kind, Ok(task)) => {
                 self.guard.intent.task_id.as_deref() == Some(task.id.as_str())
                     && self.guard.intent.expected_epoch == Some(task.execution_epoch)
                     && match kind {
@@ -637,8 +716,9 @@ impl GoalDeferredControl {
     async fn current_response(&self) -> Result<GoalResponse> {
         let controller = &self.supervisor.engine.runtime.controller;
         let session = &self.guard.intent.session_id;
-        let Some(task) = controller.current(&self.ingress, session).await? else {
-            return Ok(GoalResponse::NoCurrentGoal);
+        let task = match controller.current(&self.ingress, session).await? {
+            Ok(task) => task,
+            Err(failure) => return Ok(failure.into_response()),
         };
         if task.status.is_terminal() {
             controller
@@ -677,17 +757,53 @@ impl GoalDeferredReady {
     /// predecessor drain, successor launch or rebind. If audit persistence fails
     /// after Start/Resume commits, terminalize the unlaunched epoch, release command
     /// and turn ownership, attempt its notice, and mark GoalLaunchFailureReported.
-    pub async fn commit(mut self, settings: GoalHostSettings) -> Result<GoalDeferredCommit> {
+    /// Build settings from the current canonical config after `wait` returns.
+    pub async fn commit(mut self, settings: &GoalHostSettings<'_>) -> Result<GoalDeferredCommit> {
         let control = &mut self.control;
         let command = control
             .command
             .take()
             .context("Goal deferred command missing")?;
+        control
+            .supervisor
+            .validate_settings(settings, &control.ingress)?;
+        if !control
+            .supervisor
+            .settings_scope_enabled(settings, &control.ingress)?
+        {
+            control
+                .guard
+                .settle(GoalControlIntentSettlement::Superseded {
+                    reason: "scope_disabled".into(),
+                })
+                .await?;
+            let runtime_submission = GoalRuntimeSubmission {
+                response: GoalResponse::Disabled,
+                execution: None,
+                lease: self.lease.take(),
+            };
+            let launch_guard = GoalLaunchGuard::new(
+                control.supervisor.launches.clone(),
+                None,
+                control.custody.take(),
+            );
+            let submission = control.supervisor.execution_submission(
+                runtime_submission,
+                None,
+                control.driver.clone(),
+                control.ingress.clone(),
+                launch_guard,
+                None,
+                settings,
+            );
+            return Ok(GoalDeferredCommit {
+                control: self.control,
+                submission,
+                boundary: self.boundary.take(),
+            });
+        }
         let admission = match &control.supervisor.restart_gate {
-            Some(gate) => match gate.admit(&command).await.and_then(|admission| {
-                gate.validate_policy_generation(&settings, &command)?;
-                Ok(admission)
-            }) {
+            Some(gate) => match gate.admit(&command).await {
                 Ok(admission) => admission,
                 Err(error) => {
                     control
@@ -701,6 +817,9 @@ impl GoalDeferredReady {
             },
             None => None,
         };
+        control
+            .supervisor
+            .validate_settings(settings, &control.ingress)?;
         let claim = control
             .supervisor
             .engine
@@ -734,7 +853,15 @@ impl GoalDeferredReady {
             .supervisor
             .scope_for_session(&control.ingress)
             .await?;
+        control
+            .supervisor
+            .validate_settings(settings, &control.ingress)?;
         let needs_audit = response.is_none();
+        let mut launch_guard = GoalLaunchGuard::new(
+            control.supervisor.launches.clone(),
+            admission,
+            control.custody.take(),
+        );
         let runtime_submission = if let Some(response) = response {
             GoalRuntimeSubmission {
                 response,
@@ -746,12 +873,13 @@ impl GoalDeferredReady {
                 .supervisor
                 .engine
                 .runtime
-                .submit_bound(
-                    &settings,
+                .submit_bound_with_launch_guard(
+                    settings,
                     control.ingress.clone(),
                     control.driver.clone(),
                     command,
                     lease,
+                    &mut launch_guard,
                 )
                 .await?
         };
@@ -768,9 +896,9 @@ impl GoalDeferredReady {
             previous,
             control.driver.clone(),
             control.ingress.clone(),
-            admission,
+            launch_guard,
             None,
-            &mut control.custody,
+            settings,
         );
         if needs_audit {
             let settlement = if applied {
@@ -781,41 +909,65 @@ impl GoalDeferredReady {
                 }
             };
             if let Err(error) = control.guard.settle(settlement).await {
-                // A durable Start/Resume is not yet supervisor-owned. An
-                // audit error must not drop its only launch request and leave
-                // Running behind without an owner. Use the existing launch
-                // failure reconciliation; never admit model work on this path.
-                submission.launch_guard.failed();
-                let mut failure_reported = false;
-                if let Some(scope) = submission.launch_guard.scope() {
-                    let scope = scope.clone();
-                    let notice = control
-                        .supervisor
-                        .fail_unlaunched_execution(&scope)
-                        .await
-                        .context("reconcile unlaunched Goal after control audit failure")?;
-                    failure_reported = notice.is_some();
-                    // Release settled command/checkpoint/turn ownership before reacquisition.
-                    drop(submission._lease.take());
-                    drop(self.boundary.take());
-                    drop(control.resource.take());
-                    if let Some(notice) = notice {
-                        control
+                let error = error.context("persist Goal control transition audit");
+                if submission.launch_guard.scope().is_none() {
+                    return Err(error);
+                }
+                submission.launch_guard.retain_primary(error);
+                let cleanup = control
+                    .supervisor
+                    .fail_unlaunched_execution(&mut submission.launch_guard)
+                    .await;
+                // Release command/checkpoint/turn ownership before notice
+                // reacquisition, while the guard still owns the primary.
+                drop(submission._lease.take());
+                drop(self.boundary.take());
+                drop(control.resource.take());
+                let failure_reported = match cleanup {
+                    Ok(Some(notice)) => {
+                        if let Err(secondary) = control
                             .supervisor
                             .publish_unlaunched_failure_notice(
                                 notice,
                                 control.driver.as_ref(),
                                 &control.ingress,
                             )
-                            .await;
+                            .await
+                        {
+                            let primary = submission
+                                .launch_guard
+                                .take_primary()
+                                .context("Goal audit failure lost its original cause")?;
+                            // The marker means classified + attempted, not
+                            // confirmed publication. Keep the actual cause.
+                            return Err(anyhow::Error::new(GoalLifecycleSecondaryError {
+                                primary,
+                                secondary,
+                            })
+                            .context(GoalLaunchFailureReported));
+                        }
+                        true
                     }
-                }
-                submission.launch_guard.settled();
-                let error = error.context("persist Goal control transition audit");
+                    Ok(None) => false,
+                    Err(secondary) => {
+                        let primary = submission
+                            .launch_guard
+                            .take_primary()
+                            .context("Goal audit failure lost its original cause")?;
+                        return Err(anyhow::Error::new(GoalLifecycleSecondaryError {
+                            primary,
+                            secondary,
+                        }));
+                    }
+                };
+                let primary = submission
+                    .launch_guard
+                    .take_primary()
+                    .context("Goal audit failure lost its original cause")?;
                 return Err(if failure_reported {
-                    error.context(GoalLaunchFailureReported)
+                    primary.context(GoalLaunchFailureReported)
                 } else {
-                    error
+                    primary
                 });
             }
         }

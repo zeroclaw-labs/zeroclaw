@@ -199,27 +199,20 @@ async fn apply_reserved(
     // committed config without its publication, and a post-commit
     // personality failure still publishes the committed config while the
     // truthful errors reach the caller below.
-    let task = zeroclaw_runtime::live_config_authority::spawn_agent_lifecycle_job(Box::pin(
-        async move {
-            let result = zeroclaw_runtime::quickstart::complete_staged_apply_as_commit(
+    let task =
+        zeroclaw_runtime::live_config_authority::spawn_agent_lifecycle_job(Box::pin(async move {
+            let mut completion = zeroclaw_runtime::quickstart::complete_staged_apply_as_commit(
                 staged, &commit, revision,
             )
             .await;
-            if matches!(
-                &result,
-                Ok(zeroclaw_runtime::quickstart::QuickstartApplyOutcome::Applied(_))
-                    | Ok(
-                        zeroclaw_runtime::quickstart::QuickstartApplyOutcome::CommittedWithSideEffectErrors {
-                            ..
-                        }
-                    )
-            ) {
+            let published = completion.published;
+            if published {
                 authorization.publish_persisted(&commit.current_config());
             }
-            result
-        },
-    ));
-    let result = match task.await {
+            completion.release_config_commit(commit);
+            (published, completion.finish_for_response().await)
+        }));
+    let (published, (result, detail)) = match task.await {
         Ok(result) => result,
         Err(e) => {
             return (
@@ -235,12 +228,16 @@ async fn apply_reserved(
                 .into_response();
         }
     };
+    let reload_signalled = if published {
+        state
+            .pending_reload
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        signal_daemon_reload(&state)
+    } else {
+        false
+    };
     let body = match result {
         Ok(zeroclaw_runtime::quickstart::QuickstartApplyOutcome::Applied(agent)) => {
-            state
-                .pending_reload
-                .store(true, std::sync::atomic::Ordering::Relaxed);
-            let reload_signalled = signal_daemon_reload(&state);
             ApplyResult::Applied {
                 agent,
                 daemon_restarted: reload_signalled,
@@ -252,18 +249,20 @@ async fn apply_reserved(
                 ..
             },
         ) => {
-            // The config is committed AND published; mark the reload
-            // pending and signal it exactly like a fully successful apply,
-            // and return the truthful personality errors.
-            state
-                .pending_reload
-                .store(true, std::sync::atomic::Ordering::Relaxed);
-            let _ = signal_daemon_reload(&state);
+            // Publication was signalled above even when personality install
+            // or the subsequent Goal drain reports an error.
             ApplyResult::Errors { errors }
         }
         Err(errors) => ApplyResult::Errors { errors },
     };
-    (StatusCode::OK, Json(body)).into_response()
+    (
+        StatusCode::OK,
+        Json(zeroclaw_runtime::quickstart::QuickstartApplyResponse {
+            result: body,
+            detail,
+        }),
+    )
+        .into_response()
 }
 
 fn signal_daemon_reload(state: &AppState) -> bool {
@@ -381,6 +380,7 @@ mod tests {
             .unwrap();
         let result: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(result["kind"], "applied", "{result}");
+        assert!(result.get("detail").is_none(), "{result}");
         assert!(state.config.read().agents.contains_key("recreated"));
     }
 }

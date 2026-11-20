@@ -19,17 +19,17 @@ use zeroclaw_config::schema::Config;
 
 use platform::LocalStream;
 
-const MAX_FRAME_BYTES: u64 = 8 * 1024 * 1024;
+pub(crate) use zeroclaw_rpc_proto::MAX_FRAME_BYTES;
 
 /// Best-effort deadline for half-closing a local stream after daemon
 /// cancellation. Windows named-pipe shutdown can wait on a non-reading peer.
-const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
+pub(crate) const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Deadline for writing one frame to a local peer. A peer that stops reading
 /// for this long is disconnected, the same bound the WSS plane applies with
 /// its `PEER_WRITE_TIMEOUT`, so one stalled client cannot park the producers
 /// that feed its queue indefinitely.
-const LOCAL_PEER_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const LOCAL_PEER_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Deadline for a new connection to complete `initialize`, counted from
 /// accept. A client that connects and never initializes would otherwise hold
@@ -44,7 +44,7 @@ const LOCAL_FRAME_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How long the reader waits for a terminal error frame to reach the peer
 /// before it closes the connection anyway.
-const TERMINAL_FRAME_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const TERMINAL_FRAME_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Deadline for telling a refused client why it was refused.
 const REFUSAL_WRITE_TIMEOUT: Duration = Duration::from_millis(250);
@@ -84,9 +84,9 @@ impl LocalListenerLimits {
 
 /// A last frame for the peer, written ahead of the ordinary queue. The writer
 /// stops after it, so the peer reads the frame and then end of stream.
-struct TerminalFrame {
-    line: String,
-    written: tokio::sync::oneshot::Sender<()>,
+pub(crate) struct TerminalFrame {
+    pub(crate) line: String,
+    pub(crate) written: tokio::sync::oneshot::Sender<()>,
 }
 
 /// Serialize a JSON-RPC error response with a null id, for failures that are
@@ -109,7 +109,7 @@ fn unattributed_error_line(code: i32, message: String, data: serde_json::Value) 
     line
 }
 
-fn frame_too_large_line() -> String {
+pub(crate) fn frame_too_large_line() -> String {
     unattributed_error_line(
         zeroclaw_api::jsonrpc::error_codes::INVALID_REQUEST,
         format!("Frame exceeds the {MAX_FRAME_BYTES}-byte local RPC frame limit"),
@@ -329,11 +329,11 @@ pub struct LocalTransport {
 
 /// Timing bounds for one connection's writer task.
 #[derive(Debug, Clone, Copy)]
-struct WriterTimeouts {
+pub(crate) struct WriterTimeouts {
     /// Deadline for one frame; past it the connection is cancelled.
-    write: Duration,
+    pub(crate) write: Duration,
     /// Deadline for the final half-close.
-    shutdown: Duration,
+    pub(crate) shutdown: Duration,
 }
 
 enum WriteOutcome {
@@ -394,7 +394,7 @@ where
     }
 }
 
-async fn run_writer<W>(
+pub(crate) async fn run_writer<W>(
     mut writer: W,
     mut writer_rx: mpsc::Receiver<String>,
     mut terminal_rx: mpsc::Receiver<TerminalFrame>,
@@ -1408,14 +1408,17 @@ mod tests {
     ) {
         use crate::rpc::dispatch::connection_test_support::{
             exercise_failed_predecessor_transport, gate_failed_predecessor_publication,
-            prepare_failed_predecessor_fixture,
+            prepare_failed_predecessor_fixture, prepare_provider_error_predecessor_fixture,
         };
         const SID: &str = "failed-predecessor-local";
         const OWNER: &str = "failed-predecessor-owner";
         let tmp = tempfile::tempdir().unwrap();
         let mut ctx = test_ctx(tmp.path());
-        let (registry, parent, ordinary, successor) =
-            prepare_failed_predecessor_fixture(&mut ctx, tmp.path(), SID, OWNER).await;
+        let (registry, parent, ordinary, successor) = if parked.is_some() || terminal.is_some() {
+            prepare_failed_predecessor_fixture(&mut ctx, tmp.path(), SID, OWNER).await
+        } else {
+            prepare_provider_error_predecessor_fixture(&mut ctx, tmp.path(), SID, OWNER).await
+        };
         let gate = if parked.is_some() || terminal.is_some() {
             Some(
                 gate_failed_predecessor_publication(&ctx, tmp.path(), SID, &registry, &parent)
@@ -1523,6 +1526,12 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn goal_external_cancel_notification_settles_without_ack_local_ipc() {
+        exercise_external_cancel_delivery_local_ipc(ExternalCancelScenario::Notification).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn goal_external_cancel_outcome_unknown_delivery_local_ipc() {
         exercise_external_cancel_delivery_local_ipc(ExternalCancelScenario::OutcomeUnknown).await;
     }
@@ -1546,6 +1555,30 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[tokio::test]
+    async fn goal_external_cancel_pre_fence_removal_leaves_goal_untouched_local_ipc() {
+        exercise_external_cancel_delivery_local_ipc(ExternalCancelScenario::PreFenceRemoved).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn goal_external_cancel_pre_fence_reowner_leaves_goal_untouched_local_ipc() {
+        exercise_external_cancel_delivery_local_ipc(ExternalCancelScenario::PreFenceReowned).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn goal_external_cancel_pre_fence_replacement_preserves_successor_local_ipc() {
+        exercise_external_cancel_delivery_local_ipc(ExternalCancelScenario::PreFenceReplaced).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn goal_external_cancel_post_pause_reowner_preserves_ordinary_turn_local_ipc() {
+        exercise_external_cancel_delivery_local_ipc(ExternalCancelScenario::PostPauseReowned).await;
+    }
+
+    #[cfg(unix)]
     #[allow(clippy::await_holding_lock)]
     async fn exercise_external_cancel_delivery_local_ipc(scenario: ExternalCancelScenario) {
         let _writer_guard = zeroclaw_log::__private_test_writer_lock();
@@ -1556,7 +1589,7 @@ mod tests {
         use crate::rpc::dispatch::connection_test_support::{
             exercise_external_cancel_moved_transport,
             exercise_goal_external_cancel_failure_transport, gate_external_cancel_failure,
-            prepare_failed_predecessor_fixture, prepare_unsettled_predecessor_fixture,
+            prepare_provider_error_predecessor_fixture, prepare_unsettled_predecessor_fixture,
             refuse_external_cancel_settlement,
         };
         const SID: &str = "external-cancel-failure-local";
@@ -1565,11 +1598,12 @@ mod tests {
         let teardown = scenario == ExternalCancelScenario::Teardown;
         let tmp = tempfile::tempdir().unwrap();
         let mut ctx = test_ctx(tmp.path());
-        let (registry, parent, ordinary, successor) = if outcome_unknown {
-            prepare_unsettled_predecessor_fixture(&mut ctx, tmp.path(), SID, OWNER).await
-        } else {
-            prepare_failed_predecessor_fixture(&mut ctx, tmp.path(), SID, OWNER).await
-        };
+        let (registry, parent, ordinary, successor) =
+            if outcome_unknown || scenario.authority_change() {
+                prepare_unsettled_predecessor_fixture(&mut ctx, tmp.path(), SID, OWNER).await
+            } else {
+                prepare_provider_error_predecessor_fixture(&mut ctx, tmp.path(), SID, OWNER).await
+            };
         let gate = gate_external_cancel_failure(&ctx, tmp.path(), SID, &registry, &parent).await;
         if outcome_unknown {
             refuse_external_cancel_settlement(tmp.path()).await;
@@ -1995,8 +2029,8 @@ mod tests {
     #[tokio::test]
     async fn goal_status_uses_the_typed_session_goal_response_over_local_ipc() {
         use crate::rpc::dispatch::connection_test_support::insert_immediate_session_with_owner;
+        use crate::rpc::types::GoalResponseWire as GoalResponse;
         use crate::rpc::types::SessionGoalResult;
-        use zeroclaw_goal::control::GoalResponse;
 
         const SESSION_ID: &str = "goal-local-ipc-transport";
         const TUI_ID: &str = "goal-local-ipc-tui";
@@ -2205,6 +2239,19 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn registered_goal_rechecks_publication_over_local_ipc() {
+        use crate::rpc::dispatch::connection_test_support::{
+            GoalParentAdmissionCase, GoalParentEnding,
+        };
+        exercise_goal_parent_control_ending_over_local_ipc(
+            GoalParentAdmissionCase::QueuedResumeWithIntervening,
+            GoalParentEnding::ContinueAfterPublication,
+        )
+        .await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn goal_budget_fence_drains_actual_parent_local_ipc() {
         use crate::rpc::dispatch::connection_test_support::GoalParentAdmissionCase;
         for case in [
@@ -2254,6 +2301,19 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn goal_client_eof_preserves_actual_parent_local_ipc() {
+        use crate::rpc::dispatch::connection_test_support::{
+            GoalParentAdmissionCase, GoalParentEnding,
+        };
+        exercise_goal_parent_control_ending_over_local_ipc(
+            GoalParentAdmissionCase::DirectResume,
+            GoalParentEnding::ClientEof,
+        )
+        .await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn goal_pause_now_drain_failure_reports_once_local_ipc() {
         use crate::rpc::dispatch::connection_test_support::{
             GoalParentAdmissionCase, GoalParentEnding,
@@ -2280,6 +2340,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn goal_pause_now_supersedes_queued_budget_local_ipc() {
         use crate::rpc::dispatch::connection_test_support::{
@@ -2292,6 +2353,7 @@ mod tests {
         .await;
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn goal_cancel_overtakes_queued_resume_local_ipc() {
         use crate::rpc::dispatch::connection_test_support::{
@@ -2306,6 +2368,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn goal_queued_budget_then_pause_apply_fifo_local_ipc() {
         use crate::rpc::dispatch::connection_test_support::{
@@ -2318,6 +2381,7 @@ mod tests {
         .await;
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn goal_pause_waits_for_admitted_verifier_local_ipc() {
         use crate::rpc::dispatch::connection_test_support::{
@@ -2344,6 +2408,378 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[tokio::test]
+    async fn goal_native_llm_task_failure_transparency_local_ipc() {
+        run_goal_native_llm_task_transparency_local_ipc(false).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn goal_native_sop_cancellation_matches_delegate_local_ipc() {
+        run_goal_native_llm_task_transparency_local_ipc(true).await;
+    }
+
+    #[cfg(unix)]
+    async fn run_goal_native_llm_task_transparency_local_ipc(cancellation_only: bool) {
+        use crate::rpc::dispatch::connection_test_support::{
+            GoalParentAdmissionCase, NativeLlmTaskScenario, exercise_native_llm_task_failure,
+            prepare_held_goal_parent_fixture, prepare_native_llm_task_failure,
+        };
+        const SID: &str = "goal-native-llm-local";
+        const OWNER: &str = "goal-native-llm-owner";
+        let cases = if cancellation_only {
+            vec![
+                (false, false, true, false, false, false, false, true),
+                (false, true, false, false, false, false, false, true),
+            ]
+        } else {
+            vec![
+                (false, false, false, false, false, false, false, false),
+                (true, false, false, false, false, false, false, false),
+                (false, true, false, false, false, false, false, false),
+                (true, true, false, false, false, false, false, false),
+                (false, false, true, false, false, false, false, false),
+                (false, false, true, true, false, false, false, false),
+                (false, false, false, false, true, false, false, false),
+                (false, true, false, false, false, true, false, false),
+                (true, false, false, false, false, false, true, false),
+                (true, false, true, false, false, false, true, false),
+            ]
+        };
+        let mut cancellation_presentation = None;
+        for (
+            provider_error,
+            delegate,
+            sop,
+            sop_success,
+            tool_success,
+            delegate_timeout,
+            ordinary,
+            cancel_inflight,
+        ) in cases
+        {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut ctx = test_ctx(tmp.path());
+            let (registry, _parent) = prepare_held_goal_parent_fixture(
+                &mut ctx,
+                tmp.path(),
+                SID,
+                OWNER,
+                GoalParentAdmissionCase::DirectResume,
+            )
+            .await;
+            let scenario = NativeLlmTaskScenario {
+                provider_error,
+                delegate,
+                sop,
+                sop_success,
+                tool_success,
+                delegate_timeout,
+                ordinary,
+                cancel_inflight,
+            };
+            let fixture = prepare_native_llm_task_failure(&ctx, tmp.path(), SID, scenario).await;
+            let socket = ctx.config.read().data_dir.join("daemon.sock");
+            let cancel = CancellationToken::new();
+            let (ready_tx, mut ready_rx) = tokio::sync::watch::channel(false);
+            let readiness = crate::daemon::SocketReadinessReporter::new(move || {
+                let _ = ready_tx.send(true);
+            });
+            let server_cancel = cancel.clone();
+            let mut server = zeroclaw_spawn::spawn!(run_local_listener(
+                Arc::clone(&ctx),
+                server_cancel,
+                test_client_count(),
+                Some(readiness),
+            ));
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                tokio::select! {
+                    Ok(_) = ready_rx.wait_for(|ready| *ready) => {}
+                    outcome = &mut server => panic!("local IPC listener exited before readiness: {outcome:?}"),
+                }
+            })
+            .await
+            .expect("local IPC listener should report readiness");
+            let (reader, mut writer) = tokio::net::UnixStream::connect(&socket)
+                .await
+                .unwrap()
+                .into_split();
+            let mut reader = BufReader::new(reader);
+            let init = InitializeParams {
+                protocol_version: 1,
+                tui_id: Some(OWNER.into()),
+                tui_sig: None,
+                env: Default::default(),
+                client_capabilities: None,
+                auth_token: None,
+                auth_provider: None,
+            };
+            writer
+                .write_all(rpc_request(Method::Initialize, &init, 1).as_bytes())
+                .await
+                .unwrap();
+            let (_, _): (_, serde_json::Value) = read_result(&mut reader).await;
+            let presentation = exercise_native_llm_task_failure(
+                registry.as_ref(),
+                SID,
+                &fixture,
+                scenario,
+                async |frame| {
+                    let encoded = format!("{}\n", serde_json::to_string(&frame).unwrap());
+                    writer.write_all(encoded.as_bytes()).await.unwrap();
+                },
+                async || {
+                    let mut line = String::new();
+                    assert_ne!(reader.read_line(&mut line).await.unwrap(), 0);
+                    serde_json::from_str(&line).unwrap()
+                },
+            )
+            .await;
+            if let Some(presentation) = presentation {
+                if let Some(previous) = &cancellation_presentation {
+                    assert_eq!(
+                        previous, &presentation,
+                        "SOP and delegate cancellation must have the same IPC presentation"
+                    );
+                } else {
+                    cancellation_presentation = Some(presentation);
+                }
+            }
+            cancel.cancel();
+            drop(writer);
+            tokio::time::timeout(Duration::from_secs(2), server)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+        }
+        assert_eq!(cancellation_presentation.is_some(), cancellation_only);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn goal_native_event_pressure_and_owned_child_local_ipc() {
+        use crate::rpc::dispatch::connection_test_support::{
+            GoalParentAdmissionCase, GoalParentEnding,
+        };
+        for ending in [
+            GoalParentEnding::EventBurstSuccess,
+            GoalParentEnding::EventBurstFailure,
+            GoalParentEnding::EventBurstProjectionFailure,
+            GoalParentEnding::PreparationFailure,
+        ] {
+            exercise_goal_parent_control_ending_over_local_ipc(
+                GoalParentAdmissionCase::DirectResume,
+                ending,
+            )
+            .await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn goal_disconnect_counts_until_worker_settles_local_ipc() {
+        exercise_goal_disconnect_counts_until_worker_settles(HeldVerifierOutcome::Complete).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn goal_disconnect_retires_settled_verifier_failure_local_ipc() {
+        exercise_goal_disconnect_counts_until_worker_settles(HeldVerifierOutcome::InvalidVerdict)
+            .await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn goal_disconnect_retires_settled_unknown_accounting_local_ipc() {
+        exercise_goal_disconnect_counts_until_worker_settles(HeldVerifierOutcome::ProviderError)
+            .await;
+    }
+
+    #[cfg(unix)]
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum HeldVerifierOutcome {
+        Complete,
+        InvalidVerdict,
+        ProviderError,
+    }
+
+    #[cfg(unix)]
+    async fn exercise_goal_disconnect_counts_until_worker_settles(outcome: HeldVerifierOutcome) {
+        use crate::rpc::dispatch::connection_test_support::{
+            GoalParentAdmissionCase, assert_held_parent_and_verifier_usage,
+            prepare_held_goal_parent_fixture, prepare_held_goal_verifier,
+            prepare_held_goal_verifier_with_response,
+        };
+        use crate::rpc::types::{GoalResponseWire, SessionGoalResult};
+        use zeroclaw_api::task::TaskStatus;
+        use zeroclaw_goal::GoalAccountingState;
+        use zeroclaw_goal::control::GoalSessionKey;
+
+        const SID: &str = "goal-disconnect";
+        const OWNER: &str = "goal-disconnect-owner";
+        let directory = tempfile::tempdir().unwrap();
+        let mut ctx = test_ctx(directory.path());
+        let (registry, parent) = prepare_held_goal_parent_fixture(
+            &mut ctx,
+            directory.path(),
+            SID,
+            OWNER,
+            GoalParentAdmissionCase::DirectResume,
+        )
+        .await;
+        let verifier =
+            match outcome {
+                HeldVerifierOutcome::Complete => prepare_held_goal_verifier(&ctx).await,
+                HeldVerifierOutcome::InvalidVerdict => prepare_held_goal_verifier_with_response(
+                    &ctx,
+                    Some(r#"{"decision":"unrecognized","reason":"Fixture verdict","blockers":[]}"#),
+                )
+                .await,
+                HeldVerifierOutcome::ProviderError => {
+                    prepare_held_goal_verifier_with_response(&ctx, None).await
+                }
+            };
+        let count = test_client_count();
+        let socket = ctx.config.read().data_dir.join("daemon.sock");
+        let cancel = CancellationToken::new();
+        let server_ctx = Arc::clone(&ctx);
+        let server_cancel = cancel.clone();
+        let server_count = Arc::clone(&count);
+        let server = zeroclaw_spawn::spawn!(run_local_listener(
+            server_ctx,
+            server_cancel,
+            server_count,
+            None,
+        ));
+        wait_for_socket(&socket).await;
+        let (reader, mut writer) = tokio::net::UnixStream::connect(&socket)
+            .await
+            .unwrap()
+            .into_split();
+        let mut reader = tokio::io::BufReader::new(reader);
+        let init = InitializeParams {
+            protocol_version: 1,
+            tui_id: Some(OWNER.into()),
+            tui_sig: None,
+            env: Default::default(),
+            client_capabilities: None,
+            auth_token: None,
+            auth_provider: None,
+        };
+        writer
+            .write_all(rpc_request(Method::Initialize, &init, 1).as_bytes())
+            .await
+            .unwrap();
+        let (_, _): (_, serde_json::Value) = read_result(&mut reader).await;
+        writer
+            .write_all(
+                rpc_request(
+                    Method::SessionGoal,
+                    &serde_json::json!({
+                        "session_id": SID, "command": "/goal resume",
+                    }),
+                    2,
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let (_, result): (_, SessionGoalResult) = read_result(&mut reader).await;
+        assert!(matches!(result.response, GoalResponseWire::Resumed(_)));
+        tokio::time::timeout(Duration::from_secs(2), parent.turn.started.notified())
+            .await
+            .unwrap();
+        drop(writer);
+        drop(reader);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while ctx.tui_registry.departure(OWNER).is_none() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("observer must detach while parent is held");
+        assert_eq!(count.load(Ordering::Relaxed), 1);
+        parent.turn.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), verifier.turn.started.notified())
+            .await
+            .unwrap();
+        assert_eq!(count.load(Ordering::Relaxed), 1);
+        verifier.turn.release.notify_one();
+        wait_for_client_count(&count, 0).await;
+
+        let key = GoalSessionKey::zero_code(SID).unwrap().durable_id();
+        let task = registry
+            .current_goal_for_session(&key)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            task.status,
+            if outcome == HeldVerifierOutcome::Complete {
+                TaskStatus::Completed
+            } else {
+                TaskStatus::Failed
+            }
+        );
+        assert!(
+            ctx.session_backend
+                .as_ref()
+                .unwrap()
+                .load(&format!("rpc_{SID}"))
+                .iter()
+                .any(|message| message.role == "assistant" && message.content == "ordinary answer")
+        );
+        let goal = registry.get_goal_task(&task.id).await.unwrap().unwrap();
+        assert!(goal.pending_call_id.is_none() && goal.pending_call_epoch.is_none());
+        let ledger_path = directory.path().join("state/costs.jsonl");
+        let ledger = tokio::fs::read_to_string(&ledger_path).await.unwrap();
+        if outcome == HeldVerifierOutcome::ProviderError {
+            assert_eq!(goal.accounting_state, GoalAccountingState::OutcomeUnknown);
+            let mut rows = ledger.lines();
+            let row: zeroclaw_config::cost::types::CostRecord =
+                serde_json::from_str(rows.next().unwrap()).unwrap();
+            assert_eq!(row.task_id.as_deref(), Some(task.id.as_str()));
+            assert_eq!(row.usage.total_tokens, 3);
+            assert!(rows.next().is_none(), "unknown usage must not be invented");
+        } else {
+            assert_eq!(goal.accounting_state, GoalAccountingState::Complete);
+            assert_held_parent_and_verifier_usage(directory.path(), &task.id).await;
+        }
+        let generation = ctx.sessions.get_generation(SID).await.unwrap();
+        let _lifecycle = ctx
+            .sessions
+            .lock_goal_lifecycle(SID, generation)
+            .await
+            .unwrap();
+        let supervisor = ctx.goal_runtime.supervisor(SID).await.unwrap();
+        assert!(supervisor.worker_completed_for_session(&key).await);
+        assert!(ctx.goal_runtime.can_retire_session_goal(SID).await.unwrap());
+        assert!(ctx.goal_runtime.supervisor(SID).await.is_none());
+        assert!(!supervisor.worker_completed_for_session(&key).await);
+        assert_eq!(
+            serde_json::to_value(registry.current_goal_for_session(&key).await.unwrap()).unwrap(),
+            serde_json::to_value(Some(task)).unwrap(),
+            "orphan retirement cannot change the durable Goal",
+        );
+        assert_eq!(
+            registry.get_goal_task(&goal.task_id).await.unwrap(),
+            Some(goal),
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(ledger_path).await.unwrap(),
+            ledger
+        );
+        verifier.finish().await;
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    #[cfg(unix)]
     async fn exercise_goal_parent_control_ending_over_local_ipc(
         case: crate::rpc::dispatch::connection_test_support::GoalParentAdmissionCase,
         ending: crate::rpc::dispatch::connection_test_support::GoalParentEnding,
@@ -2353,7 +2789,12 @@ mod tests {
             prepare_goal_budget_verifier, prepare_held_goal_parent_fixture,
         };
         use crate::rpc::types::SessionGoalResult;
-        use zeroclaw_goal::control::{GoalQueuedControl, GoalResponse, GoalSessionKey};
+        use crate::rpc::types::{
+            GoalAccountingStateWire, GoalPauseReasonWire, GoalPendingActionWire,
+            GoalQueuedControlWire as GoalQueuedControl, GoalResponseWire as GoalResponse,
+            GoalTaskStatusWire,
+        };
+        use zeroclaw_goal::control::GoalSessionKey;
         use zeroclaw_goal::{GoalAccountingState, GoalPauseReason};
 
         const SID: &str = "goal-local-parent";
@@ -2376,6 +2817,35 @@ mod tests {
         }
         let (registry, parent) =
             prepare_held_goal_parent_fixture(&mut ctx, tmp.path(), SID, OWNER, case).await;
+        let burst = if matches!(
+            ending,
+            GoalParentEnding::EventBurstSuccess
+                | GoalParentEnding::EventBurstFailure
+                | GoalParentEnding::EventBurstProjectionFailure
+        ) {
+            Some(
+                crate::rpc::dispatch::connection_test_support::prepare_native_burst_fixture(
+                    &ctx,
+                    tmp.path(),
+                    SID,
+                    &parent,
+                    ending == GoalParentEnding::EventBurstFailure,
+                )
+                .await,
+            )
+        } else {
+            None
+        };
+        if ending == GoalParentEnding::EventBurstProjectionFailure {
+            *ctx.goal_runtime
+                .test_parent_projection_failure
+                .lock()
+                .unwrap() = Some(SID.into());
+        }
+        if ending == GoalParentEnding::PreparationFailure {
+            crate::rpc::dispatch::connection_test_support::prepare_native_prefix_failure(&ctx, SID)
+                .await;
+        }
         let verifier_server = if budget_fence {
             Some(prepare_goal_budget_verifier(&ctx).await)
         } else {
@@ -2387,7 +2857,10 @@ mod tests {
             None
         };
         let turn = &parent.turn;
-        let held_verifier = if verifier_pause || replacement {
+        let held_verifier = if verifier_pause
+            || replacement
+            || ending == GoalParentEnding::ContinueAfterPublication
+        {
             Some(
                 crate::rpc::dispatch::connection_test_support::prepare_held_goal_verifier(&ctx)
                     .await,
@@ -2477,6 +2950,19 @@ mod tests {
                 .await
                 .expect("ordinary model call must be in flight before Goal control");
         }
+        let commit_pause = if ending == GoalParentEnding::ContinueAfterPublication {
+            let entered = Arc::new(tokio::sync::Notify::new());
+            let release = Arc::new(tokio::sync::Notify::new());
+            *ctx.goal_runtime.test_deferred_commit_pause.lock().unwrap() =
+                Some(crate::rpc::goal::GoalTestDeferredCommitPause {
+                    session_id: SID.into(),
+                    entered: entered.clone(),
+                    release: release.clone(),
+                });
+            Some((entered, release))
+        } else {
+            None
+        };
         writer
             .write_all(
                 rpc_request(
@@ -2584,6 +3070,30 @@ mod tests {
                 return;
             }
             ordinary.release.notify_one();
+            if let Some((entered, release)) = commit_pause {
+                tokio::time::timeout(Duration::from_secs(2), entered.notified())
+                    .await
+                    .expect("deferred control must hold its session boundary");
+                writer
+                    .write_all(
+                        rpc_request(
+                            Method::SessionPrompt,
+                            &serde_json::json!({"session_id": SID, "prompt": "intervening work"}),
+                            6,
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    while ctx.sessions.session_queue.queue_depth(SID).await < 2 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("the real ordinary prompt must queue after the control");
+                release.notify_one();
+            }
             let mut ordinary_text = String::new();
             let mut ordinary_ack = false;
             let mut ordinary_completed = false;
@@ -2612,14 +3122,271 @@ mod tests {
                     .completed
                     .load(std::sync::atomic::Ordering::Acquire)
             );
+            if let Some(intervening) = &parent.intervening {
+                tokio::time::timeout(Duration::from_secs(2), intervening.started.notified())
+                    .await
+                    .expect("the queued ordinary prompt must acquire the session");
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    while ctx.sessions.session_queue.queue_depth(SID).await < 2 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("registered Goal must wait for the session");
+                let captured = ctx.config.revision();
+                let mut config = ctx.config.snapshot();
+                config.goal.include_channel_turn_context =
+                    !config.goal.include_channel_turn_context;
+                config.validate().unwrap();
+                ctx.config_authority.publish_for_test(config);
+                assert!(ctx.config.revision().succeeds_within_epoch(&captured));
+                intervening.release.notify_one();
+            }
         } else {
             assert!(matches!(resumed.response, GoalResponse::Resumed(_)));
             events.announced = true;
+        }
+        if ending == GoalParentEnding::PreparationFailure {
+            let mut failure=crate::rpc::dispatch::connection_test_support::NativePreparationFailureEvents::default();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let mut line = String::new();
+                    assert_ne!(reader.read_line(&mut line).await.unwrap(), 0);
+                    let frame: serde_json::Value = serde_json::from_str(&line).unwrap();
+                    if failure.observe(&frame) {
+                        break;
+                    }
+                }
+            })
+            .await
+            .expect("original preparation error must reach the real local IPC boundary");
+            assert_eq!(turn.calls.load(std::sync::atomic::Ordering::Acquire), 0);
+            assert_eq!(
+                registry
+                    .current_goal_for_session(&key)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                zeroclaw_api::task::TaskStatus::Failed
+            );
+            ctx.goal_runtime.dispose_session(SID).await.unwrap();
+            cancel.cancel();
+            drop(writer);
+            tokio::time::timeout(Duration::from_secs(2), server)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            return;
         }
         tokio::time::timeout(Duration::from_secs(2), turn.started.notified())
             .await
             .expect("start/resume must launch the actual Goal parent call");
         parent.assert_resume_input(response);
+        if ending == GoalParentEnding::ContinueAfterPublication {
+            let verifier = held_verifier.unwrap();
+            turn.release.notify_one();
+            tokio::time::timeout(Duration::from_secs(2), verifier.turn.started.notified())
+                .await
+                .expect("the continued Goal must reach its verifier");
+            verifier.turn.release.notify_one();
+            let mut intervening_text = String::new();
+            let mut intervening_ack = false;
+            let mut intervening_done = false;
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let mut line = String::new();
+                    assert_ne!(reader.read_line(&mut line).await.unwrap(), 0);
+                    let frame: serde_json::Value = serde_json::from_str(&line).unwrap();
+                    assert!(frame["error"].is_null(), "{frame}");
+                    if frame["id"] == 6 {
+                        crate::rpc::dispatch::connection_test_support::assert_ordinary_prompt_acknowledgement(&frame, SID);
+                        intervening_ack = true;
+                    } else if frame["method"] == "session/update" && !intervening_done {
+                        intervening_done |= crate::rpc::dispatch::connection_test_support::observe_ordinary_turn_update(&frame, SID, &mut intervening_text);
+                    }
+                    if frame["method"] == "session/goal_update" {
+                        let update: crate::rpc::types::SessionGoalUpdate =
+                            serde_json::from_value(frame["params"].clone()).unwrap();
+                        match update {
+                            crate::rpc::types::SessionGoalUpdate::Completed { session_id } => {
+                                assert_eq!(session_id, SID);
+                                break;
+                            }
+                            crate::rpc::types::SessionGoalUpdate::VerifiedCandidate { .. } => {}
+                            other => panic!("unexpected Goal disposition: {other:?}"),
+                        }
+                    }
+                }
+            })
+            .await
+            .expect("the continued Goal must complete");
+            assert!(intervening_ack && intervening_done);
+            assert_eq!(intervening_text, "ordinary answer");
+            let task = registry
+                .current_goal_for_session(&key)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(task.id, predecessor.as_ref().unwrap().id);
+            assert_eq!(task.status, zeroclaw_api::task::TaskStatus::Completed);
+            crate::rpc::dispatch::connection_test_support::assert_held_parent_and_verifier_usage(
+                tmp.path(),
+                &task.id,
+            )
+            .await;
+            let backend = Arc::clone(ctx.session_backend.as_ref().unwrap());
+            let history = tokio::task::spawn_blocking(move || backend.load(&format!("rpc_{SID}")))
+                .await
+                .unwrap();
+            crate::rpc::dispatch::connection_test_support::assert_resume_history(&history, case);
+            assert_eq!(ctx.sessions.get_generation(SID).await, Some(generation));
+            verifier.finish().await;
+            ctx.goal_runtime.dispose_session(SID).await.unwrap();
+            cancel.cancel();
+            drop(writer);
+            tokio::time::timeout(Duration::from_secs(2), server)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            return;
+        }
+        if ending == GoalParentEnding::ClientEof {
+            let before = registry
+                .current_goal_for_session(&key)
+                .await
+                .unwrap()
+                .unwrap();
+            let extension = registry.get_goal_task(&before.id).await.unwrap().unwrap();
+            assert_eq!(before.status, zeroclaw_api::task::TaskStatus::Running);
+            drop(writer);
+            drop(reader);
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while ctx
+                    .tui_registry
+                    .list()
+                    .iter()
+                    .any(|entry| entry.tui_id == OWNER)
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect(
+                "actual IPC EOF must finish connection teardown without draining the Goal parent",
+            );
+            assert_eq!(
+                serde_json::to_value(
+                    registry
+                        .current_goal_for_session(&key)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                )
+                .unwrap(),
+                serde_json::to_value(&before).unwrap(),
+            );
+            assert_eq!(
+                registry.get_goal_task(&before.id).await.unwrap().unwrap(),
+                extension
+            );
+            assert!(!turn.exited.load(std::sync::atomic::Ordering::Acquire));
+            assert_eq!(ctx.sessions.get_generation(SID).await, Some(generation));
+            assert_eq!(turn.calls.load(std::sync::atomic::Ordering::Acquire), 1);
+            // Only this separate, explicit restart is allowed to fence and
+            // drain the parent retained across the preceding pure EOF.
+            let quiesce = parent.begin_restart(registry.as_ref(), &before).await;
+            turn.release.notify_one();
+            tokio::time::timeout(Duration::from_secs(2), quiesce)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            let settled = registry.get_goal_task(&before.id).await.unwrap().unwrap();
+            assert_eq!(settled.pause_reason, Some(GoalPauseReason::DaemonRestart));
+            assert_eq!(settled.accounting_state, GoalAccountingState::Complete);
+            assert!(settled.pending_call_id.is_none() && settled.pending_call_epoch.is_none());
+            crate::rpc::dispatch::connection_test_support::assert_held_goal_usage(
+                tmp.path(),
+                &before.id,
+            )
+            .await;
+            assert_eq!(turn.calls.load(std::sync::atomic::Ordering::Acquire), 1);
+            cancel.cancel();
+            tokio::time::timeout(Duration::from_secs(2), server)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            return;
+        }
+        if let Some(burst) = burst {
+            let mut typed =
+                crate::rpc::dispatch::connection_test_support::NativeBurstEvents::default();
+            if ending == GoalParentEnding::EventBurstSuccess {
+                writer
+                    .write_all(
+                        rpc_request(
+                            Method::SessionGoal,
+                            &serde_json::json!({"session_id":SID,"command":"/goal pause"}),
+                            40,
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        let mut line = String::new();
+                        assert_ne!(reader.read_line(&mut line).await.unwrap(), 0);
+                        let frame: serde_json::Value = serde_json::from_str(&line).unwrap();
+                        if frame["id"] == 40 {
+                            let queued: SessionGoalResult =
+                                serde_json::from_value(frame["result"].clone()).unwrap();
+                            assert_eq!(
+                                queued.response,
+                                GoalResponse::Queued(GoalQueuedControl::Pause)
+                            );
+                            break;
+                        }
+                        assert!(!typed.observe(&frame, SID, ending));
+                    }
+                })
+                .await
+                .expect("typed event pressure must drain while the parent is held");
+            }
+            turn.release.notify_one();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let mut line = String::new();
+                    assert_ne!(reader.read_line(&mut line).await.unwrap(), 0);
+                    let frame: serde_json::Value = serde_json::from_str(&line).unwrap();
+                    if typed.observe(&frame, SID, ending) {
+                        break;
+                    }
+                }
+            })
+            .await
+            .expect("buffered tail and native terminal outcome must drain");
+            typed.assert_complete(ending);
+            let task = registry
+                .current_goal_for_session(&key)
+                .await
+                .unwrap()
+                .unwrap();
+            burst.assert_child_and_ledger(tmp.path(), &task.id).await;
+            ctx.goal_runtime.dispose_session(SID).await.unwrap();
+            cancel.cancel();
+            drop(writer);
+            tokio::time::timeout(Duration::from_secs(2), server)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            return;
+        }
         if case.queued().is_some() {
             case.assert_intent(
                 tmp.path(),
@@ -2861,16 +3628,17 @@ mod tests {
                 panic!("restart status must be directly observable");
             };
             assert_eq!(status.task_id, before.id);
-            assert_eq!(status.status, zeroclaw_api::task::TaskStatus::Paused);
-            assert_eq!(status.pause_reason, Some(GoalPauseReason::DaemonRestart));
+            assert_eq!(status.status, GoalTaskStatusWire::Paused);
+            assert_eq!(
+                status.pause_reason,
+                Some(GoalPauseReasonWire::DaemonRestart)
+            );
             assert!(!status.resumable);
         } else {
             assert_eq!(
                 queued.response,
                 if immediate {
-                    GoalResponse::TransitionPending(
-                        zeroclaw_goal::control::GoalPendingAction::Pause,
-                    )
+                    GoalResponse::TransitionPending(GoalPendingActionWire::Pause)
                 } else {
                     GoalResponse::Queued(if budget_fence {
                         GoalQueuedControl::Budget
@@ -3111,10 +3879,13 @@ mod tests {
                 panic!("paused budget change must return BudgetUpdated");
             };
             assert_eq!(raised.task_id, before.id);
-            assert_eq!(raised.status, zeroclaw_api::task::TaskStatus::Paused);
+            assert_eq!(raised.status, GoalTaskStatusWire::Paused);
             assert_eq!(raised.execution_epoch, paused.execution_epoch);
             assert_eq!(raised.token_limit, Some(10));
-            assert_eq!(raised.pause_reason, Some(GoalPauseReason::BudgetExhausted));
+            assert_eq!(
+                raised.pause_reason,
+                Some(GoalPauseReasonWire::BudgetExhausted)
+            );
             assert!(raised.resumable);
             assert_eq!(turn.calls.load(std::sync::atomic::Ordering::Acquire), 1);
             writer
@@ -3137,7 +3908,7 @@ mod tests {
                 panic!("budget recovery must explicitly resume the existing Goal");
             };
             assert_eq!(resumed.task_id, before.id);
-            assert_eq!(resumed.status, zeroclaw_api::task::TaskStatus::Running);
+            assert_eq!(resumed.status, GoalTaskStatusWire::Running);
             assert_eq!(resumed.execution_epoch, paused.execution_epoch + 1);
             tokio::time::timeout(Duration::from_secs(2), turn.started.notified())
                 .await
@@ -3197,7 +3968,7 @@ mod tests {
             .expect("cancel must fence without waiting for the held parent");
             assert_eq!(
                 pending.response,
-                GoalResponse::TransitionPending(zeroclaw_goal::control::GoalPendingAction::Cancel,)
+                GoalResponse::TransitionPending(GoalPendingActionWire::Cancel,)
             );
             let fenced = registry
                 .current_goal_for_session(&key)
@@ -3247,8 +4018,11 @@ mod tests {
             .await
             .expect("cancelled recovery must settle the held operation and drain");
             assert_eq!(cancelled.task_id, before.id);
-            assert_eq!(cancelled.status, zeroclaw_api::task::TaskStatus::Cancelled);
-            assert_eq!(cancelled.accounting_state, GoalAccountingState::Complete);
+            assert_eq!(cancelled.status, GoalTaskStatusWire::Cancelled);
+            assert_eq!(
+                cancelled.accounting_state,
+                GoalAccountingStateWire::Complete
+            );
             crate::rpc::dispatch::connection_test_support::assert_held_goal_usage_attempts(
                 tmp.path(),
                 &before.id,
@@ -3361,8 +4135,8 @@ mod tests {
             let budget = events.applied_budget.as_ref().unwrap();
             assert_eq!(budget.task_id, before.id);
             assert_eq!(budget.execution_epoch, before.execution_epoch);
-            assert_eq!(budget.status, zeroclaw_api::task::TaskStatus::Running);
-            assert_eq!(budget.accounting_state, GoalAccountingState::Complete);
+            assert_eq!(budget.status, GoalTaskStatusWire::Running);
+            assert_eq!(budget.accounting_state, GoalAccountingStateWire::Complete);
             assert_eq!(paused.token_limit, Some(7));
             crate::rpc::dispatch::connection_test_support::assert_budget_then_pause_intents(
                 tmp.path(),
@@ -3387,7 +4161,10 @@ mod tests {
             assert_eq!(status.task_id, before.id);
             assert_eq!(status.execution_epoch, before.execution_epoch + 1);
             assert_eq!(status.token_limit, Some(10));
-            assert_eq!(status.pause_reason, Some(GoalPauseReason::OperatorPaused));
+            assert_eq!(
+                status.pause_reason,
+                Some(GoalPauseReasonWire::OperatorPaused)
+            );
             crate::rpc::dispatch::connection_test_support::assert_budget_intent_state(
                 tmp.path(),
                 &key,
@@ -3400,14 +4177,14 @@ mod tests {
         assert_eq!(
             paused.pause_reason,
             Some(if restart {
-                GoalPauseReason::DaemonRestart
+                GoalPauseReasonWire::DaemonRestart
             } else {
-                GoalPauseReason::OperatorPaused
+                GoalPauseReasonWire::OperatorPaused
             })
         );
         assert_eq!(paused.task_id, before.id);
         assert_eq!(paused.execution_epoch, before.execution_epoch + 1);
-        assert_eq!(paused.accounting_state, GoalAccountingState::Complete);
+        assert_eq!(paused.accounting_state, GoalAccountingStateWire::Complete);
         assert!(paused.resumable);
         let goal = registry.get_goal_task(&before.id).await.unwrap().unwrap();
         assert_eq!(goal.accounting_state, GoalAccountingState::Complete);
@@ -3537,7 +4314,7 @@ mod tests {
             };
             assert_eq!(resumed.task_id, before.id);
             assert_eq!(resumed.execution_epoch, paused.execution_epoch + 1);
-            assert_eq!(resumed.status, zeroclaw_api::task::TaskStatus::Running);
+            assert_eq!(resumed.status, GoalTaskStatusWire::Running);
             tokio::time::timeout(Duration::from_secs(2), turn.started.notified())
                 .await
                 .expect("authorized recovery must admit the second parent");
@@ -3581,7 +4358,7 @@ mod tests {
             .unwrap();
             assert_eq!(
                 pending.response,
-                GoalResponse::TransitionPending(zeroclaw_goal::control::GoalPendingAction::Pause)
+                GoalResponse::TransitionPending(GoalPendingActionWire::Pause)
             );
             let fenced = registry
                 .current_goal_for_session(&key)
@@ -3608,9 +4385,12 @@ mod tests {
             assert_eq!(final_pause.execution_epoch, resumed.execution_epoch + 1);
             assert_eq!(
                 final_pause.pause_reason,
-                Some(GoalPauseReason::OperatorPaused)
+                Some(GoalPauseReasonWire::OperatorPaused)
             );
-            assert_eq!(final_pause.accounting_state, GoalAccountingState::Complete);
+            assert_eq!(
+                final_pause.accounting_state,
+                GoalAccountingStateWire::Complete
+            );
             assert!(final_pause.resumable);
             assert!(!supervisor.owns_scope(&resumed_scope).await);
             crate::rpc::dispatch::connection_test_support::assert_held_goal_usage_attempts(
@@ -3653,10 +4433,19 @@ mod tests {
     #[tokio::test]
     async fn goal_deferred_settings_failure_reports_once_local_ipc() {
         exercise_goal_boundary_completion_over_local_ipc(
-            "/goal budget set --tokens 100",
+            "/goal resume",
             crate::rpc::dispatch::connection_test_support::GoalBoundaryCompletion::SettingsFailure,
         )
         .await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn goal_deferred_explicit_budget_preserves_malformed_unused_defaults_local_ipc() {
+        exercise_goal_boundary_completion_over_local_ipc(
+            "/goal budget set --tokens 100",
+            crate::rpc::dispatch::connection_test_support::GoalBoundaryCompletion::ApplyBudgetWithInvalidUnusedDefault,
+        ).await;
     }
 
     #[cfg(unix)]
@@ -3699,7 +4488,8 @@ mod tests {
             insert_immediate_session_with_owner, prepare_queued_goal_control_fixture,
         };
         use crate::rpc::types::SessionGoalResult;
-        use zeroclaw_goal::control::{GoalResponse, GoalSessionKey};
+        use crate::rpc::types::{GoalQueuedControlWire, GoalResponseWire as GoalResponse};
+        use zeroclaw_goal::control::GoalSessionKey;
 
         const SID: &str = "goal-local-boundary";
         const OWNER: &str = "goal-local-owner";
@@ -3711,7 +4501,11 @@ mod tests {
                 tmp.path(),
             );
         }
-        let held_turn = if matches!(completion, GoalBoundaryCompletion::FinishOrdinaryTurn) {
+        let held_turn = if matches!(
+            completion,
+            GoalBoundaryCompletion::FinishOrdinaryTurn
+                | GoalBoundaryCompletion::ApplyBudgetWithInvalidUnusedDefault
+        ) {
             Some(insert_held_session_with_owner(&ctx, tmp.path(), SID, OWNER).await)
         } else {
             insert_immediate_session_with_owner(&ctx, tmp.path(), SID, OWNER).await;
@@ -3824,7 +4618,7 @@ mod tests {
             serde_json::to_value(&before).unwrap(),
             "queued controls must leave their canonical predecessor unchanged"
         );
-        if control == zeroclaw_goal::control::GoalQueuedControl::Budget {
+        if control == GoalQueuedControlWire::Budget {
             crate::rpc::dispatch::connection_test_support::assert_budget_intent_state(
                 tmp.path(),
                 &key,
@@ -3886,11 +4680,20 @@ mod tests {
             assert_eq!(ctx.sessions.session_queue.queue_depth(SID).await, 0);
             return;
         }
-        if matches!(completion, GoalBoundaryCompletion::SettingsFailure) {
+        if matches!(
+            completion,
+            GoalBoundaryCompletion::SettingsFailure
+                | GoalBoundaryCompletion::ApplyBudgetWithInvalidUnusedDefault
+        ) {
             let mut config = ctx.config.snapshot();
-            config.goal.default_cost_limit_usd = -1.0;
+            config.goal.default_cost_limit_usd = Some(-1.0);
             ctx.config_authority.publish_for_test(config);
         }
+        let private_config_before = matches!(
+            completion,
+            GoalBoundaryCompletion::ApplyBudgetWithInvalidUnusedDefault
+        )
+        .then(|| serde_json::to_value(ctx.config.snapshot()).unwrap());
         if matches!(completion, GoalBoundaryCompletion::LaunchFailure) {
             ctx.goal_runtime
                 .fail_test_launch_bind(key.clone(), before.execution_epoch + 1);
@@ -3961,7 +4764,7 @@ mod tests {
             .await
             .unwrap();
             writer.write_all(rpc_request(Method::SessionGoal,
-                &serde_json::json!({"session_id": SID, "command": "/goal start competing fixture objective"}), 6,
+                &serde_json::json!({"session_id": SID, "command": "/goal start --tokens 100 competing fixture objective"}), 6,
             ).as_bytes()).await.unwrap();
             let acknowledgement = tokio::time::timeout(
                 Duration::from_secs(2),
@@ -3972,7 +4775,7 @@ mod tests {
             assert_eq!(acknowledgement.0["id"], 6);
             assert_eq!(
                 acknowledgement.1.response,
-                GoalResponse::Queued(zeroclaw_goal::control::GoalQueuedControl::Start)
+                GoalResponse::Queued(GoalQueuedControlWire::Start)
             );
             crate::rpc::dispatch::connection_test_support::assert_goal_launch_failure_state(
                 &ctx,
@@ -4226,7 +5029,7 @@ mod tests {
             // The fault has settled; restore valid settings for the read-only
             // response barrier that detects any duplicate final notification.
             let mut config = ctx.config.snapshot();
-            config.goal.default_cost_limit_usd = 0.0;
+            config.goal.default_cost_limit_usd = Some(0.0);
             ctx.config_authority.publish_for_test(config);
             writer
                 .write_all(
@@ -4313,6 +5116,22 @@ mod tests {
                 panic!("expected the committed budget lifecycle response");
             };
             assert_eq!(status.token_limit, Some(100));
+            if private_config_before.is_some() {
+                assert_eq!(status.task_id, before.id);
+                assert_eq!(status.execution_epoch, before.execution_epoch);
+                assert_eq!(
+                    serde_json::to_value(
+                        registry
+                            .current_goal_for_session(&key)
+                            .await
+                            .unwrap()
+                            .unwrap()
+                    )
+                    .unwrap(),
+                    serde_json::to_value(&before).unwrap(),
+                    "explicit budget edit preserves the exact durable owner"
+                );
+            }
             crate::rpc::dispatch::connection_test_support::assert_budget_intent_state(
                 tmp.path(),
                 &key,
@@ -4347,6 +5166,35 @@ mod tests {
                 Some(original_generation)
             );
             assert_eq!(ctx.sessions.session_queue.queue_depth(SID).await, 0);
+        }
+        if let Some(private_config) = private_config_before {
+            assert_eq!(
+                serde_json::to_value(ctx.config.snapshot()).unwrap(),
+                private_config,
+                "successful explicit budget edit leaves malformed unused defaults untouched"
+            );
+            writer
+                .write_all(
+                    rpc_request(
+                        Method::SessionGoal,
+                        &serde_json::json!({"session_id":SID,"command":"/goal status"}),
+                        5,
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            let (frame, status): (_, SessionGoalResult) =
+                tokio::time::timeout(Duration::from_secs(2), read_result(&mut reader))
+                    .await
+                    .unwrap();
+            assert_eq!(
+                frame["id"], 5,
+                "no error or duplicate lifecycle frame before the status barrier"
+            );
+            assert!(
+                matches!(status.response,GoalResponse::Status(status) if status.task_id == before.id && status.token_limit == Some(100))
+            );
         }
         cancel.cancel();
         drop(writer);
@@ -5420,7 +6268,10 @@ mod tests {
             // connection leaves its turn task unwinding. Gate on the daemon's
             // own reload drain, which is what production waits on.
             assert_eq!(
-                crate::daemon::await_rpc_connection_drain(&count1_for_gen2).await,
+                crate::daemon::await_rpc_connection_drain_with(
+                    || count1_for_gen2.load(std::sync::atomic::Ordering::Relaxed)
+                )
+                .await,
                 crate::daemon::RpcDrain::Complete,
                 "the retiring generation must finish draining within the reload budget"
             );

@@ -6,6 +6,7 @@ use async_trait::async_trait;
 use zeroclaw_api::model_provider::TokenUsage;
 
 use crate::control::GoalExecutionScope;
+use crate::task::GoalDispatchStart;
 
 /// A Goal operation was refused because its exact execution scope is no longer
 /// running. The committed lifecycle transition, not this refusal, decides the
@@ -57,6 +58,255 @@ impl std::fmt::Display for GoalOperationFenced {
 
 impl std::error::Error for GoalOperationFenced {}
 
+/// An ordinary spend-admission refusal carrying the producing runtime
+/// boundary's checked, operation-local tool-phase evidence.
+///
+/// The original native error and its contexts remain available through
+/// [`std::error::Error::source`]. This wrapper does not classify that source,
+/// assert accounting admission or settlement, or authorize a resumable pause.
+/// Consumers must check the decisive native stop, accounting and execution
+/// ownership independently. A non-clean wrapper anywhere in a nested source
+/// chain remains disqualifying even if an outer boundary reports a clean phase.
+#[derive(Debug)]
+pub struct GoalOrdinarySpendRefusal {
+    source: anyhow::Error,
+    clean_tool_phase: bool,
+}
+
+impl GoalOrdinarySpendRefusal {
+    /// Retain the exact refusal source and the producing runtime boundary's
+    /// explicitly checked phase result. `true` requires positive evidence that
+    /// no local tool batch began or every begun batch closed correctly; missing,
+    /// open, invalid or failed cleanup evidence must be supplied as `false`.
+    #[must_use]
+    pub fn new(source: anyhow::Error, clean_tool_phase: bool) -> Self {
+        Self {
+            source,
+            clean_tool_phase,
+        }
+    }
+
+    /// Whether this producing boundary positively established a clean phase.
+    /// This does not override negative evidence from an inner boundary.
+    #[must_use]
+    pub fn clean_tool_phase(&self) -> bool {
+        self.clean_tool_phase
+    }
+}
+
+impl std::fmt::Display for GoalOrdinarySpendRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(if self.clean_tool_phase {
+            "Goal ordinary spend admission refused with a checked clean tool phase"
+        } else {
+            "Goal ordinary spend admission refused without a clean tool phase"
+        })
+    }
+}
+
+impl std::error::Error for GoalOrdinarySpendRefusal {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
+/// Goal accounting made incomplete by an observed condition, closing admission
+/// to every further Goal-owned model call. Delivered errors retain their original
+/// detail; failures retained by an accounting owner are scrubbed before reuse.
+/// Bare failures have no source; the operation-source bridge retains the
+/// original error for callers that still need its type.
+#[derive(Clone, Debug)]
+pub struct GoalAccountingFailure {
+    message: String,
+    state: crate::task::GoalAccountingState,
+    pending: bool,
+    source: Option<Arc<anyhow::Error>>,
+}
+
+/// Whether an unsettled operation had entered provider dispatch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GoalUnsettledOperation {
+    NeverDispatched,
+    Dispatched,
+}
+
+impl GoalAccountingFailure {
+    /// Report accounting errors after known usage and its classification are durable.
+    #[must_use]
+    pub fn settled(state: crate::task::GoalAccountingState, causes: &[String]) -> Self {
+        use crate::task::GoalAccountingState;
+
+        let label = match state {
+            GoalAccountingState::Complete => "complete",
+            GoalAccountingState::Missing => "missing",
+            GoalAccountingState::Invalid => "invalid",
+            GoalAccountingState::OutcomeUnknown => "outcome-unknown",
+        };
+        Self {
+            message: format!(
+                "Goal accounting is {label} after a durable usage settlement; no further Goal model call will be admitted: {}",
+                causes.join("; ")
+            ),
+            state,
+            pending: false,
+            source: None,
+        }
+    }
+
+    /// Name the durable conditions that prevent another Goal-owned model call.
+    #[must_use]
+    pub fn incomplete(state: crate::task::GoalAccountingState, pending: bool) -> Self {
+        use crate::task::GoalAccountingState;
+
+        let mut conditions = Vec::new();
+        match state {
+            GoalAccountingState::Complete => {}
+            GoalAccountingState::Missing => {
+                conditions.push("usage was not reported for an earlier Goal model call");
+            }
+            GoalAccountingState::Invalid => {
+                conditions.push(
+                    "usage for an earlier Goal model call was invalid or could not be priced",
+                );
+            }
+            GoalAccountingState::OutcomeUnknown => {
+                conditions.push("the outcome of an earlier Goal model call is unknown");
+            }
+        }
+        if pending {
+            conditions.push("an earlier Goal model call has not settled");
+        }
+        let message = if conditions.is_empty() {
+            "Goal accounting is incomplete; no further Goal model call will be admitted".to_owned()
+        } else {
+            format!(
+                "Goal accounting is incomplete: {}; no further Goal model call will be admitted",
+                conditions.join("; ")
+            )
+        };
+        Self {
+            message,
+            state,
+            pending,
+            source: None,
+        }
+    }
+
+    /// Accounting classification carried by this failure.
+    #[must_use]
+    pub fn accounting_state(&self) -> crate::task::GoalAccountingState {
+        self.state
+    }
+
+    /// Whether an earlier operation remains pending.
+    #[must_use]
+    pub fn has_pending_operation(&self) -> bool {
+        self.pending
+    }
+
+    /// Preserve known metadata across a foreign error wrapper, retaining the operation error.
+    #[must_use]
+    pub fn with_operation_source(
+        state: crate::task::GoalAccountingState,
+        pending: bool,
+        source: anyhow::Error,
+    ) -> Self {
+        let mut failure = Self::incomplete(state, pending);
+        failure.source = Some(Arc::new(source));
+        failure
+    }
+
+    /// Add settlement diagnostics without replacing the original operation error.
+    #[must_use]
+    pub fn preserving_primary_error(
+        primary: anyhow::Error,
+        settlement_error: anyhow::Error,
+    ) -> anyhow::Error {
+        let marker = settlement_error.downcast_ref::<Self>().or_else(|| {
+            settlement_error
+                .chain()
+                .find_map(|cause| cause.downcast_ref::<Self>())
+        });
+        let diagnostic = format!("{settlement_error:#}");
+        if let Some(marker) = marker {
+            let mut context = Self::incomplete(marker.state, marker.pending);
+            context.message = diagnostic;
+            primary.context(context)
+        } else {
+            primary.context(diagnostic)
+        }
+    }
+
+    /// Report a failed durable operation without conflating an unstarted call
+    /// with an unknown provider outcome.
+    #[must_use]
+    pub fn unsettled(operation: GoalUnsettledOperation, detail: &str) -> Self {
+        let condition = match operation {
+            GoalUnsettledOperation::NeverDispatched => {
+                "an admitted Goal model call that was never dispatched could not be confirmed as released, so it may remain pending"
+            }
+            GoalUnsettledOperation::Dispatched => {
+                "usage settlement for an earlier Goal model call did not become durable, so the call may remain pending"
+            }
+        };
+        Self {
+            message: format!(
+                "Goal accounting is incomplete: {condition}; no further Goal model call will be admitted: {detail}"
+            ),
+            state: match operation {
+                GoalUnsettledOperation::NeverDispatched => {
+                    crate::task::GoalAccountingState::Complete
+                }
+                GoalUnsettledOperation::Dispatched => {
+                    crate::task::GoalAccountingState::OutcomeUnknown
+                }
+            },
+            pending: true,
+            source: None,
+        }
+    }
+
+    /// Report an admission whose durable result was not delivered to its caller.
+    #[must_use]
+    pub fn admission_unconfirmed(detail: &str) -> Self {
+        Self {
+            message: format!(
+                "Goal accounting is incomplete: the admission of a Goal model call that was never dispatched did not finish, so the call may remain pending; no further Goal model call will be admitted: {detail}"
+            ),
+            state: crate::task::GoalAccountingState::Complete,
+            pending: true,
+            source: None,
+        }
+    }
+
+    /// Return a copy whose diagnostic has passed through the caller's scrubber.
+    #[must_use]
+    pub fn redacted(&self, scrub: impl FnOnce(&str) -> String) -> Self {
+        let diagnostic = match &self.source {
+            Some(source) => format!("{}: {source:#}", self.message),
+            None => self.message.clone(),
+        };
+        Self {
+            message: scrub(&diagnostic),
+            state: self.state,
+            pending: self.pending,
+            source: None,
+        }
+    }
+}
+
+impl std::fmt::Display for GoalAccountingFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for GoalAccountingFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source.as_deref().map(|source| source.as_ref())
+    }
+}
+
 /// Configured route at the start of one logical Goal-owned provider operation.
 #[derive(Clone, Debug)]
 pub struct GoalOperationRequest {
@@ -79,9 +329,19 @@ pub struct GoalUsageEvent {
     pub provider_ref: String,
     pub model: String,
     pub usage: TokenUsage,
-    /// False when token dimensions are retained but malformed cache metadata
-    /// prevents a trustworthy dollar projection.
+    /// False when retained token dimensions cannot be priced reliably because
+    /// cache metadata is malformed or the model identity is unattributed.
     pub priceable: bool,
+}
+
+/// Diagnostic for an incomplete physical attempt, independent of any usage row.
+#[derive(Clone, Debug)]
+pub struct GoalAccountingIssue {
+    pub provider_ref: String,
+    pub model: String,
+    pub accounting_state: crate::task::GoalAccountingState,
+    /// Diagnostic only; callers must not parse this to determine policy.
+    pub reason: String,
 }
 
 /// Full accounting projection for one admitted logical Goal operation.
@@ -90,11 +350,13 @@ pub struct GoalOperationSettlement {
     pub accounting_state: crate::task::GoalAccountingState,
     /// Known usage is retained even when the overall operation is incomplete.
     pub events: Vec<GoalUsageEvent>,
+    /// Ordered incomplete-attempt diagnostics; empty for a clean operation.
+    pub issues: Vec<GoalAccountingIssue>,
 }
 
 impl GoalOperationSettlement {
-    /// Reject an apparently complete operation when any event cannot support
-    /// a structurally valid durable usage record or safely priced cache split.
+    /// Combine issue states and reject malformed or unpriceable usage without
+    /// discarding the original diagnostics or known usage rows.
     pub fn normalize(&mut self) {
         use crate::task::GoalAccountingState;
 
@@ -120,6 +382,20 @@ impl GoalOperationSettlement {
                     > input.saturating_sub(event.usage.cached_input_tokens.unwrap_or(0))
         });
 
+        for issue in &self.issues {
+            self.accounting_state = combine_accounting_state(
+                self.accounting_state,
+                if issue.accounting_state == GoalAccountingState::Complete {
+                    GoalAccountingState::Invalid
+                } else {
+                    issue.accounting_state
+                },
+            );
+            if issue.provider_ref.trim().is_empty() || issue.model.trim().is_empty() {
+                self.accounting_state =
+                    combine_accounting_state(self.accounting_state, GoalAccountingState::Invalid);
+            }
+        }
         if invalid_event {
             self.accounting_state =
                 combine_accounting_state(self.accounting_state, GoalAccountingState::Invalid);
@@ -165,12 +441,71 @@ pub struct GoalUsagePrice {
     pub timestamp: chrono::DateTime<chrono::Utc>,
 }
 
-/// A single admitted Goal-owned model operation can settle only after all
-/// physical attempts in the ordinary provider path have reported.
+/// Keeps the admission's liveness witness for the caller's operation scope.
+/// Dropping it before settlement lets the accounting owner settle abandoned work.
+#[must_use = "the admission guard must live until settlement or release"]
+pub struct GoalOperationGuard {
+    _witness: Box<dyn Send>,
+}
+
+impl GoalOperationGuard {
+    /// Wrap an accounting owner's operation-lifetime witness.
+    pub fn new(witness: impl Send + 'static) -> Self {
+        Self {
+            _witness: Box::new(witness),
+        }
+    }
+}
+
+/// A one-shot source of the best available settlement when a caller is dropped.
+pub type GoalAbandonmentSettlement = Box<dyn FnOnce() -> GoalOperationSettlement + Send>;
+
+/// A single admitted Goal-owned model operation settles after its physical
+/// attempts have reported or been classified as outcome-unknown.
 #[async_trait]
 pub trait GoalOperationAccounting: Send + Sync {
+    /// Admit work only with complete durable accounting. Incomplete accounting
+    /// returns a [`GoalAccountingFailure`], independently of the Goal budget.
+    /// Once the durable admission starts, dropping the future does not cancel it.
+    /// An undelivered applied admission is released, a definite refusal is left
+    /// unchanged, and an uncertain failure is retained with scrubbed detail.
     async fn admit(&self, request: GoalOperationRequest) -> anyhow::Result<()>;
+    /// Obtain the witness immediately after admission, before yielding. Hold it
+    /// through settlement or release, including if the caller is cancelled.
+    fn admission_guard(&self) -> anyhow::Result<GoalOperationGuard>;
+    /// Mark the first poll of the admitted provider dispatch.
+    fn mark_dispatch_entered(&self) {}
+    /// Replace the current admission's source for abandonment settlement.
+    fn set_abandonment_settlement(&self, _source: GoalAbandonmentSettlement) {}
+    /// Wait for outstanding local accounting work, including any retained
+    /// failure, to become observable.
+    async fn quiesce(&self) {}
+    /// Return an undelivered owner-side failure, with sensitive detail scrubbed.
+    fn unsettled_failure(&self) -> Option<GoalAccountingFailure> {
+        None
+    }
+    /// After awaited pre-dispatch work, check the admitted operation while
+    /// acquiring the registry's session gate. This read-only check takes no
+    /// additional operation permit. On error the caller must not dispatch and
+    /// must release the unstarted admission. The guard orders dispatch entry,
+    /// not physical transmission, against fences using the same registry
+    /// instance. Retries and fallback within an entered operation are not gated.
+    async fn begin_dispatch(&self) -> anyhow::Result<GoalDispatchStart>;
+    /// Persist known usage and its accounting classification before reopening
+    /// admission. `Ok` means settlement is durable and no accounting error was
+    /// observed by the accountant; the reported settlement may itself still be
+    /// incomplete. A runtime-settled [`GoalAccountingFailure`] acknowledges a
+    /// durable settlement and closed admission; other typed failures may instead
+    /// report unconfirmed custody and leave a pending marker.
+    /// Once its durable section starts, dropping this future does not cancel it;
+    /// an undelivered failure is retained with scrubbed detail.
     async fn settle(&self, settlement: GoalOperationSettlement) -> anyhow::Result<()>;
+    /// Release an admitted operation only when its provider-dispatch future
+    /// has never been polled. No physical attempt or usage can exist in that
+    /// case. A failed release must leave durable pending evidence intact. Once
+    /// its durable section starts, dropping this future does not cancel it; an
+    /// undelivered failure is retained with scrubbed detail.
+    async fn release_unstarted(&self) -> anyhow::Result<()>;
     async fn pricing_complete(&self) -> anyhow::Result<bool>;
 }
 
@@ -189,6 +524,412 @@ tokio::task_local! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Debug)]
+    struct ForeignSpendWrapper(anyhow::Error);
+
+    impl std::fmt::Display for ForeignSpendWrapper {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("foreign spend wrapper")
+        }
+    }
+
+    impl std::error::Error for ForeignSpendWrapper {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            Some(self.0.as_ref())
+        }
+    }
+
+    #[test]
+    fn ordinary_spend_refusal_keeps_checked_phase_and_each_diagnostic_once() {
+        for clean in [false, true] {
+            let source = anyhow::Error::new(Primary).context("ordinary admission detail");
+            let refusal = GoalOrdinarySpendRefusal::new(source, clean);
+            assert_eq!(refusal.clean_tool_phase(), clean);
+            let expected = if clean {
+                "Goal ordinary spend admission refused with a checked clean tool phase"
+            } else {
+                "Goal ordinary spend admission refused without a clean tool phase"
+            };
+            assert_eq!(refusal.to_string(), expected);
+            assert_eq!(
+                std::error::Error::source(&refusal).unwrap().to_string(),
+                "ordinary admission detail"
+            );
+            let error = anyhow::Error::new(refusal);
+            assert_eq!(
+                format!("{error:#}"),
+                format!("{expected}: ordinary admission detail: primary provider failure")
+            );
+            assert!(error.chain().any(|cause| cause.is::<Primary>()));
+            assert!(
+                !error
+                    .chain()
+                    .any(|cause| cause.is::<GoalAccountingFailure>())
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_spend_refusal_preserves_native_stop_through_foreign_sources() {
+        use zeroclaw_api::turn_stop::{TurnStop, TurnStopCode, tag, turn_stop};
+
+        let original = tag(
+            anyhow::Error::new(Primary).context("original admission context"),
+            TurnStop::fatal(TurnStopCode::BudgetExhausted, "ordinary budget exhausted"),
+        );
+        let original_diagnostic = format!("{original:#}");
+        let refusal =
+            GoalOrdinarySpendRefusal::new(anyhow::Error::new(ForeignSpendWrapper(original)), true);
+        let error = anyhow::Error::new(ForeignSpendWrapper(anyhow::Error::new(refusal)))
+            .context("outer admission context");
+
+        assert_eq!(
+            turn_stop(&error).unwrap().code,
+            TurnStopCode::BudgetExhausted
+        );
+        assert_eq!(
+            turn_stop(&error).unwrap().detail,
+            "ordinary budget exhausted"
+        );
+        assert!(error.chain().any(|cause| cause.is::<Primary>()));
+        let markers = error
+            .chain()
+            .filter_map(|cause| cause.downcast_ref::<GoalOrdinarySpendRefusal>())
+            .collect::<Vec<_>>();
+        assert_eq!(markers.len(), 1);
+        assert!(markers[0].clean_tool_phase());
+        let text = format!("{error:#}");
+        assert!(text.ends_with(&original_diagnostic), "{text}");
+        assert_eq!(text.matches("outer admission context").count(), 1, "{text}");
+        // The existing native tag displays its cause and exposes that same
+        // cause as its source. Preserve that diagnostic without copying it.
+        for detail in ["original admission context", "primary provider failure"] {
+            assert_eq!(
+                text.matches(detail).count(),
+                original_diagnostic.matches(detail).count(),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_spend_refusal_outer_clean_phase_preserves_inner_negative_proof() {
+        use zeroclaw_api::turn_stop::{TurnStop, TurnStopCode, turn_stop};
+
+        let original = anyhow::Error::new(TurnStop::fatal(
+            TurnStopCode::BudgetExhausted,
+            "ordinary budget exhausted",
+        ));
+        let inner = GoalOrdinarySpendRefusal::new(original, false);
+        let outer = GoalOrdinarySpendRefusal::new(
+            anyhow::Error::new(ForeignSpendWrapper(anyhow::Error::new(inner)))
+                .context("enclosing operation"),
+            true,
+        );
+        let error = anyhow::Error::new(outer);
+
+        assert!(
+            error
+                .downcast_ref::<GoalOrdinarySpendRefusal>()
+                .unwrap()
+                .clean_tool_phase()
+        );
+        let phases = error
+            .chain()
+            .filter_map(|cause| cause.downcast_ref::<GoalOrdinarySpendRefusal>())
+            .map(GoalOrdinarySpendRefusal::clean_tool_phase)
+            .collect::<Vec<_>>();
+        assert_eq!(phases, [true, false]);
+        assert_eq!(
+            turn_stop(&error).unwrap().code,
+            TurnStopCode::BudgetExhausted
+        );
+    }
+
+    #[test]
+    fn accounting_failure_display_is_its_complete_diagnostic() {
+        // A bare durable accounting failure renders each original cause exactly once.
+        let failure = GoalAccountingFailure::settled(
+            crate::task::GoalAccountingState::OutcomeUnknown,
+            &["cause one".to_owned(), "cause two".to_owned()],
+        );
+        let expected = "Goal accounting is outcome-unknown after a durable usage settlement; no further Goal model call will be admitted: cause one; cause two";
+        assert_eq!(failure.to_string(), expected);
+        assert_eq!(
+            failure.accounting_state(),
+            crate::task::GoalAccountingState::OutcomeUnknown
+        );
+        assert!(!failure.has_pending_operation());
+        assert!(std::error::Error::source(&failure).is_none());
+        let error = anyhow::Error::new(failure);
+        assert_eq!(error.to_string(), expected);
+        assert_eq!(format!("{error:#}"), expected);
+    }
+
+    #[test]
+    fn unsettled_failures_distinguish_dispatch_and_retain_scrubbed_detail() {
+        let unstarted = GoalAccountingFailure::unsettled(
+            GoalUnsettledOperation::NeverDispatched,
+            "registry secret",
+        );
+        assert!(unstarted.to_string().contains("never dispatched"));
+        assert!(unstarted.to_string().contains("may remain pending"));
+        assert!(!unstarted.to_string().contains("so it remains pending"));
+        assert!(!unstarted.to_string().contains("outcome of an earlier"));
+        let redacted = unstarted.redacted(|message| message.replace("secret", "[redacted]"));
+        assert!(redacted.to_string().contains("registry [redacted]"));
+
+        let dispatched = GoalAccountingFailure::unsettled(
+            GoalUnsettledOperation::Dispatched,
+            "ledger unavailable",
+        );
+        assert!(dispatched.to_string().contains("usage settlement"));
+        assert!(dispatched.to_string().contains("ledger unavailable"));
+        let combined = GoalAccountingFailure::preserving_primary_error(
+            anyhow::Error::msg("provider failed"),
+            dispatched.into(),
+        );
+        assert_eq!(
+            format!("{combined:#}").matches("provider failed").count(),
+            1
+        );
+    }
+
+    #[test]
+    fn unconfirmed_admission_does_not_claim_a_marker_exists() {
+        let message = GoalAccountingFailure::admission_unconfirmed("fixture error").to_string();
+        assert!(message.starts_with("Goal accounting is incomplete:"));
+        assert!(message.ends_with("no further Goal model call will be admitted: fixture error"));
+        assert!(message.contains("never dispatched"));
+        assert!(message.contains("may remain pending"));
+        assert!(!message.contains("could not be released"));
+        assert!(!message.contains("outcome of an earlier"));
+        assert!(!message.contains("has not settled"));
+        assert_eq!(message.matches("fixture error").count(), 1);
+    }
+
+    #[test]
+    fn incomplete_accounting_failure_names_each_durable_condition() {
+        // Every durable condition is named in order, independently of any budget.
+        use crate::task::GoalAccountingState::{Complete, Invalid, Missing, OutcomeUnknown};
+
+        for (state, pending, expected) in [
+            (
+                Missing,
+                false,
+                "Goal accounting is incomplete: usage was not reported for an earlier Goal model call; no further Goal model call will be admitted",
+            ),
+            (
+                Invalid,
+                false,
+                "Goal accounting is incomplete: usage for an earlier Goal model call was invalid or could not be priced; no further Goal model call will be admitted",
+            ),
+            (
+                OutcomeUnknown,
+                false,
+                "Goal accounting is incomplete: the outcome of an earlier Goal model call is unknown; no further Goal model call will be admitted",
+            ),
+            (
+                Invalid,
+                true,
+                "Goal accounting is incomplete: usage for an earlier Goal model call was invalid or could not be priced; an earlier Goal model call has not settled; no further Goal model call will be admitted",
+            ),
+            (
+                Complete,
+                false,
+                "Goal accounting is incomplete; no further Goal model call will be admitted",
+            ),
+        ] {
+            let failure = GoalAccountingFailure::incomplete(state, pending);
+            assert_eq!(failure.to_string(), expected);
+            assert_eq!(failure.accounting_state(), state);
+            assert_eq!(failure.has_pending_operation(), pending);
+            assert!(std::error::Error::source(&failure).is_none());
+        }
+    }
+
+    #[derive(Debug)]
+    struct Primary;
+    impl std::fmt::Display for Primary {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("primary provider failure")
+        }
+    }
+    impl std::error::Error for Primary {}
+
+    #[derive(Debug)]
+    struct ForeignWrapper(GoalAccountingFailure);
+    impl std::fmt::Display for ForeignWrapper {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("foreign settlement wrapper")
+        }
+    }
+    impl std::error::Error for ForeignWrapper {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            Some(&self.0)
+        }
+    }
+
+    #[test]
+    fn retained_failure_scrubs_the_entire_source_and_preserves_pending_state() {
+        use crate::task::GoalAccountingState::{Complete, OutcomeUnknown};
+
+        for (failure, expected) in [
+            (
+                GoalAccountingFailure::unsettled(
+                    GoalUnsettledOperation::NeverDispatched,
+                    "release",
+                ),
+                Complete,
+            ),
+            (
+                GoalAccountingFailure::admission_unconfirmed("admission"),
+                Complete,
+            ),
+            (
+                GoalAccountingFailure::unsettled(GoalUnsettledOperation::Dispatched, "settlement"),
+                OutcomeUnknown,
+            ),
+        ] {
+            assert_eq!(failure.accounting_state(), expected);
+            assert!(failure.has_pending_operation());
+        }
+
+        let failure = GoalAccountingFailure::with_operation_source(
+            OutcomeUnknown,
+            true,
+            anyhow::Error::msg("fixture-sensitive-inner").context("operation failed"),
+        );
+        let cloned = failure.clone();
+        assert!(std::error::Error::source(&cloned).is_some());
+        let retained =
+            cloned.redacted(|detail| detail.replace("fixture-sensitive-inner", "[redacted]"));
+        assert_eq!(retained.accounting_state(), OutcomeUnknown);
+        assert!(retained.has_pending_operation());
+        assert!(std::error::Error::source(&retained).is_none());
+        assert!(
+            retained
+                .to_string()
+                .contains("operation failed: [redacted]")
+        );
+        assert!(!format!("{retained:?}").contains("fixture-sensitive-inner"));
+    }
+
+    #[test]
+    fn primary_error_and_full_secondary_chain_survive_combination() {
+        use crate::task::GoalAccountingState::OutcomeUnknown;
+        let secondary = anyhow::Error::new(ForeignWrapper(GoalAccountingFailure::incomplete(
+            OutcomeUnknown,
+            true,
+        )))
+        .context("outer settlement detail");
+        let combined =
+            GoalAccountingFailure::preserving_primary_error(anyhow::Error::new(Primary), secondary);
+        assert!(combined.downcast_ref::<Primary>().is_some());
+        let marker = combined.downcast_ref::<GoalAccountingFailure>().unwrap();
+        assert_eq!(marker.accounting_state(), OutcomeUnknown);
+        assert!(marker.has_pending_operation());
+        let text = format!("{combined:#}");
+        for detail in [
+            "outer settlement detail",
+            "foreign settlement wrapper",
+            "outcome of an earlier Goal model call is unknown",
+            "primary provider failure",
+        ] {
+            assert_eq!(text.matches(detail).count(), 1, "{text}");
+        }
+
+        let plain = GoalAccountingFailure::preserving_primary_error(
+            anyhow::Error::new(Primary),
+            anyhow::Error::msg("ledger failure").context("storage wrapper"),
+        );
+        assert!(plain.downcast_ref::<GoalAccountingFailure>().is_none());
+        assert!(plain.downcast_ref::<Primary>().is_some());
+        assert_eq!(
+            format!("{plain:#}"),
+            "storage wrapper: ledger failure: primary provider failure"
+        );
+
+        let wrapper = GoalAccountingFailure::with_operation_source(OutcomeUnknown, true, combined);
+        assert_eq!(wrapper.accounting_state(), OutcomeUnknown);
+        assert!(wrapper.has_pending_operation());
+        let mut source = std::error::Error::source(&wrapper);
+        let mut saw_primary = false;
+        while let Some(cause) = source {
+            saw_primary |= cause.downcast_ref::<Primary>().is_some();
+            source = cause.source();
+        }
+        assert!(saw_primary);
+    }
+
+    #[test]
+    fn normalization_combines_ordered_issues_and_rejects_inconsistent_inputs() {
+        use crate::task::GoalAccountingState::{Complete, Invalid, Missing, OutcomeUnknown};
+        let issue = |state, provider: &str, model: &str, reason: &str| GoalAccountingIssue {
+            provider_ref: provider.to_owned(),
+            model: model.to_owned(),
+            accounting_state: state,
+            reason: reason.to_owned(),
+        };
+        let mut settlement = GoalOperationSettlement {
+            accounting_state: Complete,
+            events: vec![GoalUsageEvent {
+                provider_ref: "b".into(),
+                model: "model-b".into(),
+                usage: TokenUsage {
+                    input_tokens: Some(7),
+                    output_tokens: Some(3),
+                    cached_input_tokens: None,
+                    cache_creation_input_tokens: None,
+                },
+                priceable: true,
+            }],
+            issues: vec![
+                issue(Missing, "a", "model-a", "missing"),
+                issue(Invalid, "c", "model-c", "MissingOutput"),
+                issue(OutcomeUnknown, "d", "model-d", "unknown"),
+            ],
+        };
+        settlement.normalize();
+        assert_eq!(settlement.accounting_state, OutcomeUnknown);
+        assert_eq!(settlement.events.len(), 1);
+        assert_eq!(
+            settlement
+                .issues
+                .iter()
+                .map(|i| i.reason.as_str())
+                .collect::<Vec<_>>(),
+            ["missing", "MissingOutput", "unknown"]
+        );
+        for invalid in [
+            issue(Complete, "a", "m", "contradiction"),
+            issue(Missing, " ", "m", "blank route"),
+            issue(Missing, "a", " ", "blank model"),
+        ] {
+            let mut direct = GoalOperationSettlement {
+                accounting_state: Complete,
+                events: vec![],
+                issues: vec![invalid],
+            };
+            direct.normalize();
+            assert_eq!(direct.accounting_state, Invalid);
+            assert_eq!(direct.issues.len(), 1);
+        }
+        let mut direct = GoalOperationSettlement {
+            accounting_state: Complete,
+            events: vec![],
+            issues: vec![issue(Missing, "a", "m", "missing")],
+        };
+        direct.normalize();
+        assert_eq!(direct.accounting_state, Missing);
+        settlement.events[0].usage.input_tokens = None;
+        settlement.accounting_state = Complete;
+        settlement.issues.clear();
+        settlement.normalize();
+        assert_eq!(settlement.accounting_state, Invalid);
+        assert_eq!(settlement.events.len(), 1);
+    }
 
     #[test]
     fn operation_fence_errors_preserve_the_five_refusal_texts_without_a_source() {
@@ -234,6 +975,7 @@ mod tests {
                 },
                 priceable: false,
             }],
+            issues: vec![],
         };
 
         settlement.normalize();

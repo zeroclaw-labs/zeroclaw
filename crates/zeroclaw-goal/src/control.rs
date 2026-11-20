@@ -15,9 +15,10 @@ use crate::task::{
     GoalAccountingState, GoalPauseReason, GoalPauseState, GoalTaskRecord, GoalTaskRegistry,
     GoalTransitionResult,
 };
-use anyhow::{Error, Result, bail};
+use anyhow::{Context, Error, Result, bail};
 use async_trait::async_trait;
 use chrono::Utc;
+use goal_execution::GoalLaunchGuard;
 use uuid::Uuid;
 use zeroclaw_api::{
     model_provider::ChatMessage,
@@ -28,27 +29,29 @@ use zeroclaw_commands::goal::{
     GoalBudgetLimits, GoalBudgetSelection, GoalCommand, is_valid_finite_goal_cost_limit,
     is_valid_finite_goal_token_limit, validate_goal_objective,
 };
+use zeroclaw_config::goal::GoalDefaultBudget;
 
 mod deferred;
-pub mod goal_child_fence;
 mod goal_execution;
 mod parent_input;
 mod policy;
 
 pub use deferred::{GoalControlClass, GoalQueuedControl, GoalTurnBoundary, classify_goal_control};
 
-pub use goal_child_fence::scope_goal_parent as scope_goal_parent_turn;
 pub use goal_execution::{
     GoalControlAbandonReason, GoalControlAdmission, GoalDeferredClosed, GoalDeferredCommit,
     GoalDeferredControl, GoalDeferredReady, GoalDiagnosticTextGuard, GoalExecutionEngine,
     GoalExecutionOutcome, GoalExecutionRestartCoordinator, GoalExecutionSubmission,
-    GoalExecutionSupervisor, GoalExternalCancellation, GoalFailureNoticeDelivery,
-    GoalLaunchFailureReported, GoalSupervisorRetired, dispose_unowned_session_goal,
+    GoalExecutionSupervisor, GoalExternalCancellation, GoalExternalCancellationFence,
+    GoalExternalCancellationScope, GoalExternalCancellationTarget, GoalExternalStopDisposition,
+    GoalFailureNoticeDelivery, GoalLaunchFailureReported, GoalPolicyCutover, GoalPolicyFence,
+    GoalSupervisorRetired, dispose_unowned_session_goal,
 };
 pub use parent_input::{GoalParentTurnInput, goal_parent_turn_input};
 pub use policy::{
     GoalAgentPolicySnapshot, GoalPolicyDecision, GoalPolicyRevocation, GoalPolicySnapshot,
-    classify_goal_policy, revoke_goals_under_policy,
+    classify_goal_ingress_policy, classify_goal_policy, revoke_goals_under_policy,
+    select_goal_policy_revocations,
 };
 
 /// Compose transient verifier feedback as untrusted user-role input.
@@ -106,14 +109,11 @@ impl GoalSessionKey {
     /// Returns an error for a blank or padded key, a key whose existing shared
     /// sanitizer would change it, or a key outside the `matrix_` namespace.
     pub fn matrix(history_key: impl Into<String>) -> Result<Self> {
-        let history_key = canonical_nonblank("Matrix history key", history_key.into())?;
-        if sanitize_session_key(&history_key) != history_key {
-            bail!("Matrix Goal history key is not canonical");
-        }
-        if !history_key.starts_with("matrix_") {
-            bail!("Matrix Goal history key is outside the Matrix namespace");
-        }
-        Ok(Self::Matrix { history_key })
+        let key = Self::Matrix {
+            history_key: history_key.into(),
+        };
+        key.validate_canonical()?;
+        Ok(key)
     }
 
     /// Build a ZeroCode key from the adapter's canonical raw session ID.
@@ -127,11 +127,32 @@ impl GoalSessionKey {
     /// Returns an error for a blank or padded ID, or an ID whose existing
     /// shared sanitizer would change it.
     pub fn zero_code(raw_session_id: impl Into<String>) -> Result<Self> {
-        let raw_session_id = canonical_nonblank("ZeroCode session id", raw_session_id.into())?;
-        if sanitize_session_key(&raw_session_id) != raw_session_id {
-            bail!("ZeroCode Goal session id is not canonical");
+        let key = Self::ZeroCode {
+            raw_session_id: raw_session_id.into(),
+        };
+        key.validate_canonical()?;
+        Ok(key)
+    }
+
+    fn validate_canonical(&self) -> Result<()> {
+        match self {
+            Self::Matrix { history_key } => {
+                require_canonical_nonblank("Matrix history key", history_key)?;
+                if sanitize_session_key(history_key) != *history_key {
+                    bail!("Matrix Goal history key is not canonical");
+                }
+                if !history_key.starts_with("matrix_") {
+                    bail!("Matrix Goal history key is outside the Matrix namespace");
+                }
+            }
+            Self::ZeroCode { raw_session_id } => {
+                require_canonical_nonblank("ZeroCode session id", raw_session_id)?;
+                if sanitize_session_key(raw_session_id) != *raw_session_id {
+                    bail!("ZeroCode Goal session id is not canonical");
+                }
+            }
         }
-        Ok(Self::ZeroCode { raw_session_id })
+        Ok(())
     }
 
     pub const fn surface(&self) -> GoalSurface {
@@ -155,8 +176,13 @@ impl GoalSessionKey {
 /// hook-mutable generic channel field and `tui_id` is never durable identity.
 #[derive(Clone, PartialEq, Eq)]
 pub enum GoalIngressPrincipal {
-    Matrix { raw_mxid: String },
-    ZeroCode { tui_id: String },
+    /// The authenticated Matrix user ID, stored verbatim without a surface prefix.
+    Matrix {
+        raw_mxid: String,
+    },
+    ZeroCode {
+        tui_id: String,
+    },
 }
 
 impl fmt::Debug for GoalIngressPrincipal {
@@ -212,7 +238,8 @@ impl GoalIngressContext {
     /// # Errors
     ///
     /// Returns an error if the principal surface differs from the session key,
-    /// or if the agent, route, or principal is blank.
+    /// the directly constructed session key is not canonical, or if the agent,
+    /// route, or principal is blank.
     pub fn trusted(
         session_key: GoalSessionKey,
         agent: impl Into<String>,
@@ -222,6 +249,7 @@ impl GoalIngressContext {
         if session_key.surface() != principal.surface() {
             bail!("Goal ingress principal does not match the session surface");
         }
+        session_key.validate_canonical()?;
         principal.validate()?;
         Ok(Self {
             session_key,
@@ -294,6 +322,12 @@ impl GoalSessionBinding {
 pub trait GoalSessionDriver: Send + Sync {
     fn session_key(&self) -> &GoalSessionKey;
 
+    /// Transfer a surface's execution liveness token to the actual worker.
+    /// A retained driver is not proof that the worker is still running.
+    fn take_execution_liveness(&self) -> Option<Box<dyn Send>> {
+        None
+    }
+
     /// Revalidate the exact live session and acquire its validity lease.
     ///
     /// The returned lease must keep the driver's authoritative live-session
@@ -342,14 +376,14 @@ pub trait GoalSessionDriver: Send + Sync {
     /// Goal lifecycle needs. The executor treats `ingress` as admission-time
     /// audit data only; live policy stays with the driver and is revalidated
     /// before the lease executes protected work. `canonical_history` is
-    /// read-only, parent and verifier calls
-    /// mutate only process-local working state, and `append_parent_candidate`
-    /// durably appends and delivers each non-empty parent response before the
-    /// verifier classifies it. This preserves the original agent response when
-    /// the verifier pauses the Goal. While acquiring the lease, the driver must
-    /// also observe `checkpoint.wait_closed()` and abandon only a still-pending
-    /// admission when that future completes; after returning the lease, the
-    /// driver must not interrupt admitted work on account of checkpoint closure.
+    /// read-only. Parent and verifier calls mutate only process-local working
+    /// state. `append_parent_candidate` durably appends each accepted parent
+    /// candidate once before verification can continue, pause or complete the
+    /// Goal. It persists only, without re-rendering or re-delivering events.
+    /// While acquiring the lease, the driver must also observe
+    /// `checkpoint.wait_closed()` and abandon only a still-pending admission
+    /// when that future completes; after returning the lease, the driver must
+    /// not interrupt admitted work on account of checkpoint closure.
     /// The object is the sole transport bridge used by the later Goal executor.
     /// Acquire identity/foreground ownership without rendering errors. Return
     /// the producer's error unchanged; canonical projection is a lease concern.
@@ -490,11 +524,14 @@ impl GoalParentTurnResult {
     /// Build a result from a complete ordinary Agent transcript.
     ///
     /// Ordinary isolated Agent turns return a history containing their final
-    /// assistant response. The Goal controller carries that response
-    /// separately as the candidate and appends it itself only after a valid
-    /// verifier `Continue`, so this constructor removes the terminal assistant
-    /// entry while retaining all preceding assistant tool calls and tool
-    /// results.
+    /// assistant response. This constructor removes that terminal entry
+    /// because the result carries the response separately as its candidate,
+    /// while retaining all preceding assistant tool calls and tool results.
+    /// The Goal controller persists each non-empty parent candidate to
+    /// canonical session history before invoking the verifier. If a valid
+    /// verifier `Continue` prepares another parent turn, the controller adds
+    /// that candidate once to the next turn's working history with the
+    /// verifier feedback; it is not persisted only after `Continue`.
     ///
     /// # Errors
     ///
@@ -619,8 +656,9 @@ Use a nonempty reason of at most 2000 characters. For complete and continue,
 blockers must be an empty array. For blocked, include 1 to 16 blockers, each
 with a nonempty message of at most 2000 characters and a kind of
 "needs_user_input", "human_escalation", or "external_dependency". The optional
-payload may contain only bounded, necessary structured context. Do not rewrite
-or downgrade a blocked decision to continue.
+payload may contain only necessary structured context of at most 4096 bytes
+when encoded as compact JSON. Do not rewrite or downgrade a blocked decision
+to continue.
 "#;
 
 impl fmt::Debug for GoalVerifierTurn {
@@ -647,6 +685,7 @@ pub enum GoalFailureReason {
     OperationOutcomeUnknown,
     ExecutorStartFailed,
     ExecutorFailed,
+    CandidatePersistenceFailed,
     Other,
 }
 
@@ -663,8 +702,27 @@ impl GoalFailureReason {
             Some("accounting_outcome_unknown") => Self::OperationOutcomeUnknown,
             Some("executor_start_failed") => Self::ExecutorStartFailed,
             Some("executor_failed") => Self::ExecutorFailed,
+            Some("candidate_persistence_failed") => Self::CandidatePersistenceFailed,
             _ => Self::Other,
         }
+    }
+}
+
+#[cfg(test)]
+mod goal_failure_reason_tests {
+    use super::GoalFailureReason;
+
+    #[test]
+    fn candidate_persistence_failure_has_stable_terminal_and_serde_names() {
+        assert_eq!(
+            GoalFailureReason::from_terminal_reason(Some("candidate_persistence_failed")),
+            GoalFailureReason::CandidatePersistenceFailed
+        );
+        assert_eq!(
+            serde_json::to_string(&GoalFailureReason::CandidatePersistenceFailed)
+                .expect("failure reason serialization should succeed"),
+            "\"candidate_persistence_failed\""
+        );
     }
 }
 
@@ -678,13 +736,20 @@ pub enum GoalExecutionNotice {
 /// Surface-owned foreground execution bridge. It retains the live-session
 /// guard and one foreground slot for its lifetime, but has no lifecycle or
 /// ledger authority; the later executor owns both around these calls.
+///
+/// Parent and verifier calls run inside `GOAL_OPERATION_ACCOUNTING`. Tokio
+/// task-local values do not automatically follow spawned tasks: an implementor
+/// that spawns model work must carry and re-enter that accounting scope, and
+/// must not return before the work and its settlement finish.
 #[async_trait]
 pub trait GoalSessionExecutionLease: Send {
     /// Exact live session retained by this foreground lease.
     fn session_key(&self) -> &GoalSessionKey;
-    /// Return the original projection error without rendering it. Acquisition
-    /// proves session identity; history restoration has its own error boundary.
-    fn canonical_history(&self) -> Result<Vec<ChatMessage>>;
+    /// Prepare and capture canonical history for this exact trusted parent input.
+    /// Acquisition proves session identity; policy-sensitive projection happens
+    /// only after host admission. Return the original projection error without
+    /// rendering it so the engine retains its original-error boundary.
+    async fn canonical_history(&mut self, input: &GoalParentTurnInput) -> Result<Vec<ChatMessage>>;
     /// Append an operator response to the same canonical session before a
     /// resumed Goal is allowed to issue its next parent turn.  Implementors
     /// must make this durable using the exact surface session that their
@@ -697,30 +762,34 @@ pub trait GoalSessionExecutionLease: Send {
     async fn append_resume_response(&mut self, _response: String) -> Result<()> {
         bail!("Goal session driver cannot durably append a resume response")
     }
-    /// Consume a surface-owned canonical prefix when it was already assembled
-    /// for this execution.  The default retains compatibility for drivers
-    /// whose canonical history remains in a shared session store.
-    fn take_canonical_history(&mut self) -> Result<Vec<ChatMessage>> {
-        self.canonical_history()
-    }
-    /// Run through ordinary execution and render every returned error through
-    /// the surface's native, scrubbed error path before returning it.
+    /// Run ordinary execution and delivery, preserving the original error object
+    /// for type-based accounting classification and native error rendering.
+    /// Every returned ordinary operation error, including preparation and final
+    /// projection failures, must have exactly one native publication attempt at
+    /// the host boundary under its ordinary suppression and egress policy.
+    /// This requires the attempt, not successful delivery; a publication failure
+    /// must not replace the original operation error.
     async fn run_parent_turn(
         &mut self,
         operation: &GoalOperationScope,
         turn: GoalParentTurn,
     ) -> Result<GoalParentTurnResult>;
-    /// Use ordinary verifier execution and render every returned error through
-    /// the surface's native, scrubbed error path before returning it.
+    /// Use ordinary verifier execution, preserving the original error object.
+    /// Every returned ordinary operation error, including preparation failures,
+    /// has the same one-attempt native publication obligation and ordinary
+    /// suppression/egress policy as `run_parent_turn`, not guaranteed delivery.
     async fn run_verifier(
         &mut self,
         operation: &GoalOperationScope,
         turn: GoalVerifierTurn,
     ) -> Result<GoalVerifierResult>;
-    /// Persist the complete parent response to this exact canonical session
-    /// and deliver it through the surface's ordinary response path before the
-    /// verifier runs. Implementations must retain normal egress scrubbing.
-    /// Render every returned error through the ordinary native error path.
+    /// Durably append one accepted parent candidate through the same session
+    /// persistence used for an ordinary turn's final response. Return only
+    /// after the append is durable. The engine calls this once per candidate,
+    /// before verification can continue, pause or complete the Goal.
+    ///
+    /// This method persists only: it must not re-render or re-deliver the
+    /// candidate. Ordinary agent events remain the parent turn's responsibility.
     async fn append_parent_candidate(&mut self, candidate: String) -> Result<()>;
     /// Render an original Goal execution error through the surface's ordinary
     /// native error path and egress scrub. This does not persist history, call
@@ -883,17 +952,24 @@ impl GoalExecutionHost {
     /// Validate a typed command against the exact trusted driver supplied by
     /// the caller. Local disabled/help responses return without binding; all
     /// other commands do not mutate lifecycle state or start model work.
+    /// Build settings from the current canonical
+    /// [`zeroclaw_config::schema::Config`] for each command;
+    /// never reuse them for a later command or hold a config lock across an
+    /// await. Start and Resume fail closed with the canonical typed Goal
+    /// configuration error, while administrative commands do not consult the
+    /// verifier.
     /// [`GoalController`] borrows the returned submission for durable
     /// transitions. A later executor consumes it to acquire the same exact
     /// driver; it must never resolve a value-equivalent replacement driver.
     pub async fn submit(
         &self,
-        settings: &GoalHostSettings,
+        settings: &GoalHostSettings<'_>,
         ingress: GoalIngressContext,
         driver: Arc<dyn GoalSessionDriver>,
         command: GoalCommand,
     ) -> Result<GoalSubmission> {
-        if !settings.enabled || matches!(command, GoalCommand::Help) {
+        settings.revalidate_captured()?;
+        if !settings.command_scope_enabled(&ingress)? || matches!(command, GoalCommand::Help) {
             return Ok(GoalSubmission(GoalSubmissionState::Unavailable {
                 ingress,
                 command,
@@ -901,6 +977,13 @@ impl GoalExecutionHost {
         }
         if driver.session_key() != ingress.session_key() {
             bail!("Goal session driver does not match trusted ingress");
+        }
+
+        if matches!(
+            command,
+            GoalCommand::Start { .. } | GoalCommand::Resume { .. }
+        ) {
+            settings.require_execution_admissible()?;
         }
 
         let lease = driver.bind(&ingress).await?;
@@ -911,13 +994,14 @@ impl GoalExecutionHost {
     /// same driver while its command serialization is already owned.
     fn submit_bound(
         &self,
-        settings: &GoalHostSettings,
+        settings: &GoalHostSettings<'_>,
         ingress: GoalIngressContext,
         driver: Arc<dyn GoalSessionDriver>,
         command: GoalCommand,
         lease: GoalSessionLease,
     ) -> Result<GoalSubmission> {
-        if !settings.enabled || matches!(command, GoalCommand::Help) {
+        settings.revalidate_captured()?;
+        if !settings.command_scope_enabled(&ingress)? || matches!(command, GoalCommand::Help) {
             return Ok(GoalSubmission(GoalSubmissionState::Unavailable {
                 ingress,
                 command,
@@ -925,6 +1009,12 @@ impl GoalExecutionHost {
         }
         if driver.session_key() != ingress.session_key() {
             bail!("Goal session driver does not match trusted ingress");
+        }
+        if matches!(
+            command,
+            GoalCommand::Start { .. } | GoalCommand::Resume { .. }
+        ) {
+            settings.require_execution_admissible()?;
         }
         if lease.binding().session_key() != ingress.session_key() {
             bail!("Goal session binding does not match trusted ingress");
@@ -940,23 +1030,29 @@ impl GoalExecutionHost {
 
     /// Acquire execution only through the same exact trusted driver boundary
     /// used for command admission. This never selects a driver from route text
-    /// and refuses while Goal Mode is disabled.
+    /// and refuses while Goal Mode is disabled. Build settings from the current
+    /// canonical [`zeroclaw_config::schema::Config`] separately for each
+    /// acquisition; never reuse them
+    /// from command admission or hold a config lock across an await. Invalid
+    /// Goal configuration fails closed with its canonical typed error.
     ///
     /// The admission lease is released immediately before the driver acquires
     /// foreground execution so a driver can take its own session guard. The
     /// driver must therefore revalidate the live session while acquiring that
     /// guard; it may not treat the earlier admission as a durable snapshot.
+    /// A same-generation forward publication is rechecked against fresh policy
+    /// and strict configuration validation before execution may continue.
     /// This consumes `submission` even if acquisition fails; retry requires a
     /// fresh host admission after the executor has rechecked durable task,
     /// epoch, and ingress ownership.
     pub async fn acquire_execution(
         &self,
-        settings: &GoalHostSettings,
+        settings: &GoalHostSettings<'_>,
         submission: GoalSubmission,
         scope: &GoalExecutionScope,
         checkpoint: &GoalParentTurnCheckpoint,
     ) -> Result<Box<dyn GoalSessionExecutionLease>> {
-        if !settings.enabled {
+        if !settings.enabled() {
             bail!("Goal Mode is disabled");
         }
         let GoalSubmission(GoalSubmissionState::Bound {
@@ -968,16 +1064,22 @@ impl GoalExecutionHost {
         else {
             bail!("Goal submission was not admitted");
         };
+        settings.require_current_execution_policy(&ingress)?;
+        if !settings.command_scope_enabled(&ingress)? {
+            bail!("Goal command scope is disabled by current policy");
+        }
         if driver.session_key() != ingress.session_key() {
             bail!("Goal execution driver session key does not match trusted ingress");
         }
         if scope.session_id() != ingress.session_key().durable_id() {
             bail!("Goal execution scope session does not match trusted ingress");
         }
+        settings.require_execution_admissible()?;
         drop(lease);
         let lease = driver
             .acquire_execution(&ingress, scope, checkpoint)
             .await?;
+        settings.require_current_execution_policy(&ingress)?;
         if lease.session_key() != ingress.session_key() {
             bail!("Goal execution lease session key does not match trusted ingress");
         }
@@ -1082,9 +1184,16 @@ impl GoalRuntime {
         GoalExecutionEngine::new(self.clone(), accounting_factory)
     }
 
+    /// Submit one typed Goal command using settings borrowed from the
+    /// canonical config current for this command. Build them immediately
+    /// before this call and use the same settings value for host admission
+    /// and the controller transition; do not reuse it for another command.
+    /// Start and Resume fail closed with the typed configuration error before
+    /// session binding. Commands that do not start or resume work produce no
+    /// execution request.
     pub async fn submit(
         &self,
-        settings: &GoalHostSettings,
+        settings: &GoalHostSettings<'_>,
         ingress: GoalIngressContext,
         driver: Arc<dyn GoalSessionDriver>,
         command: GoalCommand,
@@ -1093,30 +1202,76 @@ impl GoalRuntime {
         self.apply_submission(settings, submission).await
     }
 
-    async fn submit_bound(
+    async fn submit_with_launch_guard(
         &self,
-        settings: &GoalHostSettings,
+        settings: &GoalHostSettings<'_>,
+        ingress: GoalIngressContext,
+        driver: Arc<dyn GoalSessionDriver>,
+        command: GoalCommand,
+        guard: &mut GoalLaunchGuard,
+    ) -> Result<GoalRuntimeSubmission> {
+        let submission = self.host.submit(settings, ingress, driver, command).await?;
+        self.apply_submission_with_launch_guard(settings, submission, Some(guard))
+            .await
+    }
+
+    async fn submit_bound_with_launch_guard(
+        &self,
+        settings: &GoalHostSettings<'_>,
         ingress: GoalIngressContext,
         driver: Arc<dyn GoalSessionDriver>,
         command: GoalCommand,
         lease: GoalSessionLease,
+        guard: &mut GoalLaunchGuard,
     ) -> Result<GoalRuntimeSubmission> {
         let submission = self
             .host
             .submit_bound(settings, ingress, driver, command, lease)?;
-        self.apply_submission(settings, submission).await
+        self.apply_submission_with_launch_guard(settings, submission, Some(guard))
+            .await
     }
 
     async fn apply_submission(
         &self,
-        settings: &GoalHostSettings,
+        settings: &GoalHostSettings<'_>,
         submission: GoalSubmission,
     ) -> Result<GoalRuntimeSubmission> {
+        self.apply_submission_with_launch_guard(settings, submission, None)
+            .await
+    }
+
+    async fn apply_submission_with_launch_guard(
+        &self,
+        settings: &GoalHostSettings<'_>,
+        submission: GoalSubmission,
+        mut guard: Option<&mut GoalLaunchGuard>,
+    ) -> Result<GoalRuntimeSubmission> {
+        if let Some(guard) = guard.as_deref_mut() {
+            self.retry_launch_cleanup(settings, &submission, guard, false)
+                .await?;
+        }
         let resume_response = match submission.command() {
             GoalCommand::Resume { response } => response.clone(),
             _ => None,
         };
-        let response = self.controller.submit(settings, &submission).await?;
+        settings.revalidate_captured()?;
+        let response = self
+            .controller
+            .submit_with_launch_guard(settings, &submission, guard.as_deref_mut())
+            .await?;
+        if !matches!(
+            &response,
+            GoalResponse::Started(_) | GoalResponse::Resumed(_)
+        ) && let Some(guard) = guard.as_deref_mut()
+            && guard.scope().is_some()
+        {
+            guard.reconcile_held().await?;
+            guard.discharge_entry();
+        }
+        if let Some(guard) = guard.as_deref_mut() {
+            self.retry_launch_cleanup(settings, &submission, guard, true)
+                .await?;
+        }
         let (execution, lease) = match &response {
             GoalResponse::Started(projection) | GoalResponse::Resumed(projection) => {
                 let initial_turn_kind = if matches!(&response, GoalResponse::Started(_)) {
@@ -1124,11 +1279,15 @@ impl GoalRuntime {
                 } else {
                     GoalParentTurnKind::Resume
                 };
-                let scope = GoalExecutionScope::new(
-                    projection.task_id.clone(),
-                    submission.ingress().session_key().durable_id(),
-                    projection.execution_epoch,
-                )?;
+                let scope = if let Some(scope) = guard.as_deref().and_then(GoalLaunchGuard::scope) {
+                    scope.clone()
+                } else {
+                    GoalExecutionScope::new(
+                        projection.task_id.clone(),
+                        submission.ingress().session_key().durable_id(),
+                        projection.execution_epoch,
+                    )?
+                };
                 (
                     Some(GoalExecutionRequest {
                         scope,
@@ -1148,13 +1307,51 @@ impl GoalRuntime {
         })
     }
 
+    /// Host validation precedes cleanup; canonical owner checks precede any
+    /// registry mutation. Cancel commits its terminal fence before retrying.
+    async fn retry_launch_cleanup(
+        &self,
+        settings: &GoalHostSettings<'_>,
+        submission: &GoalSubmission,
+        guard: &GoalLaunchGuard,
+        after_cancel: bool,
+    ) -> Result<()> {
+        if !settings.enabled()
+            || submission.is_unavailable()
+            || matches!(submission.command(), GoalCommand::Cancel) != after_cancel
+        {
+            return Ok(());
+        }
+        let session = submission.ingress().session_key().durable_id();
+        if !guard.has_pending_session(&session) {
+            return Ok(());
+        }
+        let current = self
+            .controller
+            .registry
+            .current_goal_for_session(&session)
+            .await?;
+        if current
+            .as_ref()
+            .is_none_or(|task| ingress_owns_task(submission.ingress(), task))
+        {
+            guard.retry_session(&session).await?;
+        }
+        Ok(())
+    }
+
     /// Acquire the foreground lease for an exact running Goal handoff.
     ///
     /// The caller supplies the request returned by [`Self::submit`]; this
     /// method deliberately has no route- or session-key lookup path.
+    /// Build settings from the canonical config separately for this
+    /// acquisition, immediately before calling this method; never reuse the
+    /// settings supplied to `submit`. Invalid config fails before the driver
+    /// is asked to acquire execution. A newer same-generation publication
+    /// requires fresh policy and strict configuration validation.
     pub async fn acquire_execution(
         &self,
-        settings: &GoalHostSettings,
+        settings: &GoalHostSettings<'_>,
         request: GoalExecutionRequest,
         checkpoint: &GoalParentTurnCheckpoint,
     ) -> Result<Box<dyn GoalSessionExecutionLease>> {
@@ -1189,82 +1386,277 @@ fn require_canonical_nonblank(name: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
-/// Process-local settings already validated from the active Goal configuration.
-#[derive(Debug, Clone, PartialEq)]
-pub struct GoalHostSettings {
-    enabled: bool,
-    default_limits: GoalBudgetLimits,
+/// Borrowed settings for one operation against the current canonical config.
+pub struct GoalHostSettings<'a> {
+    config: &'a zeroclaw_config::schema::Config,
     owner_pid: u32,
     owner_boot_id: String,
-    policy_generation: Option<u64>,
+    snapshot: Option<&'a GoalHostSettingsSnapshot>,
 }
 
-impl GoalHostSettings {
-    /// Build settings resolved from the active Goal configuration for one
-    /// controller admission.
+/// Revision drift is not authority: only a same-generation forward publication
+/// can be examined for a managed refusal or registered execution continuation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GoalSettingsRevisionChange {
+    ForwardPublication,
+    DifferentOrBackwardRevision,
+}
+
+impl fmt::Display for GoalSettingsRevisionChange {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(
+            "Goal policy changed while this command was being admitted; retry the command",
+        )
+    }
+}
+
+impl std::error::Error for GoalSettingsRevisionChange {}
+
+fn validate_goal_settings_revision(
+    captured: zeroclaw_config::live::ConfigRevision,
+    current: zeroclaw_config::live::ConfigRevision,
+) -> Result<()> {
+    if captured == current {
+        return Ok(());
+    }
+    Err(
+        if current.same_epoch(&captured) && current.succeeds_within_epoch(&captured) {
+            GoalSettingsRevisionChange::ForwardPublication
+        } else {
+            GoalSettingsRevisionChange::DifferentOrBackwardRevision
+        }
+        .into(),
+    )
+}
+
+impl fmt::Debug for GoalHostSettings<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GoalHostSettings")
+            .field("enabled", &self.enabled())
+            .field("owner_pid", &self.owner_pid)
+            .finish()
+    }
+}
+
+impl<'a> GoalHostSettings<'a> {
+    /// Borrow settings from the canonical config current for this operation.
     ///
-    /// When enabled, this constructor requires at least one finite default.
-    /// Call [`Self::from_validated_limits`] for resolved limits whose config
-    /// validation already established that explicitly configured zero values
-    /// mean unlimited.
+    /// This lower-level primitive leaves canonical-source and current-policy
+    /// serialization to its caller. It cannot qualify a coordinator-managed
+    /// supervisor admission: use [`GoalHostSettingsSource::snapshot`] there.
+    /// Never borrow from a config lock held across `.await`.
     ///
     /// # Errors
     ///
-    /// Returns an error if the owner boot ID is blank or a semantic default
-    /// limit is invalid. Configuration loading must normalize an explicit
-    /// unlimited default to `None` before constructing this value.
-    pub fn new(
-        enabled: bool,
-        default_limits: GoalBudgetLimits,
+    /// Returns an error if the owner boot ID is blank.
+    pub fn from_config(
+        config: &'a zeroclaw_config::schema::Config,
         owner_pid: u32,
         owner_boot_id: impl Into<String>,
     ) -> Result<Self> {
-        if enabled
-            && default_limits.token_limit.is_none()
-            && default_limits.cost_limit_usd.is_none()
-        {
-            bail!(
-                "enabled Goal Mode unlimited defaults require validated configuration provenance"
-            );
-        }
-        Self::from_validated_limits(enabled, default_limits, owner_pid, owner_boot_id)
-    }
-
-    /// Build settings from limits normalized by the runtime's validated Goal
-    /// configuration. The Goal component deliberately accepts this narrow
-    /// value rather than depending on the configuration crate.
-    ///
-    /// Unlike [`Self::new`], this constructor permits both normalized limits
-    /// to be unlimited. Callers must first validate the source configuration
-    /// and resolve its declared defaults.
-    pub fn from_validated_limits(
-        enabled: bool,
-        default_limits: GoalBudgetLimits,
-        owner_pid: u32,
-        owner_boot_id: impl Into<String>,
-    ) -> Result<Self> {
-        validate_default_limits(default_limits)?;
-        let GoalBudgetLimits {
-            token_limit,
-            cost_limit_usd,
-        } = default_limits;
         Ok(Self {
-            enabled,
-            default_limits: GoalBudgetLimits {
-                token_limit,
-                cost_limit_usd,
-            },
+            config,
             owner_pid,
             owner_boot_id: required("Goal owner boot id", owner_boot_id.into())?,
-            policy_generation: None,
+            snapshot: None,
         })
     }
 
-    /// Record the live Goal-policy generation observed before these settings
-    /// were resolved.
-    pub fn with_policy_generation(mut self, generation: u64) -> Self {
-        self.policy_generation = Some(generation);
-        self
+    fn enabled(&self) -> bool {
+        self.config.goal.enabled
+    }
+
+    fn validate_current_for(&self, expected: &GoalHostSettingsSource) -> Result<()> {
+        let snapshot = self
+            .snapshot
+            .context("Goal settings lack canonical snapshot provenance")?;
+        if !snapshot.source.config.same_storage(&expected.config)
+            || self.owner_pid != expected.owner_pid
+            || self.owner_boot_id != expected.owner_boot_id
+        {
+            bail!("Goal settings do not belong to this host generation");
+        }
+        validate_goal_settings_revision(snapshot.revision, expected.config.revision())
+    }
+
+    /// The managed caller has already authenticated the expected source. Keep
+    /// that captured publication fresh after lower-level binding/cleanup waits;
+    /// unstamped primitives still have their documented caller-owned role.
+    fn revalidate_captured(&self) -> Result<()> {
+        if let Some(snapshot) = self.snapshot {
+            self.validate_current_for(&snapshot.source)?;
+        }
+        Ok(())
+    }
+
+    /// Re-resolve policy for an already-registered worker after publication
+    /// drift. Other admission paths retain their strict revision refusal.
+    fn require_current_execution_policy(&self, ingress: &GoalIngressContext) -> Result<()> {
+        let Some(snapshot) = self.snapshot else {
+            return Ok(());
+        };
+        let conflict = match self.validate_current_for(&snapshot.source) {
+            Ok(()) => return Ok(()),
+            Err(error) => error,
+        };
+        if conflict.downcast_ref::<GoalSettingsRevisionChange>()
+            != Some(&GoalSettingsRevisionChange::ForwardPublication)
+        {
+            return Err(conflict);
+        }
+
+        let fresh = snapshot.source.snapshot();
+        if !fresh.revision.same_epoch(&snapshot.revision)
+            || !fresh.revision.succeeds_within_epoch(&snapshot.revision)
+        {
+            return Err(conflict);
+        }
+        let settings = fresh.settings();
+        if !settings.enabled() {
+            return Err(conflict);
+        }
+        let proof = settings.command_scope_enabled(ingress).and_then(|enabled| {
+            if enabled {
+                fresh
+                    .config
+                    .validate()
+                    .context("Goal publication conflict configuration is invalid")?;
+            }
+            Ok(enabled)
+        });
+        match proof {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(conflict),
+            Err(secondary) => Err(anyhow::Error::new(
+                goal_execution::GoalLifecycleSecondaryError {
+                    primary: conflict,
+                    secondary,
+                },
+            )),
+        }
+    }
+
+    fn scope_enabled(&self, ingress: &GoalIngressContext) -> Result<bool> {
+        let policy = GoalPolicySnapshot::from_config(self.config);
+        Ok(classify_goal_ingress_policy(&policy, ingress)?.is_none())
+    }
+
+    /// Canonical captures carry the full route/agent eligibility contract.
+    /// Unstamped lower-level callers retain their explicit policy-owner role.
+    fn command_scope_enabled(&self, ingress: &GoalIngressContext) -> Result<bool> {
+        if self.snapshot.is_some() {
+            self.scope_enabled(ingress)
+        } else {
+            Ok(self.enabled())
+        }
+    }
+
+    fn require_execution_admissible(&self) -> Result<()> {
+        self.config
+            .validate_goal_config()
+            .context("Goal configuration does not admit execution")
+    }
+
+    fn default_limits(&self) -> Result<Option<GoalBudgetLimits>> {
+        self.require_execution_admissible()?;
+        match self
+            .config
+            .goal
+            .default_budget()
+            .map_err(|_| Error::msg("Goal default limits are invalid"))?
+        {
+            GoalDefaultBudget::Configured(limits) => {
+                validate_default_limits(limits)?;
+                Ok(Some(limits))
+            }
+            GoalDefaultBudget::Unconfigured => Ok(None),
+        }
+    }
+}
+
+/// Resolves Goal settings after an asynchronous execution handoff.
+///
+/// The handle must belong to the host generation's canonical live-config
+/// owner, not storage constructed from a private copy. This source retains
+/// that read-only handle and bound process identity, never resolved policy.
+#[derive(Clone)]
+pub struct GoalHostSettingsSource {
+    config: zeroclaw_config::live::LiveConfigHandle,
+    owner_pid: u32,
+    owner_boot_id: String,
+}
+
+/// One operation's immutable canonical Config/publication pair and provenance.
+///
+/// Created only by a source bound to the host generation. It holds no config
+/// read guard and is deliberately not Clone: later operations capture a fresh
+/// pair. Borrowing settings does not authorize a command; supervised admission
+/// checks this source identity and exact current revision under its own guard.
+pub struct GoalHostSettingsSnapshot {
+    config: zeroclaw_config::schema::Config,
+    revision: zeroclaw_config::live::ConfigRevision,
+    source: GoalHostSettingsSource,
+}
+
+impl GoalHostSettingsSnapshot {
+    /// Borrow settings tied structurally to this exact captured pair. The
+    /// snapshot cannot be edited or paired with a different Config by callers.
+    pub fn settings(&self) -> GoalHostSettings<'_> {
+        GoalHostSettings {
+            config: &self.config,
+            owner_pid: self.source.owner_pid,
+            owner_boot_id: self.source.owner_boot_id.clone(),
+            snapshot: Some(self),
+        }
+    }
+}
+
+impl fmt::Debug for GoalHostSettingsSnapshot {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GoalHostSettingsSnapshot")
+            .field("owner_pid", &self.source.owner_pid)
+            .finish_non_exhaustive()
+    }
+}
+
+impl GoalHostSettingsSource {
+    /// Bind the host's canonical live handle and process owner identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the owner boot ID is blank.
+    pub fn new(
+        config: zeroclaw_config::live::LiveConfigHandle,
+        owner_pid: u32,
+        owner_boot_id: impl Into<String>,
+    ) -> Result<Self> {
+        Ok(Self {
+            config,
+            owner_pid,
+            owner_boot_id: required("Goal owner boot id", owner_boot_id.into())?,
+        })
+    }
+
+    /// Capture Config and its opaque revision under one short paired read.
+    /// No guard or resolved policy is retained by the source itself.
+    pub fn snapshot(&self) -> GoalHostSettingsSnapshot {
+        let (config, revision) = self.config.snapshot_with_revision();
+        GoalHostSettingsSnapshot {
+            config,
+            revision,
+            source: self.clone(),
+        }
+    }
+}
+
+impl fmt::Debug for GoalHostSettingsSource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GoalHostSettingsSource")
+            .field("owner_pid", &self.owner_pid)
+            .finish_non_exhaustive()
     }
 }
 
@@ -1305,7 +1697,11 @@ pub enum GoalResponse {
     Cancelled(GoalStatusProjection),
     AlreadyCancelled(GoalStatusProjection),
     NoCurrentGoal,
+    /// The session cannot be used for Goal control. No owner or Goal state is disclosed.
+    SessionUnavailable,
     AlreadyActive,
+    /// A start without budget flags found no configured default budget; no Goal was created.
+    BudgetRequired,
     Terminal(GoalStatusProjection),
     Stale,
 }
@@ -1367,6 +1763,20 @@ pub struct GoalController {
     registry: Arc<dyn GoalTaskRegistry>,
 }
 
+enum CurrentGoalFailure {
+    Missing,
+    Unavailable,
+}
+
+impl CurrentGoalFailure {
+    fn into_response(self) -> GoalResponse {
+        match self {
+            Self::Missing => GoalResponse::NoCurrentGoal,
+            Self::Unavailable => GoalResponse::SessionUnavailable,
+        }
+    }
+}
+
 impl GoalController {
     pub fn new(registry: Arc<dyn GoalTaskRegistry>) -> Self {
         Self { registry }
@@ -1377,21 +1787,25 @@ impl GoalController {
     /// The returned task is a binding for later revalidation, not authority.
     async fn preflight_normal(
         &self,
-        settings: &GoalHostSettings,
+        settings: &GoalHostSettings<'_>,
         submission: &GoalSubmission,
     ) -> Result<(Option<GoalResponse>, Option<TaskRecord>)> {
-        if !settings.enabled || submission.is_unavailable() {
+        settings.revalidate_captured()?;
+        if !settings.command_scope_enabled(submission.ingress())? || submission.is_unavailable() {
             return Ok((Some(GoalResponse::Disabled), None));
         }
         let ingress = submission.ingress();
         let session_id = ingress.session_key().durable_id();
         if let GoalCommand::Start { objective, budget } = submission.command() {
             validate_goal_objective(objective).map_err(|error| Error::msg(format!("{error:?}")))?;
-            select_limits(settings.default_limits, *budget)?;
+            settings.require_execution_admissible()?;
+            let Some(_) = select_limits(|| settings.default_limits(), *budget)? else {
+                return Ok((Some(GoalResponse::BudgetRequired), None));
+            };
             let current = self.registry.current_goal_for_session(&session_id).await?;
             let response = current.as_ref().and_then(|task| {
                 if !ingress_owns_task(ingress, task) {
-                    Some(GoalResponse::NoCurrentGoal)
+                    Some(GoalResponse::SessionUnavailable)
                 } else if !task.status.is_terminal() {
                     Some(GoalResponse::AlreadyActive)
                 } else {
@@ -1400,8 +1814,9 @@ impl GoalController {
             });
             return Ok((response, current));
         }
-        let Some(task) = self.current(ingress, &session_id).await? else {
-            return Ok((Some(GoalResponse::NoCurrentGoal), None));
+        let task = match self.current(ingress, &session_id).await? {
+            Ok(task) => task,
+            Err(failure) => return Ok((Some(failure.into_response()), None)),
         };
         let rejection = if task.status.is_terminal() {
             Some(
@@ -1451,17 +1866,34 @@ impl GoalController {
     }
 
     /// Apply a previously host-validated Goal submission through guarded
-    /// durable transitions without consuming its exact driver proof.
+    /// durable transitions without consuming its exact driver proof. Construct
+    /// settings from the current canonical
+    /// [`zeroclaw_config::schema::Config`] for each command and do
+    /// not reuse them across commands or hold a config lock across `.await`.
+    /// Start and Resume fail closed with the canonical typed Goal
+    /// configuration error; administrative commands do not consult the
+    /// verifier.
     ///
     /// The caller must keep `settings` current for this admission. A disabled
     /// setting returns [`GoalResponse::Disabled`] for every command, local help
     /// included, without a lifecycle change.
     pub async fn submit(
         &self,
-        settings: &GoalHostSettings,
+        settings: &GoalHostSettings<'_>,
         submission: &GoalSubmission,
     ) -> Result<GoalResponse> {
-        if !settings.enabled {
+        self.submit_with_launch_guard(settings, submission, None)
+            .await
+    }
+
+    async fn submit_with_launch_guard(
+        &self,
+        settings: &GoalHostSettings<'_>,
+        submission: &GoalSubmission,
+        guard: Option<&mut GoalLaunchGuard>,
+    ) -> Result<GoalResponse> {
+        settings.revalidate_captured()?;
+        if !settings.command_scope_enabled(submission.ingress())? {
             return Ok(GoalResponse::Disabled);
         }
         if submission.is_unavailable() {
@@ -1473,7 +1905,7 @@ impl GoalController {
         match submission.command() {
             GoalCommand::Help => Ok(GoalResponse::Help),
             GoalCommand::Start { budget, objective } => {
-                self.start(settings, submission.ingress(), *budget, objective)
+                self.start(settings, submission.ingress(), *budget, objective, guard)
                     .await
             }
             GoalCommand::Status => self.status(submission.ingress(), false).await,
@@ -1482,7 +1914,7 @@ impl GoalController {
                 self.set_budget(submission.ingress(), *selection).await
             }
             GoalCommand::Pause { .. } => self.pause(submission.ingress()).await,
-            GoalCommand::Resume { .. } => self.resume(settings, submission.ingress()).await,
+            GoalCommand::Resume { .. } => self.resume(settings, submission.ingress(), guard).await,
             GoalCommand::Cancel => self.cancel(submission.ingress()).await,
         }
     }
@@ -1495,7 +1927,7 @@ impl GoalController {
     /// or session text after a durable lifecycle change.
     pub async fn submit_for_execution(
         &self,
-        settings: &GoalHostSettings,
+        settings: &GoalHostSettings<'_>,
         submission: GoalSubmission,
     ) -> Result<(GoalResponse, GoalSubmission)> {
         let response = self.submit(settings, &submission).await?;
@@ -1504,15 +1936,20 @@ impl GoalController {
 
     async fn start(
         &self,
-        settings: &GoalHostSettings,
+        settings: &GoalHostSettings<'_>,
         ingress: &GoalIngressContext,
         selection: GoalBudgetSelection,
         objective: &str,
+        mut guard: Option<&mut GoalLaunchGuard>,
     ) -> Result<GoalResponse> {
+        settings.require_execution_admissible()?;
         validate_goal_objective(objective).map_err(|error| Error::msg(format!("{error:?}")))?;
-        let limits = select_limits(settings.default_limits, selection)?;
+        let Some(limits) = select_limits(|| settings.default_limits(), selection)? else {
+            return Ok(GoalResponse::BudgetRequired);
+        };
         let session_id = ingress.session_key().durable_id();
         let task_id = Uuid::new_v4().to_string();
+        let scope = GoalExecutionScope::new(task_id.clone(), session_id.clone(), 1)?;
         let task = TaskRecord {
             id: task_id.clone(),
             kind: TaskKind::Goal,
@@ -1546,12 +1983,16 @@ impl GoalController {
             .await?
         {
             GoalTransitionResult::Applied => {
+                if let Some(guard) = guard.as_deref_mut() {
+                    guard.arm(scope)?;
+                }
                 self.admitted_projection_response(
                     ingress,
                     &session_id,
                     &task_id,
                     1,
                     GoalResponse::Started,
+                    guard,
                 )
                 .await
             }
@@ -1574,7 +2015,7 @@ impl GoalController {
             // A Matrix principal that does not own this persisted Goal must
             // neither learn its state nor receive a retry-shaped response for
             // an authorization conflict.
-            return Ok(GoalResponse::NoCurrentGoal);
+            return Ok(GoalResponse::SessionUnavailable);
         }
         if !task.status.is_terminal() {
             return Ok(GoalResponse::AlreadyActive);
@@ -1585,8 +2026,9 @@ impl GoalController {
 
     async fn status(&self, ingress: &GoalIngressContext, budget: bool) -> Result<GoalResponse> {
         let session_id = ingress.session_key().durable_id();
-        let Some(task) = self.current(ingress, &session_id).await? else {
-            return Ok(GoalResponse::NoCurrentGoal);
+        let task = match self.current(ingress, &session_id).await? {
+            Ok(task) => task,
+            Err(failure) => return Ok(failure.into_response()),
         };
         let Some(projection) = self.project_current(ingress, &session_id, &task).await? else {
             return Ok(GoalResponse::Stale);
@@ -1606,8 +2048,9 @@ impl GoalController {
         selection: GoalBudgetSelection,
     ) -> Result<GoalResponse> {
         let session_id = ingress.session_key().durable_id();
-        let Some(task) = self.current(ingress, &session_id).await? else {
-            return Ok(GoalResponse::NoCurrentGoal);
+        let task = match self.current(ingress, &session_id).await? {
+            Ok(task) => task,
+            Err(failure) => return Ok(failure.into_response()),
         };
         if task.status.is_terminal() {
             return self
@@ -1646,8 +2089,9 @@ impl GoalController {
 
     async fn pause(&self, ingress: &GoalIngressContext) -> Result<GoalResponse> {
         let session_id = ingress.session_key().durable_id();
-        let Some(task) = self.current(ingress, &session_id).await? else {
-            return Ok(GoalResponse::NoCurrentGoal);
+        let task = match self.current(ingress, &session_id).await? {
+            Ok(task) => task,
+            Err(failure) => return Ok(failure.into_response()),
         };
         if task.status == TaskStatus::Paused {
             return self
@@ -1693,12 +2137,15 @@ impl GoalController {
 
     async fn resume(
         &self,
-        settings: &GoalHostSettings,
+        settings: &GoalHostSettings<'_>,
         ingress: &GoalIngressContext,
+        mut guard: Option<&mut GoalLaunchGuard>,
     ) -> Result<GoalResponse> {
+        settings.require_execution_admissible()?;
         let session_id = ingress.session_key().durable_id();
-        let Some(task) = self.current(ingress, &session_id).await? else {
-            return Ok(GoalResponse::NoCurrentGoal);
+        let task = match self.current(ingress, &session_id).await? {
+            Ok(task) => task,
+            Err(failure) => return Ok(failure.into_response()),
         };
         if task.status.is_terminal() {
             return self
@@ -1713,6 +2160,10 @@ impl GoalController {
         if task.status != TaskStatus::Paused {
             return Ok(GoalResponse::AlreadyActive);
         }
+        let Some(next_epoch) = task.execution_epoch.checked_add(1) else {
+            return self.resume_stale_response(ingress, &session_id).await;
+        };
+        let scope = GoalExecutionScope::new(task.id.clone(), session_id.clone(), next_epoch)?;
         match self
             .registry
             .resume_session_goal(
@@ -1725,12 +2176,16 @@ impl GoalController {
             .await?
         {
             GoalTransitionResult::Applied => {
+                if let Some(guard) = guard.as_deref_mut() {
+                    guard.arm(scope)?;
+                }
                 self.admitted_projection_response(
                     ingress,
                     &session_id,
                     &task.id,
-                    task.execution_epoch.saturating_add(1),
+                    next_epoch,
                     GoalResponse::Resumed,
+                    guard,
                 )
                 .await
             }
@@ -1747,8 +2202,10 @@ impl GoalController {
         ingress: &GoalIngressContext,
         session_id: &str,
     ) -> Result<GoalResponse> {
-        let Some(task) = self.current(ingress, session_id).await? else {
-            return Ok(GoalResponse::Stale);
+        let task = match self.current(ingress, session_id).await? {
+            Ok(task) => task,
+            Err(CurrentGoalFailure::Unavailable) => return Ok(GoalResponse::SessionUnavailable),
+            Err(CurrentGoalFailure::Missing) => return Ok(GoalResponse::Stale),
         };
         if task.status.is_terminal() {
             return self
@@ -1761,8 +2218,9 @@ impl GoalController {
 
     async fn cancel(&self, ingress: &GoalIngressContext) -> Result<GoalResponse> {
         let session_id = ingress.session_key().durable_id();
-        let Some(task) = self.current(ingress, &session_id).await? else {
-            return Ok(GoalResponse::NoCurrentGoal);
+        let task = match self.current(ingress, &session_id).await? {
+            Ok(task) => task,
+            Err(failure) => return Ok(failure.into_response()),
         };
         if task.status == TaskStatus::Cancelled {
             return self
@@ -1807,17 +2265,17 @@ impl GoalController {
         &self,
         ingress: &GoalIngressContext,
         session_id: &str,
-    ) -> Result<Option<TaskRecord>> {
+    ) -> Result<std::result::Result<TaskRecord, CurrentGoalFailure>> {
         let Some(task) = self.registry.current_goal_for_session(session_id).await? else {
-            return Ok(None);
+            return Ok(Err(CurrentGoalFailure::Missing));
         };
         // Matrix history keys are filesystem-safe and therefore lossy. The
         // exact authenticated MXID is the durable authority for an existing
         // Matrix Goal, while a ZeroCode tui_id remains transient continuity.
         if !ingress_owns_task(ingress, &task) {
-            return Ok(None);
+            return Ok(Err(CurrentGoalFailure::Unavailable));
         }
-        Ok(Some(task))
+        Ok(Ok(task))
     }
 
     async fn projection_for(
@@ -1826,7 +2284,7 @@ impl GoalController {
         session_id: &str,
         task_id: &str,
     ) -> Result<Option<GoalStatusProjection>> {
-        let Some(task) = self.current(ingress, session_id).await? else {
+        let Ok(task) = self.current(ingress, session_id).await? else {
             return Ok(None);
         };
         if task.id != task_id {
@@ -1842,14 +2300,23 @@ impl GoalController {
         task: &TaskRecord,
     ) -> Result<Option<GoalStatusProjection>> {
         match self.registry.get_goal_task(&task.id).await? {
-            Some(goal) => Ok(Some(GoalStatusProjection::from_parts(task, &goal))),
+            Some(goal) => {
+                // The extension read can overlap a lifecycle transition. Fence
+                // the projection with a fresh canonical task snapshot so its
+                // status and epoch cannot come from different moments.
+                let current = self.current(ingress, session_id).await?;
+                if !matches!(current, Ok(ref current) if same_task_snapshot(current, task)) {
+                    return Ok(None);
+                }
+                Ok(Some(GoalStatusProjection::from_parts(task, &goal)))
+            }
             None => {
                 // A terminal predecessor can be atomically replaced between
-                // the current-task read and extension read. Recheck only on
-                // that exceptional missing-extension path so a genuine
-                // corrupt current task remains an error.
+                // the current-task read and extension read. Keep reporting a
+                // genuine missing-extension error only while the same task
+                // snapshot remains current.
                 let current = self.current(ingress, session_id).await?;
-                if current.as_ref().is_none_or(|current| current.id != task.id) {
+                if !matches!(current, Ok(ref current) if same_task_snapshot(current, task)) {
                     Ok(None)
                 } else {
                     bail!("Goal task extension is missing")
@@ -1865,13 +2332,40 @@ impl GoalController {
         task_id: &str,
         execution_epoch: i64,
         response: impl FnOnce(GoalStatusProjection) -> GoalResponse,
+        guard: Option<&mut GoalLaunchGuard>,
     ) -> Result<GoalResponse> {
-        match self
+        let projected = self
             .projection_response(ingress, session_id, task_id, response)
             .await
-        {
+            .and_then(|response| {
+                if let GoalResponse::Started(projection) | GoalResponse::Resumed(projection) =
+                    &response
+                {
+                    anyhow::ensure!(
+                        projection.task_id == task_id
+                            && projection.execution_epoch == execution_epoch,
+                        "Goal admission projection no longer matches its exact committed epoch"
+                    );
+                }
+                Ok(response)
+            });
+        match projected {
             Ok(response) => Ok(response),
             Err(error) => {
+                if let Some(guard) = guard {
+                    guard.retain_primary(error);
+                    let settlement = guard.reconcile_held().await;
+                    let error = guard
+                        .take_primary()
+                        .context("Goal projection failure lost its original cause")?;
+                    return match settlement {
+                        Ok(_) => Err(error),
+                        Err(secondary) => {
+                            Err(error
+                                .context(format!("settle Goal admission failure: {secondary:#}")))
+                        }
+                    };
+                }
                 // Admission committed, but no request can reach the executor
                 // without its projection. Settle only the admitted epoch;
                 // another transition's winner remains authoritative.
@@ -1936,22 +2430,28 @@ impl GoalController {
     }
 }
 
+fn same_task_snapshot(current: &TaskRecord, original: &TaskRecord) -> bool {
+    current.id == original.id
+        && current.status == original.status
+        && current.execution_epoch == original.execution_epoch
+}
+
 fn ingress_owns_task(ingress: &GoalIngressContext, task: &TaskRecord) -> bool {
     ingress.surface() != GoalSurface::Matrix
         || task.principal_id.as_deref() == ingress.durable_principal_id()
 }
 
 fn select_limits(
-    defaults: GoalBudgetLimits,
+    defaults: impl FnOnce() -> Result<Option<GoalBudgetLimits>>,
     selection: GoalBudgetSelection,
-) -> Result<GoalBudgetLimits> {
+) -> Result<Option<GoalBudgetLimits>> {
     match selection {
-        GoalBudgetSelection::Defaults => Ok(defaults),
-        GoalBudgetSelection::Limits(limits) => validate_command_limits(limits),
-        GoalBudgetSelection::Unlimited => Ok(GoalBudgetLimits {
+        GoalBudgetSelection::Defaults => defaults(),
+        GoalBudgetSelection::Limits(limits) => validate_command_limits(limits).map(Some),
+        GoalBudgetSelection::Unlimited => Ok(Some(GoalBudgetLimits {
             token_limit: None,
             cost_limit_usd: None,
-        }),
+        })),
     }
 }
 
@@ -1983,6 +2483,72 @@ fn validate_command_limits(limits: GoalBudgetLimits) -> Result<GoalBudgetLimits>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn paired_settings_preserve_config_and_reject_stale_publication() {
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.goal.enabled = true;
+        config.goal.default_token_limit = Some(1234);
+        let live = zeroclaw_config::live::LiveConfig::new(config.clone());
+        let source = GoalHostSettingsSource::new(live.handle(), 7, "fixture-boot").unwrap();
+        let snapshot = source.snapshot();
+        let settings = snapshot.settings();
+        assert_eq!(settings.config.goal.default_token_limit, Some(1234));
+        settings.validate_current_for(&source).unwrap();
+
+        // Even an eligibility-preserving publication is a different capture.
+        config.goal.default_token_limit = Some(5678);
+        live.publish(live.next_revision().unwrap(), config).unwrap();
+        assert_eq!(settings.config.goal.default_token_limit, Some(1234));
+        assert!(settings.validate_current_for(&source).is_err());
+        assert!(settings.revalidate_captured().is_err());
+        let current = source.snapshot();
+        current.settings().validate_current_for(&source).unwrap();
+        assert_eq!(
+            current.settings().config.goal.default_token_limit,
+            Some(5678)
+        );
+    }
+
+    #[test]
+    fn paired_settings_reject_private_storage_and_wrong_process_owner() {
+        let live = zeroclaw_config::live::LiveConfig::new(Default::default());
+        let source = GoalHostSettingsSource::new(live.handle(), 7, "fixture-boot").unwrap();
+        let private = zeroclaw_config::live::LiveConfig::new(live.snapshot());
+        let wrong_storage = GoalHostSettingsSource::new(private.handle(), 7, "fixture-boot")
+            .unwrap()
+            .snapshot();
+        let wrong_pid = GoalHostSettingsSource::new(live.handle(), 8, "fixture-boot")
+            .unwrap()
+            .snapshot();
+        let wrong_boot = GoalHostSettingsSource::new(live.handle(), 7, "other-boot")
+            .unwrap()
+            .snapshot();
+        for snapshot in [&wrong_storage, &wrong_pid, &wrong_boot] {
+            assert!(snapshot.settings().validate_current_for(&source).is_err());
+        }
+        source
+            .snapshot()
+            .settings()
+            .validate_current_for(&source)
+            .unwrap();
+    }
+
+    #[test]
+    fn unstamped_primitive_settings_do_not_qualify_managed_admission() {
+        let live = zeroclaw_config::live::LiveConfig::new(Default::default());
+        let source = GoalHostSettingsSource::new(live.handle(), 7, "fixture-boot").unwrap();
+        let config = live.snapshot();
+        let primitive = GoalHostSettings::from_config(&config, 7, "fixture-boot").unwrap();
+        assert!(primitive.validate_current_for(&source).is_err());
+        // Explicit lower-level primitives still leave serialization to callers.
+        primitive.revalidate_captured().unwrap();
+        source
+            .snapshot()
+            .settings()
+            .validate_current_for(&source)
+            .unwrap();
+    }
 
     #[tokio::test]
     async fn supervisor_handoff_transfers_the_running_request_command_lease() {
@@ -2137,10 +2703,10 @@ mod tests {
         ] {
             assert!(
                 select_limits(
-                    GoalBudgetLimits {
+                    || Ok(Some(GoalBudgetLimits {
                         token_limit: Some(1),
                         cost_limit_usd: None,
-                    },
+                    })),
                     GoalBudgetSelection::Limits(limits),
                 )
                 .is_err()
@@ -2191,6 +2757,10 @@ mod tests {
         assert!(normalized_prompt.contains("explicit final request for user clarification"));
         assert!(normalized_prompt.contains("Ordinary progress prose does not"));
         assert!(normalized_prompt.contains("1 to 16 blockers"));
+        assert!(normalized_prompt.contains(&format!(
+            "at most {} bytes when encoded as compact JSON",
+            goal_execution::MAX_VERIFIER_BLOCKER_PAYLOAD_BYTES
+        )));
         assert_eq!(messages[1].role, "user");
     }
 
@@ -2212,6 +2782,77 @@ mod tests {
         assert_eq!(decoded["objective"].as_str(), Some(turn.objective.as_str()));
         assert_eq!(decoded["candidate"].as_str(), Some(turn.candidate.as_str()));
         assert_eq!(messages[1].content.matches("\\n").count(), 5);
+    }
+
+    #[test]
+    fn trusted_ingress_rejects_noncanonical_public_session_variants() {
+        for session_key in [
+            GoalSessionKey::Matrix {
+                history_key: "rpc_shared".into(),
+            },
+            GoalSessionKey::Matrix {
+                history_key: "".into(),
+            },
+            GoalSessionKey::Matrix {
+                history_key: " matrix_room ".into(),
+            },
+            GoalSessionKey::Matrix {
+                history_key: "matrix_room with spaces".into(),
+            },
+            GoalSessionKey::ZeroCode {
+                raw_session_id: "same session".into(),
+            },
+            GoalSessionKey::ZeroCode {
+                raw_session_id: " padded ".into(),
+            },
+            GoalSessionKey::ZeroCode {
+                raw_session_id: "".into(),
+            },
+        ] {
+            let principal = match session_key.surface() {
+                GoalSurface::Matrix => GoalIngressPrincipal::Matrix {
+                    raw_mxid: "@zeroclaw_user:example.org".into(),
+                },
+                GoalSurface::ZeroCode => GoalIngressPrincipal::ZeroCode {
+                    tui_id: "client-1".into(),
+                },
+            };
+            assert!(GoalIngressContext::trusted(session_key, "main", "direct", principal).is_err());
+        }
+    }
+
+    #[test]
+    fn trusted_ingress_preserves_valid_canonical_session_variants() {
+        for (session_key, expected_durable_id) in [
+            (
+                GoalSessionKey::Matrix {
+                    history_key: "matrix_room_primary".into(),
+                },
+                "matrix_room_primary",
+            ),
+            (
+                GoalSessionKey::ZeroCode {
+                    raw_session_id: "same-session".into(),
+                },
+                "rpc_same-session",
+            ),
+        ] {
+            let expected_session_key = session_key.clone();
+            let expected_surface = session_key.surface();
+            let principal = match expected_surface {
+                GoalSurface::Matrix => GoalIngressPrincipal::Matrix {
+                    raw_mxid: "@zeroclaw_user:example.org".into(),
+                },
+                GoalSurface::ZeroCode => GoalIngressPrincipal::ZeroCode {
+                    tui_id: "client-1".into(),
+                },
+            };
+            let ingress =
+                GoalIngressContext::trusted(session_key, "main", "direct", principal).unwrap();
+            assert_eq!(ingress.surface(), expected_surface);
+            assert_eq!(ingress.session_key(), &expected_session_key);
+            assert_eq!(ingress.session_key().durable_id(), expected_durable_id);
+        }
     }
 
     #[test]
@@ -2251,16 +2892,5 @@ mod tests {
         goal.pending_call_epoch = None;
         task.execution_epoch = i64::MAX;
         assert!(!goal_is_resumable(&task, &goal));
-    }
-
-    #[tokio::test]
-    async fn shared_parent_turn_scope_marks_goal_owned_child_admission() {
-        scope_goal_parent_turn(async {
-            let _guard = goal_child_fence::admit_goal_child()
-                .await
-                .expect("Goal parent scope should allow a foreground child")
-                .expect("Goal parent scope should install a child fence");
-        })
-        .await;
     }
 }

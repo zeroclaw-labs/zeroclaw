@@ -131,6 +131,44 @@ where
     }
 }
 
+/// Run a Goal-accounted future to settlement without an outer dropping timeout.
+pub(super) fn run_bridged_anyhow_to_completion<T, F>(fut: F, what: &str) -> anyhow::Result<T>
+where
+    T: Send + 'static,
+    F: Future<Output = anyhow::Result<T>> + Send + 'static,
+{
+    let (tx, rx) = sync_channel(1);
+    let handle = std::thread::Builder::new()
+        .name(format!("sop-bridge-{what}"))
+        .spawn(move || {
+            let result = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime.block_on(fut),
+                Err(error) => Err(anyhow::Error::msg(format!(
+                    "bridge runtime build failed: {error}"
+                ))),
+            };
+            let _ = tx.send(result);
+        })
+        .map_err(|error| {
+            anyhow::Error::msg(format!("failed to spawn the {what} bridge thread: {error}"))
+        })?;
+    match rx.recv() {
+        Ok(result) => {
+            let _ = handle.join();
+            result
+        }
+        Err(_) => {
+            let _ = handle.join();
+            Err(anyhow::Error::msg(format!(
+                "{what} task died before reporting a result"
+            )))
+        }
+    }
+}
+
 /// Run `fut` on a dedicated bridge thread and return only after the worker has
 /// completed, even if it exceeds `timeout`. This is for public, non-idempotent
 /// writes: after the timeout expires, the caller waits for the eventual result
@@ -169,6 +207,16 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Instant;
+
+    #[test]
+    fn accounted_bridge_returns_the_original_error_chain() {
+        let error = run_bridged_anyhow_to_completion::<(), _>(
+            async { Err(anyhow::Error::msg("inner cause").context("outer cause")) },
+            "test",
+        )
+        .expect_err("the bridged error must be returned");
+        assert_eq!(format!("{error:#}"), "outer cause: inner cause");
+    }
 
     #[test]
     fn runs_a_future_from_a_plain_thread() {

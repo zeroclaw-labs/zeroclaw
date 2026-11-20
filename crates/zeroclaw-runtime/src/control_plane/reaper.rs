@@ -103,6 +103,14 @@ async fn recover_terminal_settlements(store: &dyn TaskRegistry) -> anyhow::Resul
             continue;
         };
 
+        // Goal lifecycle is owned by its controller. Supported generic writers
+        // reject session-bound Goal settlement intents; preserve any legacy or
+        // anomalous row instead of applying delegate settlement rules or
+        // aborting recovery for unrelated tasks.
+        if task.kind == TaskKind::Goal {
+            continue;
+        }
+
         // A terminal winner is authoritative. The outbox row can only be stale.
         if task.status.is_terminal() {
             if is_authoritative_owner(intent.owner_pid, &intent.owner_boot_id) {
@@ -123,36 +131,84 @@ async fn recover_terminal_settlements(store: &dyn TaskRegistry) -> anyhow::Resul
             continue;
         }
 
-        let (resolved_status, output, error) =
-            if let Some(artifact_error) = artifact_validation_error(&intent).await {
-                (
-                    TaskStatus::Failed,
-                    None,
-                    Some(format!(
-                        "terminal settlement recovery failed for task {}: {artifact_error}",
-                        intent.task_id
-                    )),
-                )
-            } else {
-                (
-                    intent.desired_status,
-                    if intent.desired_status == TaskStatus::Completed {
-                        intent.artifact_ref.clone()
-                    } else {
-                        None
-                    },
-                    intent.terminal_error.clone(),
-                )
-            };
-
-        if store
-            .promote_terminal_settlement(&intent, resolved_status, output, error)
-            .await?
-        {
+        if promote_validated_settlement(store, &intent).await? {
             recovered += 1;
         }
     }
     Ok(recovered)
+}
+
+async fn promote_validated_settlement(
+    store: &dyn TaskRegistry,
+    intent: &TerminalSettlementIntent,
+) -> anyhow::Result<bool> {
+    let (status, output, error) =
+        if let Some(artifact_error) = artifact_validation_error(intent).await {
+            (
+                TaskStatus::Failed,
+                None,
+                Some(format!(
+                    "terminal settlement recovery failed for task {}: {artifact_error}",
+                    intent.task_id
+                )),
+            )
+        } else {
+            (
+                intent.desired_status,
+                if intent.desired_status == TaskStatus::Completed {
+                    intent.artifact_ref.clone()
+                } else {
+                    None
+                },
+                intent.terminal_error.clone(),
+            )
+        };
+    store
+        .promote_terminal_settlement(intent, status, output, error)
+        .await
+}
+
+/// Called only after awaiting the exact delegate worker's JoinHandle proves exit.
+/// The parent process may still be live; task ownership and terminal winners
+/// remain guarded by the store's compare-and-set transactions.
+pub(crate) async fn recover_exited_delegate_worker(
+    store: &dyn TaskRegistry,
+    task_id: &str,
+    owner_pid: u32,
+    owner_boot_id: &str,
+) -> anyhow::Result<bool> {
+    let Some(task) = store.get(task_id).await? else {
+        return Ok(false);
+    };
+    if task.kind != TaskKind::Delegate
+        || task.status.is_terminal()
+        || task.owner_pid != owner_pid
+        || task.owner_boot_id != owner_boot_id
+    {
+        return Ok(false);
+    }
+    if let Some(intent) = store
+        .list_terminal_settlement_intents()
+        .await?
+        .into_iter()
+        .find(|intent| {
+            intent.task_id == task_id
+                && intent.owner_pid == owner_pid
+                && intent.owner_boot_id == owner_boot_id
+        })
+    {
+        return promote_validated_settlement(store, &intent).await;
+    }
+    store
+        .transition_terminal_if_owner(
+            task_id,
+            owner_pid,
+            owner_boot_id,
+            TaskStatus::Failed,
+            None,
+            Some("background delegate worker exited before terminal settlement".into()),
+        )
+        .await
 }
 
 /// Age in seconds of an RFC3339 instant, or `None` if it cannot be parsed. We NEVER
@@ -368,6 +424,104 @@ mod tests {
         assert_eq!(
             s.get("ordinary-timeout").await.unwrap().unwrap().status,
             TaskStatus::TimedOut
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_preserves_goal_settlement_intents_without_blocking_delegates() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteTaskStore::new(dir.path()).unwrap();
+        let goal_id = "goal-with-legacy-settlement";
+        let goal = TaskRecord {
+            id: goal_id.into(),
+            kind: TaskKind::Goal,
+            agent: "main".into(),
+            status: TaskStatus::Running,
+            owner_pid: 999_999,
+            owner_boot_id: "boot-OLD".into(),
+            heartbeat_at: None,
+            depth: 0,
+            parent_id: None,
+            originator_route: None,
+            originator_chain: Vec::new(),
+            delivered: false,
+            idem_key: None,
+            principal_id: None,
+            session_id: Some("goal-session".into()),
+            execution_epoch: 0,
+            started_at: Utc::now().to_rfc3339(),
+            finished_at: None,
+        };
+        store
+            .create_or_replace_session_goal(
+                goal,
+                GoalTaskRecord {
+                    task_id: goal_id.into(),
+                    objective: "goal objective".into(),
+                    ..GoalTaskRecord::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let goal_path = dir.path().join(format!("{goal_id}.json"));
+        let goal_bytes = br#"{"task_id":"goal-with-legacy-settlement","output":"goal"}"#;
+        tokio::fs::write(&goal_path, goal_bytes).await.unwrap();
+        let goal_intent = intent(goal_id, &goal_path, TaskStatus::Completed, goal_bytes);
+        assert!(
+            store
+                .insert_legacy_terminal_settlement_intent_for_test(&goal_intent)
+                .unwrap()
+        );
+
+        let delegate_id = "ordinary-delegate-settlement";
+        let delegate_path = dir.path().join(format!("{delegate_id}.json"));
+        let delegate_bytes = br#"{"task_id":"ordinary-delegate-settlement","output":"done"}"#;
+        tokio::fs::write(&delegate_path, delegate_bytes)
+            .await
+            .unwrap();
+        store
+            .create(rec(delegate_id, "boot-OLD", 999_999, None))
+            .await
+            .unwrap();
+        assert!(
+            store
+                .persist_terminal_settlement_intent(intent(
+                    delegate_id,
+                    &delegate_path,
+                    TaskStatus::Completed,
+                    delegate_bytes,
+                ))
+                .await
+                .unwrap()
+        );
+        store
+            .create(rec("ordinary-orphan", "boot-OLD", 999_999, None))
+            .await
+            .unwrap();
+
+        assert_eq!(recovery_pass(&store, "boot-NEW").await.unwrap(), 2);
+        assert_eq!(
+            store.get(delegate_id).await.unwrap().unwrap().status,
+            TaskStatus::Completed
+        );
+        assert_eq!(
+            store.get("ordinary-orphan").await.unwrap().unwrap().status,
+            TaskStatus::Lost
+        );
+        assert_eq!(
+            store.get(goal_id).await.unwrap().unwrap().status,
+            TaskStatus::Running
+        );
+        let remaining = store.list_terminal_settlement_intents().await.unwrap();
+        assert_eq!(remaining, vec![goal_intent.clone()]);
+
+        // The periodic reaper shares settlement recovery and must also tolerate
+        // the preserved Goal row on later sweeps.
+        sweep(&store, "boot-NEW", 600).await.unwrap();
+        assert_eq!(
+            store.list_terminal_settlement_intents().await.unwrap(),
+            vec![goal_intent]
         );
     }
 

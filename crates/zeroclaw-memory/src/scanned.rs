@@ -800,6 +800,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn redaction_persists_all_matches_without_changing_unicode_context() {
+        let tmp = TempDir::new().unwrap();
+        let policy = MemoryPolicyConfig {
+            redact_on_write: true,
+            ..MemoryPolicyConfig::default()
+        };
+        // Multibyte prefixes, intervening text, and suffixes make byte offsets
+        // differ from character counts for both matches.
+        let content = format!("前言🦀 {INLINE_API_KEY}\n中间 e\u{301} {INLINE_API_KEY} 结束🌍");
+        let expected = "前言🦀 [REDACTED:api_key]\n中间 e\u{301} [REDACTED:api_key] 结束🌍";
+        {
+            let mem = scanned(&tmp, &policy);
+            mem.store("unicode", &content, MemoryCategory::Core, None)
+                .await
+                .unwrap();
+        }
+
+        // Reopen the raw backend so read-time scanning cannot hide a secret
+        // that was accidentally persisted by the write decorator.
+        let raw = SqliteMemory::new("sqlite", tmp.path()).unwrap();
+        let entry = raw.get("unicode").await.unwrap().unwrap();
+        assert_eq!(entry.content, expected);
+        assert_eq!(raw.count().await.unwrap(), 1);
+    }
+
+    #[tokio::test]
     async fn redaction_precedes_default_reject_for_supported_secret() {
         let tmp = TempDir::new().unwrap();
         let policy = MemoryPolicyConfig {

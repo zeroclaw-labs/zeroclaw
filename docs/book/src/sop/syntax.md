@@ -335,7 +335,9 @@ with a clear message, like `shell.exec`:
   `with:` - `instruction` (required), `system`, `output_key` (default `text`),
   `echo` (payload fields copied into the output for downstream piping). The piped
   event payload is delivered inside an explicit untrusted-content frame and is
-  never read as configuration.
+  never read as configuration. Inside a Goal, its model call is charged to the
+  Goal and ordinary spending limits; a Goal stop ends the run without routing
+  through `on_failure`.
 - **`forge.comment`** - posts a comment to a git-forge issue/PR through the git
   channel's outbound path (provider-agnostic: GitHub / Gitea / Forgejo). Input
   fields: `repo` (`owner/repo`), `number`, `body`, and optional `channel`
@@ -360,6 +362,10 @@ capabilities and routes are **fail-closed** there: `llm.generate` /
 acting, and a checkpoint's route notice is a log-only no-op. This is the same
 fail-closed model as `shell.exec`; run a pipeline that needs these capabilities
 under the daemon.
+
+An `llm.generate` adapter must implement `generate_goal_accounted` to run
+inside a Goal. An adapter without Goal usage reporting fails the step without
+sending a model request.
 
 ### Step Contract Enforcement
 

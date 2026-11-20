@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Select the advisory Windows nextest scope from Git paths and Cargo metadata."""
+"""Select Windows CI from Git paths and Cargo package ownership."""
 
 from __future__ import annotations
 
@@ -133,16 +133,16 @@ def metadata_path(repo_root: Path, manifest_path: str) -> Path | None:
 
 
 def load_packages(
-    metadata_file: Path, repo_root: Path
+    metadata_file: Path, repo_root: Path, *, no_deps: bool = False
 ) -> tuple[list[Package], dict[str, set[str]], str | None]:
     try:
         metadata = json.loads(metadata_file.read_text(encoding="utf-8"))
         raw_packages = metadata["packages"]
         workspace_members = metadata["workspace_members"]
-        raw_nodes = metadata["resolve"]["nodes"]
+        raw_nodes = None if no_deps else metadata["resolve"]["nodes"]
         if not isinstance(raw_packages, list) or not isinstance(workspace_members, list):
             raise ValueError("packages and workspace_members must be arrays")
-        if not isinstance(raw_nodes, list):
+        if not no_deps and not isinstance(raw_nodes, list):
             raise ValueError("resolve nodes must be an array")
         member_ids = {member for member in workspace_members if isinstance(member, str)}
         if len(member_ids) != len(workspace_members):
@@ -176,10 +176,43 @@ def load_packages(
         return [], {}, "Cargo metadata is malformed or unavailable (no workspace packages)."
 
     packages_by_id = {package.package_id: package for package in packages}
-    if set(packages_by_id) != member_ids:
+    if set(packages_by_id) != member_ids or len(packages_by_id) != len(packages):
         return [], {}, "Cargo metadata is malformed or unavailable (workspace package set)."
+    if len({package.name for package in packages}) != len(packages):
+        return [], {}, "Cargo metadata is ambiguous (duplicate package names)."
 
     reverse_dependents = {package.name: set() for package in packages}
+    if no_deps:
+        # --no-deps avoids registry resolution. Keep every internal path edge,
+        # including optional, target-specific, build and dev dependencies. This
+        # may over-select, but cannot omit an edge because a feature is disabled
+        # on the Linux detector rather than the Windows consumer.
+        packages_by_root = {package.root: package for package in packages}
+        for raw_package in raw_packages:
+            if raw_package["id"] not in member_ids:
+                continue
+            dependent = packages_by_id[raw_package["id"]]
+            raw_deps = raw_package.get("dependencies")
+            if not isinstance(raw_deps, list):
+                return [], {}, "Cargo metadata is malformed or unavailable (dependency list)."
+            for raw_dep in raw_deps:
+                if not isinstance(raw_dep, dict) or not isinstance(raw_dep.get("name"), str):
+                    return [], {}, "Cargo metadata is malformed or unavailable (path dependency)."
+                path = raw_dep.get("path")
+                if path is None:
+                    # A registry/git edge naming a workspace package might be
+                    # patched during resolution. Without that proof, run all.
+                    if raw_dep["name"] in reverse_dependents:
+                        return [], {}, "Cargo metadata is ambiguous (non-path workspace dependency)."
+                    continue
+                if not isinstance(path, str) or not Path(path).is_absolute():
+                    return [], {}, "Cargo metadata is malformed or unavailable (dependency path)."
+                dependency = packages_by_root.get(Path(path).resolve())
+                if dependency is None or dependency.name != raw_dep["name"]:
+                    return [], {}, "Cargo metadata is ambiguous (unknown path dependency)."
+                reverse_dependents[dependency.name].add(dependent.name)
+        return packages, reverse_dependents, None
+
     seen_nodes: set[str] = set()
     for raw_node in raw_nodes:
         if not isinstance(raw_node, dict):
@@ -392,6 +425,60 @@ def emit(selection: Selection) -> None:
     print(f"needs_plugin_host={'true' if selection.needs_plugin_host else 'false'}")
 
 
+def select_required_jobs(
+    event: str, changed_file: Path | None, metadata_file: Path | None, repo_root: Path
+) -> dict[str, bool]:
+    run_all = dict.fromkeys(
+        ("windows_root", "windows_voice_wake", "windows_recovery", "windows_service"), True
+    )
+    if event != "pull_request" or changed_file is None or metadata_file is None:
+        return run_all
+    changed_paths, paths_ok = read_changed_paths(changed_file)
+    if not paths_ok or not changed_paths:
+        return run_all
+    try:
+        packages, reverse_dependents, error = load_packages(metadata_file, repo_root, no_deps=True)
+    except (OSError, ValueError, RuntimeError):
+        # Invalid filesystem paths and symlink loops are unusable graph evidence.
+        return run_all
+    owners = {"zeroclaw", "zeroclaw-channels", "zeroclaw-runtime", "zeroclaw-config", "zeroclaw-spawn"}
+    if error is not None or not owners.issubset(reverse_dependents):
+        return run_all
+    selection = select_pull_request(changed_paths, repo_root, packages, reverse_dependents)
+    if selection.mode == "full":
+        return run_all
+
+    manifests_affect_runtime = False
+    for path in changed_paths:
+        if PurePosixPath(path).name not in {"Cargo.toml", "build.rs"}:
+            continue
+        package = package_for(path, repo_root, packages)
+        if package is None:
+            return run_all
+        closure = close_over_reverse_dependents({package.name}, reverse_dependents)
+        manifests_affect_runtime |= "zeroclaw-runtime" in closure
+
+    return {
+        "windows_root": "zeroclaw" in selection.packages,
+        "windows_voice_wake": "zeroclaw-channels" in selection.packages,
+        "windows_recovery": manifests_affect_runtime or any(
+            path == "crates/zeroclaw-runtime/src/lib.rs"
+            or path.startswith("crates/zeroclaw-runtime/src/control_plane/")
+            for path in changed_paths
+        ),
+        "windows_service": manifests_affect_runtime
+        or bool({"zeroclaw-config", "zeroclaw-spawn"} & set(selection.packages))
+        or any(
+            path in {
+                "crates/zeroclaw-runtime/src/lib.rs",
+                "crates/zeroclaw-runtime/examples/windows_service_smoke_fixture.rs",
+            }
+            or path.startswith("crates/zeroclaw-runtime/src/service/")
+            for path in changed_paths
+        ),
+    }
+
+
 def emit_package_args(raw_packages: str) -> int:
     try:
         packages = json.loads(raw_packages)
@@ -415,11 +502,21 @@ def main() -> int:
     parser.add_argument("--metadata-file", "--metadata", dest="metadata_file", type=Path)
     parser.add_argument("--repo-root", type=Path, default=Path.cwd())
     parser.add_argument("--package-args-json")
+    parser.add_argument(
+        "--required-jobs", action="store_true",
+        help="Use registry-free metadata for required-job booleans",
+    )
     args = parser.parse_args()
     if args.package_args_json is not None:
         return emit_package_args(args.package_args_json)
     if args.event is None:
         parser.error("--event is required unless --package-args-json is used")
+    if args.required_jobs:
+        for name, selected in select_required_jobs(
+            args.event, args.changed_file, args.metadata_file, args.repo_root.resolve()
+        ).items():
+            print(f"{name}={'true' if selected else 'false'}")
+        return 0
     emit(select(args.event, args.changed_file, args.metadata_file, args.repo_root.resolve()))
     return 0
 

@@ -10,3 +10,4 @@ This section covers everything beyond day-to-day development: docs, translations
 - [Labels](./labels.md): single source of truth for every label and its automation status
 - [Superseding PRs](./superseding.md): when to supersede, attribution rules, PR and commit templates
 - [Release runbook](./release-runbook.md): verification, tag cut, monitor, post-release validation, downstream publishers
+- [Plugin release acceptance](./plugin-release-acceptance.md): proving a first-party plugin installs and runs from a published binary, with an evidence template

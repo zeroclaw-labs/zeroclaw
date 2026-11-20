@@ -9,6 +9,8 @@ use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::policy::ToolOperation;
 use zeroclaw_providers::ProviderDispatch;
 
+use crate::model_call::{DirectToolModelCall, ToolModelCallGate, ToolModelCallOutcome};
+
 /// Tool that runs a single prompt through an LLM and optionally validates
 /// the response against a JSON Schema. No tools are provided to the LLM —
 /// this is a pure text-in, text-out (or JSON-out) call.
@@ -33,6 +35,7 @@ pub struct LlmTaskTool {
     api_key: Option<String>,
     /// ModelProvider runtime options inherited from root config.
     provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions,
+    model_call_gate: Arc<dyn ToolModelCallGate>,
 }
 
 impl LlmTaskTool {
@@ -55,7 +58,14 @@ impl LlmTaskTool {
             default_temperature,
             api_key,
             provider_runtime_options,
+            model_call_gate: Arc::new(DirectToolModelCall),
         }
+    }
+
+    /// Use the host's admission and accounting gate for tool-owned model calls.
+    pub fn with_model_call_gate(mut self, gate: Arc<dyn ToolModelCallGate>) -> Self {
+        self.model_call_gate = gate;
+        self
     }
 
     /// Construct the model provider using the alias-aware factory so that
@@ -211,18 +221,27 @@ impl Tool for LlmTaskTool {
         // Make the LLM call (no tools, no agent loop). `temperature` is
         // already Option<f64>; pass straight through. None omits the field
         // on the wire so the provider applies its own default.
-        let response = match ProviderDispatch::from_ref(&*model_provider)
-            .simple_chat(&effective_prompt, model, temperature)
+        let provider_ref = format!("{}.{}", self.family, self.alias);
+        let dispatcher = ProviderDispatch::from_ref(&*model_provider);
+        let response = match self
+            .model_call_gate
+            .run(
+                &provider_ref,
+                model,
+                Box::pin(dispatcher.simple_chat(&effective_prompt, model, temperature)),
+            )
             .await
         {
-            Ok(text) => text,
-            Err(e) => {
+            ToolModelCallOutcome::Completed(Ok(text)) => text,
+            ToolModelCallOutcome::Completed(Err(e)) => {
                 return Ok(ToolResult {
                     success: false,
                     output: ToolOutput::default(),
                     error: Some(format!("LLM call failed: {e}")),
                 });
             }
+            ToolModelCallOutcome::Refused(error)
+            | ToolModelCallOutcome::Stopped { stop: error, .. } => return Err(error),
         };
 
         // If schema was provided, validate the response

@@ -21,7 +21,9 @@ use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, Condvar, Mutex};
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
+use std::time::Instant;
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 use tokio::io::{AsyncRead, AsyncReadExt};
 #[cfg(any(target_os = "linux", target_os = "macos", all(test, not(unix))))]
@@ -46,7 +48,6 @@ const SERVICE_LOG_PENDING_BYTES: usize = 1024 * 1024;
 const SERVICE_LOG_WRITER_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 const DESKTOP_PIPE_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 const DESKTOP_READINESS_FRAME_MAX_BYTES: usize = 4096;
 const SERVICE_STOP_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(any(target_os = "macos", test))]
@@ -4709,6 +4710,20 @@ mod service_helper_tests {
             service_log_targets(&stdout_log, &stderr_log),
             vec![stdout_log],
             "a capture file that was never created is not a target"
+        );
+    }
+
+    #[test]
+    fn follow_log_targets_ignores_missing_streams() {
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+        let stdout_log = dir.path().join("daemon.stdout.log");
+        let stderr_log = dir.path().join("daemon.stderr.log");
+        fs::write(&stderr_log, "late failure\n").unwrap();
+
+        assert_eq!(
+            follow_log_targets(&stdout_log, &stderr_log),
+            vec![stderr_log],
+            "follow mode should attach only to streams that exist"
         );
     }
 

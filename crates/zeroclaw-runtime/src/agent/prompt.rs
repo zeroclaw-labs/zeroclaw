@@ -104,6 +104,9 @@ pub struct PromptContext<'a> {
     pub agent_workspace_dir: &'a Path,
     pub model_name: &'a str,
     pub tools: &'a [Box<dyn Tool>],
+    /// Render-time projection of unselected built-in schemas. Execution still
+    /// resolves the complete policy-admitted registry.
+    pub hidden_builtin_names: Option<&'a std::collections::HashSet<String>>,
     pub skills: &'a [Skill],
     pub skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode,
     pub identity_config: Option<&'a IdentityConfig>,
@@ -390,6 +393,12 @@ impl PromptSection for ToolsSection {
 
         let mut out = String::from("## Tools\n\n");
         for tool in ctx.tools {
+            if ctx
+                .hidden_builtin_names
+                .is_some_and(|names| names.contains(tool.name()))
+            {
+                continue;
+            }
             let i18n_description = crate::i18n::get_tool_description(tool.name());
             let desc = i18n_description.unwrap_or_else(|| tool.description());
             let _ = writeln!(
@@ -759,6 +768,7 @@ mod tests {
             identity_config: None,
             interaction: None,
             dispatcher_instructions: "",
+            hidden_builtin_names: None,
             sends_native_tool_specs: false,
             security_summary: None,
             autonomy_level: AutonomyLevel::Supervised,
@@ -840,6 +850,7 @@ mod tests {
             identity_config: Some(&identity_config),
             interaction: None,
             dispatcher_instructions: "",
+            hidden_builtin_names: None,
             sends_native_tool_specs: false,
 
             security_summary: None,
@@ -876,6 +887,7 @@ mod tests {
             identity_config: None,
             interaction: None,
             dispatcher_instructions: "instr",
+            hidden_builtin_names: None,
             sends_native_tool_specs: false,
 
             security_summary: None,
@@ -903,6 +915,7 @@ mod tests {
             identity_config: None,
             interaction: Some(&interaction),
             dispatcher_instructions: "",
+            hidden_builtin_names: None,
             sends_native_tool_specs: false,
             security_summary: None,
             autonomy_level: AutonomyLevel::Supervised,
@@ -941,6 +954,7 @@ mod tests {
             identity_config: None,
             interaction: Some(&interaction),
             dispatcher_instructions: "",
+            hidden_builtin_names: None,
             sends_native_tool_specs: false,
             security_summary: None,
             autonomy_level: AutonomyLevel::Supervised,
@@ -966,6 +980,7 @@ mod tests {
             identity_config: None,
             interaction: None,
             dispatcher_instructions: "",
+            hidden_builtin_names: None,
             sends_native_tool_specs: true,
 
             security_summary: None,
@@ -992,6 +1007,7 @@ mod tests {
             identity_config: None,
             interaction: None,
             dispatcher_instructions: "",
+            hidden_builtin_names: None,
             sends_native_tool_specs: false,
 
             security_summary: None,
@@ -1048,6 +1064,7 @@ mod tests {
             identity_config: None,
             interaction: None,
             dispatcher_instructions: "",
+            hidden_builtin_names: None,
             sends_native_tool_specs: false,
 
             security_summary: None,
@@ -1104,6 +1121,7 @@ mod tests {
             identity_config: None,
             interaction: None,
             dispatcher_instructions: "",
+            hidden_builtin_names: None,
             sends_native_tool_specs: false,
 
             security_summary: None,
@@ -1150,6 +1168,7 @@ mod tests {
             identity_config: None,
             interaction: None,
             dispatcher_instructions: "",
+            hidden_builtin_names: None,
             sends_native_tool_specs: false,
             security_summary: None,
             autonomy_level: AutonomyLevel::Supervised,
@@ -1202,6 +1221,7 @@ mod tests {
             identity_config: None,
             interaction: None,
             dispatcher_instructions: "",
+            hidden_builtin_names: None,
             sends_native_tool_specs: false,
             security_summary: None,
             autonomy_level: AutonomyLevel::Supervised,
@@ -1232,6 +1252,7 @@ mod tests {
             identity_config: None,
             interaction: None,
             dispatcher_instructions: "instr",
+            hidden_builtin_names: None,
             sends_native_tool_specs: false,
 
             security_summary: None,
@@ -1270,6 +1291,7 @@ mod tests {
             identity_config: None,
             interaction: None,
             dispatcher_instructions: "instr",
+            hidden_builtin_names: None,
             sends_native_tool_specs: false,
 
             security_summary: None,
@@ -1334,6 +1356,7 @@ mod tests {
             identity_config: None,
             interaction: None,
             dispatcher_instructions: "",
+            hidden_builtin_names: None,
             sends_native_tool_specs: false,
 
             security_summary: None,
@@ -1373,6 +1396,7 @@ mod tests {
             identity_config: None,
             interaction: None,
             dispatcher_instructions: "",
+            hidden_builtin_names: None,
             sends_native_tool_specs: false,
 
             security_summary: Some(summary.clone()),
@@ -1413,6 +1437,7 @@ mod tests {
             identity_config: None,
             interaction: None,
             dispatcher_instructions: "",
+            hidden_builtin_names: None,
             sends_native_tool_specs: false,
 
             security_summary: None,
@@ -1445,6 +1470,7 @@ mod tests {
             identity_config: None,
             interaction: None,
             dispatcher_instructions: "",
+            hidden_builtin_names: None,
             sends_native_tool_specs: false,
 
             security_summary: None,
@@ -1495,6 +1521,7 @@ mod tests {
             identity_config: None,
             interaction: None,
             dispatcher_instructions: "",
+            hidden_builtin_names: None,
             sends_native_tool_specs: false,
             security_summary: None,
             autonomy_level: AutonomyLevel::Full,
@@ -1533,6 +1560,7 @@ mod tests {
             identity_config: None,
             interaction: None,
             dispatcher_instructions: "",
+            hidden_builtin_names: None,
             sends_native_tool_specs: false,
             security_summary: None,
             autonomy_level: AutonomyLevel::Full,
@@ -1566,6 +1594,7 @@ mod tests {
             identity_config: None,
             interaction: None,
             dispatcher_instructions: "",
+            hidden_builtin_names: None,
             sends_native_tool_specs: false,
 
             security_summary: None,
@@ -1601,6 +1630,7 @@ mod tests {
             identity_config: None,
             interaction: None,
             dispatcher_instructions: "",
+            hidden_builtin_names: None,
             sends_native_tool_specs: false,
             security_summary: None,
             autonomy_level: AutonomyLevel::Supervised,

@@ -7,12 +7,23 @@
 unmaintained = "all"
 # yanked: deny | warn | allow
 yanked = "deny"
-# Ignore known unmaintained transitive deps we cannot easily replace
+# Advisories we cannot act on from this repository: unmaintained transitive
+# deps we cannot easily replace, and vulnerabilities whose fix is published
+# but unreachable because an intermediate crate pins the vulnerable version.
 ignore = [
     # rustls-pemfile -- unmaintained, functionality moved to rustls-pki-types;
     # transitive dep, upstream migration tracked
     { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile unmaintained; transitive dep awaiting upstream migration to rustls-pki-types" },
     { id = "RUSTSEC-2026-0319", reason = "anymap2 unmaintained; matrix-sdk 0.19.1 still depends on it with no replacement release; remove after upstream migration, tracked in #11429" },
+    { id = "RUSTSEC-2026-0441", reason = "pin-utils unmaintained; async-imap 0.11.3 (and 0.12.0) still depend on it with no release without it; remove after upstream migration, tracked in #12252" },
+    # libsqlite3-sys -- the bundled SQLite 3.53.2 can return uninitialized
+    # page-cache memory when a database is opened together with a crafted
+    # sibling -wal file (CVE-2026-119375; local, needs both files). Fixed in
+    # 0.39 (SQLite 3.54), which needs rusqlite 0.41. matrix-sdk-sqlite 0.19.1,
+    # the newest, requires rusqlite 0.40.2, and libsqlite3-sys is a `links`
+    # crate, so the lockfile cannot carry the fix yet. Drop this entry in the
+    # rusqlite 0.41 bump; #12320 tracks it.
+    { id = "RUSTSEC-2026-0459", reason = "libsqlite3-sys 0.38.2 bundles SQLite 3.53.2 (CVE-2026-119375, local, needs a crafted db and -wal pair); the 0.39 fix needs rusqlite 0.41, unreachable while matrix-sdk-sqlite 0.19.1 requires rusqlite 0.40.2; #12320" },
 ]
 
 [licenses]
@@ -126,6 +137,16 @@ version = "=0.1.4"
 [[bans.skip]]
 name = "mio"
 version = "=0.8.11"
+
+# zip 9.0.3 (root crate, macOS and BSD only) requires nix 0.31, while
+# zeroclaw-providers' unix dependency and process-wrap =9.0.0 (a Windows-only
+# dependency whose nix edge is cfg(unix)) still require nix 0.30. Remove this
+# skip when zeroclaw-providers moves to nix 0.31 and process-wrap moves to
+# 9.0.3 or later, which also needs the workspace's `windows` crates on 0.62.
+[[bans.skip]]
+name = "nix"
+version = "=0.30.1"
+reason = "zip 9.0.3 requires nix 0.31; zeroclaw-providers and process-wrap =9.0.0 still require nix 0.30"
 
 [[bans.skip]]
 name = "nom"

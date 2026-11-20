@@ -25,9 +25,11 @@ const WS_PROTOCOL: &str = "zeroclaw.v1";
 /// WS /ws/sops/runs, real-time SOP run summaries.
 pub async fn handle_ws_sop_runs(
     State(state): State<AppState>,
+    dashboard: Option<axum::Extension<std::sync::Arc<crate::dashboard_session::DashboardAuth>>>,
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
+    let mut session_watch = None;
     if state.pairing.require_pairing() {
         let token = headers
             .get(header::AUTHORIZATION)
@@ -46,12 +48,28 @@ pub async fn handle_ws_sop_runs(
             })
             .unwrap_or("");
 
-        if !state.pairing.is_authenticated(token) {
-            return (
-                StatusCode::UNAUTHORIZED,
-                "Unauthorized: provide Authorization header or Sec-WebSocket-Protocol bearer",
+        // A signed-in administrator session presents no token; the feed
+        // ends when the session stops admitting it.
+        let session = if token.is_empty() {
+            crate::dashboard_session::operator_session(
+                dashboard.as_ref().map(|axum::Extension(auth)| auth),
+                &state,
             )
-                .into_response();
+        } else {
+            crate::dashboard_session::OperatorSession::Absent
+        };
+        match session {
+            crate::dashboard_session::OperatorSession::Admitted(watch) => session_watch = watch,
+            crate::dashboard_session::OperatorSession::Denied(denied) => return denied,
+            crate::dashboard_session::OperatorSession::Absent => {
+                if !state.pairing.is_authenticated(token) {
+                    return (
+                        StatusCode::UNAUTHORIZED,
+                        "Unauthorized: provide Authorization header or Sec-WebSocket-Protocol bearer",
+                    )
+                        .into_response();
+                }
+            }
         }
     }
 
@@ -65,66 +83,66 @@ pub async fn handle_ws_sop_runs(
         ws
     };
 
-    ws.on_upgrade(move |socket| handle_socket(socket, state))
+    ws.on_upgrade(move |socket| handle_socket(socket, state, session_watch))
         .into_response()
 }
 
-async fn handle_socket(socket: WebSocket, state: AppState) {
+async fn handle_socket(
+    socket: WebSocket,
+    state: AppState,
+    mut session_watch: Option<crate::dashboard_session::SessionWatch>,
+) {
     let (mut sender, mut receiver) = socket.split();
 
-    // The SOP subsystem may be disabled; tell the client and close.
-    let Some(engine) = state.sop_engine.as_ref() else {
-        let msg = serde_json::json!({ "type": "disabled" });
-        let _ = sender.send(Message::Text(msg.to_string().into())).await;
-        return;
-    };
-
-    // Snapshot + subscribe under one lock so no transition is missed between
-    // reading the current set and arming the feed. The guard is dropped before
-    // any await (the WS send) so the future stays Send.
-    let locked: Result<
-        (
-            Vec<SopRunSummary>,
-            Option<tokio::sync::broadcast::Receiver<SopRunSummary>>,
-        ),
-        (),
-    > = {
-        match engine.lock() {
-            Ok(guard) => Ok((guard.run_summaries(None), guard.subscribe_run_changes())),
-            Err(_) => Err(()),
-        }
-    };
-    let (snapshot, rx) = match locked {
-        Ok(v) => v,
-        Err(()) => {
-            let msg = serde_json::json!({ "type": "error", "error": "engine lock poisoned" });
+    // Initial frames share the live feed's cancellation path so a stalled
+    // first send cannot hold the session watch after sign-out or reload.
+    let forward = async {
+        // The SOP subsystem may be disabled; tell the client and close.
+        let Some(engine) = state.sop_engine.as_ref() else {
+            let msg = serde_json::json!({ "type": "disabled" });
             let _ = sender.send(Message::Text(msg.to_string().into())).await;
             return;
-        }
-    };
+        };
 
-    let msg = serde_json::json!({ "type": "snapshot", "runs": snapshot });
-    if sender
-        .send(Message::Text(msg.to_string().into()))
-        .await
-        .is_err()
-    {
-        return;
-    }
-
-    // No notifier attached (headless embedder): the snapshot stands; keep the
-    // socket open until the client leaves rather than closing abruptly.
-    let Some(mut rx) = rx else {
-        while let Some(m) = receiver.next().await {
-            match m {
-                Ok(Message::Close(_)) | Err(_) => break,
-                _ => {}
+        // Snapshot + subscribe under one lock so no transition is missed between
+        // reading the current set and arming the feed. The guard is dropped before
+        // any await (the WS send) so the future stays Send.
+        let locked: Result<
+            (
+                Vec<SopRunSummary>,
+                Option<tokio::sync::broadcast::Receiver<SopRunSummary>>,
+            ),
+            (),
+        > = {
+            match engine.lock() {
+                Ok(guard) => Ok((guard.run_summaries(None), guard.subscribe_run_changes())),
+                Err(_) => Err(()),
             }
-        }
-        return;
-    };
+        };
+        let (snapshot, rx) = match locked {
+            Ok(v) => v,
+            Err(()) => {
+                let msg = serde_json::json!({ "type": "error", "error": "engine lock poisoned" });
+                let _ = sender.send(Message::Text(msg.to_string().into())).await;
+                return;
+            }
+        };
 
-    let send_task = zeroclaw_spawn::spawn!(async move {
+        let msg = serde_json::json!({ "type": "snapshot", "runs": snapshot });
+        if sender
+            .send(Message::Text(msg.to_string().into()))
+            .await
+            .is_err()
+        {
+            return;
+        }
+
+        // Forward run changes. It never completes on its own: with no notifier
+        // attached (headless embedder) the snapshot stands, and the socket stays
+        // open until the client leaves rather than closing abruptly.
+        let Some(mut rx) = rx else {
+            return std::future::pending::<()>().await;
+        };
         loop {
             match rx.recv().await {
                 Ok(run) => {
@@ -144,14 +162,26 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             }
         }
-    });
+        std::future::pending::<()>().await;
+    };
 
-    while let Some(m) = receiver.next().await {
-        match m {
-            Ok(Message::Close(_)) | Err(_) => break,
-            _ => {}
+    let read_loop = async {
+        while let Some(m) = receiver.next().await {
+            match m {
+                Ok(Message::Close(_)) | Err(_) => break,
+                _ => {}
+            }
         }
+    };
+    // A dashboard session that ends, or loses its access, ends the feed with
+    // the session's close code, with or without a notifier.
+    let lost = tokio::select! {
+        biased;
+        code = crate::dashboard_session::session_lost(&mut session_watch, &state) => Some(code),
+        () = read_loop => None,
+        () = forward => None,
+    };
+    if let Some(code) = lost {
+        crate::ws::close_with(&mut sender, &mut receiver, code, "dashboard session ended").await;
     }
-
-    send_task.abort();
 }

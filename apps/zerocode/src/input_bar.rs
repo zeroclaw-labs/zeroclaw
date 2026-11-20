@@ -46,7 +46,9 @@ enum SlashCommandId {
     ChangeDirectory,
     ClearQueue,
     Browse,
+    Goal,
     Help,
+    LoadSession,
     Model,
     ModelProvider,
     RestartSession,
@@ -92,6 +94,11 @@ const LOCAL_COMMANDS: &[LocalCommandDescriptor] = &[
     LocalCommandDescriptor {
         id: SlashCommandId::Detach,
         name: "detach",
+        aliases: &[],
+    },
+    LocalCommandDescriptor {
+        id: SlashCommandId::LoadSession,
+        name: "load-session",
         aliases: &[],
     },
     LocalCommandDescriptor {
@@ -158,6 +165,11 @@ impl SlashCommandRegistry {
     }
 
     fn parse<'a>(&self, input: &'a str) -> SlashCommand<'a> {
+        // Explicit Goal commands must not become model input if discovery is
+        // absent; the daemon still owns grammar and authorization.
+        if goal_command_tail(input).is_some() {
+            return SlashCommand::Goal;
+        }
         let trimmed = input.trim();
         let (head, argument) = trimmed
             .split_once(' ')
@@ -197,13 +209,33 @@ impl SlashCommandRegistry {
             (SlashCommandId::ModelProvider, Some(name)) => SlashCommand::ModelProvider(name),
             (SlashCommandId::Model, None | Some("")) => SlashCommand::ModelPicker,
             (SlashCommandId::Model, Some(name)) => SlashCommand::Model(name),
+            (SlashCommandId::LoadSession, None | Some("")) => SlashCommand::LoadSessionPicker,
+            (SlashCommandId::LoadSession, Some(query)) => SlashCommand::LoadSession(query),
             _ => SlashCommand::NotACommand,
         }
     }
 }
 
+/// Commands whose completion fills `"<command> "` and waits for an argument
+/// instead of submitting.
+fn command_takes_argument(choice: &str) -> bool {
+    matches!(
+        choice,
+        "/goal" | "/model" | "/model-provider" | "/load-session"
+    )
+}
+
+pub(crate) fn goal_command_tail(input: &str) -> Option<&str> {
+    let mut parts = input.trim_start().splitn(2, char::is_whitespace);
+    let token = parts.next()?;
+    token
+        .eq_ignore_ascii_case("/goal")
+        .then(|| parts.next().unwrap_or_default().trim_start())
+}
+
 fn shared_command_id(id: &str) -> Option<SlashCommandId> {
     match id {
+        "goal" => Some(SlashCommandId::Goal),
         "help" => Some(SlashCommandId::Help),
         "model" => Some(SlashCommandId::Model),
         "new" => Some(SlashCommandId::RestartSession),
@@ -217,6 +249,8 @@ fn shared_command_id(id: &str) -> Option<SlashCommandId> {
 pub(crate) enum InputBarAction {
     /// Key consumed, no further action for parent.
     Consumed,
+    /// A daemon-owned Goal control; does not consume composer attachments.
+    GoalCommand(String),
     /// User submitted a message (Enter with text and/or attachments).
     Submit {
         text: Option<String>,
@@ -238,6 +272,10 @@ pub(crate) enum InputBarAction {
     /// and start a new session in the selected directory. Takes no argument:
     /// the root is always chosen interactively.
     ChangeDirectory,
+    /// `/load-session` with no argument — open the pane's session picker.
+    OpenSessionPicker,
+    /// `/load-session <query>` — resolve and resume a saved session.
+    LoadSession(String),
     /// User typed `/clear-queue [N]`. The input bar doesn't own the queue, so
     /// it hands removal up to the parent. None = clear all; Some(N) = the
     /// 1-based queue position (Some(0) is an invalid-index sentinel).
@@ -289,7 +327,12 @@ enum SlashCommand<'a> {
     /// `/change-directory` — open the directory picker for a new session.
     ChangeDirectory,
     EnterBrowseMode,
+    Goal,
     OpenHelp,
+    /// `/load-session <query>` — resume a saved session by name or id.
+    LoadSession(&'a str),
+    /// `/load-session` (no arg) — open the session picker.
+    LoadSessionPicker,
     NotACommand,
 }
 
@@ -722,6 +765,12 @@ pub(crate) struct InputBarState {
     last_input_area: Rect,
     /// Cached inner width from the most recent render.
     last_inner_width: u16,
+    /// Rect of the autocomplete popup from the most recent render, for
+    /// mouse hit-testing. `None` when the popup was not drawn.
+    last_autocomplete_area: Option<Rect>,
+    /// Index of the first match drawn in the popup. The popup can be shorter
+    /// than the match list; render scrolls this to keep the highlight visible.
+    autocomplete_scroll: usize,
 
     // Phase 4: Text selection
     /// Text selection range as byte offsets (start, end) where start <= end.
@@ -791,6 +840,8 @@ impl InputBarState {
             scroll_offset: 0,
             last_input_area: Rect::default(),
             last_inner_width: 0,
+            last_autocomplete_area: None,
+            autocomplete_scroll: 0,
             selection: None,
             selection_anchor: None,
             autocomplete_matches: Vec::new(),
@@ -892,6 +943,11 @@ impl InputBarState {
         use crate::keymap::InputBarAction as A;
         match A::from_chord(key) {
             Some(A::CopySelection | A::Cut) => self.has_selection(),
+            Some(A::HistoryPrev | A::HistoryNext) => !self.input.is_empty(),
+            // Tab and Esc are completion keys while the popup is open. Esc is
+            // also a chat browse chord, and non-character chords otherwise
+            // bypass the composer.
+            Some(A::AutocompleteAccept | A::AutocompleteCancel) => self.autocomplete_active,
             Some(
                 A::Undo
                 | A::Redo
@@ -1054,21 +1110,33 @@ impl InputBarState {
         self.provider_catalog = providers;
     }
 
+    /// Popup state for tests outside this module: (entry count, highlighted
+    /// index, open).
+    #[cfg(test)]
+    pub(crate) fn autocomplete_snapshot(&self) -> (usize, Option<usize>, bool) {
+        (
+            self.autocomplete_matches.len(),
+            self.autocomplete_index,
+            self.autocomplete_active,
+        )
+    }
+
     fn dismiss_autocomplete(&mut self) {
+        self.autocomplete_scroll = 0;
         self.autocomplete_active = false;
         self.autocomplete_matches.clear();
         self.autocomplete_index = None;
     }
 
     /// Apply a chosen popup entry to the input. A command choice replaces the
-    /// whole line (and, for the model commands, appends a space so argument
-    /// autocomplete kicks in immediately). An argument choice rewrites only the
-    /// value after the command prefix.
+    /// whole line (and, for commands that take an argument, appends a space so
+    /// argument autocomplete, where the command has any, kicks in immediately).
+    /// An argument choice rewrites only the value after the command prefix.
     fn apply_autocomplete_choice(&mut self, choice: &str) {
         self.edit(|state| {
             match state.autocomplete_target {
                 AutocompleteTarget::Command => {
-                    let takes_arg = choice == "/model" || choice == "/model-provider";
+                    let takes_arg = command_takes_argument(choice);
                     state.input = if takes_arg {
                         format!("{choice} ")
                     } else {
@@ -1086,6 +1154,50 @@ impl InputBarState {
         });
     }
 
+    /// Mouse over the completion popup: a left click on a row fills the
+    /// input with that entry (like Tab), the wheel moves the highlight, and
+    /// anything else inside the popup is swallowed so it can't reach the
+    /// transcript underneath. Returns false when the event is outside it.
+    fn handle_autocomplete_mouse(&mut self, mouse: MouseEvent) -> bool {
+        if !self.autocomplete_active {
+            return false;
+        }
+        let Some(area) = self.last_autocomplete_area else {
+            return false;
+        };
+        if !mouse::in_rect(mouse.column, mouse.row, area) {
+            return false;
+        }
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                // Row 0 and the last row are the borders.
+                let inner_top = area.y + 1;
+                let inner_bottom = area.y + area.height.saturating_sub(1);
+                if mouse.row >= inner_top && mouse.row < inner_bottom {
+                    let index = self.autocomplete_scroll + usize::from(mouse.row - inner_top);
+                    if let Some(choice) = self.autocomplete_matches.get(index).cloned() {
+                        self.autocomplete_index = Some(index);
+                        self.apply_autocomplete_choice(&choice);
+                        self.dismiss_autocomplete();
+                    }
+                }
+            }
+            MouseEventKind::ScrollUp => {
+                if let Some(idx) = self.autocomplete_index {
+                    self.autocomplete_index = Some(idx.saturating_sub(1));
+                }
+            }
+            MouseEventKind::ScrollDown => {
+                if let Some(idx) = self.autocomplete_index {
+                    let max = self.autocomplete_matches.len().saturating_sub(1);
+                    self.autocomplete_index = Some((idx + 1).min(max));
+                }
+            }
+            _ => {}
+        }
+        true
+    }
+
     fn accept_completion_on_submit(&mut self) -> InputBarAction {
         let Some(idx) = self.autocomplete_index else {
             return self.handle_enter();
@@ -1096,8 +1208,7 @@ impl InputBarState {
         let target = self.autocomplete_target;
         self.apply_autocomplete_choice(&choice);
         self.dismiss_autocomplete();
-        let fills_only = target == AutocompleteTarget::Command
-            && (choice == "/model" || choice == "/model-provider");
+        let fills_only = target == AutocompleteTarget::Command && command_takes_argument(&choice);
         if fills_only {
             return InputBarAction::Consumed;
         }
@@ -1810,6 +1921,10 @@ impl InputBarState {
             return true;
         }
 
+        if self.handle_autocomplete_mouse(mouse) {
+            return true;
+        }
+
         // Input bar interactions.
         if !mouse::in_rect(mouse.column, mouse.row, self.last_input_area) {
             return false;
@@ -1937,6 +2052,8 @@ impl InputBarState {
                 SlashCommand::ClearQueue(idx) => InputBarAction::ClearQueue(idx),
                 SlashCommand::RestartSession => InputBarAction::RestartSession,
                 SlashCommand::ChangeDirectory => InputBarAction::ChangeDirectory,
+                SlashCommand::LoadSession(query) => InputBarAction::LoadSession(query.to_string()),
+                SlashCommand::LoadSessionPicker => InputBarAction::OpenSessionPicker,
                 SlashCommand::ToggleThinking => InputBarAction::ToggleThinking,
                 SlashCommand::EnterBrowseMode => InputBarAction::EnterBrowseMode,
                 SlashCommand::OpenHelp => InputBarAction::OpenHelp,
@@ -1946,6 +2063,7 @@ impl InputBarState {
                     InputBarAction::SetModelProvider(name.to_string())
                 }
                 SlashCommand::ModelProviderPicker => InputBarAction::OpenModelProviderPicker,
+                SlashCommand::Goal => InputBarAction::GoalCommand(msg),
                 SlashCommand::NotACommand => {
                     let attachments = self.take_attachments();
                     InputBarAction::Submit {
@@ -2413,7 +2531,8 @@ impl InputBarState {
     }
 
     /// Render the auto-complete popup above the input bar if active.
-    pub fn render_autocomplete_popup(&self, f: &mut Frame) {
+    pub fn render_autocomplete_popup(&mut self, f: &mut Frame) {
+        self.last_autocomplete_area = None;
         if !self.autocomplete_active || self.autocomplete_matches.is_empty() {
             return;
         }
@@ -2442,11 +2561,27 @@ impl InputBarState {
         }
 
         f.render_widget(Clear, popup_rect);
+        self.last_autocomplete_area = Some(popup_rect);
+
+        // A short terminal clips the popup. Scroll so the highlighted entry
+        // stays in view, and draw only the visible slice.
+        let visible = usize::from(popup_rect.height.saturating_sub(2)).max(1);
+        let max_scroll = self.autocomplete_matches.len().saturating_sub(visible);
+        if let Some(idx) = self.autocomplete_index {
+            if idx < self.autocomplete_scroll {
+                self.autocomplete_scroll = idx;
+            } else if idx >= self.autocomplete_scroll + visible {
+                self.autocomplete_scroll = idx + 1 - visible;
+            }
+        }
+        self.autocomplete_scroll = self.autocomplete_scroll.min(max_scroll);
 
         let items: Vec<ListItem> = self
             .autocomplete_matches
             .iter()
             .enumerate()
+            .skip(self.autocomplete_scroll)
+            .take(visible)
             .map(|(i, cmd)| {
                 let style = if Some(i) == self.autocomplete_index {
                     theme::selected_style()
@@ -3803,7 +3938,7 @@ mod tests {
     }
 
     #[test]
-    fn derived_slash_command_set_matches_expected_thirteen_entries() {
+    fn derived_slash_command_set_matches_expected_entries() {
         let expected: Vec<&str> = vec![
             "/attach",
             "/attachments",
@@ -3812,6 +3947,7 @@ mod tests {
             "/clear-queue",
             "/detach",
             "/help",
+            "/load-session",
             "/model",
             "/model-provider",
             "/new",
@@ -3835,6 +3971,49 @@ mod tests {
                 "{command} is advertised but not recognized by parse_slash_command"
             );
         }
+    }
+
+    #[test]
+    fn goal_discovery_and_explicit_commands_respect_the_token_boundary() {
+        let goal = crate::wire::CommandDescriptor {
+            id: "goal".into(),
+            name: "goal".into(),
+            aliases: vec![],
+        };
+        let registry = SlashCommandRegistry::new(&[goal]);
+        assert!(registry.command_names().any(|name| name == "/goal"));
+        assert!(command_takes_argument("/goal"));
+        let legacy = SlashCommandRegistry::new(&[]);
+        assert!(!legacy.command_names().any(|name| name == "/goal"));
+        for registry in [registry, legacy] {
+            assert!(matches!(
+                registry.parse("  /GOAL\tpause now"),
+                SlashCommand::Goal
+            ));
+            assert!(matches!(
+                registry.parse("/goalkeeper"),
+                SlashCommand::NotACommand
+            ));
+        }
+        assert_eq!(
+            goal_command_tail(" /GOAL RESUME first\n\nsecond"),
+            Some("RESUME first\n\nsecond")
+        );
+    }
+
+    #[test]
+    fn goal_inject_is_a_control_and_does_not_take_draft_attachments() {
+        let mut bar = InputBarState::with_shared_commands(&[]);
+        bar.insert_text("/GOAL cancel");
+        let directory = tempfile::tempdir().unwrap();
+        let attachment = directory.path().join("draft.png");
+        std::fs::write(&attachment, b"fixture").unwrap();
+        bar.add_attachment(PendingAttachment::from_path(attachment.to_str().unwrap()).unwrap());
+        assert!(
+            matches!(bar.handle_inject(), InputBarAction::GoalCommand(command) if command == "/GOAL cancel")
+        );
+        assert_eq!(bar.pending_attachments()[0].path, attachment);
+        assert!(attachment.exists());
     }
 
     /// Parity guard: unknown leading tokens are rejected (recognize ⊆
@@ -4015,6 +4194,69 @@ mod tests {
         // picker or submit.
         assert!(matches!(action, InputBarAction::Consumed));
         assert_eq!(bar.input(), "/model ");
+    }
+
+    #[test]
+    fn parse_load_session_with_and_without_argument() {
+        assert!(matches!(
+            parse_slash_command("/load-session"),
+            SlashCommand::LoadSessionPicker
+        ));
+        assert!(matches!(
+            parse_slash_command("/load-session   "),
+            SlashCommand::LoadSessionPicker
+        ));
+        assert!(matches!(
+            parse_slash_command("/load-session 9f3a"),
+            SlashCommand::LoadSession("9f3a")
+        ));
+        assert!(matches!(
+            parse_slash_command("/load-session   my  session  "),
+            SlashCommand::LoadSession("my  session")
+        ));
+    }
+
+    #[test]
+    fn load_session_submit_maps_to_actions() {
+        let mut bar = input_bar_with_shared_commands();
+        bar.load_for_edit("/load-session release notes".into(), Vec::new());
+        bar.dismiss_autocomplete();
+        let action = bar.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert!(matches!(action, InputBarAction::LoadSession(q) if q == "release notes"));
+
+        bar.load_for_edit("/load-session".into(), Vec::new());
+        bar.dismiss_autocomplete();
+        let action = bar.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert!(matches!(action, InputBarAction::OpenSessionPicker));
+    }
+
+    #[test]
+    fn enter_on_load_session_completion_fills_without_submitting() {
+        let mut bar = input_bar_with_shared_commands();
+        bar.insert_text("/load-s");
+        assert!(bar.autocomplete_active);
+        let action = bar.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert!(matches!(action, InputBarAction::Consumed));
+        assert_eq!(bar.input(), "/load-session ");
+        assert!(
+            !bar.autocomplete_active,
+            "/load-session has no argument completion"
+        );
+    }
+
+    #[test]
+    fn second_enter_after_load_session_completion_opens_the_picker() {
+        let mut bar = input_bar_with_shared_commands();
+        bar.insert_text("/load-s");
+        assert!(matches!(
+            bar.handle_key(KeyEvent::from(KeyCode::Enter)),
+            InputBarAction::Consumed
+        ));
+        assert_eq!(bar.input(), "/load-session ");
+        assert!(matches!(
+            bar.handle_key(KeyEvent::from(KeyCode::Enter)),
+            InputBarAction::OpenSessionPicker
+        ));
     }
 
     #[test]
@@ -4339,6 +4581,182 @@ mod tests {
     }
 
     // ── Auto-complete tests ──────────────────────────────────
+
+    /// Draw the bar in the lower rows of a terminal and the completion popup
+    /// above it, the way the chat pane does.
+    fn render_bar_with_popup(bar: &mut InputBarState) {
+        let backend = TestBackend::new(60, 20);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                let area = Rect::new(0, 16, 60, 4);
+                bar.render(
+                    frame,
+                    area,
+                    false,
+                    false,
+                    &TurnStatus::Idle,
+                    Instant::now(),
+                    None,
+                );
+                bar.render_autocomplete_popup(frame);
+            })
+            .expect("draw input bar");
+    }
+
+    fn left_click(column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn composer_claims_completion_keys_only_while_the_popup_is_open() {
+        let mut bar = input_bar_with_shared_commands();
+        let tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+
+        bar.insert_text("hello");
+        assert!(!bar.autocomplete_active);
+        assert!(!bar.claims_edit_key(&tab));
+        assert!(!bar.claims_edit_key(&esc));
+
+        bar.clear_input();
+        bar.insert_text("/");
+        assert!(bar.autocomplete_active);
+        assert!(bar.claims_edit_key(&tab));
+        assert!(bar.claims_edit_key(&esc));
+    }
+
+    #[test]
+    fn clicking_an_autocomplete_row_fills_that_command() {
+        let mut bar = input_bar_with_shared_commands();
+        bar.insert_text("/");
+        assert!(bar.autocomplete_matches.len() >= 2);
+        let second = bar.autocomplete_matches[1].clone();
+        render_bar_with_popup(&mut bar);
+        let area = bar.last_autocomplete_area.expect("popup rendered");
+
+        // Row 0 is the top border; row 2 is the second entry.
+        assert!(bar.handle_mouse(left_click(area.x + 2, area.y + 2)));
+
+        assert_eq!(bar.input(), second);
+        assert!(!bar.autocomplete_active);
+    }
+
+    #[test]
+    fn clicking_the_autocomplete_border_keeps_the_popup_open() {
+        let mut bar = input_bar_with_shared_commands();
+        bar.insert_text("/");
+        render_bar_with_popup(&mut bar);
+        let area = bar.last_autocomplete_area.expect("popup rendered");
+
+        assert!(bar.handle_mouse(left_click(area.x + 2, area.y)));
+
+        assert_eq!(bar.input(), "/");
+        assert!(bar.autocomplete_active);
+    }
+
+    #[test]
+    fn scrolling_over_autocomplete_moves_the_highlight() {
+        let mut bar = input_bar_with_shared_commands();
+        bar.insert_text("/");
+        render_bar_with_popup(&mut bar);
+        let area = bar.last_autocomplete_area.expect("popup rendered");
+        let scroll = |kind| MouseEvent {
+            kind,
+            column: area.x + 2,
+            row: area.y + 1,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        assert!(bar.handle_mouse(scroll(MouseEventKind::ScrollDown)));
+        assert_eq!(bar.autocomplete_index, Some(1));
+        assert!(bar.handle_mouse(scroll(MouseEventKind::ScrollUp)));
+        assert_eq!(bar.autocomplete_index, Some(0));
+    }
+
+    /// Draw the bar at the bottom of a short terminal, so the popup is
+    /// clipped to fewer rows than there are matches, and return the buffer.
+    fn render_short_popup(bar: &mut InputBarState) -> ratatui::buffer::Buffer {
+        let backend = TestBackend::new(60, 8);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                bar.render(
+                    frame,
+                    Rect::new(0, 4, 60, 4),
+                    false,
+                    false,
+                    &TurnStatus::Idle,
+                    Instant::now(),
+                    None,
+                );
+                bar.render_autocomplete_popup(frame);
+            })
+            .expect("draw input bar");
+        terminal.backend().buffer().clone()
+    }
+
+    fn row_text(buffer: &ratatui::buffer::Buffer, area: Rect, row: u16) -> String {
+        (area.x..area.right())
+            .map(|x| buffer[(x, row)].symbol().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn clipped_autocomplete_scrolls_to_keep_the_highlight_visible() {
+        let mut bar = input_bar_with_shared_commands();
+        bar.insert_text("/");
+        let count = bar.autocomplete_matches.len();
+        render_short_popup(&mut bar);
+        let area = bar.last_autocomplete_area.expect("popup rendered");
+        let visible = usize::from(area.height - 2);
+        assert!(
+            visible >= 2 && count > visible + 1,
+            "need a clipped popup: {visible} rows for {count} matches"
+        );
+
+        // Move the highlight one past the last row the popup can show.
+        let target = visible;
+        let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+        for _ in 0..target {
+            bar.handle_key(down);
+        }
+        assert_eq!(bar.autocomplete_index, Some(target));
+        let buffer = render_short_popup(&mut bar);
+        let selected = bar.autocomplete_matches[target].clone();
+        let last_row = area.y + area.height - 2;
+        let shown = row_text(&buffer, area, last_row);
+        assert!(
+            shown.contains(&format!("{selected} ")) || shown.trim_end().ends_with(&selected),
+            "highlighted {selected:?} must be on the last visible row, got {shown:?}"
+        );
+
+        // A click on the first visible row picks the scrolled-to entry,
+        // not the first match.
+        let first_visible = bar.autocomplete_matches[1].clone();
+        assert!(bar.handle_mouse(left_click(area.x + 2, area.y + 1)));
+        assert_eq!(bar.input(), first_visible);
+    }
+
+    #[test]
+    fn closed_autocomplete_does_not_capture_clicks() {
+        let mut bar = input_bar_with_shared_commands();
+        bar.insert_text("/");
+        render_bar_with_popup(&mut bar);
+        let area = bar.last_autocomplete_area.expect("popup rendered");
+        bar.insert_text(" ");
+        assert!(!bar.autocomplete_active);
+        render_bar_with_popup(&mut bar);
+        assert_eq!(bar.last_autocomplete_area, None);
+
+        assert!(!bar.handle_mouse(left_click(area.x + 2, area.y + 2)));
+        assert_eq!(bar.input(), "/ ");
+    }
 
     #[test]
     fn autocomplete_triggers_on_slash() {

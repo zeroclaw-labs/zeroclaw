@@ -719,7 +719,8 @@ fn manifest_with_name(manifest_src: &str, new_name: &str) -> Result<String> {
 
 /// Replace a file's contents atomically: stage a sibling temp file, flush it
 /// to disk, then rename it over the target. Readers see either the old
-/// contents or the new ones, never a half-written file.
+/// contents or the new ones, never a half-written file, and a reader holding
+/// the target open does not stop the replace on any platform.
 ///
 /// The staging file is created fresh and exclusively under a name nothing can
 /// predict. A fixed name like `.SOP.toml.tmp` would be wrong twice over: two
@@ -765,7 +766,7 @@ fn write_file_atomic_detailed(path: &Path, contents: &str) -> Result<(), AtomicW
     };
 
     let stage = || -> Result<tempfile::NamedTempFile> {
-        let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
+        let mut tmp = tempfile::Builder::new().make_in(dir, create_staging_file)?;
         tmp.write_all(contents.as_bytes())?;
         tmp.as_file().sync_all()?;
         if let Ok(existing) = std::fs::metadata(path) {
@@ -773,14 +774,37 @@ fn write_file_atomic_detailed(path: &Path, contents: &str) -> Result<(), AtomicW
         }
         Ok(tmp)
     };
-    let tmp = stage().map_err(AtomicWriteError::NotPublished)?;
-    tmp.persist(path)
-        .map_err(|e| AtomicWriteError::NotPublished(anyhow::Error::new(e.error)))?;
+    let mut staged = stage()
+        .map_err(AtomicWriteError::NotPublished)?
+        .into_temp_path();
+    // `std::fs::rename`, not `persist`: on Windows `persist` is a bare
+    // `MoveFileExW`, which cannot replace a file that any reader holds open.
+    // `rename` retries that refusal with POSIX semantics, which swap the name
+    // while open readers keep the old contents, as long as they opened it with
+    // delete sharing (std's own opens do). On Unix both are rename(2).
+    std::fs::rename(&staged, path)
+        .map_err(|e| AtomicWriteError::NotPublished(anyhow::Error::new(e)))?;
+    // The staging name no longer exists, so there is nothing left to clean up.
+    staged.disable_cleanup(true);
     // Flushing the file is only half of it: until the directory entry that
     // names it is on disk too, a power loss can take the rename back. But the
     // rename has already happened and is visible, so a failure here must not
     // be reported as though the file were unchanged.
     sync_dir(dir).map_err(AtomicWriteError::PublishedNotFlushed)
+}
+
+/// Create a staging file the way `NamedTempFile::new_in` does (exclusively,
+/// owner-only on Unix) but without the Windows temporary attribute: `persist`
+/// would clear that attribute, and the plain rename that publishes the file
+/// would carry it onto the target.
+fn create_staging_file(path: &Path) -> std::io::Result<std::fs::File> {
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    options.open(path)
 }
 
 #[cfg(test)]
@@ -2637,12 +2661,35 @@ mod tests {
                 reads
             })
         };
-        for i in 0..300 {
-            save_sop(root.path(), &named_sop("busy", revisions[i % 2])).unwrap();
-        }
+        let saved =
+            (0..300).try_for_each(|i| save_sop(root.path(), &named_sop("busy", revisions[i % 2])));
         stop.store(true, std::sync::atomic::Ordering::SeqCst);
         let reads = reader.join().expect("the reader never saw a partial file");
+        // Checked once the reader has stopped, so a refused save reports
+        // itself instead of the reader losing the directory as the test unwinds.
+        saved.expect("a save must not fail while a reader has the files open");
         assert!(reads > 0, "the reader actually raced the saves");
+    }
+
+    /// A reader holding the SOP files open must not stop a save from replacing
+    /// them, and keeps reading the revision it opened. Windows refuses a plain
+    /// replace of an open file, so this pins the replace itself rather than
+    /// leaving it to a race.
+    #[test]
+    fn a_save_replaces_files_a_reader_holds_open() {
+        let root = tempfile::tempdir().unwrap();
+        save_sop(root.path(), &named_sop("held", "Old step")).unwrap();
+        let sop_dir = root.path().join("held");
+        let _held_manifest = std::fs::File::open(sop_dir.join("SOP.toml")).unwrap();
+        let mut held_steps = std::fs::File::open(sop_dir.join("SOP.md")).unwrap();
+
+        save_sop(root.path(), &named_sop("held", "New step"))
+            .expect("an open reader must not stop the save");
+
+        let old_steps = std::io::read_to_string(&mut held_steps).unwrap();
+        assert!(old_steps.contains("Old step"), "{old_steps}");
+        let loaded = load_sop(&sop_dir, SopExecutionMode::Supervised).unwrap();
+        assert_eq!(loaded.steps[0].title, "New step");
     }
 
     /// An edit-save names the SOP it was loaded from. After that SOP is

@@ -191,6 +191,15 @@ Streaming is a capability boundary. A channel may support draft edits,
 multi-message streaming, typing indicators, or only final-send behavior. The
 shared lifecycle decides how those capabilities are used during a turn.
 
+Independently visible channel notifications and progress drafts are outbound
+egress. Their presentation owners apply the current configured leak detector
+to the completed display copy after its last content mutation and before local
+caps and delivery. Recheck the current policy at later send or draft-update
+boundaries; a policy read does not make changes atomic across an await, retract
+prior output, or guarantee detection of every secret. Keep original tool
+events, model inputs/history, execution results, and receipts unchanged: the
+guard protects the user-visible copy, not the underlying turn data.
+
 Review streaming changes by asking:
 
 - does the channel declare the capability instead of hardcoding behavior in

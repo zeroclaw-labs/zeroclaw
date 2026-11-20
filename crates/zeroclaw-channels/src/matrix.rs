@@ -147,11 +147,12 @@ mod mention {
         body: &str,
     ) -> Option<String> {
         let body = body.trim_start();
-        if body.starts_with("/goal") {
+        let command_start = goal_command_token_start(body)?;
+        let address = &body[..command_start];
+        if address.trim().is_empty() {
             return Some(body.to_string());
         }
 
-        let (address, command_suffix) = body.split_once("/goal")?;
         let explicit_mention =
             m_mentions_user_ids.is_some_and(|ids| ids.iter().any(|id| id == bot_user_id.as_str()));
         if !is_mentioned(bot_user_id, bot_display_name, m_mentions_user_ids, body)
@@ -160,7 +161,22 @@ mod mention {
             return None;
         }
 
-        Some(format!("/goal{command_suffix}"))
+        Some(body[command_start..].to_string())
+    }
+
+    /// Find a complete `/goal` token without imposing syntax on the address
+    /// immediately before it; `is_leading_bot_address` owns that validation.
+    fn goal_command_token_start(content: &str) -> Option<usize> {
+        content.match_indices('/').find_map(|(index, _)| {
+            let candidate = &content[index..];
+            let token = candidate.get(.."/goal".len())?;
+            (token.eq_ignore_ascii_case("/goal")
+                && candidate["/goal".len()..]
+                    .chars()
+                    .next()
+                    .is_none_or(char::is_whitespace))
+            .then_some(index)
+        })
     }
 
     fn is_leading_bot_address(
@@ -8292,6 +8308,8 @@ mod tests {
 
         #[test]
         fn addressed_goal_command_is_normalized_before_forwarding() {
+            use zeroclaw_commands::goal::{GoalCommand, parse_goal_command};
+
             let bot = user_id!("@zc-architect:example.org");
             assert_eq!(
                 normalize_addressed_goal_command(
@@ -8311,6 +8329,55 @@ mod tests {
                 ),
                 Some("/goal status".to_string()),
             );
+            assert_eq!(
+                normalize_addressed_goal_command(
+                    bot,
+                    Some("zc-architect"),
+                    None,
+                    "@zc-architect:example.org:/goal cancel",
+                ),
+                Some("/goal cancel".to_string()),
+            );
+            assert_eq!(
+                normalize_addressed_goal_command(
+                    bot,
+                    Some("zc-architect"),
+                    None,
+                    "zc-architect:/GOAL CaNcEl",
+                ),
+                Some("/GOAL CaNcEl".to_string()),
+            );
+            assert_eq!(
+                normalize_addressed_goal_command(
+                    bot,
+                    Some("zc-architect"),
+                    None,
+                    "zc-architect,/GoAl ReSuMe Keep This Case\nand this line too",
+                ),
+                Some("/GoAl ReSuMe Keep This Case\nand this line too".to_string()),
+            );
+            let resumed = normalize_addressed_goal_command(
+                bot,
+                Some("zc-architect"),
+                None,
+                "zc-architect,/GoAl ReSuMe Keep This Case\nand this line too",
+            )
+            .expect("an authenticated comma-terminated address is preserved");
+            assert_eq!(
+                parse_goal_command(&resumed),
+                Ok(GoalCommand::Resume {
+                    response: Some("Keep This Case\nand this line too".to_string()),
+                })
+            );
+            let cancelled = normalize_addressed_goal_command(
+                bot,
+                Some("zc-architect"),
+                None,
+                "zc-architect:/GOAL CaNcEl",
+            )
+            .expect("an authenticated colon-terminated address is preserved");
+            assert_eq!(cancelled, "/GOAL CaNcEl");
+            assert_eq!(parse_goal_command(&cancelled), Ok(GoalCommand::Cancel));
             assert_eq!(
                 normalize_addressed_goal_command(
                     bot,
@@ -8360,11 +8427,54 @@ mod tests {
                 normalize_addressed_goal_command(
                     bot,
                     Some("zc-architect"),
+                    None,
+                    "@other:example.org /GOAL cancel",
+                ),
+                None,
+            );
+            assert_eq!(
+                normalize_addressed_goal_command(
+                    bot,
+                    Some("zc-architect"),
                     Some(&["@zc-architect:example.org".to_string()]),
                     "Please ask zc-architect: /goal help",
                 ),
                 None,
             );
+            assert_eq!(
+                normalize_addressed_goal_command(
+                    bot,
+                    Some("zc-architect"),
+                    None,
+                    "@zc-architect:example.org /GOALkeeper cancel",
+                ),
+                None,
+            );
+        }
+
+        #[test]
+        fn first_thread_goal_classifier_matches_complete_case_insensitive_token() {
+            use zeroclaw_commands::goal::{GoalCommand, GoalCommandParseError, parse_goal_command};
+
+            let bot = user_id!("@bot:example.org");
+            for input in ["/goal status", "/GOAL StAtUs", "\u{2003}/gOaL\tstatus"] {
+                let normalized = normalize_addressed_goal_command(bot, None, None, input);
+                assert_eq!(normalized.as_deref(), Some(input.trim_start()));
+                assert_eq!(parse_goal_command(input), Ok(GoalCommand::Status));
+            }
+            assert_eq!(
+                parse_goal_command("/goalkeeper status"),
+                Err(GoalCommandParseError::NotGoalCommand)
+            );
+            for input in [
+                "/goalkeeper status",
+                "/goal/status",
+                "ordinary prose /GOAL status",
+                "ordinary 🙂 /GOAL status",
+                "@other:example.org /GOAL status",
+            ] {
+                assert!(normalize_addressed_goal_command(bot, None, None, input).is_none());
+            }
         }
 
         #[test]

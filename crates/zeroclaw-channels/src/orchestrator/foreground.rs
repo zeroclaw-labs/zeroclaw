@@ -25,6 +25,8 @@ pub(crate) struct ConversationLocks {
     #[cfg(test)]
     goal_test_bind_barrier: Mutex<Option<Arc<GoalTestBindBarrier>>>,
     #[cfg(test)]
+    goal_test_execution_barrier: Mutex<Option<Arc<GoalTestBindBarrier>>>,
+    #[cfg(test)]
     goal_test_drop_reset_completion: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     goal_test_cancel_reset_admission: std::sync::atomic::AtomicBool,
@@ -86,6 +88,8 @@ impl ConversationLocks {
             goal_test_control_plane: OnceLock::new(),
             #[cfg(test)]
             goal_test_bind_barrier: Mutex::new(None),
+            #[cfg(test)]
+            goal_test_execution_barrier: Mutex::new(None),
             #[cfg(test)]
             goal_test_drop_reset_completion: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
@@ -239,6 +243,36 @@ pub(super) async fn await_goal_test_bind_barrier(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+pub(super) fn install_goal_test_execution_barrier(
+    locks: &Arc<Mutex<HashMap<String, Arc<ConversationLocks>>>>,
+    key: &str,
+) -> Arc<GoalTestBindBarrier> {
+    let barrier = Arc::new(GoalTestBindBarrier::default());
+    assert!(
+        locks_for_key(locks, key)
+            .goal_test_execution_barrier
+            .lock()
+            .unwrap()
+            .replace(barrier.clone())
+            .is_none()
+    );
+    barrier
+}
+
+#[cfg(test)]
+pub(super) async fn await_goal_test_execution_barrier(
+    locks: &Arc<Mutex<HashMap<String, Arc<ConversationLocks>>>>,
+    key: &str,
+) {
+    let entry = locks_for_key(locks, key);
+    let barrier = entry.goal_test_execution_barrier.lock().unwrap().take();
+    if let Some(barrier) = barrier {
+        barrier.entered.notify_one();
+        barrier.release.notified().await;
+    }
 }
 
 fn locks_for_key(

@@ -1,6 +1,9 @@
-use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicUsize, Ordering},
+use std::{
+    collections::VecDeque,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 use async_trait::async_trait;
@@ -33,12 +36,41 @@ impl std::fmt::Display for OriginalCurrentGoalReadFailure {
 
 impl std::error::Error for OriginalCurrentGoalReadFailure {}
 
-/// Delegates lifecycle state to the real store, with one-shot finish and
-/// explicitly armed read failures. Neither failure fabricates a durable row.
+/// Distinctive worker transition error injected by this fixture.
+#[derive(Debug)]
+pub(super) struct WorkerTransitionFailure;
+
+impl std::fmt::Display for WorkerTransitionFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("distinctive worker Goal transition failure")
+    }
+}
+
+impl std::error::Error for WorkerTransitionFailure {}
+
+enum FinishFault {
+    Original(&'static str),
+    Worker(Arc<FinishFaultReleaseGate>),
+}
+
+impl FinishFault {
+    fn reason(&self) -> &'static str {
+        match self {
+            Self::Original(reason) => reason,
+            Self::Worker(_) => "executor_failed",
+        }
+    }
+}
+
+/// Only the named ordered finish calls fail; the real store owns every row.
+/// All non-faulted Goal state, including policy enumeration and revocation,
+/// delegates to the real SQLite store.
 pub(super) struct FinishFaultRegistry {
     store: Arc<SqliteTaskStore>,
-    remaining_reason: Mutex<Option<&'static str>>,
+    remaining: Mutex<VecDeque<FinishFault>>,
+    attempts: Mutex<Vec<String>>,
     failures: AtomicUsize,
+    applied: AtomicUsize,
     pause_gate: Option<Arc<FinishFaultPauseGate>>,
     failing_read_session: Mutex<Option<String>>,
     read_failures: AtomicUsize,
@@ -51,16 +83,38 @@ pub(super) struct FinishFaultPauseGate {
     paused: Notify,
 }
 
+/// Hold only the actual worker fallback, independently of operator controls.
+#[derive(Default)]
+pub(super) struct FinishFaultReleaseGate {
+    pub(super) observed: Notify,
+    pub(super) released: Notify,
+}
+
 impl FinishFaultRegistry {
     pub(super) fn new(store: Arc<SqliteTaskStore>, reason: &'static str) -> Self {
         Self {
             store,
-            remaining_reason: Mutex::new(Some(reason)),
+            remaining: Mutex::new(VecDeque::from([FinishFault::Original(reason)])),
+            attempts: Mutex::new(Vec::new()),
             failures: AtomicUsize::new(0),
+            applied: AtomicUsize::new(0),
             pause_gate: None,
             failing_read_session: Mutex::new(None),
             read_failures: AtomicUsize::new(0),
         }
+    }
+
+    pub(super) fn candidate_then_worker(
+        store: Arc<SqliteTaskStore>,
+        gate: Arc<FinishFaultReleaseGate>,
+    ) -> Self {
+        let registry = Self::new(store, "candidate_persistence_failed");
+        registry
+            .remaining
+            .lock()
+            .unwrap()
+            .push_back(FinishFault::Worker(gate));
+        registry
     }
 
     pub(super) fn with_pause_gate(mut self, gate: Arc<FinishFaultPauseGate>) -> Self {
@@ -79,10 +133,30 @@ impl FinishFaultRegistry {
     pub(super) fn read_failures(&self) -> usize {
         self.read_failures.load(Ordering::SeqCst)
     }
+
+    pub(super) fn attempts(&self) -> Vec<String> {
+        self.attempts.lock().unwrap().clone()
+    }
+
+    pub(super) fn applied(&self) -> usize {
+        self.applied.load(Ordering::SeqCst)
+    }
 }
 
 #[async_trait]
 impl GoalTaskRegistry for FinishFaultRegistry {
+    async fn begin_operation_dispatch(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        expected_epoch: i64,
+        pending_call_id: &str,
+    ) -> anyhow::Result<Option<zeroclaw_goal::task::GoalDispatchStart>> {
+        self.store
+            .begin_operation_dispatch(task_id, session_id, expected_epoch, pending_call_id)
+            .await
+    }
+
     async fn latest_active_goal_for_agent(
         &self,
         agent: &str,
@@ -170,6 +244,17 @@ impl GoalTaskRegistry for FinishFaultRegistry {
         self.store.current_goal_for_session(session_id).await
     }
 
+    async fn list_nonterminal_session_goals(&self) -> anyhow::Result<Vec<TaskRecord>> {
+        self.store.list_nonterminal_session_goals().await
+    }
+
+    async fn cancel_policy_targets(
+        &self,
+        targets: &[zeroclaw_goal::GoalPolicyTarget],
+    ) -> anyhow::Result<GoalTransitionResult> {
+        self.store.cancel_policy_targets(targets).await
+    }
+
     async fn terminal_reason_for_session_goal(
         &self,
         task_id: &str,
@@ -234,29 +319,47 @@ impl GoalTaskRegistry for FinishFaultRegistry {
         status: TaskStatus,
         error: Option<String>,
     ) -> anyhow::Result<GoalTransitionResult> {
-        let inject = {
-            let mut remaining = self.remaining_reason.lock().unwrap();
+        self.attempts
+            .lock()
+            .unwrap()
+            .push(error.clone().unwrap_or_default());
+        let fault = {
+            let mut remaining = self.remaining.lock().unwrap();
             if status == TaskStatus::Failed
-                && remaining.is_some()
-                && remaining.as_deref() == error.as_deref()
+                && remaining
+                    .front()
+                    .is_some_and(|fault| Some(fault.reason()) == error.as_deref())
             {
-                remaining.take();
-                true
+                remaining.pop_front()
             } else {
-                false
+                None
             }
         };
-        if inject {
+        if let Some(fault) = fault {
             self.failures.fetch_add(1, Ordering::SeqCst);
-            if let Some(gate) = &self.pause_gate {
-                gate.observed.notify_one();
-                gate.paused.notified().await;
+            match fault {
+                FinishFault::Original(_) => {
+                    if let Some(gate) = &self.pause_gate {
+                        gate.observed.notify_one();
+                        gate.paused.notified().await;
+                    }
+                    return Err(OriginalTransitionFailure.into());
+                }
+                FinishFault::Worker(gate) => {
+                    gate.observed.notify_one();
+                    gate.released.notified().await;
+                    return Err(WorkerTransitionFailure.into());
+                }
             }
-            return Err(OriginalTransitionFailure.into());
         }
-        self.store
+        let result = self
+            .store
             .finish_session_goal(task_id, session_id, expected_epoch, status, error)
-            .await
+            .await?;
+        if result == GoalTransitionResult::Applied {
+            self.applied.fetch_add(1, Ordering::SeqCst);
+        }
+        Ok(result)
     }
 
     async fn admit_pending_operation(

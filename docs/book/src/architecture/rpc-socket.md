@@ -45,7 +45,7 @@ named pipes carry the same byte stream as Unix sockets.
 
 ```
 {"jsonrpc":"2.0","method":"initialize","params":{"protocolVersion":1},"id":1}\n
-{"jsonrpc":"2.0","result":{"protocolVersion":1,"serverVersion":"0.8.5"},"id":1}\n
+{"jsonrpc":"2.0","result":{"protocolVersion":1,"serverVersion":"0.9.0"},"id":1}\n
 ```
 
 ## Connection limits
@@ -57,11 +57,41 @@ The local endpoint bounds what one client can hold:
 | Frame size | 8 MiB per line | One `-32600` error with `id: null` and `data: {"reason": "frame_too_large", "limit_bytes": 8388608}`, then end of stream. The rest of the oversized line is never read, so the connection cannot continue. |
 | Initialize | 30 s from connect | A connection that has not completed `initialize` 30 s after it connected is closed with no reply, so a client that connects and sends nothing cannot hold a connection slot. The deadline covers authentication too: an `initialize` sent in time whose authentication is still running when it passes, such as a slow OIDC check, is closed rather than accepted late. |
 | Unfinished frame | 30 s from the frame's first byte | Once a frame starts, the whole line must arrive within 30 s of its first byte, however steadily the rest arrives. Past that the client receives one `-32600` error with `id: null` and `data: {"reason": "frame_timeout", "limit_ms": 30000}`, then end of stream. The wait between frames is not bounded, so an initialized client may stay idle. |
-| Write stall | 30 s per frame | A client that stops reading for 30 s while the daemon has output queued for it is disconnected. Other connections are unaffected. Disconnecting ends the turns that connection started, as any other disconnect does. That includes a suspended client: a zerocode stopped with Ctrl-Z, or frozen with Ctrl-S, while a turn streams has that turn cancelled after 30 s, where before it finished once the client resumed. |
+| Write stall | 30 s per frame | A client that stops reading for 30 s while the daemon has output queued for it is disconnected. Other connections are unaffected. Disconnecting ends the ordinary turns that connection started, as any other disconnect does. That includes a suspended client: a zerocode stopped with Ctrl-Z, or frozen with Ctrl-S, while an ordinary turn streams has that turn cancelled after 30 s, where before it finished once the client resumed. Durable Goal execution follows the separate lifecycle described below. |
 | Open connections | `rpc.max_local_connections`, default 512 | A connection past the ceiling receives one `-32004` error with `id: null` and `data: {"reason": "connection_limit", "limit": N}`, then end of stream. The daemon logs one warning when it starts refusing. The value is read when the listener starts. |
 
 Payloads larger than a frame travel as a chunked upload rather than in one
 line. See [Chunked uploads](#chunked-uploads).
+
+## Live sessions
+
+The daemon keeps at most 64 sessions live at once, across all clients. Past
+that, `session/new` is refused with `-32001` ("Session limit reached").
+
+A session stays live when its client disconnects, so the client can reconnect
+with its identity and carry on. A remote client (WSS) that stays away
+releases its sessions. Once the client has had no live connection for
+`wss.orphaned_session_timeout_secs` (default 1800), the daemon closes each of
+its sessions that:
+
+- has also been idle that long (a turn counts as activity when it finishes);
+- has no turn running;
+- has no approval pending.
+
+Closing one works as `session/close` does: the session leaves the live map,
+and its transcript is kept. Retirement never writes a transcript: a chat
+session is closed only when its store already holds all of its history. A
+session whose store lacks part of it (a failed save, say), differs from it, or
+can't be read stays live. The daemon logs each one it closes.
+
+After that, the transcript is in the store but out of a remote client's reach.
+Over WSS a client reaches only live sessions its own identity owns, so it
+can't list, read or resume a closed one. A local client can resume it.
+
+Sessions of local clients are not closed this way. Setting
+`wss.orphaned_session_timeout_secs` to `0` keeps every orphaned session live
+until the daemon restarts. A change takes effect within a minute, without a
+restart.
 
 ## Handshake
 
@@ -98,11 +128,104 @@ the operating system:
 | `session/prompt` | client -> daemon | Run a turn (streamed via `session/update` notifications) |
 | `session/goal` | client -> daemon | Submit a typed Goal Mode control command for an existing session |
 | `session/cancel` | client -> daemon | Cancel an in-flight turn |
+| `session/abort` | client -> daemon | Interrupt an in-flight turn with operator authority |
 | `session/state` | client -> daemon | Read live session lifecycle state, active turn identity, and the optional current plan; active or queued work is represented by `state: "running"` so recovery clients can confirm terminal status before releasing retained work |
 | `status` | client -> daemon | Server version, protocol version, active session list |
 | `file/upload/begin`, `file/upload/chunk`, `file/upload/commit` | client -> daemon | Upload one file in ordered chunks; see [Chunked uploads](#chunked-uploads) |
 | `session/update` | daemon -> client | Streaming notification during a turn (text chunks, tool calls, approvals) |
 | `elicitation/create` | daemon -> client | Request interactive input for ask-user and poll flows |
+
+### Goal controls and parent output
+
+`session/goal` uses the existing authenticated session and the same Goal control
+plane as Matrix. It is available through local IPC and WSS, not through Web
+chat or the in-process dashboard transport. The latter does not advertise the
+method or command. A TUI identity provides continuity; it is not a grant.
+`session/goal` requires `sessions:execute`.
+Session ownership and current permissions are rechecked after admission waits,
+before preparing a parent operation.
+
+Ordinary start, resume, pause and budget mutations acknowledge queued work
+promptly and apply at the current turn boundary. Cancel and `pause now`
+interrupt immediately while already admitted usage and cleanup settle. The
+channel-only `/stop` shortcut uses the same immediate-pause semantics.
+`resume [RESPONSE]` preserves multiline text in the same durable session when
+execution is acquired, before the next parent prepares its history. Plain
+resume inserts no user response.
+
+Parent thinking, drafts, text, tool calls, results and errors retain the normal
+`session/update` path. Goal lifecycle notices use the typed
+`session/goal_update` payload in the OpenRPC contract. A
+`session_unavailable` reply does not disclose a session's owner or Goal state;
+it is distinct from `no_current_goal`.
+Started/resumed notices precede execution; an agent's question precedes a
+verifier-blocked pause. The legacy `verified_candidate` update is a successful
+parent's presentation fallback after its ordinary event stream drains. It is
+not a verifier verdict or a persistence acknowledgement. Saving the candidate
+is a separate, once-only durable append; its failure remains visible as an
+original error and the typed `candidate_persistence_failed` lifecycle reason.
+Native Goal core errors retain the ordinary `turn_complete` event with
+`goal_owned: true`. That provenance marks presentation only; it cannot
+finish a separately submitted `session/prompt`.
+
+An admitted Start/Resume can encounter a forward configuration revision conflict
+before worker registration. Only a conflict within the same canonical storage,
+configuration epoch and process generation, with fresh authorization, enabled
+scope and valid configuration, can settle as `Paused/ExternalDependency`.
+After successful settlement, the initial Started/Resumed acknowledgement is
+followed by a late lifecycle response on `session/goal_update`, reflecting the
+actual canonical winner. No worker executes the refused request. A fresh
+authorized Resume can continue the same durable Goal and session under current
+settings; the daemon does not retry automatically. A refused Resume's response
+text is not appended or automatically replayed: include it again in the explicit
+retry if still intended. Disabled scope, malformed configuration, authority
+failures and genuine operation or persistence failures retain their existing
+policies; this is not general failure resumability.
+
+After the worker is registered, a same-epoch forward publication while it waits
+for the session lane does not by itself interrupt the Goal. The worker checks
+fresh configuration and scope eligibility, and the existing session authority
+checks still apply. If they pass, it appends an optional Resume response once
+to the canonical session before the first parent turn. Disabled scope, invalid
+configuration, different or older epochs and authority failures keep their
+existing failure policies. Revocation cancels before publication; an answer
+from an acquisition that is refused, fenced or fails before append is not
+automatically replayed.
+
+The native parent has no additional overall Goal timeout. Existing finite
+tool, child, summary and Matrix turn bounds remain enforced. A daemon restart
+requires explicit authorized resume; an ordinary client disconnect does not
+cancel a durable Goal. With a control plane installed, orphan retirement
+keeps live sessions with active, resumable, or unsettled Goals. Opening
+another same-mode session also keeps siblings with any bound Goal, including
+terminal ones. If a Goal lookup fails, the sweep retains the live session.
+
+If the daemon starts without control-plane supervision, ordinary live-session
+eviction can still run. Neither automatic sweep fences, settles, or deletes a
+durable Goal or deletes the durable transcript. Explicit session disposal and
+daemon-generation shutdown have their own fence-and-drain boundaries.
+
+For an executing Goal, an accepted `session/cancel` or `session/abort` fences
+continuation and requests an immediate pause without removing its session.
+Cancel uses `Sessions:Update` and Abort uses `Sessions:Delete`. Over WSS both
+keep the existing owning-client restriction; a trusted local connection may
+stop any live session it can access, including another client's turn.
+Neither operation requires the `session/goal` grant. Both recheck current
+authority and the captured live session after admission waits; a reused session
+ID does not authorize stopping its replacement.
+
+The stop fences Goal continuation before waiting for admitted work to settle.
+It releases Goal command serialization before that wait and signals ordinary
+turn cancellation only after Goal operation settlement is established. The
+request response precedes any separately owed Goal failure notice, so a notice
+waiting for the foreground does not hold up the acknowledgement. Notifications
+still perform an accepted stop without a response. Losing the connection
+withdraws undeliverable output, not already accepted settlement duties. Genuine
+terminal outcomes still win: a failure committed before the stop stays terminal,
+and pending, unknown or incomplete accounting still ends the Goal Failed. A fully
+accounted operation error that settles after the committed stop leaves the Goal
+paused. The ordinary cancellation response is not a promise that the Goal ended
+paused.
 
 ### Atomic configuration writes
 
@@ -120,6 +243,13 @@ All fields are staged on one candidate and validated before one persistent
 commit. Later entries for the same property win. A staging or commit failure
 leaves the persisted and live config unchanged; an invalid entry error names
 its zero-based index.
+
+Goal policy revocation has a separate durable effect: affected Goals are
+cancelled before the configuration is saved. A later save or publication
+failure does not revive them; the error reports the committed cancellation
+alongside the configuration failure. Expanding Goal eligibility requires
+runtime replacement before a new Goal may execute. See [Config lifecycle](config-lifecycle.md)
+for the distinction between saved, published and applied configuration.
 
 The caller needs `Config:Update` and authorization for every requested path.
 The daemon resolves current authority while holding the config write lock,
@@ -162,7 +292,9 @@ than answered, preventing response loops.
 
 ### Turn streaming
 
-`session/prompt` returns the final result when the turn completes. During
+The request form of `session/prompt` answers an empty object
+(`SessionPromptAck`) once the turn has ended; the turn's text and outcome
+arrive on the `turn_complete` `session/update` notification. During
 execution, the daemon sends `session/update` notifications with incremental
 events:
 
@@ -299,23 +431,40 @@ Paste lines one at a time:
 On Windows, use any named-pipe client (PowerShell `[System.IO.Pipes.NamedPipeClientStream]`,
 `nc` via WSL, or just run `zerocode`).
 
+## Contract document
+
+The method table, every wire type's JSON Schema, the notification names and
+the error codes are rendered into
+[`zeroclaw-rpc.openrpc.json`](zeroclaw-rpc.openrpc.json) by
+`cargo generate openrpc`. CI fails when that file drifts from
+`zeroclaw-rpc-proto`. OpenRPC describes what travels inside the JSON-RPC
+envelope; the NDJSON framing, handshake and transport rules on this page are
+the prose half of the contract.
+
 ## Internals
 
-The dispatch layer lives in `crates/zeroclaw-runtime/src/rpc/`:
+The wire contract lives in `crates/zeroclaw-rpc-proto/` and the dispatch
+layer in `crates/zeroclaw-runtime/src/rpc/`:
 
 | File | Role |
 |---|---|
+| `zeroclaw-rpc-proto/src/method.rs` | `Method` enum, the single wire-name table, per-method params/result contract |
+| `zeroclaw-rpc-proto/src/types.rs` | wire-stable request, response and notification payload types |
+| `zeroclaw-rpc-proto/src/notification.rs` | server-to-client notification names |
+| `zeroclaw-rpc-client/src/client.rs` | `RpcClient`: dial, handshake, request/notification mux, reconnect backoff |
 | `transport.rs` | `RpcTransport` trait |
 | `turn.rs` | `execute_turn()` shared turn executor |
 | `session.rs` | `RpcSession`, `SessionStore` |
-| `dispatch.rs` | `RpcDispatcher` method routing |
+| `dispatch.rs` | `RpcDispatcher` method routing and `Method::authz` classification |
 | `local.rs` | `LocalTransport` + listener (Unix socket / Windows named pipe) |
+| `inproc.rs` | `InprocTransport` + `InprocConnector`: in-memory duplex connections for the supervised gateway; their own transport class, no peer credential, and no anonymous compatibility path, so every in-process `initialize` needs an explicit credential |
 | `wss.rs` | WSS (WebSocket Secure) transport + TLS acceptor |
 | `attachments.rs` | File upload processing, dedup, marker generation |
 | `upload.rs` | Chunked-upload staging: ordering, per-connection and process-wide bounds |
 
-Long-running `session/prompt` and `session/goal` work belongs to the accepted
-connection generation. The dispatcher retains their task handles through
+Long-running `session/prompt`, `session/goal`, `session/cancel` and
+`session/abort` work belongs to the accepted connection generation. The
+dispatcher retains their task handles through
 connection teardown, and a ZeroCode Goal worker retains the generation's
 liveness token for its full lifetime. This prevents a replacement daemon
 generation from admitting work for the same durable session while old Goal

@@ -230,7 +230,6 @@ function ResourceListEditor({
   const [open, setOpen] = useState<string | null>(null);
   const [newResource, setNewResource] = useState('');
   const [adding, setAdding] = useState(false);
-  const [reloadKey, setReloadKey] = useState(0);
   const [catalogPricing, setCatalogPricing] = useState<Record<string, ModelPricing> | null>(null);
 
   const reload = async () => {
@@ -324,11 +323,7 @@ function ResourceListEditor({
               isOpen={open === resource}
               onToggle={() => setOpen(open === resource ? null : resource)}
               onRemove={() => removeResource(resource)}
-              onSaved={() => {
-                setReloadKey((n) => n + 1);
-                onSaved?.();
-              }}
-              reloadKey={reloadKey}
+              onSaved={() => onSaved?.()}
             />
           ))
         )}
@@ -410,7 +405,6 @@ function ResourceRow({
   onToggle,
   onRemove,
   onSaved,
-  reloadKey,
 }: {
   category: CostRatesCategory;
   providerType: string;
@@ -420,7 +414,6 @@ function ResourceRow({
   onToggle: () => void;
   onRemove: () => void;
   onSaved: () => void;
-  reloadKey: number;
 }) {
   const fullPath = `${basePath}.${resource}`;
   const [armed, setArmed] = useState(false);
@@ -498,8 +491,9 @@ function ResourceRow({
           className="px-4 pb-3"
           style={{ borderTop: '1px solid var(--pc-border)' }}
         >
+          {/* FieldForm reloads itself; keep its save warnings mounted. */}
           <FieldForm
-            key={`${reloadKey}-${fullPath}`}
+            key={fullPath}
             prefix={fullPath}
             onSaved={onSaved}
             showDelete={false}

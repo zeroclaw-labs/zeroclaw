@@ -121,6 +121,16 @@ impl ApprovalPendingMap {
             .is_some()
     }
 
+    /// Whether any approval raised for `session_id` is still waiting for an
+    /// answer.
+    pub fn has_pending_for_session(&self, session_id: &str) -> bool {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .any(|entry| entry.session_id == session_id)
+    }
+
     #[cfg(test)]
     pub fn contains(&self, request_id: &str) -> bool {
         self.inner
@@ -307,11 +317,8 @@ impl RpcContext {
     }
 
     pub fn for_live_test(config: Config, sessions: Arc<SessionStore>) -> Arc<Self> {
-        let tui_dir = config
-            .config_path
-            .parent()
-            .map(std::path::Path::to_path_buf)
-            .unwrap_or_else(|| config.data_dir.clone());
+        // Same resolver as the daemon, so this harness signs as production does.
+        let tui_registry = Arc::new(TuiRegistry::for_config(&config));
         let data_dir = config.data_dir.clone();
         // Mirrors the daemon: one shared certificate audit logger for the
         // whole context, best-effort like the ACP store above.
@@ -337,7 +344,7 @@ impl RpcContext {
             reload_tx: None,
             gateway_shutdown_tx: None,
             approval_pending: Arc::new(ApprovalPendingMap::default()),
-            tui_registry: Arc::new(TuiRegistry::new(&tui_dir)),
+            tui_registry,
             acp_session_store: AcpSessionStore::new(data_dir.as_path()).ok().map(Arc::new),
             sop_engine: None,
             sop_driver_handles: None,
@@ -354,7 +361,7 @@ impl RpcContext {
     #[cfg(test)]
     pub fn minimal(config: Config, sessions: Arc<SessionStore>) -> Arc<Self> {
         let auth = crate::rpc::auth::RpcInboundAuth::for_tests(&config);
-        let authority = LiveConfigAuthority::new(config);
+        let authority = LiveConfigAuthority::for_tests(config);
         Arc::new(Self {
             config: authority.live_handle(),
             config_authority: authority.clone(),
@@ -396,7 +403,7 @@ impl RpcContext {
         )
         .ok();
         let auth = crate::rpc::auth::RpcInboundAuth::for_tests(&config);
-        let authority = LiveConfigAuthority::new(config);
+        let authority = LiveConfigAuthority::for_tests(config);
         Arc::new(Self {
             config: authority.live_handle(),
             config_authority: authority.clone(),
@@ -479,7 +486,7 @@ impl RpcContext {
         subscriptions: Arc<crate::rpc::subscription::SubscriptionHub>,
     ) -> Arc<Self> {
         let auth = crate::rpc::auth::RpcInboundAuth::for_tests(&config);
-        let authority = LiveConfigAuthority::new(config);
+        let authority = LiveConfigAuthority::for_tests(config);
         Arc::new(Self {
             config: authority.live_handle(),
             config_authority: authority.clone(),
@@ -516,7 +523,7 @@ impl RpcContext {
         sop_engine: Arc<std::sync::Mutex<crate::sop::SopEngine>>,
     ) -> Arc<Self> {
         let auth = crate::rpc::auth::RpcInboundAuth::for_tests(&config);
-        let authority = LiveConfigAuthority::new(config);
+        let authority = LiveConfigAuthority::for_tests(config);
         Arc::new(Self {
             config: authority.live_handle(),
             config_authority: authority.clone(),
@@ -559,7 +566,7 @@ impl RpcContext {
         sop_driver_handles: Option<crate::sop::SopDriverHandles>,
     ) -> Arc<Self> {
         let auth = crate::rpc::auth::RpcInboundAuth::for_tests(&config);
-        let authority = LiveConfigAuthority::new(config);
+        let authority = LiveConfigAuthority::for_tests(config);
         Arc::new(Self {
             config: authority.live_handle(),
             config_authority: authority.clone(),
@@ -595,7 +602,7 @@ impl RpcContext {
         memory: Arc<dyn zeroclaw_api::memory_traits::Memory>,
     ) -> Arc<Self> {
         let auth = crate::rpc::auth::RpcInboundAuth::for_tests(&config);
-        let authority = LiveConfigAuthority::new(config);
+        let authority = LiveConfigAuthority::for_tests(config);
         Arc::new(Self {
             config: authority.live_handle(),
             config_authority: authority.clone(),
@@ -632,7 +639,7 @@ impl RpcContext {
         cost_tracker: Arc<CostTracker>,
     ) -> Arc<Self> {
         let auth = crate::rpc::auth::RpcInboundAuth::for_tests(&config);
-        let authority = LiveConfigAuthority::new(config);
+        let authority = LiveConfigAuthority::for_tests(config);
         Arc::new(Self {
             config: authority.live_handle(),
             config_authority: authority.clone(),
@@ -670,7 +677,7 @@ impl RpcContext {
         acp_session_store: Option<Arc<AcpSessionStore>>,
     ) -> Arc<Self> {
         let auth = crate::rpc::auth::RpcInboundAuth::for_tests(&config);
-        let authority = LiveConfigAuthority::new(config);
+        let authority = LiveConfigAuthority::for_tests(config);
         Arc::new(Self {
             config: authority.live_handle(),
             config_authority: authority.clone(),
@@ -708,7 +715,7 @@ impl RpcContext {
         reload_tx: Option<tokio::sync::watch::Sender<bool>>,
     ) -> Arc<Self> {
         let auth = crate::rpc::auth::RpcInboundAuth::for_tests(&config);
-        let authority = LiveConfigAuthority::new(config);
+        let authority = LiveConfigAuthority::for_tests(config);
         Arc::new(Self {
             config: authority.live_handle(),
             config_authority: authority.clone(),
@@ -761,6 +768,29 @@ mod tests {
                 .same_storage(&authority.live_handle())
         );
         assert_eq!(ctx.config.revision(), authority.published_revision());
+    }
+
+    /// A commit one test holds on its context must not stall another test's
+    /// config writers in the same binary.
+    #[tokio::test]
+    async fn test_contexts_do_not_share_a_config_write_lock() {
+        let sessions = || {
+            Arc::new(SessionStore::new(
+                16,
+                Arc::new(zeroclaw_infra::session_queue::SessionActorQueue::new(
+                    4, 10, 60,
+                )),
+            ))
+        };
+        let first = RpcContext::minimal(Config::default(), sessions());
+        let second = RpcContext::for_persistence_tests(Config::default(), sessions(), None, None);
+
+        let _held = first
+            .begin_config_commit()
+            .await
+            .expect("a fresh context admits a commit");
+        assert!(first.config_authority.config_write_lock_is_held());
+        assert!(!second.config_authority.config_write_lock_is_held());
     }
 
     #[test]
