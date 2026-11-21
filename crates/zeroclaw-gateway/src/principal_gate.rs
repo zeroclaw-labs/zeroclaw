@@ -1554,6 +1554,115 @@ type = "string"
         config
     }
 
+    #[tokio::test]
+    async fn scoped_http_rotation_preserves_only_same_origin_grants() {
+        use zeroclaw_config::secrets::SecretStore;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = paired_config();
+        config.config_path = tmp.path().join("config.toml");
+        config.data_dir = tmp.path().join("data");
+        config.secrets.encrypt = true;
+        SecretStore::new(tmp.path(), true)
+            .encrypt("fixture")
+            .unwrap();
+        let router = router_for(config);
+        let path = "/api/config/http-credentials";
+        let mut expected = Vec::new();
+        for (operation, origin, value, allowed) in [
+            ("create", "https://one.example", "initial", false),
+            ("replace", "https://one.example:443", "rotated", true),
+            ("replace", "https://two.example", "different", false),
+        ] {
+            let (status, body) = send(&router, "POST", path, Some("zc_paired"), None, Some(
+                serde_json::json!({"operation": operation, "name": "example", "credential": {
+                    "origin": origin, "http_allowed": true, "auth": {"kind": "api_key", "value": value}
+                }}),
+            )).await;
+            assert!(status.is_success(), "{status}: {body}");
+            let (status, body) = send(&router, "GET", path, Some("zc_paired"), None, None).await;
+            assert_eq!(status, StatusCode::OK);
+            expected.push((body["credentials"][0]["http_allowed"].clone(), allowed));
+            assert!(body["credentials"][0].get("auth").is_none());
+            if operation == "create" {
+                let (status, body) = send(&router, "POST", path, Some("zc_paired"), None, Some(
+                    serde_json::json!({"operation": "replace", "name": "example", "permissions": {"http_allowed": true}}),
+                )).await;
+                assert!(status.is_success(), "{status}: {body}");
+            }
+        }
+        for (actual, allowed) in expected {
+            assert_eq!(actual, serde_json::json!(allowed));
+        }
+    }
+
+    #[tokio::test]
+    async fn scoped_http_catalog_refuses_generic_gateway_writes() {
+        use zeroclaw_config::secrets::SecretStore;
+        let tmp = tempfile::tempdir().unwrap();
+        let idp = introspection_idp(&["ops"]).await;
+        let mut config = editor_config(
+            &tmp,
+            &idp.uri(),
+            &[Verb::Read, Verb::Create, Verb::Update, Verb::Delete],
+            &["http_request.*"],
+        );
+        config.secrets.encrypt = true;
+        let fixture = SecretStore::new(tmp.path(), true).encrypt(
+            r#"{"origin":"https://one.example","http_allowed":false,"auth":{"kind":"api_key","value":"fixture"}}"#,
+        ).unwrap();
+        config
+            .http_request
+            .scoped_credentials
+            .insert("example".into(), fixture);
+        config.save().await.unwrap();
+        let file = config.config_path.clone();
+        let original = std::fs::read(&file).unwrap();
+        let router = router_for(config);
+        for (method, path, body) in [
+            (
+                "PUT",
+                "/api/config/prop",
+                Some(serde_json::json!({
+                    "path":"http_request.scoped_credentials.example","value":"replacement"
+                })),
+            ),
+            (
+                "DELETE",
+                "/api/config/prop?path=http_request.scoped_credentials.example",
+                None,
+            ),
+            (
+                "PATCH",
+                "/api/config",
+                Some(serde_json::json!([
+                    {"op":"remove","path":"/http_request/scoped_credentials/example"}
+                ])),
+            ),
+            (
+                "POST",
+                "/api/config/map-key?path=http_request.scoped_credentials&key=another",
+                None,
+            ),
+            (
+                "DELETE",
+                "/api/config/map-key?path=http_request.scoped_credentials&key=example",
+                None,
+            ),
+        ] {
+            let (status, body) = send(
+                &router,
+                method,
+                path,
+                Some("opaque-token"),
+                Some("oidc.test"),
+                body,
+            )
+            .await;
+            assert!(!status.is_success(), "{method} {path}: {status} {body}");
+            assert_eq!(std::fs::read(&file).unwrap(), original, "{method} {path}");
+        }
+    }
+
     async fn create_agent(router: &Router, alias: &str) {
         let (status, body) = send(
             router,
