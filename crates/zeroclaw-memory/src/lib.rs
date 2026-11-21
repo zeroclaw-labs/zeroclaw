@@ -2522,9 +2522,7 @@ url = "http://localhost:6333"
             );
 
             let name = configured_memory_backend(&config, Some("worker"));
-            let memory = create_memory_for_agent(&config, "worker", None)
-                .await
-                .unwrap();
+            let memory = create_memory_for_agent(&config, "worker").await.unwrap();
             assert_eq!(name, expected);
             assert_eq!(memory.name(), name);
         }
