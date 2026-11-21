@@ -19605,6 +19605,7 @@ Let me check the result."#;
         use super::{ToolLoop, run_tool_call_loop};
         use crate::observability::noop::NoopObserver;
         use ::zeroclaw_log::Instrument;
+        use zeroclaw_api::attribution::Attributable;
 
         let _writer_guard = zeroclaw_log::__private_test_writer_lock();
         let _hook_guard = zeroclaw_log::__private_test_hook_lock();
@@ -19622,6 +19623,7 @@ Let me check the result."#;
             capabilities: ProviderCapabilities::default(),
         };
         let observer = NoopObserver;
+        let attribution = crate::agent::AgentAttribution("trimtest");
 
         let big = "x".repeat(4000);
         let mut history = vec![
@@ -19691,9 +19693,7 @@ Let me check the result."#;
             agent_alias: None,
             turn_id: "test-turn-id",
         })
-        .instrument(zeroclaw_log::attribution_span!(
-            &crate::agent::AgentAttribution("trimtest")
-        ))
+        .instrument(zeroclaw_log::attribution_span!(&attribution))
         .await
         .expect("loop should succeed");
 
@@ -19706,6 +19706,8 @@ Let me check the result."#;
                         .get("message")
                         .and_then(|v| v.as_str())
                         .is_some_and(|m| m.starts_with("History trimmed:"))
+                        // The broadcast includes concurrent agents' records.
+                        && value["zeroclaw"]["agent_alias"].as_str() == Some(attribution.alias())
                     {
                         trim_event = Some(value);
                         break;
