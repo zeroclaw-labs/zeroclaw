@@ -33,10 +33,7 @@ impl SkillImprover {
                 return false;
             }
         }
-        if self.is_on_disk_cooldown(slug) {
-            return false;
-        }
-        true
+        !self.is_on_disk_cooldown(slug)
     }
 
     // SKILL.md front-matter's `updated_at:` is bumped on every successful
