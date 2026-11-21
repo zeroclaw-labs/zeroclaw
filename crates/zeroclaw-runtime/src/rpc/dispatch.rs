@@ -24231,9 +24231,11 @@ mod tests {
             }
             assert_eq!(agent.tool_names().contains(&"tool_search"), helper);
             let prompt = agent.system_prompt_for_test().unwrap();
-            assert_eq!(prompt.contains("## Deferred Tools"), helper && !always);
-            if helper && !always {
+            assert_eq!(prompt.contains("## Deferred Tools"), helper);
+            if helper {
                 assert!(prompt.contains(TOOL));
+            }
+            if helper && !always {
                 assert!(!agent.dispatch_tool_for_test(TOOL, json!({})).await.success);
                 let selected = agent
                     .dispatch_tool_for_test(

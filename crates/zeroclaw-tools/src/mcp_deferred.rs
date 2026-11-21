@@ -370,8 +370,10 @@ fn summary_line(description: &str, max_chars: usize) -> String {
     cut
 }
 
-/// Advertise unselected built-in schemas without copying their JSON schemas
+/// Advertise deferred built-in schemas without copying their JSON schemas
 /// into the prompt. Access policy is applied before any name is rendered.
+/// Selected schemas stay listed: the list follows the catalog and access
+/// policy only, so selecting a schema never changes the system prompt.
 pub(crate) fn build_deferred_builtin_tools_section(
     activated: &ActivatedToolSet,
     policy: Option<&ToolAccessPolicy>,
@@ -387,7 +389,6 @@ fn render_deferred_builtin_tools_section(
 ) -> String {
     let mut specs: Vec<_> = activated
         .deferred_builtin_specs()
-        .filter(|spec| !activated.is_builtin_schema_exposed(&spec.name))
         .filter(|spec| is_allowed(&spec.name))
         .collect();
     if specs.is_empty() {
@@ -396,7 +397,8 @@ fn render_deferred_builtin_tools_section(
     specs.sort_by(|a, b| a.name.cmp(&b.name));
     let mut out = String::from(
         "## Deferred Built-in Tools\n\n\
-         Use `tool_search` to fetch full schemas for the built-in tools below. \
+         Use `tool_search` to fetch full schemas for the built-in tools below \
+         that you cannot call yet. \
          Use `\"select:name1,name2\"` for exact tools or keywords to search. \
          Schema selection does not change tool permissions or approval requirements.\n\n\
          <available-deferred-builtin-tools>\n",
@@ -416,7 +418,8 @@ fn render_deferred_builtin_tools_section(
 /// of the description, capped) so the LLM knows what is available without
 /// consuming context window on full schemas or full docstrings. Includes an
 /// instruction block that tells the LLM to call `tool_search` to activate
-/// them.
+/// them. Activated tools stay listed: the section depends only on the
+/// deferred catalog and access policy, so activation never changes it.
 pub fn build_deferred_tools_section(deferred: &DeferredMcpToolSet) -> String {
     build_deferred_tools_section_filtered(deferred, None)
 }
@@ -425,32 +428,19 @@ pub fn build_deferred_tools_section_filtered(
     deferred: &DeferredMcpToolSet,
     policy: Option<&crate::tool_search::ToolAccessPolicy>,
 ) -> String {
-    build_deferred_tools_section_excluding(deferred, policy, &HashSet::new())
-}
-
-pub fn build_deferred_tools_section_excluding(
-    deferred: &DeferredMcpToolSet,
-    policy: Option<&crate::tool_search::ToolAccessPolicy>,
-    exclude: &HashSet<String>,
-) -> String {
     if deferred.is_empty() {
         return String::new();
     }
     let mut out = String::new();
     out.push_str("## Deferred Tools\n\n");
     out.push_str(
-        "The tools listed below are available but NOT yet loaded. \
-         To use any of them you MUST first call the `tool_search` tool \
-         to fetch their full schemas. Use `\"select:name1,name2\"` for \
-         exact tools or keywords to search. Once activated, the tools \
-         become callable for the rest of the conversation.\n\n",
+        "Call `tool_search` to load any tool below that you cannot call yet. \
+         Use `\"select:name1,name2\"` for exact tools or keywords to search. \
+         Loaded tools stay callable for the rest of the conversation.\n\n",
     );
     out.push_str("<available-deferred-tools>\n");
     let mut count = 0;
     for stub in &deferred.stubs {
-        if exclude.contains(&stub.prefixed_name) {
-            continue;
-        }
         if let Some(p) = policy
             && !p.is_tool_allowed(&stub.prefixed_name)
         {
@@ -554,7 +544,7 @@ mod tests {
     }
 
     #[test]
-    fn builtin_prompt_is_compact_filtered_and_omits_selected_schemas() {
+    fn builtin_prompt_is_compact_filtered_and_keeps_selected_schemas() {
         let mut set = ActivatedToolSet::new();
         set.set_deferred_builtin_specs(vec![
             ToolSpec::new(
@@ -586,7 +576,11 @@ mod tests {
         );
         assert_eq!(set.hidden_builtin_names(), hidden_names);
         set.select_builtin_schema("calendar").unwrap();
-        assert!(build_deferred_builtin_tools_section(&set, Some(&policy)).is_empty());
+        assert!(!set.hidden_builtin_names().contains("calendar"));
+        assert_eq!(
+            build_deferred_builtin_tools_section(&set, Some(&policy)),
+            prompt
+        );
     }
 
     #[test]
@@ -884,7 +878,7 @@ mod tests {
     }
 
     #[test]
-    fn build_deferred_section_excluding_omits_named_stubs() {
+    fn build_deferred_section_wording_holds_for_activated_tools() {
         let stubs = vec![
             make_stub("fs__read_file", "Read a file"),
             make_stub("git__status", "Git status"),
@@ -899,30 +893,10 @@ mod tests {
             ),
             security: test_security(),
         };
-        let exclude: HashSet<String> = ["fs__read_file".to_string()].into_iter().collect();
-        let section = build_deferred_tools_section_excluding(&set, None, &exclude);
-        assert!(
-            !section.contains("fs__read_file"),
-            "pre-activated stub must not be advertised as deferred"
-        );
-        assert!(section.contains("git__status"));
-    }
-
-    #[test]
-    fn build_deferred_section_excluding_all_returns_empty() {
-        let stubs = vec![make_stub("fs__read_file", "Read a file")];
-        let set = DeferredMcpToolSet {
-            stubs,
-            registry: std::sync::Arc::new(
-                tokio::runtime::Runtime::new()
-                    .unwrap()
-                    .block_on(McpRegistry::connect_all(&[]))
-                    .unwrap(),
-            ),
-            security: test_security(),
-        };
-        let exclude: HashSet<String> = ["fs__read_file".to_string()].into_iter().collect();
-        assert!(build_deferred_tools_section_excluding(&set, None, &exclude).is_empty());
+        let section = build_deferred_tools_section(&set);
+        assert!(section.contains("fs__read_file") && section.contains("git__status"));
+        assert!(section.contains("that you cannot call yet"));
+        assert!(!section.contains("NOT yet loaded"));
     }
 
     #[test]

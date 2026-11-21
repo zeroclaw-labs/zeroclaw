@@ -337,6 +337,63 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn activation_adds_request_specs_without_changing_discovery_prompt() {
+        use zeroclaw_tools::mcp_deferred::DeferredMcpToolStub;
+        use zeroclaw_tools::mcp_protocol::McpToolDef;
+
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let calendar = Box::new(CountingTool::new("calendar", Arc::clone(&invocations)));
+        let mut activated = ActivatedToolSet::new();
+        activated.set_deferred_builtin_specs(vec![calendar.spec()]);
+        let activated = Arc::new(Mutex::new(activated));
+        let deferred = crate::tools::DeferredMcpToolSet {
+            stubs: vec![DeferredMcpToolStub::new(
+                "remote__notes".to_string(),
+                McpToolDef {
+                    name: "notes".to_string(),
+                    description: Some("Remote notes".to_string()),
+                    input_schema: serde_json::json!({"type": "object", "properties": {}}),
+                },
+            )],
+            registry: Arc::new(crate::tools::McpRegistry::connect_all(&[]).await.unwrap()),
+            security: Arc::new(zeroclaw_config::policy::SecurityPolicy::default()),
+        };
+        let search = crate::tools::ToolSearchTool::new(deferred, Arc::clone(&activated));
+        let registry: Vec<Box<dyn Tool>> = vec![
+            calendar,
+            Box::new(CountingTool::new("tool_search", invocations)),
+        ];
+        let request_names = || {
+            build_iteration_tool_specs(
+                &NativeToolsProvider,
+                "test-model",
+                &registry,
+                &[],
+                Some(&activated),
+            )
+            .unwrap()
+            .request_tool_specs()
+            .iter()
+            .map(|spec| spec.name.clone())
+            .collect::<Vec<_>>()
+        };
+
+        let prompt = search.deferred_prompt_section();
+        assert_eq!(request_names(), vec!["tool_search"]);
+
+        search
+            .execute(serde_json::json!({"query": "select:calendar,remote__notes"}))
+            .await
+            .unwrap();
+
+        assert_eq!(search.deferred_prompt_section(), prompt);
+        assert_eq!(
+            request_names(),
+            vec!["calendar", "remote__notes", "tool_search"]
+        );
+    }
+
     #[test]
     fn build_iteration_tool_specs_recovers_poisoned_activated_tool_lock() {
         let activated = Arc::new(Mutex::new(ActivatedToolSet::new()));
