@@ -70,7 +70,11 @@ link-local address is refused when the config is loaded and again on every
 call. A private, loopback or local host (`127.0.0.1`, `192.168.x.x`,
 `localhost`, a `.local` name) needs `allow_private_endpoint = true`. Each call
 resolves the host once, checks every address it returns, and sends only to
-those addresses, without a proxy and without following redirects.
+those addresses, without a proxy and without following redirects. An address
+under one of the deployment's `security.nat64_prefixes` is also judged by the
+IPv4 destination it translates to, so a translated metadata or private address
+is refused like a direct one; if that list does not parse, every call is
+refused.
 
 The provider request can therefore contain recalled memory without making the
 current turn a new memory. Review prompt-assembly changes by asking:

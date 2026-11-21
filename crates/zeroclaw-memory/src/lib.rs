@@ -68,7 +68,7 @@ pub use postgres::PostgresMemory;
 pub use principal_plane::PrincipalPlaneMemory;
 pub use qdrant::QdrantMemory;
 pub use rerank::{RerankConfig, RerankStrategy};
-pub use rerank_external::{ExternalRerankSettings, RerankFailure};
+pub use rerank_external::{ExternalRerankSettings, InvalidNat64Prefixes, RerankFailure};
 pub use response_cache::ResponseCache;
 #[allow(unused_imports)]
 pub use retrieval::{RetrievalConfig, RetrievalPipeline};

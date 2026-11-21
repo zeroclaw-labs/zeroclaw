@@ -1406,6 +1406,7 @@ impl AgentBuilder {
                 crate::agent::memory_inject::MemoryInjectConfig::from_memory_config(
                     &zeroclaw_config::schema::MemoryConfig::default(),
                     crate::agent::memory_inject::DEFAULT_RECALL_LIMIT,
+                    &[],
                 )
             }),
             config,
@@ -3620,6 +3621,7 @@ impl Agent {
                 crate::agent::memory_inject::MemoryInjectConfig::from_memory_config(
                     &config.memory,
                     config.effective_memory_recall_limit(agent_alias),
+                    &config.security.nat64_prefixes,
                 ),
             )
             .prompt_builder(SystemPromptBuilder::with_defaults())

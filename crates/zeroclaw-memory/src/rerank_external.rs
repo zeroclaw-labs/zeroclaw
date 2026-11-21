@@ -15,14 +15,18 @@
 //! network guard ([`zeroclaw_infra::net_guard::ResolvedDestination`]) and
 //! dials only the addresses that passed, with redirects off. Cloud metadata
 //! addresses are refused always; private and local ones only pass with
-//! `allow_private_endpoint`.
+//! `allow_private_endpoint`. An address under one of the deployment's
+//! `security.nat64_prefixes` is judged by the IPv4 destination it translates
+//! to as well.
 
 use crate::rerank::{self, RerankConfig};
 use crate::traits::MemoryEntry;
 use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
-use zeroclaw_infra::net_guard::{PrivateNetworkAccess, ResolvedDestination, normalize_host};
+use zeroclaw_infra::net_guard::{
+    Nat64Prefix, PrivateNetworkAccess, ResolvedDestination, normalize_host, parse_nat64_prefixes,
+};
 
 /// Longest text sent for the query or for one candidate, in characters.
 pub const MAX_RERANK_TEXT_CHARS: usize = 1_500;
@@ -42,9 +46,19 @@ pub struct ExternalRerankSettings {
     /// Most candidates sent per call.
     pub max_candidates: usize,
     /// Whether the endpoint may resolve to private, loopback or local
-    /// addresses. Cloud metadata addresses are refused either way.
+    /// addresses. Cloud metadata addresses are refused either way, including
+    /// through a configured NAT64 translation.
     pub allow_private_endpoint: bool,
+    /// The deployment's `security.nat64_prefixes`, parsed when the settings
+    /// are built (see [`Self::parse_nat64_prefixes`]). `Err` means the
+    /// configured list did not parse: every call is then refused, so a typo
+    /// cannot quietly turn the translation check off.
+    pub nat64_prefixes: Result<Vec<Nat64Prefix>, InvalidNat64Prefixes>,
 }
+
+/// The configured `security.nat64_prefixes` list did not parse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvalidNat64Prefixes;
 
 /// Why a rerank call produced no usable order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,6 +93,31 @@ impl RerankFailure {
 }
 
 impl ExternalRerankSettings {
+    /// Parse the deployment's `security.nat64_prefixes` for
+    /// [`Self::nat64_prefixes`]. One bad entry rejects the whole list, as the
+    /// other egress paths do; the rejection is logged with the entries the
+    /// operator has to fix.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidNat64Prefixes`] when any configured entry is not an
+    /// RFC 6052 prefix.
+    pub fn parse_nat64_prefixes(
+        configured: &[String],
+    ) -> Result<Vec<Nat64Prefix>, InvalidNat64Prefixes> {
+        parse_nat64_prefixes(configured, "security.nat64_prefixes").map_err(|error| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_category(::zeroclaw_log::EventCategory::Memory)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({ "error": error.to_string() })),
+                "memory external rerank refuses every call: security.nat64_prefixes did not parse"
+            );
+            InvalidNat64Prefixes
+        })
+    }
+
     /// The URL the request goes to. An endpoint whose path already ends in
     /// `/rerank` is used as given; one with another explicit path gets
     /// `/rerank` appended; a bare origin gets `/v1/rerank`. Only the path
@@ -240,6 +279,11 @@ impl ExternalRerankSettings {
         url: &mut reqwest::Url,
         deadline: Instant,
     ) -> Result<reqwest::Client, RerankFailure> {
+        // A list that did not parse refuses before anything is resolved.
+        let nat64_prefixes = self
+            .nat64_prefixes
+            .as_deref()
+            .map_err(|_| RerankFailure::Refused)?;
         let host = url.host_str().ok_or(RerankFailure::Refused)?.to_string();
         let port = url.port_or_known_default().ok_or(RerankFailure::Refused)?;
         let bare_host = host.trim_start_matches('[').trim_end_matches(']');
@@ -265,9 +309,7 @@ impl ExternalRerankSettings {
         } else {
             PrivateNetworkAccess::Deny
         };
-        // No network-specific NAT64 prefixes are passed: the well-known
-        // `64:ff9b::/96` form is still decoded.
-        let destination = ResolvedDestination::new(&host, port, addresses, access, &[])
+        let destination = ResolvedDestination::new(&host, port, addresses, access, nat64_prefixes)
             .map_err(|_| RerankFailure::Refused)?;
         let mut builder = reqwest::Client::builder()
             .no_proxy()
@@ -353,7 +395,88 @@ mod tests {
             max_candidates: 16,
             // The mock servers below listen on loopback.
             allow_private_endpoint: true,
+            nat64_prefixes: Ok(Vec::new()),
         }
+    }
+
+    /// The network-specific prefix the guard's own documentation uses.
+    const NAT64_PREFIX: &str = "2001:67c:2b0:db32:0:1::/96";
+
+    fn with_nat64(endpoint: &str, prefixes: &[&str]) -> ExternalRerankSettings {
+        let configured: Vec<String> = prefixes.iter().map(ToString::to_string).collect();
+        ExternalRerankSettings {
+            nat64_prefixes: ExternalRerankSettings::parse_nat64_prefixes(&configured),
+            ..settings(endpoint)
+        }
+    }
+
+    /// What the guard decides for the endpoint, without sending anything.
+    async fn guard(settings: &ExternalRerankSettings) -> Result<(), RerankFailure> {
+        let mut url = reqwest::Url::parse(&settings.rerank_url()).unwrap();
+        settings
+            .pinned_client(&mut url, Instant::now() + Duration::from_secs(5))
+            .await
+            .map(|_| ())
+    }
+
+    #[tokio::test]
+    async fn a_configured_nat64_prefix_refuses_translated_metadata() {
+        // Under the prefix this address translates to 169.254.169.254.
+        let endpoint = "http://[2001:67c:2b0:db32:0:1:a9fe:a9fe]:8098";
+        // Without the prefix it reads as a global address and passes.
+        let unconfigured = ExternalRerankSettings {
+            allow_private_endpoint: false,
+            ..settings(endpoint)
+        };
+        assert_eq!(guard(&unconfigured).await, Ok(()));
+        for allow_private_endpoint in [false, true] {
+            let configured = ExternalRerankSettings {
+                allow_private_endpoint,
+                ..with_nat64(endpoint, &[NAT64_PREFIX])
+            };
+            assert_eq!(
+                guard(&configured).await,
+                Err(RerankFailure::Refused),
+                "allow_private_endpoint = {allow_private_endpoint}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_configured_nat64_prefix_refuses_a_translated_private_address() {
+        // Under the prefix this address translates to 192.168.1.5.
+        let endpoint = "http://[2001:67c:2b0:db32:0:1:c0a8:105]:8098";
+        let unconfigured = ExternalRerankSettings {
+            allow_private_endpoint: false,
+            ..settings(endpoint)
+        };
+        assert_eq!(guard(&unconfigured).await, Ok(()));
+        let configured = ExternalRerankSettings {
+            allow_private_endpoint: false,
+            ..with_nat64(endpoint, &[NAT64_PREFIX])
+        };
+        assert_eq!(guard(&configured).await, Err(RerankFailure::Refused));
+    }
+
+    #[tokio::test]
+    async fn configured_nat64_prefixes_keep_the_private_opt_in() {
+        let endpoint = "http://127.0.0.1:1";
+        assert_eq!(guard(&with_nat64(endpoint, &[NAT64_PREFIX])).await, Ok(()));
+        let denied = ExternalRerankSettings {
+            allow_private_endpoint: false,
+            ..with_nat64(endpoint, &[NAT64_PREFIX])
+        };
+        assert_eq!(guard(&denied).await, Err(RerankFailure::Refused));
+    }
+
+    #[tokio::test]
+    async fn a_malformed_nat64_list_refuses_every_call() {
+        let settings = with_nat64("http://127.0.0.1:1", &[NAT64_PREFIX, "not-a-prefix"]);
+        assert_eq!(settings.nat64_prefixes, Err(InvalidNat64Prefixes));
+        assert_eq!(
+            settings.rerank("query", &["one", "two"]).await,
+            Err(RerankFailure::Refused)
+        );
     }
 
     #[tokio::test]

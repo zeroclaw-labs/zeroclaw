@@ -101,10 +101,15 @@ impl MemoryInjectConfig {
     /// Build the injection config from the agent's resolved memory config
     /// plus the effective recall limit. Threads the relevance floor and the
     /// rerank stage settings; budgets stay at the renderer defaults.
+    ///
+    /// `nat64_prefixes` is the deployment's `security.nat64_prefixes`: the
+    /// external rerank endpoint is checked through the same translations as
+    /// every other egress path.
     #[must_use]
     pub fn from_memory_config(
         memory: &zeroclaw_config::schema::MemoryConfig,
         limit: usize,
+        nat64_prefixes: &[String],
     ) -> Self {
         let limit = if memory.rerank_enabled {
             rerank::bounded_final_limit(limit)
@@ -114,7 +119,7 @@ impl MemoryInjectConfig {
         let rerank = build_rerank_config(memory, limit);
         let external_rerank = (memory.rerank_enabled
             && rerank.strategy == rerank::RerankStrategy::External)
-            .then(|| external_rerank_settings(&memory.external_rerank))
+            .then(|| external_rerank_settings(&memory.external_rerank, nat64_prefixes))
             .flatten();
         Self {
             limit,
@@ -131,6 +136,7 @@ impl MemoryInjectConfig {
 
 fn external_rerank_settings(
     external: &zeroclaw_config::schema::MemoryExternalRerankConfig,
+    nat64_prefixes: &[String],
 ) -> Option<zeroclaw_memory::ExternalRerankSettings> {
     let endpoint = external.endpoint.trim();
     if endpoint.is_empty() {
@@ -142,6 +148,9 @@ fn external_rerank_settings(
         timeout: std::time::Duration::from_millis(external.timeout_ms.max(1)),
         max_candidates: external.max_candidates.max(1),
         allow_private_endpoint: external.allow_private_endpoint,
+        nat64_prefixes: zeroclaw_memory::ExternalRerankSettings::parse_nat64_prefixes(
+            nat64_prefixes,
+        ),
     })
 }
 
@@ -1423,6 +1432,7 @@ mod tests {
         let flags_off = MemoryInjectConfig::from_memory_config(
             &zeroclaw_config::schema::MemoryConfig::default(),
             DEFAULT_RECALL_LIMIT,
+            &[],
         );
         let rerank_on = MemoryInjectConfig::from_memory_config(
             &zeroclaw_config::schema::MemoryConfig {
@@ -1431,6 +1441,7 @@ mod tests {
                 ..Default::default()
             },
             DEFAULT_RECALL_LIMIT,
+            &[],
         );
 
         let cases: Vec<(&str, TurnOrigin, bool, bool, MemoryInjectConfig, &str)> = vec![
@@ -1723,7 +1734,7 @@ mod tests {
             ..Default::default()
         };
         memory.rerank_strategy = "none".into();
-        let cfg = MemoryInjectConfig::from_memory_config(&memory, usize::MAX);
+        let cfg = MemoryInjectConfig::from_memory_config(&memory, usize::MAX, &[]);
 
         assert_eq!(cfg.limit, rerank::MAX_CANDIDATE_POOL);
         assert_eq!(cfg.rerank.final_limit, rerank::MAX_CANDIDATE_POOL);
@@ -1807,7 +1818,7 @@ mod tests {
     #[test]
     fn from_memory_config_threads_rerank_settings() {
         let mut memory = zeroclaw_config::schema::MemoryConfig::default();
-        let cfg = MemoryInjectConfig::from_memory_config(&memory, 7);
+        let cfg = MemoryInjectConfig::from_memory_config(&memory, 7, &[]);
         assert_eq!(cfg.limit, 7);
         assert!((cfg.min_relevance_score - memory.min_relevance_score).abs() < f64::EPSILON);
         assert!(!cfg.rerank_enabled);
@@ -1820,7 +1831,7 @@ mod tests {
         memory.rerank_enabled = true;
         memory.rerank_strategy = " MMR ".into();
         memory.mmr_lambda = 0.6;
-        let cfg = MemoryInjectConfig::from_memory_config(&memory, 5);
+        let cfg = MemoryInjectConfig::from_memory_config(&memory, 5, &[]);
         assert!(cfg.rerank_enabled);
         assert_eq!(
             cfg.rerank.strategy,
@@ -1829,12 +1840,12 @@ mod tests {
 
         // Unknown strategies fall back to no advanced rerank.
         memory.rerank_strategy = "llm_judge".into();
-        let cfg = MemoryInjectConfig::from_memory_config(&memory, 5);
+        let cfg = MemoryInjectConfig::from_memory_config(&memory, 5, &[]);
         assert_eq!(cfg.rerank.strategy, rerank::RerankStrategy::None);
 
         // A zero multiplier is clamped so over-fetch never zeroes recall.
         memory.candidate_multiplier = 0;
-        let cfg = MemoryInjectConfig::from_memory_config(&memory, 5);
+        let cfg = MemoryInjectConfig::from_memory_config(&memory, 5, &[]);
         assert_eq!(cfg.candidate_multiplier, 1);
     }
 
@@ -2049,7 +2060,7 @@ mod tests {
             min_relevance_score: 0.4,
             ..Default::default()
         };
-        let inject = MemoryInjectConfig::from_memory_config(&config, 5);
+        let inject = MemoryInjectConfig::from_memory_config(&config, 5, &[]);
         let context = render_memory_context(
             &memory,
             &RecordingObserver::default(),
@@ -2176,6 +2187,7 @@ mod tests {
                     timeout: std::time::Duration::from_millis(300),
                     max_candidates: 16,
                     allow_private_endpoint: true,
+                    nat64_prefixes: Ok(Vec::new()),
                 }),
                 ..Default::default()
             }
@@ -2362,11 +2374,11 @@ mod tests {
             memory.external_rerank.allow_private_endpoint = true;
 
             memory.rerank_strategy = "external".into();
-            let off = MemoryInjectConfig::from_memory_config(&memory, 5);
+            let off = MemoryInjectConfig::from_memory_config(&memory, 5, &[]);
             assert!(off.external_rerank.is_none(), "stage off sends nothing");
 
             memory.rerank_enabled = true;
-            let on = MemoryInjectConfig::from_memory_config(&memory, 5);
+            let on = MemoryInjectConfig::from_memory_config(&memory, 5, &[]);
             assert_eq!(on.rerank.strategy, rerank::RerankStrategy::External);
             let external = on.external_rerank.expect("settings for the external stage");
             assert_eq!(external.endpoint, "http://127.0.0.1:8098");
@@ -2374,8 +2386,28 @@ mod tests {
             assert_eq!(external.max_candidates, 12);
             assert!(external.allow_private_endpoint);
 
+            // The deployment's NAT64 prefixes reach the endpoint guard; a list
+            // that does not parse is kept as invalid, which refuses every call.
+            let prefixes = vec!["2001:67c:2b0:db32:0:1::/96".to_string()];
+            let with_prefixes = MemoryInjectConfig::from_memory_config(&memory, 5, &prefixes)
+                .external_rerank
+                .expect("settings for the external stage");
+            assert_eq!(
+                with_prefixes.nat64_prefixes,
+                zeroclaw_memory::ExternalRerankSettings::parse_nat64_prefixes(&prefixes)
+            );
+            assert_eq!(
+                with_prefixes.nat64_prefixes.map(|parsed| parsed.len()),
+                Ok(1)
+            );
+            let malformed =
+                MemoryInjectConfig::from_memory_config(&memory, 5, &["not-a-prefix".to_string()])
+                    .external_rerank
+                    .expect("settings for the external stage");
+            assert!(malformed.nat64_prefixes.is_err());
+
             memory.rerank_strategy = "mmr".into();
-            let mmr = MemoryInjectConfig::from_memory_config(&memory, 5);
+            let mmr = MemoryInjectConfig::from_memory_config(&memory, 5, &[]);
             assert!(
                 mmr.external_rerank.is_none(),
                 "another strategy sends nothing"

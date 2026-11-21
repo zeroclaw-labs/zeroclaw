@@ -13205,7 +13205,8 @@ pub struct MemoryExternalRerankConfig {
     /// `192.168.x.x`, `localhost`, a `.local` name), such as a reranker on
     /// this machine or the home network. Off by default: memory text then goes
     /// only to globally routable addresses. Cloud metadata addresses are
-    /// refused either way.
+    /// refused either way, including through a configured
+    /// `security.nat64_prefixes` translation.
     #[serde(default)]
     pub allow_private_endpoint: bool,
 }
