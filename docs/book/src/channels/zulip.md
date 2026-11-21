@@ -132,7 +132,8 @@ are folded in a collapsed **Details** spoiler:
 
 The marker binds the message to the run without in-memory state, so reactions
 keep working after a daemon restart. The signature is an HMAC-SHA256 over the
-reference and the place the prompt was posted to, keyed from the bot's API key.
+alias that posted the prompt, the reference and the place the prompt was posted
+to, keyed from the bot's API key.
 A marker the agent is talked into writing in an ordinary reply is not valid:
 outgoing text is sanitized so that only the gate prompt itself can carry one, and
 a marker moved to another place or forged without the key is rejected.
@@ -146,8 +147,9 @@ Limits:
   reactions and stay answerable from channels that support them.
 - After a restart, in a stream with `mention_only`, a text answer must mention
   the bot; reactions always work.
-- Rotating the bot's API key invalidates the signature of prompts already posted:
-  their reactions are ignored, the text answer still works.
+- Rotating the bot's API key, or renaming the alias, invalidates the signature of
+  prompts already posted: their reactions are ignored, the text answer still
+  works.
 - If the organization limits how long messages can be edited, the outcome of a
   gate decided after that window is posted as a new reply instead of editing the
   prompt.
@@ -162,8 +164,9 @@ agent; peer groups and approval routes can target a single alias
 - **One bot for several agents**: aliases share the same bot credentials, each
   with its own `stream_ids`, so the stream decides which agent answers. Set
   `dm_enabled = false` on these aliases, otherwise every alias of the bot would
-  answer the same direct message. Each alias also accepts gate reactions only on
-  prompts posted in its own streams.
+  answer the same direct message. Each alias accepts gate reactions only on
+  prompts it posted itself, in its own streams: another alias of the same bot
+  ignores them even when their streams overlap.
 
 ```toml
 [channels.zulip.prj_a]
@@ -184,13 +187,17 @@ dm_enabled = false
 2. An expired event queue is registered again automatically. Events that arrive
    between the expiry and the new registration are **not** replayed; for a chat
    this is acceptable, but a message sent in that window gets no answer.
-3. Rate limits (`429`) are honoured with `Retry-After`. Transient failures (5xx,
+3. Rate limits (`429`) are honoured with `Retry-After`, capped at five minutes
+   (a missing or invalid value waits five seconds); shutdown does not wait for it. Transient failures (5xx,
    a non-JSON error page from a proxy, timeouts) are retried up to five times
    with exponential backoff while keeping the queue; past that, the listener
    exits and the channel supervisor restarts it.
 4. The bot identity is fetched once via `GET /api/v1/users/me` and cached for the
    process lifetime.
 5. Attachments are not uploaded yet: outgoing messages carry text only.
+6. `site` must be `https://`. Plain `http://` is accepted only for a loopback
+   host (a local development server): for any other host the channel refuses to
+   send the API key and does not start.
 
 ## See also
 

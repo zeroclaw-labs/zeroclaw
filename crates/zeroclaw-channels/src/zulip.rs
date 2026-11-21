@@ -69,12 +69,43 @@ const GATE_KEY_CONTEXT: &[u8] = b"zeroclaw zulip sop gate marker v1";
 const GATE_SIGNATURE_BYTES: usize = 16;
 /// Registry entries older than this are swept on the next insert.
 const GATE_SWEEP_AFTER: Duration = Duration::from_secs(14 * 24 * 60 * 60);
+/// Wait after a 429 without a usable `Retry-After`, and the longest wait honoured.
+const RETRY_AFTER_DEFAULT_SECS: f64 = 5.0;
+const RETRY_AFTER_MAX_SECS: f64 = 300.0;
 
 fn approval_response_for_emoji(emoji: &str) -> Option<ChannelApprovalResponse> {
     match emoji {
         APPROVAL_EMOJI_APPROVE => Some(ChannelApprovalResponse::Approve),
         APPROVAL_EMOJI_DENY => Some(ChannelApprovalResponse::Deny),
         _ => None,
+    }
+}
+
+/// `Retry-After` in seconds, clamped: a missing, negative, non-finite or huge
+/// value must neither panic `Duration::from_secs_f64` nor stall the listener.
+fn retry_after_delay(header: Option<&str>) -> Duration {
+    let secs = header
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|s| s.is_finite() && *s >= 0.0)
+        .unwrap_or(RETRY_AFTER_DEFAULT_SECS);
+    Duration::from_secs_f64(secs.min(RETRY_AFTER_MAX_SECS))
+}
+
+/// Basic auth carries the API key, which also derives the gate-marker key:
+/// only HTTPS, or plain HTTP to a loopback host (local servers and tests).
+fn is_secure_site(site: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(site) else {
+        return false;
+    };
+    match url.scheme() {
+        "https" => true,
+        "http" => match url.host() {
+            Some(url::Host::Domain(d)) => d.eq_ignore_ascii_case("localhost"),
+            Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+            Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+            None => false,
+        },
+        _ => false,
     }
 }
 
@@ -92,6 +123,8 @@ enum ZulipError {
     Decode(serde_json::Error),
     /// 5xx or a non-JSON body (proxy, error page): worth retrying.
     Transient(String),
+    /// The configured site is not HTTPS: the API key is never sent to it.
+    InsecureSite,
 }
 
 impl ZulipError {
@@ -113,6 +146,10 @@ impl fmt::Display for ZulipError {
             Self::Transport(e) => write!(f, "transport error: {e}"),
             Self::Decode(e) => write!(f, "decode error: {e}"),
             Self::Transient(msg) => write!(f, "transient server error: {msg}"),
+            Self::InsecureSite => write!(
+                f,
+                "zulip site must use https:// (plain http is accepted only for loopback)"
+            ),
         }
     }
 }
@@ -893,6 +930,9 @@ impl ZulipChannel {
 
     /// Single place for auth, rate limiting and the `result` check.
     async fn call<T: DeserializeOwned>(&self, req: RequestBuilder) -> Result<T, ZulipError> {
+        if !is_secure_site(&self.site) {
+            return Err(ZulipError::InsecureSite);
+        }
         let resp = req
             .basic_auth(&self.email, Some(&self.api_key))
             .send()
@@ -900,13 +940,11 @@ impl ZulipChannel {
         let status = resp.status();
 
         if status == StatusCode::TOO_MANY_REQUESTS {
-            let secs = resp
+            let header = resp
                 .headers()
                 .get("retry-after")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.parse::<f64>().ok())
-                .unwrap_or(5.0);
-            return Err(ZulipError::RateLimited(Duration::from_secs_f64(secs)));
+                .and_then(|v| v.to_str().ok());
+            return Err(ZulipError::RateLimited(retry_after_delay(header)));
         }
 
         let bytes = resp.bytes().await?;
@@ -1616,7 +1654,13 @@ impl Channel for ZulipChannel {
                         serde_json::json!({ "alias": self.alias, "delay_ms": delay.as_millis() }),
                         "Zulip rate limit hit; waiting",
                     );
-                    tokio::time::sleep(delay).await;
+                    tokio::select! {
+                        () = tokio::time::sleep(delay) => {}
+                        () = cancel.cancelled() => {
+                            self.delete_queue(&queue.queue_id).await;
+                            return Ok(());
+                        }
+                    }
                 }
                 // The queue is still valid server-side: retrying keeps it, while
                 // returning would lose it along with incoming events.
@@ -2466,6 +2510,56 @@ mod tests {
     }
 
     #[test]
+    fn retry_after_is_clamped() {
+        assert_eq!(retry_after_delay(Some("0.2")), Duration::from_millis(200));
+        assert_eq!(retry_after_delay(Some(" 7 ")), Duration::from_secs(7));
+        for bad in [None, Some("soon"), Some("NaN"), Some("inf"), Some("-1")] {
+            assert_eq!(retry_after_delay(bad), Duration::from_secs(5), "{bad:?}");
+        }
+        assert_eq!(retry_after_delay(Some("1e300")), Duration::from_secs(300));
+    }
+
+    #[test]
+    fn only_https_or_loopback_sites_are_secure() {
+        for ok in [
+            "https://zulip.example.com",
+            "https://zulip.example.com:8443/",
+            "http://localhost:9991",
+            "http://127.0.0.1:8080",
+            "http://[::1]:8080",
+        ] {
+            assert!(is_secure_site(ok), "{ok}");
+        }
+        for bad in [
+            "http://zulip.example.com",
+            "http://10.0.0.5",
+            "http://localhost.example.com",
+            "ftp://zulip.example.com",
+            "zulip.example.com",
+            "",
+        ] {
+            assert!(!is_secure_site(bad), "{bad}");
+        }
+    }
+
+    #[tokio::test]
+    async fn api_key_is_never_sent_to_a_plain_http_site() {
+        let ch = ZulipChannel::new(
+            "http://zulip.example.com".into(),
+            "bot@example.com".into(),
+            "secret".into(),
+            "main",
+            Arc::new(Vec::new),
+            false,
+        );
+        let res = ch
+            .call::<Envelope>(ch.http_client().get(ch.url("users/me")))
+            .await;
+        assert!(matches!(res, Err(ZulipError::InsecureSite)));
+        assert!(!ch.health_check().await);
+    }
+
+    #[test]
     fn marker_is_bound_to_the_posting_alias() {
         let key = derive_gate_key("test-api-key");
         let signature = sign_gate(&key, "alias-a", "run-s#1", TEST_TARGET);
@@ -2835,6 +2929,39 @@ mod wire_tests {
         let ch = channel_for(&server);
         let mut l = start_listening(&ch);
         assert_eq!(l.next().await.content, "late");
+        l.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn huge_retry_after_neither_panics_nor_blocks_shutdown() {
+        let server = MockServer::start().await;
+        mount_identity(&server).await;
+        mount_register(&server, 421, 1).await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/events"))
+            .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "1e300"))
+            .mount(&server)
+            .await;
+
+        let ch = channel_for(&server);
+        let l = start_listening(&ch);
+        // Wait until the listener has hit the 429 and is sleeping
+        tokio::time::timeout(WAIT, async {
+            loop {
+                let polled = server
+                    .received_requests()
+                    .await
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|r| r.url.path() == "/api/v1/events");
+                if polled {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("listener never polled events");
         l.stop().await.unwrap();
     }
 
