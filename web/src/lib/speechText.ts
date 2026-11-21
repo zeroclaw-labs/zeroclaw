@@ -20,8 +20,9 @@ function visibleText(
   switch (node.type) {
     case 'text':
     case 'inlineCode':
-    case 'html':
       return node.value ?? '';
+    case 'html':
+      return (node.value ?? '').replace(/<!--[\s\S]*?-->|<\/?[a-z][\w:-]*(?=[\s/>])(?:[^"'<>]|"[^"]*"|'[^']*')*>/gi, '');
     case 'code':
       return '\n' + (node.value ?? '') + '\n';
     case 'image':
