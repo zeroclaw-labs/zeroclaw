@@ -9992,7 +9992,12 @@ impl RpcDispatcher {
         } else {
             // Return full config, masked.
             let mut masked = config;
-            masked.mask_secrets();
+            masked.mask_secrets().map_err(|error| {
+                rpc_err(
+                    INTERNAL_ERROR,
+                    format!("failed to mask configuration secrets: {error}"),
+                )
+            })?;
             Ok(serde_json::to_value(&masked).unwrap_or(Value::Null))
         }
     }
@@ -11963,9 +11968,11 @@ impl RpcDispatcher {
         }
 
         // Map-keyed sections surface even when empty.
-        let all_map_paths: Vec<&'static str> =
-            Config::map_key_sections().iter().map(|s| s.path).collect();
-        for &prefix in &all_map_paths
+        let all_map_paths: Vec<String> = Config::map_key_sections()
+            .iter()
+            .map(|s| s.path.clone())
+            .collect();
+        for prefix in all_map_paths
             .iter()
             .filter_map(|p| p.split('.').next())
             .collect::<std::collections::HashSet<_>>()
@@ -21075,7 +21082,7 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl crate::sop::DecisionModel for PausedSopDecision {
+    impl zeroclaw_api::decision::DecisionModel for PausedSopDecision {
         fn id(&self) -> &str {
             "paused"
         }
@@ -21083,8 +21090,8 @@ mod tests {
         async fn ask(
             &self,
             _state: Value,
-            _questions: std::collections::BTreeMap<String, crate::sop::decision::Question>,
-        ) -> anyhow::Result<crate::sop::decision::Answers> {
+            _questions: std::collections::BTreeMap<String, zeroclaw_api::decision::Question>,
+        ) -> anyhow::Result<zeroclaw_api::decision::Answers> {
             self.entered.notify_one();
             self.release.notified().await;
             // RunStrict admits this synthetic outage, so only authorization
@@ -21126,7 +21133,7 @@ mod tests {
                     .with_store(Arc::clone(&store))
                     .with_decision_models(std::collections::HashMap::from([(
                         "paused".into(),
-                        model.clone() as Arc<dyn crate::sop::DecisionModel>,
+                        model.clone() as Arc<dyn zeroclaw_api::decision::DecisionModel>,
                     )]));
                 replacement.set_sops_for_test(vec![sop.clone()]);
                 *engine.lock().unwrap() = replacement;

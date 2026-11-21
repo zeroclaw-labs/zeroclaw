@@ -15,7 +15,7 @@ use crate::traits::{
 use async_trait::async_trait;
 use futures_util::{StreamExt, stream};
 use reqwest::{
-    Client, ClientBuilder,
+    Client,
     header::{HeaderMap, HeaderValue, USER_AGENT},
 };
 use serde::{Deserialize, Serialize};
@@ -73,6 +73,12 @@ pub struct OpenAiCompatibleModelProvider {
     native_tool_calling: bool,
     /// HTTP request timeout in seconds for LLM API calls. Default: 120.
     timeout_secs: u64,
+    /// Explicitly disables the legacy request timeout when true.
+    timeout_disabled: bool,
+    /// Optional HTTP response-read idle timeout. `None` uses the streaming
+    /// baseline; `read_timeout_disabled` explicitly removes that baseline.
+    read_timeout_secs: Option<u64>,
+    read_timeout_disabled: bool,
     /// Extra HTTP headers to include in all API requests.
     extra_headers: std::collections::HashMap<String, String>,
     /// Optional reasoning effort for GPT-5/Codex-compatible backends.
@@ -537,6 +543,9 @@ pub struct OpenAiCompatibleBuilder {
     /// `None` preserves the default derived from `merge_system_into_user`.
     native_tool_calling_override: Option<bool>,
     timeout_secs: Option<u64>,
+    timeout_disabled: bool,
+    read_timeout_secs: Option<u64>,
+    read_timeout_disabled: bool,
     extra_headers: std::collections::HashMap<String, String>,
     reasoning_effort: Option<String>,
     /// Set to `true` by
@@ -683,7 +692,32 @@ impl OpenAiCompatibleBuilder {
     pub fn timeout_secs(mut self, timeout_secs: u64) -> Self {
         if timeout_secs > 0 {
             self.timeout_secs = Some(timeout_secs);
+            self.timeout_disabled = false;
         }
+        self
+    }
+
+    /// Disable the compatible adapter's total request timeout while retaining
+    /// independent connect/read-idle and outer cancellation boundaries.
+    pub fn without_timeout(mut self) -> Self {
+        self.timeout_secs = None;
+        self.timeout_disabled = true;
+        self
+    }
+
+    /// Override the per-read idle timeout for response bodies and streams.
+    pub fn read_timeout_secs(mut self, timeout_secs: u64) -> Self {
+        if timeout_secs > 0 {
+            self.read_timeout_secs = Some(timeout_secs);
+            self.read_timeout_disabled = false;
+        }
+        self
+    }
+
+    /// Disable the adapter's default stream read-idle bound.
+    pub fn without_read_timeout(mut self) -> Self {
+        self.read_timeout_secs = None;
+        self.read_timeout_disabled = true;
         self
     }
 
@@ -880,6 +914,9 @@ impl OpenAiCompatibleBuilder {
             native_tool_calling,
             merge_system_into_user,
             timeout_secs: self.timeout_secs.unwrap_or(120),
+            timeout_disabled: self.timeout_disabled,
+            read_timeout_secs: self.read_timeout_secs,
+            read_timeout_disabled: self.read_timeout_disabled,
             extra_headers: self.extra_headers,
             reasoning_effort: self.reasoning_effort,
             reasoning_effort_passthrough: self.reasoning_effort_passthrough,
@@ -924,6 +961,9 @@ impl OpenAiCompatibleModelProvider {
             merge_system_into_user_preserve_native: false,
             native_tool_calling_override: None,
             timeout_secs: None,
+            timeout_disabled: false,
+            read_timeout_secs: None,
+            read_timeout_disabled: false,
             extra_headers: std::collections::HashMap::new(),
             reasoning_effort: None,
             reasoning_effort_passthrough: false,
@@ -944,24 +984,6 @@ impl OpenAiCompatibleModelProvider {
             auth_profile_override: None,
         }
     }
-    /// Add the configured custom CA certificate to a reqwest builder.
-    /// The PEM bytes were loaded at construction, so this performs no disk I/O.
-    fn add_tls_cert_to_builder(&self, builder: ClientBuilder) -> ClientBuilder {
-        if let Some(ref pem) = self.tls_ca_cert_pem {
-            match reqwest::Certificate::from_pem(pem) {
-                Ok(cert) => return builder.add_root_certificate(cert),
-                Err(e) => ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                    "Failed to parse CA certificate — TLS will use system roots"
-                ),
-            }
-        }
-        builder
-    }
-
     /// Collect all `system` role messages and keep them in a provider-safe
     /// shape. Strict OpenAI-compatible endpoints accept a leading system
     /// message but reject system messages later in the history.
@@ -1013,161 +1035,76 @@ impl OpenAiCompatibleModelProvider {
         (result, true)
     }
 
-    fn http_client(&self) -> Client {
-        let timeout = self.timeout_secs;
-        let has_user_agent = self.user_agent.is_some();
-        let has_extra_headers = !self.extra_headers.is_empty();
-        let has_tls_cert = self.tls_ca_cert_pem.is_some();
-        // An OpenCode client needs its own redirect policy, which the shared
-        // cached client below does not carry.
-        let endpoint = self.chat_completions_url();
-        let targets_opencode = crate::opencode_session::is_opencode_target(&endpoint);
-
-        if has_user_agent || has_extra_headers || has_tls_cert || targets_opencode {
-            let mut headers = HeaderMap::new();
-            if let Some(ua) = self.user_agent.as_deref()
-                && let Ok(value) = HeaderValue::from_str(ua)
-            {
-                headers.insert(USER_AGENT, value);
-            }
-            for (key, value) in &self.extra_headers {
-                match (
-                    reqwest::header::HeaderName::from_bytes(key.as_bytes()),
-                    HeaderValue::from_str(value),
-                ) {
-                    (Ok(name), Ok(val)) => {
-                        headers.insert(name, val);
-                    }
-                    _ => {
-                        ::zeroclaw_log::record!(
-                            WARN,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Note
-                            )
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                            .with_attrs(::serde_json::json!({"header": key})),
-                            "Skipping invalid extra header name or value"
-                        );
-                    }
+    fn transport_headers(&self) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        if let Some(ua) = self.user_agent.as_deref()
+            && let Ok(value) = HeaderValue::from_str(ua)
+        {
+            headers.insert(USER_AGENT, value);
+        }
+        for (key, value) in &self.extra_headers {
+            match (
+                reqwest::header::HeaderName::from_bytes(key.as_bytes()),
+                HeaderValue::from_str(value),
+            ) {
+                (Ok(name), Ok(value)) => {
+                    headers.insert(name, value);
                 }
-            }
-
-            let builder = Client::builder()
-                .timeout(std::time::Duration::from_secs(timeout))
-                .connect_timeout(std::time::Duration::from_secs(10))
-                .default_headers(headers);
-            let builder = crate::opencode_session::restrict_redirects(builder, &endpoint);
-            let builder = self.add_tls_cert_to_builder(builder);
-            let builder = zeroclaw_config::schema::apply_runtime_proxy_to_builder(
-                builder,
-                "model_provider.compatible",
-            );
-
-            return builder.build().unwrap_or_else(|error| {
-                ::zeroclaw_log::record!(
+                _ => ::zeroclaw_log::record!(
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                         .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(
-                            ::serde_json::json!({"error": super::format_error_chain(&error)})
-                        ),
-                    "Failed to build proxied timeout client with custom headers or TLS certificate: "
-                );
-                Client::new()
-            });
+                        .with_attrs(::serde_json::json!({"header": key})),
+                    "Skipping invalid extra header name or value"
+                ),
+            }
         }
-
-        zeroclaw_config::schema::build_runtime_proxy_client_with_timeouts(
-            "model_provider.compatible",
-            timeout,
-            10,
-        )
+        headers
     }
 
-    /// HTTP client for streaming SSE connections — no overall timeout (reqwest's
-    /// total timeout kills long-running streams mid-response), but a `read_timeout`
-    /// idle bound so a silent connection fails fast instead of hanging forever.
-    /// The bound is derived as `max(STREAM_IDLE_TIMEOUT, timeout_secs)`: the 300 s
-    /// floor applies when `timeout_secs` is unset or lower, and a higher
-    /// `timeout_secs` raises the bound to match. Streaming paths must use this
-    /// client instead of http_client().
-    fn streaming_http_client(&self) -> Client {
+    fn http_client(&self) -> anyhow::Result<Client> {
         let endpoint = self.chat_completions_url();
-        let has_user_agent = self.user_agent.is_some();
-        let has_extra_headers = !self.extra_headers.is_empty();
-        let has_tls_cert = self.tls_ca_cert_pem.is_some();
-
-        if has_user_agent || has_extra_headers || has_tls_cert {
-            let mut headers = HeaderMap::new();
-            if let Some(ua) = self.user_agent.as_deref()
-                && let Ok(value) = HeaderValue::from_str(ua)
-            {
-                headers.insert(USER_AGENT, value);
-            }
-            for (key, value) in &self.extra_headers {
-                match (
-                    reqwest::header::HeaderName::from_bytes(key.as_bytes()),
-                    HeaderValue::from_str(value),
-                ) {
-                    (Ok(name), Ok(val)) => {
-                        headers.insert(name, val);
-                    }
-                    _ => {
-                        ::zeroclaw_log::record!(
-                            WARN,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Note
-                            )
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                            .with_attrs(::serde_json::json!({"header": key})),
-                            "Skipping invalid extra header name or value"
-                        );
-                    }
-                }
-            }
-
-            let builder = Client::builder()
-                .connect_timeout(std::time::Duration::from_secs(10))
-                .read_timeout(super::stream_idle_timeout(self.timeout_secs).duration())
-                .default_headers(headers);
-            let builder = crate::opencode_session::restrict_redirects(builder, &endpoint);
-            let builder = self.add_tls_cert_to_builder(builder);
-            let builder = zeroclaw_config::schema::apply_runtime_proxy_to_builder(
-                builder,
-                "provider.compatible",
-            );
-            return builder.build().unwrap_or_else(|error| {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(
-                            ::serde_json::json!({"error": super::format_error_chain(&error)})
-                        ),
-                    "Failed to build proxied streaming client with custom headers or TLS certificate: "
-                );
-                Client::new()
-            });
+        crate::transport::ChatHttpPolicy {
+            request_timeout: (!self.timeout_disabled)
+                .then(|| std::time::Duration::from_secs(self.timeout_secs)),
+            read_timeout: self
+                .read_timeout_secs
+                .filter(|_| !self.read_timeout_disabled)
+                .map(std::time::Duration::from_secs),
+            headers: self.transport_headers(),
+            redirect_endpoint: Some(&endpoint),
+            tls_ca_cert_pem: self.tls_ca_cert_pem.as_deref(),
         }
+        .client("model_provider.compatible")
+    }
 
-        let builder = Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(10))
-            .read_timeout(super::stream_idle_timeout(self.timeout_secs).duration());
-        let builder = crate::opencode_session::restrict_redirects(builder, &endpoint);
-        let builder =
-            zeroclaw_config::schema::apply_runtime_proxy_to_builder(builder, "provider.compatible");
-        builder.build().unwrap_or_else(|error| {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"error": super::format_error_chain(&error)})),
-                "Failed to build proxied streaming client: "
-            );
-            Client::new()
-        })
+    fn streaming_timeouts(&self) -> super::StreamTimeouts {
+        super::StreamTimeouts {
+            // The legacy timeout bounds non-streaming requests and raises the
+            // read-idle floor. A streaming total deadline is supplied by the
+            // later canonical `stream_request_timeout_secs` consumer.
+            request: None,
+            read: (!self.read_timeout_disabled).then(|| {
+                self.read_timeout_secs.map_or_else(
+                    || super::stream_idle_timeout(self.timeout_secs),
+                    |secs| super::StreamIdleBound::Read(std::time::Duration::from_secs(secs)),
+                )
+            }),
+        }
+    }
+
+    /// Apply the same resolved deadlines used by streaming error diagnostics.
+    fn streaming_http_client(&self) -> anyhow::Result<Client> {
+        let endpoint = self.chat_completions_url();
+        let timeouts = self.streaming_timeouts();
+        crate::transport::ChatHttpPolicy {
+            request_timeout: timeouts.request,
+            read_timeout: timeouts.read.map(|timeout| timeout.duration()),
+            headers: self.transport_headers(),
+            redirect_endpoint: Some(&endpoint),
+            tls_ca_cert_pem: self.tls_ca_cert_pem.as_deref(),
+        }
+        .client("provider.compatible")
     }
 
     fn models_url(&self) -> String {
@@ -1569,7 +1506,7 @@ impl OpenAiCompatibleModelProvider {
         let url = self.chat_completions_url();
         let response = match self
             .apply_opencode_session_header(self.apply_auth_header(
-                self.http_client().post(&url).json(&request),
+                self.http_client()?.post(&url).json(&request),
                 credential.as_deref(),
             )?)
             .send()
@@ -2711,14 +2648,12 @@ fn parse_sse_line(line: &str) -> StreamResult<Option<StreamChunk>> {
     Ok(None)
 }
 
-/// Convert SSE byte stream to text chunks.
-/// Convert an SSE byte stream into structured chunks. `idle_timeout` is the
-/// streaming client's read-idle bound; it names the bound that fired in
-/// body-read timeout errors, including whether `timeout_secs` can raise it.
+/// Convert an SSE byte stream into text chunks, retaining the request's
+/// deadlines across the header/body boundary for accurate diagnostics.
 fn sse_bytes_to_chunks(
     response: reqwest::Response,
     count_tokens: bool,
-    idle_timeout: super::StreamIdleBound,
+    timeouts: super::StreamDeadline,
 ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
     let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamChunk>>(100);
 
@@ -2797,10 +2732,7 @@ fn sse_bytes_to_chunks(
                 }
                 Err(e) => {
                     let _ = tx
-                        .send(Err(StreamError::Http(super::stream_idle_error_message(
-                            &e,
-                            idle_timeout,
-                        ))))
+                        .send(Err(StreamError::Http(timeouts.error_message(&e))))
                         .await;
                     return;
                 }
@@ -2821,20 +2753,16 @@ fn sse_bytes_to_chunks(
 pub(crate) fn sse_bytes_to_events(
     response: reqwest::Response,
     count_tokens: bool,
+    timeouts: super::StreamDeadline,
 ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
-    sse_bytes_to_events_for_contract(
-        response,
-        count_tokens,
-        false,
-        super::StreamIdleBound::Fixed(super::STREAM_IDLE_TIMEOUT),
-    )
+    sse_bytes_to_events_for_contract(response, count_tokens, false, timeouts)
 }
 
 fn sse_bytes_to_events_for_contract(
     response: reqwest::Response,
     count_tokens: bool,
     targets_mistral_tool_call_contract: bool,
-    idle_timeout: super::StreamIdleBound,
+    timeouts: super::StreamDeadline,
 ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
     let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(100);
 
@@ -2985,10 +2913,7 @@ fn sse_bytes_to_events_for_contract(
                 }
                 Err(e) => {
                     let _ = tx
-                        .send(Err(StreamError::Http(super::stream_idle_error_message(
-                            &e,
-                            idle_timeout,
-                        ))))
+                        .send(Err(StreamError::Http(timeouts.error_message(&e))))
                         .await;
                     return;
                 }
@@ -4155,7 +4080,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             // it and would otherwise leak into operator logs.
             let safe_url = super::sanitize_api_error(&url);
             let response = self
-                .apply_auth_header(self.http_client().get(&url), list_credential.as_deref())?
+                .apply_auth_header(self.http_client()?.get(&url), list_credential.as_deref())?
                 .send()
                 .await
                 .map_err(|e| {
@@ -4258,7 +4183,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             // it and would otherwise leak into operator logs.
             let safe_url = super::sanitize_api_error(&url);
             let response = self
-                .apply_auth_header(self.http_client().get(&url), list_credential.as_deref())?
+                .apply_auth_header(self.http_client()?.get(&url), list_credential.as_deref())?
                 .send()
                 .await
                 .map_err(|e| {
@@ -4422,7 +4347,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
 
         let response = match self
             .apply_opencode_session_header(self.apply_auth_header(
-                self.http_client().post(&url).json(&request),
+                self.http_client()?.post(&url).json(&request),
                 credential.as_deref(),
             )?)
             .send()
@@ -4523,7 +4448,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         let response = loop {
             let response = match self
                 .apply_opencode_session_header(self.apply_auth_header(
-                    self.http_client().post(&url).json(&payload),
+                    self.http_client()?.post(&url).json(&payload),
                     credential.as_deref(),
                 )?)
                 .send()
@@ -4667,7 +4592,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         let response = loop {
             let response = match self
                 .apply_opencode_session_header(self.apply_auth_header(
-                    self.http_client().post(&url).json(&payload),
+                    self.http_client()?.post(&url).json(&payload),
                     credential.as_deref(),
                 )?)
                 .send()
@@ -4919,8 +4844,14 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             }
 
             let url = provider.chat_completions_url();
-            let client = provider.streaming_http_client();
-            let idle_timeout = super::stream_idle_timeout(provider.timeout_secs);
+            let client = match provider.streaming_http_client() {
+                Ok(client) => client,
+                Err(error) => {
+                    let _ = tx.send(Err(StreamError::Http(error.to_string()))).await;
+                    return;
+                }
+            };
+            let timeouts = provider.streaming_timeouts();
             let auth_header = provider.auth_header.clone();
             let credential = match provider.resolve_credential().await {
                 Ok(credential) => credential,
@@ -4933,7 +4864,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             };
             let targets_mistral_tool_call_contract = provider.targets_mistral_tool_call_contract();
 
-            let response = loop {
+            let (response, timeouts) = loop {
                 let mut req_builder = client.post(&url).json(&payload);
                 req_builder = match apply_auth_to_request(
                     req_builder,
@@ -4954,27 +4885,22 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                     req_builder = req_builder.header(OPENCODE_SESSION_HEADER, session);
                 }
 
+                let active_timeouts = timeouts.start();
                 let response = match req_builder.send().await {
                     Ok(r) => r,
                     Err(e) => {
                         let _ = tx
                             .send(Err(if e.is_connect() {
-                                StreamError::ConnectFailed(super::stream_idle_error_message(
-                                    &e,
-                                    idle_timeout,
-                                ))
+                                StreamError::ConnectFailed(active_timeouts.error_message(&e))
                             } else {
-                                StreamError::Http(super::stream_idle_error_message(
-                                    &e,
-                                    idle_timeout,
-                                ))
+                                StreamError::Http(active_timeouts.error_message(&e))
                             }))
                             .await;
                         return;
                     }
                 };
                 if response.status().is_success() {
-                    break response;
+                    break (response, active_timeouts);
                 }
 
                 let status = response.status();
@@ -5016,7 +4942,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 response,
                 count_tokens,
                 targets_mistral_tool_call_contract,
-                idle_timeout,
+                timeouts,
             );
             while let Some(event) = event_stream.next().await {
                 if tx.send(event).await.is_err() {
@@ -5126,8 +5052,14 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             // `StreamEvent::Usage`.
 
             let url = provider.chat_completions_url();
-            let client = provider.streaming_http_client();
-            let idle_timeout = super::stream_idle_timeout(provider.timeout_secs);
+            let client = match provider.streaming_http_client() {
+                Ok(client) => client,
+                Err(error) => {
+                    let _ = tx.send(Err(StreamError::Http(error.to_string()))).await;
+                    return;
+                }
+            };
+            let timeouts = provider.streaming_timeouts();
             let auth_header = provider.auth_header.clone();
             let credential = match provider.resolve_credential().await {
                 Ok(credential) => credential,
@@ -5166,17 +5098,15 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             }
 
             // Send request
+            let timeouts = timeouts.start();
             let response = match req_builder.send().await {
                 Ok(r) => r,
                 Err(e) => {
                     let _ = tx
                         .send(Err(if e.is_connect() {
-                            StreamError::ConnectFailed(super::stream_idle_error_message(
-                                &e,
-                                idle_timeout,
-                            ))
+                            StreamError::ConnectFailed(timeouts.error_message(&e))
                         } else {
-                            StreamError::Http(super::stream_idle_error_message(&e, idle_timeout))
+                            StreamError::Http(timeouts.error_message(&e))
                         }))
                         .await;
                     return;
@@ -5195,7 +5125,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             }
 
             // Convert to chunk stream and forward to channel
-            let mut chunk_stream = sse_bytes_to_chunks(response, count_tokens, idle_timeout);
+            let mut chunk_stream = sse_bytes_to_chunks(response, count_tokens, timeouts);
             while let Some(chunk) = chunk_stream.next().await {
                 if tx.send(chunk).await.is_err() {
                     break; // Receiver dropped
@@ -5280,8 +5210,14 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             // `StreamEvent::Usage`.
 
             let url = provider.chat_completions_url();
-            let client = provider.streaming_http_client();
-            let idle_timeout = super::stream_idle_timeout(provider.timeout_secs);
+            let client = match provider.streaming_http_client() {
+                Ok(client) => client,
+                Err(error) => {
+                    let _ = tx.send(Err(StreamError::Http(error.to_string()))).await;
+                    return;
+                }
+            };
+            let timeouts = provider.streaming_timeouts();
             let auth_header = provider.auth_header.clone();
             let credential = match provider.resolve_credential().await {
                 Ok(credential) => credential,
@@ -5313,17 +5249,15 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 req_builder = req_builder.header(OPENCODE_SESSION_HEADER, session);
             }
 
+            let timeouts = timeouts.start();
             let response = match req_builder.send().await {
                 Ok(r) => r,
                 Err(e) => {
                     let _ = tx
                         .send(Err(if e.is_connect() {
-                            StreamError::ConnectFailed(super::stream_idle_error_message(
-                                &e,
-                                idle_timeout,
-                            ))
+                            StreamError::ConnectFailed(timeouts.error_message(&e))
                         } else {
-                            StreamError::Http(super::stream_idle_error_message(&e, idle_timeout))
+                            StreamError::Http(timeouts.error_message(&e))
                         }))
                         .await;
                     return;
@@ -5340,7 +5274,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 return;
             }
 
-            let mut chunk_stream = sse_bytes_to_chunks(response, count_tokens, idle_timeout);
+            let mut chunk_stream = sse_bytes_to_chunks(response, count_tokens, timeouts);
             while let Some(chunk) = chunk_stream.next().await {
                 if tx.send(chunk).await.is_err() {
                     break;
@@ -5361,7 +5295,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         let url = self.models_url();
         let credential = self.resolve_credential().await?;
         let mut response = self
-            .apply_auth_header(self.http_client().get(&url), credential.as_deref())?
+            .apply_auth_header(self.http_client()?.get(&url), credential.as_deref())?
             .send()
             .await?;
         // Drain without retaining the catalog so HTTP/1 connections can be reused.
@@ -5592,6 +5526,56 @@ mod tests {
             .credential(key)
             .auth_style(AuthStyle::Bearer)
             .build()
+    }
+
+    #[tokio::test]
+    async fn compatible_transport_reuses_pools_for_headers_and_explicit_read_policy() {
+        use axum::{Router, extract::ConnectInfo, routing::get};
+        use std::net::SocketAddr;
+
+        let _proxy_guard = crate::RuntimeProxyTestGuard::acquire().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let app = Router::new().route(
+            "/",
+            get(|ConnectInfo(peer): ConnectInfo<SocketAddr>| async move { peer.to_string() }),
+        );
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+        let _server_guard = scopeguard::guard(server, |server| server.abort());
+        let peer =
+            async |client: Client| client.get(&url).send().await.unwrap().text().await.unwrap();
+        for custom_headers in [false, true] {
+            let mut builder = OpenAiCompatibleModelProvider::builder("test")
+                .display_name("transport-test")
+                .base_url(&url)
+                .auth_style(AuthStyle::Bearer)
+                .read_timeout_secs(30);
+            if custom_headers {
+                builder = builder.user_agent("transport-test");
+            }
+            let provider = builder.build();
+            for streaming in [false, true] {
+                let client = || {
+                    if streaming {
+                        provider.streaming_http_client().unwrap()
+                    } else {
+                        provider.http_client().unwrap()
+                    }
+                };
+                assert_eq!(
+                    peer(client()).await,
+                    peer(client()).await,
+                    "identical compatible transport settings must reuse the connection pool"
+                );
+            }
+        }
     }
 
     async fn mock_non_streaming_response(
@@ -9975,9 +9959,9 @@ mod tests {
             "readable file (even with bad PEM) must populate tls_ca_cert_pem bytes"
         );
         // http_client() must build cleanly even when PEM parse fails internally.
-        // The method returns Client directly (panics on builder error), so if we
-        // reach here without panic the fallback-to-system-roots path is working.
-        let _client = p.http_client();
+        // Malformed optional PEM retains system roots; unrelated client setup
+        // errors are returned to the caller.
+        let _client = p.http_client().unwrap();
     }
 
     #[test]
@@ -10001,7 +9985,7 @@ mod tests {
             p.tls_ca_cert_pem.is_some(),
             "readable file (even with bad PEM) must populate tls_ca_cert_pem bytes"
         );
-        let _client = p.streaming_http_client();
+        let _client = p.streaming_http_client().unwrap();
     }
 
     #[tokio::test]
@@ -10028,7 +10012,12 @@ mod tests {
     }
 
     async fn collect_stream_events(body: &'static str) -> Vec<StreamResult<StreamEvent>> {
-        let mut stream = sse_bytes_to_events(sse_response(body), false);
+        let mut stream = sse_bytes_to_events(
+            sse_response(body),
+            false,
+            crate::StreamTimeouts::from(crate::StreamIdleBound::Fixed(crate::STREAM_IDLE_TIMEOUT))
+                .start(),
+        );
         let mut events = Vec::new();
         while let Ok(Some(ev)) =
             tokio::time::timeout(std::time::Duration::from_secs(2), stream.next()).await
@@ -10073,6 +10062,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn legacy_timeout_does_not_end_active_stream_in_every_entry_point() {
+        use axum::{Router, body::Body, routing::post};
+        use futures_util::StreamExt as _;
+        let _proxy_guard = crate::RuntimeProxyTestGuard::acquire().await;
+        let app = Router::new().route(
+            "/chat/completions",
+            post(|| async {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                let first = futures_util::stream::once(async {
+                    Ok::<_, std::convert::Infallible>(
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"first\"}}]}\n\n",
+                    )
+                });
+                let open = futures_util::stream::pending::<
+                    Result<&'static str, std::convert::Infallible>,
+                >();
+                Body::from_stream(first.chain(open))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server =
+            zeroclaw_spawn::spawn!(async move { axum::serve(listener, app).await.unwrap() });
+        for entry in ["events", "system", "history"] {
+            let mut builder = OpenAiCompatibleModelProvider::builder("test")
+                .display_name("test")
+                .base_url(&url)
+                .auth_style(AuthStyle::Bearer)
+                .credential(Some("fixture-key"))
+                .timeout_secs(1)
+                .read_timeout_secs(3);
+            if entry == "events" {
+                builder = builder.extra_headers(std::collections::HashMap::from([(
+                    "x-fixture".to_owned(),
+                    "present".to_owned(),
+                )]));
+            }
+            let provider = builder.build();
+            let messages = [ChatMessage::user("hi")];
+            let mut stream = match entry {
+                "events" => provider
+                    .stream_chat(
+                        ProviderChatRequest::new(&messages),
+                        "test-model",
+                        None,
+                        StreamOptions::new(true),
+                    )
+                    .map(|result| result.map(drop))
+                    .boxed(),
+                "system" => provider
+                    .stream_chat_with_system(
+                        None,
+                        "hi",
+                        "test-model",
+                        None,
+                        StreamOptions::new(true),
+                    )
+                    .map(|result| result.map(drop))
+                    .boxed(),
+                _ => provider
+                    .stream_chat_with_history(
+                        &messages,
+                        "test-model",
+                        None,
+                        StreamOptions::new(true),
+                    )
+                    .map(|result| result.map(drop))
+                    .boxed(),
+            };
+            tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .expect("initial data must arrive before the deadline");
+            let still_active =
+                tokio::time::timeout(std::time::Duration::from_millis(1200), stream.next()).await;
+            assert!(
+                still_active.is_err(),
+                "{entry}: legacy timeout_secs must not terminate an active stream: {still_active:?}"
+            );
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn done_sentinel_finishes_chunk_stream_without_eof() {
         let (response, server) = open_sse_response(
             "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n",
@@ -10081,7 +10155,8 @@ mod tests {
         let mut stream = sse_bytes_to_chunks(
             response,
             false,
-            crate::StreamIdleBound::Fixed(crate::STREAM_IDLE_TIMEOUT),
+            crate::StreamTimeouts::from(crate::StreamIdleBound::Fixed(crate::STREAM_IDLE_TIMEOUT))
+                .start(),
         );
 
         let first = tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
@@ -10105,7 +10180,12 @@ mod tests {
             "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n",
         )
         .await;
-        let mut stream = sse_bytes_to_events(response, false);
+        let mut stream = sse_bytes_to_events(
+            response,
+            false,
+            crate::StreamTimeouts::from(crate::StreamIdleBound::Fixed(crate::STREAM_IDLE_TIMEOUT))
+                .start(),
+        );
         let mut saw_final = false;
 
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
@@ -10727,12 +10807,12 @@ mod tests {
         let has_policy = |client: Client| format!("{client:?}").contains("redirect_policy");
 
         let opencode = opencode_provider("https://opencode.ai/zen/v1");
-        assert!(has_policy(opencode.http_client()));
-        assert!(has_policy(opencode.streaming_http_client()));
+        assert!(has_policy(opencode.http_client().unwrap()));
+        assert!(has_policy(opencode.streaming_http_client().unwrap()));
 
         let other = opencode_provider("https://api.openai.com/v1");
-        assert!(!has_policy(other.http_client()));
-        assert!(!has_policy(other.streaming_http_client()));
+        assert!(!has_policy(other.http_client().unwrap()));
+        assert!(!has_policy(other.streaming_http_client().unwrap()));
     }
 
     #[test]
@@ -12718,12 +12798,9 @@ mod tests {
 
     #[test]
     fn effective_content_preserves_literal_think_tags() {
-        // The deleted `strip_think_tags()` helper searched for the exact
-        // substring `<think>` / `</think>` and stripped those blocks
-        // unconditionally. This regression pins that literal `<think>` tags
-        // now round-trip byte-for-byte, including legitimate uses where the
-        // model legitimately discusses the tag (HTML sample, code quoting,
-        // meta-discussion).
+        // Wire deserialization preserves literal content byte-for-byte.
+        // Think extraction is a later, admitted response policy rather than a
+        // transport-side mutation, so HTML/code examples remain intact here.
         let json = r#"{"choices":[{"message":{"content":"Here is the HTML: <think>internal note</think>"}}]}"#;
         let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
         let msg = &resp.choices[0].message;
@@ -13852,11 +13929,9 @@ mod tests {
 
     #[test]
     fn effective_content_preserves_unclosed_think_tag() {
-        // An unclosed literal `<think>` tag must NOT discard the rest of the
-        // response. The old `strip_think_tags()` helper saw no closing
-        // `</think>` and dropped the trailing tail, collapsing
-        // "Visible <think>hidden tail" to "Visible". The new path returns
-        // the input unchanged.
+        // An unclosed literal `<think>` tag must not discard the rest of the
+        // wire response. Deserialization preserves the input unchanged; any
+        // admitted extraction policy runs after the provider response exists.
         let json = r#"{"choices":[{"message":{"content":"Visible <think>hidden tail"}}]}"#;
         let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
         let msg = &resp.choices[0].message;
@@ -13865,12 +13940,9 @@ mod tests {
 
     #[test]
     fn effective_content_preserves_multiple_think_blocks() {
-        // Multiple literal `<think>` blocks in `content` survive the removal
-        // intact. The old `strip_think_tags()` helper would have collapsed
-        // the visible text to "Answer A  and B  done" — the double spaces
-        // mark where `<think>hidden 1</think>` and `<think>hidden 2</think>`
-        // used to be — losing the inter-block separators and the tag
-        // delimiters themselves.
+        // Multiple literal `<think>` blocks in wire content survive intact.
+        // The shared response normalizer decides later whether this model's
+        // admitted policy extracts them.
         let json = r#"{"choices":[{"message":{"content":"Answer A <think>hidden 1</think> and B <think>hidden 2</think> done"}}]}"#;
         let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
         let msg = &resp.choices[0].message;
@@ -13947,15 +14019,9 @@ mod tests {
 
     #[test]
     fn reasoning_content_preserved_when_content_only_think_tags() {
-        // The compatible provider no longer strips literal
-        // `<think>...</think>` blocks from `content`. Previously the
-        // `<think>secret</think>`-only content was collapsed to the empty
-        // string by `strip_think_tags()`, and `effective_content()` returned
-        // `""` so the visible-text field was effectively replaced by the
-        // model's chain-of-thought marker. Now the literal `<think>` tags
-        // round-trip into `effective_content()` byte-for-byte, and
-        // `reasoning_content` is still preserved separately and not leaked
-        // into the response text.
+        // Wire content and reasoning metadata remain separate. The shared
+        // response normalizer, rather than this deserializer, decides whether
+        // an admitted model policy extracts inline reasoning from content.
         let json = r#"{"choices":[{"message":{"content":"<think>secret</think>","reasoning_content":"Thinking text"}}]}"#;
         let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
         let msg = &resp.choices[0].message;
@@ -16176,7 +16242,10 @@ mod tests {
         let mut stream = sse_bytes_to_chunks(
             response,
             false,
-            crate::StreamIdleBound::Fixed(std::time::Duration::from_secs(300)),
+            crate::StreamTimeouts::from(crate::StreamIdleBound::Fixed(
+                std::time::Duration::from_secs(300),
+            ))
+            .start(),
         );
         let first = tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
             .await
@@ -16262,14 +16331,14 @@ mod tests {
             .extra_headers(headers)
             .build();
         // Should not panic
-        let _client = p.http_client();
+        let _client = p.http_client().unwrap();
     }
 
     #[test]
     fn http_client_without_extra_headers_or_user_agent() {
         let p = make_model_provider("test", "https://example.com", None);
         // Should use the cached proxy client path
-        let _client = p.http_client();
+        let _client = p.http_client().unwrap();
     }
 
     #[test]
@@ -16287,7 +16356,7 @@ mod tests {
         assert_eq!(p.user_agent.as_deref(), Some("CustomAgent/1.0"));
         assert_eq!(p.extra_headers.len(), 1);
         // Should not panic
-        let _client = p.http_client();
+        let _client = p.http_client().unwrap();
     }
 
     #[test]

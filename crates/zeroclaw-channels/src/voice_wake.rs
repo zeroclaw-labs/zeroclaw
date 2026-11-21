@@ -8,9 +8,9 @@ use async_trait::async_trait;
 use cpal::Sample;
 use tokio::sync::mpsc;
 
-use crate::transcription::TranscriptionManager;
 use zeroclaw_config::schema::TranscriptionConfig;
 use zeroclaw_config::schema::VoiceWakeConfig;
+use zeroclaw_providers::transcription::TranscriptionManager;
 
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
 

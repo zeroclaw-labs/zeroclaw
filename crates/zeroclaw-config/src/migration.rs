@@ -7,8 +7,11 @@ use crate::schema::v2::V2Config;
 
 /// The schema version this binary writes and expects on disk.
 ///
-/// V4 retires keys listed in [`RETIRED_KEYS`] (first: `[security.nevis]`).
-pub const CURRENT_SCHEMA_VERSION: u32 = 4;
+/// V4 is the frozen released layout. V5 is the current evolution boundary;
+/// its changes run only in the V4 → V5 migration step.
+pub const CURRENT_SCHEMA_VERSION: u32 = 5;
+
+mod v4_to_v5;
 
 /// Something a migration changed or assumed about the operator's config.
 ///
@@ -447,16 +450,17 @@ pub fn detect_version(value: &toml::Value) -> Result<u32> {
                 );
                 let fix = match retired {
                     Some((path, reason)) => format!(
-                        "`{path}` is retired ({reason}), so if the rest of the file is current, \
+                        "`{path}` is retired ({reason}), so if the rest of the file is in the released V4 layout, \
                          adding `schema_version = 4` as its first line is the whole fix: the \
                          current layout then drops it with a notice. If the whole file is \
                          older, add `schema_version = 1` or `schema_version = 2` instead"
                     ),
-                    None => "Rewrite the older settings in the current layout and add \
-                             `schema_version = 4` as the first line, or, if the whole file is \
-                             older, add `schema_version = 1` or `schema_version = 2` instead; \
-                             `zeroclaw config migrate` then rewrites it in the current layout"
-                        .to_string(),
+                    None => format!(
+                        "Rewrite the older settings in the released V4 layout and add \
+                         `schema_version = 4` as the first line, or, if the whole file is \
+                         older, add `schema_version = 1` or `schema_version = 2` instead; \
+                         `zeroclaw config migrate` then applies the V4 → V5 migration"
+                    ),
                 };
                 anyhow::bail!(
                     "config has no `schema_version` and mixes layouts: {current}, but {legacy}. \
@@ -475,7 +479,8 @@ pub fn detect_version(value: &toml::Value) -> Result<u32> {
                     "config has no `schema_version`, and {detail}. Add `schema_version` as the \
                      first line of the file with the version it was written for, so it is not \
                      guessed: `schema_version = 1` or `schema_version = 2` for an older file, \
-                     `schema_version = 3` or `schema_version = 4` for the current layout"
+                     `schema_version = 3` or `schema_version = 4` for their released layouts, \
+                     or `schema_version = {CURRENT_SCHEMA_VERSION}` only when the file was written by a V5-aware binary"
                 )
             }
         },
@@ -507,8 +512,8 @@ enum UnversionedShape {
     /// A section only the V3 layout has beside a setting only an older one
     /// has. Either reading reshapes or drops part of the file, so neither is
     /// chosen. `retired` names the older setting, and the reason, when the
-    /// current layout retires it anyway, so stating the current version is
-    /// the whole fix.
+    /// released V4 layout retires it anyway, so stating V4 lets the normal
+    /// V4 → V5 migration apply afterward.
     Mixed {
         current: String,
         legacy: String,
@@ -2514,6 +2519,8 @@ const MIGRATION_STEPS: &[MigrationStep] = &[
     // V3 → V4: no shape change; the chain applies the V4 entries in
     // `RETIRED_KEYS` after this step.
     |value| stamp_schema_version(value, 4),
+    // V4 → V5 is isolated so future shape changes do not rewrite V4.
+    v4_to_v5::migrate,
 ];
 
 const _: () = assert!(
@@ -2564,10 +2571,10 @@ fn run_chain_until(
             apply_retired_keys(&mut cur, version, RETIRED_KEYS, notices);
         }
     }
-    // Caps belong to the current schema: a chain that stops at a historical
-    // version produces what that version wrote, while every route to the
-    // current one (load, migrate, `config generate`) gets the caps applied.
-    if target == CURRENT_SCHEMA_VERSION {
+    // Caps belong to V4 and later: a chain that stops at a historical version
+    // produces what that version wrote, while every route through V4 or V5
+    // (load, migrate, `config generate`) gets the caps applied.
+    if target >= 4 {
         lower_capped_keys(&mut cur, notices);
     }
     Ok(cur)
@@ -5854,7 +5861,7 @@ client_secret = "plaintext-nevis-secret"
             .expect("a V3 config migrates to V4");
 
         let value: toml::Value = toml::from_str(&migrated).unwrap();
-        assert_eq!(detect_version(&value).unwrap(), 4);
+        assert_eq!(detect_version(&value).unwrap(), CURRENT_SCHEMA_VERSION);
         let security = value["security"].as_table().expect("[security] kept");
         assert!(!security.contains_key("nevis"), "{migrated}");
         assert_eq!(
@@ -6962,7 +6969,7 @@ mention_only = false
         for _ in 0..4 {
             let mut created = false;
             for section in Config::map_key_sections() {
-                if config.create_map_key(section.path, "probe") == Ok(true) {
+                if config.create_map_key(&section.path, "probe") == Ok(true) {
                     created = true;
                 }
             }
@@ -7744,7 +7751,7 @@ mention_only = false
             assert!(
                 err.contains("is retired (")
                     && err.contains(
-                        "so if the rest of the file is current, adding `schema_version = 4` \
+                        "so if the rest of the file is in the released V4 layout, adding `schema_version = 4` \
                          as its first line is the whole fix"
                     ),
                 "{err}"
@@ -8791,7 +8798,9 @@ summary_model = "opus"
         assert!(notices.is_empty(), "{notices:?}");
         assert_eq!(
             migrated,
-            format!("schema_version = 4  # stamped by an older zeroclaw\n{UNTOUCHED_V3_BODY}"),
+            format!(
+                "schema_version = {CURRENT_SCHEMA_VERSION}  # stamped by an older zeroclaw\n{UNTOUCHED_V3_BODY}"
+            ),
             "everything but the version must keep its exact bytes"
         );
     }

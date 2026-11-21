@@ -50,7 +50,7 @@ fn write_config(dir: &std::path::Path, uri: &str) {
     std::fs::write(
         dir.join("config.toml"),
         format!(
-            r#"schema_version = 4
+            r#"schema_version = 5
 locale = "en"
 
 [reliability]

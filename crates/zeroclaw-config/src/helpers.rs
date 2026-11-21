@@ -1207,3 +1207,211 @@ mod tests {
         assert!(!is_unknown_property_error(&marker, "gateway.host"));
     }
 }
+
+#[cfg(test)]
+mod registry_reflection_tests {
+    use crate::traits::MaskSecrets;
+    use serde::{Deserialize, Serialize};
+    use std::collections::HashMap;
+    use zeroclaw_macros::Configurable;
+
+    #[derive(Debug, Default, Serialize, Deserialize, Configurable)]
+    #[prefix = "profiles"]
+    struct Model {
+        id: String,
+    }
+
+    #[derive(Debug, Default, Serialize, Deserialize, Configurable)]
+    #[prefix = "profiles"]
+    struct Profile {
+        #[nested]
+        #[resource_key]
+        models: HashMap<String, Model>,
+    }
+
+    #[derive(Debug, Default, Serialize, Deserialize, Configurable)]
+    #[prefix = "profiles.openai"]
+    struct Family {
+        #[nested]
+        #[serde(flatten)]
+        base: Profile,
+    }
+
+    #[derive(Debug, Default, Serialize, Deserialize, Configurable)]
+    #[prefix = "root"]
+    struct Catalog {
+        #[nested]
+        profiles: HashMap<String, Family>,
+    }
+
+    #[test]
+    fn nested_map_crud_rebases_flattened_prefix_and_preserves_dotted_keys() {
+        let mut family = Family::default();
+        let sections = Family::map_key_sections();
+        let section = &sections
+            .iter()
+            .find(|section| section.path.ends_with(".models"))
+            .unwrap()
+            .path;
+        assert_eq!(section, "profiles.openai.models");
+        assert!(family.create_map_key(section, "chat.fast").unwrap());
+        assert_eq!(family.get_map_keys(section).unwrap(), vec!["chat.fast"]);
+        assert!(
+            family
+                .rename_map_key(section, "chat.fast", "chat.backup")
+                .unwrap()
+        );
+        assert!(family.delete_map_key(section, "chat.backup").unwrap());
+
+        let mut catalog = Catalog::default();
+        catalog
+            .profiles
+            .insert("gateway.prod".into(), Family::default());
+        let section = "root.profiles.gateway.prod.models";
+        assert!(catalog.create_map_key(section, "chat.fast").unwrap());
+        assert_eq!(catalog.get_map_keys(section).unwrap(), vec!["chat.fast"]);
+        assert!(
+            catalog.profiles["gateway.prod"]
+                .base
+                .models
+                .contains_key("chat.fast")
+        );
+        assert!(
+            catalog
+                .rename_map_key(section, "chat.fast", "chat.backup")
+                .unwrap()
+        );
+        assert!(catalog.delete_map_key(section, "chat.backup").unwrap());
+        assert!(catalog.get_map_keys(section).unwrap().is_empty());
+    }
+
+    #[derive(Debug, Default, Serialize, Deserialize, Configurable)]
+    #[prefix = "sample"]
+    #[secret_hook = "extension_secrets"]
+    struct SecretSample {
+        #[secret]
+        token: String,
+        #[serde(skip)]
+        extra: String,
+    }
+
+    mod extension_secrets {
+        use super::SecretSample;
+        use crate::secrets::SecretStore;
+        use crate::traits::{MASKED_SECRET, SecretField, SecretFieldInfo};
+
+        pub fn secret_fields(value: &SecretSample, fields: &mut Vec<SecretFieldInfo>) {
+            fields.push(SecretFieldInfo {
+                name: "sample.extra",
+                category: "sample",
+                is_set: !value.extra.is_empty(),
+            });
+        }
+
+        pub fn encrypt_secrets(
+            value: &mut SecretSample,
+            store: &SecretStore,
+        ) -> anyhow::Result<()> {
+            value.extra.encrypt_in_place(store, "sample.extra")
+        }
+
+        pub fn decrypt_secrets(
+            value: &mut SecretSample,
+            store: &SecretStore,
+        ) -> anyhow::Result<()> {
+            value.extra.decrypt_in_place(store, "sample.extra")
+        }
+
+        pub fn mask_secrets(value: &mut SecretSample) -> anyhow::Result<()> {
+            anyhow::ensure!(value.extra != "fixture-error", "extension mask failed");
+            if !value.extra.is_empty() {
+                value.extra = MASKED_SECRET.to_owned();
+            }
+            Ok(())
+        }
+
+        pub fn restore_secrets_from(
+            value: &mut SecretSample,
+            current: &SecretSample,
+        ) -> anyhow::Result<()> {
+            anyhow::ensure!(current.extra != "fixture-error", "extension restore failed");
+            if value.extra == MASKED_SECRET {
+                value.extra.clone_from(&current.extra);
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn extension_secret_hooks_join_the_existing_secret_lifecycle() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = crate::secrets::SecretStore::new(directory.path(), true);
+        let mut value = SecretSample {
+            token: "fixture-static".into(),
+            extra: "fixture-extension".into(),
+        };
+        assert_eq!(value.secret_fields().len(), 2);
+        value.encrypt_secrets(&store).unwrap();
+        assert_ne!(value.token, "fixture-static");
+        assert_ne!(value.extra, "fixture-extension");
+        value.decrypt_secrets(&store).unwrap();
+        assert_eq!(value.token, "fixture-static");
+        assert_eq!(value.extra, "fixture-extension");
+        let mut masked = SecretSample {
+            token: value.token.clone(),
+            extra: value.extra.clone(),
+        };
+        masked.mask_secrets().unwrap();
+        assert_eq!(masked.token, crate::traits::MASKED_SECRET);
+        assert_eq!(masked.extra, crate::traits::MASKED_SECRET);
+        masked.restore_secrets_from(&value).unwrap();
+        assert_eq!(masked.token, value.token);
+        assert_eq!(masked.extra, value.extra);
+    }
+
+    #[test]
+    fn extension_secret_hook_errors_reach_the_caller() {
+        let mut value = SecretSample {
+            token: String::new(),
+            extra: "fixture-error".into(),
+        };
+        assert!(
+            value
+                .mask_secrets()
+                .unwrap_err()
+                .to_string()
+                .contains("extension mask failed")
+        );
+        let mut masked = SecretSample::default();
+        assert!(
+            masked
+                .restore_secrets_from(&value)
+                .unwrap_err()
+                .to_string()
+                .contains("extension restore failed")
+        );
+    }
+
+    #[zeroclaw_macros::normalize_config_input(normalize)]
+    #[derive(Debug, Serialize)]
+    struct Admission {
+        #[serde(default)]
+        name: String,
+        #[cfg(any())]
+        excluded: String,
+    }
+
+    fn normalize(input: &mut Admission) -> anyhow::Result<()> {
+        anyhow::ensure!(input.name != "invalid", "invalid admission fixture");
+        input.name = input.name.trim().to_owned();
+        Ok(())
+    }
+
+    #[test]
+    fn input_normalization_runs_before_publication_and_propagates_errors() {
+        let input: Admission = toml::from_str("name = '  chat.fast  '").unwrap();
+        assert_eq!(input.name, "chat.fast");
+        assert!(toml::from_str::<Admission>("name = 'invalid'").is_err());
+        assert_eq!(toml::from_str::<Admission>("").unwrap().name, "");
+    }
+}

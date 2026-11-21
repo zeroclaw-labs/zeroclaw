@@ -1670,7 +1670,7 @@ impl ModelProvider for OpenAiCodexModelProvider {
                 request_builder,
                 &tx,
                 count_tokens,
-                crate::StreamIdleBound::Fixed(crate::STREAM_IDLE_TIMEOUT),
+                crate::StreamIdleBound::Fixed(crate::STREAM_IDLE_TIMEOUT).into(),
             )
             .await;
         });

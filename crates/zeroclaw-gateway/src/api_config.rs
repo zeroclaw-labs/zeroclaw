@@ -95,7 +95,12 @@ pub struct PatchResponse {
 /// served by a newer gateway.
 pub async fn handle_config_get(State(state): State<AppState>) -> Response {
     let mut cfg = state.config.read().clone();
-    cfg.mask_secrets();
+    if let Err(error) = cfg.mask_secrets() {
+        return error_response(ConfigApiError::new(
+            ConfigApiCode::ValidationFailed,
+            format!("failed to mask configuration secrets: {error}"),
+        ));
+    }
     Json(cfg).into_response()
 }
 
@@ -1347,7 +1352,7 @@ pub struct TemplatesResponse {
 #[derive(Debug, Serialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct TemplateEntry {
-    pub path: &'static str,
+    pub path: String,
     /// `map` for `HashMap<String, T>`, `list` for `Vec<T>`.
     pub kind: &'static str,
     /// Rust type name of the value, e.g. `ModelProviderConfig`.
