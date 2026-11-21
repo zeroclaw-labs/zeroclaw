@@ -899,7 +899,7 @@ mod tests {
     struct DetEmbedding;
 
     #[async_trait]
-    impl crate::embeddings::EmbeddingProvider for DetEmbedding {
+    impl zeroclaw_api::embedding::EmbeddingProvider for DetEmbedding {
         fn name(&self) -> &str {
             "det"
         }

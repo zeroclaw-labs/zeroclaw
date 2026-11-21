@@ -516,10 +516,10 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
 
                 // MaskSecrets — the blanket impl handles both single and double nesting.
                 mask_ops.push(quote! {
-                    crate::traits::MaskSecrets::mask_secrets(&mut self.#field_ident);
+                    crate::traits::MaskSecrets::mask_secrets(&mut self.#field_ident)?;
                 });
                 restore_ops.push(quote! {
-                    crate::traits::MaskSecrets::restore_secrets_from(&mut self.#field_ident, &current.#field_ident);
+                    crate::traits::MaskSecrets::restore_secrets_from(&mut self.#field_ident, &current.#field_ident)?;
                 });
 
                 let field_name_lit = snake_to_kebab(&field_ident.to_string());
@@ -1181,11 +1181,11 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                 continue;
             } else if is_option {
                 mask_ops.push(quote! {
-                    if let Some(inner) = &mut self.#field_ident { inner.mask_secrets(); }
+                    if let Some(inner) = &mut self.#field_ident { inner.mask_secrets()?; }
                 });
                 restore_ops.push(quote! {
                     if let Some(inner) = &mut self.#field_ident {
-                        if let Some(cur) = &current.#field_ident { inner.restore_secrets_from(cur); }
+                        if let Some(cur) = &current.#field_ident { inner.restore_secrets_from(cur)?; }
                     }
                 });
 
@@ -1356,13 +1356,13 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                     }
                 });
                 mask_ops.push(quote! {
-                    crate::traits::MaskSecrets::mask_secrets(&mut self.#field_ident);
+                    crate::traits::MaskSecrets::mask_secrets(&mut self.#field_ident)?;
                 });
                 restore_ops.push(quote! {
                     crate::traits::MaskSecrets::restore_secrets_from(
                         &mut self.#field_ident,
                         &current.#field_ident,
-                    );
+                    )?;
                 });
 
                 let vec_inner_name = vec_inner_ty.to_token_stream().to_string();
@@ -1753,10 +1753,10 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                 });
 
                 mask_ops.push(quote! {
-                    self.#field_ident.mask_secrets();
+                    self.#field_ident.mask_secrets()?;
                 });
                 restore_ops.push(quote! {
-                    self.#field_ident.restore_secrets_from(&current.#field_ident);
+                    self.#field_ident.restore_secrets_from(&current.#field_ident)?;
                 });
 
                 let field_ty = &field.ty;
@@ -2395,11 +2395,13 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
         }
 
         impl crate::traits::MaskSecrets for #struct_name {
-            fn mask_secrets(&mut self) {
+            fn mask_secrets(&mut self) -> anyhow::Result<()> {
                 #(#mask_ops)*
+                Ok(())
             }
-            fn restore_secrets_from(&mut self, current: &Self) {
+            fn restore_secrets_from(&mut self, current: &Self) -> anyhow::Result<()> {
                 #(#restore_ops)*
+                Ok(())
             }
         }
     };

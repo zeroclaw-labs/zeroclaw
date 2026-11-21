@@ -15,7 +15,7 @@
 #
 # You should see the command flow through to the simulator and the visualizer update.
 
-schema_version = 4
+schema_version = 5
 
 # ─── Providers ─────────────────────────────────────────────────────────────
 # Use OpenRouter (set OPENROUTER_API_KEY in your .env).

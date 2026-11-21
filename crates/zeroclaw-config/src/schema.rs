@@ -885,6 +885,34 @@ impl WireApi {
     }
 }
 
+/// Wire protocol used by a typed decision model.
+///
+/// `openai_decisions` is OpenAI's dedicated Decisions API (`POST
+/// /v1/decisions`). OpenAI-compatible gateways and local servers can expose
+/// the same contract. `system_one` keeps the existing Jev / Laya contract
+/// available for legacy decision entries. Chat Completions and Responses are
+/// chat wire APIs and are intentionally represented by [`WireApi`] instead.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum DecisionWireApi {
+    #[serde(rename = "openai_decisions")]
+    OpenAiDecisions,
+    SystemOne,
+}
+
+impl DecisionWireApi {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::OpenAiDecisions => "openai_decisions",
+            Self::SystemOne => "system_one",
+        }
+    }
+}
+
 /// Policy for images a native tool-result carrier declared in its
 /// `attachments` array.
 #[derive(

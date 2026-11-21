@@ -1802,8 +1802,10 @@ mod tests {
         Sop, SopExecutionMode, SopPriority, SopRunAction, SopStep, SopStepResult, SopStepStatus,
         SopTrigger, SopTriggerSource,
     };
+    use zeroclaw_api::decision::{Answer, Answers, DecisionModel, Question};
     use zeroclaw_config::schema::SopConfig;
     use zeroclaw_memory::traits::{Memory, MemoryCategory, MemoryEntry};
+    use zeroclaw_providers::decision::SystemOneClient;
 
     fn test_sop(name: &str, triggers: Vec<SopTrigger>) -> Sop {
         Sop {
@@ -3782,9 +3784,7 @@ mod tests {
 
     mod decision_gating {
         use super::*;
-        use crate::sop::decision::{
-            Answer, Answers, DecisionModel, GateOnError, Question, SopDecisionSpec, SystemOneClient,
-        };
+        use crate::sop::decision::{GateOnError, SopDecisionSpec};
         use std::collections::BTreeMap;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
