@@ -5785,21 +5785,31 @@ mod tests {
                 })
             }));
 
-            let (result, started) = tokio::time::timeout(DAEMON_DEADLOCK_GUARD, async {
-                tokio::join!(
-                    run_fixture(
-                        config,
-                        "127.0.0.1".to_string(),
-                        0,
-                        registry,
-                        false,
-                        startup_feedback_enabled,
-                    ),
-                    started_rx.recv(),
-                )
+            // Keep the large daemon future out of the observer's poll stack.
+            let deadline = tokio::time::Instant::now() + DAEMON_DEADLOCK_GUARD;
+            let daemon = zeroclaw_spawn::spawn!(run_fixture(
+                config,
+                "127.0.0.1".to_string(),
+                0,
+                registry,
+                false,
+                startup_feedback_enabled,
+            ));
+            let mut daemon = scopeguard::guard(daemon, |task| task.abort());
+            let (started, result) = match tokio::time::timeout_at(deadline, async {
+                let started = started_rx.recv().await;
+                (started, (&mut *daemon).await)
             })
             .await
-            .expect("daemon must not deadlock on an initial socket ownership conflict");
+            {
+                Ok(outcome) => outcome,
+                Err(_) => {
+                    daemon.abort();
+                    let _ = (&mut *daemon).await;
+                    panic!("daemon must not deadlock on an initial socket ownership conflict");
+                }
+            };
+            let result = result.expect("daemon task should not panic");
             started.expect("socket starter should observe the initial startup attempt");
             let error =
                 result.expect_err("daemon startup should fail on an initially owned socket");
