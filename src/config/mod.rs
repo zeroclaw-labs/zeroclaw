@@ -114,6 +114,7 @@ mod tests {
             per_user_session: true,
             passive_group_context: false,
             ack_reactions: None,
+            ack_reaction_emojis: Vec::new(),
             proxy_url: None,
             approval_timeout_secs: 120,
             excluded_tools: vec![],

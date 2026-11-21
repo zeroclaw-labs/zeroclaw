@@ -711,8 +711,17 @@ fn pick_uniform_index(len: usize) -> usize {
     }
 }
 
-fn random_telegram_ack_reaction() -> &'static str {
-    TELEGRAM_ACK_REACTIONS[pick_uniform_index(TELEGRAM_ACK_REACTIONS.len())]
+fn select_telegram_ack_reaction(configured: &[String]) -> &str {
+    let pool: Vec<&str> = configured
+        .iter()
+        .map(|emoji| emoji.trim())
+        .filter(|emoji| !emoji.is_empty())
+        .collect();
+    match pool.as_slice() {
+        [] => TELEGRAM_ACK_REACTIONS[pick_uniform_index(TELEGRAM_ACK_REACTIONS.len())],
+        [emoji] => emoji,
+        _ => pool[pick_uniform_index(pool.len())],
+    }
 }
 
 fn build_telegram_ack_reaction_request(
@@ -1138,6 +1147,7 @@ pub struct TelegramChannel {
     voice_transcriptions: Mutex<std::collections::HashMap<String, String>>,
     workspace_dir: Option<std::path::PathBuf>,
     ack_reactions: bool,
+    ack_reaction_emojis_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
     tts_manager: Option<Arc<super::tts::TtsManager>>,
     voice_chats: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     /// Resolves voice peers from canonical config at call-time.
@@ -2764,6 +2774,7 @@ impl TelegramChannel {
             voice_transcriptions: Mutex::new(std::collections::HashMap::new()),
             workspace_dir: None,
             ack_reactions: true,
+            ack_reaction_emojis_resolver: Arc::new(Vec::new),
             tts_manager: None,
             voice_chats: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             voice_peer_resolver: Arc::new(Vec::new) as Arc<dyn Fn() -> Vec<String> + Send + Sync>,
@@ -2831,6 +2842,15 @@ impl TelegramChannel {
     /// Configure whether Telegram-native acknowledgement reactions are sent.
     pub fn with_ack_reactions(mut self, enabled: bool) -> Self {
         self.ack_reactions = enabled;
+        self
+    }
+
+    /// Resolve the automatic acknowledgement emoji pool for each message.
+    pub(crate) fn with_ack_reaction_emojis_resolver(
+        mut self,
+        resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
+    ) -> Self {
+        self.ack_reaction_emojis_resolver = resolver;
         self
     }
 
@@ -3759,8 +3779,9 @@ impl TelegramChannel {
         let client = self.http_client();
         let url = self.api_url("setMessageReaction");
         let bot_token = self.bot_token.clone();
-        let emoji = random_telegram_ack_reaction().to_string();
-        let body = build_telegram_ack_reaction_request(&chat_id, message_id, &emoji);
+        let configured_emojis = (self.ack_reaction_emojis_resolver)();
+        let emoji = select_telegram_ack_reaction(&configured_emojis);
+        let body = build_telegram_ack_reaction_request(&chat_id, message_id, emoji);
         let clear_timeout = self.reaction_clear_timeout;
         let key = (chat_id.clone(), message_id);
         let state = Arc::new(AckReactionState::default());
@@ -9846,10 +9867,22 @@ mod tests {
     }
 
     #[test]
-    fn random_telegram_ack_reaction_is_from_pool() {
-        for _ in 0..128 {
-            let emoji = random_telegram_ack_reaction();
-            assert!(TELEGRAM_ACK_REACTIONS.contains(&emoji));
+    fn telegram_ack_reaction_defaults_to_builtin_pool() {
+        for configured in [vec![], vec![" ".into(), String::new()]] {
+            for _ in 0..32 {
+                let emoji = select_telegram_ack_reaction(&configured);
+                assert!(TELEGRAM_ACK_REACTIONS.contains(&emoji));
+            }
+        }
+    }
+
+    #[test]
+    fn telegram_ack_reaction_uses_only_configured_pool() {
+        assert_eq!(select_telegram_ack_reaction(&[" 👀 ".into()]), "👀");
+        let configured = [" 👀 ".into(), String::new(), "👍".into()];
+        for _ in 0..32 {
+            let emoji = select_telegram_ack_reaction(&configured);
+            assert!(["👀", "👍"].contains(&emoji));
         }
     }
 
@@ -21618,7 +21651,8 @@ mod tests {
             )
             .with_mock_api_base(server.uri())
             .with_workspace_dir(workspace.path().to_path_buf())
-            .with_ack_reactions(true),
+            .with_ack_reactions(true)
+            .with_ack_reaction_emojis_resolver(Arc::new(|| vec!["👀".into()])),
         );
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
         let listener_channel = Arc::clone(&channel);
@@ -21669,7 +21703,10 @@ mod tests {
             .iter()
             .filter(|request| request.url.path() == "/botfake-token/setMessageReaction")
             .filter_map(|request| request.body_json::<serde_json::Value>().ok())
-            .filter_map(|body| body.get("message_id").and_then(serde_json::Value::as_i64))
+            .filter_map(|body| {
+                assert_eq!(body["reaction"][0]["emoji"], "👀");
+                body.get("message_id").and_then(serde_json::Value::as_i64)
+            })
             .collect();
         assert_eq!(
             reaction_message_ids,

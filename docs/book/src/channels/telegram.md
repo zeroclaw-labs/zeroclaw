@@ -249,6 +249,22 @@ zeroclaw service stop
 zeroclaw service start
 ```
 
+## Choose the automatic acknowledgement emoji
+
+Set `ack_reaction_emojis` on a Telegram alias to replace the built-in pool.
+With a single emoji, the bot uses it for every automatic acknowledgement:
+
+```toml
+[channels.telegram.home]
+ack_reaction_emojis = ["👀"]
+```
+
+Use `["👀", "👍"]` to pick one at random per acknowledgement. Omit the key or
+use `[]` to keep the built-in pool. Surrounding whitespace and blank entries
+are ignored. `ack_reactions = false` still disables automatic acknowledgements.
+Use regular emojis supported by Telegram's Bot API and allowed in the chat.
+This setting does not change the agent's reply.
+
 ## Switching models from the chat (`/model`)
 
 Authorized senders can switch the active model interactively, without leaving

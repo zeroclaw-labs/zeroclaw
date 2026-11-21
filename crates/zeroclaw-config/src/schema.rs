@@ -17298,6 +17298,13 @@ pub struct TelegramConfig {
     #[tab(Behavior)]
     #[serde(default)]
     pub ack_reactions: Option<bool>,
+    /// Telegram Bot API emojis for automatic acknowledgements. A non-empty
+    /// list replaces the built-in pool. Whitespace and blank entries are
+    /// ignored. Omit or use an empty list for the built-in pool. Ignored when
+    /// acknowledgement reactions are disabled.
+    #[tab(Behavior)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ack_reaction_emojis: Vec<String>,
     /// Per-channel proxy URL (http, https, socks5, socks5h).
     /// Overrides the global `[proxy]` setting for this channel only.
     #[tab(Advanced)]
@@ -17342,6 +17349,7 @@ impl Default for TelegramConfig {
             per_user_session: true,
             passive_group_context: false,
             ack_reactions: None,
+            ack_reaction_emojis: Vec::new(),
             proxy_url: None,
             approval_timeout_secs: default_telegram_approval_timeout_secs(),
             excluded_tools: Vec::new(),
@@ -35005,6 +35013,7 @@ auto_save = true
                         per_user_session: true,
                         passive_group_context: false,
                         ack_reactions: None,
+                        ack_reaction_emojis: Vec::new(),
                         proxy_url: None,
                         approval_timeout_secs: default_telegram_approval_timeout_secs(),
                         excluded_tools: vec![],
@@ -37068,6 +37077,7 @@ default_temperature = 0.7
             per_user_session: true,
             passive_group_context: false,
             ack_reactions: None,
+            ack_reaction_emojis: Vec::new(),
             proxy_url: None,
             approval_timeout_secs: 120,
             excluded_tools: vec![],
@@ -44008,6 +44018,7 @@ high_entropy_tokens = false
                 per_user_session: true,
                 passive_group_context: false,
                 ack_reactions: None,
+                ack_reaction_emojis: Vec::new(),
                 proxy_url: None,
                 approval_timeout_secs: default_telegram_approval_timeout_secs(),
                 excluded_tools: vec![],
@@ -47286,6 +47297,22 @@ channel = "notion"
             debug_output.contains("***"),
             "Debug output must mask the private_key and access_token"
         );
+    }
+
+    #[test]
+    async fn telegram_ack_reaction_emojis_round_trip() {
+        let unset: TelegramConfig = toml::from_str("").unwrap();
+        assert!(unset.ack_reaction_emojis.is_empty());
+        assert!(TelegramConfig::default().ack_reaction_emojis.is_empty());
+        assert!(!toml::to_string(&unset)
+            .unwrap()
+            .contains("ack_reaction_emojis"));
+
+        let cfg: TelegramConfig = toml::from_str(r#"ack_reaction_emojis = ["👀", "👍"]"#).unwrap();
+        assert_eq!(cfg.ack_reaction_emojis, ["👀", "👍"]);
+        let serialized = toml::to_string(&cfg).unwrap();
+        let parsed: TelegramConfig = toml::from_str(&serialized).unwrap();
+        assert_eq!(parsed.ack_reaction_emojis, cfg.ack_reaction_emojis);
     }
 
     #[test]
