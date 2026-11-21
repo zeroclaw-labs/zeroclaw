@@ -1,12 +1,18 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useLocation } from 'react-router-dom';
 import { AgentProvider } from '@/contexts/AgentContext';
 import { AgentChatInner, type AgentChatStatus } from '@/pages/AgentChat';
 import { ChatTabBar, type TabIndicator, type WorkspaceLayout } from '@/components/ChatTabBar';
 import { basePath } from '@/lib/basePath';
+import { getSessions } from '@/lib/api';
+import { t } from '@/lib/i18n';
+import { useNotificationWindow, useWindowPanes } from './useNotificationWindow';
 import {
   applySessionChange,
   loadPersisted,
-  makeTab,
+  linkedSession,
+  ownedGatewaySession,
+  tabForRoute,
   reservationsByKey,
   STORAGE_KEY,
   tabForOpenRequest,
@@ -45,6 +51,36 @@ export interface ChatWorkspaceProps {
  * and its socket only closes — when its tab is explicitly closed.
  */
 export default function ChatWorkspace({ initialAlias, allowedAliases }: ChatWorkspaceProps) {
+  const location = useLocation();
+  const { state: notificationWindow, windowId } = useNotificationWindow(initialAlias);
+  const requested = linkedSession(location.search);
+  const [resolved, setResolved] = useState<{ alias: string; routeKey: string; requested?: string; session?: string }>();
+  useEffect(() => {
+    let cancelled = false;
+    const settle = (session?: string) => {
+      if (!cancelled) setResolved({ alias: initialAlias, routeKey: location.key, requested, session });
+    };
+    if (requested) {
+      void getSessions().then((rows) => settle(ownedGatewaySession(rows, initialAlias, requested)), () => settle());
+    } else {
+      settle();
+    }
+    return () => { cancelled = true; };
+  }, [initialAlias, requested, location.key]);
+
+  const route = requested ? resolved : { alias: initialAlias, routeKey: location.key, requested: undefined, session: undefined };
+  // Keep mounted panes and sockets during an in-app navigation. A cold link
+  // waits for the session inventory before it can mount a pane with that ID.
+  if (notificationWindow === 'forwarded') return <p role="status" className="p-4">{t('agent.notification_opened_elsewhere')}</p>;
+  if (notificationWindow === 'waiting' || !route || (allowedAliases && !allowedAliases.has(route.alias))) return null;
+  const waiting = route.routeKey !== location.key || route.alias !== initialAlias || route.requested !== requested;
+  return <Workspace initialAlias={route.alias} allowedAliases={allowedAliases}
+    session={route.session} routeKey={route.routeKey} waiting={waiting} windowId={windowId} />;
+}
+
+function Workspace({ initialAlias, allowedAliases, session, routeKey, waiting, windowId }: ChatWorkspaceProps & {
+  session?: string; routeKey: string; waiting: boolean; windowId: string;
+}) {
   const persisted = useRef<Partial<PersistedState>>(loadPersisted());
 
   const [tabs, setTabs] = useState<ChatTab[]>(() => {
@@ -53,21 +89,17 @@ export default function ChatWorkspace({ initialAlias, allowedAliases }: ChatWork
     );
     // The route's agent is always open, but only add it when it is not already
     // there — a deep link should land on the existing pane, not fork a new one.
-    return stored.some((tb) => tb.alias === initialAlias)
-      ? stored
-      : [...stored, makeTab(initialAlias)];
+    const tab = tabForRoute(stored, initialAlias, session, persisted.current.activeKey);
+    return stored.includes(tab) ? stored : [...stored, tab];
   });
   // Resolved up front rather than in an effect: an empty first commit would
   // activate tabs[0] and replaceState the URL to the wrong agent before the
   // route settled. Prefer the pane that was active when the workspace was
   // stored, so reloading with two panes of one agent returns to the right one.
   const [activeKey, setActiveKey] = useState<string>(() => {
-    const preferred = persisted.current.activeKey;
-    const match =
-      tabs.find((tb) => tb.key === preferred && tb.alias === initialAlias) ??
-      tabs.find((tb) => tb.alias === initialAlias);
-    return match?.key ?? tabs[0]?.key ?? '';
+    return tabForRoute(tabs, initialAlias, session, persisted.current.activeKey).key;
   });
+  useWindowPanes(windowId, tabs);
   const [layout, setLayout] = useState<WorkspaceLayout>(persisted.current.layout ?? 'tabs');
   const [splitKeys, setSplitKeys] = useState<[string, string | null]>(
     persisted.current.splitKeys ?? ['', null],
@@ -172,27 +204,20 @@ export default function ChatWorkspace({ initialAlias, allowedAliases }: ChatWork
     syncIndicators();
   }, [visibleKeys, syncIndicators]);
 
-  // Open + activate the route alias on mount and on every change, without
-  // remounting the workspace (the workspace is keyed by nothing volatile).
-  // Activates the agent's FIRST open pane rather than forking another: a deep
-  // link means "show me this agent", not "give me one more of it".
+  // A notification can target a second conversation of an already open agent.
+  const pendingRoute = useRef<string | null>(null);
   useEffect(() => {
-    // Already showing this agent — including on mount, where the initial state
-    // above resolved it. Bailing keeps this idempotent under StrictMode's
-    // double-invoked effects, which would otherwise re-activate the agent's
-    // first pane and undo the restored selection.
-    const current = tabsRef.current.find((tb) => tb.key === activeKeyRef.current);
-    if (current?.alias === initialAlias) return;
-
-    const existing = tabsRef.current.find((tb) => tb.alias === initialAlias);
-    if (existing) {
-      setActiveKey(existing.key);
-      return;
+    const open = tabsRef.current;
+    const tab = tabForRoute(open, initialAlias, session, activeKeyRef.current);
+    pendingRoute.current = tab.key;
+    if (!open.includes(tab)) {
+      setTabs((prev) => [...prev, tab]);
     }
-    const tab = makeTab(initialAlias);
-    setTabs((prev) => (prev.some((tb) => tb.alias === initialAlias) ? prev : [...prev, tab]));
     setActiveKey(tab.key);
-  }, [initialAlias]);
+    if (session) {
+      setSplitKeys((prev) => prev.includes(tab.key) ? prev : [tab.key, prev[1]]);
+    }
+  }, [initialAlias, session, routeKey]);
 
   // Persist workspace shape on any structural change.
   useEffect(() => {
@@ -240,6 +265,8 @@ export default function ChatWorkspace({ initialAlias, allowedAliases }: ChatWork
   // Mirror the active alias to the URL via history.replaceState only — never a
   // React Router navigate, which would remount AgentChat and kill connections.
   useEffect(() => {
+    if (waiting || (pendingRoute.current && pendingRoute.current !== activeTab?.key)) return;
+    pendingRoute.current = null;
     // Include the reverse-proxy prefix so `target` matches the real
     // `window.location.pathname` under a gateway base path (e.g. "/zeroclaw").
     // Without it the comparison would never match, firing replaceState every
@@ -248,10 +275,15 @@ export default function ChatWorkspace({ initialAlias, allowedAliases }: ChatWork
     // already normalized to "" (root) or a no-trailing-slash prefix, so plain
     // concatenation can't produce a double slash.
     const target = `${basePath}/agent/${activeTab?.alias ?? initialAlias}`;
-    if (window.location.pathname !== target) {
-      try { window.history.replaceState(window.history.state, '', target); } catch { /* noop */ }
+    const params = new URLSearchParams(window.location.search);
+    const linked = params.get('session');
+    if (window.location.pathname !== target || (linked !== null && linked !== activeTab?.sessionId && linked !== `gw_${activeTab?.sessionId}`)) {
+      params.delete('session');
+      const query = params.toString();
+      const url = target + (query ? `?${query}` : '') + (window.location.hash || '');
+      try { window.history.replaceState(window.history.state, '', url); } catch { /* noop */ }
     }
-  }, [activeTab, initialAlias]);
+  }, [activeTab, initialAlias, routeKey, waiting]);
 
   // ── Tab bar handlers ──────────────────────────────────────────────────
   const selectTab = useCallback((key: string) => {

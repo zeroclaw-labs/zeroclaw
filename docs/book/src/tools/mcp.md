@@ -36,6 +36,76 @@ mcp_bundles = ["files"]   # connects to `filesystem`; an agent without this gets
 
 This is the *connection* boundary (which servers an agent talks to at all). The `allowed_tools` / `excluded_tools` controls below are the per-tool *capability* boundary applied on top of whatever a granted server exposes.
 
+## Local macOS notifications
+
+On macOS 13 or later, a local agent can send Notification Center alerts through
+an optional stdio server. Clicking a banner opens the configured dashboard agent
+in the default browser. An optional conversation ID selects a saved gateway
+conversation attributed to that agent, including when another tab already has
+the same agent open. If the dashboard cannot verify the conversation from its
+session list, the link opens the agent’s usual chat.
+If another browser tab is already running the chat workspace, a notification
+tab asks it to open the conversation. Browsers with Web Locks and Broadcast
+Channel support can reuse its live connections.
+
+From the repository root, build the app using the Xcode Command Line Tools.
+Open it once to request notification permission.
+
+```sh
+app="$HOME/Applications/ZeroClaw Notifications.app"
+apps/macos-notifications/build.sh "$app"
+open "$app"
+```
+
+In System Settings → Notifications, allow alerts for **ZeroClaw Notifications**.
+Choose the presentation style and previews appropriate for the machine. The title
+and body can appear on its lock screen.
+
+Use the absolute executable path on your Mac and the origin of your paired
+dashboard. Set the last argument to the receiving agent alias. Include the
+bundle in that agent’s existing configuration and start a fresh agent session.
+
+```toml
+[[mcp.servers]]
+name = "mac_alerts"
+transport = "stdio"
+command = "/absolute/path/ZeroClaw Notifications.app/Contents/MacOS/zeroclaw-notify"
+args = ["serve", "http://127.0.0.1:42617", "operator"]
+
+[mcp_bundles.desktop_alerts]
+servers = ["mac_alerts"]
+
+[agents.operator]
+mcp_bundles = ["desktop_alerts"]
+```
+
+The agent tool is `mac_alerts__system_notify`. Its required `title` and `body`
+fields and optional `priority` follow the `system.notify` capability. Set
+`priority` to `low`, `normal`, or `high`. A high-priority alert requests sound.
+The server accepts an optional `session_id` and a stable `event_id` for retries.
+Both accept up to 128 ASCII letters, digits, hyphens or underscores. A receipt
+suppresses repeats for 30 days for the same origin, agent and event. The receipt
+stores a hash and timestamp. Tool success records acceptance by Notification
+Center. Focus settings and user preferences control presentation.
+
+```json
+{"title":"Review ready","body":"The draft is ready for inspection.","session_id":"notification-test","event_id":"review-ready-1"}
+```
+
+The server accepts loopback dashboard origins. The clickable destination comes
+from the server configuration, and the dashboard applies its normal pairing and
+agent-access checks. Removing the bundle grant and restarting the session
+disconnects the server. A denied permission produces a tool error.
+
+![Two operator tabs with the notification conversation selected](images/notification-conversation.png)
+
+Run the helper’s smoke test with `python3 apps/macos-notifications/smoke.py "$app"`
+from the repository root. Add `--deliver --agent operator` to request one
+real banner and retry its event ID. To target an existing conversation, add
+`--session` with its display ID or full gateway session key. Click
+the banner with the browser closed to test the return path. Supply `--origin`
+if your local gateway uses another port.
+
 ## Transports
 
 A server is reached over one of three transports (the `transport` field):

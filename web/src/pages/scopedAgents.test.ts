@@ -33,6 +33,7 @@ class FakeWebSocket {
 
 const fakeWindow = Object.assign(new EventTarget(), {
   location: { protocol: "https:", host: "zc.example", hostname: "zc.example", port: "", pathname: "/", search: "" },
+  focus: () => {},
   setTimeout: (fn: () => void, ms: number) => setTimeout(fn, ms),
   clearTimeout: (id: ReturnType<typeof setTimeout>) => clearTimeout(id),
 });
@@ -44,9 +45,11 @@ Object.assign(globalThis, { window: fakeWindow, document: new EventTarget(), Web
 const requested: string[] = [];
 let agentsBody: unknown = { agents: [] };
 let agentsStatus = 200;
+let sessionList: (() => Promise<Response>) | undefined;
 globalThis.fetch = async (input) => {
   const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
   requested.push(url);
+  if (url.endsWith("/api/sessions") && sessionList) return sessionList();
   if (url.endsWith("/api/agents/available")) {
     return new Response(JSON.stringify(agentsBody), {
       status: agentsStatus,
@@ -60,6 +63,7 @@ const { setOidcSession } = await import("../lib/auth.ts");
 const { default: AgentsList } = await import("./AgentsList.tsx");
 const { default: AgentChat } = await import("./AgentChat.tsx");
 const { default: ChatWorkspace } = await import("./ChatWorkspace.tsx");
+const { AgentProvider } = await import("../contexts/AgentContext.tsx");
 const { MemoryRouter, Route, Routes } = await import("react-router-dom");
 
 const scoped: OidcSession = {
@@ -110,7 +114,88 @@ afterEach(async () => {
   setOidcSession(null);
   requested.length = 0;
   agentsStatus = 200;
+  sessionList = undefined;
   FakeWebSocket.instances.length = 0;
+});
+
+test("a notification waits for gateway attribution and opens the display ID", async () => {
+  let finish!: () => void;
+  const pending = new Promise<void>((resolve) => { finish = resolve; });
+  sessionList = async () => {
+    await pending;
+    return Response.json({ sessions: [{ session_id: "saved", session_key: "gw_saved", agent_alias: "support", channel_id: null }] });
+  };
+  const r = await render("/agent/support?session=gw_saved", createElement(ChatWorkspace, { initialAlias: "support" }), "/agent/:alias");
+  assert.equal(r.root.findAllByType(AgentProvider).length, 0);
+  await act(async () => {
+    finish();
+  });
+  assert.equal(r.root.findByType(AgentProvider).props.initialSessionId, "saved");
+});
+
+test("an unavailable linked conversation opens the agent's ordinary chat", async () => {
+  sessionList = async () => Response.json({ sessions: [] });
+  const r = await render("/agent/support?session=unavailable", createElement(ChatWorkspace, { initialAlias: "support" }), "/agent/:alias");
+  assert.notEqual(r.root.findByType(AgentProvider).props.initialSessionId, "unavailable");
+});
+
+test("a display ID beginning with gw_ reads the exact persisted session key", async () => {
+  sessionList = async () => Response.json({ sessions: [{
+    session_id: "gw_saved", session_key: "gw_gw_saved", agent_alias: "support", channel_id: null,
+  }] });
+  const r = await render("/agent/support?session=gw_gw_saved", createElement(ChatWorkspace, { initialAlias: "support" }), "/agent/:alias");
+  assert.equal(r.root.findByType(AgentProvider).props.initialSessionId, "gw_saved");
+  assert.ok(requested.some((url) => url.endsWith("/api/sessions/gw_gw_saved/messages")));
+});
+
+test("a second notification window delegates to the open workspace", {
+  skip: typeof navigator === "undefined" || !navigator.locks || typeof BroadcastChannel === "undefined",
+}, async () => {
+  sessionList = async () => Response.json({ sessions: [{
+    session_id: "active", session_key: "gw_active", agent_alias: "support", channel_id: null,
+  }] });
+  const first = await render("/agent/support", createElement(ChatWorkspace, { initialAlias: "support" }), "/agent/:alias");
+  let second: ReactTestRenderer | undefined;
+  try {
+    await act(async () => {
+      second = create(createElement(MemoryRouter, { initialEntries: ["/agent/support?notify=1&session=gw_active"] },
+        createElement(ChatWorkspace, { initialAlias: "support" })));
+    });
+    await settle();
+    assert.ok(second);
+    assert.equal(second.root.findAllByType(AgentProvider).length, 0);
+    assert.match(text(second.root), /existing ZeroClaw window/);
+    assert.ok(first.root.findAllByType(AgentProvider).some((pane) => pane.props.initialSessionId === "active"));
+  } finally {
+    await act(async () => { second?.unmount(); });
+  }
+});
+
+test("a notification selects the window holding its pane among two ordinary windows", {
+  skip: typeof navigator === "undefined" || !navigator.locks || typeof BroadcastChannel === "undefined",
+}, async () => {
+  const first = await render("/agent/support", createElement(ChatWorkspace, { initialAlias: "support" }), "/agent/:alias");
+  const windows: ReactTestRenderer[] = [];
+  async function open(path: string) {
+    await act(async () => {
+      windows.push(create(createElement(MemoryRouter, { initialEntries: [path] },
+        createElement(ChatWorkspace, { initialAlias: "support" }))));
+    });
+    await settle();
+    return windows[windows.length - 1]!;
+  }
+  try {
+    const other = await open("/agent/support");
+    const id = other.root.findByType(AgentProvider).props.initialSessionId;
+    assert.notEqual(first.root.findByType(AgentProvider).props.initialSessionId, id);
+    sessionList = async () => Response.json({sessions: [{session_id: id, session_key: `gw_${id}`, agent_alias: "support", channel_id: null}]});
+    const alert = await open(`/agent/support?notify=1&session=gw_${id}`);
+    assert.match(text(alert.root), /existing ZeroClaw window/);
+    assert.equal(first.root.findAllByType(AgentProvider).length, 1);
+    assert.equal(other.root.findByType(AgentProvider).props.initialSessionId, id);
+  } finally {
+    await act(async () => { for (const win of windows) win.unmount(); });
+  }
 });
 
 test("the agents page lists only the agents this account may use", async () => {

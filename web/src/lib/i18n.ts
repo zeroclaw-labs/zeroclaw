@@ -115,6 +115,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.message_error': '消息错误',
     'agent.failed_switch_model': '切换模型失败',
     'agent.model_switch_timeout': '模型切换超时，请检查网络后重试',
+    'agent.notification_opened_elsewhere': '此会话已在现有的 ZeroClaw 窗口中打开。',
 
     // Supervised-mode tool approval (#6522)
     'agent.approval_title': '需要授权工具调用',
@@ -1599,6 +1600,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.message_error': 'Message error',
     'agent.failed_switch_model': 'Failed to switch model',
     'agent.model_switch_timeout': 'Model switch timed out. Please check your connection and try again.',
+    'agent.notification_opened_elsewhere': 'This conversation is open in your existing ZeroClaw window.',
     'agent.clear_all': 'Clear all',
     'agent.delete_message': 'Delete message',
     // Multi-session chat (#7543)

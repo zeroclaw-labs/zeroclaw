@@ -2256,8 +2256,7 @@ export function getSessionMessages(
 /**
  * Give a persisted session a display name.
  *
- * Takes the bare session id (the `gw_`-stripped `session_id`, not
- * `session_key`) because the handler prefixes `gw_` itself. Answers 404 when
+ * Accepts the persisted session key. Answers 404 when
  * the gateway has no metadata row for the session — notably when session
  * persistence is disabled.
  */
@@ -2272,9 +2271,7 @@ export function renameSession(
 }
 
 /**
- * Delete a persisted session. Accepts either the full DB key or a bare gateway
- * session id — the handler prefixes `gw_` only when the id carries no
- * underscore. Unlike {@link renameSession}, which needs the bare id.
+ * Delete a persisted session by its full DB key or an unambiguous display ID.
  */
 export function deleteSession(
   sessionKey: string,
