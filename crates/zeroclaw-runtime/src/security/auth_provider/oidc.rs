@@ -163,7 +163,7 @@ struct Claims {
 enum VerifiedVia {
     /// Offline JWKS signature validation: the token itself is the only
     /// evidence, so `iss`/`aud`/`exp` are all mandatory.
-    Jwks,
+    Jwks { typed: bool },
     /// A positive verdict from the configured issuer's authenticated
     /// introspection endpoint. The endpoint is the authority, but its
     /// `active` flag alone binds nothing: the response must also carry
@@ -676,7 +676,8 @@ impl OidcAuthProvider {
     /// The operator-declared claim naming the client, when it replaces the
     /// RFC 9068 default. JWKS only: introspection answers follow RFC 7662.
     fn declared_client_id_claim(&self, via: VerifiedVia) -> Option<&str> {
-        (via == VerifiedVia::Jwks && self.config.client_id_claim != DEFAULT_OIDC_CLIENT_ID_CLAIM)
+        (via != VerifiedVia::Introspection
+            && self.config.client_id_claim != DEFAULT_OIDC_CLIENT_ID_CLAIM)
             .then_some(self.config.client_id_claim.as_str())
     }
 
@@ -761,7 +762,7 @@ impl OidcAuthProvider {
         if !typed && !audience_is_exactly(claims.aud.as_ref(), &self.config.audience) {
             return deny(DenyReason::BadCredential);
         }
-        self.claims_to_identity(&claims, raw, VerifiedVia::Jwks)
+        self.claims_to_identity(&claims, raw, VerifiedVia::Jwks { typed })
     }
 
     async fn verify_introspection(&self, token: &str) -> AuthOutcome {
@@ -837,22 +838,41 @@ impl OidcAuthProvider {
         }
     }
 
-    /// What the configured `actor_claim` says about this token: presence
-    /// proves the configured kind, absence proves the other. `None` when no
-    /// claim is configured.
-    fn actor_evidence(
+    /// Reconcile the issuer's evidence about this token with the operator's
+    /// declaration about its client. A shared app ID identifies both flows.
+    fn verified_actor(
         &self,
+        client_id: &str,
         raw: &serde_json::Map<String, serde_json::Value>,
+        require_token_evidence: bool,
     ) -> Option<ActorClass> {
-        if self.config.actor_claim.is_empty() {
-            return None;
+        let declared = self.declared_actor(client_id);
+        let path = self.config.actor_claim.as_str();
+        if path.is_empty() {
+            return if require_token_evidence {
+                None
+            } else {
+                declared
+            };
         }
+        let marker = claim_at_path(raw, path);
         let marked = ActorClass::from(self.config.actor_claim_marks);
-        Some(if claim_at_path(raw, &self.config.actor_claim).is_some() {
+        let actor = if require_token_evidence {
+            if matches!(path, "azp" | "client_id") || path == self.config.client_id_claim {
+                return None;
+            }
+            // On the compatibility path only a positive, issuer-specific
+            // human marker establishes a person (e.g. Entra delegated scopes).
+            if marked != ActorClass::Human || marker?.as_str()?.trim().is_empty() {
+                return None;
+            }
+            ActorClass::Human
+        } else if marker.is_some() {
             marked
         } else {
             marked.other()
-        })
+        };
+        declared.is_none_or(|kind| kind == actor).then_some(actor)
     }
 
     /// Shared claim checks + identity assembly. `via` decides which absent
@@ -957,7 +977,7 @@ impl OidcAuthProvider {
             return deny(DenyReason::BadCredential);
         }
         let Some(client_id) = named_client.or_else(|| {
-            if via == VerifiedVia::Jwks
+            if via != VerifiedVia::Introspection
                 && declared_client_claim.is_none()
                 && claims.client_id.is_none()
             {
@@ -970,24 +990,15 @@ impl OidcAuthProvider {
         };
         // RFC 9068 requires a token identifier; the issuer may spell it
         // differently (`token_id_claim`, JWKS only).
-        if via == VerifiedVia::Jwks
+        if via != VerifiedVia::Introspection
             && nonblank_str_claim(&raw, &self.config.token_id_claim).is_none()
         {
             return deny(DenyReason::BadCredential);
         }
-        let actor = match (self.declared_actor(client_id), self.actor_evidence(&raw)) {
-            // Evidence contradicting a declaration is ambiguity: deny rather
-            // than let either side win.
-            (Some(declared), Some(evidence)) if declared != evidence => {
-                return deny(DenyReason::BadCredential);
-            }
-            (Some(declared), _) => declared,
-            // A client declared nowhere is classified by the operator's
-            // actor claim alone (a shared human+machine client).
-            (None, Some(evidence)) => evidence,
-            // No declaration and no claim evidence: nothing positively
-            // establishes the actor class, so the token authenticates nobody.
-            (None, None) => return deny(DenyReason::BadCredential),
+        let require_token_evidence =
+            matches!(via, VerifiedVia::Jwks { typed: false }) || declared_client_claim.is_some();
+        let Some(actor) = self.verified_actor(client_id, &raw, require_token_evidence) else {
+            return deny(DenyReason::BadCredential);
         };
         // Keycloak also stamps azp on user tokens issued to service clients.
         // It proves the authorized client, not machine credentials: require
@@ -1017,7 +1028,7 @@ impl OidcAuthProvider {
             .with_claims(raw)
             .with_mfa_verified(mfa_verified);
         match via {
-            VerifiedVia::Jwks => {
+            VerifiedVia::Jwks { .. } => {
                 // The RFC 9068 profile requires iat. Cap lifetime from token
                 // issuance (not from every verification) so an old valid
                 // token cannot be extended indefinitely.
@@ -1677,7 +1688,15 @@ mod tests {
             let mut config = self.config(OidcValidation::Jwks);
             config.require_at_jwt = false;
             config.client_id = "zeroclaw-daemon".into();
+            config.actor_claim = "uid".into();
+            config.actor_claim_marks = OidcActorKind::Human;
             config
+        }
+
+        fn untyped_user_claims(&self) -> serde_json::Value {
+            let mut claims = self.good_claims();
+            claims["uid"] = serde_json::json!("00u-alice");
+            claims
         }
     }
 
@@ -1686,7 +1705,7 @@ mod tests {
         let idp = start_idp().await;
         let provider = idp.provider(OidcValidation::Jwks);
         for header in [UNTYPED_JWT_HEADER, NO_TYP_HEADER] {
-            let token = idp.mint_with_header(header, &idp.good_claims());
+            let token = idp.mint_with_header(header, &idp.untyped_user_claims());
             let outcome = provider.verify(&bearer(token)).await;
             assert!(is_bad_credential(&outcome), "{header}: {outcome:?}");
         }
@@ -1698,7 +1717,7 @@ mod tests {
         let idp = start_idp().await;
         let provider = OidcAuthProvider::new("test", idp.untyped_config()).unwrap();
         for header in [UNTYPED_JWT_HEADER, NO_TYP_HEADER] {
-            let token = idp.mint_with_header(header, &idp.good_claims());
+            let token = idp.mint_with_header(header, &idp.untyped_user_claims());
             let outcome = provider.verify(&bearer(token)).await;
             let identity = outcome.identity().unwrap_or_else(|| panic!("{header}"));
             assert_eq!(
@@ -1725,7 +1744,7 @@ mod tests {
             serde_json::json!(["zeroclaw", "some-other-api"]),
             serde_json::json!(["zeroclaw", "zeroclaw"]),
         ] {
-            let mut claims = idp.good_claims();
+            let mut claims = idp.untyped_user_claims();
             claims["aud"] = aud.clone();
             claims["azp"] = serde_json::json!("zerocode-cli");
             for header in [UNTYPED_JWT_HEADER, NO_TYP_HEADER] {
@@ -1744,7 +1763,7 @@ mod tests {
             serde_json::json!("zeroclaw"),
             serde_json::json!(["zeroclaw"]),
         ] {
-            let mut claims = idp.good_claims();
+            let mut claims = idp.untyped_user_claims();
             claims["aud"] = aud.clone();
             let token = idp.mint_with_header(UNTYPED_JWT_HEADER, &claims);
             let outcome = provider.verify(&bearer(token)).await;
@@ -1771,15 +1790,15 @@ mod tests {
         // A header naming any other JWT type is not an access token.
         for typ in ["logout+jwt", "dpop+jwt", "secevent+jwt", "JOSE"] {
             let header = format!(r#"{{"alg":"ES256","kid":"test-key","typ":"{typ}"}}"#);
-            let token = idp.mint_with_header(&header, &idp.good_claims());
+            let token = idp.mint_with_header(&header, &idp.untyped_user_claims());
             let outcome = provider.verify(&bearer(token)).await;
             assert!(is_bad_credential(&outcome), "typ {typ}: {outcome:?}");
         }
         // An untyped ID token: its `aud` is the client it was issued to, and
         // it echoes the sign-in nonce. Either alone refuses it.
-        let mut id_token = idp.good_claims();
+        let mut id_token = idp.untyped_user_claims();
         id_token["aud"] = serde_json::json!("zerocode-cli");
-        let mut nonce_only = idp.good_claims();
+        let mut nonce_only = idp.untyped_user_claims();
         nonce_only["nonce"] = serde_json::json!("n-0S6_WzA2Mj");
         for claims in [id_token, nonce_only] {
             let token = idp.mint_with_header(UNTYPED_JWT_HEADER, &claims);
@@ -1797,25 +1816,24 @@ mod tests {
             let mut config = idp.untyped_config();
             config.client_id = client_id.into();
             let provider = OidcAuthProvider::new("test", config).unwrap();
-            let token = idp.mint_with_header(UNTYPED_JWT_HEADER, &idp.good_claims());
+            let token = idp.mint_with_header(UNTYPED_JWT_HEADER, &idp.untyped_user_claims());
             let outcome = provider.verify(&bearer(token)).await;
             assert!(is_bad_credential(&outcome), "{client_id:?}: {outcome:?}");
         }
         let mut config = idp.untyped_config();
         config.interactive_clients.push("zeroclaw".into());
         let provider = OidcAuthProvider::new("test", config).unwrap();
-        let token = idp.mint_with_header(UNTYPED_JWT_HEADER, &idp.good_claims());
+        let token = idp.mint_with_header(UNTYPED_JWT_HEADER, &idp.untyped_user_claims());
         assert!(is_bad_credential(&provider.verify(&bearer(token)).await));
     }
 
     /// Okta custom authorization server access token: no `typ`, client in
     /// `cid`, user marker in `uid`, no `client_id`.
     fn okta_claims(idp: &TestIdp) -> serde_json::Value {
-        let mut claims = idp.good_claims();
+        let mut claims = idp.untyped_user_claims();
         let object = claims.as_object_mut().unwrap();
         object.remove("client_id");
         object.insert("cid".into(), serde_json::json!("zerocode-cli"));
-        object.insert("uid".into(), serde_json::json!("00u-alice"));
         claims
     }
 
@@ -1879,31 +1897,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_declared_azp_client_claim_admits_entra_service_tokens() {
+    async fn entra_compatibility_requires_positive_human_evidence() {
         let idp = start_idp().await;
         let mut config = idp.untyped_config();
         config.client_id_claim = "azp".into();
         config.token_id_claim = "uti".into();
-        config.service_clients = vec!["batch-app".into()];
-        config.service_profile_map =
-            HashMap::from([("batch-app".to_string(), "operator".to_string())]);
+        config.actor_claim = "scp".into();
         let provider = OidcAuthProvider::new("test", config.clone()).unwrap();
-        let token = idp.mint_with_header(UNTYPED_JWT_HEADER, &entra_service_claims(&idp));
-        let outcome = provider.verify(&bearer(token)).await;
+
+        let machine = entra_service_claims(&idp);
+        let mut user = machine.clone();
+        user["sub"] = serde_json::json!("employee");
+        user["scp"] = serde_json::json!("reports.read");
+        let outcome = provider
+            .verify(&bearer(idp.mint_with_header(UNTYPED_JWT_HEADER, &user)))
+            .await;
         assert_eq!(
-            outcome.identity().expect("service token").subject,
-            IdentitySubject::Service {
+            outcome.identity().expect("delegated user").subject,
+            IdentitySubject::Oidc {
                 issuer: idp.issuer.clone(),
-                client_id: "batch-app".into(),
+                subject: "employee".into(),
             }
         );
-
-        // With the default client claim, `azp` alone never proves a service
-        // client (Keycloak stamps it on user tokens too), so it is refused.
-        config.client_id_claim = "client_id".into();
-        let provider = OidcAuthProvider::new("test", config).unwrap();
-        let token = idp.mint_with_header(UNTYPED_JWT_HEADER, &entra_service_claims(&idp));
+        let token = idp.mint_with_header(UNTYPED_JWT_HEADER, &machine);
         assert!(is_bad_credential(&provider.verify(&bearer(token)).await));
+
+        // A service declaration cannot supply the missing per-token evidence,
+        // even when the issuer types its token but uses an alternate client claim.
+        config.service_clients = vec!["batch-app".into()];
+        config.actor_claim.clear();
+        let provider = OidcAuthProvider::new("test", config).unwrap();
+        for token in [
+            idp.mint_with_header(UNTYPED_JWT_HEADER, &user),
+            idp.mint(user),
+        ] {
+            assert!(is_bad_credential(&provider.verify(&bearer(token)).await));
+        }
     }
 
     #[tokio::test]

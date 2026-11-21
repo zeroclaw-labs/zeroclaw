@@ -14526,7 +14526,10 @@ pub struct OidcConfig {
     /// for a client that issues both human and machine tokens (declared in
     /// neither client list); also checked against declared clients, where
     /// contradicting evidence denies. Empty = no claim-based classification,
-    /// so every accepted client must be declared.
+    /// so every accepted client must be declared on the standard path.
+    /// For untyped JWKS tokens or a custom client claim, configure a
+    /// nonblank string claim issued only to people and set `actor_claim_marks`
+    /// to `human` (e.g. Entra's delegated `scp` or Okta's `uid`).
     pub actor_claim: String,
     /// Which actor kind the presence of `actor_claim` proves.
     pub actor_claim_marks: OidcActorKind,
@@ -14549,8 +14552,8 @@ pub struct OidcConfig {
     /// Top-level claim naming the OAuth client in JWKS-validated access
     /// tokens. Default `client_id` (RFC 9068), where a person's token may
     /// name its client in `azp` instead. Set it where the issuer uses another
-    /// claim: `cid` for Okta, `azp` for Entra ID v2.0 tokens (which then also
-    /// identifies service principals). A declared claim has no fallback, and
+    /// claim: `cid` for Okta, `azp` for Entra ID v2.0 tokens. A declared
+    /// client claim identifies the application. It has no fallback, and
     /// a token whose `client_id` contradicts it is refused. JWKS only:
     /// introspection answers always use `client_id`.
     pub client_id_claim: String,
