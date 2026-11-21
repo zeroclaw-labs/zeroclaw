@@ -959,6 +959,23 @@ async fn parse_whisper_response(resp: reqwest::Response) -> Result<String> {
 /// `transcribe()` calls. When the agent has no such reference, `transcribe`
 /// falls back to the `[transcription].default_provider` alias when one is
 /// configured, and fails loud otherwise.
+/// Permanent failure: the resolved transcription provider name is not among
+/// the registered providers. Distinct from provider I/O errors so callers
+/// can skip permanently instead of retrying a configuration that cannot
+/// succeed on any attempt.
+#[derive(Debug, Clone)]
+pub struct ProviderNotConfigured {
+    pub name: String,
+}
+
+impl std::fmt::Display for ProviderNotConfigured {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Transcription provider '{}' not configured", self.name)
+    }
+}
+
+impl std::error::Error for ProviderNotConfigured {}
+
 pub struct TranscriptionManager {
     transcription_providers: HashMap<String, Box<dyn TranscriptionProvider>>,
     max_audio_bytes: Option<usize>,
@@ -1229,22 +1246,29 @@ impl TranscriptionManager {
         file_name: &str,
         transcription_provider: &str,
     ) -> Result<String> {
-        let p = self.transcription_providers.get(transcription_provider).ok_or_else(|| {
-            let available: Vec<&str> = self.transcription_providers.keys().map(|k| k.as_str()).collect();
-            ::zeroclaw_log::record!(
-                ERROR,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({
-                        "transcription_provider": transcription_provider,
-                        "available": available,
-                    })),
-                "transcription: provider not configured"
-            );
-            anyhow::Error::msg(format!(
-                "Transcription transcription_provider '{transcription_provider}' not configured. Available: {available:?}"
-            ))
-        })?;
+        let p = self
+            .transcription_providers
+            .get(transcription_provider)
+            .ok_or_else(|| {
+                let available: Vec<&str> = self
+                    .transcription_providers
+                    .keys()
+                    .map(|k| k.as_str())
+                    .collect();
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "transcription_provider": transcription_provider,
+                            "available": available,
+                        })),
+                    "transcription: provider not configured"
+                );
+                anyhow::Error::new(ProviderNotConfigured {
+                    name: transcription_provider.to_string(),
+                })
+            })?;
 
         self.enforce_global_audio_limit(audio_data)?;
 
@@ -1817,6 +1841,11 @@ mod tests {
         assert!(
             err.to_string().contains("not configured"),
             "expected not-configured error, got: {err}"
+        );
+        assert!(
+            err.downcast_ref::<ProviderNotConfigured>().is_some(),
+            "the not-configured failure must be typed so callers can \
+             distinguish it from retryable provider I/O errors: {err}"
         );
     }
 
