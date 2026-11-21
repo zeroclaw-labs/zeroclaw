@@ -3183,6 +3183,68 @@ mod tests {
                 .is_allowed()
         );
     }
+
+    fn assert_declared_client_claims_must_agree(validation: OidcValidation) {
+        let via = match validation {
+            OidcValidation::Jwks => VerifiedVia::Jwks,
+            OidcValidation::Introspection => VerifiedVia::Introspection,
+        };
+        let clients = ["client-a", "client-b"];
+        let config = OidcConfig {
+            validation,
+            issuer: "https://issuer.invalid".into(),
+            audience: "test-resource".into(),
+            interactive_clients: clients.map(str::to_owned).to_vec(),
+            ..Default::default()
+        };
+        let provider = OidcAuthProvider::new("test", config).unwrap();
+        let now = now_unix();
+        // Both paths reach this boundary with decoded metadata. No transport is involved.
+        let check = |client: &str, party: &str| {
+            let raw = serde_json::json!({
+                "active": true,
+                "iss": provider.config.issuer,
+                "aud": provider.config.audience,
+                "sub": "test-subject",
+                "iat": now,
+                "exp": now + 60,
+                "jti": "test-identifier",
+                "token_type": "Bearer",
+                "client_id": client,
+                "azp": party,
+            });
+            let claims: Claims = serde_json::from_value(raw.clone()).unwrap();
+            provider.claims_to_identity(&claims, raw.as_object().unwrap().clone(), via)
+        };
+        for (client, other) in [(clients[0], clients[1]), (clients[1], clients[0])] {
+            let AuthOutcome::Verified(identity) = check(client, client) else {
+                panic!("matching declared client metadata must verify");
+            };
+            assert_eq!(
+                identity.revalidate_by.is_some(),
+                via == VerifiedVia::Introspection
+            );
+
+            // The other party is also declared. Only the agreement between the fields changes.
+            assert!(matches!(
+                check(client, other),
+                AuthOutcome::Denied {
+                    reason: DenyReason::BadCredential
+                }
+            ));
+        }
+    }
+
+    #[test]
+    fn decoded_jwks_declared_client_claims_must_agree() {
+        assert_declared_client_claims_must_agree(OidcValidation::Jwks);
+    }
+
+    #[test]
+    fn decoded_introspection_declared_client_claims_must_agree() {
+        assert_declared_client_claims_must_agree(OidcValidation::Introspection);
+    }
+
     #[tokio::test]
     async fn azp_does_not_replace_the_introspection_client_id_contract() {
         let idp = start_idp().await;
