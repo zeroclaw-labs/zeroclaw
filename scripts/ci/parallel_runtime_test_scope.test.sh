@@ -148,18 +148,24 @@ if [ -s "$cargo_log" ]; then
     exit 1
 fi
 
-: > "$cargo_log"
-set +e
-PATH="${mock_dir}:$PATH" \
-    ZEROCLAW_PARALLEL_TEST_CARGO_LOG="$cargo_log" \
-    ZEROCLAW_PARALLEL_TEST_PASS_TIMEOUT_SECONDS=0 \
-    bash "$gate" >/dev/null 2>&1
-status=$?
-set -e
-if [ "$status" -ne 2 ] || [ -s "$cargo_log" ]; then
-    echo "FAIL: a zero pass timeout should exit 2 before Cargo runs, got $status" >&2
-    exit 1
-fi
+# Zero and zero-padded values must be refused before Cargo runs: 00 would run no
+# passes or turn the deadline off, and 08 is an error in bash arithmetic.
+for setting in RUNS THREADS PASS_TIMEOUT_SECONDS; do
+    for value in 0 00 08; do
+        : > "$cargo_log"
+        set +e
+        env PATH="${mock_dir}:$PATH" \
+            ZEROCLAW_PARALLEL_TEST_CARGO_LOG="$cargo_log" \
+            "ZEROCLAW_PARALLEL_TEST_${setting}=${value}" \
+            bash "$gate" >/dev/null 2>&1
+        status=$?
+        set -e
+        if [ "$status" -ne 2 ] || [ -s "$cargo_log" ]; then
+            echo "FAIL: ZEROCLAW_PARALLEL_TEST_${setting}=${value} should exit 2 before Cargo runs, got $status" >&2
+            exit 1
+        fi
+    done
+done
 
 # A pass that stops must fail at its deadline and say which pass it was. The
 # build call returns at once; only the test run sleeps past the deadline.

@@ -7,23 +7,25 @@ threads="${ZEROCLAW_PARALLEL_TEST_THREADS:-16}"
 scope="${ZEROCLAW_PARALLEL_TEST_SCOPE:-all}"
 pass_timeout="${ZEROCLAW_PARALLEL_TEST_PASS_TIMEOUT_SECONDS:-300}"
 
+# A leading zero is refused: bash arithmetic reads 010 as octal 8 and 08 as an
+# error, and GNU timeout reads 00 as no deadline at all.
 case "$runs" in
-    ''|*[!0-9]*|0)
-        echo "ZEROCLAW_PARALLEL_TEST_RUNS must be a positive integer (got: $runs)."
+    ''|*[!0-9]*|0*)
+        echo "ZEROCLAW_PARALLEL_TEST_RUNS must be a positive integer with no leading zero (got: $runs)."
         exit 2
         ;;
 esac
 
 case "$threads" in
-    ''|*[!0-9]*|0)
-        echo "ZEROCLAW_PARALLEL_TEST_THREADS must be a positive integer (got: $threads)."
+    ''|*[!0-9]*|0*)
+        echo "ZEROCLAW_PARALLEL_TEST_THREADS must be a positive integer with no leading zero (got: $threads)."
         exit 2
         ;;
 esac
 
 case "$pass_timeout" in
-    ''|*[!0-9]*|0)
-        echo "ZEROCLAW_PARALLEL_TEST_PASS_TIMEOUT_SECONDS must be a positive integer (got: $pass_timeout)."
+    ''|*[!0-9]*|0*)
+        echo "ZEROCLAW_PARALLEL_TEST_PASS_TIMEOUT_SECONDS must be a positive integer with no leading zero (got: $pass_timeout)."
         exit 2
         ;;
 esac
