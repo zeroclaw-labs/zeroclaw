@@ -148,6 +148,15 @@ impl FileReadTool {
         // Check file size AFTER canonicalization to prevent TOCTOU symlink bypass
         match tokio::fs::metadata(&resolved_path).await {
             Ok(meta) => {
+                if meta.is_dir() {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: ToolOutput::default(),
+                        error: Some(crate::i18n::get_required_cli_string(
+                            "cli-tool-file-read-directory",
+                        )),
+                    });
+                }
                 if meta.len() > MAX_FILE_SIZE_BYTES {
                     return Ok(ToolResult {
                         success: false,
@@ -173,27 +182,7 @@ impl FileReadTool {
             .and_then(|v| v.as_str())
             .unwrap_or("utf8");
 
-        if encoding == "base64" {
-            // Binary read: return raw bytes base64-encoded. Line numbering and
-            // offset/limit are text concepts and do not apply here.
-            let bytes = match tokio::fs::read(&resolved_path).await {
-                Ok(b) => b,
-                Err(e) => {
-                    return Ok(ToolResult {
-                        success: false,
-                        output: ToolOutput::default(),
-                        error: Some(format!("Failed to read file: {e}")),
-                    });
-                }
-            };
-            use base64::Engine;
-            let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
-            return Ok(ToolResult {
-                success: true,
-                output: encoded.into(),
-                error: None,
-            });
-        } else if encoding != "utf8" {
+        if !matches!(encoding, "utf8" | "base64") {
             return Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
@@ -203,7 +192,35 @@ impl FileReadTool {
             });
         }
 
-        match tokio::fs::read_to_string(&resolved_path).await {
+        // Read once so decoding failures cannot be confused with I/O failures,
+        // or cause a second read of a file that may have changed in between.
+        let bytes = match tokio::fs::read(&resolved_path).await {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some(crate::i18n::get_required_cli_string_with_args(
+                        "cli-tool-file-read-failed",
+                        &[("error", &error.to_string())],
+                    )),
+                });
+            }
+        };
+
+        if encoding == "base64" {
+            // Binary read: return raw bytes base64-encoded. Line numbering and
+            // offset/limit are text concepts and do not apply here.
+            use base64::Engine;
+            let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+            return Ok(ToolResult {
+                success: true,
+                output: encoded.into(),
+                error: None,
+            });
+        }
+
+        match std::str::from_utf8(&bytes) {
             Ok(contents) => {
                 let lines: Vec<&str> = contents.lines().collect();
                 let total = lines.len();
@@ -264,21 +281,6 @@ impl FileReadTool {
                 })
             }
             Err(_) => {
-                // Not valid UTF-8 — read raw bytes and try to extract text
-                let bytes = tokio::fs::read(&resolved_path).await.map_err(|e| {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                            .with_attrs(::serde_json::json!({
-                                "path": resolved_path.display().to_string(),
-                                "error": format!("{}", e),
-                            })),
-                        "file_read: raw byte fallback read failed"
-                    );
-                    anyhow::Error::msg(format!("Failed to read file: {e}"))
-                })?;
-
                 // PDF text extraction was removed with the `rag-pdf` feature
                 // Bytes still flow to the binary detection below.
 
@@ -479,6 +481,54 @@ mod tests {
         assert!(result.error.as_ref().unwrap().contains("Failed to resolve"));
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn file_read_directory_is_recoverable() {
+        let workspace = tempfile::tempdir().unwrap();
+        tokio::fs::create_dir(workspace.path().join("identity"))
+            .await
+            .unwrap();
+        let tool = test_tool(workspace.path().to_path_buf());
+
+        for encoding in ["utf8", "base64"] {
+            for path in ["identity/", "."] {
+                let result = tool
+                    .execute(json!({"path": path, "encoding": encoding}))
+                    .await
+                    .expect("a directory must produce a recoverable tool result");
+                assert!(!result.success);
+                assert!(result.output.is_empty());
+                assert!(result.error.as_deref().unwrap().contains("directory"));
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn file_read_io_error_is_recoverable() {
+        let workspace = tempfile::tempdir().unwrap();
+        // A socket passes canonicalization and metadata checks, but cannot be
+        // read as a file. Unlike mode bits, this also fails when tests run as root.
+        let _socket =
+            std::os::unix::net::UnixListener::bind(workspace.path().join("socket")).unwrap();
+        let tool = test_tool(workspace.path().to_path_buf());
+
+        for encoding in ["utf8", "base64"] {
+            let result = tool
+                .execute(json!({"path": "socket", "encoding": encoding}))
+                .await
+                .expect("an I/O failure must produce a recoverable tool result");
+            assert!(!result.success);
+            assert!(result.output.is_empty());
+            assert!(
+                result
+                    .error
+                    .as_deref()
+                    .unwrap()
+                    .contains("Failed to read file")
+            );
+        }
     }
 
     #[tokio::test]
@@ -1259,6 +1309,71 @@ mod tests {
         pub fn make_observer() -> Arc<dyn Observer> {
             Arc::from(NoopObserver {})
         }
+    }
+
+    #[tokio::test]
+    async fn e2e_agent_file_read_recovers_after_directory_error() {
+        use crate::agent::agent::Agent;
+        use crate::agent::dispatcher::NativeToolDispatcher;
+        use e2e_helpers::*;
+        use zeroclaw_providers::{ChatResponse, ToolCall};
+
+        let workspace = tempfile::tempdir().unwrap();
+        tokio::fs::create_dir(workspace.path().join("identity"))
+            .await
+            .unwrap();
+        tokio::fs::write(workspace.path().join("identity/notes.md"), "Fixture notes")
+            .await
+            .unwrap();
+
+        let responses = ["identity/", "identity/notes.md"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, path)| ChatResponse {
+                text: None,
+                tool_calls: vec![ToolCall {
+                    id: format!("read-{index}"),
+                    name: "file_read".into(),
+                    arguments: json!({"path": path}).to_string(),
+                    extra_content: None,
+                }],
+                usage: None,
+                reasoning_content: None,
+            })
+            .chain(std::iter::once(ChatResponse {
+                text: Some("Recovered and read the notes.".into()),
+                tool_calls: vec![],
+                usage: None,
+                reasoning_content: None,
+            }))
+            .collect();
+        let (provider, requests) = RecordingModelProvider::new(responses);
+        let mut agent = Agent::builder()
+            .model_provider(Box::new(provider))
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(test_tool(workspace.path().to_path_buf()))],
+            ))
+            .memory(make_memory())
+            .observer(make_observer())
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(workspace.path().to_path_buf())
+            .build()
+            .unwrap();
+
+        assert_eq!(
+            agent.turn("Read the identity notes").await.unwrap(),
+            "Recovered and read the notes."
+        );
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert!(
+            requests[1]
+                .iter()
+                .any(|message| { message.role == "tool" && message.content.contains("directory") })
+        );
+        assert!(requests[2].iter().any(|message| {
+            message.role == "tool" && message.content.contains("1: Fixture notes")
+        }));
     }
 
     #[tokio::test]

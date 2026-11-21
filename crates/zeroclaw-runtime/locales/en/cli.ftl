@@ -2,6 +2,9 @@ cli-about = The fastest, smallest AI assistant.
 cli-no-command-provided = No command provided.
 cli-try-quickstart = Try `zeroclaw quickstart` to create your first agent.
 
+cli-tool-file-read-directory = Cannot read a directory as a file. Specify a file path.
+cli-tool-file-read-failed = Failed to read file: {$error}
+
 cli-quickstart-about = Create your first agent end-to-end
 cli-agent-about = Start the AI agent loop
 cli-gateway-about = Manage the gateway server (webhooks, websockets)
