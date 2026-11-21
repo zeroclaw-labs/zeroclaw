@@ -63,34 +63,35 @@ Inbound ingress is no longer the gap.
 `/plugin/{path}` and hands `parse-webhook` the method, query, headers
 (including `Authorization`) and exact body. A Teams plugin could therefore
 verify the Bot Framework token and bind the activity to it inside the
-component. Receiving webhooks does not make a plugin equivalent to this
-channel, though. For Teams the exception is:
+component.
 
-- **Remaining operational constraints**:
-  - *Channel-addressed tool delivery.* Plugin channels are constructed
-    asynchronously, so the synchronous `build_channel_map` and
-    `register_channels_for_tools` surfaces cannot see them, and tools that
-    address a channel by name cannot target a plugin channel yet. Teams is
-    reachable from those tools as a native channel.
-  - *Supported distribution and configuration.*
-    [#8850](https://github.com/zeroclaw-labs/zeroclaw/issues/8850) still
-    tracks feeding plugins the canonical channel config, native-or-plugin
-    provider selection and active routing, publishing compatible plugin
-    packages, and shipping a supported WASM-enabled artifact.
-    [#10996](https://github.com/zeroclaw-labs/zeroclaw/issues/10996) tracks
-    seeding the channel instance configuration and egress grants during
-    plugin installation. Until those land, operators have no supported path
-    to install and configure a Teams plugin.
-- **Native code path that depends on them**: the orchestrator constructs
+Distribution and configuration are no longer the gap either. Supported
+release artifacts ship the WASM plugin host
+([#11347](https://github.com/zeroclaw-labs/zeroclaw/pull/11347)),
+`plugin install` and `plugin bind` create the channel instance binding and
+seed its egress grants
+([#11302](https://github.com/zeroclaw-labs/zeroclaw/pull/11302)), and a
+package whose manifest declares `provides = "<id>"` activates once per
+configured `[channels.<id>.<alias>]`, so a Teams mirror could reuse the
+existing `[channels.msteams.<alias>]` config. Receiving webhooks and being
+installable do not make a plugin equivalent to this channel, though. For
+Teams the exception is:
+
+- **Remaining operational constraint**: *channel-addressed tool delivery.*
+  Plugin channels are constructed asynchronously, so the synchronous
+  `build_channel_map` and `register_channels_for_tools` surfaces cannot see
+  them, and tools that address a channel by name cannot target a plugin
+  channel yet. Teams is reachable from those tools as a native channel.
+- **Native code path that depends on it**: the orchestrator constructs
   `MsTeamsChannel` in `build_channel_by_id` and
   `collect_configured_channels` and reaches it from `deliver_announcement`,
   `listing.rs` lists it, and `MsTeamsChannel::listen()` hosts the axum
   `/api/messages` route, where `bind_activity_to_claims()` authenticates each
   request against the signed token before any state is recorded.
 - **Condition that permits migration**: once channel-addressed tools can
-  target plugin channels and the #8850 and #10996 work gives operators a
-  supported install and configuration path, this channel can move to a
-  plugin without protocol changes. `auth.rs`, `activity.rs`, and
+  target plugin channels, a Teams plugin that mirrors `msteams` and shows
+  parity with this channel under #8850 can replace it without protocol
+  changes. `auth.rs`, `activity.rs`, and
   `conversation.rs` already hold no axum types; only `mod.rs` does. That
   port is separate work and is not part of this change.
 
