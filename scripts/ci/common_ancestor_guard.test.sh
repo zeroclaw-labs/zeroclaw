@@ -35,6 +35,16 @@ if (cd "$repo" && bash "$guard" origin/master missing-target) >/dev/null 2>&1; t
   exit 1
 fi
 
+if (cd "$repo" && bash "$guard" "--is-ancestor" "$related_sha") >/dev/null 2>&1; then
+  echo "expected hyphen-prefixed base ref to fail" >&2
+  exit 1
+fi
+
+if (cd "$repo" && bash "$guard" origin/master "--help") >/dev/null 2>&1; then
+  echo "expected hyphen-prefixed target ref to fail" >&2
+  exit 1
+fi
+
 expected_target='          HISTORY_CHECK_SHA: ${{ github.event_name == '\''pull_request'\'' && github.event.pull_request.head.sha || github.sha }}'
 grep -Fqx "$expected_target" "$workflow" || {
   echo "history guard must select pull_request.head.sha for PRs and github.sha otherwise" >&2
