@@ -3378,6 +3378,7 @@ async fn run_tool_call_loop_impl<'a>(
                 activated_tools,
                 excluded_tools,
                 model_switch_callback: model_switch_callback.as_ref(),
+                approval: ctx.approval,
             };
             let mut retained_indices = Vec::new();
             let mut retained_calls = Vec::new();
@@ -3456,6 +3457,7 @@ async fn run_tool_call_loop_impl<'a>(
                         activated_tools,
                         excluded_tools,
                         model_switch_callback: model_switch_callback.as_ref(),
+                        approval: ctx.approval,
                     };
                     execute_tools_parallel(
                         &executable_calls,
@@ -3474,6 +3476,7 @@ async fn run_tool_call_loop_impl<'a>(
                         activated_tools,
                         excluded_tools,
                         model_switch_callback: model_switch_callback.as_ref(),
+                        approval: ctx.approval,
                     };
                     execute_tools_sequential(
                         &executable_calls,
