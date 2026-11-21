@@ -32,6 +32,8 @@ const {
   STORAGE_KEY,
   applySessionChange,
   loadPersisted,
+  linkedSession,
+  tabForRoute,
   makeTab,
   reservationsByKey,
   tabForOpenRequest,
@@ -233,4 +235,17 @@ test('a pane move rewrites only that pane and keeps identity stable', () => {
 test('reporting the conversation a pane is already on is a no-op', () => {
   const tabs: Tab[] = [{ key: 'k1', alias: 'ops', sessionId: 'A' }];
   assert.equal(applySessionChange(tabs, 'k1', 'A')[0], tabs[0]);
+});
+
+test('notification links address an exact conversation of the selected agent', () => {
+  const first = makeTab('operator', 'first');
+  const second = makeTab('operator', 'second');
+  const tabs = [first, second];
+  assert.equal(linkedSession('?session=second'), 'second');
+  assert.equal(linkedSession('?session=..%2Fother'), undefined);
+  assert.equal(tabForRoute(tabs, 'operator', 'second').key, second.key);
+  assert.notEqual(tabForRoute(tabs, 'other', 'second').sessionId, second.sessionId);
+  assert.equal(tabForRoute(tabs, 'operator').key, first.key);
+  assert.equal(tabForRoute(tabs, 'operator', undefined, second.key).key, second.key);
+  assert.equal(tabForRoute(tabs, 'operator', 'unopened').sessionId, 'unopened');
 });
