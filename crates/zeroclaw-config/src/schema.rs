@@ -20167,7 +20167,8 @@ pub struct SecurityConfig {
     #[nested]
     pub otp: OtpConfig,
 
-    /// Emergency-stop state machine configuration.
+    /// Emergency-stop configuration. Not enforced: no runtime path reads the
+    /// estop state, so these settings do not stop anything.
     #[serde(default)]
     #[nested]
     pub estop: EstopConfig,
@@ -20383,15 +20384,17 @@ impl Default for OtpConfig {
 #[prefix = "security.estop"]
 #[serde(deny_unknown_fields)]
 pub struct EstopConfig {
-    /// Enable emergency stop controls.
+    /// Emergency stop switch. Not enforced: no runtime path reads the estop
+    /// state, so enabling it does not stop anything.
     #[serde(default)]
     pub enabled: bool,
 
-    /// File path used to persist estop state.
+    /// File path reserved for estop state. Not enforced: nothing reads its contents.
     #[serde(default = "default_estop_state_file")]
     pub state_file: String,
 
-    /// Require a valid OTP before resume operations.
+    /// Require a valid OTP before resume operations. Not enforced: the resume
+    /// command refuses to run.
     #[serde(default = "default_true")]
     pub require_otp_to_resume: bool,
 }

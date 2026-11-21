@@ -23,6 +23,8 @@ mod degraded_config_remediation;
 mod desktop_cli_linux;
 mod direct_cli_terminal_completion;
 mod dockerignore_test;
+#[cfg(feature = "agent-runtime")]
+mod estop_cli;
 #[cfg(feature = "gateway")]
 mod gateway;
 mod gemini_capabilities;
