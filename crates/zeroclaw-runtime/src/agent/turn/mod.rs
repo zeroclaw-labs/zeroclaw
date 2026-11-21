@@ -3921,6 +3921,16 @@ fn sop_step_excluded_tools(
 #[derive(Clone)]
 pub struct SopStepReassembly<'a> {
     pub config: &'a zeroclaw_config::schema::Config,
+    /// The per-run caller ceiling in force for the loop that owns this handle,
+    /// forwarded so a re-assembled step agent cannot recover tools the caller
+    /// was never granted. Carrying it here — rather than re-deriving it from
+    /// the step agent's own config — is what makes the bound descend
+    /// monotonically: each nested assembly is capped by what the level above
+    /// actually received, not by what the step agent's profile would allow on
+    /// its own. `Some` only on the `run` path, the one entry point that has a
+    /// caller allowlist; every other construction site has no caller ceiling to
+    /// forward and passes `None`.
+    pub caller_allowed: Option<&'a [String]>,
     pub live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
     /// The owner whose private plane the running session's memory is pinned
     /// to, or `None` for an unowned session. A re-assembled step agent's
@@ -4067,6 +4077,7 @@ pub(crate) async fn assemble_owned_execution(
     sop_audit: Option<Arc<crate::sop::SopAuditLogger>>,
     parent_approval: Option<&crate::approval::ApprovalManager>,
     memory_owner: Option<&zeroclaw_api::memory_traits::PrincipalScope>,
+    caller_allowed: Option<&[String]>,
 ) -> Result<OwnedAgentExecution> {
     assemble_owned_execution_with_capabilities(
         config,
@@ -4078,6 +4089,7 @@ pub(crate) async fn assemble_owned_execution(
         sop_audit,
         parent_approval,
         memory_owner,
+        caller_allowed,
         None,
     )
     .await
@@ -4086,6 +4098,7 @@ pub(crate) async fn assemble_owned_execution(
 /// [`assemble_owned_execution`] with the step agent's memory, provider and any
 /// source-supplied tools obtained from `capabilities`, and its provider
 /// resolved for `principal`, the enclosing turn's.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn assemble_owned_execution_with_capabilities(
     config: &zeroclaw_config::schema::Config,
     live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
@@ -4096,6 +4109,7 @@ pub(crate) async fn assemble_owned_execution_with_capabilities(
     sop_audit: Option<Arc<crate::sop::SopAuditLogger>>,
     parent_approval: Option<&crate::approval::ApprovalManager>,
     memory_owner: Option<&zeroclaw_api::memory_traits::PrincipalScope>,
+    caller_allowed: Option<&[String]>,
     execution_admission: Option<AgentExecutionAdmission>,
 ) -> Result<OwnedAgentExecution> {
     if let Some(admission) = execution_admission.as_ref() {
@@ -4170,6 +4184,17 @@ pub(crate) async fn assemble_owned_execution_with_capabilities(
                 .as_ref()
                 .map(AgentExecutionAdmission::capability),
             acp_sessions: None,
+            // The step agent's scheduler tools need the ceiling's VALUE, not just
+            // membership in it: `caller_allowed` decides which tools this step is
+            // offered, but a job it stores outlives the step entirely. Without this
+            // the step agent would hold a `cron_add` that persists the step agent's
+            // own registry — the same escape, one hop further out.
+            caller_ceiling: caller_allowed.map(|list| {
+                let handle: crate::tools::caller_ceiling::CallerCeiling =
+                    Arc::new(std::sync::OnceLock::new());
+                let _ = handle.set(list.to_vec());
+                handle
+            }),
         })?,
         None => crate::tools::supplied_registry_base()?,
     };
@@ -4198,7 +4223,12 @@ pub(crate) async fn assemble_owned_execution_with_capabilities(
             built,
             skills: &skills,
             runtime,
-            caller_allowed: None,
+            // The caller ceiling reaches BOTH the built-in filter and the MCP
+            // tool-access policy through this one field, so forwarding it here
+            // also caps eager MCP registration and the runtime `tool_search`
+            // activation channel — the surfaces a step agent would otherwise
+            // use to grow back into capabilities its caller never had.
+            caller_allowed,
             connect_mcp: true,
             // A nested SOP step re-assembly is per turn (memoized per alias);
             // it has no cross-turn reuse contract, so the per-call
@@ -4547,6 +4577,7 @@ async fn drive_live_sop_actions(
                                             run_audit.clone(),
                                             approval,
                                             step_owner,
+                                            reassembly.caller_allowed,
                                             execution_admission.clone(),
                                         )
                                         .await
@@ -4562,6 +4593,7 @@ async fn drive_live_sop_actions(
                                             run_audit.clone(),
                                             approval,
                                             step_owner,
+                                            reassembly.caller_allowed,
                                             execution_admission.clone(),
                                         )
                                         .await
@@ -5001,6 +5033,7 @@ async fn drive_live_sop_actions(
                         &queued.engine,
                         &run_id,
                         step_result.clone(),
+                        queued.bounded_caller,
                     )?;
                     crate::sop::executor::audit_sop_step(
                         run_audit.as_deref(),
@@ -5044,7 +5077,17 @@ async fn drive_live_sop_actions(
                             Ok(engine) => engine,
                             Err(poisoned) => poisoned.into_inner(),
                         };
-                        engine.advance_headless_deterministic_step(&run_id, action)?
+                        let next = engine.advance_headless_deterministic_step(&run_id, action)?;
+                        // Same rule as `advance_sop_step`, under this lock.
+                        if queued.bounded_caller {
+                            crate::sop::executor::cancel_parked_run_for_bounded_caller(
+                                &mut engine,
+                                &next,
+                            )?
+                            .unwrap_or(next)
+                        } else {
+                            next
+                        }
                     };
                     action = next;
                     // Let an operator request acquire the engine before the next
@@ -7417,6 +7460,7 @@ mod sop_step_reassembly_tests {
             None,
             None,
             None,
+            None,
         )
         .await
         .expect("reader assembles");
@@ -7425,6 +7469,7 @@ mod sop_step_reassembly_tests {
             None,
             "writer",
             Arc::clone(&engine),
+            None,
             None,
             None,
             None,
@@ -7450,6 +7495,232 @@ mod sop_step_reassembly_tests {
         // With no parent approval manager the child is non-interactive
         // (auto-deny), matching the headless driver.
         assert!(reader.approval.is_non_interactive());
+    }
+
+    /// A bounded caller's ceiling has to survive the hop into a nested step
+    /// agent: the step is assembled from its OWN profile, so without the
+    /// ceiling it recovers every tool the caller's turn was refused.
+    ///
+    /// Both ends are asserted. The unbounded control proves the agent really
+    /// holds the tool the ceiling is meant to take away; without it the negative
+    /// would pass for a profile that never offered the tool at all.
+    #[tokio::test]
+    async fn assembling_a_step_agent_applies_the_callers_ceiling() {
+        use zeroclaw_config::multi_agent::{AgentMemoryConfig, MemoryBackendKind};
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, Config, ModelProviderConfig, OllamaModelProviderConfig,
+            RiskProfileConfig, SopConfig,
+        };
+
+        let root =
+            std::env::temp_dir().join(format!("zeroclaw-sop-ceiling-{}", uuid::Uuid::new_v4()));
+        let mut config = Config {
+            data_dir: root.join("data"),
+            config_path: root.join("config.toml"),
+            ..Config::default()
+        };
+        config.risk_profiles.insert(
+            "both".to_string(),
+            RiskProfileConfig {
+                allowed_tools: vec!["file_read".to_string(), "file_write".to_string()],
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.providers.models.ollama.insert(
+            "p".to_string(),
+            OllamaModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("test-model".to_string()),
+                    ..ModelProviderConfig::default()
+                },
+                ..OllamaModelProviderConfig::default()
+            },
+        );
+        config.agents.insert(
+            "both".to_string(),
+            AliasedAgentConfig {
+                enabled: true,
+                model_provider: "ollama.p".into(),
+                risk_profile: "both".into(),
+                memory: AgentMemoryConfig {
+                    backend: MemoryBackendKind::Markdown,
+                },
+                ..AliasedAgentConfig::default()
+            },
+        );
+        let engine = Arc::new(std::sync::Mutex::new(crate::sop::SopEngine::new(
+            SopConfig::default(),
+        )));
+
+        let unbounded = assemble_owned_execution(
+            &config,
+            None,
+            "both",
+            Arc::clone(&engine),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("unbounded step agent assembles");
+        let unbounded_names = tool_names(&unbounded.tools_registry);
+        assert!(
+            unbounded_names.contains(&"file_read".to_string())
+                && unbounded_names.contains(&"file_write".to_string()),
+            "control: with no ceiling the step agent holds both tools: {unbounded_names:?}"
+        );
+
+        let ceiling = vec!["file_read".to_string()];
+        let bounded = assemble_owned_execution(
+            &config,
+            None,
+            "both",
+            Arc::clone(&engine),
+            None,
+            None,
+            None,
+            Some(ceiling.as_slice()),
+        )
+        .await
+        .expect("bounded step agent assembles");
+        let bounded_names = tool_names(&bounded.tools_registry);
+        assert!(
+            bounded_names.contains(&"file_read".to_string()),
+            "a tool the ceiling admits must still be offered: {bounded_names:?}"
+        );
+        assert!(
+            !bounded_names.contains(&"file_write".to_string()),
+            "a tool outside the ceiling must not be recovered: {bounded_names:?}"
+        );
+    }
+
+    /// A config with a step agent `stepper` whose profile allows the scheduler
+    /// tool `cron_add` and `file_read`, so a ceiling naming both is satisfiable
+    /// and the step agent holds the tool whose stored list is observed.
+    fn scheduler_step_config(tmp: &tempfile::TempDir) -> zeroclaw_config::schema::Config {
+        use zeroclaw_config::multi_agent::{AgentMemoryConfig, MemoryBackendKind};
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, Config, ModelProviderConfig, OllamaModelProviderConfig,
+            RiskProfileConfig,
+        };
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).expect("data dir");
+        config.risk_profiles.insert(
+            "stepper".to_string(),
+            RiskProfileConfig {
+                allowed_tools: vec!["cron_add".to_string(), "file_read".to_string()],
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.providers.models.ollama.insert(
+            "p".to_string(),
+            OllamaModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("test-model".to_string()),
+                    ..ModelProviderConfig::default()
+                },
+                ..OllamaModelProviderConfig::default()
+            },
+        );
+        config.agents.insert(
+            "stepper".to_string(),
+            AliasedAgentConfig {
+                enabled: true,
+                model_provider: "ollama.p".into(),
+                risk_profile: "stepper".into(),
+                memory: AgentMemoryConfig {
+                    backend: MemoryBackendKind::Markdown,
+                },
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config
+    }
+
+    /// Store an agent job through the step registry's own `cron_add`, with NO
+    /// `allowed_tools`, and return the tool list the job was stored with.
+    ///
+    /// An unset list under a ceiling is stored as the ceiling itself
+    /// (`caller_ceiling::cap_stored_allowed_tools`), so this reads back the
+    /// ceiling VALUE the step agent's scheduler tool holds; with no ceiling the
+    /// list stays unset.
+    async fn step_cron_add_stored_tools(
+        config: &zeroclaw_config::schema::Config,
+        owned: &OwnedAgentExecution,
+    ) -> Option<Vec<String>> {
+        let stored = run_step_tool(
+            owned,
+            "cron_add",
+            serde_json::json!({
+                "job_type": "agent",
+                "prompt": "report back",
+                "schedule": { "kind": "every", "every_ms": 3_600_000 },
+                "approved": true,
+            }),
+        )
+        .await;
+        assert!(stored.success, "the step agent stores the job: {stored:?}");
+        let jobs = crate::cron::list_jobs_by_agent(config, "stepper").expect("list jobs");
+        assert_eq!(jobs.len(), 1, "one job stored by the step agent: {jobs:?}");
+        jobs[0].allowed_tools.clone()
+    }
+
+    /// The ceiling handed to a step agent reaches its scheduler tools as a
+    /// VALUE: a job the step agent stores without `allowed_tools` carries the
+    /// caller's ceiling, not the step agent's own registry. Membership in the
+    /// ceiling alone (which tools the step is offered) does not show this, and
+    /// a job outlives the step.
+    #[tokio::test]
+    async fn assembling_a_step_agent_hands_its_scheduler_tools_the_callers_ceiling_value() {
+        let engine = Arc::new(std::sync::Mutex::new(crate::sop::SopEngine::new(
+            zeroclaw_config::schema::SopConfig::default(),
+        )));
+        let ceiling = vec!["file_read".to_string(), "cron_add".to_string()];
+
+        let tmp_control = tempfile::TempDir::new().expect("tempdir");
+        let control_config = scheduler_step_config(&tmp_control);
+        let unbounded = assemble_owned_execution(
+            &control_config,
+            None,
+            "stepper",
+            Arc::clone(&engine),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("unbounded step agent assembles");
+        assert_eq!(
+            step_cron_add_stored_tools(&control_config, &unbounded).await,
+            None,
+            "control: with no ceiling the stored list stays unset"
+        );
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let config = scheduler_step_config(&tmp);
+        let bounded = assemble_owned_execution(
+            &config,
+            None,
+            "stepper",
+            Arc::clone(&engine),
+            None,
+            None,
+            None,
+            Some(ceiling.as_slice()),
+        )
+        .await
+        .expect("bounded step agent assembles");
+        assert_eq!(
+            step_cron_add_stored_tools(&config, &bounded).await,
+            Some(ceiling),
+            "the step agent's scheduler tool stores the caller's ceiling"
+        );
     }
 
     /// A config with a step agent `stepper` on SQLite memory whose policy
@@ -7551,6 +7822,7 @@ mod sop_step_reassembly_tests {
             None,
             None,
             Some(&owner),
+            None,
         )
         .await
         .expect("the step agent assembles");
@@ -7613,9 +7885,10 @@ mod sop_step_reassembly_tests {
         let engine = Arc::new(std::sync::Mutex::new(crate::sop::SopEngine::new(
             zeroclaw_config::schema::SopConfig::default(),
         )));
-        let owned = assemble_owned_execution(&config, None, "stepper", engine, None, None, None)
-            .await
-            .expect("the step agent assembles");
+        let owned =
+            assemble_owned_execution(&config, None, "stepper", engine, None, None, None, None)
+                .await
+                .expect("the step agent assembles");
         let stored = run_step_tool(
             &owned,
             "memory_store",
@@ -7700,6 +7973,7 @@ mod sop_step_reassembly_tests {
             Some(live_config.handle()),
             "stepper",
             Arc::clone(&engine),
+            None,
             None,
             None,
             None,
@@ -7800,6 +8074,7 @@ mod sop_step_reassembly_tests {
             Arc::clone(&engine),
             None,
             Some(&parent),
+            None,
             None,
         )
         .await
@@ -9154,6 +9429,7 @@ mod sop_step_reassembly_tests {
             engine: Arc::clone(&engine),
             audit,
             action,
+            bounded_caller: false,
         };
         let mut local_history_has_trim_breadcrumb = false;
         let history_has_trim_breadcrumb =
@@ -9226,6 +9502,7 @@ mod sop_step_reassembly_tests {
         let (engine, _run_id, action) = start_single_cross_agent_step("stepper");
         let owner = PrincipalScope::new("user:alice").with_agent(Some("outer".to_string()));
         let handle = SopStepReassembly {
+            caller_allowed: None,
             config: &config,
             capabilities: None,
             live_config: None,
@@ -9318,6 +9595,7 @@ mod sop_step_reassembly_tests {
         let (engine, _run_id, action) = start_single_cross_agent_step("stepper");
         let owner = PrincipalScope::new("user:alice").with_agent(Some("outer".to_string()));
         let handle = SopStepReassembly {
+            caller_allowed: None,
             config: &config,
             capabilities: Some(&bound),
             live_config: None,
@@ -9374,6 +9652,81 @@ mod sop_step_reassembly_tests {
         );
     }
 
+    /// Drive one cross-agent step through the real driver with `caller_allowed`
+    /// on the handle (bound to `capabilities` when given) and return the tool
+    /// list the re-assembled step agent's `cron_add` stores for an unrestricted
+    /// job. The step's model call fails; assembly and caching have already run.
+    async fn driven_step_cron_add_stored_tools(
+        caller_allowed: &[String],
+        capabilities: Option<&crate::composition::BoundCapabilities>,
+    ) -> Option<Vec<String>> {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let config = scheduler_step_config(&tmp);
+        let (engine, _run_id, action) = start_single_cross_agent_step("stepper");
+        let handle = SopStepReassembly {
+            caller_allowed: Some(caller_allowed),
+            config: &config,
+            capabilities,
+            live_config: None,
+            memory_owner: None,
+        };
+        let parent_tools = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
+        let mut history = vec![ChatMessage::system("parent system prompt")];
+        let mut exec_cache = std::collections::HashMap::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            drive_step(
+                Arc::clone(&engine),
+                action,
+                &TextProvider,
+                &parent_tools,
+                &crate::observability::NoopObserver {},
+                &mut history,
+                None,
+                None,
+                None,
+                Some("outer"),
+                Some(handle),
+                None,
+                &mut exec_cache,
+            ),
+        )
+        .await
+        .expect("the driver settles");
+        let owned = exec_cache
+            .get("stepper")
+            .expect("the driver re-assembled the step agent");
+        step_cron_add_stored_tools(&config, owned).await
+    }
+
+    /// Through the real driver, a turn with NO supplied capabilities hands the
+    /// handle's `caller_allowed` on to the step agent it re-assembles: the job
+    /// that agent's `cron_add` stores carries the ceiling.
+    #[tokio::test]
+    async fn the_driver_hands_an_unbound_steps_scheduler_tools_the_callers_ceiling() {
+        let ceiling = vec!["file_read".to_string(), "cron_add".to_string()];
+        assert_eq!(
+            driven_step_cron_add_stored_tools(&ceiling, None).await,
+            Some(ceiling),
+            "the unbound arm must pass the caller's ceiling to the step assembly"
+        );
+    }
+
+    /// The same through the bound-capabilities arm.
+    #[tokio::test]
+    async fn the_driver_hands_a_bound_steps_scheduler_tools_the_callers_ceiling() {
+        let ceiling = vec!["file_read".to_string(), "cron_add".to_string()];
+        let bound = crate::composition::BoundCapabilities {
+            capabilities: crate::composition::RuntimeCapabilities::config_backed_unobserved(),
+            principal: None,
+        };
+        assert_eq!(
+            driven_step_cron_add_stored_tools(&ceiling, Some(&bound)).await,
+            Some(ceiling),
+            "the bound arm must pass the caller's ceiling to the step assembly"
+        );
+    }
+
     /// Runs of one principal in different namespaces or tenants are different
     /// owners. An unowned session driving both must not serve the second run's
     /// step from the execution it assembled for the first, whose tools write
@@ -9421,6 +9774,7 @@ mod sop_step_reassembly_tests {
                 let (engine, _run_id, action) =
                     start_single_cross_agent_step_for("stepper", Some(owner.clone()));
                 let handle = SopStepReassembly {
+                    caller_allowed: None,
                     config: &config,
                     capabilities: Some(&bound),
                     live_config: None,
@@ -9512,6 +9866,7 @@ mod sop_step_reassembly_tests {
             let config = stepper_config(tmp.path());
             let (engine, run_id, action) = start_single_cross_agent_step("stepper");
             let handle = SopStepReassembly {
+                caller_allowed: None,
                 config: &config,
                 capabilities: Some(&bound),
                 live_config: None,
@@ -9581,6 +9936,7 @@ mod sop_step_reassembly_tests {
         let (engine, run_id, action) =
             start_single_cross_agent_step_for("stepper", Some(owner.clone()));
         let handle = SopStepReassembly {
+            caller_allowed: None,
             config: &config,
             capabilities: None,
             live_config: None,
@@ -9676,6 +10032,7 @@ mod sop_step_reassembly_tests {
         let owner = PrincipalScope::new("user:alice").with_agent(Some("stepper".to_string()));
         let (engine, run_id, action) = start_single_step_for(None, None, Some(owner));
         let handle = SopStepReassembly {
+            caller_allowed: None,
             config: &config,
             capabilities: None,
             live_config: None,
@@ -9780,6 +10137,7 @@ mod sop_step_reassembly_tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let config = stepper_config(tmp.path());
         let handle = SopStepReassembly {
+            caller_allowed: None,
             config: &config,
             live_config: None,
             capabilities: Some(bound),
@@ -10109,6 +10467,7 @@ mod sop_step_reassembly_tests {
         let config = zeroclaw_config::schema::Config::default();
         let handle = SopStepReassembly {
             config: &config,
+            caller_allowed: None,
             live_config: None,
             memory_owner: None,
             capabilities: None,
@@ -10213,6 +10572,7 @@ mod sop_step_reassembly_tests {
         let config = zeroclaw_config::schema::Config::default();
         let handle = SopStepReassembly {
             config: &config,
+            caller_allowed: None,
             live_config: None,
             memory_owner: None,
             capabilities: None,
@@ -10313,6 +10673,7 @@ mod sop_step_reassembly_tests {
         let config = zeroclaw_config::schema::Config::default();
         let handle = SopStepReassembly {
             config: &config,
+            caller_allowed: None,
             live_config: None,
             memory_owner: None,
             capabilities: None,
@@ -10379,6 +10740,7 @@ mod sop_step_reassembly_tests {
         let config = zeroclaw_config::schema::Config::default();
         let handle = SopStepReassembly {
             config: &config,
+            caller_allowed: None,
             live_config: None,
             memory_owner: None,
             capabilities: None,
@@ -10437,6 +10799,7 @@ mod sop_step_reassembly_tests {
         let config = zeroclaw_config::schema::Config::default();
         let handle = SopStepReassembly {
             config: &config,
+            caller_allowed: None,
             live_config: None,
             memory_owner: None,
             capabilities: None,
@@ -10503,6 +10866,7 @@ mod sop_step_reassembly_tests {
         let config = zeroclaw_config::schema::Config::default();
         let handle = SopStepReassembly {
             config: &config,
+            caller_allowed: None,
             live_config: None,
             memory_owner: None,
             capabilities: None,
@@ -10562,6 +10926,7 @@ mod sop_step_reassembly_tests {
         let config = zeroclaw_config::schema::Config::default();
         let handle = SopStepReassembly {
             config: &config,
+            caller_allowed: None,
             live_config: None,
             memory_owner: None,
             capabilities: None,
@@ -10767,6 +11132,7 @@ mod sop_step_reassembly_tests {
         let config = zeroclaw_config::schema::Config::default();
         let handle = SopStepReassembly {
             config: &config,
+            caller_allowed: None,
             live_config: None,
             memory_owner: None,
             capabilities: None,
@@ -10976,6 +11342,305 @@ mod sop_step_reassembly_tests {
             "the live driver must execute exactly MAX_HEADLESS_DRIVE_STEPS capabilities, \
              the same bound both headless drivers use"
         );
+    }
+
+    // ── bounded caller: parks the live driver reaches on its own ────────────
+    //
+    // `sop_execute`/`sop_advance` refuse and cancel a run whose returned action
+    // parks it, but that only covers the action they return. When it is a step,
+    // the live driver runs it and advances the run itself, and the NEXT action
+    // can park just as well. A parked run outlives the turn and is resumed by
+    // an external approver on the headless driver with no ceiling at all, so a
+    // run queued by a bounded caller must be cancelled at whichever park the
+    // driver reaches, not only at the first one.
+
+    fn two_step_sop(
+        name: &str,
+        mode: crate::sop::types::SopExecutionMode,
+        second: crate::sop::types::SopStep,
+        first: crate::sop::types::SopStep,
+    ) -> crate::sop::types::Sop {
+        crate::sop::types::Sop {
+            name: name.to_string(),
+            description: "bounded live-driver park".to_string(),
+            version: "1.0.0".to_string(),
+            priority: crate::sop::types::SopPriority::Normal,
+            execution_mode: mode,
+            triggers: vec![crate::sop::types::SopTrigger::Manual],
+            steps: vec![first, second],
+            cooldown_secs: 0,
+            max_concurrent: 1,
+            location: None,
+            deterministic: mode == crate::sop::types::SopExecutionMode::Deterministic,
+            admission_policy: Default::default(),
+            max_pending_approvals: 0,
+            agent: None,
+            decision: None,
+        }
+    }
+
+    fn plain_step(number: u32) -> crate::sop::types::SopStep {
+        crate::sop::types::SopStep {
+            number,
+            title: format!("Step {number}"),
+            body: format!("Do step {number}"),
+            ..crate::sop::types::SopStep::default()
+        }
+    }
+
+    /// Step one runs in the turn; step two requires confirmation.
+    fn sop_gated_at_step_two() -> crate::sop::types::Sop {
+        let mut second = plain_step(2);
+        second.requires_confirmation = true;
+        two_step_sop(
+            "gated-at-two",
+            crate::sop::types::SopExecutionMode::Auto,
+            second,
+            plain_step(1),
+        )
+    }
+
+    fn start_manual_run(
+        mut engine: crate::sop::SopEngine,
+        sop: crate::sop::types::Sop,
+    ) -> (
+        Arc<std::sync::Mutex<crate::sop::SopEngine>>,
+        String,
+        crate::sop::types::SopRunAction,
+    ) {
+        let name = sop.name.clone();
+        engine.set_sops_for_test(vec![sop]);
+        let action = engine
+            .start_run(
+                &name,
+                crate::sop::types::SopEvent {
+                    source: crate::sop::types::SopTriggerSource::Manual,
+                    topic: None,
+                    payload: None,
+                    timestamp: "2026-09-25T00:00:00Z".to_string(),
+                },
+            )
+            .expect("run starts");
+        let run_id = match &action {
+            crate::sop::types::SopRunAction::ExecuteStep { run_id, .. }
+            | crate::sop::types::SopRunAction::DeterministicStep { run_id, .. } => run_id.clone(),
+            other => panic!("the first action must be a step the driver runs, got {other:?}"),
+        };
+        (Arc::new(std::sync::Mutex::new(engine)), run_id, action)
+    }
+
+    /// `drive_step`, but with the queued action's `bounded_caller` set and
+    /// the driver's own result returned rather than unwrapped.
+    async fn drive_queued(
+        engine: &Arc<std::sync::Mutex<crate::sop::SopEngine>>,
+        action: crate::sop::types::SopRunAction,
+        bounded_caller: bool,
+    ) -> anyhow::Result<()> {
+        let queued = crate::sop::executor::QueuedSopAction {
+            engine: Arc::clone(engine),
+            audit: None,
+            action,
+            bounded_caller,
+        };
+        let parent_tools = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
+        let mut history: Vec<ChatMessage> = Vec::new();
+        let mut exec_cache = std::collections::HashMap::new();
+        drive_live_sop_actions(
+            vec![queued],
+            &mut history,
+            &mut false,
+            &TextProvider,
+            "mock",
+            "mock-model",
+            "mock-model",
+            None,
+            &parent_tools,
+            &crate::observability::NoopObserver {},
+            true,
+            None,
+            None,
+            &zeroclaw_config::schema::MultimodalConfig::default(),
+            None,
+            5,
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            &zeroclaw_config::schema::PacingConfig::default(),
+            false,
+            false,
+            30_000,
+            zeroclaw_config::schema::ResolvedContextLimits {
+                model_context_window: 100_000,
+                context_token_budget: 100_000,
+                model_context_window_source:
+                    zeroclaw_config::schema::ModelContextWindowSource::Configured,
+            },
+            None,
+            &LoopKnobs::default(),
+            "cli",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &mut exec_cache,
+        )
+        .await
+    }
+
+    /// The run must be terminal, out of the active set, and not resumable by
+    /// an approver — the three things a parked run would otherwise be.
+    fn assert_cancelled_and_not_resumable(
+        engine: &Arc<std::sync::Mutex<crate::sop::SopEngine>>,
+        run_id: &str,
+        driven_steps: usize,
+    ) {
+        let mut guard = engine.lock().expect("engine lock");
+        let run = guard.get_run(run_id).expect("run stays queryable").clone();
+        // Counts completed steps only: routing past an unmet dependency also
+        // records a `Skipped` result for the step it could not enter.
+        let completed = run
+            .step_results
+            .iter()
+            .filter(|r| r.status == crate::sop::types::SopStepStatus::Completed)
+            .count();
+        assert_eq!(
+            completed, driven_steps,
+            "the ungated step(s) must still have run inside the turn: {run:?}"
+        );
+        assert_eq!(
+            run.status,
+            crate::sop::types::SopRunStatus::Cancelled,
+            "a bounded caller's run must be cancelled at the park the live driver reached"
+        );
+        assert!(!guard.active_runs().contains_key(run_id));
+        let outcome = guard
+            .resolve_gate(
+                run_id,
+                crate::sop::approval::ApprovalDecision::Approve,
+                crate::sop::approval::ApprovalPrincipal::cli(None),
+            )
+            .expect("resolving a cancelled run's gate must not error");
+        assert!(
+            !matches!(outcome, crate::sop::approval::ResolveOutcome::Resumed(_)),
+            "an external approver must not be able to resume it, got: {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_live_driver_cancels_a_run_that_reaches_approval_after_a_step() {
+        let (engine, run_id, action) = start_manual_run(
+            crate::sop::SopEngine::new(zeroclaw_config::schema::SopConfig::default()),
+            sop_gated_at_step_two(),
+        );
+        drive_queued(&engine, action, true)
+            .await
+            .expect("a successful cancellation is not a driver error");
+        assert_cancelled_and_not_resumable(&engine, &run_id, 1);
+    }
+
+    /// `Pending` does not look like a park, but a background tick can promote
+    /// it to an approval gate later (see `executor::parked_run_id`).
+    #[tokio::test]
+    async fn bounded_live_driver_cancels_a_run_left_pending_on_a_dependency() {
+        let mut second = plain_step(2);
+        second.routing.depends_on = vec![99];
+        let sop = two_step_sop(
+            "pending-at-two",
+            crate::sop::types::SopExecutionMode::Auto,
+            second,
+            plain_step(1),
+        );
+        let (engine, run_id, action) = start_manual_run(
+            crate::sop::SopEngine::new(zeroclaw_config::schema::SopConfig::default()),
+            sop,
+        );
+        drive_queued(&engine, action, true)
+            .await
+            .expect("a successful cancellation is not a driver error");
+        assert_cancelled_and_not_resumable(&engine, &run_id, 1);
+    }
+
+    /// The deterministic arm advances under its own engine lock, separate
+    /// from `advance_sop_step`, so it needs the same check.
+    #[tokio::test]
+    async fn bounded_live_driver_cancels_a_deterministic_run_that_reaches_a_checkpoint() {
+        let first = crate::sop::types::SopStep {
+            kind: crate::sop::types::SopStepKind::Capability,
+            capability: Some("noop".into()),
+            ..plain_step(1)
+        };
+        let second = crate::sop::types::SopStep {
+            kind: crate::sop::types::SopStepKind::Checkpoint,
+            ..plain_step(2)
+        };
+        let sop = two_step_sop(
+            "checkpoint-at-two",
+            crate::sop::types::SopExecutionMode::Deterministic,
+            second,
+            first,
+        );
+        let (engine, run_id, action) = start_manual_run(
+            crate::sop::SopEngine::new(zeroclaw_config::schema::SopConfig::default()),
+            sop,
+        );
+        drive_queued(&engine, action, true)
+            .await
+            .expect("a successful cancellation is not a driver error");
+        assert_cancelled_and_not_resumable(&engine, &run_id, 1);
+    }
+
+    /// If the cancellation cannot be persisted the run is still active, and
+    /// the driver must say so instead of finishing as if it had been closed.
+    #[tokio::test]
+    async fn bounded_live_driver_reports_a_cancellation_it_could_not_persist() {
+        let engine = crate::sop::SopEngine::new(zeroclaw_config::schema::SopConfig::default())
+            .with_store(Arc::new(
+                crate::sop::test_support::AlwaysFailFinishStore::new(),
+            ));
+        let (engine, run_id, action) = start_manual_run(engine, sop_gated_at_step_two());
+
+        let err = drive_queued(&engine, action, true)
+            .await
+            .expect_err("an unpersisted cancellation must surface as an error");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains(&run_id) && message.contains("could NOT be cancelled"),
+            "the error must name the run and the failed cancellation, got: {message}"
+        );
+        let guard = engine.lock().expect("engine lock");
+        assert!(
+            guard.active_runs().contains_key(&run_id),
+            "the run really is still active; the test would be vacuous otherwise"
+        );
+    }
+
+    /// Control: an unbounded caller's run parks exactly as before.
+    #[tokio::test]
+    async fn unbounded_live_driver_still_parks_for_approval() {
+        let (engine, run_id, action) = start_manual_run(
+            crate::sop::SopEngine::new(zeroclaw_config::schema::SopConfig::default()),
+            sop_gated_at_step_two(),
+        );
+        drive_queued(&engine, action, false)
+            .await
+            .expect("an unbounded park is not an error");
+        let guard = engine.lock().expect("engine lock");
+        assert_eq!(
+            guard.get_run(&run_id).map(|r| r.status),
+            Some(crate::sop::types::SopRunStatus::WaitingApproval)
+        );
+        assert!(guard.active_runs().contains_key(&run_id));
     }
 }
 

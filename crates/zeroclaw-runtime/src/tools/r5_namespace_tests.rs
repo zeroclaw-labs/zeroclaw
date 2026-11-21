@@ -82,6 +82,7 @@ fn build_case(optional: &[&str], pipeline_enabled: bool, plugins_enabled: bool) 
         None,
         None,
         None,
+        None,
     )
     .unwrap();
     (tmp, config, security, built, runtime)
@@ -840,6 +841,7 @@ async fn late_build(
         &config,
         None,
         false,
+        None,
         None,
         None,
         None,

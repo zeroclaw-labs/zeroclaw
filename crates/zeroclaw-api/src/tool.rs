@@ -532,6 +532,19 @@ pub fn clear_runtime_approval(tool_name: &str, args: &mut serde_json::Value) {
 
 #[async_trait]
 pub trait Tool: Send + Sync + crate::attribution::Attributable {
+    /// Downcast hook for the rare caller that must reason about a concrete
+    /// tool type instead of the trait object.
+    ///
+    /// Defaults to `None`, so no implementation is forced to opt in and the
+    /// absence of an override is a refusal rather than a gap. The bounded
+    /// delegation rebuild uses it to ask an MCP tool which server owns it,
+    /// resolved against the registry the instance itself carries - the only
+    /// authoritative answer, since a prefixed name cannot be parsed back into
+    /// a server whose own name may contain the separator.
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        None
+    }
+
     /// True when this tool does work that does not carry the RPC principal's
     /// current authority: nested, scheduled or headless runs, turns on another
     /// agent, shared procedures, or other principals' sessions. Non-admin RPC

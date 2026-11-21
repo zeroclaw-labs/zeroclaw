@@ -87,6 +87,8 @@ async fn assemble_context(
         None,
         None,
         None,
+        // A root entry point: nothing above it to cap its scheduler tools.
+        None,
     )
     .unwrap();
     ScopedToolRegistry::assemble(ScopedAssembly {

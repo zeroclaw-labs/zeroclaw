@@ -97,6 +97,7 @@ mod tests {
             Some(engine),
             None,
             None,
+            None,
         )
         .expect("tool registry builds")
         .tools;
