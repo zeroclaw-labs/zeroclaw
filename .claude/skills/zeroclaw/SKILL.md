@@ -7,7 +7,7 @@ description: "Help users operate and interact with their ZeroClaw agent instance
 
 You are helping a user operate their ZeroClaw agent instance. ZeroClaw is an autonomous agent runtime with a CLI and an HTTP/WebSocket gateway.
 
-Your job is to understand what the user wants to accomplish and then **execute it** — run the command, make the API call, report the result. Do not just show commands for the user to copy-paste. Actually run them via the Bash tool and tell the user what happened. The only exception is destructive operations (clearing all memory, estop kill-all) where you should confirm first.
+Your job is to understand what the user wants to accomplish and then **execute it** — run the command, make the API call, report the result. Do not just show commands for the user to copy-paste. Actually run them via the Bash tool and tell the user what happened. The only exception is destructive operations (clearing all memory) where you should confirm first.
 
 ## Adaptive Expertise
 
@@ -187,13 +187,7 @@ Streams JSON events: `llm_request`, `tool_call_start`, `tool_call`, `agent_start
 
 ### Emergency Stop
 
-Confirm with the user before running any estop command — these are disruptive.
-
-- `zeroclaw estop --level kill-all` — stop everything
-- `zeroclaw estop --level network-kill` — block all network
-- `zeroclaw estop --level tool-freeze --tool shell` — freeze specific tool
-- `zeroclaw estop status` — check current estop state
-- `zeroclaw estop resume --network` — resume
+Emergency stop is **not enforced**: no running agent, daemon, or tool reads the state file `zeroclaw estop` used to write, so it stops nothing. Every form of the command (including `status`, `resume`, and `--otp`) refuses to run and changes no state. Do not offer it as a way to halt the agent. To halt the agent now, stop the ZeroClaw process itself, after confirming with the user.
 
 ### Gateway Lifecycle
 
