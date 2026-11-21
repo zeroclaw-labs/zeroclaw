@@ -5,6 +5,7 @@ use serde_json::json;
 use std::collections::BTreeSet;
 use std::fmt::Write;
 use std::sync::{Arc, OnceLock};
+use zeroclaw_api::session_message::{MessageValidationError, SessionMessage};
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::policy::ToolOperation;
@@ -14,6 +15,7 @@ use zeroclaw_infra::acp_session_store::{
 use zeroclaw_infra::session_backend::SessionBackend;
 
 static SESSIONS_SEND_DESCRIPTION: OnceLock<String> = OnceLock::new();
+static SESSIONS_MESSAGE_DESCRIPTION: OnceLock<String> = OnceLock::new();
 
 /// Agent-scoped access to the durable ACP session store.
 ///
@@ -167,6 +169,22 @@ fn validate_session_id(session_id: &str) -> Result<(), SessionValidationError> {
         return Err(SessionValidationError::NoAlphanumeric);
     }
     Ok(())
+}
+
+/// Chat-mode RPC sessions run their turns under the bare session ID but store
+/// their transcript and metadata under this prefix.
+const RPC_SESSION_KEY_PREFIX: &str = "rpc_";
+
+/// The key the backend stores a running session under: the tool-loop key
+/// itself, or its RPC transcript key when only that one has metadata.
+fn stored_session_key(backend: &dyn SessionBackend, loop_key: &str) -> String {
+    if backend.get_session_metadata(loop_key).is_none() {
+        let rpc_key = format!("{RPC_SESSION_KEY_PREFIX}{loop_key}");
+        if backend.get_session_metadata(&rpc_key).is_some() {
+            return rpc_key;
+        }
+    }
+    loop_key.to_string()
 }
 
 fn resolve_existing_session_key(backend: &dyn SessionBackend, session_id: &str) -> Option<String> {
@@ -566,6 +584,213 @@ fn session_not_found(session_id: &str) -> ToolResult {
         error: Some(format!(
             "Session '{session_id}' not found. Use sessions_list or sessions_current to choose an existing session. Gateway dashboard sessions are stored as 'gw_<session_id>'."
         )),
+    }
+}
+
+// ── SessionsMessageTool ─────────────────────────────────────────────
+
+/// Async receiver-discretionary session messaging. Stores a durable message
+/// event for the target session instead of appending to its history; the
+/// receiving agent decides whether and how to respond.
+pub struct SessionsMessageTool {
+    backend: Arc<dyn SessionBackend>,
+    security: Arc<SecurityPolicy>,
+    /// Alias of the agent this tool instance runs for. When set, the source
+    /// session's recorded alias must match it, so a session key alone cannot
+    /// speak for another agent.
+    agent_alias: Option<String>,
+}
+
+impl SessionsMessageTool {
+    pub fn new(
+        backend: Arc<dyn SessionBackend>,
+        security: Arc<SecurityPolicy>,
+        agent_alias: Option<String>,
+    ) -> Self {
+        Self {
+            backend,
+            security,
+            agent_alias,
+        }
+    }
+
+    fn failure(error: String) -> ToolResult {
+        ToolResult {
+            success: false,
+            output: ToolOutput::default(),
+            error: Some(error),
+        }
+    }
+
+    /// The verified source alias: the session's recorded alias, which must
+    /// agree with the alias this tool is bound to when one is bound.
+    fn source_alias<'a>(&'a self, recorded: Option<&'a str>) -> Result<&'a str, String> {
+        match (self.agent_alias.as_deref(), recorded) {
+            (Some(bound), Some(recorded)) if bound != recorded => Err(tool_msg_with_args(
+                "tool-sessions-message-error-source-alias-mismatch",
+                &[("bound", bound), ("recorded", recorded)],
+            )),
+            (_, Some(recorded)) => Ok(recorded),
+            (_, None) => Err(tool_msg("tool-sessions-message-error-source-alias-missing")),
+        }
+    }
+
+    fn verify_same_alias(source_alias: &str, target_alias: Option<&str>) -> Result<(), String> {
+        match target_alias {
+            Some(target) if target == source_alias => Ok(()),
+            Some(target) => Err(tool_msg_with_args(
+                "tool-sessions-message-error-cross-alias",
+                &[("source", source_alias), ("target", target)],
+            )),
+            None => Err(tool_msg("tool-sessions-message-error-target-alias-missing")),
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for SessionsMessageTool {
+    fn requires_unrestricted_principal(&self) -> bool {
+        // Same-alias routing is not a per-principal ownership check.
+        true
+    }
+
+    fn name(&self) -> &str {
+        "sessions_message"
+    }
+
+    fn description(&self) -> &str {
+        SESSIONS_MESSAGE_DESCRIPTION
+            .get_or_init(|| tool_msg("tool-sessions-message"))
+            .as_str()
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "target_session_id": {
+                    "type": "string",
+                    "description": tool_msg("tool-sessions-message-param-target-session-id")
+                },
+                "message": {
+                    "type": "string",
+                    "description": tool_msg("tool-sessions-message-param-message")
+                }
+            },
+            "required": ["target_session_id", "message"]
+        })
+    }
+
+    async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        if let Err(error) = self
+            .security
+            .enforce_tool_operation(ToolOperation::Act, "sessions_message")
+        {
+            return Ok(Self::failure(error));
+        }
+
+        let Some(source_session_key) = current_session_key() else {
+            return Ok(Self::failure(tool_msg(
+                "tool-sessions-message-error-no-session-context",
+            )));
+        };
+        let source_session_key = stored_session_key(self.backend.as_ref(), &source_session_key);
+
+        let Some(target_session_id) = args.get("target_session_id").and_then(|v| v.as_str()) else {
+            return Ok(Self::failure(tool_msg_with_args(
+                "tool-sessions-message-error-missing-param",
+                &[("param", "target_session_id")],
+            )));
+        };
+
+        if let Err(error) = validate_session_id(target_session_id) {
+            return Ok(error.into_tool_result());
+        }
+
+        let Some(message_body) = args.get("message").and_then(|v| v.as_str()) else {
+            return Ok(Self::failure(tool_msg_with_args(
+                "tool-sessions-message-error-missing-param",
+                &[("param", "message")],
+            )));
+        };
+
+        if message_body.trim().is_empty() {
+            return Ok(Self::failure(tool_msg("tool-sessions-message-error-empty")));
+        }
+
+        if let Err(MessageValidationError::BodyTooLarge { actual, max }) =
+            SessionMessage::validate_body_size(message_body)
+        {
+            let (actual, max) = (actual.to_string(), max.to_string());
+            return Ok(Self::failure(tool_msg_with_args(
+                "tool-sessions-message-error-too-large",
+                &[("actual", &actual), ("max", &max)],
+            )));
+        }
+
+        let Some(target_session_key) =
+            resolve_existing_session_key(self.backend.as_ref(), target_session_id).or_else(|| {
+                let rpc_key = format!("{RPC_SESSION_KEY_PREFIX}{}", target_session_id.trim());
+                self.backend
+                    .list_sessions()
+                    .contains(&rpc_key)
+                    .then_some(rpc_key)
+            })
+        else {
+            return Ok(session_not_found(target_session_id));
+        };
+
+        let source_metadata = self.backend.get_session_metadata(&source_session_key);
+        let target_metadata = self.backend.get_session_metadata(&target_session_key);
+        let recorded_source = source_metadata
+            .as_ref()
+            .and_then(|m| m.agent_alias.as_deref());
+        let target_alias = target_metadata
+            .as_ref()
+            .and_then(|m| m.agent_alias.as_deref());
+
+        let source_alias = match self.source_alias(recorded_source) {
+            Ok(alias) => alias,
+            Err(error) => return Ok(Self::failure(error)),
+        };
+        if let Err(error) = Self::verify_same_alias(source_alias, target_alias) {
+            return Ok(Self::failure(error));
+        }
+
+        let delivery_id = uuid::Uuid::new_v4().to_string();
+        let message = SessionMessage::new(
+            delivery_id.clone(),
+            source_session_key.clone(),
+            target_session_key.clone(),
+            message_body.to_string(),
+            Some(source_alias.to_string()),
+            target_alias.map(String::from),
+        );
+
+        match self.backend.store_session_message(&message) {
+            Ok(()) => Ok(ToolResult {
+                success: true,
+                output: tool_msg_with_args(
+                    "tool-sessions-message-output-sent",
+                    &[
+                        ("session_id", &target_session_key),
+                        ("delivery_id", &delivery_id),
+                    ],
+                )
+                .into(),
+                error: None,
+            }),
+            Err(e) if e.kind() == std::io::ErrorKind::Unsupported => Ok(Self::failure(tool_msg(
+                "tool-sessions-message-error-unsupported",
+            ))),
+            Err(e) => {
+                let error = e.to_string();
+                Ok(Self::failure(tool_msg_with_args(
+                    "tool-sessions-message-error-store",
+                    &[("error", &error)],
+                )))
+            }
+        }
     }
 }
 
@@ -1104,6 +1329,7 @@ mod tests {
     use std::sync::Mutex;
     use tempfile::TempDir;
     use zeroclaw_api::model_provider::ChatMessage;
+    use zeroclaw_api::session_message::{MAX_MESSAGE_BODY_BYTES, SessionMessage};
     use zeroclaw_infra::session_backend::SessionMetadata;
     use zeroclaw_infra::session_store::SessionStore;
 
@@ -1168,7 +1394,11 @@ mod tests {
         }
 
         fn list_sessions(&self) -> Vec<String> {
-            self.inner.list_sessions()
+            let mut sessions: Vec<String> = self.metadata.lock().unwrap().keys().cloned().collect();
+            sessions.extend(self.inner.list_sessions());
+            sessions.sort();
+            sessions.dedup();
+            sessions
         }
 
         fn list_sessions_with_metadata(&self) -> Vec<SessionMetadata> {
@@ -2397,5 +2627,357 @@ mod tests {
         assert!(result.success);
         assert!(!result.output.contains(&foreign));
         assert!(!result.output.contains("colliding foreign chat message"));
+    }
+
+    // ── SessionsMessageTool tests ──────────────────────────────────
+
+    struct MessageCapturingBackend {
+        inner: Arc<dyn SessionBackend>,
+        messages: Mutex<Vec<SessionMessage>>,
+    }
+
+    impl MessageCapturingBackend {
+        fn new(inner: Arc<dyn SessionBackend>) -> Self {
+            Self {
+                inner,
+                messages: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn captured_messages(&self) -> Vec<SessionMessage> {
+            self.messages.lock().unwrap().clone()
+        }
+    }
+
+    impl SessionBackend for MessageCapturingBackend {
+        fn load(&self, key: &str) -> Vec<ChatMessage> {
+            self.inner.load(key)
+        }
+
+        fn append(&self, key: &str, msg: &ChatMessage) -> std::io::Result<()> {
+            self.inner.append(key, msg)
+        }
+
+        fn remove_last(&self, key: &str) -> std::io::Result<bool> {
+            self.inner.remove_last(key)
+        }
+
+        fn list_sessions(&self) -> Vec<String> {
+            self.inner.list_sessions()
+        }
+
+        fn list_sessions_with_metadata(&self) -> Vec<SessionMetadata> {
+            self.inner.list_sessions_with_metadata()
+        }
+
+        fn get_session_metadata(&self, session_key: &str) -> Option<SessionMetadata> {
+            self.inner.get_session_metadata(session_key)
+        }
+
+        fn store_session_message(&self, message: &SessionMessage) -> std::io::Result<()> {
+            self.messages.lock().unwrap().push(message.clone());
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn sessions_message_creates_durable_event() {
+        let (_tmp, inner) = seeded_metadata_backend(vec![
+            session_metadata("alice_session", Some("agent1"), None, 2),
+            session_metadata("bob_session", Some("agent1"), None, 1),
+        ]);
+        let capturing_backend = Arc::new(MessageCapturingBackend::new(inner));
+        let backend: Arc<dyn SessionBackend> = capturing_backend.clone();
+
+        let tool =
+            SessionsMessageTool::new(backend.clone(), test_security(), Some("agent1".into()));
+
+        let result = zeroclaw_api::TOOL_LOOP_SESSION_KEY
+            .scope(
+                Some("alice_session".into()),
+                tool.execute(json!({
+                    "target_session_id": "bob_session",
+                    "message": "Hello from Alice"
+                })),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        assert!(result.output.contains("delivery_id"));
+
+        let captured = capturing_backend.captured_messages();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].source_session_key, "alice_session");
+        assert_eq!(captured[0].target_session_key, "bob_session");
+        assert_eq!(captured[0].body, "Hello from Alice");
+        assert!(!captured[0].admitted);
+    }
+
+    #[tokio::test]
+    async fn sessions_message_rejects_cross_alias() {
+        let (_tmp, backend) = seeded_metadata_backend(vec![
+            session_metadata("alice_session", Some("agent1"), None, 2),
+            session_metadata("bob_session", Some("agent2"), None, 1),
+        ]);
+
+        let tool = SessionsMessageTool::new(backend, test_security(), Some("agent1".into()));
+
+        let result = zeroclaw_api::TOOL_LOOP_SESSION_KEY
+            .scope(
+                Some("alice_session".into()),
+                tool.execute(json!({
+                    "target_session_id": "bob_session",
+                    "message": "Hello"
+                })),
+            )
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert_eq!(
+            result.error.as_deref(),
+            Some(
+                tool_msg_with_args(
+                    "tool-sessions-message-error-cross-alias",
+                    &[("source", "agent1"), ("target", "agent2")],
+                )
+                .as_str()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn sessions_message_rejects_missing_source_alias() {
+        let (_tmp, backend) = seeded_metadata_backend(vec![
+            session_metadata("alice_session", None, None, 2),
+            session_metadata("bob_session", Some("agent1"), None, 1),
+        ]);
+
+        let tool = SessionsMessageTool::new(backend, test_security(), Some("agent1".into()));
+
+        let result = zeroclaw_api::TOOL_LOOP_SESSION_KEY
+            .scope(
+                Some("alice_session".into()),
+                tool.execute(json!({
+                    "target_session_id": "bob_session",
+                    "message": "Hello"
+                })),
+            )
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert_eq!(
+            result.error.as_deref(),
+            Some(tool_msg("tool-sessions-message-error-source-alias-missing").as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn sessions_message_validates_body_size() {
+        let (_tmp, inner) = seeded_metadata_backend(vec![
+            session_metadata("alice_session", Some("agent1"), None, 2),
+            session_metadata("bob_session", Some("agent1"), None, 1),
+        ]);
+        let capturing_backend = Arc::new(MessageCapturingBackend::new(inner));
+        let backend: Arc<dyn SessionBackend> = capturing_backend.clone();
+
+        let tool = SessionsMessageTool::new(backend, test_security(), Some("agent1".into()));
+
+        let too_large = "a".repeat(MAX_MESSAGE_BODY_BYTES + 1);
+
+        let result = zeroclaw_api::TOOL_LOOP_SESSION_KEY
+            .scope(
+                Some("alice_session".into()),
+                tool.execute(json!({
+                    "target_session_id": "bob_session",
+                    "message": too_large
+                })),
+            )
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        let actual = (MAX_MESSAGE_BODY_BYTES + 1).to_string();
+        let max = MAX_MESSAGE_BODY_BYTES.to_string();
+        assert_eq!(
+            result.error.as_deref(),
+            Some(
+                tool_msg_with_args(
+                    "tool-sessions-message-error-too-large",
+                    &[("actual", &actual), ("max", &max)],
+                )
+                .as_str()
+            )
+        );
+        assert!(capturing_backend.captured_messages().is_empty());
+    }
+
+    #[tokio::test]
+    async fn sessions_message_rejects_unknown_target() {
+        let (_tmp, backend) = seeded_metadata_backend(vec![session_metadata(
+            "alice_session",
+            Some("agent1"),
+            None,
+            2,
+        )]);
+
+        let tool = SessionsMessageTool::new(backend, test_security(), Some("agent1".into()));
+
+        let result = zeroclaw_api::TOOL_LOOP_SESSION_KEY
+            .scope(
+                Some("alice_session".into()),
+                tool.execute(json!({
+                    "target_session_id": "nonexistent",
+                    "message": "Hello"
+                })),
+            )
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(result.error.unwrap().contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn sessions_message_requires_session_context() {
+        let (_tmp, backend) = test_backend();
+        let tool = SessionsMessageTool::new(backend, test_security(), Some("agent1".into()));
+
+        let result = tool
+            .execute(json!({
+                "target_session_id": "bob",
+                "message": "Hello"
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert_eq!(
+            result.error.as_deref(),
+            Some(tool_msg("tool-sessions-message-error-no-session-context").as_str())
+        );
+    }
+
+    #[test]
+    fn sessions_message_tool_name_and_schema() {
+        let (_tmp, backend) = test_backend();
+        let tool = SessionsMessageTool::new(backend, test_security(), None);
+        assert_eq!(tool.name(), "sessions_message");
+        let schema = tool.parameters_schema();
+        assert!(
+            schema["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("target_session_id"))
+        );
+        assert!(
+            schema["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("message"))
+        );
+    }
+
+    #[tokio::test]
+    async fn sessions_message_rejects_source_alias_other_than_bound_agent() {
+        let (_tmp, inner) = seeded_metadata_backend(vec![
+            session_metadata("alice_session", Some("agent2"), None, 2),
+            session_metadata("bob_session", Some("agent2"), None, 1),
+        ]);
+        let capturing_backend = Arc::new(MessageCapturingBackend::new(inner));
+        let backend: Arc<dyn SessionBackend> = capturing_backend.clone();
+        let tool = SessionsMessageTool::new(backend, test_security(), Some("agent1".into()));
+
+        let result = zeroclaw_api::TOOL_LOOP_SESSION_KEY
+            .scope(
+                Some("alice_session".into()),
+                tool.execute(json!({
+                    "target_session_id": "bob_session",
+                    "message": "Hello"
+                })),
+            )
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert_eq!(
+            result.error.as_deref(),
+            Some(
+                tool_msg_with_args(
+                    "tool-sessions-message-error-source-alias-mismatch",
+                    &[("bound", "agent1"), ("recorded", "agent2")],
+                )
+                .as_str()
+            )
+        );
+        assert!(capturing_backend.captured_messages().is_empty());
+    }
+
+    #[tokio::test]
+    async fn sessions_message_reports_backend_without_message_store() {
+        let (_tmp, backend) = seeded_metadata_backend(vec![
+            session_metadata("alice_session", Some("agent1"), None, 2),
+            session_metadata("bob_session", Some("agent1"), None, 1),
+        ]);
+        let tool = SessionsMessageTool::new(backend, test_security(), Some("agent1".into()));
+
+        let result = zeroclaw_api::TOOL_LOOP_SESSION_KEY
+            .scope(
+                Some("alice_session".into()),
+                tool.execute(json!({
+                    "target_session_id": "bob_session",
+                    "message": "Hello"
+                })),
+            )
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert_eq!(
+            result.error.as_deref(),
+            Some(tool_msg("tool-sessions-message-error-unsupported").as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn sessions_message_persists_between_rpc_sessions_in_the_default_backend() {
+        let tmp = TempDir::new().unwrap();
+        let sqlite = Arc::new(
+            zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(tmp.path()).unwrap(),
+        );
+        for key in ["rpc_alice", "rpc_bob"] {
+            sqlite.append(key, &ChatMessage::user("hi")).unwrap();
+            sqlite.set_session_agent_alias(key, "agent1").unwrap();
+        }
+        let backend: Arc<dyn SessionBackend> = sqlite.clone();
+        let tool = SessionsMessageTool::new(backend, test_security(), Some("agent1".into()));
+
+        // RPC turns run under the bare session ID.
+        let result = zeroclaw_api::TOOL_LOOP_SESSION_KEY
+            .scope(
+                Some("alice".into()),
+                tool.execute(json!({"target_session_id": "bob", "message": "status?"})),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.success, "{:?}", result.error);
+        let pending = sqlite
+            .next_pending_session_message("rpc_bob")
+            .unwrap()
+            .expect("the message waits for bob");
+        assert_eq!(pending.source_session_key, "rpc_alice");
+        assert_eq!(pending.body, "status?");
+        assert_eq!(pending.source_agent_alias.as_deref(), Some("agent1"));
+        assert!(result.output.contains(&pending.delivery_id));
+    }
+
+    #[test]
+    fn sessions_message_is_withheld_from_restricted_principals() {
+        let (_tmp, backend) = test_backend();
+        let tool = SessionsMessageTool::new(backend, test_security(), None);
+        assert!(tool.requires_unrestricted_principal());
     }
 }

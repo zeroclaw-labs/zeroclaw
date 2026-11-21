@@ -873,6 +873,43 @@ struct LiveSessionEffect<'a> {
 #[error("session effect refused: {0:?}")]
 struct SessionEffectDenied(JsonRpcError);
 
+/// Put the oldest pending peer message for `session_key` ahead of `prompt`,
+/// attributed to its sender, and return its delivery ID. The message is not
+/// admitted here: the caller records admission once the turn is admitted.
+fn take_peer_message_into_prompt(
+    backend: &dyn zeroclaw_infra::session_backend::SessionBackend,
+    session_key: &str,
+    prompt: &mut String,
+) -> Option<String> {
+    let message = match backend.next_pending_session_message(session_key) {
+        Ok(message) => message?,
+        Err(error) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "session_key": session_key,
+                        "error": error.to_string(),
+                    })),
+                "Failed to read pending peer session messages"
+            );
+            return None;
+        }
+    };
+    let sender = message.source_agent_alias.as_deref().unwrap_or("unknown");
+    let source = message
+        .source_session_key
+        .strip_prefix("rpc_")
+        .unwrap_or(&message.source_session_key);
+    *prompt = format!(
+        "[message from agent {sender}, session {source}, delivery {delivery}]\n{body}\n[end of message]\n\n{prompt}",
+        delivery = message.delivery_id,
+        body = message.body,
+    );
+    Some(message.delivery_id)
+}
+
 fn session_effect_io_error(error: anyhow::Error) -> std::io::Error {
     // Preserve the concrete refusal across the object-safe backend's io error
     // boundary; anyhow's boxed adapter does not retain std downcast identity.
@@ -7070,6 +7107,15 @@ impl RpcDispatcher {
         self.ctx.sessions.wait_test_prompt_execution_pause().await;
         let persist_session_state = !matches!(chat_mode, crate::rpc::types::ChatMode::Acp);
         let session_key = format!("rpc_{sid}");
+        // A peer message waiting for this session joins this turn's input,
+        // one per turn. It stays pending unless the turn is admitted.
+        let peer_delivery = if persist_session_state {
+            self.ctx.session_backend.as_ref().and_then(|backend| {
+                take_peer_message_into_prompt(backend.as_ref(), &session_key, &mut prompt)
+            })
+        } else {
+            None
+        };
         let turn_id = uuid::Uuid::new_v4().to_string();
         let checkpoint_error = Arc::new(tokio::sync::Mutex::new(None::<String>));
         let checkpoint_turn_id = (!persist_session_state).then(|| uuid::Uuid::new_v4().to_string());
@@ -7266,6 +7312,23 @@ impl RpcDispatcher {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take();
+        if refused_preparation.is_none()
+            && let Some(delivery_id) = peer_delivery.as_deref()
+            && let Some(backend) = self.ctx.session_backend.as_ref()
+            && let Err(error) = backend.mark_session_message_admitted(delivery_id)
+        {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "session_id": sid,
+                        "delivery_id": delivery_id,
+                        "error": error.to_string(),
+                    })),
+                "Failed to record a peer session message as admitted"
+            );
+        }
         if let Some(error) = refused_preparation {
             cancel_registration.finish();
             if checkpoint_turn_id.is_some() && error.code == INTERNAL_ERROR {
@@ -33237,6 +33300,7 @@ mod tests {
                     "sessions_history",
                     "sessions_current",
                     "sessions_send",
+                    "sessions_message",
                 ]
                 .into_iter()
                 .map(str::to_string)
@@ -53857,6 +53921,70 @@ mod tests {
             done["params"]["outcome"],
             json!("completed"),
             "Bob's turn is not cancelled: {done}"
+        );
+    }
+
+    /// A message another session stored for this one joins its next prompt,
+    /// attributed to the sender, and is admitted once.
+    #[tokio::test]
+    async fn a_pending_peer_message_joins_the_next_prompt_once() {
+        use zeroclaw_infra::session_backend::SessionBackend as _;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sid = "s-peer-inbox";
+        let (ctx, backend, workspace) = steering_ctx(&tmp, |profile| profile.admin = true);
+        let handles = install_recording_session(
+            &ctx,
+            &backend,
+            sid,
+            "user:alice",
+            &workspace,
+            Vec::new(),
+            false,
+        )
+        .await;
+        backend
+            .store_session_message(&zeroclaw_api::session_message::SessionMessage::new(
+                "d-peer",
+                "rpc_s-sender",
+                format!("rpc_{sid}"),
+                "the build is green",
+                Some("test-agent".into()),
+                Some("test-agent".into()),
+            ))
+            .unwrap();
+        let (alice, _alice_rx) = roster_peer(&ctx, 4242).await;
+
+        alice
+            .handle_session_prompt(&json!({"session_id": sid, "prompt": "next step?"}))
+            .await
+            .expect("the prompt runs");
+        let calls = handles.calls().await;
+        let (text, _) = calls.last().expect("the turn reached the provider");
+        assert!(
+            text.contains(
+                "[message from agent test-agent, session s-sender, delivery d-peer]\n\
+                 the build is green\n[end of message]\n\nnext step?"
+            ),
+            "{text}"
+        );
+        assert!(
+            backend
+                .next_pending_session_message(&format!("rpc_{sid}"))
+                .unwrap()
+                .is_none(),
+            "the message is admitted"
+        );
+
+        alice
+            .handle_session_prompt(&json!({"session_id": sid, "prompt": "and now?"}))
+            .await
+            .expect("the second prompt runs");
+        let calls = handles.calls().await;
+        let (text, _) = calls.last().unwrap();
+        assert_eq!(
+            text.matches("delivery d-peer").count(),
+            1,
+            "only the first turn's history carries it: {text}"
         );
     }
 
