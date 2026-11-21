@@ -524,6 +524,96 @@ mod tests {
             }
         }
 
+        #[cfg(any(unix, windows))]
+        struct UnicodeOutputExecutor;
+
+        #[cfg(any(unix, windows))]
+        #[async_trait]
+        impl CodingCliExecutor for UnicodeOutputExecutor {
+            async fn output(
+                &self,
+                _command: CodingCliCommand,
+            ) -> Result<Output, CodingCliExecutionError> {
+                #[cfg(unix)]
+                use std::os::unix::process::ExitStatusExt;
+                #[cfg(windows)]
+                use std::os::windows::process::ExitStatusExt;
+
+                Ok(Output {
+                    status: std::process::ExitStatus::from_raw(0),
+                    stdout: "a🦀éZ".as_bytes().to_vec(),
+                    stderr: b"diagnostic".to_vec(),
+                })
+            }
+        }
+
+        #[cfg(any(unix, windows))]
+        #[tokio::test]
+        async fn every_adapter_caps_unicode_stdout_at_a_complete_codepoint() {
+            let workspace = tempfile::tempdir().unwrap();
+            let security = Arc::new(SecurityPolicy {
+                autonomy: AutonomyLevel::Full,
+                workspace_dir: workspace.path().to_path_buf(),
+                ..SecurityPolicy::default()
+            });
+            let executor = Arc::new(UnicodeOutputExecutor);
+            for (cap, expected) in [
+                (0, "\n... [output truncated]"),
+                (4, "a\n... [output truncated]"),
+                (5, "a🦀\n... [output truncated]"),
+                (8, "a🦀éZ"),
+            ] {
+                let tools: Vec<Box<dyn Tool>> = vec![
+                    Box::new(ClaudeCodeTool::new_with_executor(
+                        security.clone(),
+                        ClaudeCodeConfig {
+                            max_output_bytes: cap,
+                            ..ClaudeCodeConfig::default()
+                        },
+                        executor.clone(),
+                    )),
+                    Box::new(CodexCliTool::new_with_executor(
+                        security.clone(),
+                        CodexCliConfig {
+                            max_output_bytes: cap,
+                            ..CodexCliConfig::default()
+                        },
+                        executor.clone(),
+                    )),
+                    Box::new(GeminiCliTool::new_with_executor(
+                        security.clone(),
+                        GeminiCliConfig {
+                            max_output_bytes: cap,
+                            ..GeminiCliConfig::default()
+                        },
+                        executor.clone(),
+                    )),
+                    Box::new(OpenCodeCliTool::new_with_executor(
+                        security.clone(),
+                        OpenCodeCliConfig {
+                            max_output_bytes: cap,
+                            ..OpenCodeCliConfig::default()
+                        },
+                        executor.clone(),
+                    )),
+                ];
+                for tool in tools {
+                    let result = tool
+                        .execute(serde_json::json!({"prompt": "output probe"}))
+                        .await
+                        .unwrap();
+                    assert!(result.success, "{} at cap {cap}", tool.name());
+                    assert_eq!(
+                        result.output.as_str(),
+                        expected,
+                        "{} at cap {cap}",
+                        tool.name()
+                    );
+                    assert_eq!(result.error.as_deref(), Some("diagnostic"));
+                }
+            }
+        }
+
         #[tokio::test]
         async fn every_adapter_applies_the_canonical_environment_boundary() {
             let workspace = tempfile::tempdir().expect("temporary workspace");
