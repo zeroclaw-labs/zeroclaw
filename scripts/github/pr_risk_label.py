@@ -729,6 +729,14 @@ def strict_test_only_proof(
         if not all(is_low_path(path) for path in paths):
             return False, "non-low or mixed production file is present"
 
+    # The compare request only pays for itself once the proof is eligible;
+    # a failed lookup reads like unavailable source evidence instead of
+    # losing the whole report.
+    try:
+        merge_base_sha = api.get_merge_base(base_sha, head_sha)
+    except Exception as exc:
+        return False, f"source evidence is unavailable: {exc}"
+
     for item in high_rust_files:
         patch = item.get("patch")
         if not isinstance(patch, str):
@@ -754,7 +762,7 @@ def strict_test_only_proof(
 
         path = normalize_path(item.get("filename"))
         try:
-            base_source = source_text(api.get_source(path, base_sha))
+            base_source = source_text(api.get_source(path, merge_base_sha))
             head_source = source_text(api.get_source(path, head_sha))
             base_lines = base_source.splitlines()
             head_lines = head_source.splitlines()
