@@ -93,6 +93,11 @@ pub struct InteractionContext {
     persistence: SessionPersistence,
 }
 
+/// Header both identity renderers (the direct `append_project_context` and the
+/// channel `IdentitySection`) emit at a section boundary — the single source
+/// for the identity-zone lookup in `system_prompt::project_context_zone`.
+pub(crate) const PROJECT_CONTEXT_HEADER: &str = "## Project Context\n\n";
+
 pub(crate) const TIMESTAMP_ORIENTATION: &str = "This is an interactive conversation with a user; a leading `[CURRENT DATE & TIME: ...]` line on their message is timestamp metadata added by the runtime, not log or API data — treat it as an ordinary conversational message and respond naturally and directly.\n\n";
 
 pub(crate) fn append_timestamp_orientation(prompt: &mut String) {
@@ -324,7 +329,7 @@ impl PromptSection for IdentitySection {
     }
 
     fn build(&self, ctx: &PromptContext<'_>) -> Result<String> {
-        let mut prompt = String::from("## Project Context\n\n");
+        let mut prompt = String::from(PROJECT_CONTEXT_HEADER);
         let mut has_aieos = false;
         if let Some(config) = ctx.identity_config
             && identity::is_aieos_configured(config)
@@ -1025,6 +1030,98 @@ mod tests {
         assert!(prompt.contains("## Project Context"));
         assert!(prompt.contains("## Workspace"));
         assert!(prompt.contains("## Runtime"));
+    }
+
+    #[test]
+    fn identity_precedes_tools_and_skills_in_channel_and_direct_builders() {
+        let workspace = tempfile::TempDir::new().expect("tempdir");
+        std::fs::write(workspace.path().join("AGENTS.md"), "PARITY_IDENTITY_MARKER")
+            .expect("write AGENTS.md");
+        let skills = vec![crate::skills::Skill {
+            name: "parity-skill".into(),
+            description: "Parity skill metadata".into(),
+            description_localizations: Default::default(),
+            version: "1.0.0".into(),
+            author: None,
+            tags: vec![],
+            tools: vec![],
+            prompts: vec![],
+            slash_options: Vec::new(),
+            always: false,
+            location: None,
+        }];
+
+        // Channel path: `SystemPromptBuilder::with_defaults` renders
+        // `IdentitySection` second, before ToolHonesty/Tools/Skills, so the
+        // identity zone survives head-retained budget truncation.
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(TestTool)];
+        let ctx = PromptContext {
+            workspace_dir: workspace.path(),
+            agent_workspace_dir: workspace.path(),
+            model_name: "test-model",
+            tools: &tools,
+            skills: &skills,
+            skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
+            identity_config: None,
+            interaction: None,
+            dispatcher_instructions: "",
+            hidden_builtin_names: None,
+            sends_native_tool_specs: false,
+            security_summary: None,
+            autonomy_level: AutonomyLevel::Supervised,
+            inject_memory: true,
+            shell_profile: None,
+        };
+        let channel_prompt = SystemPromptBuilder::with_defaults().build(&ctx).unwrap();
+        let channel_project = channel_prompt
+            .find("## Project Context")
+            .expect("channel project context");
+        let channel_tools = channel_prompt.find("## Tools").expect("channel tools");
+        let channel_skills = channel_prompt
+            .find("## Available Skills")
+            .expect("channel skills");
+        assert!(
+            channel_project < channel_tools,
+            "channel builder must render identity before tools"
+        );
+        assert!(
+            channel_project < channel_skills,
+            "channel builder must render identity before skills"
+        );
+
+        // Direct path (cron/CLI/headless turns): the assembled prompt builder
+        // must hold the same order — identity first, then tools/skills.
+        let direct_prompt = crate::agent::system_prompt::build_system_prompt_with_mode_and_autonomy(
+            workspace.path(),
+            "test-model",
+            &[("test_tool", "tool desc")],
+            &skills,
+            None,
+            Some(8_000),
+            None,
+            false,
+            zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
+            false,
+            0,
+            true,
+            false,
+            None,
+        );
+        let direct_project = direct_prompt
+            .find("## Project Context")
+            .expect("direct project context");
+        let direct_tools = direct_prompt.find("## Tools").expect("direct tools");
+        let direct_skills = direct_prompt
+            .find("## Available Skills")
+            .expect("direct skills");
+        assert!(
+            direct_project < direct_tools,
+            "direct builder must render identity before tools"
+        );
+        assert!(
+            direct_project < direct_skills,
+            "direct builder must render identity before skills"
+        );
     }
 
     #[test]
