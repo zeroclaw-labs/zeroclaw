@@ -22,6 +22,7 @@ pub mod migration;
 pub mod multi_agent;
 pub mod opt_in_tools;
 pub mod pairing;
+pub mod password_hash;
 pub mod paths;
 pub mod platform;
 pub mod policy;
