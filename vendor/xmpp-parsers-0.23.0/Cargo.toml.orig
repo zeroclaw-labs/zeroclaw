@@ -1,0 +1,46 @@
+[package]
+name = "xmpp-parsers"
+version = "0.23.0"
+authors = [
+  "Emmanuel Gil Peyrot <linkmauve@linkmauve.fr>",
+  "Maxime “pep” Buquet <pep@bouah.net>",
+]
+description = "Collection of parsers and serialisers for XMPP extensions"
+homepage = "https://gitlab.com/xmpp-rs/xmpp-rs"
+repository = "https://gitlab.com/xmpp-rs/xmpp-rs"
+keywords = ["xmpp", "jabber", "xml"]
+categories = ["parsing", "network-programming"]
+license = "MPL-2.0"
+edition = "2021"
+
+[dependencies]
+base64 = "0.22"
+digest = "0.11"
+sha1 = "0.11"
+sha2 = "0.11"
+sha3 = "0.12"
+blake2 = "0.10.4"
+time = { version = "0.3.55", default-features = false, features = ["std", "parsing", "formatting", "macros"] }
+log = { version = "0.4", optional = true }
+# same repository dependencies
+jid = { version = "0.12", path = "../jid", features = ["minidom"] }
+minidom = { version = "0.19", path = "../minidom" }
+xso = { version = "0.4", path = "../xso", features = ["macros", "minidom", "panicking-into-impl", "jid", "uuid", "base64", "serde_json"] }
+uuid = { version = "1.9.1", features = ["v4"] }
+serde_json = { version = "1.0", default-features = false, features = ["alloc"] }
+
+[features]
+# Build xmpp-parsers to make components instead of clients.
+component = []
+# Raise errors on unexpected children and attributes.
+pedantic = [ "xso/pedantic" ]
+# Enable serde support in jid crate
+serde = [ "jid/serde" ]
+# Enable some additional logging in helpers
+log = [ "dep:log" ]
+
+[package.metadata.docs.rs]
+rustdoc-args = [ "--sort-modules-by-appearance", "-Zunstable-options" ]
+
+# Allow the vendored parser tests to run independently.
+[workspace]

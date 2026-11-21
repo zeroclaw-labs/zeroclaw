@@ -1,0 +1,932 @@
+<?xml version="1.0"?>
+<?xml-stylesheet href="../style.xsl" type="text/xsl"?>
+<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+<Project xmlns="http://usefulinc.com/ns/doap#" xmlns:foaf="http://xmlns.com/foaf/0.1/" xmlns:xmpp="https://linkmauve.fr/ns/xmpp-doap#" xmlns:schema="https://schema.org/">
+    <name>xmpp-parsers</name>
+
+    <created>2017-04-18</created>
+
+    <shortdesc xml:lang="en">Collection of parsers and serialisers for XMPP extensions</shortdesc>
+    <shortdesc xml:lang="fr">Collection de parseurs et de sérialiseurs pour extensions XMPP</shortdesc>
+
+    <description xml:lang="en">TODO</description>
+    <description xml:lang="fr">TODO</description>
+
+    <homepage rdf:resource="https://gitlab.com/xmpp-rs/xmpp-parsers"/>
+    <documentation rdf:resource="https://docs.rs/xmpp-parsers/"/>
+    <download-page rdf:resource="https://crates.io/crates/xmpp-parsers"/>
+    <bug-database rdf:resource="https://gitlab.com/xmpp-rs/xmpp-parsers/issues"/>
+    <!-- See https://github.com/ewilderj/doap/issues/53 -->
+    <developer-forum rdf:resource="xmpp:chat@xmpp.rs?join"/>
+    <support-forum rdf:resource="xmpp:chat@xmpp.rs?join"/>
+
+    <license rdf:resource="https://gitlab.com/xmpp-rs/xmpp-parsers/raw/master/LICENSE"/>
+
+    <!-- Until https://github.com/ewilderj/doap/pull/68 is merged, we’ll use schema.org instead. -->
+    <schema:logo rdf:resource="https://xmpp.rs/logo.svg"/>
+
+    <programming-language>Rust</programming-language>
+
+    <os>linux</os>
+    <os>windows</os>
+    <os>macos</os>
+    <os>android</os>
+
+    <category rdf:resource="https://linkmauve.fr/ns/xmpp-doap#category-library"/>
+
+    <maintainer>
+        <foaf:Person>
+            <foaf:name>Link Mauve</foaf:name>
+            <foaf:homepage rdf:resource="https://linkmauve.fr/"/>
+            <foaf:mbox_sha1sum>aaa4dac2b31c1be4ee8f8e2ab986d34fb261974f</foaf:mbox_sha1sum>
+        </foaf:Person>
+    </maintainer>
+    <maintainer>
+        <foaf:Person>
+            <foaf:name>pep.</foaf:name>
+            <foaf:homepage rdf:resource="https://bouah.net/"/>
+            <foaf:mbox_sha1sum>99bcf9784288e323b0d2dea9c9ac7a2ede98395a</foaf:mbox_sha1sum>
+        </foaf:Person>
+    </maintainer>
+
+    <repository>
+        <GitRepository>
+            <browse rdf:resource="https://gitlab.com/xmpp-rs/xmpp-parsers"/>
+            <location rdf:resource="https://gitlab.com/xmpp-rs/xmpp-parsers.git"/>
+        </GitRepository>
+    </repository>
+
+    <implements rdf:resource="https://xmpp.org/rfcs/rfc6120.html"/>
+    <implements rdf:resource="https://xmpp.org/rfcs/rfc6121.html"/>
+    <implements rdf:resource="https://xmpp.org/rfcs/rfc7395.html"/>
+    <implements>
+        <xmpp:SupportedXep>
+            <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0004.html"/>
+            <xmpp:status>partial</xmpp:status>
+            <xmpp:version>2.9</xmpp:version>
+            <xmpp:since>0.1.0</xmpp:since>
+        </xmpp:SupportedXep>
+    </implements>
+    <implements>
+        <xmpp:SupportedXep>
+            <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0030.html"/>
+            <xmpp:status>complete</xmpp:status>
+            <xmpp:version>2.5rc3</xmpp:version>
+            <xmpp:since>0.1.0</xmpp:since>
+        </xmpp:SupportedXep>
+    </implements>
+    <implements>
+        <xmpp:SupportedXep>
+            <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0045.html"/>
+            <xmpp:status>complete</xmpp:status>
+            <xmpp:version>1.32.0</xmpp:version>
+            <xmpp:since>0.5.0</xmpp:since>
+        </xmpp:SupportedXep>
+    </implements>
+    <implements>
+        <xmpp:SupportedXep>
+            <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0047.html"/>
+            <xmpp:status>complete</xmpp:status>
+            <xmpp:version>2.0</xmpp:version>
+            <xmpp:since>0.1.0</xmpp:since>
+        </xmpp:SupportedXep>
+    </implements>
+    <implements>
+        <xmpp:SupportedXep>
+            <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0048.html"/>
+            <xmpp:status>complete</xmpp:status>
+            <xmpp:version>1.1</xmpp:version>
+            <xmpp:since>0.10.0</xmpp:since>
+        </xmpp:SupportedXep>
+    </implements>
+    <implements>
+        <xmpp:SupportedXep>
+            <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0049.html"/>
+            <xmpp:status>partial</xmpp:status>
+            <xmpp:version>1.2</xmpp:version>
+            <xmpp:since>0.21.0</xmpp:since>
+            <xmpp:note>Only for XEP-0048 storage</xmpp:note>
+        </xmpp:SupportedXep>
+    </implements>
+    <implements>
+        <xmpp:SupportedXep>
+            <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0054.html"/>
+            <xmpp:status>partial</xmpp:status>
+            <xmpp:version>1.2</xmpp:version>
+            <xmpp:since>0.21.0</xmpp:since>
+            <xmpp:note>Only photo element is supported for XEP-0054</xmpp:note>
+        </xmpp:SupportedXep>
+    </implements>
+    <implements>
+        <xmpp:SupportedXep>
+            <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0059.html"/>
+            <xmpp:status>complete</xmpp:status>
+            <xmpp:version>1.0</xmpp:version>
+            <xmpp:since>0.1.0</xmpp:since>
+        </xmpp:SupportedXep>
+    </implements>
+    <implements>
+        <xmpp:SupportedXep>
+            <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0060.html"/>
+            <xmpp:status>partial</xmpp:status>
+            <xmpp:version>1.15.8</xmpp:version>
+            <xmpp:since>0.5.0</xmpp:since>
+        </xmpp:SupportedXep>
+    </implements>
+    <implements>
+        <xmpp:SupportedXep>
+            <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0066.html"/>
+            <xmpp:status>partial</xmpp:status>
+            <xmpp:version>1.5</xmpp:version>
+            <xmpp:since>0.21.0</xmpp:since>
+	    <xmpp:note>Only the &lt;x/&gt; element, for compatibility with how Conversations shares files</xmpp:note>
+        </xmpp:SupportedXep>
+    </implements>
+    <implements>
+        <xmpp:SupportedXep>
+            <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0068.html"/>
+            <xmpp:status>complete</xmpp:status>
+            <xmpp:version>1.2</xmpp:version>
+            <xmpp:since>0.1.0</xmpp:since>
+            <xmpp:note>there is no specific module for this, the feature is all in the XEP-0004 module</xmpp:note>
+        </xmpp:SupportedXep>
+    </implements>
+    <implements>
+        <xmpp:SupportedXep>
+            <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0071.html"/>
+            <xmpp:status>complete</xmpp:status>
+            <xmpp:version>1.5.4</xmpp:version>
+            <xmpp:since>0.15.0</xmpp:since>
+        </xmpp:SupportedXep>
+    </implements>
+    <implements>
+        <xmpp:SupportedXep>
+            <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0077.html"/>
+            <xmpp:status>complete</xmpp:status>
+            <xmpp:version>2.4</xmpp:version>
+            <xmpp:since>0.6.0</xmpp:since>
+        </xmpp:SupportedXep>
+    </implements>
+    <implements>
+        <xmpp:SupportedXep>
+            <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0082.html"/>
+            <xmpp:status>complete</xmpp:status>
+            <xmpp:version>1.1</xmpp:version>
+            <xmpp:since>0.9.0</xmpp:since>
+        </xmpp:SupportedXep>
+    </implements>
+    <implements>
+        <xmpp:SupportedXep>
+            <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0084.html"/>
+            <xmpp:status>complete</xmpp:status>
+            <xmpp:version>1.1.4</xmpp:version>
+            <xmpp:since>0.13.0</xmpp:since>
+        </xmpp:SupportedXep>
+    </implements>
+    <implements>
+        <xmpp:SupportedXep>
+            <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0085.html"/>
+            <xmpp:status>complete</xmpp:status>
+            <xmpp:version>2.1</xmpp:version>
+            <xmpp:since>0.1.0</xmpp:since>
+        </xmpp:SupportedXep>
+    </implements>
+    <implements>
+        <xmpp:SupportedXep>
+            <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0092.html"/>
+            <xmpp:status>complete</xmpp:status>
+            <xmpp:version>1.1</xmpp:version>
+            <xmpp:since>0.8.0</xmpp:since>
+        </xmpp:SupportedXep>
+    </implements>
+    <implements>
+        <xmpp:SupportedXep>
+            <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0107.html"/>
+            <xmpp:status>complete</xmpp:status>
+            <xmpp:version>1.2.1</xmpp:version>
+            <xmpp:since>0.9.0</xmpp:since>
+        </xmpp:SupportedXep>
+    </implements>
+    <implements>
+        <xmpp:SupportedXep>
+            <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0114.html"/>
+            <xmpp:status>complete</xmpp:status>
+            <xmpp:version>1.6</xmpp:version>
+            <xmpp:since>0.10.0</xmpp:since>
+        </xmpp:SupportedXep>
+    </implements>
+    <implements>
+        <xmpp:SupportedXep>
+            <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0115.html"/>
+            <xmpp:status>complete</xmpp:status>
+            <xmpp:version>1.5.1</xmpp:version>
+            <xmpp:since>0.4.0</xmpp:since>
+        </xmpp:SupportedXep>
+    </implements>
+    <implements>
+        <xmpp:SupportedXep>
+            <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0118.html"/>
+            <xmpp:status>complete</xmpp:status>
+            <xmpp:version>1.2</xmpp:version>
+            <xmpp:since>0.15.0</xmpp:since>
+        </xmpp:SupportedXep>
+    </implements>
+    <implements>
+        <xmpp:SupportedXep>
+            <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0122.html"/>
+            <xmpp:status>complete</xmpp:status>
+            <xmpp:version>1.0.2</xmpp:version>
+            <xmpp:since>0.21.0</xmpp:since>
+        </xmpp:SupportedXep>
+    </implements>
+    <implements>
+        <xmpp:SupportedXep>
+            <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0153.html"/>
+            <xmpp:status>complete</xmpp:status>
+            <xmpp:version>1.1</xmpp:version>
+            <xmpp:since>0.21.0</xmpp:since>
+        </xmpp:SupportedXep>
+    </implements>
+    <implements>
+        <xmpp:SupportedXep>
+            <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0157.html"/>
+            <xmpp:status>complete</xmpp:status>
+            <xmpp:version>1.0.1</xmpp:version>
+            <xmpp:since>0.13.0</xmpp:since>
+        </xmpp:SupportedXep>
+    </implements>
+    <implements>
+        <xmpp:SupportedXep>
+            <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0166.html"/>
+            <xmpp:status>complete</xmpp:status>
+            <xmpp:version>1.1.2</xmpp:version>
+            <xmpp:since>0.1.0</xmpp:since>
+        </xmpp:SupportedXep>
+    </implements>
+    <implements>
+        <xmpp:SupportedXep>
+            <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0167.html"/>
+            <xmpp:status>complete</xmpp:status>
+            <xmpp:version>1.2.3</xmpp:version>
+            <xmpp:since>0.13.0</xmpp:since>
+        </xmpp:SupportedXep>
+    </implements>
+    <implements>
+        <xmpp:SupportedXep>
+            <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0172.html"/>
+            <xmpp:status>complete</xmpp:status>
+            <xmpp:version>1.1</xmpp:version>
+            <xmpp:since>0.10.0</xmpp:since>
+        </xmpp:SupportedXep>
+    </implements>
+    <implements>
+        <xmpp:SupportedXep>
+            <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0176.html"/>
+            <xmpp:status>complete</xmpp:status>
+            <xmpp:version>1.1</xmpp:version>
+            <xmpp:since>0.13.0</xmpp:since>
+        </xmpp:SupportedXep>
+    </implements>
+    <implements>
+        <xmpp:SupportedXep>
+            <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0177.html"/>
+            <xmpp:status>complete</xmpp:status>
+            <xmpp:version>1.1.1</xmpp:version>
+            <xmpp:since>0.18.0</xmpp:since>
+        </xmpp:SupportedXep>
+    </implements>
+    <implements>
+        <xmpp:SupportedXep>
+            <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0184.html"/>
+            <xmpp:status>complete</xmpp:status>
+            <xmpp:version>1.4.0</xmpp:version>
+            <xmpp:since>0.1.0</xmpp:since>
+        </xmpp:SupportedXep>
+    </implements>
+    <implements>
+        <xmpp:SupportedXep>
+            <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0191.html"/>
+            <xmpp:status>complete</xmpp:status>
+            <xmpp:version>1.3</xmpp:version>
+            <xmpp:since>0.9.0</xmpp:since>
+        </xmpp:SupportedXep>
+    </implements>
+    <implements>
+        <xmpp:SupportedXep>
+            <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0198.html"/>
+            <xmpp:status>complete</xmpp:status>
+            <xmpp:version>1.6</xmpp:version>
+            <xmpp:since>0.10.0</xmpp:since>
+        </xmpp:SupportedXep>
+    </implements>
+    <implements>
+        <xmpp:SupportedXep>
+            <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0199.html"/>
+            <xmpp:status>complete</xmpp:status>
+            <xmpp:version>2.0.1</xmpp:version>
+            <xmpp:since>0.1.0</xmpp:since>
+        </xmpp:SupportedXep>
+    </implements>
+    <implements>
+        <xmpp:SupportedXep>
+            <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0202.html"/>
+            <xmpp:status>complete</xmpp:status>
+            <xmpp:version>2.0</xmpp:version>
+            <xmpp:since>0.14.0</xmpp:since>
+        </xmpp:SupportedXep>
+    </implements>
+    <implements>
+        <xmpp:SupportedXep>
+            <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0203.html"/>
+            <xmpp:status>complete</xmpp:status>
+            <xmpp:version>2.0</xmpp:version>
+            <xmpp:since>0.1.0</xmpp:since>
+        </xmpp:SupportedXep>
+    </implements>
+    <implements>
+        <xmpp:SupportedXep>
+            <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0215.html"/>
+            <xmpp:status>complete</xmpp:status>
+            <xmpp:version>0.7.2</xmpp:version>
+            <xmpp:since>0.19.0</xmpp:since>
+        </xmpp:SupportedXep>
+    </implements>
+    <implements>
+        <xmpp:SupportedXep>
+            <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0221.html"/>
+            <xmpp:status>complete</xmpp:status>
+            <xmpp:version>1.0</xmpp:version>
+            <xmpp:since>0.1.0</xmpp:since>
+        </xmpp:SupportedXep>
+    </implements>
+    <implements>
+        <xmpp:SupportedXep>
+            <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0224.html"/>
+            <xmpp:status>complete</xmpp:status>
+            <xmpp:version>1.0</xmpp:version>
+            <xmpp:since>0.1.0</xmpp:since>
+        </xmpp:SupportedXep>
+    </implements>
+    <implements>
+        <xmpp:SupportedXep>
+            <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0231.html"/>
+            <xmpp:status>complete</xmpp:status>
+            <xmpp:version>1.0</xmpp:version>
+            <xmpp:since>0.15.0</xmpp:since>
+        </xmpp:SupportedXep>
+    </implements>
+    <implements>
+        <xmpp:SupportedXep>
+            <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0234.html"/>
+            <xmpp:status>complete</xmpp:status>
+            <xmpp:version>0.19.1</xmpp:version>
+            <xmpp:since>0.1.0</xmpp:since>
+        </xmpp:SupportedXep>
+    </implements>
+    <implements>
+        <xmpp:SupportedXep>
+            <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0257.html"/>
+            <xmpp:status>complete</xmpp:status>
+            <xmpp:version>0.3</xmpp:version>
+            <xmpp:since>0.16.0</xmpp:since>
+        </xmpp:SupportedXep>
+    </implements>
+    <implements>
+        <xmpp:SupportedXep>
+            <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0260.html"/>
+            <xmpp:status>complete</xmpp:status>
+            <xmpp:version>1.0.3</xmpp:version>
+            <xmpp:since>0.2.0</xmpp:since>
+        </xmpp:SupportedXep>
+    </implements>
+    <implements>
+        <xmpp:SupportedXep>
+            <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0261.html"/>
+            <xmpp:status>complete</xmpp:status>
+            <xmpp:version>1.0</xmpp:version>
+            <xmpp:since>0.1.0</xmpp:since>
+        </xmpp:SupportedXep>
+    </implements>
+    <implements>
+        <xmpp:SupportedXep>
+            <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0264.html"/>
+            <xmpp:status>complete</xmpp:status>
+            <xmpp:version>0.4.2</xmpp:version>
+            <xmpp:since>0.21.0</xmpp:since>
+        </xmpp:SupportedXep>
+    </implements>
+    <implements>
+        <xmpp:SupportedXep>
+            <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0277.html"/>
+            <xmpp:status>partial</xmpp:status>
+            <xmpp:version>0.6.3</xmpp:version>
+            <xmpp:since>0.14.0</xmpp:since>
+            <xmpp:note>only the namespace is included for now</xmpp:note>
+        </xmpp:SupportedXep>
+    </implements>
+    <implements>
+        <xmpp:SupportedXep>
+            <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0280.html"/>
+            <xmpp:status>complete</xmpp:status>
+            <xmpp:version>0.13.0</xmpp:version>
+            <xmpp:since>0.15.0</xmpp:since>
+        </xmpp:SupportedXep>
+    </implements>
+    <implements>
+        <xmpp:SupportedXep>
+            <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0293.html"/>
+            <xmpp:status>partial</xmpp:status>
+            <xmpp:version>1.0.1</xmpp:version>
+            <xmpp:since>0.16.0</xmpp:since>
+            <xmpp:note>Only supported in payload-type, and only for rtcp-fb.</xmpp:note>
+        </xmpp:SupportedXep>
+    </implements>
+    <implements>
+        <xmpp:SupportedXep>
+            <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0294.html"/>
+            <xmpp:status>partial</xmpp:status>
+            <xmpp:version>1.1.1</xmpp:version>
+            <xmpp:since>0.18.0</xmpp:since>
+            <xmpp:note>Parameters aren’t yet implemented.</xmpp:note>
+        </xmpp:SupportedXep>
+    </implements>
+    <implements>
+        <xmpp:SupportedXep>
+            <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0297.html"/>
+            <xmpp:status>complete</xmpp:status>
+            <xmpp:version>1.0</xmpp:version>
+            <xmpp:since>0.1.0</xmpp:since>
+        </xmpp:SupportedXep>
+    </implements>
+    <implements>
+        <xmpp:SupportedXep>
+            <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0300.html"/>
+            <xmpp:status>complete</xmpp:status>
+            <xmpp:version>0.6.0</xmpp:version>
+            <xmpp:since>0.1.0</xmpp:since>
+        </xmpp:SupportedXep>
+    </implements>
+    <implements>
+        <xmpp:SupportedXep>
+            <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0301.html"/>
+            <xmpp:status>complete</xmpp:status>
+            <xmpp:version>1.0</xmpp:version>
+            <xmpp:since>0.19.1</xmpp:since>
+        </xmpp:SupportedXep>
+    </implements>
+    <implements>
+        <xmpp:SupportedXep>
+            <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0308.html"/>
+            <xmpp:status>complete</xmpp:status>
+            <xmpp:version>1.1.0</xmpp:version>
+            <xmpp:since>0.1.0</xmpp:since>
+        </xmpp:SupportedXep>
+    </implements>
+    <implements>
+        <xmpp:SupportedXep>
+            <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0313.html"/>
+            <xmpp:status>complete</xmpp:status>
+            <xmpp:version>1.1.1</xmpp:version>
+            <xmpp:since>0.1.0</xmpp:since>
+        </xmpp:SupportedXep>
+    </implements>
+    <implements>
+        <xmpp:SupportedXep>
+            <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0319.html"/>
+            <xmpp:status>complete</xmpp:status>
+            <xmpp:version>1.0.2</xmpp:version>
+            <xmpp:since>0.3.0</xmpp:since>
+        </xmpp:SupportedXep>
+    </implements>
+    <implements>
+        <xmpp:SupportedXep>
+            <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0320.html"/>
+            <xmpp:status>complete</xmpp:status>
+            <xmpp:version>0.3.1</xmpp:version>
+            <xmpp:since>0.13.0</xmpp:since>
+        </xmpp:SupportedXep>
+    </implements>
+    <implements>
+        <xmpp:SupportedXep>
+            <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0328.html"/>
+            <xmpp:status>complete</xmpp:status>
+            <xmpp:version>0.1</xmpp:version>
+            <xmpp:since>0.16.0</xmpp:since>
+        </xmpp:SupportedXep>
+    </implements>
+    <implements>
+        <xmpp:SupportedXep>
+            <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0333.html"/>
+            <xmpp:status>complete</xmpp:status>
+            <xmpp:version>1.0.0</xmpp:version>
+            <xmpp:since>NEXT</xmpp:since>
+        </xmpp:SupportedXep>
+    </implements>
+    <implements>
+        <xmpp:SupportedXep>
+            <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0335.html"/>
+            <xmpp:status>complete</xmpp:status>
+            <xmpp:version>0.1.1</xmpp:version>
+            <xmpp:since>0.22.0</xmpp:since>
+        </xmpp:SupportedXep>
+    </implements>
+    <implements>
+        <xmpp:SupportedXep>
+            <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0338.html"/>
+            <xmpp:status>complete</xmpp:status>
+            <xmpp:version>1.0.0</xmpp:version>
+            <xmpp:since>0.18.0</xmpp:since>
+        </xmpp:SupportedXep>
+    </implements>
+    <implements>
+        <xmpp:SupportedXep>
+            <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0339.html"/>
+            <xmpp:status>complete</xmpp:status>
+            <xmpp:version>0.3</xmpp:version>
+            <xmpp:since>0.16.0</xmpp:since>
+        </xmpp:SupportedXep>
+    </implements>
+    <implements>
+        <xmpp:SupportedXep>
+            <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0352.html"/>
+            <xmpp:status>complete</xmpp:status>
+            <xmpp:version>0.3.0</xmpp:version>
+            <xmpp:since>0.16.0</xmpp:since>
+        </xmpp:SupportedXep>
+    </implements>
+    <implements>
+        <xmpp:SupportedXep>
+            <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0353.html"/>
+            <xmpp:status>complete</xmpp:status>
+            <xmpp:version>0.3</xmpp:version>
+            <xmpp:since>0.7.0</xmpp:since>
+        </xmpp:SupportedXep>
+    </implements>
+    <implements>
+        <xmpp:SupportedXep>
+            <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0357.html"/>
+            <xmpp:status>complete</xmpp:status>
+            <xmpp:version>0.4.1</xmpp:version>
+            <xmpp:since>0.22.0</xmpp:since>
+        </xmpp:SupportedXep>
+    </implements>
+    <implements>
+        <xmpp:SupportedXep>
+            <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0359.html"/>
+            <xmpp:status>complete</xmpp:status>
+            <xmpp:version>0.6.0</xmpp:version>
+            <xmpp:since>0.1.0</xmpp:since>
+        </xmpp:SupportedXep>
+    </implements>
+    <implements>
+        <xmpp:SupportedXep>
+            <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0363.html"/>
+            <xmpp:status>complete</xmpp:status>
+            <xmpp:version>1.1.0</xmpp:version>
+            <xmpp:since>0.19.0</xmpp:since>
+        </xmpp:SupportedXep>
+    </implements>
+    <implements>
+        <xmpp:SupportedXep>
+            <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0369.html"/>
+            <xmpp:status>removed</xmpp:status>
+            <xmpp:version>0.14.3</xmpp:version>
+            <xmpp:since>0.18.0</xmpp:since>
+        </xmpp:SupportedXep>
+    </implements>
+    <implements>
+        <xmpp:SupportedXep>
+            <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0373.html"/>
+            <xmpp:status>partial</xmpp:status>
+            <xmpp:version>0.4.0</xmpp:version>
+            <xmpp:since>0.16.0</xmpp:since>
+        </xmpp:SupportedXep>
+    </implements>
+    <implements>
+        <xmpp:SupportedXep>
+            <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0377.html"/>
+            <xmpp:status>complete</xmpp:status>
+            <xmpp:version>0.3.1</xmpp:version>
+            <xmpp:since>0.22.0</xmpp:since>
+        </xmpp:SupportedXep>
+    </implements>
+    <implements>
+        <xmpp:SupportedXep>
+            <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0380.html"/>
+            <xmpp:status>complete</xmpp:status>
+            <xmpp:version>0.2.0</xmpp:version>
+            <xmpp:since>0.1.0</xmpp:since>
+        </xmpp:SupportedXep>
+    </implements>
+    <implements>
+        <xmpp:SupportedXep>
+            <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0384.html"/>
+            <xmpp:status>complete</xmpp:status>
+            <xmpp:version>0.3.0</xmpp:version>
+            <xmpp:since>0.19.1</xmpp:since>
+        </xmpp:SupportedXep>
+    </implements>
+    <implements>
+        <xmpp:SupportedXep>
+            <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0386.html"/>
+            <xmpp:status>complete</xmpp:status>
+            <xmpp:version>1.0.0</xmpp:version>
+            <xmpp:since>0.21.0</xmpp:since>
+        </xmpp:SupportedXep>
+    </implements>
+    <implements>
+        <xmpp:SupportedXep>
+            <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0388.html"/>
+            <xmpp:status>complete</xmpp:status>
+            <xmpp:version>1.0.1</xmpp:version>
+            <xmpp:since>0.22.0</xmpp:since>
+        </xmpp:SupportedXep>
+    </implements>
+    <implements>
+        <xmpp:SupportedXep>
+            <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0390.html"/>
+            <xmpp:status>complete</xmpp:status>
+            <xmpp:version>0.3.0</xmpp:version>
+            <xmpp:since>0.1.0</xmpp:since>
+        </xmpp:SupportedXep>
+    </implements>
+    <implements>
+        <xmpp:SupportedXep>
+            <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0402.html"/>
+            <xmpp:status>complete</xmpp:status>
+            <xmpp:version>1.1.3</xmpp:version>
+            <xmpp:since>0.16.0</xmpp:since>
+        </xmpp:SupportedXep>
+    </implements>
+    <implements>
+        <xmpp:SupportedXep>
+            <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0421.html"/>
+            <xmpp:status>complete</xmpp:status>
+            <xmpp:version>0.1.0</xmpp:version>
+            <xmpp:since>0.16.0</xmpp:since>
+        </xmpp:SupportedXep>
+    </implements>
+    <implements>
+        <xmpp:SupportedXep>
+            <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0440.html"/>
+            <xmpp:status>complete</xmpp:status>
+            <xmpp:version>0.4.2</xmpp:version>
+            <xmpp:since>0.22.0</xmpp:since>
+        </xmpp:SupportedXep>
+    </implements>
+    <implements>
+        <xmpp:SupportedXep>
+            <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0441.html"/>
+            <xmpp:status>complete</xmpp:status>
+            <xmpp:version>0.2.0</xmpp:version>
+            <xmpp:since>0.19.0</xmpp:since>
+        </xmpp:SupportedXep>
+    </implements>
+    <implements>
+        <xmpp:SupportedXep>
+            <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0444.html"/>
+            <xmpp:status>complete</xmpp:status>
+            <xmpp:version>0.1.0</xmpp:version>
+            <xmpp:since>0.20.0</xmpp:since>
+        </xmpp:SupportedXep>
+    </implements>
+    <implements>
+        <xmpp:SupportedXep>
+            <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0463.html"/>
+            <xmpp:status>complete</xmpp:status>
+            <xmpp:version>0.2.0</xmpp:version>
+            <xmpp:since>NEXT</xmpp:since>
+        </xmpp:SupportedXep>
+    </implements>
+    <implements>
+        <xmpp:SupportedXep>
+            <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0478.html"/>
+            <xmpp:status>complete</xmpp:status>
+            <xmpp:version>0.2.0</xmpp:version>
+            <xmpp:since>0.22.0</xmpp:since>
+        </xmpp:SupportedXep>
+    </implements>
+    <implements>
+        <xmpp:SupportedXep>
+            <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0484.html"/>
+            <xmpp:status>complete</xmpp:status>
+            <xmpp:version>0.1.1</xmpp:version>
+            <xmpp:since>0.21.0</xmpp:since>
+        </xmpp:SupportedXep>
+    </implements>
+    <implements>
+        <xmpp:SupportedXep>
+            <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0490.html"/>
+            <xmpp:status>complete</xmpp:status>
+            <xmpp:version>1.0.1</xmpp:version>
+            <xmpp:since>0.22.0</xmpp:since>
+        </xmpp:SupportedXep>
+    </implements>
+    <implements>
+        <xmpp:SupportedXep>
+            <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0494.html"/>
+            <xmpp:status>complete</xmpp:status>
+            <xmpp:version>0.1.0</xmpp:version>
+            <xmpp:since>NEXT</xmpp:since>
+        </xmpp:SupportedXep>
+    </implements>
+    <implements>
+        <xmpp:SupportedXep>
+            <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0507.html"/>
+            <xmpp:status>complete</xmpp:status>
+            <xmpp:version>0.1.0</xmpp:version>
+            <xmpp:since>NEXT</xmpp:since>
+        </xmpp:SupportedXep>
+    </implements>
+
+    <release>
+        <Version>
+            <revision>0.19.2</revision>
+            <created>2022-12-17</created>
+            <file-release rdf:resource="https://crates.io/api/v1/crates/xmpp-parsers/0.19.2/download"/>
+        </Version>
+    </release>
+    <release>
+        <Version>
+            <revision>0.19.1</revision>
+            <created>2022-07-13</created>
+            <file-release rdf:resource="https://crates.io/api/v1/crates/xmpp-parsers/0.19.1/download"/>
+        </Version>
+    </release>
+    <release>
+        <Version>
+            <revision>0.19.0</revision>
+            <created>2022-03-07</created>
+            <file-release rdf:resource="https://crates.io/api/v1/crates/xmpp-parsers/0.19.0/download"/>
+        </Version>
+    </release>
+    <release>
+        <Version>
+            <revision>0.18.1</revision>
+            <created>2021-01-13</created>
+            <file-release rdf:resource="https://crates.io/api/v1/crates/xmpp-parsers/0.18.1/download"/>
+        </Version>
+    </release>
+    <release>
+        <Version>
+            <revision>0.18.0</revision>
+            <created>2021-01-13</created>
+            <file-release rdf:resource="https://crates.io/api/v1/crates/xmpp-parsers/0.18.0/download"/>
+        </Version>
+    </release>
+    <release>
+        <Version>
+            <revision>0.17.0</revision>
+            <created>2020-02-15</created>
+            <file-release rdf:resource="https://crates.io/api/v1/crates/xmpp-parsers/0.17.0/download"/>
+        </Version>
+    </release>
+    <release>
+        <Version>
+            <revision>0.16.0</revision>
+            <created>2019-10-15</created>
+            <file-release rdf:resource="https://crates.io/api/v1/crates/xmpp-parsers/0.16.0/download"/>
+        </Version>
+    </release>
+    <release>
+        <Version>
+            <revision>0.15.0</revision>
+            <created>2019-09-06</created>
+            <file-release rdf:resource="https://crates.io/api/v1/crates/xmpp-parsers/0.15.0/download"/>
+        </Version>
+    </release>
+    <release>
+        <Version>
+            <revision>0.14.0</revision>
+            <created>2019-07-13</created>
+            <file-release rdf:resource="https://crates.io/api/v1/crates/xmpp-parsers/0.14.0/download"/>
+        </Version>
+    </release>
+    <release>
+        <Version>
+            <revision>0.13.1</revision>
+            <created>2019-04-12</created>
+            <file-release rdf:resource="https://crates.io/api/v1/crates/xmpp-parsers/0.13.1/download"/>
+        </Version>
+    </release>
+    <release>
+        <Version>
+            <revision>0.13.0</revision>
+            <created>2019-03-20</created>
+            <file-release rdf:resource="https://crates.io/api/v1/crates/xmpp-parsers/0.13.0/download"/>
+        </Version>
+    </release>
+    <release>
+        <Version>
+            <revision>0.12.2</revision>
+            <created>2019-01-16</created>
+            <file-release rdf:resource="https://crates.io/api/v1/crates/xmpp-parsers/0.12.2/download"/>
+        </Version>
+    </release>
+    <release>
+        <Version>
+            <revision>0.12.1</revision>
+            <created>2019-01-16</created>
+            <file-release rdf:resource="https://crates.io/api/v1/crates/xmpp-parsers/0.12.1/download"/>
+        </Version>
+    </release>
+    <release>
+        <Version>
+            <revision>0.12.0</revision>
+            <created>2019-01-16</created>
+            <file-release rdf:resource="https://crates.io/api/v1/crates/xmpp-parsers/0.12.0/download"/>
+        </Version>
+    </release>
+    <release>
+        <Version>
+            <revision>0.11.1</revision>
+            <created>2018-09-20</created>
+            <file-release rdf:resource="https://crates.io/api/v1/crates/xmpp-parsers/0.11.1/download"/>
+        </Version>
+    </release>
+    <release>
+        <Version>
+            <revision>0.11.0</revision>
+            <created>2018-08-02</created>
+            <file-release rdf:resource="https://crates.io/api/v1/crates/xmpp-parsers/0.11.0/download"/>
+        </Version>
+    </release>
+    <release>
+        <Version>
+            <revision>0.10.0</revision>
+            <created>2018-07-31</created>
+            <file-release rdf:resource="https://crates.io/api/v1/crates/xmpp-parsers/0.10.0/download"/>
+        </Version>
+    </release>
+    <release>
+        <Version>
+            <revision>0.9.0</revision>
+            <created>2017-12-27</created>
+            <file-release rdf:resource="https://crates.io/api/v1/crates/xmpp-parsers/0.9.0/download"/>
+        </Version>
+    </release>
+    <release>
+        <Version>
+            <revision>0.8.0</revision>
+            <created>2017-11-30</created>
+            <file-release rdf:resource="https://crates.io/api/v1/crates/xmpp-parsers/0.8.0/download"/>
+        </Version>
+    </release>
+    <release>
+        <Version>
+            <revision>0.7.1</revision>
+            <created>2017-11-30</created>
+            <file-release rdf:resource="https://crates.io/api/v1/crates/xmpp-parsers/0.7.1/download"/>
+        </Version>
+    </release>
+    <release>
+        <Version>
+            <revision>0.7.0</revision>
+            <created>2017-11-30</created>
+            <file-release rdf:resource="https://crates.io/api/v1/crates/xmpp-parsers/0.7.0/download"/>
+        </Version>
+    </release>
+    <release>
+        <Version>
+            <revision>0.6.0</revision>
+            <created>2017-11-30</created>
+            <file-release rdf:resource="https://crates.io/api/v1/crates/xmpp-parsers/0.6.0/download"/>
+        </Version>
+    </release>
+    <release>
+        <Version>
+            <revision>0.5.0</revision>
+            <created>2017-11-30</created>
+            <file-release rdf:resource="https://crates.io/api/v1/crates/xmpp-parsers/0.5.0/download"/>
+        </Version>
+    </release>
+    <release>
+        <Version>
+            <revision>0.4.0</revision>
+            <created>2017-11-30</created>
+            <file-release rdf:resource="https://crates.io/api/v1/crates/xmpp-parsers/0.4.0/download"/>
+        </Version>
+    </release>
+    <release>
+        <Version>
+            <revision>0.3.0</revision>
+            <created>2017-11-30</created>
+            <file-release rdf:resource="https://crates.io/api/v1/crates/xmpp-parsers/0.3.0/download"/>
+        </Version>
+    </release>
+    <release>
+        <Version>
+            <revision>0.2.0</revision>
+            <created>2017-11-30</created>
+            <file-release rdf:resource="https://crates.io/api/v1/crates/xmpp-parsers/0.2.0/download"/>
+        </Version>
+    </release>
+    <release>
+        <Version>
+            <revision>0.1.0</revision>
+            <created>2017-11-30</created>
+            <file-release rdf:resource="https://crates.io/api/v1/crates/xmpp-parsers/0.1.0/download"/>
+        </Version>
+    </release>
+</Project>
+</rdf:RDF>

@@ -1,7 +1,7 @@
 use aes::Aes256;
 use async_trait::async_trait;
 use base64::Engine as _;
-use cbc::cipher::{BlockDecryptMut, KeyIvInit, block_padding::Pkcs7};
+use cbc::cipher::{BlockModeDecrypt, KeyIvInit, block_padding::Pkcs7};
 use futures_util::{SinkExt, StreamExt};
 use prost::Message as ProstMessage;
 use reqwest::multipart::{Form, Part};
@@ -907,8 +907,9 @@ fn decrypt_lark_webhook_body(body: &[u8], encrypt_key: Option<&str>) -> anyhow::
     let key = Sha256::digest(encrypt_key.as_bytes());
     let iv = &encrypted[..16];
     let mut ciphertext = encrypted[16..].to_vec();
-    let plaintext = cbc::Decryptor::<Aes256>::new(&key, iv.into())
-        .decrypt_padded_mut::<Pkcs7>(&mut ciphertext)
+    let plaintext = cbc::Decryptor::<Aes256>::new_from_slices(&key, iv)
+        .map_err(|error| anyhow::Error::msg(format!("invalid webhook key or IV: {error}")))?
+        .decrypt_padded::<Pkcs7>(&mut ciphertext)
         .map_err(|error| {
             anyhow::Error::msg(format!("failed to decrypt webhook payload: {error}"))
         })?;
@@ -6685,14 +6686,15 @@ mod tests {
         }
 
         fn encrypted_body(plaintext: &[u8], encrypt_key: &str) -> Vec<u8> {
-            use cbc::cipher::{BlockEncryptMut, block_padding::Pkcs7};
+            use cbc::cipher::{BlockModeEncrypt, block_padding::Pkcs7};
 
             let key = Sha256::digest(encrypt_key.as_bytes());
             let iv = [0x42; 16];
             let mut ciphertext = vec![0; plaintext.len() + 16];
             ciphertext[..plaintext.len()].copy_from_slice(plaintext);
-            let ciphertext = cbc::Encryptor::<Aes256>::new(&key, (&iv).into())
-                .encrypt_padded_mut::<Pkcs7>(&mut ciphertext, plaintext.len())
+            let ciphertext = cbc::Encryptor::<Aes256>::new_from_slices(&key, &iv)
+                .unwrap()
+                .encrypt_padded::<Pkcs7>(&mut ciphertext, plaintext.len())
                 .unwrap();
             let mut encrypted = iv.to_vec();
             encrypted.extend_from_slice(ciphertext);

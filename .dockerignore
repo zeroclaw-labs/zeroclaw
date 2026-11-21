@@ -81,3 +81,7 @@ apps/*
 # its full source is needed for workspace resolution and the relay build.
 !apps/zerorelay/
 scripts/
+# The docs generator embeds this installer at compile time during cargo web build.
+!scripts/
+scripts/*
+!scripts/install_windows_prebuilt.ps1
