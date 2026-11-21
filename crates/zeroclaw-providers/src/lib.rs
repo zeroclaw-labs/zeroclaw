@@ -23,6 +23,7 @@ pub mod ollama;
 mod ollama_wire;
 pub mod openai;
 pub mod openai_codex;
+mod opencode_go;
 pub mod opencode_session;
 pub mod openrouter;
 pub mod openrouter_catalog;
@@ -1662,6 +1663,18 @@ fn create_model_provider_inner(
         ));
     }
 
+    // The legacy spelling selects a service, not just the OpenCode wire family.
+    // Preserve it before canonical dispatch would replace Go with Zen.
+    if split_name == "opencode-go" && provider_kind == "opencode" {
+        return Ok(apply_factory_leaf_metadata(
+            factory::apply_compat_options(
+                factory::build_opencode_go_compat(alias, key, resolved_url),
+                options,
+            ),
+            options.vision,
+        ));
+    }
+
     factory::dispatch_family_factory(config, provider_kind, alias, key, resolved_url, options)
         .map(|provider| apply_factory_leaf_metadata(provider, options.vision))
 }
@@ -2902,7 +2915,12 @@ mod tests {
     }
 
     #[test]
-    fn factory_opencode_go() {}
+    fn factory_opencode_go() {
+        let provider = create_model_provider("opencode-go", None).expect("Go provider");
+        assert_eq!(provider.default_base_url(), Some(opencode_go::BASE_URL));
+        let zen = create_model_provider("opencode", None).expect("Zen provider");
+        assert_eq!(zen.default_base_url(), Some("https://opencode.ai/zen/v1"));
+    }
 
     #[test]
     fn factory_zai() {
@@ -6308,6 +6326,9 @@ pub async fn fetch_context_window(
     // different shape, so it is not the OpenAI-compatible `/models` reader.
     if provider_type == "openrouter" {
         return fetch_openrouter_context_window(config).await;
+    }
+    if provider_type == "opencode" {
+        return opencode_go::fetch_context_window(config).await;
     }
     fetch_openai_compatible_context_window(provider_type, config).await
 }

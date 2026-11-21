@@ -680,9 +680,40 @@ impl CompatFamilySpec for OpencodeModelProviderConfig {
     const AUTH: AuthStyle = AuthStyle::Bearer;
     const MODELS_DEV_KEY: Option<&'static str> = Some("opencode");
 
+    fn build_compat(
+        &self,
+        alias: &str,
+        key: Option<&str>,
+        api_url: Option<&str>,
+    ) -> crate::compatible::OpenAiCompatibleBuilder {
+        if api_url
+            .and_then(crate::opencode_go::catalog_base_url)
+            .is_some()
+        {
+            build_opencode_go_compat(alias, key, api_url)
+        } else {
+            self.build_compat_base(alias, key, api_url)
+        }
+    }
+
     fn wire_api(&self) -> Option<zeroclaw_config::schema::WireApi> {
         self.base.wire_api
     }
+}
+/// Preserve Go's endpoint and catalogue for both legacy and typed profiles.
+pub(crate) fn build_opencode_go_compat(
+    alias: &str,
+    key: Option<&str>,
+    api_url: Option<&str>,
+) -> crate::compatible::OpenAiCompatibleBuilder {
+    OpenAiCompatibleModelProvider::builder(alias)
+        .display_name("OpenCode Go")
+        .base_url(api_url.unwrap_or(crate::opencode_go::BASE_URL))
+        .canonical_base_url(crate::opencode_go::BASE_URL)
+        .credential(key)
+        .auth_style(AuthStyle::Bearer)
+        .models_dev_key("opencode-go")
+        .public_model_listing()
 }
 impl CompatFamilySpec for DoubaoModelProviderConfig {
     const DISPLAY: &'static str = "Doubao";

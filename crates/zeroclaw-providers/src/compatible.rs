@@ -422,6 +422,9 @@ pub(crate) struct ModelsResponse {
 #[derive(Deserialize)]
 struct ModelEntry {
     id: String,
+    /// Go publishes capacity here. Other families keep their existing policy.
+    #[serde(default)]
+    limit: serde_json::Value,
     /// Pricing data from the provider's `/models` endpoint.
     /// Kilo Gateway: `{"pricing": {"prompt": "0", "completion": "0"}}`
     /// OpenRouter: `{"pricing": {"prompt": "0.000003", "completion": "0.000015"}}`
@@ -470,6 +473,7 @@ pub(crate) fn parse_model_ids_from_bytes(bytes: &[u8]) -> anyhow::Result<Vec<Str
 /// Returns sorted list of `ModelInfo` with pricing data where available.
 fn normalize_models_with_pricing(
     body: ModelsResponse,
+    opencode_go: bool,
 ) -> Vec<zeroclaw_api::model_provider::ModelInfo> {
     use zeroclaw_api::model_provider::ModelInfo;
     let mut models: Vec<ModelInfo> = body
@@ -479,8 +483,11 @@ fn normalize_models_with_pricing(
         .map(|e| ModelInfo {
             id: e.id.trim().to_string(),
             pricing: e.pricing,
-            // OpenAI-compatible `/v1/models` has no context-window field.
-            context_window: None,
+            context_window: if opencode_go {
+                crate::opencode_go::context_window_from_limit(&e.limit)
+            } else {
+                None
+            },
         })
         .collect();
     models.sort_by(|a, b| a.id.cmp(&b.id));
@@ -1171,7 +1178,10 @@ impl OpenAiCompatibleModelProvider {
     }
 
     fn models_url(&self) -> String {
-        format!("{}/models", self.base_url)
+        // Go's current chat URL has an extra `/openai` segment; its public
+        // catalogue remains at the service root. Custom URLs stay untouched.
+        let base = crate::opencode_go::catalog_base_url(&self.base_url).unwrap_or(&self.base_url);
+        format!("{base}/models")
     }
 
     /// Inject Anthropic prompt-cache breakpoints behind `cache_passthrough`.
@@ -4322,7 +4332,10 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                     self.name
                 ))
             })?;
-            return Ok(normalize_models_with_pricing(body));
+            return Ok(normalize_models_with_pricing(
+                body,
+                crate::opencode_go::catalog_base_url(&self.base_url).is_some(),
+            ));
         }
         // No credential — try models.dev first (no pricing from that source),
         // then fall back to OpenRouter which does include pricing.
@@ -5386,6 +5399,65 @@ impl ::zeroclaw_api::attribution::Attributable for OpenAiCompatibleModelProvider
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn opencode_go_typed_factory_selects_go_without_changing_zen() {
+        use crate::factory::CompatFamilySpec;
+        let config = zeroclaw_config::schema::OpencodeModelProviderConfig::default();
+        for base in [
+            crate::opencode_go::BASE_URL,
+            "https://opencode.ai/inference/go/openai/v1",
+        ] {
+            let provider = config
+                .build_compat("arbitrary-alias", None, Some(base))
+                .build();
+            assert!(provider.public_model_listing);
+            assert_eq!(provider.models_dev_key.as_deref(), Some("opencode-go"));
+            assert_eq!(provider.base_url, base);
+            assert_eq!(
+                provider.models_url(),
+                format!(
+                    "{}/models",
+                    crate::opencode_go::catalog_base_url(base).unwrap()
+                )
+            );
+        }
+        // The alias alone is not evidence of a Go endpoint.
+        let zen = config.build_compat("go", None, None).build();
+        assert!(!zen.public_model_listing);
+        assert_eq!(zen.models_dev_key.as_deref(), Some("opencode"));
+        assert_eq!(zen.models_url(), "https://opencode.ai/zen/v1/models");
+        let custom = config
+            .build_compat("go", None, Some("https://custom.invalid/v1"))
+            .build();
+        assert!(!custom.public_model_listing);
+        assert_eq!(custom.models_url(), "https://custom.invalid/v1/models");
+    }
+
+    #[test]
+    fn opencode_go_listing_keeps_capacity_without_interpreting_other_families() {
+        let fixture = serde_json::json!({"data": [
+            {"id": "constructed-valid", "limit": {"context": 1000000}},
+            {"id": "constructed-malformed", "limit": "unknown"},
+            {"id": "constructed-zero", "limit": {"context": 0}}
+        ]});
+        let go =
+            normalize_models_with_pricing(serde_json::from_value(fixture.clone()).unwrap(), true);
+        assert_eq!(
+            go.iter()
+                .find(|model| model.id == "constructed-valid")
+                .unwrap()
+                .context_window,
+            Some(1000000)
+        );
+        assert!(
+            go.iter()
+                .filter(|model| model.id != "constructed-valid")
+                .all(|model| model.context_window.is_none())
+        );
+        let other = normalize_models_with_pricing(serde_json::from_value(fixture).unwrap(), false);
+        assert!(other.iter().all(|model| model.context_window.is_none()));
+    }
 
     /// Empty / whitespace arguments must collapse to `"{}"` so OpenAI-style
     /// providers never see an invalid `tool_calls[].function.arguments`.
@@ -16981,7 +17053,7 @@ mod tests {
     fn models_with_pricing_drop_unrecognized_pricing_shape() {
         let body: ModelsResponse =
             serde_json::from_str(XAI_MODELS_WITH_TIERED_IMAGE_PRICING).unwrap();
-        let models = normalize_models_with_pricing(body);
+        let models = normalize_models_with_pricing(body, false);
         assert_eq!(models.len(), 2);
         assert!(
             models.iter().all(|m| m.pricing.is_none()),
@@ -17001,7 +17073,7 @@ mod tests {
             ]}"#,
         )
         .unwrap();
-        let models = normalize_models_with_pricing(body);
+        let models = normalize_models_with_pricing(body, false);
         let a = models[0]
             .pricing
             .as_ref()
