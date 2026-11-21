@@ -2197,6 +2197,9 @@ jobs:
       - name: Run SOP editor regressions
         working-directory: web
         run: npm run test:sop-editor
+      - name: Voice tests
+        working-directory: web
+        run: npm run test:voice
       - name: Run dashboard sign-in regressions
         working-directory: web
         run: npm run test:auth
