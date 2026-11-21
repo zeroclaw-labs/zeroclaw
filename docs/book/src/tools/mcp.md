@@ -244,12 +244,56 @@ base64 into the model context. Instead it materializes the bytes under the
 session workspace `uploads/` directory (same shared helper and 10 MB limit as
 ACP inbound `resource.blob`) and redacts the blob from the model-facing tool output, replacing it
 with a `materialized` reference: a `[Document: …]` marker for
-non-image mimes, or the plain saved path for image mimes, with the
-image declared as an attachment on the tool result rather than
+other document mimes, or the plain saved path for images and supported MP4
+videos, with the visual media declared as an attachment on the tool result rather than
 written into the text as a marker. This is
 gated by content shape, not by tool name. Materialization does not auto-deliver
 the file to ACP clients; the agent still calls `deliver_file` when outbound
 delivery is needed. See [ACP `session/prompt` blob intake](../channels/acp.md#sessionprompt).
+
+An embedded resource explicitly declaring `mimeType: "video/mp4"` is saved
+with an `.mp4` extension and declared as a video attachment after its MP4
+container header is checked. MIME matching is case-insensitive and ignores
+parameters. The resource URI remains provenance; ZeroClaw does not fetch it.
+Missing or misleading filename extensions cannot change the saved media type.
+Other video formats keep document behavior. A malformed MP4 or Base64 payload
+is redacted with an unavailable notice, leaving sibling content intact. Videos
+share the existing 10 MiB per-file and aggregate budgets and 64-item result cap.
+
+The [Qwen provider](../providers/catalog.md) sends current-turn
+video attachments as `video_url` with a Base64 MP4 Data URL. It enforces its
+smaller service byte budget at dispatch. Native tool videos are relocated into
+a following user message with an external-output label tied to the originating
+tool-result ordinal. Prompt-mode carriers use only their declared attachments;
+marker examples in tool text remain literal. Videos remain available during
+later tool rounds of the same user turn and are omitted after the next user
+turn. Unsupported Qwen models receive an unavailable notice instead of a video
+part. Other providers continue their existing document/text behavior.
+
+An isolated end-to-end test exercises MCP HTTP intake, the real tool wrapper,
+native and XML agent turns, provider request capture, and next-turn omission:
+
+```sh
+cargo test -p zeroclaw-runtime --features test-util --test mcp_video \
+  --config 'profile.test.package.zeroclaw-runtime.opt-level=1' \
+  mcp_video_reaches_qwen_http_through_native_and_xml_agent_turns
+```
+
+The command optimizes the runtime test code to keep macOS linker unwind tables
+within their size limit. All compiler and linker diagnostics remain enabled.
+
+The opt-in ignored test `mcp_video_agent_to_real_qwen` uses the explicit
+`ZEROCLAW_TEST_QWEN_API_KEY`, `ZEROCLAW_TEST_QWEN_ENDPOINT`, and
+`ZEROCLAW_TEST_QWEN_VIDEO` environment variables. It runs an isolated MCP fixture
+and makes paid Qwen requests. Run it through the live test entry point:
+
+```sh
+cargo test -p zeroclaw-runtime --features test-util --test live \
+  --config 'profile.test.package.zeroclaw-runtime.opt-level=1' \
+  mcp_video_agent_to_real_qwen -- --ignored --nocapture
+```
+
+Ordinary tests do not contact a real model.
 
 The two other binary MCP content shapes are mapped as follows. A `type: "image"`
 item (base64 `data` + `mimeType`) is materialized the same way and its content

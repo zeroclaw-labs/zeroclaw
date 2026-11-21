@@ -78,3 +78,6 @@ pub use loop_::{
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod qwen_video_tests;
