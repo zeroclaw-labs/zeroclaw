@@ -31,13 +31,15 @@ const fakeWindow = {
   location: { protocol: 'http:', host: 'localhost' },
   dispatchEvent: () => true,
 };
-// Document listeners are kept so a test can dispatch a key press to them.
+// Document listeners are kept so a test can dispatch a key press to them, and the
+// focused element is tracked so the composer can be told it still holds focus.
 type DocumentListener = (event: { key?: string; defaultPrevented?: boolean; isComposing?: boolean }) => void;
 const documentListeners = new Map<string, Set<DocumentListener>>();
 function dispatchDocumentEvent(type: string, event: Parameters<DocumentListener>[0]): void {
   for (const listener of [...(documentListeners.get(type) ?? [])]) listener(event);
 }
 const fakeDocument: { activeElement?: unknown } & Record<string, unknown> = {
+  activeElement: null,
   addEventListener: (type: string, listener: DocumentListener) => {
     const listeners = documentListeners.get(type) ?? new Set<DocumentListener>();
     listeners.add(listener);
@@ -68,6 +70,11 @@ Object.defineProperty(globalThis, 'navigator', {
 });
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean })
   .IS_REACT_ACT_ENVIRONMENT = true;
+
+// The composer textarea's node mock: counts focus() calls, and reports no
+// client rects while `composerVisible` is false (a `display: none` pane).
+let composerFocusCalls = 0;
+let composerVisible = true;
 
 let listedSessions: Array<Record<string, unknown>> = [];
 type SessionsResponder = () => Promise<Array<Record<string, unknown>>>;
@@ -324,11 +331,17 @@ async function mountChat(
       ),
       {
         createNodeMock: (element) => element.type === 'textarea'
-          ? { style: {}, focus: () => {}, scrollHeight: 24 }
+          ? {
+            style: {},
+            focus: () => { composerFocusCalls += 1; },
+            scrollHeight: 24,
+            getClientRects: () => (composerVisible ? [{}] : []),
+          }
           : {
             focus: () => { lastFocused = element as typeof lastFocused; },
             scrollIntoView: () => {},
             contains: (node: unknown) => containedNodes.has(node),
+            querySelector: () => null,
           },
       },
     );
@@ -982,6 +995,65 @@ test('composer drafts follow agent and session without crossing conversations', 
   await settle();
   assert.equal(textarea(mounted.renderer).props.value, 'draft-B');
   await unmount(mounted.renderer);
+});
+
+test('the composer takes focus back when a turn ends, unless hidden or focus moved', async () => {
+  const runtime = new FakeSessionRuntime();
+  runtime.queueMessages('A', () => Promise.resolve(messagesResponse('A', true)));
+  const mounted = await mountChat(runtime, true);
+  await openSocket(runtime, 0);
+  await settle();
+
+  async function runTurn(reply: string): Promise<number> {
+    await act(async () => { mounted.context().sendMessage(`ask ${reply}`); });
+    assert.equal(textarea(mounted.renderer).props.disabled, true, 'locked during the turn');
+    const before = composerFocusCalls;
+    await act(async () => {
+      runtime.sockets[0]!.emitMessage({ type: 'done', full_response: reply });
+    });
+    assert.equal(textarea(mounted.renderer).props.disabled, false, 'unlocked after the turn');
+    return composerFocusCalls - before;
+  }
+
+  assert.equal(await runTurn('first'), 1, 'focus returns to the composer');
+
+  fakeDocument.activeElement = { tagName: 'BUTTON' };
+  try {
+    assert.equal(await runTurn('second'), 0, 'focus the user moved elsewhere is kept');
+  } finally {
+    fakeDocument.activeElement = null;
+  }
+
+  composerVisible = false;
+  try {
+    assert.equal(await runTurn('third'), 0, 'a hidden pane does not take focus');
+  } finally {
+    composerVisible = true;
+  }
+
+  assert.equal(await runTurn('fourth'), 1);
+  await unmount(mounted.renderer);
+});
+
+test('a per-socket conversation closed mid-turn gives the enabled composer its focus back', async () => {
+  await withSession(scopedSession, async () => {
+    const runtime = new FakeSessionRuntime();
+    const mounted = await mountChat(runtime, true);
+    const socket = await startConversation(mounted, runtime, 'hello', 'core-1');
+    assert.equal(textarea(mounted.renderer).props.disabled, true, 'locked during the turn');
+    const before = composerFocusCalls;
+
+    await act(async () => { socket.emitClose(1006); });
+    await settle();
+
+    assert.equal(mounted.context().connected, false);
+    assert.equal(mounted.context().startsConversationOnSend, true);
+    assert.equal(textarea(mounted.renderer).props.disabled, false, 'usable without a socket');
+    assert.equal(composerFocusCalls - before, 1, 'focus returns without reconnecting');
+    assert.equal(runtime.sockets.length, 1, 'no new socket was opened for the focus');
+    assert.equal(socket.connectCalls, 1);
+    await unmount(mounted.renderer);
+  });
 });
 
 test('a late close from the previous session socket cannot clear the active approval', async () => {
