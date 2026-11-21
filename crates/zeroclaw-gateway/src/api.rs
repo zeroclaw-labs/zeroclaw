@@ -2167,17 +2167,47 @@ pub async fn handle_api_session_rename(
     }
 }
 
-/// GET /api/sessions/running — list sessions currently in "running" state
+// Config owns the current aliases; deletion cannot retire an alias with active
+// work. Lifecycle leases own activity, independent of transport or persistence.
+fn runtime_work_is_busy(state: &AppState) -> bool {
+    use zeroclaw_runtime::live_config_authority::AgentDeleteBlocker;
+    state.config.read().agents.keys().any(|alias| {
+        state.agent_lifecycle.active_turn_count(alias) > 0
+            || matches!(
+                state.agent_lifecycle.delete_blocker(alias),
+                Some(
+                    AgentDeleteBlocker::Reservations { .. }
+                        | AgentDeleteBlocker::Deleting { .. }
+                        | AgentDeleteBlocker::GenerationClosing
+                )
+            )
+    })
+}
+
+/// Request projection; activity comes from the live admission coordinator,
+/// never from persisted session metadata.
+#[derive(Default, Deserialize)]
+pub struct RunningSessionsQuery {
+    #[serde(default)]
+    pub activity_only: bool,
+}
+
+/// GET /api/sessions/running — optionally probe activity without reading history.
 pub async fn handle_api_sessions_running(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Query(query): Query<RunningSessionsQuery>,
 ) -> impl IntoResponse {
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
 
+    if query.activity_only {
+        return Json(serde_json::json!({"busy": runtime_work_is_busy(&state)})).into_response();
+    }
     let Some(ref backend) = state.session_backend else {
         return Json(serde_json::json!({
+            "busy": runtime_work_is_busy(&state),
             "sessions": [],
             "message": "Session persistence is disabled"
         }))
@@ -2198,7 +2228,8 @@ pub async fn handle_api_sessions_running(
         })
         .collect();
 
-    Json(serde_json::json!({ "sessions": sessions })).into_response()
+    Json(serde_json::json!({ "busy": runtime_work_is_busy(&state), "sessions": sessions }))
+        .into_response()
 }
 
 /// GET /api/sessions/{id}/state — get session state
@@ -3281,6 +3312,192 @@ pub(crate) mod tests {
         .await
         .into_response();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    struct RunningSessionsProbeBackend {
+        on_list:
+            Box<dyn Fn() -> Vec<zeroclaw_infra::session_backend::SessionMetadata> + Send + Sync>,
+    }
+
+    impl SessionBackend for RunningSessionsProbeBackend {
+        fn load(&self, _key: &str) -> Vec<zeroclaw_api::model_provider::ChatMessage> {
+            unreachable!("activity probes must not read transcripts")
+        }
+        fn append(
+            &self,
+            _key: &str,
+            _message: &zeroclaw_api::model_provider::ChatMessage,
+        ) -> std::io::Result<()> {
+            unreachable!("activity probes must not write transcripts")
+        }
+        fn remove_last(&self, _key: &str) -> std::io::Result<bool> {
+            unreachable!("activity probes must not change transcripts")
+        }
+        fn list_sessions(&self) -> Vec<String> {
+            unreachable!("activity probes must not enumerate sessions")
+        }
+        fn list_running_sessions(&self) -> Vec<zeroclaw_infra::session_backend::SessionMetadata> {
+            (self.on_list)()
+        }
+    }
+
+    #[tokio::test]
+    async fn api_sessions_running_activity_only_skips_backend_enumeration() {
+        use tower::ServiceExt;
+        let mut config = config_with_telegram("default");
+        config
+            .agents
+            .insert("test-agent".into(), Default::default());
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = reads.clone();
+        let mut state = test_state(config);
+        state.session_backend = Some(Arc::new(RunningSessionsProbeBackend {
+            on_list: Box::new(move || {
+                observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Vec::new()
+            }),
+        }));
+        let router = axum::Router::new()
+            .route(
+                "/api/sessions/running",
+                axum::routing::get(handle_api_sessions_running),
+            )
+            .with_state(state.clone());
+        let mut lease = Some(state.agent_lifecycle.reserve_turn("test-agent").unwrap());
+        for expected_busy in [true, false] {
+            let response = router
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri("/api/sessions/running?activity_only=true")
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response_json(response).await,
+                serde_json::json!({"busy":expected_busy})
+            );
+            if expected_busy {
+                drop(lease.take());
+            }
+        }
+        assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let response = router
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/sessions/running?activity_only=false")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response_json(response).await["sessions"],
+            serde_json::json!([])
+        );
+        assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn api_sessions_running_activity_only_preserves_bearer_authentication() {
+        use tower::ServiceExt;
+        let mut state = test_state(Config::default());
+        state.pairing = Arc::new(PairingGuard::new(true, &[], Default::default()));
+        let router = axum::Router::new()
+            .route(
+                "/api/sessions/running",
+                axum::routing::get(handle_api_sessions_running),
+            )
+            .with_state(state);
+        let response = router
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/sessions/running?activity_only=true")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn api_sessions_running_samples_busy_after_metadata_enumeration() {
+        let mut config = config_with_telegram("default");
+        config
+            .agents
+            .insert("test-agent".into(), Default::default());
+        let mut state = test_state(config);
+        let lifecycle = state.agent_lifecycle.clone();
+        let turn = Arc::new(std::sync::Mutex::new(None));
+        let held = turn.clone();
+        state.session_backend = Some(Arc::new(RunningSessionsProbeBackend {
+            on_list: Box::new(move || {
+                *held.lock().unwrap() = Some(lifecycle.reserve_turn("test-agent").unwrap());
+                Vec::new()
+            }),
+        }));
+        assert!(!runtime_work_is_busy(&state));
+        let response = handle_api_sessions_running(
+            State(state.clone()),
+            HeaderMap::new(),
+            Query(RunningSessionsQuery::default()),
+        )
+        .await
+        .into_response();
+        assert_eq!(response_json(response).await["busy"], true);
+        turn.lock().unwrap().take();
+        assert!(!runtime_work_is_busy(&state));
+    }
+
+    #[tokio::test]
+    async fn api_sessions_running_reports_runtime_work_without_persisted_sessions() {
+        let mut config = config_with_telegram("default");
+        config.agents.insert(
+            "test-agent".into(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+        );
+        let state = test_state(config);
+        assert!(state.session_backend.is_none());
+        // These leases are the same source used by web, RPC and channel turns.
+        let lease = state.agent_lifecycle.reserve_turn("test-agent").unwrap();
+        let response = handle_api_sessions_running(
+            State(state.clone()),
+            HeaderMap::new(),
+            Query(RunningSessionsQuery::default()),
+        )
+        .await
+        .into_response();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["busy"], true);
+        assert_eq!(body["sessions"], serde_json::json!([]));
+        drop(lease);
+        let response = handle_api_sessions_running(
+            State(state.clone()),
+            HeaderMap::new(),
+            Query(RunningSessionsQuery::default()),
+        )
+        .await
+        .into_response();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["busy"], false);
+        let reservation = state
+            .agent_lifecycle
+            .reserve_admission("test-agent")
+            .unwrap();
+        assert!(runtime_work_is_busy(&state));
+        drop(reservation);
+        state.agent_lifecycle.close_generation();
+        assert!(runtime_work_is_busy(&state));
     }
 
     fn link_job_to_test_agent(state: &AppState, job_id: &str) {
