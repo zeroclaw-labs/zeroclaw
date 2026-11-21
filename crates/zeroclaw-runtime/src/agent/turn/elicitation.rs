@@ -651,7 +651,7 @@ runtime_profile = "hinted"
                     provider_name: "mock",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: None,
+                    temperature: None.into(),
                 },
                 crate::agent::loop_::ResolvedIo {
                     tools_registry: spec.tools_registry,
@@ -671,7 +671,7 @@ runtime_profile = "hinted"
                     excluded_tools: spec.excluded_tools,
                     dedup_exempt_tools: &[],
                     pacing: &zeroclaw_config::schema::PacingConfig::default(),
-                    strict_tool_parsing: false,
+                    text_tool_calls_disabled: false,
                     parallel_tools: false,
                     max_tool_result_chars: 30_000,
                     keep_tool_context_turns: 2,
