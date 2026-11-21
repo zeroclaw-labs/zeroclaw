@@ -233,6 +233,10 @@ impl Tool for ArcToolRef {
         self.0.requires_unrestricted_principal()
     }
 
+    fn wrapped_tool_name(&self) -> Option<&str> {
+        self.0.wrapped_tool_name()
+    }
+
     fn name(&self) -> &str {
         self.0.name()
     }
@@ -369,6 +373,10 @@ impl ::zeroclaw_api::attribution::Attributable for ArcDelegatingTool {
 impl Tool for ArcDelegatingTool {
     fn requires_unrestricted_principal(&self) -> bool {
         self.inner.requires_unrestricted_principal()
+    }
+
+    fn wrapped_tool_name(&self) -> Option<&str> {
+        self.inner.wrapped_tool_name()
     }
 
     fn name(&self) -> &str {
