@@ -44,9 +44,11 @@ Object.assign(globalThis, { window: fakeWindow, document: new EventTarget(), Web
 const requested: string[] = [];
 let agentsBody: unknown = { agents: [] };
 let agentsStatus = 200;
+let sessionList: (() => Promise<Response>) | undefined;
 globalThis.fetch = async (input) => {
   const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
   requested.push(url);
+  if (url.endsWith("/api/sessions") && sessionList) return sessionList();
   if (url.endsWith("/api/agents/available")) {
     return new Response(JSON.stringify(agentsBody), {
       status: agentsStatus,
@@ -60,6 +62,7 @@ const { setOidcSession } = await import("../lib/auth.ts");
 const { default: AgentsList } = await import("./AgentsList.tsx");
 const { default: AgentChat } = await import("./AgentChat.tsx");
 const { default: ChatWorkspace } = await import("./ChatWorkspace.tsx");
+const { AgentProvider } = await import("../contexts/AgentContext.tsx");
 const { MemoryRouter, Route, Routes } = await import("react-router-dom");
 
 const scoped: OidcSession = {
@@ -110,7 +113,29 @@ afterEach(async () => {
   setOidcSession(null);
   requested.length = 0;
   agentsStatus = 200;
+  sessionList = undefined;
   FakeWebSocket.instances.length = 0;
+});
+
+test("a notification waits for gateway attribution and opens the display ID", async () => {
+  let finish!: () => void;
+  const pending = new Promise<void>((resolve) => { finish = resolve; });
+  sessionList = async () => {
+    await pending;
+    return Response.json({ sessions: [{ session_id: "saved", session_key: "gw_saved", agent_alias: "support", channel_id: null }] });
+  };
+  const r = await render("/agent/support?session=gw_saved", createElement(ChatWorkspace, { initialAlias: "support" }), "/agent/:alias");
+  assert.equal(r.root.findAllByType(AgentProvider).length, 0);
+  await act(async () => {
+    finish();
+  });
+  assert.equal(r.root.findByType(AgentProvider).props.initialSessionId, "saved");
+});
+
+test("an unavailable linked conversation opens the agent's ordinary chat", async () => {
+  sessionList = async () => Response.json({ sessions: [] });
+  const r = await render("/agent/support?session=unavailable", createElement(ChatWorkspace, { initialAlias: "support" }), "/agent/:alias");
+  assert.notEqual(r.root.findByType(AgentProvider).props.initialSessionId, "unavailable");
 });
 
 test("the agents page lists only the agents this account may use", async () => {

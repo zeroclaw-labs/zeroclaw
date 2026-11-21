@@ -33,6 +33,7 @@ const {
   applySessionChange,
   loadPersisted,
   linkedSession,
+  ownedGatewaySession,
   tabForRoute,
   makeTab,
   reservationsByKey,
@@ -248,4 +249,16 @@ test('notification links address an exact conversation of the selected agent', (
   assert.equal(tabForRoute(tabs, 'operator').key, first.key);
   assert.equal(tabForRoute(tabs, 'operator', undefined, second.key).key, second.key);
   assert.equal(tabForRoute(tabs, 'operator', 'unopened').sessionId, 'unopened');
+});
+
+test('notification targets must be attributed gateway conversations', () => {
+  const row = { session_id: 'second', session_key: 'gw_second', agent_alias: 'operator',
+    channel_id: null, created_at: '', last_activity: '', message_count: 1 };
+  assert.equal(ownedGatewaySession([row], 'operator', 'second'), 'second');
+  assert.equal(ownedGatewaySession([row], 'operator', 'gw_second'), 'second');
+  assert.equal(ownedGatewaySession([row, { ...row, session_id: 'gw_second', session_key: 'gw_gw_second' }], 'operator', 'gw_second'), undefined);
+  assert.equal(ownedGatewaySession([row], 'another', 'second'), undefined);
+  assert.equal(ownedGatewaySession([{ ...row, agent_alias: null }], 'operator', 'second'), undefined);
+  assert.equal(ownedGatewaySession([{ ...row, session_key: 'rpc_second' }], 'operator', 'second'), undefined);
+  assert.equal(ownedGatewaySession([], 'operator', 'second'), undefined);
 });

@@ -40,8 +40,10 @@ This is the *connection* boundary (which servers an agent talks to at all). The 
 
 On macOS 13 or later, a local agent can send Notification Center alerts through
 an optional stdio server. Clicking a banner opens the configured dashboard agent
-in the default browser. An optional conversation ID selects that conversation,
-including when another tab already has the same agent open.
+in the default browser. An optional conversation ID selects a saved gateway
+conversation attributed to that agent, including when another tab already has
+the same agent open. If the dashboard cannot verify the conversation from its
+session list, the link opens the agent’s usual chat.
 
 From the repository root, build the app using the Xcode Command Line Tools.
 Open it once to request notification permission.
@@ -95,9 +97,11 @@ disconnects the server. A denied permission produces a tool error.
 ![Two operator tabs with the notification conversation selected](images/notification-conversation.png)
 
 Run the helper’s smoke test with `python3 apps/macos-notifications/smoke.py "$app"`
-from the repository root. Add `--deliver --agent operator` to request
-one real banner and retry its event ID. Click it with the browser closed to test
-the return path. Supply `--origin` if your local gateway uses another port.
+from the repository root. Add `--deliver --agent operator` to request one
+real banner and retry its event ID. To target an existing conversation, add
+`--session` with its display ID or full gateway session key. Click
+the banner with the browser closed to test the return path. Supply `--origin`
+if your local gateway uses another port.
 
 ## Transports
 

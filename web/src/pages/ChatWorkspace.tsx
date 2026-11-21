@@ -4,10 +4,12 @@ import { AgentProvider } from '@/contexts/AgentContext';
 import { AgentChatInner, type AgentChatStatus } from '@/pages/AgentChat';
 import { ChatTabBar, type TabIndicator, type WorkspaceLayout } from '@/components/ChatTabBar';
 import { basePath } from '@/lib/basePath';
+import { getSessions } from '@/lib/api';
 import {
   applySessionChange,
   loadPersisted,
   linkedSession,
+  ownedGatewaySession,
   tabForRoute,
   reservationsByKey,
   STORAGE_KEY,
@@ -48,7 +50,33 @@ export interface ChatWorkspaceProps {
  */
 export default function ChatWorkspace({ initialAlias, allowedAliases }: ChatWorkspaceProps) {
   const location = useLocation();
-  const session = linkedSession(location.search);
+  const requested = linkedSession(location.search);
+  const [resolved, setResolved] = useState<{ alias: string; routeKey: string; requested?: string; session?: string }>();
+  useEffect(() => {
+    let cancelled = false;
+    const settle = (session?: string) => {
+      if (!cancelled) setResolved({ alias: initialAlias, routeKey: location.key, requested, session });
+    };
+    if (requested) {
+      void getSessions().then((rows) => settle(ownedGatewaySession(rows, initialAlias, requested)), () => settle());
+    } else {
+      settle();
+    }
+    return () => { cancelled = true; };
+  }, [initialAlias, requested, location.key]);
+
+  const route = requested ? resolved : { alias: initialAlias, routeKey: location.key, requested: undefined, session: undefined };
+  // Keep mounted panes and sockets during an in-app navigation. A cold link
+  // waits for the session inventory before it can mount a pane with that ID.
+  if (!route || (allowedAliases && !allowedAliases.has(route.alias))) return null;
+  const waiting = route.routeKey !== location.key || route.alias !== initialAlias || route.requested !== requested;
+  return <Workspace initialAlias={route.alias} allowedAliases={allowedAliases}
+    session={route.session} routeKey={route.routeKey} waiting={waiting} />;
+}
+
+function Workspace({ initialAlias, allowedAliases, session, routeKey, waiting }: ChatWorkspaceProps & {
+  session?: string; routeKey: string; waiting: boolean;
+}) {
   const persisted = useRef<Partial<PersistedState>>(loadPersisted());
 
   const [tabs, setTabs] = useState<ChatTab[]>(() => {
@@ -184,7 +212,7 @@ export default function ChatWorkspace({ initialAlias, allowedAliases }: ChatWork
     if (session) {
       setSplitKeys((prev) => prev.includes(tab.key) ? prev : [tab.key, prev[1]]);
     }
-  }, [initialAlias, session, location.key]);
+  }, [initialAlias, session, routeKey]);
 
   // Persist workspace shape on any structural change.
   useEffect(() => {
@@ -232,7 +260,7 @@ export default function ChatWorkspace({ initialAlias, allowedAliases }: ChatWork
   // Mirror the active alias to the URL via history.replaceState only — never a
   // React Router navigate, which would remount AgentChat and kill connections.
   useEffect(() => {
-    if (pendingRoute.current && pendingRoute.current !== activeTab?.key) return;
+    if (waiting || (pendingRoute.current && pendingRoute.current !== activeTab?.key)) return;
     pendingRoute.current = null;
     // Include the reverse-proxy prefix so `target` matches the real
     // `window.location.pathname` under a gateway base path (e.g. "/zeroclaw").
@@ -242,13 +270,15 @@ export default function ChatWorkspace({ initialAlias, allowedAliases }: ChatWork
     // already normalized to "" (root) or a no-trailing-slash prefix, so plain
     // concatenation can't produce a double slash.
     const target = `${basePath}/agent/${activeTab?.alias ?? initialAlias}`;
-    const url = new URL(window.location.href);
-    if (window.location.pathname !== target || (url.searchParams.has('session') && activeTab?.sessionId !== url.searchParams.get('session'))) {
-      url.pathname = target;
-      url.searchParams.delete('session');
+    const params = new URLSearchParams(window.location.search);
+    const linked = params.get('session');
+    if (window.location.pathname !== target || (linked !== null && linked !== activeTab?.sessionId && linked !== `gw_${activeTab?.sessionId}`)) {
+      params.delete('session');
+      const query = params.toString();
+      const url = target + (query ? `?${query}` : '') + (window.location.hash || '');
       try { window.history.replaceState(window.history.state, '', url); } catch { /* noop */ }
     }
-  }, [activeTab, initialAlias, location.key]);
+  }, [activeTab, initialAlias, routeKey, waiting]);
 
   // ── Tab bar handlers ──────────────────────────────────────────────────
   const selectTab = useCallback((key: string) => {

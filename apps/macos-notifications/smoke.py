@@ -9,6 +9,7 @@ parser.add_argument("app", type=Path)
 parser.add_argument("--deliver", action="store_true")
 parser.add_argument("--origin", default="http://127.0.0.1:42617")
 parser.add_argument("--agent", default="operator")
+parser.add_argument("--session", help="existing dashboard conversation ID owned by this agent")
 args = parser.parse_args()
 binary = args.app / "Contents/MacOS/zeroclaw-notify"
 
@@ -25,7 +26,8 @@ frames = ["{", call("initialize", 1, protocolVersion="2025-06-18"),
 if args.deliver:
     import uuid
     event = uuid.uuid4().hex
-    frames += [tool(i, session_id="notification-test", event_id=event) for i in (4, 5)]
+    destination = {"session_id": args.session} if args.session else {}
+    frames += [tool(i, event_id=event, **destination) for i in (4, 5)]
 proc = subprocess.run([binary, "serve", args.origin, args.agent], input="\n".join(frames)+"\n",
                       capture_output=True, text=True, check=True, timeout=20)
 rows = {row["id"]: row for row in map(json.loads, proc.stdout.splitlines())}
