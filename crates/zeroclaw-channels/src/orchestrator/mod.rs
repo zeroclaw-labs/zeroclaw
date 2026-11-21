@@ -1894,7 +1894,8 @@ fn is_stop_command(content: &str) -> bool {
 }
 
 fn stop_reply_message(msg: &ChannelMessage, reply: impl Into<String>) -> SendMessage {
-    SendMessage::reply_to(msg, reply)
+    // Operational /stop acks are system text, not conversational replies.
+    SendMessage::reply_to(msg, reply).suppress_voice()
 }
 
 /// Every XML-ish element name that opens a tool-CALL envelope, longest first so
@@ -5635,7 +5636,10 @@ async fn handle_runtime_command_for_delivery(
         ),
     };
 
-    if let Err(err) = channel.send(&SendMessage::reply_to(msg, response)).await {
+    if let Err(err) = channel
+        .send(&SendMessage::reply_to(msg, response).suppress_voice())
+        .await
+    {
         ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -46181,6 +46185,72 @@ BTC is currently around $65,000 based on latest tool output."#
         let reply = stop_reply_message(&message, "stop requested");
 
         assert_full_email_reply_chain(&reply);
+    }
+
+    #[test]
+    fn stop_reply_message_suppresses_voice() {
+        let message = zeroclaw_api::channel::ChannelMessage {
+            id: "msg-stop".to_string(),
+            sender: "alice".to_string(),
+            reply_target: "chat-42".to_string(),
+            content: "/stop".to_string(),
+            channel: "telegram".into(),
+            channel_alias: None,
+            timestamp: 1,
+            thread_ts: None,
+            interruption_scope_id: None,
+            attachments: vec![],
+            subject: None,
+            ..Default::default()
+        };
+        let reply = stop_reply_message(&message, "stop requested");
+        assert!(
+            reply.suppress_voice,
+            "/stop acknowledgements must stay out of conversational TTS"
+        );
+        assert_eq!(reply.recipient, "chat-42");
+        assert!(!reply.force_voice);
+    }
+
+    #[tokio::test]
+    async fn runtime_command_responses_suppress_voice() {
+        // /thinking and other operational replies share one send site; they
+        // must not enter conversational voice routing (Telegram TTS / voice-
+        // only peers).
+        let channel_impl = Arc::new(SendMessageRecordingChannel::telegram(false));
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut ctx = channel_runtime_context_for_defaults_test(
+            tmp.path(),
+            "agentX",
+            "openrouter.default",
+            "default-model",
+        );
+        ctx.channels_by_name = Arc::new(HashMap::from([(
+            channel.name().to_string(),
+            Arc::clone(&channel),
+        )]));
+
+        let mut msg = scope_test_msg("alice", "telegram", None);
+        msg.content = "/thinking high".into();
+        assert!(
+            handle_runtime_command_if_needed(&ctx, &msg, Some(&channel)).await,
+            "runtime command should be handled"
+        );
+
+        let sent = channel_impl.sent_messages.lock().await;
+        assert_eq!(
+            sent.len(),
+            1,
+            "expected one operational reply, got {sent:?}"
+        );
+        assert!(
+            sent[0].suppress_voice,
+            "runtime-command reply must suppress voice, got {:?}",
+            sent[0]
+        );
+        assert!(!sent[0].force_voice);
+        assert_eq!(sent[0].recipient, msg.reply_target);
     }
 
     #[tokio::test]
