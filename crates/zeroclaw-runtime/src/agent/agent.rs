@@ -2003,6 +2003,18 @@ impl Agent {
         self.memory_session_id = session_id;
     }
 
+    /// Borrow-clone the agent's canonical memory backend (`NoneMemory` when
+    /// memory is disabled or excluded).
+    pub fn memory_handle(&self) -> Arc<dyn Memory> {
+        Arc::clone(&self.memory)
+    }
+
+    /// Whether automatic memory persistence / consolidation is active on this
+    /// agent (`false` whenever persistent memory is excluded).
+    pub fn auto_save_enabled(&self) -> bool {
+        self.auto_save
+    }
+
     pub fn set_temperature(&mut self, temperature: Option<f64>) {
         self.temperature = temperature;
     }
