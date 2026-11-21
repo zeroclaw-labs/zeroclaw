@@ -254,6 +254,10 @@ pub struct AcpServer {
     /// (closed) so standalone/IDE ACP servers do not let untrusted clients
     /// escalate into persistent memory, MCP bundles, and external channels.
     allow_webchat_policy: bool,
+    /// Optional authenticated principal id for scoped gateway sessions.
+    /// `None` for unscoped/operator sessions; `Some(id)` stamps created
+    /// sessions and restricts list/rename/load/resume to that exact principal.
+    principal_id: Option<String>,
     /// Process- or connection-scoped default agent alias (`--agent` for
     /// standalone ACP or `?agent=` on the gateway endpoint). Slots into the
     /// `session/new` alias precedence chain between an explicit `agentAlias`
@@ -407,6 +411,7 @@ impl AcpServer {
             cost_tracker: None,
             default_session_policy: AcpSessionPolicy::default(),
             allow_webchat_policy: false,
+            principal_id: None,
             connection_default_agent: None,
             client_elicitation_caps: std::sync::RwLock::new(ElicitationCapabilities::default()),
         }
@@ -650,6 +655,32 @@ impl AcpServer {
     pub fn with_allow_webchat_policy(mut self, allow: bool) -> Self {
         self.allow_webchat_policy = allow;
         self
+    }
+
+    /// Scope all session creation, listing, renaming, and restoration on this
+    /// server instance to an authenticated principal (`None` = operator/unscoped).
+    pub fn with_principal_id(mut self, principal_id: Option<String>) -> Self {
+        self.principal_id = principal_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        self
+    }
+
+    /// Cancel all currently running turns on this server instance (used when
+    /// a dashboard session is revoked or signed out mid-turn).
+    pub fn cancel_active_turns(&self) {
+        let tokens: Vec<_> = self
+            .cancel_tokens
+            .lock()
+            .expect("cancel_tokens lock poisoned — invariant: all guarded critical sections are short, infallible HashMap ops")
+            .values()
+            .cloned()
+            .collect();
+        for token in tokens {
+            token.cancel();
+        }
     }
 
     /// Run the ACP server, reading JSON-RPC requests from stdin and writing
@@ -1328,12 +1359,17 @@ impl AcpServer {
             let alias = agent_alias.clone();
             let wsd = workspace_dir.clone();
             let surface = session_policy.interaction_surface;
-            // The orchestrator ACP transport (CLI/IDE-native) carries no
-            // authenticated gateway principal, so these sessions are stamped
-            // with a NULL owner -- visible only to unscoped connections, never
-            // to a scoped gateway principal (RFC 7141 F2).
+            let principal = self.principal_id.clone();
+            // Standalone/operator sessions carry NULL owner; scoped gateway
+            // sessions stamp their authenticated principal_id (RFC 7141 F2).
             let created = tokio::task::spawn_blocking(move || {
-                store.create_session_with_interaction_surface(&sid, &alias, &wsd, surface, None)
+                store.create_session_with_interaction_surface(
+                    &sid,
+                    &alias,
+                    &wsd,
+                    surface,
+                    principal.as_deref(),
+                )
             })
             .await;
             let error = match created {
@@ -1419,13 +1455,15 @@ impl AcpServer {
     }
 
     async fn handle_session_list(&self) -> RpcResult {
-        // The current ACP server carries unscoped sessions only.
         let store = self.store.clone().ok_or_else(|| RpcError {
             code: INTERNAL_ERROR,
             message: "ACP session storage is unavailable".into(),
             data: None,
         })?;
-        let rows = tokio::task::spawn_blocking(move || store.list_sessions_owned(None)).await;
+        let principal = self.principal_id.clone();
+        let rows =
+            tokio::task::spawn_blocking(move || store.list_sessions_owned(principal.as_deref()))
+                .await;
         let Ok(Ok(rows)) = rows else {
             return Err(RpcError {
                 code: INTERNAL_ERROR,
@@ -1470,8 +1508,9 @@ impl AcpServer {
         })?;
         let id = session_id.to_owned();
         let persisted_name = name.to_owned();
+        let principal = self.principal_id.clone();
         let result = tokio::task::spawn_blocking(move || {
-            store.rename_session_authorized(&id, &persisted_name, None, |_| Ok(()))
+            store.rename_session_authorized(&id, &persisted_name, principal.as_deref(), |_| Ok(()))
         })
         .await;
         match result {
@@ -1489,11 +1528,12 @@ impl AcpServer {
         }
     }
 
-    fn load_unscoped_session_for_restore(
+    fn load_session_for_restore(
+        &self,
         store: &AcpSessionStore,
         session_id: &str,
     ) -> Result<Box<AcpSessionData>, RpcError> {
-        match store.load_session_for_restore_owned(session_id, None) {
+        match store.load_session_for_restore_owned(session_id, self.principal_id.as_deref()) {
             Ok(Some(AcpSessionRestore::Restorable(data))) => Ok(data),
             Ok(Some(AcpSessionRestore::Missing)) => Err(RpcError {
                 code: SESSION_NOT_FOUND,
@@ -1589,7 +1629,7 @@ impl AcpServer {
             loading.insert(session_id.clone());
         }
 
-        let data = Self::load_unscoped_session_for_restore(store, &session_id);
+        let data = self.load_session_for_restore(store, &session_id);
 
         // Every restore failure releases the reserved slot.
         let data = match data {
@@ -1914,7 +1954,7 @@ impl AcpServer {
             loading.insert(session_id.clone());
         }
 
-        let data = Self::load_unscoped_session_for_restore(store, &session_id);
+        let data = self.load_session_for_restore(store, &session_id);
 
         // Every restore failure releases the reserved slot.
         let data = match data {
