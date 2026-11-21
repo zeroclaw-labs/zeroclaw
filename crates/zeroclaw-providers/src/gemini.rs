@@ -1269,6 +1269,7 @@ impl GeminiModelProvider {
 
         if !response.status().is_success() {
             let status = response.status();
+            let retry_after = super::response_retry_after(&response);
             let error_text = response.text().await.unwrap_or_default();
 
             if auth.is_oauth() && Self::should_rotate_oauth_on_error(status, &error_text) {
@@ -1346,7 +1347,12 @@ impl GeminiModelProvider {
                         .send()
                         .await?;
                 } else {
-                    anyhow::bail!("Gemini API error ({status}): {error_text}");
+                    return Err(super::reliable::ProviderHttpError::new(
+                        status,
+                        format!("Gemini API error ({status}): {error_text}"),
+                        retry_after,
+                    )
+                    .into_retry_error());
                 }
             } else if auth.is_oauth()
                 && Self::should_retry_oauth_without_generation_config(status, &error_text)
@@ -1370,12 +1376,18 @@ impl GeminiModelProvider {
                     .send()
                     .await?;
             } else {
-                anyhow::bail!("Gemini API error ({status}): {error_text}");
+                return Err(super::reliable::ProviderHttpError::new(
+                    status,
+                    format!("Gemini API error ({status}): {error_text}"),
+                    retry_after,
+                )
+                .into_retry_error());
             }
         }
 
         if !response.status().is_success() {
             let status = response.status();
+            let retry_after = super::response_retry_after(&response);
             let error_text = response.text().await.unwrap_or_default();
             if auth.is_oauth()
                 && Self::should_retry_oauth_without_generation_config(status, &error_text)
@@ -1399,14 +1411,25 @@ impl GeminiModelProvider {
                     .send()
                     .await?;
             } else {
-                anyhow::bail!("Gemini API error ({status}): {error_text}");
+                return Err(super::reliable::ProviderHttpError::new(
+                    status,
+                    format!("Gemini API error ({status}): {error_text}"),
+                    retry_after,
+                )
+                .into_retry_error());
             }
         }
 
         if !response.status().is_success() {
             let status = response.status();
+            let retry_after = super::response_retry_after(&response);
             let error_text = response.text().await.unwrap_or_default();
-            anyhow::bail!("Gemini API error ({status}): {error_text}");
+            return Err(super::reliable::ProviderHttpError::new(
+                status,
+                format!("Gemini API error ({status}): {error_text}"),
+                retry_after,
+            )
+            .into_retry_error());
         }
 
         let result: GenerateContentResponse = response.json().await?;

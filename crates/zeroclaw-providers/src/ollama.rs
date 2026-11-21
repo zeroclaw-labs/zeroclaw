@@ -615,6 +615,7 @@ impl OllamaModelProvider {
 
         let response = request_builder.send().await?;
         let status = response.status();
+        let retry_after = super::response_retry_after(&response);
         ::zeroclaw_log::record!(
             DEBUG,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
@@ -640,11 +641,11 @@ impl OllamaModelProvider {
                     status, sanitized
                 )
             );
-            anyhow::bail!(
+            return Err(super::reliable::ProviderHttpError::new(status, format!(
                 "Ollama API error ({}): {}. Is Ollama running? (brew install ollama && ollama serve)",
                 status,
                 sanitized
-            );
+            ), retry_after).into_retry_error());
         }
 
         let chat_response: ApiChatResponse = match serde_json::from_slice(&body) {

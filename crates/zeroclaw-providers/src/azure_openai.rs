@@ -338,6 +338,7 @@ impl AzureOpenAiModelProvider {
             }
 
             let status = response.status();
+            let retry_after = super::response_retry_after(&response);
             let body = response.text().await.unwrap_or_else(|_| {
                 "<failed to read Azure OpenAI error response body>".to_string()
             });
@@ -372,7 +373,10 @@ impl AzureOpenAiModelProvider {
                 continue;
             }
 
-            return Err(super::api_error_from_parts("Azure OpenAI", status, &body));
+            return Err(
+                super::api_error_from_parts("Azure OpenAI", status, &body, retry_after)
+                    .into_retry_error(),
+            );
         }
     }
 

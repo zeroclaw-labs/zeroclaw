@@ -1295,23 +1295,62 @@ pub(crate) fn stream_idle_error_message(
     }
 }
 
+/// Extract only a normalized retry delay before the response body is consumed.
+pub(crate) fn response_retry_after(response: &reqwest::Response) -> Option<std::time::Duration> {
+    if !matches!(
+        response.status(),
+        reqwest::StatusCode::TOO_MANY_REQUESTS | reqwest::StatusCode::SERVICE_UNAVAILABLE
+    ) {
+        return None;
+    }
+    let value = response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?;
+    parse_retry_after_header(value, std::time::SystemTime::now())
+}
+
+fn parse_retry_after_header(
+    value: &str,
+    now: std::time::SystemTime,
+) -> Option<std::time::Duration> {
+    let value = value.trim();
+    if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) {
+        let seconds = value.parse().unwrap_or(u64::MAX);
+        return Some(std::time::Duration::from_secs(seconds));
+    }
+    let date = httpdate::parse_http_date(value).ok()?;
+    Some(date.duration_since(now).unwrap_or_default())
+}
+
 /// Build a sanitized model_provider error from a failed HTTP response.
 pub async fn api_error(model_provider: &str, response: reqwest::Response) -> anyhow::Error {
+    typed_api_error(model_provider, response)
+        .await
+        .into_retry_error()
+}
+
+pub(crate) async fn typed_api_error(
+    model_provider: &str,
+    response: reqwest::Response,
+) -> reliable::ProviderHttpError {
     let status = response.status();
+    let retry_after = response_retry_after(&response);
     let body = response
         .text()
         .await
         .unwrap_or_else(|_| "<failed to read model_provider error body>".to_string());
-    api_error_from_parts(model_provider, status, &body)
+    api_error_from_parts(model_provider, status, &body, retry_after)
 }
 
-/// Build a sanitized model_provider error after a caller has already consumed
-/// the response body to classify a narrowly bounded fallback.
+/// Build a sanitized error after a caller has read the body to classify a fallback.
 pub(crate) fn api_error_from_parts(
     model_provider: &str,
     status: reqwest::StatusCode,
     body: &str,
-) -> anyhow::Error {
+    retry_after: Option<std::time::Duration>,
+) -> reliable::ProviderHttpError {
     let sanitized = sanitize_api_error(body);
     ::zeroclaw_log::record!(
         ERROR,
@@ -1324,9 +1363,11 @@ pub(crate) fn api_error_from_parts(
             })),
         "providers: API error"
     );
-    anyhow::Error::msg(format!(
-        "{model_provider} API error ({status}): {sanitized}"
-    ))
+    reliable::ProviderHttpError::new(
+        status,
+        format!("{model_provider} API error ({status}): {sanitized}"),
+        retry_after,
+    )
 }
 
 /// Resolve API key for a model_provider from the typed alias config/override.
