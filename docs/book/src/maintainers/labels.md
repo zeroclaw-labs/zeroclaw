@@ -120,8 +120,8 @@ Applied automatically by `pr-path-labeler.yml`. Globs live in `.github/labeler.y
 | `cron` | `src/cron/**`, `crates/zeroclaw-runtime/src/cron/**` |
 | `daemon` | `src/daemon/**`, `crates/zeroclaw-runtime/src/daemon/**` |
 | `doctor` | `src/doctor/**`, `crates/zeroclaw-runtime/src/doctor/**` |
-| `health` | `src/health/**`, `crates/zeroclaw-runtime/src/health/**` |
-| `heartbeat` | `src/heartbeat/**`, `crates/zeroclaw-runtime/src/heartbeat/**` |
+| `health` | `crates/zeroclaw-runtime/src/health/**` |
+| `heartbeat` | `crates/zeroclaw-runtime/src/heartbeat/**` |
 | `integration` | `src/integrations/**`, `crates/zeroclaw-runtime/src/integrations/**` |
 | `memory` | `src/memory/**`, `crates/zeroclaw-memory/src/**` |
 | `security` | `src/security/**`, `crates/zeroclaw-runtime/src/security/**` |
