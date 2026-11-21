@@ -6858,8 +6858,17 @@ fn default_agent_tool_dispatcher() -> String {
     "auto".into()
 }
 
+/// Default system-prompt character budget for profiles that do not set
+/// `max_system_prompt_chars`. `0` would mean "unlimited", which lets an
+/// oversized workspace bootstrap reach the provider verbatim (incident
+/// #11908: warning-only let a 563K-char system prompt through against a
+/// 40K-token budget). The default therefore stays a finite, generous cap —
+/// production operators use 20k-64k — so an unconfigured profile still
+/// bounds prompt growth.
+/// An explicit `max_system_prompt_chars = 0` in a profile keeps the
+/// opt-in unlimited behavior.
 fn default_max_system_prompt_chars() -> usize {
-    0
+    50_000
 }
 
 // ── Pacing ────────────────────────────────────────────────────────
