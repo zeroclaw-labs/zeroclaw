@@ -18,7 +18,7 @@
 
 use super::OpenAiCodexModelProvider;
 use crate::auth::openai_oauth::extract_chatgpt_account_id_from_jwt;
-use crate::auth::profiles::AuthProfileKind;
+use crate::auth::profiles::OAuthAccessSnapshot;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -59,6 +59,7 @@ pub enum CodexUsageError {
     AuthStoreUnreadable,
     ProfileNotFound { explicit_override: bool },
     ProfileNotOAuth,
+    AccessTokenMissing,
     TokenExpired,
     AccountIdMissing,
     AccountIdMismatch,
@@ -90,6 +91,7 @@ impl std::fmt::Display for CodexUsageError {
                 "no OpenAI Codex OAuth profile found; run `zeroclaw auth login --model-provider openai-codex`",
             ),
             Self::ProfileNotOAuth => f.write_str("the OpenAI Codex auth profile is not OAuth-based"),
+            Self::AccessTokenMissing => f.write_str("the OpenAI Codex profile has no access token"),
             Self::TokenExpired => f.write_str(
                 "the OpenAI Codex access token is expired; usage lookup does not refresh tokens, \
                  so run a ZeroClaw command that uses this provider or `zeroclaw auth refresh --model-provider openai-codex` first",
@@ -355,20 +357,19 @@ impl OpenAiCodexModelProvider {
             .map_err(|_| CodexUsageError::AuthStoreUnreadable)?
             .ok_or(CodexUsageError::ProfileNotFound { explicit_override })?;
 
-        let token_set = match (profile.kind, profile.token_set.as_ref()) {
-            (AuthProfileKind::OAuth, Some(token_set)) => token_set,
-            _ => return Err(CodexUsageError::ProfileNotOAuth),
+        let (stored_account_id, tokens) = match profile {
+            OAuthAccessSnapshot::Access { account_id, tokens } => (account_id, tokens),
+            OAuthAccessSnapshot::NotOAuth => return Err(CodexUsageError::ProfileNotOAuth),
+            OAuthAccessSnapshot::MissingAccessToken => {
+                return Err(CodexUsageError::AccessTokenMissing);
+            }
         };
-        let access_token = token_set.access_token.trim();
-        if access_token.is_empty() {
-            return Err(CodexUsageError::ProfileNotOAuth);
-        }
-        if token_set.is_expiring_within(Duration::ZERO) {
+        let access_token = tokens.access_token.trim();
+        if tokens.is_expiring_within(Duration::ZERO) {
             return Err(CodexUsageError::TokenExpired);
         }
 
-        let stored = profile
-            .account_id
+        let stored = stored_account_id
             .as_deref()
             .map(str::trim)
             .filter(|id| !id.is_empty());
@@ -983,14 +984,14 @@ mod tests {
             provider_api_url: Some("https://example.invalid/backend-api".to_string()),
             ..ModelProviderRuntimeOptions::default()
         };
+        // A malformed snapshot would produce AuthStoreUnreadable if consulted.
+        std::fs::write(dir.path().join("auth-profiles.json"), "not json").unwrap();
         let provider = OpenAiCodexModelProvider::new("test", &options, Some("key")).unwrap();
         assert!(matches!(
             provider.fetch_usage_from(&mock.base).await,
             Err(CodexUsageError::UnsupportedRoute(_))
         ));
         assert!(mock.seen.lock().unwrap().requests.is_empty());
-        // Auth was never read: no store file was created by (or needed for) the call.
-        assert!(!dir.path().join("auth-profiles.json").exists());
     }
 
     #[tokio::test]
@@ -1297,6 +1298,45 @@ mod tests {
             .unwrap_err();
         assert_eq!(err, CodexUsageError::AuthStoreUnreadable);
         assert!(!format!("{err} {err:?}").contains("marker-redacted"));
+        assert!(mock.seen.lock().unwrap().requests.is_empty());
+    }
+
+    #[tokio::test]
+    async fn invalid_selected_profile_is_not_confused_with_missing_or_replaced() {
+        let _proxy = crate::RuntimeProxyTestGuard::acquire().await;
+        let mock = start_mock(Reply::Json(usage_body())).await;
+        let dir = tempfile::tempdir().unwrap();
+        store_profile(&dir, "default", FAKE_ACCOUNT, false).await;
+        store_profile(&dir, "work", FAKE_OTHER_ACCOUNT, true).await;
+
+        for (kind, token, expected) in [
+            (
+                "token",
+                json!("enc2:not-valid-hex"),
+                CodexUsageError::ProfileNotOAuth,
+            ),
+            (
+                "invalid-kind",
+                json!(FAKE_ACCOUNT),
+                CodexUsageError::AuthStoreUnreadable,
+            ),
+            ("oauth", Value::Null, CodexUsageError::AccessTokenMissing),
+            ("oauth", json!(""), CodexUsageError::AccessTokenMissing),
+            ("oauth", json!(" \t"), CodexUsageError::AccessTokenMissing),
+        ] {
+            edit_store(&dir, |doc| {
+                let selected = &mut doc["profiles"]["openai-codex:work"];
+                selected["kind"] = json!(kind);
+                selected["access_token"] = token;
+            });
+            let path = dir.path().join("auth-profiles.json");
+            let before = std::fs::read(&path).unwrap();
+            assert_eq!(
+                provider_in(&dir, None).fetch_usage_from(&mock.base).await,
+                Err(expected)
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+        }
         assert!(mock.seen.lock().unwrap().requests.is_empty());
     }
 

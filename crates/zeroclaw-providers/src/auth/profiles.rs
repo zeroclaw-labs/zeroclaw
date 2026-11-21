@@ -143,6 +143,16 @@ impl Default for AuthProfilesData {
     }
 }
 
+/// Result of checking the selected profile without decoding other credentials.
+pub(crate) enum OAuthAccessSnapshot {
+    NotOAuth,
+    MissingAccessToken,
+    Access {
+        account_id: Option<String>,
+        tokens: TokenSet,
+    },
+}
+
 #[derive(Debug, Clone)]
 pub struct AuthProfilesStore {
     path: PathBuf,
@@ -175,8 +185,8 @@ impl AuthProfilesStore {
         &self,
         model_provider: &str,
         profile_override: Option<&str>,
-    ) -> Result<Option<AuthProfile>> {
-        let persisted = self.read_persisted_locked().await?;
+    ) -> Result<Option<OAuthAccessSnapshot>> {
+        let persisted = self.read_persisted_snapshot().await?;
         let Some(profile_id) = super::select_profile_id_from(
             &persisted.active_profiles,
             &persisted.profiles,
@@ -189,45 +199,40 @@ impl AuthProfilesStore {
         let Some(p) = persisted.profiles.get(&profile_id) else {
             return Ok(None);
         };
-        if p.model_provider != model_provider
-            || !matches!(parse_profile_kind(&p.kind), Ok(AuthProfileKind::OAuth))
-        {
+        if p.model_provider != model_provider {
             return Ok(None);
         }
-        let Some(stored_access) = p.access_token.as_deref().filter(|v| !v.is_empty()) else {
-            return Ok(None);
+        if parse_profile_kind(&p.kind)? != AuthProfileKind::OAuth {
+            return Ok(Some(OAuthAccessSnapshot::NotOAuth));
+        }
+        let Some(stored_access) = p.access_token.as_deref().filter(|v| !v.trim().is_empty()) else {
+            return Ok(Some(OAuthAccessSnapshot::MissingAccessToken));
         };
         let access_token = self
             .secret_store
             .decrypt(stored_access)
             .map_err(|_| anyhow::Error::msg("failed to decode the selected access credential"))?;
+        if access_token.trim().is_empty() {
+            return Ok(Some(OAuthAccessSnapshot::MissingAccessToken));
+        }
         let expires_at = parse_optional_datetime(p.expires_at.as_deref())
             .map_err(|_| anyhow::Error::msg("invalid expiry on the selected profile"))?;
-        Ok(Some(AuthProfile {
-            id: profile_id,
-            model_provider: p.model_provider.clone(),
-            profile_name: p.profile_name.clone(),
-            kind: AuthProfileKind::OAuth,
+        Ok(Some(OAuthAccessSnapshot::Access {
             account_id: p.account_id.clone(),
-            workspace_id: p.workspace_id.clone(),
-            token_set: Some(TokenSet {
+            tokens: TokenSet {
                 access_token,
                 refresh_token: None,
                 id_token: None,
                 expires_at,
-                token_type: p.token_type.clone(),
-                scope: p.scope.clone(),
-            }),
-            token: None,
-            metadata: BTreeMap::new(),
-            created_at: parse_datetime_with_fallback(&p.created_at),
-            updated_at: parse_datetime_with_fallback(&p.updated_at),
+                token_type: None,
+                scope: None,
+            },
         }))
     }
 
     pub async fn list_profile_ids(&self) -> Result<Vec<String>> {
         let _lock = self.acquire_lock().await?;
-        let persisted = self.read_persisted_locked().await?;
+        let persisted = self.read_persisted_snapshot().await?;
         Ok(persisted.profiles.into_keys().collect())
     }
 
@@ -316,7 +321,7 @@ impl AuthProfilesStore {
     }
 
     async fn load_locked(&self) -> Result<AuthProfilesData> {
-        let mut persisted = self.read_persisted_locked().await?;
+        let mut persisted = self.read_persisted_snapshot().await?;
         let mut migrated = false;
 
         let mut profiles = BTreeMap::new();
@@ -455,7 +460,7 @@ impl AuthProfilesStore {
         self.write_persisted_locked(&persisted).await
     }
 
-    async fn read_persisted_locked(&self) -> Result<PersistedAuthProfiles> {
+    async fn read_persisted_snapshot(&self) -> Result<PersistedAuthProfiles> {
         if !self.path.exists() {
             return Ok(PersistedAuthProfiles::default());
         }
@@ -845,7 +850,9 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let tokens = loaded.token_set.unwrap();
+        let OAuthAccessSnapshot::Access { tokens, .. } = loaded else {
+            panic!("expected selected OAuth access token");
+        };
         assert_eq!(tokens.access_token, "fake-access");
         assert!(tokens.refresh_token.is_none());
         assert!(tokens.id_token.is_none());

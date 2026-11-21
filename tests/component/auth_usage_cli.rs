@@ -30,7 +30,7 @@ enabled = true
 
     let output = Command::new(env!("CARGO_BIN_EXE_zeroclaw"))
         .env("ZEROCLAW_CONFIG_DIR", dir.path())
-        .env("RUST_LOG", "off")
+        .env_remove("RUST_LOG")
         .args([
             "auth",
             "usage",

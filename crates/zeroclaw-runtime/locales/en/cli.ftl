@@ -1809,6 +1809,7 @@ cli-auth-usage-err-auth-store = The local auth profile store could not be read.
 cli-auth-usage-err-profile-not-found = The requested OpenAI Codex auth profile was not found.
 cli-auth-usage-err-no-profile = No OpenAI Codex OAuth profile found; run `zeroclaw auth login --model-provider openai-codex`.
 cli-auth-usage-err-not-oauth = The OpenAI Codex auth profile is not OAuth-based.
+cli-auth-usage-err-access-token-missing = The selected OpenAI Codex OAuth profile has no access token. Run `zeroclaw auth login --model-provider openai-codex` to sign in again.
 cli-auth-usage-err-token-expired = The OpenAI Codex access token is expired. Usage lookup does not refresh tokens; run `zeroclaw auth refresh --model-provider openai-codex` first.
 cli-auth-usage-err-account-missing = The OpenAI Codex auth profile has no account id.
 cli-auth-usage-err-account-mismatch = The OpenAI Codex access token and the stored account id belong to different accounts.

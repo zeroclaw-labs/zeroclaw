@@ -10067,8 +10067,8 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
         };
         return handle_oidc_command(oidc_command, &config).await;
     }
-    // Usage is read-only, and --json owns stdout. Do not initialize an
-    // unrelated OTP secret or print its enrollment URI for this command.
+    // After normal config loading, usage does not write auth or OTP state.
+    // Skip OTP enrollment so its URI cannot pollute --json stdout.
     #[cfg(feature = "agent-runtime")]
     if let Commands::Auth {
         auth_command: auth_command @ AuthCommands::Usage { .. },
@@ -14992,6 +14992,7 @@ fn codex_usage_error_text(
             explicit_override: false,
         } => "cli-auth-usage-err-no-profile",
         E::ProfileNotOAuth => "cli-auth-usage-err-not-oauth",
+        E::AccessTokenMissing => "cli-auth-usage-err-access-token-missing",
         E::TokenExpired => "cli-auth-usage-err-token-expired",
         E::AccountIdMissing => "cli-auth-usage-err-account-missing",
         E::AccountIdMismatch => "cli-auth-usage-err-account-mismatch",

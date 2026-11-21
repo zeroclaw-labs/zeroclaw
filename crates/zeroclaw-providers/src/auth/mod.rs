@@ -9,7 +9,8 @@ pub mod xai_oauth;
 use crate::auth::oauth_common::{RefreshAttemptError, RefreshRetryPolicy, refresh_with_retries};
 use crate::auth::openai_oauth::refresh_access_token;
 use crate::auth::profiles::{
-    AuthProfile, AuthProfileKind, AuthProfilesData, AuthProfilesStore, TokenSet, profile_id,
+    AuthProfile, AuthProfileKind, AuthProfilesData, AuthProfilesStore, OAuthAccessSnapshot,
+    TokenSet, profile_id,
 };
 use anyhow::Result;
 use std::collections::{BTreeMap, HashMap};
@@ -62,11 +63,11 @@ impl AuthService {
     /// decoded. An explicit override that does not exist, or that names a
     /// profile of a different provider (e.g. a full `other:name` id), yields
     /// `None`, never another profile.
-    pub async fn get_oauth_profile_access_only(
+    pub(crate) async fn get_oauth_profile_access_only(
         &self,
         model_provider: &str,
         profile_override: Option<&str>,
-    ) -> Result<Option<AuthProfile>> {
+    ) -> Result<Option<OAuthAccessSnapshot>> {
         let model_provider = normalize_model_provider(model_provider)?;
         self.store
             .read_oauth_access_only(&model_provider, profile_override)
