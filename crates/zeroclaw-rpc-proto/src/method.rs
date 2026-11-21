@@ -29,6 +29,7 @@ pub enum Method {
     SessionConfigure,
     SessionCancel,
     SessionGitBranch,
+    SessionReloadContext,
     SessionList,
     SessionListAcp,
     SessionMessages,
@@ -168,6 +169,7 @@ impl Method {
         (Method::SessionConfigure, "session/configure"),
         (Method::SessionCancel, "session/cancel"),
         (Method::SessionGitBranch, "session/git_branch"),
+        (Method::SessionReloadContext, "session/reload_context"),
         (Method::SessionList, "session/list"),
         (Method::SessionListAcp, "session/list-acp"),
         (Method::SessionMessages, "session/messages"),
@@ -324,6 +326,10 @@ impl Method {
             ),
             M::SessionCancel => (Typed("SessionIdParams"), Typed("SessionCancelResult")),
             M::SessionGitBranch => (Typed("SessionIdParams"), Typed("SessionGitBranchResult")),
+            M::SessionReloadContext => (
+                Typed("SessionIdParams"),
+                Typed("SessionReloadContextResult"),
+            ),
             M::SessionList => (Typed("SessionListParams"), Typed("SessionListResult")),
             M::SessionListAcp => (None, Typed("SessionListResult")),
             M::SessionMessages => (

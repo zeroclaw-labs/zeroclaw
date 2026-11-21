@@ -42,7 +42,7 @@ catalog! {
     SessionIdParams, ChatMode, SessionNewResult, SessionCloseResult, SessionKillParams,
     SessionKillResult, SessionPromptParams, SessionPromptResult, SessionPromptAck,
     SessionConfigureParams,
-    SessionConfigureResult, SessionCancelResult, SessionGitBranchResult, SessionListParams,
+    SessionConfigureResult, SessionCancelResult, SessionGitBranchResult, SessionReloadContextResult, SessionListParams,
     SessionListResult, SessionEntry, SessionMessagesResult, SessionMessagesParams,
     MessageEntryKind, MessageEntry, SessionStateResult, SessionDeleteResult, SessionOverrides,
     SessionSteerParams, SessionSteerResult, SessionAppendParams, SessionAppendResult,
