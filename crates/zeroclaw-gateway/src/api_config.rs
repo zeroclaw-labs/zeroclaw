@@ -1578,11 +1578,17 @@ pub async fn mutate_http_credential(
                 }) else {
                     return StatusCode::SERVICE_UNAVAILABLE.into_response();
                 };
-                if permissions
-                    .expected_revision
-                    .as_deref()
-                    .is_some_and(|revision| revision != permission_revision(&record))
-                {
+                let replaces_list = permissions.http_origins.is_some()
+                    || permissions.destinations.is_some()
+                    || permissions
+                        .browser
+                        .as_ref()
+                        .is_some_and(|browser| browser.origins.is_some());
+                let current_revision = permission_revision(&record);
+                if match permissions.expected_revision.as_deref() {
+                    Some(revision) => revision != current_revision,
+                    None => replaces_list,
+                } {
                     return StatusCode::CONFLICT.into_response();
                 }
                 let grant = serde_json::json!({
