@@ -172,7 +172,7 @@ cli-memory-list-about = 列出内存条目，可使用可选过滤器
 cli-memory-get-about = 按键获取特定的内存条目
 cli-memory-stats-about = 显示内存后端的统计信息和健康状况
 cli-memory-clear-about = 按类别、按键清除内存，或清除全部
-cli-memory-clear-unsupported-backend = 内存清除不支持仅追加后端 '{$backend}'；请切换到可删除的后端（sqlite、lucid 或 postgres）
+cli-memory-clear-unsupported-backend = 内存清除不支持仅追加后端 '{$backend}'；请切换到可删除的后端（sqlite 或 postgres）
 cli-estop-status-about = 打印当前急停状态
 cli-estop-resume-about = 从已激活的急停级别恢复
 cli-models-refresh-about = 刷新并缓存提供商模型
@@ -192,7 +192,7 @@ cli-sop-list-about = 列出已加载的 SOP
 cli-sop-validate-about = 验证 SOP 定义
 cli-sop-show-about = 显示 SOP 的详细信息
 cli-migrate-openclaw-about = 将 OpenClaw 工作区中的记忆导入到此 ZeroClaw 工作区
-cli-migrate-openclaw-qdrant-unsupported = Qdrant 当前不支持作为 OpenClaw 迁移目标。请将 memory.backend 设置为 sqlite、lucid 或 markdown，然后重试。
+cli-migrate-openclaw-qdrant-unsupported = Qdrant 当前不支持作为 OpenClaw 迁移目标。请将 memory.backend 设置为 sqlite 或 markdown，然后重试。
 cli-agent-long-about =
     启动 AI 代理循环。
 
@@ -963,6 +963,9 @@ cli-config-retired-reason-tts-default = 没有全局默认的 TTS 提供商；�
 cli-config-retired-reason-global-transcription = 没有全局默认的转写提供商；请改为在每个 `[agents.<alias>]` 上设置 `transcription_provider`
 cli-config-retired-reason-identity = 身份按代理设置；请将其移至 `[agents.<alias>.identity]`
 cli-config-retired-reason-pairing-max-pending = 网关同一时间只保留一个待用配对码，签发新码会使之前的配对码失效
+cli-config-retired-value-replaced = 警告：已将 {$path} 中配置键 `{$key}` 的已停用值替换为 `{$replacement}`：{$reason}
+cli-config-retired-reason-lucid = Lucid 记忆后端已移除；其记忆已存储在 `memory.backend = "sqlite"` 读取的 SQLite 存储中
+cli-config-retired-reason-lucid-backend = Lucid 记忆后端已移除；它将每条记忆都存入了 `sqlite` 读取的 SQLite 存储，因此所有记忆都会保留，只有来自外部 Lucid 索引的召回结果不再出现
 cli-config-migration-inferred-v3 = 警告：{$path} 没有 `schema_version`，但其配置段为 V3 格式，因此按 V3 架构读取并从 V3 开始迁移。请运行 `zeroclaw config migrate`，将当前的 `schema_version` 写入文件。
 cli-config-env-override-retired = 警告：已忽略 `{$variable}`，因为它设置的是已停用的配置键：{$reason}
 cli-config-migration-pending = 警告：这些更改仅对本次运行生效。运行 `zeroclaw config migrate` 将其写入 {$path}。

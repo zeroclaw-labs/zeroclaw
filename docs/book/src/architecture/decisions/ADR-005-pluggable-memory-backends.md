@@ -25,7 +25,7 @@ ZeroClaw needs persistent memory across installations with different operational
 
 These stores do not have identical schemas or operational properties. They still need to present one runtime interface for memory operations and scoping. Individual operations may have backend-specific capability semantics; for example, Markdown memory is append-only and does not delete entries. Turn processing must not depend on a concrete database type, and adding a backend must not require copying prompt assembly, consolidation, hygiene, or agent-authorization policy into that backend.
 
-The current repository recognizes SQLite, Lucid, PostgreSQL, Qdrant, and Markdown storage, plus `none` to disable persistent memory. SQLite is the default. FND-001 separately identifies SQLite and Markdown as the desired baseline stores for the eventual minimal runtime; that packaging target does not limit the storage contract to two implementations.
+The current repository recognizes SQLite, PostgreSQL, Qdrant, and Markdown storage, plus `none` to disable persistent memory; the Lucid connector was retired in v0.9.1. SQLite is the default. FND-001 separately identifies SQLite and Markdown as the desired baseline stores for the eventual minimal runtime; that packaging target does not limit the storage contract to two implementations.
 
 ## Decision
 

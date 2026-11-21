@@ -51,7 +51,7 @@ Tool approval, receipts, cancellation, and iteration limits keep their existing 
 
 Each agent has its own `Arc<dyn Memory>` instance. The factory (`zeroclaw_memory::create_memory_for_agent`) dispatches by backend kind:
 
-- **SQLite / Postgres / Lucid**: shared install-wide store. The `agents` table maps alias → UUID, and the `memories` table carries `agent_id` referencing that UUID. The factory wraps the inner backend in `AgentScopedMemory`, which stamps the bound agent's UUID on every store via `store_with_agent` and filters every recall via `recall_for_agents` with the resolved allowlist. Structured grants can further filter each sibling to exact category names; the bound agent always sees all of its own categories.
+- **SQLite / Postgres**: shared install-wide store. The `agents` table maps alias → UUID, and the `memories` table carries `agent_id` referencing that UUID. The factory wraps the inner backend in `AgentScopedMemory`, which stamps the bound agent's UUID on every store via `store_with_agent` and filters every recall via `recall_for_agents` with the resolved allowlist. Structured grants can further filter each sibling to exact category names; the bound agent always sees all of its own categories.
 - **Markdown**: per-agent dir. Each agent's `MarkdownMemory` writes to `<install>/agents/<alias>/workspace/MEMORY.md` and `memory/YYYY-MM-DD.md`. Because Markdown does not preserve per-row custom categories, the config validator and factory reject category-scoped grants for this backend; only unrestricted sibling grants are accepted. The wrapper still filters any direct peer construction defensively.
 - **Qdrant**: shared collection, payload-keyed. The `agent_id` payload field is the per-agent attribution; `recall_for_agents` over-fetches and post-filters by payload.
 - **None**: no-op stub. The wrapper still exists so the runtime path is uniform.
@@ -73,4 +73,3 @@ See [Multi-agent setup walkthrough](./multi-agent-setup.md#rename-an-agent) for 
 1. Cross-backend cross-agent memory access (e.g. SQLite agent reading a Postgres agent's rows).
 2. Automated restore from an agent deletion archive.
 3. Per-agent secret namespacing: there is a single workspace-wide `SecretStore`.
-4. Lucid wire-format extensions for cross-agent scoping.

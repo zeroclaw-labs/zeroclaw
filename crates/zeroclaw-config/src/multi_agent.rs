@@ -97,9 +97,6 @@ pub enum MemoryBackendKind {
     /// Markdown files in the agent's workspace
     /// (`crates/zeroclaw-memory/src/markdown.rs`).
     Markdown,
-    /// Hybrid local SQLite + external Lucid CLI
-    /// (`crates/zeroclaw-memory/src/lucid.rs`).
-    Lucid,
 }
 
 /// Per-agent workspace and cross-agent access configuration.
@@ -433,7 +430,6 @@ external_peers = ["@user_1", "@user_2"]
             (MemoryBackendKind::Postgres, "\"postgres\""),
             (MemoryBackendKind::Qdrant, "\"qdrant\""),
             (MemoryBackendKind::Markdown, "\"markdown\""),
-            (MemoryBackendKind::Lucid, "\"lucid\""),
         ];
         for (kind, expected) in cases {
             let json = serde_json::to_string(&kind).unwrap();
@@ -441,6 +437,22 @@ external_peers = ["@user_1", "@user_2"]
             let back: MemoryBackendKind = serde_json::from_str(&json).unwrap();
             assert_eq!(back, kind);
         }
+    }
+
+    /// The Lucid backend was removed, so `lucid` no longer names a variant
+    /// and a config holding it fails to deserialize. Load replaces it with
+    /// `sqlite` before deserializing (`migration::RETIRED_VALUES`); without
+    /// that, the resilient load would drop the whole `[agents]` section.
+    #[test]
+    fn memory_backend_kind_no_longer_accepts_lucid() {
+        for spelled in ["\"lucid\"", "\"Lucid\""] {
+            assert!(
+                serde_json::from_str::<MemoryBackendKind>(spelled).is_err(),
+                "{spelled}"
+            );
+        }
+        let agent: Result<AgentMemoryConfig, _> = toml::from_str("backend = \"lucid\"\n");
+        assert!(agent.is_err(), "{agent:?}");
     }
 
     #[test]

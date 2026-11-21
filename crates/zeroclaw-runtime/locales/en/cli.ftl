@@ -189,7 +189,7 @@ cli-memory-list-about = List memory entries with optional filters
 cli-memory-get-about = Get a specific memory entry by key
 cli-memory-stats-about = Show memory backend statistics and health
 cli-memory-clear-about = Clear memories by category, by key, or clear all
-cli-memory-clear-unsupported-backend = memory clear is unsupported for append-only backend '{$backend}'; switch to a deletable backend (sqlite, lucid, or postgres)
+cli-memory-clear-unsupported-backend = memory clear is unsupported for append-only backend '{$backend}'; switch to a deletable backend (sqlite or postgres)
 
 cli-estop-status-about = Print current estop status
 cli-estop-resume-about = Resume from an engaged estop level
@@ -216,7 +216,7 @@ cli-sop-validate-about = Validate SOP definitions
 cli-sop-show-about = Show details of an SOP
 
 cli-migrate-openclaw-about = Import memory from an OpenClaw workspace into this ZeroClaw workspace
-cli-migrate-openclaw-qdrant-unsupported = Qdrant is not currently supported as an OpenClaw migration target. Set memory.backend to sqlite, lucid, or markdown and retry.
+cli-migrate-openclaw-qdrant-unsupported = Qdrant is not currently supported as an OpenClaw migration target. Set memory.backend to sqlite or markdown and retry.
 
 cli-agent-long-about =
     Start the AI agent loop.
@@ -1131,6 +1131,9 @@ cli-config-retired-reason-tts-default = there is no global default TTS provider;
 cli-config-retired-reason-global-transcription = there is no global default transcription provider; set `transcription_provider` on each `[agents.<alias>]` instead
 cli-config-retired-reason-identity = identity is set per agent; move it to `[agents.<alias>.identity]`
 cli-config-retired-reason-pairing-max-pending = the gateway keeps one pending pairing code at a time, and issuing a new code cancels the previous one
+cli-config-retired-value-replaced = warning: replaced the retired value of config key `{$key}` in {$path} with `{$replacement}`: {$reason}
+cli-config-retired-reason-lucid = the Lucid memory backend was removed; its memories are already in the SQLite store that `memory.backend = "sqlite"` reads
+cli-config-retired-reason-lucid-backend = the Lucid memory backend was removed; it stored every memory in the SQLite store that `sqlite` reads, so they are all kept, and only recall results that came from the external Lucid index stop appearing
 cli-config-migration-inferred-v3 = warning: {$path} has no `schema_version`, but its sections are in the V3 format, so it was read as schema V3 and migrated from there. Run `zeroclaw config migrate` to write the current `schema_version` into the file.
 cli-config-env-override-retired = warning: ignored `{$variable}`, which sets a retired config key: {$reason}
 cli-config-migration-pending = warning: these changes apply to this run only. Run `zeroclaw config migrate` to write them to {$path}.
