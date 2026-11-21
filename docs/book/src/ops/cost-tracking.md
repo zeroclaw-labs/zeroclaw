@@ -260,8 +260,11 @@ The dashboard's **Cost** tab shows three panels plus a Window picker
 
 ### Gateway
 
-- `GET /api/cost`: current `CostSummary` (matches the dashboard's
-  Cost overview shape). Add `?agent=<alias>` for a single-agent view.
+- `GET /api/cost`: `{cost: CostSummary, budget: {tracking,
+  daily_limit_usd, monthly_limit_usd, warn_at_percent}}`. `budget` holds
+  the limits the dashboard's Cost overview bars are drawn against; without
+  tracking or a limit, the card shows the amount alone. Add
+  `?agent=<alias>` for a single-agent view.
 - `GET /api/config/templates`: every map-keyed section the schema
   registers, used by the Rates tab's category × provider-type
   dropdowns.
@@ -275,8 +278,9 @@ The dashboard's **Cost** tab shows three panels plus a Window picker
 **Dashboard shows $0.0000 for all agents after configuring rates.**
 Old records are immutable, they were recorded with `cost_usd = 0`
 because no rate was set when they happened. Make a new chat request
-after the daemon reload and check **Cost overview > Session** plus
-**Spend by model**; both should populate for the new request.
+after the daemon reload and check **Spend by model** on the Cost tab (or
+the Cost overview's Daily amount); both should populate for the new
+request.
 
 **`zeroclaw status` says pricing is unavailable even though some rates are configured.**
 Pricing is resolved per token-bearing dimension. For example, an input rate

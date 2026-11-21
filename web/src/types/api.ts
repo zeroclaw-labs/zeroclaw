@@ -128,6 +128,16 @@ export interface MemoryEntry {
   agent_alias: string | null;
 }
 
+/** The spending limits `GET /api/cost` reports as `budget`: the config the
+ * budget check reads. A limit is `null` when there is none to draw a bar
+ * against. */
+export interface CostBudget {
+  tracking: boolean;
+  daily_limit_usd: number | null;
+  monthly_limit_usd: number | null;
+  warn_at_percent: number;
+}
+
 export interface CostSummary {
   session_cost_usd: number;
   daily_cost_usd: number;

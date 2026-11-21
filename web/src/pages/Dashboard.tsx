@@ -28,6 +28,7 @@ import {
 } from "lucide-react";
 import type {
   StatusResponse,
+  CostBudget,
   CostSummary,
   Session,
   ChannelDetail,
@@ -38,7 +39,7 @@ import type {
 } from "@/types/api";
 import {
   getStatus,
-  getCost,
+  getCostOverview,
   getSessions,
   getChannels,
   getSessionMessages,
@@ -52,6 +53,7 @@ import {
   listProps,
 } from "@/lib/api";
 import { resolveModelToProviderType } from "@/lib/configuredModels";
+import { costOverviewBars } from "@/pages/costBudget.logic";
 import DoctorFixModal from "@/components/DoctorFixModal";
 
 type CostWindow = "today" | "7d" | "30d" | "month" | "all";
@@ -427,22 +429,21 @@ const TABS: { id: TabId; labelKey: string; icon: typeof LayoutDashboard }[] = [
 function OverviewTab({
   status,
   cost,
+  budget,
   tuis,
   showAllChannels,
   setShowAllChannels,
 }: {
   status: StatusResponse;
   cost: CostSummary;
+  budget: CostBudget | null;
   tuis: TuiEntry[];
   showAllChannels: boolean;
   setShowAllChannels: (fn: (v: boolean) => boolean) => void;
 }) {
-  const maxCost = Math.max(
-    cost.session_cost_usd,
-    cost.daily_cost_usd,
-    cost.monthly_cost_usd,
-    0.001,
-  );
+  // Each period's spend against its configured limit. The Cost tab's window
+  // total has no limit to measure against, so the card doesn't show it.
+  const costBars = costOverviewBars(cost, budget);
 
   // Component Health → "fix in place" modal target (set when an error row's
   // last_error parses to a config entity). Same modal as the Doctor page.
@@ -537,21 +538,18 @@ function OverviewTab({
           <div className="space-y-4">
             {[
               {
-                label: t("dashboard.session_label"),
-                value: cost.session_cost_usd,
-                color: "var(--pc-accent)",
-              },
-              {
                 label: t("dashboard.daily_label"),
                 value: cost.daily_cost_usd,
                 color: "#34d399",
+                bar: costBars.daily,
               },
               {
                 label: t("dashboard.monthly_label"),
                 value: cost.monthly_cost_usd,
                 color: "#a78bfa",
+                bar: costBars.monthly,
               },
-            ].map(({ label, value, color }) => (
+            ].map(({ label, value, color, bar }) => (
               <div key={label}>
                 <div className="flex justify-between text-sm mb-1.5">
                   <span style={{ color: "var(--pc-text-muted)" }}>{label}</span>
@@ -560,20 +558,33 @@ function OverviewTab({
                     style={{ color: "var(--pc-text-primary)" }}
                   >
                     {formatUSD(value)}
+                    {bar && (
+                      <span style={{ color: "var(--pc-text-muted)" }}>
+                        {" / "}
+                        {formatUSD(bar.limitUsd)}
+                      </span>
+                    )}
                   </span>
                 </div>
-                <div
-                  className="w-full h-1.5 rounded-full overflow-hidden"
-                  style={{ background: "var(--pc-hover)" }}
-                >
+                {bar && (
                   <div
-                    className="h-full rounded-full progress-bar-animated transition-all duration-700 ease-out"
-                    style={{
-                      width: `${Math.max((value / maxCost) * 100, 2)}%`,
-                      background: color,
-                    }}
-                  />
-                </div>
+                    className="w-full h-1.5 rounded-full overflow-hidden"
+                    style={{ background: "var(--pc-hover)" }}
+                  >
+                    <div
+                      className="h-full rounded-full progress-bar-animated transition-all duration-700 ease-out"
+                      style={{
+                        width: `${bar.percent}%`,
+                        background:
+                          bar.tone === "reached"
+                            ? "var(--color-status-error)"
+                            : bar.tone === "warning"
+                              ? "var(--color-status-warning)"
+                              : color,
+                      }}
+                    />
+                  </div>
+                )}
               </div>
             ))}
           </div>
@@ -1736,6 +1747,7 @@ function parseTab(raw: string | null): TabId {
 export default function Dashboard() {
   const [status, setStatus] = useState<StatusResponse | null>(null);
   const [cost, setCost] = useState<CostSummary | null>(null);
+  const [costBudget, setCostBudget] = useState<CostBudget | null>(null);
   const [tuis, setTuis] = useState<TuiEntry[]>([]);
   const [costWindow, setCostWindow] = useState<CostWindow>("today");
   const [error, setError] = useState<string | null>(null);
@@ -1771,11 +1783,12 @@ export default function Dashboard() {
   usePolling(
     (isStale) => {
       const { from, to } = costWindowBounds(costWindow);
-      Promise.all([getStatus(), getCost(from, to), getTuis()])
+      Promise.all([getStatus(), getCostOverview(from, to), getTuis()])
         .then(([s, c, t]) => {
           if (isStale()) return;
           setStatus(s);
-          setCost(c);
+          setCost(c.cost);
+          setCostBudget(c.budget);
           setTuis(t);
         })
         .catch((err) => {
@@ -1871,6 +1884,7 @@ export default function Dashboard() {
         <OverviewTab
           status={status}
           cost={cost}
+          budget={costBudget}
           tuis={tuis}
           showAllChannels={showAllChannels}
           setShowAllChannels={setShowAllChannels}
