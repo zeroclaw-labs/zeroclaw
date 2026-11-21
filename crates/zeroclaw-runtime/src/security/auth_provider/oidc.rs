@@ -547,6 +547,7 @@ pub struct OidcAuthProvider {
 impl OidcAuthProvider {
     pub fn new(alias: impl Into<String>, config: OidcConfig) -> anyhow::Result<Self> {
         let alias = alias.into();
+        config.validate_actor_claim(&alias)?;
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(15))
             .redirect(reqwest::redirect::Policy::none())
@@ -857,10 +858,10 @@ impl OidcAuthProvider {
         }
         let marker = claim_at_path(raw, path);
         let marked = ActorClass::from(self.config.actor_claim_marks);
-        let actor = if require_token_evidence {
-            if matches!(path, "azp" | "client_id") || path == self.config.client_id_claim {
-                return None;
-            }
+        let actor = if !self.config.actor_claim_values.is_empty() {
+            let value = marker?.as_str()?;
+            ActorClass::from(*self.config.actor_claim_values.get(value)?)
+        } else if require_token_evidence {
             // On the compatibility path only a positive, issuer-specific
             // human marker establishes a person (e.g. Entra delegated scopes).
             if marked != ActorClass::Human || marker?.as_str()?.trim().is_empty() {
@@ -1000,9 +1001,8 @@ impl OidcAuthProvider {
         let Some(actor) = self.verified_actor(client_id, &raw, require_token_evidence) else {
             return deny(DenyReason::BadCredential);
         };
-        // Keycloak also stamps azp on user tokens issued to service clients.
-        // It proves the authorized client, not machine credentials: require
-        // client_id for every service actor, whether declared or claim-derived.
+        // The implicit azp fallback is restricted to people. Service tokens
+        // must identify a client through the configured client claim as well.
         if named_client.is_none() && actor != ActorClass::Human {
             return deny(DenyReason::BadCredential);
         }
@@ -1933,6 +1933,115 @@ mod tests {
         ] {
             assert!(is_bad_credential(&provider.verify(&bearer(token)).await));
         }
+    }
+
+    fn entra_actor_config(idp: &TestIdp) -> OidcConfig {
+        let mut config = idp.untyped_config();
+        config.client_id_claim = "azp".into();
+        config.token_id_claim = "uti".into();
+        config.actor_claim = "idtyp".into();
+        config.actor_claim_values = HashMap::from([
+            ("app".into(), OidcActorKind::Service),
+            ("user".into(), OidcActorKind::Human),
+        ]);
+        config
+    }
+
+    #[tokio::test]
+    async fn untyped_service_needs_actor_evidence_even_with_the_standard_client_claim() {
+        let idp = start_idp().await;
+        let mut config = idp.untyped_config();
+        config.actor_claim.clear();
+        config.service_clients = vec!["reporting-batch".into()];
+        let provider = OidcAuthProvider::new("test", config).unwrap();
+        let mut claims = idp.good_claims();
+        claims["client_id"] = serde_json::json!("reporting-batch");
+        let typed = provider.verify(&bearer(idp.mint(claims.clone()))).await;
+        assert!(matches!(
+            typed.identity().unwrap().subject,
+            IdentitySubject::Service { .. }
+        ));
+        let untyped = idp.mint_with_header(UNTYPED_JWT_HEADER, &claims);
+        assert!(is_bad_credential(&provider.verify(&bearer(untyped)).await));
+    }
+
+    #[tokio::test]
+    async fn shared_entra_app_gets_only_the_grants_for_its_signed_actor_type() {
+        use crate::security::principal_resolver::PrincipalResolver;
+        use zeroclaw_api::grants::ResolvedGrants;
+
+        let idp = start_idp().await;
+        let provider = OidcAuthProvider::new("test", entra_actor_config(&idp)).unwrap();
+        let mut policy = resolver_policy(&idp, "batch-app");
+        let mut service_grants = ResolvedGrants::none();
+        service_grants
+            .resources
+            .insert(Resource::Config, [Verb::Read].into());
+        policy.profiles.insert("reporter".into(), service_grants);
+        policy
+            .oidc
+            .get_mut("test")
+            .unwrap()
+            .service_profile_map
+            .insert("batch-app".into(), "reporter".into());
+        let resolver = PrincipalResolver::new(policy);
+
+        // Both tokens name the same application and carry the mapped human
+        // role. Only the signed actor type selects the applicable mapping.
+        for (value, subject, actor) in [
+            ("user", "employee", ActorKind::Human),
+            ("app", "sp-object-id", ActorKind::Service),
+        ] {
+            let mut claims = entra_service_claims(&idp);
+            claims["idtyp"] = serde_json::json!(value);
+            claims["sub"] = serde_json::json!(subject);
+            claims["realm_access"] = serde_json::json!({"roles": ["ops"]});
+            let token = idp.mint_with_header(UNTYPED_JWT_HEADER, &claims);
+            let outcome = provider.verify(&bearer(token)).await;
+            let resolved = resolver
+                .resolve(outcome.identity().expect("verified actor"))
+                .unwrap();
+            assert_eq!(resolved.principal.actor, actor);
+            assert_eq!(
+                resolved.grants.permits(Resource::Sessions, Verb::Read),
+                actor == ActorKind::Human
+            );
+            assert_eq!(
+                resolved.grants.permits(Resource::Config, Verb::Read),
+                actor == ActorKind::Service
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_service_declaration_cannot_override_missing_or_conflicting_actor_evidence() {
+        let idp = start_idp().await;
+        let mut config = entra_actor_config(&idp);
+        config.service_clients = vec!["batch-app".into()];
+        let provider = OidcAuthProvider::new("test", config.clone()).unwrap();
+        let mut claims = entra_service_claims(&idp);
+        let token = idp.mint_with_header(UNTYPED_JWT_HEADER, &claims);
+        assert!(is_bad_credential(&provider.verify(&bearer(token)).await));
+        for marker in [
+            serde_json::json!("user"),
+            serde_json::json!("device"),
+            serde_json::json!("APP"),
+            serde_json::json!(null),
+            serde_json::json!(["app"]),
+            serde_json::json!(true),
+        ] {
+            claims["idtyp"] = marker;
+            let token = idp.mint_with_header(UNTYPED_JWT_HEADER, &claims);
+            assert!(is_bad_credential(&provider.verify(&bearer(token)).await));
+        }
+
+        // Even positive service evidence still needs the configured client
+        // claim. The implicit Keycloak azp fallback remains human-only.
+        config.client_id_claim = DEFAULT_OIDC_CLIENT_ID_CLAIM.into();
+        let provider = OidcAuthProvider::new("test", config).unwrap();
+        claims["idtyp"] = serde_json::json!("app");
+        let token = idp.mint_with_header(UNTYPED_JWT_HEADER, &claims);
+        assert!(is_bad_credential(&provider.verify(&bearer(token)).await));
     }
 
     #[tokio::test]

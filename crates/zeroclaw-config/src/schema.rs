@@ -14497,10 +14497,10 @@ pub struct OidcConfig {
     pub service_scopes: Vec<String>,
     /// Client identities whose tokens are ALWAYS service principals
     /// (`client_credentials` callers), matched against the token's
-    /// verified `client_id` claim. Service tokens always need `client_id`:
-    /// in JWKS mode a token with no `client_id` whose signed `azp` names one
-    /// of these clients is refused, never treated as a service. Service
-    /// principals are keyed by issuer + client identity and never inherit
+    /// verified client claim. With default claim names an `azp` fallback
+    /// cannot establish a service. An untyped JWKS token or a custom client
+    /// claim also requires an explicit service value in `actor_claim_values`.
+    /// Service principals are keyed by issuer + client identity and never inherit
     /// human-user assumptions, whatever provider-specific shape their
     /// `sub` takes (`<client>@clients`, a service-account user id, or the
     /// client id itself).
@@ -14508,7 +14508,8 @@ pub struct OidcConfig {
     /// Actor classification is declarative, never inferred from the
     /// `sub`/`client_id` relationship: a token is a service because its
     /// client is listed here, a human because its client is listed in
-    /// `interactive_clients`, or classified by `actor_claim`. A token whose
+    /// `interactive_clients`, or classified by `actor_claim`. When evidence
+    /// is required it must agree with any client declaration. A token whose
     /// client is declared nowhere and carries no configured actor claim
     /// evidence is denied. A client may appear in only one of the two lists.
     pub service_clients: Vec<String>,
@@ -14519,20 +14520,27 @@ pub struct OidcConfig {
     /// and resolve through `profile_map`. A client may appear in only one of
     /// `service_clients` and `interactive_clients`.
     pub interactive_clients: Vec<String>,
-    /// Dotted path to a claim the issuer stamps on exactly ONE actor kind's
-    /// tokens (present, non-null), e.g. Auth0's `gty` on client-credentials
+    /// Dotted path to an issuer-controlled actor claim. With an empty
+    /// `actor_claim_values`, the issuer must stamp it on exactly ONE actor
+    /// kind's tokens (present, non-null), e.g. Auth0's `gty` on client-credentials
     /// tokens or Okta's `uid` on user tokens. `actor_claim_marks` names the
     /// kind its presence proves; absence proves the other kind. Required
     /// for a client that issues both human and machine tokens (declared in
     /// neither client list); also checked against declared clients, where
     /// contradicting evidence denies. Empty = no claim-based classification,
     /// so every accepted client must be declared on the standard path.
-    /// For untyped JWKS tokens or a custom client claim, configure a
-    /// nonblank string claim issued only to people and set `actor_claim_marks`
-    /// to `human` (e.g. Entra's delegated `scp` or Okta's `uid`).
+    /// In presence mode, untyped JWKS tokens and custom client claims
+    /// require a nonblank string issued only to people and
+    /// `actor_claim_marks = "human"` (Entra's delegated `scp` or Okta's `uid`).
     pub actor_claim: String,
-    /// Which actor kind the presence of `actor_claim` proves.
+    /// Which actor kind the presence of `actor_claim` proves in presence mode.
     pub actor_claim_marks: OidcActorKind,
+    /// Map exact, case-sensitive signed string values at `actor_claim` to
+    /// `human` or `service` (JWKS only). A nonempty map requires a match
+    /// on every token, including tokens from declared clients. Entra can
+    /// issue `idtyp` with values `app` and `user`.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub actor_claim_values: HashMap<String, OidcActorKind>,
     /// Require the RFC 9068 typed JWT profile for JWKS validation. Opaque
     /// tokens remain valid only through configured introspection.
     ///
@@ -14599,6 +14607,7 @@ impl std::fmt::Debug for OidcConfig {
             .field("interactive_clients", &self.interactive_clients)
             .field("actor_claim", &self.actor_claim)
             .field("actor_claim_marks", &self.actor_claim_marks)
+            .field("actor_claim_values", &self.actor_claim_values)
             .field("require_at_jwt", &self.require_at_jwt)
             .field("client_id_claim", &self.client_id_claim)
             .field("token_id_claim", &self.token_id_claim)
@@ -14641,6 +14650,7 @@ impl Default for OidcConfig {
             interactive_clients: Vec::new(),
             actor_claim: String::new(),
             actor_claim_marks: OidcActorKind::default(),
+            actor_claim_values: HashMap::new(),
             require_at_jwt: true,
             client_id_claim: DEFAULT_OIDC_CLIENT_ID_CLAIM.to_string(),
             token_id_claim: DEFAULT_OIDC_TOKEN_ID_CLAIM.to_string(),
@@ -14681,19 +14691,17 @@ pub enum OidcValidation {
     Introspection,
 }
 
-/// The actor kind an OIDC `actor_claim`'s presence proves.
+/// The kind of identity established by the provider's actor claim.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, zeroclaw_macros::ConfigEnum,
 )]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum OidcActorKind {
-    /// The claim is present only on `client_credentials` (machine) tokens;
-    /// a token without it is a human's.
+    /// A service acting on its own.
     #[default]
     Service,
-    /// The claim is present only on interactive (human) tokens; a token
-    /// without it is a machine's.
+    /// An application acting on behalf of a person.
     Human,
 }
 
@@ -15138,8 +15146,47 @@ impl OidcConfig {
                  in neither and classified by actor_claim"
             );
         }
-        if self.actor_claim != self.actor_claim.trim() {
+        self.validate_actor_claim(alias)
+    }
+
+    /// Validate the actor evidence used by the verifier, including when a
+    /// provider is built directly without validating the whole configuration.
+    pub fn validate_actor_claim(&self, alias: &str) -> Result<()> {
+        let path = self.actor_claim.as_str();
+        if path != path.trim() {
             anyhow::bail!("oidc.{alias}.actor_claim must not have surrounding whitespace");
+        }
+        let exact = !self.actor_claim_values.is_empty();
+        let custom_jwks = self.validation == OidcValidation::Jwks
+            && (!self.require_at_jwt || self.client_id_claim != DEFAULT_OIDC_CLIENT_ID_CLAIM);
+        if (exact || custom_jwks)
+            && !path.is_empty()
+            && (matches!(path, "client_id" | "azp") || path == self.client_id_claim)
+        {
+            anyhow::bail!("oidc.{alias}.actor_claim must be independent of the client ID");
+        }
+        if !exact {
+            return Ok(());
+        }
+        if self.validation != OidcValidation::Jwks {
+            anyhow::bail!("oidc.{alias}.actor_claim_values requires signed JWKS tokens");
+        }
+        if path
+            .split('.')
+            .any(|part| part.is_empty() || part != part.trim())
+        {
+            anyhow::bail!(
+                "oidc.{alias}.actor_claim_values requires a nonblank actor_claim path with nonempty segments"
+            );
+        }
+        if self
+            .actor_claim_values
+            .keys()
+            .any(|value| value.is_empty() || value != value.trim())
+        {
+            anyhow::bail!(
+                "oidc.{alias}.actor_claim_values requires nonblank keys without surrounding whitespace"
+            );
         }
         Ok(())
     }
@@ -31780,6 +31827,53 @@ zeroclaw-operators = "operator"
         config
             .validate()
             .expect("disjoint declarations with a trimmed actor claim validate");
+    }
+
+    #[::core::prelude::v1::test]
+    fn oidc_actor_claim_values_require_an_independent_signed_claim() {
+        let mut oidc = auth_config().oidc.remove("corp").unwrap();
+        oidc.client_id_claim = "cid".into();
+        oidc.actor_claim = "idtyp".into();
+        oidc.actor_claim_values = HashMap::from([
+            ("app".into(), OidcActorKind::Service),
+            ("user".into(), OidcActorKind::Human),
+        ]);
+        let encoded = toml::to_string(&oidc).unwrap();
+        let decoded: OidcConfig = toml::from_str(&encoded).unwrap();
+        assert_eq!(decoded.actor_claim_values, oidc.actor_claim_values);
+        decoded.validate("corp").expect("valid exact actor values");
+        for (path, error) in [
+            ("", "nonblank actor_claim path"),
+            ("claims..kind", "nonblank actor_claim path"),
+            ("azp", "independent of the client ID"),
+            ("client_id", "independent of the client ID"),
+            ("cid", "independent of the client ID"),
+        ] {
+            let mut bad = oidc.clone();
+            bad.actor_claim = path.into();
+            let message = bad.validate("corp").unwrap_err().to_string();
+            assert!(message.contains(error), "{path:?}: {message}");
+        }
+        for value in ["", " app"] {
+            let mut bad = oidc.clone();
+            bad.actor_claim_values
+                .insert(value.into(), OidcActorKind::Service);
+            assert!(
+                bad.validate("corp")
+                    .unwrap_err()
+                    .to_string()
+                    .contains("actor_claim_values")
+            );
+        }
+        oidc.validation = OidcValidation::Introspection;
+        oidc.client_id_claim = DEFAULT_OIDC_CLIENT_ID_CLAIM.into();
+        oidc.client_secret = Some("test-secret".into());
+        assert!(
+            oidc.validate("corp")
+                .unwrap_err()
+                .to_string()
+                .contains("actor_claim_values")
+        );
     }
 
     #[::core::prelude::v1::test]
