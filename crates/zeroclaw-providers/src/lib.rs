@@ -7,6 +7,7 @@ pub mod azure_openai;
 pub mod bedrock;
 pub mod catalog;
 pub mod compatible;
+mod conversation_affinity;
 pub mod copilot;
 pub mod dispatch;
 pub mod factory;
