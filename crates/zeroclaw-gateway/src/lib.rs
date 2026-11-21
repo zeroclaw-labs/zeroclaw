@@ -35,12 +35,14 @@ pub mod api_webhook;
 pub mod auth_rate_limit;
 pub mod canvas;
 mod chat_core;
+mod cloud_vault_write;
 pub mod core_rpc;
 pub mod dashboard_core;
 pub mod dashboard_session;
 pub mod node_tool;
 pub mod nodes;
 pub mod openapi;
+mod openbao_write;
 #[cfg(feature = "plugins-wasm")]
 mod plugin_webhook;
 pub mod principal_gate;
@@ -955,6 +957,18 @@ fn config_admin_router(route_auth: principal_gate::ConfigRouteAuth) -> Router<Ap
                 .put(api_config::handle_prop_put)
                 .delete(api_config::handle_prop_delete)
                 .options(api_config::handle_options_prop),
+        )
+        .route(
+            "/api/config/plugin-tls-credentials",
+            get(api_config::list_plugin_tls_credentials)
+                .post(api_config::mutate_plugin_tls_credential)
+                .layer(axum::extract::DefaultBodyLimit::max(64 * 1024)),
+        )
+        .route(
+            "/api/config/http-credentials",
+            get(api_config::list_http_credentials)
+                .post(api_config::mutate_http_credential)
+                .layer(axum::extract::DefaultBodyLimit::max(16 * 1024)),
         )
         .route("/api/config/list", get(api_config::handle_list))
         .route("/api/config/drift", get(api_config::handle_drift))

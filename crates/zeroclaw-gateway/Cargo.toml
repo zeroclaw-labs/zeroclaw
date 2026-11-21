@@ -32,6 +32,7 @@ hyper-util = { version = "0.1", features = ["tokio", "server-auto", "server-grac
 tower = { version = "0.5", default-features = false, features = ["util"] }
 tower-http = { version = "0.6", default-features = false, features = ["limit", "timeout", "fs"] }
 http-body-util = "0.1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 # TLS
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
@@ -80,6 +81,7 @@ rusqlite = { version = "0.40", features = ["bundled", "fallible_uint"] }
 # Misc
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
 parking_lot = "0.12"
+time = { version = "0.3", default-features = false, features = ["std", "formatting", "macros"] }
 toml = "1.0"
 toml_edit = "0.25"
 uuid = { version = "1.22", default-features = false, features = ["v4", "std"] }
