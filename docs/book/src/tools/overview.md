@@ -248,6 +248,10 @@ If you need finer-grained gating under Full autonomy, put sensitive tools in the
 
 See [Autonomy levels](../security/autonomy.md) for the full set of per-profile fields.
 
+## One-shot coding CLI working directories
+
+With the Docker runtime, one-shot coding CLI tools mount the agent's authorized workspace root at `/workspace`. A request for `working_directory = "packages/app"` starts in `/workspace/packages/app` with the rest of that repository visible. The Docker daemon must see that workspace at its host path. If an allowlist is configured, it must permit the root itself. The selected host directory must exist and resolve inside that root. A disabled workspace mount makes these tools unavailable. Native execution continues to use the selected host directory directly.
+
 ## See also
 
 - [MCP](./mcp.md)

@@ -323,6 +323,20 @@ pub trait RuntimeAdapter: Send + Sync {
         let _ = env_keys;
         self.build_shell_command(command, workspace_dir)
     }
+
+    /// Prepare a one-shot coding CLI command. The policy supplies the agent's
+    /// workspace root and the tool supplies the selected host working directory.
+    /// Adapters with separate filesystem namespaces can validate and map the
+    /// pair. The default retains the existing selected-directory behavior.
+    fn build_coding_cli_shell_command(
+        &self,
+        command: &str,
+        _workspace_root: &Path,
+        working_dir: &Path,
+        env_keys: &[&OsStr],
+    ) -> anyhow::Result<tokio::process::Command> {
+        self.build_shell_command_with_env_keys(command, working_dir, env_keys)
+    }
 }
 
 #[cfg(test)]
@@ -413,6 +427,16 @@ mod tests {
         ) -> anyhow::Result<tokio::process::Command> {
             anyhow::bail!("shell-less runtime does not support shell commands")
         }
+    }
+
+    #[test]
+    fn coding_cli_default_preserves_the_selected_directory_for_existing_adapters() {
+        let root = Path::new("agent-workspace");
+        let selected = root.join("packages").join("app");
+        let command = DummyRuntime
+            .build_coding_cli_shell_command("pwd", root, &selected, &[])
+            .unwrap();
+        assert_eq!(command.as_std().get_current_dir(), Some(selected.as_path()));
     }
 
     #[test]

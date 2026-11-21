@@ -2350,6 +2350,7 @@ fn all_tools_with_runtime_on_thread(
     let coding_cli_executor = coding_cli_executor::RuntimeCodingCliExecutor::shared(
         runtime.clone(),
         sandbox.clone(),
+        security.clone(),
         root_config.runtime.kind == zeroclaw_config::schema::RuntimeKind::Native,
     );
     // Keep a shared runtime adapter available after constructing ShellTool.
