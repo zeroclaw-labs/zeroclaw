@@ -15,14 +15,18 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use tempfile::TempDir;
-use zeroclaw_api::channel::SendMessage;
-use zeroclaw_api::webhook::{PluginWebhookRegistry, RawWebhook, WebhookOutcome};
+use zeroclaw_api::channel::{Channel, SendMessage};
+use zeroclaw_api::webhook::{
+    PluginWebhookOutcome, PluginWebhookOwner, PluginWebhookRegistryLease, PluginWebhookRequest,
+    WebhookCancellation,
+};
 use zeroclaw_config::multi_agent::{PeerGroupConfig, PeerUsername};
 use zeroclaw_config::providers::{ChannelRef, ModelProviderRef};
 use zeroclaw_config::schema::{
     AliasedAgentConfig, AnthropicModelProviderConfig, Config, PluginChannelConfig,
     PluginEntryConfig, RiskProfileConfig,
 };
+use zeroclaw_infra::plugin_webhook::PluginWebhookIngress;
 use zeroclaw_plugins::PluginCapability;
 use zeroclaw_plugins::host::PluginHost;
 use zeroclaw_plugins::instance::PluginInstanceScope;
@@ -113,6 +117,7 @@ fn activation_config(plugins: &TempDir, alias: &str, retry_count: &str) -> Confi
         PluginChannelConfig {
             package: "channel-fixture".to_string(),
             enabled: true,
+            ..PluginChannelConfig::default()
         },
     );
     config.agents.insert(
@@ -158,10 +163,25 @@ fn activation_config(plugins: &TempDir, alias: &str, retry_count: &str) -> Confi
     config
 }
 
-#[tokio::test]
-async fn configured_channel_reaches_real_guest_and_shared_listener_contract() {
-    let plugins = install_fixture_package();
-    let mut config = activation_config(&plugins, "operations", "5");
+/// A webhook carrying the fixture's shared secret.
+fn fixture_webhook(method: &str, query: &str, body: &[u8]) -> PluginWebhookRequest {
+    PluginWebhookRequest::new(
+        "fixture",
+        method,
+        query,
+        vec![("x-fixture-secret".to_string(), "channel-secret".to_string())],
+        body.to_vec(),
+    )
+    .expect("fixture request is within ingress bounds")
+}
+
+/// The configured `operations` fixture channel, admitted for the peer
+/// `tester`, whose webhook route is published into `ingress`.
+async fn operations_channel(
+    plugins: &TempDir,
+    ingress: &PluginWebhookIngress,
+) -> (Arc<dyn Channel>, PluginWebhookRegistryLease) {
+    let mut config = activation_config(plugins, "operations", "5");
     config.peer_groups.insert(
         "plugin-operations".to_string(),
         PeerGroupConfig {
@@ -174,17 +194,23 @@ async fn configured_channel_reaches_real_guest_and_shared_listener_contract() {
         .validate()
         .expect("the activation declaration is valid operator config");
 
-    let registry = Arc::new(PluginWebhookRegistry::new());
-    let webhook_generation = registry.start_generation();
+    let webhook_generation = ingress.registry().start_generation();
     let channels = zeroclaw_runtime::plugin_runtime::configured_plugin_channels_with_webhooks(
         Arc::new(config),
         None,
         Some(&webhook_generation),
     )
     .await;
-
     assert_eq!(channels.len(), 1, "the configured fixture must construct");
-    let channel = Arc::clone(&channels[0]);
+    (Arc::clone(&channels[0]), webhook_generation)
+}
+
+#[tokio::test]
+async fn configured_channel_reaches_real_guest_and_shared_listener_contract() {
+    let plugins = install_fixture_package();
+    let ingress = PluginWebhookIngress::new(300, 16);
+    let (channel, _webhook_generation) = operations_channel(&plugins, &ingress).await;
+
     assert_eq!(channel.name(), "plugin");
     assert_eq!(
         channel.alias(),
@@ -205,28 +231,37 @@ async fn configured_channel_reaches_real_guest_and_shared_listener_contract() {
     let (tx, mut rx) = tokio::sync::mpsc::channel(1);
     let listener_channel = Arc::clone(&channel);
     let listener = zeroclaw_spawn::spawn!(async move { listener_channel.listen(tx).await });
-    let sink = registry
+    let route = ingress
+        .registry()
         .get("fixture")
         .expect("validated guest route is published atomically");
-    let (reply, outcome) = tokio::sync::oneshot::channel();
-    sink.send(RawWebhook {
-        method: "POST".to_string(),
-        query: String::new(),
-        headers: vec![(
-            "x-fixture-secret".to_string(),
-            "channel-secret".to_string(),
+    assert_eq!(
+        route.owner(),
+        &PluginWebhookOwner::new("channel-fixture", "operations"),
+        "the route is owned by the package and the operator's alias"
+    );
+    drop(route);
+    assert_eq!(
+        ingress.routes().routes(),
+        [(
+            "fixture".to_string(),
+            PluginWebhookOwner::new("channel-fixture", "operations")
         )],
-        body: br#"{"id":"runtime-1","sender":"tester","reply_target":"room","content":"from webhook"}"#.to_vec(),
-        cancellation: zeroclaw_api::webhook::WebhookCancellation::new(),
-        idempotency: None,
-        reply,
-    })
-    .await
-    .expect("published route remains live");
-    assert!(matches!(
-        outcome.await.expect("webhook worker replies"),
-        Ok(WebhookOutcome::Ack)
-    ));
+        "the route listing names the same owner"
+    );
+    assert_eq!(
+        ingress
+            .dispatch(
+                fixture_webhook(
+                    "POST",
+                    "",
+                    br#"{"id":"runtime-1","sender":"tester","reply_target":"room","content":"from webhook"}"#,
+                ),
+                &WebhookCancellation::new(),
+            )
+            .await,
+        PluginWebhookOutcome::Ack
+    );
     let message = tokio::time::timeout(Duration::from_secs(5), rx.recv())
         .await
         .expect("webhook reaches shared channel receiver")
@@ -235,20 +270,15 @@ async fn configured_channel_reaches_real_guest_and_shared_listener_contract() {
     assert_eq!(message.content, "from webhook");
     assert_eq!(message.channel, "plugin");
     assert_eq!(message.channel_alias.as_deref(), Some("operations"));
-    let (reply, outcome) = tokio::sync::oneshot::channel();
-    sink.send(RawWebhook {
-        method: "GET".to_string(),
-        query: "challenge=runtime-echo".to_string(),
-        headers: vec![("x-fixture-secret".to_string(), "channel-secret".to_string())],
-        body: Vec::new(),
-        cancellation: zeroclaw_api::webhook::WebhookCancellation::new(),
-        idempotency: None,
-        reply,
-    })
-    .await
-    .expect("published GET route remains live");
-    assert!(matches!(outcome.await.expect("challenge worker replies"),
-        Ok(WebhookOutcome::Body(body)) if body == "challenge=runtime-echo"));
+    assert_eq!(
+        ingress
+            .dispatch(
+                fixture_webhook("GET", "challenge=runtime-echo", b""),
+                &WebhookCancellation::new(),
+            )
+            .await,
+        PluginWebhookOutcome::Reply("challenge=runtime-echo".to_string())
+    );
     assert!(
         rx.try_recv().is_err(),
         "challenge must not reach the agent queue"
@@ -257,6 +287,55 @@ async fn configured_channel_reaches_real_guest_and_shared_listener_contract() {
         !listener.is_finished(),
         "the real plugin listener must retain its polling lifecycle"
     );
+    drop(rx);
+    tokio::time::timeout(Duration::from_secs(5), listener)
+        .await
+        .expect("listener exits after its receiver closes")
+        .expect("listener task joins cleanly")
+        .expect("listener returns successfully");
+}
+
+#[tokio::test]
+async fn a_repeated_message_id_is_delivered_once_through_the_core_ingress() {
+    let plugins = install_fixture_package();
+    let ingress = PluginWebhookIngress::new(300, 16);
+    let (channel, _webhook_generation) = operations_channel(&plugins, &ingress).await;
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+    let listener_channel = Arc::clone(&channel);
+    let listener = zeroclaw_spawn::spawn!(async move { listener_channel.listen(tx).await });
+    let body = br#"{"id":"dedup-1","sender":"tester","reply_target":"room","content":"once"}"#;
+    assert_eq!(
+        ingress
+            .dispatch(
+                fixture_webhook("POST", "", body),
+                &WebhookCancellation::new()
+            )
+            .await,
+        PluginWebhookOutcome::Ack
+    );
+    let message = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .expect("the first delivery reaches the channel receiver")
+        .expect("listener remains connected");
+    assert_eq!(message.id, "dedup-1");
+
+    // The worker skips a committed message ID before it acknowledges, so
+    // nothing can be in flight once the second Ack returns.
+    assert_eq!(
+        ingress
+            .dispatch(
+                fixture_webhook("POST", "", body),
+                &WebhookCancellation::new()
+            )
+            .await,
+        PluginWebhookOutcome::Ack
+    );
+    assert!(
+        rx.try_recv().is_err(),
+        "a repeated message ID must not reach the agent queue again"
+    );
+
     drop(rx);
     tokio::time::timeout(Duration::from_secs(5), listener)
         .await
@@ -292,6 +371,7 @@ async fn duplicate_guest_routes_reject_every_claimant_before_registry_mutation()
         PluginChannelConfig {
             package: "channel-fixture".to_string(),
             enabled: true,
+            ..PluginChannelConfig::default()
         },
     );
     config
@@ -325,8 +405,8 @@ async fn duplicate_guest_routes_reject_every_claimant_before_registry_mutation()
         ..PluginEntryConfig::default()
     });
 
-    let registry = Arc::new(PluginWebhookRegistry::new());
-    let webhook_generation = registry.start_generation();
+    let ingress = PluginWebhookIngress::new(300, 16);
+    let webhook_generation = ingress.registry().start_generation();
     let channels = zeroclaw_runtime::plugin_runtime::configured_plugin_channels_with_webhooks(
         Arc::new(config),
         None,
@@ -339,7 +419,7 @@ async fn duplicate_guest_routes_reject_every_claimant_before_registry_mutation()
         "both instances advertise the same fixture route and must both be rejected"
     );
     assert!(
-        registry.get("fixture").is_none(),
+        ingress.registry().get("fixture").is_none(),
         "claim resolution must finish before one partial winner mutates the registry"
     );
 }
