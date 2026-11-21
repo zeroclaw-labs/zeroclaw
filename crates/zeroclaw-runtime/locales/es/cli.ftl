@@ -1087,6 +1087,7 @@ cli-estop-updated-at = {"  "}updated_at:     {$v}
 cli-auth-saved = Perfil guardado {$profile}
 cli-auth-active-for = Perfil activo para {$provider}: {$profile}
 cli-auth-refresh-ok = ✓ Actualización de token correcta (perfil {$profile})
+cli-auth-codex-refresh-reused = Este token de actualización de OpenAI Codex ya se usó. Si importaste la sesión de la CLI de Codex, vuelve a ejecutar `{$command}`. Para un perfil con nombre, añade `--profile <name>`. En otro caso, vuelve a iniciar sesión.
 cli-auth-removed = Perfil de autenticación eliminado {$provider}:{$profile}
 cli-auth-not-found = Perfil de autenticación no encontrado: {$provider}:{$profile}
 cli-auth-xai-imported = Perfil de autenticación de xAI importado desde {$path}

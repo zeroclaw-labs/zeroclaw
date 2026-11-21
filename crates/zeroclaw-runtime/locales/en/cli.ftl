@@ -1257,6 +1257,7 @@ cli-estop-updated-at = {"  "}updated_at:     {$v}
 cli-auth-saved = Saved profile {$profile}
 cli-auth-active-for = Active profile for {$provider}: {$profile}
 cli-auth-refresh-ok = ✓ Token refresh OK (profile {$profile})
+cli-auth-codex-refresh-reused = This OpenAI Codex refresh token was already used. If you imported your Codex CLI login, run `{$command}` again. For a named profile, add `--profile <name>`. Otherwise, sign in again.
 cli-auth-removed = Removed auth profile {$provider}:{$profile}
 cli-auth-not-found = Auth profile not found: {$provider}:{$profile}
 cli-auth-xai-imported = Imported xAI auth profile from {$path}

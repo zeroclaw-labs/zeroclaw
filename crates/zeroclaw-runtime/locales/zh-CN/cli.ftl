@@ -1086,6 +1086,7 @@ cli-estop-updated-at = {"  "}updated_at:     {$v}
 cli-auth-saved = 已保存配置文件 {$profile}
 cli-auth-active-for = {$provider} 的活动配置文件：{$profile}
 cli-auth-refresh-ok = ✓ 令牌刷新成功（配置文件 {$profile}）
+cli-auth-codex-refresh-reused = 此 OpenAI Codex 刷新令牌已被使用。如果你导入了 Codex CLI 的登录信息，请重新运行 `{$command}`。如果使用命名配置，请添加 `--profile <name>`。否则，请重新登录。
 cli-auth-removed = 已移除身份验证配置文件 {$provider}:{$profile}
 cli-auth-not-found = 未找到身份验证配置文件：{$provider}:{$profile}
 cli-auth-xai-imported = 已从 {$path} 导入 xAI 身份验证配置文件

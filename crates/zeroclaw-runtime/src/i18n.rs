@@ -432,6 +432,27 @@ mod tests {
     }
 
     #[test]
+    fn codex_refresh_reimport_hint_preserves_the_command_in_every_locale() {
+        let command =
+            "zeroclaw auth login --model-provider openai-codex --import ~/.codex/auth.json";
+        for locale in available_locales() {
+            let source = match locale.code.as_str() {
+                "en" => include_str!("../locales/en/cli.ftl"),
+                code => builtin_cli_ftl_source(code).expect("built-in CLI messages"),
+            };
+            let hint = format_ftl_message(
+                source,
+                &locale.code,
+                "cli-auth-codex-refresh-reused",
+                &[("command", command)],
+            )
+            .expect("reimport hint must exist in the selected locale");
+            assert!(hint.contains(command), "{}", locale.code);
+            assert!(hint.contains("--profile <name>"), "{}", locale.code);
+        }
+    }
+
+    #[test]
     fn paircode_cli_strings_format_in_every_builtin_locale() {
         let endpoint = "gateway.example:49001";
         let cases = [

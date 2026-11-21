@@ -1085,6 +1085,7 @@ cli-estop-updated-at = {"  "}updated_at:     {$v}
 cli-auth-saved = プロファイル {$profile} を保存しました
 cli-auth-active-for = {$provider} のアクティブなプロファイル: {$profile}
 cli-auth-refresh-ok = ✓ トークンの更新に成功しました (プロファイル {$profile})
+cli-auth-codex-refresh-reused = この OpenAI Codex のリフレッシュトークンは使用済みです。Codex CLI のログイン情報をインポートした場合は、`{$command}` をもう一度実行してください。名前付きプロファイルの場合は `--profile <name>` を追加してください。それ以外の場合は、再度サインインしてください。
 cli-auth-removed = 認証プロファイル {$provider}:{$profile} を削除しました
 cli-auth-not-found = 認証プロファイルが見つかりません: {$provider}:{$profile}
 cli-auth-xai-imported = xAI 認証プロファイルを {$path} からインポートしました

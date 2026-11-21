@@ -1090,6 +1090,7 @@ cli-estop-updated-at = {"  "}updated_at:     { $v }
 cli-auth-saved = Profil { $profile } enregistré
 cli-auth-active-for = Profil actif pour { $provider } : { $profile }
 cli-auth-refresh-ok = ✓ Actualisation du jeton OK (profil { $profile })
+cli-auth-codex-refresh-reused = Ce jeton de renouvellement OpenAI Codex a déjà été utilisé. Si vous avez importé votre connexion depuis la CLI Codex, relancez `{$command}`. Pour un profil nommé, ajoutez `--profile <name>`. Sinon, reconnectez-vous.
 cli-auth-removed = Profil d'authentification supprimé { $provider }:{ $profile }
 cli-auth-not-found = Profil d'authentification introuvable : { $provider }:{ $profile }
 cli-auth-xai-imported = Profil d'authentification xAI importé depuis { $path }
