@@ -32,6 +32,10 @@ mod auth_boundary;
 
 #[path = "architecture/rpc_proto_boundary.rs"]
 mod rpc_proto_boundary;
+
+#[path = "architecture/pairing_state_load.rs"]
+mod pairing_state_load;
+
 #[path = "architecture/stream_error_terminal.rs"]
 mod stream_error_terminal;
 
