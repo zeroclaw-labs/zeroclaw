@@ -1314,7 +1314,7 @@ fn cost_budget(state: &AppState) -> serde_json::Value {
 
 /// GET /api/cost — cost summary over `[from, to)` (either bound omitted
 /// = unbounded on that side), plus the spending limits as `budget` (see
-/// [`cost_budget`]). Pass `?agent=<alias>` for the per-agent view, which
+/// `cost_budget`). Pass `?agent=<alias>` for the per-agent view, which
 /// ignores from/to and returns the alias's session+daily rollup.
 pub async fn handle_api_cost(
     State(state): State<AppState>,
