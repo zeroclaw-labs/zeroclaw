@@ -236,6 +236,7 @@ impl<T: CompatFamilySpec> FamilyProviderFactory for T {
             key,
             opts,
             false,
+            None,
         ) {
             return Ok(p);
         }
@@ -394,12 +395,14 @@ fn build_responses_provider_if_requested(
     key: Option<&str>,
     opts: &ModelProviderRuntimeOptions,
     single_tool_rounds_supported: bool,
+    reasoning_surface: Option<crate::openai_reasoning::ReasoningSurface>,
 ) -> Option<Box<dyn ModelProvider>> {
     if wire_api != Some(zeroclaw_config::schema::WireApi::Responses) {
         return None;
     }
     let mut builder = crate::openai::OpenAiResponsesModelProvider::builder(alias)
         .credential(key)
+        .reasoning_surface(reasoning_surface)
         .single_tool_rounds_supported(single_tool_rounds_supported);
     if let Some(url) = base_url {
         builder = builder.api_url(url);
@@ -1017,6 +1020,7 @@ impl FamilyProviderFactory for XaiModelProviderConfig {
             key,
             opts,
             false,
+            None,
         ) {
             return Ok(p);
         }
@@ -1274,7 +1278,10 @@ impl FamilyProviderFactory for OpenAIModelProviderConfig {
         // Codex variant routing: OAuth subscription auth → Codex responses protocol.
         if self.base.requires_openai_auth {
             return Ok(Box::new(
-                crate::openai_codex::OpenAiCodexModelProvider::new(alias, opts, key)?,
+                crate::openai_codex::OpenAiCodexModelProvider::new(alias, opts, key)?
+                    .with_reasoning_surface(
+                        crate::openai_reasoning::ReasoningSurface::Subscription,
+                    ),
             ));
         }
         // Responses wire protocol with standard API key — full streaming tool calls.
@@ -1294,12 +1301,14 @@ impl FamilyProviderFactory for OpenAIModelProviderConfig {
                     crate::openai::BASE_URL | crate::openai::RESPONSES_URL
                 )
             }),
+            Some(crate::openai_reasoning::ReasoningSurface::PublicApi),
         ) {
             return Ok(p);
         }
         // Fallback: chat_completions wire (explicit opt-in or legacy unset configs).
         let mut b = crate::openai::OpenAiModelProvider::builder(alias)
             .credential(key)
+            .reasoning_surface(crate::openai_reasoning::ReasoningSurface::PublicApi)
             .single_tool_rounds_supported(
                 api_url.is_none_or(|url| url.trim_end_matches('/') == crate::openai::BASE_URL),
             );
@@ -1893,6 +1902,7 @@ impl FamilyProviderFactory for LlamacppModelProviderConfig {
             Some(llama_cpp_key),
             opts,
             false,
+            None,
         ) {
             return Ok(p);
         }
@@ -1997,6 +2007,7 @@ impl FamilyProviderFactory for CustomModelProviderConfig {
             key,
             opts,
             false,
+            None,
         ) {
             return Ok(p);
         }
@@ -2043,6 +2054,7 @@ impl FamilyProviderFactory for zeroclaw_config::schema::ModelProviderConfig {
             key,
             opts,
             false,
+            None,
         ) {
             return Ok(p);
         }
@@ -2167,6 +2179,7 @@ mod tests {
                     ChatRequest {
                         messages: &messages,
                         tools: None,
+                        thinking_level: None,
                         thinking: None,
                     },
                     "test-model",
@@ -2237,6 +2250,7 @@ mod tests {
                     ChatRequest {
                         messages: &messages,
                         tools: Some(&tools),
+                        thinking_level: None,
                         thinking: None,
                     },
                     "claude-sonnet-4-5",

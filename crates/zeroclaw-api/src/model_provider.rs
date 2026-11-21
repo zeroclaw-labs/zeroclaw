@@ -5,6 +5,47 @@ use serde::{Deserialize, Serialize};
 use std::fmt::Write;
 use std::sync::Arc;
 
+/// How deeply the model should reason for a given message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "lowercase")]
+pub enum ThinkingLevel {
+    Off,
+    Minimal,
+    Low,
+    #[default]
+    Medium,
+    High,
+    Max,
+}
+
+impl ThinkingLevel {
+    /// Parse a level or its existing command alias without case sensitivity.
+    pub fn from_str_insensitive(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "off" | "none" => Some(Self::Off),
+            "minimal" | "min" => Some(Self::Minimal),
+            "low" => Some(Self::Low),
+            "medium" | "med" | "default" => Some(Self::Medium),
+            "high" => Some(Self::High),
+            "max" | "maximum" => Some(Self::Max),
+            _ => None,
+        }
+    }
+
+    /// The canonical serialized name of this level.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Minimal => "minimal",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Max => "max",
+        }
+    }
+}
+
 pub const MAX_BUDGET_TOKENS: u32 = 128_000;
 /// Anthropic's documented minimum for extended-thinking `budget_tokens`.
 /// Requests below this are rejected with 400 by the provider; clamping at
@@ -270,6 +311,11 @@ pub struct ChatRequest<'a> {
     /// support extended thinking should send a dedicated thinking budget
     /// in the API request and force `temperature = 1.0`.
     pub thinking: Option<NativeThinkingParams>,
+    /// An opted-in neutral reasoning level for this request, independent of
+    /// token-budget thinking. `None` preserves provider defaults and global
+    /// settings; providers without level support ignore it. Reconstructed
+    /// requests must carry the source request's value.
+    pub thinking_level: Option<ThinkingLevel>,
 }
 
 /// A tool result to feed back to the LLM.
