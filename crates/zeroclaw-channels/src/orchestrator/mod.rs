@@ -4540,6 +4540,7 @@ fn resync_sender_history_after_trim(
 fn channel_history_before_turn_delta<'a>(
     history: &'a [ChatMessage],
     delta: &[ChatMessage],
+    memory: Option<(usize, &str)>,
 ) -> &'a [ChatMessage] {
     // Count occurrences in the canonical current-turn delta, rather than
     // excluding every user message with the same text. An inbound may itself
@@ -4551,10 +4552,16 @@ fn channel_history_before_turn_delta<'a>(
         }
     }
     let inbound = history.iter().enumerate().rposition(|(index, message)| {
-        if message.role != "user" || is_paired_prompt_tool_result(history, index) {
+        let content = memory
+            .filter(|(target_index, _)| *target_index == index)
+            .and_then(|(_, prefix)| message.content.strip_prefix(prefix))
+            .unwrap_or(&message.content);
+        if message.role != "user"
+            || is_paired_prompt_tool_result_with_content(history, index, content)
+        {
             return false;
         }
-        if let Some(remaining) = generated_users.get_mut(message.content.as_str())
+        if let Some(remaining) = generated_users.get_mut(content)
             && *remaining > 0
         {
             *remaining -= 1;
@@ -4679,8 +4686,18 @@ fn resync_history_after_trim_or_evict_cache(
 
 fn is_paired_prompt_tool_result(history: &[ChatMessage], index: usize) -> bool {
     history.get(index).is_some_and(|message| {
+        is_paired_prompt_tool_result_with_content(history, index, &message.content)
+    })
+}
+
+fn is_paired_prompt_tool_result_with_content(
+    history: &[ChatMessage],
+    index: usize,
+    content: &str,
+) -> bool {
+    history.get(index).is_some_and(|message| {
         message.role == "user"
-            && zeroclaw_api::tool_carrier::is_prompt_tool_carrier(&message.content)
+            && zeroclaw_api::tool_carrier::is_prompt_tool_carrier(content)
             && index
                 .checked_sub(1)
                 .and_then(|i| history.get(i))
@@ -10822,7 +10839,13 @@ async fn process_channel_message_body(
     let history_resync_failed = resync_history_after_trim_or_evict_cache(
         ctx.as_ref(),
         &history_key,
-        channel_history_before_turn_delta(&history, &completed_turn_messages),
+        channel_history_before_turn_delta(
+            &history,
+            &completed_turn_messages,
+            channel_injected_memory_preamble
+                .as_ref()
+                .map(|target| (target.index, target.preamble.as_str())),
+        ),
         history_has_trim_breadcrumb,
         crumb_present_before_loop,
         prior_turns_len_before_loop,
@@ -20418,12 +20441,37 @@ pub(crate) mod tests {
         ];
         let delta = history[2..].to_vec();
         assert_eq!(
-            super::channel_history_before_turn_delta(&history, &delta).len(),
+            super::channel_history_before_turn_delta(&history, &delta, None).len(),
             2
         );
         assert_eq!(
-            super::channel_history_before_turn_delta(&history, &[]).len(),
+            super::channel_history_before_turn_delta(&history, &[], None).len(),
             5
+        );
+    }
+
+    #[test]
+    fn turn_delta_boundary_ignores_memory_prefixed_prompt_tool_result() {
+        let call = super::ChatMessage::assistant(
+            r#"<tool_call>{"name":"shell","arguments":{"command":"true"}}</tool_call>"#,
+        );
+        let result = super::ChatMessage::user(
+            "[Tool results]
+fixture output",
+        );
+        let prefix = "fixture memory\n\n";
+        let delta = [call.clone(), result.clone()];
+        let history = [
+            super::ChatMessage::system("system"),
+            super::ChatMessage::user("original request"),
+            call,
+            super::ChatMessage::user(format!("{prefix}{}", result.content)),
+        ];
+
+        assert!(super::is_paired_prompt_tool_result(&delta, 1));
+        assert_eq!(
+            super::channel_history_before_turn_delta(&history, &delta, Some((3, prefix))).len(),
+            2
         );
     }
 
