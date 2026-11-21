@@ -249,12 +249,13 @@ pub fn build_spec() -> serde_json::Value {
                             "encryption_enabled": {"type": "boolean"},
                             "credentials": {"type": "array", "items": {
                                 "type": "object",
-                                "required": ["name", "origin", "kind", "source"],
+                                "required": ["name", "origin", "kind", "source", "permission_revision"],
                                 "properties": {
                                     "name": {"type": "string"},
                                     "origin": {"type": "string"},
                                     "kind": {"type": "string"},
                                     "source": {"type": "string"},
+                                    "permission_revision": {"type": "string", "description": "Current revision of the credential permission state."},
                                     "http_allowed": {"type": ["boolean", "null"]},
                                     "http_origins": {"type": "array", "items": {"type": "string"}},
                                     "browser_origin": {"type": ["string", "null"]},
@@ -314,6 +315,7 @@ pub fn build_spec() -> serde_json::Value {
                         "permissions": {
                             "type": "object",
                             "properties": {
+                                "expected_revision": {"type": "string", "description": "Use the permission_revision from GET. Required when replacing http_origins, browser.origins, or destinations. A missing required or stale revision returns 409."},
                                 "http_allowed": {"type": "boolean"},
                                 "http_origins": {"type": "array", "maxItems": 32, "items": {"type": "string"}},
                                 "browser": {
@@ -1195,6 +1197,15 @@ mod tests {
         let path = &spec["paths"]["/api/config/http-credentials"];
         assert!(path["get"]["responses"]["200"].is_object());
         assert!(path["post"]["responses"]["204"].is_object());
+        assert!(path["post"]["responses"]["409"].is_object());
+        let row = &path["get"]["responses"]["200"]["content"]["application/json"]["schema"]["properties"]
+            ["credentials"]["items"];
+        assert_eq!(row["properties"]["permission_revision"]["type"], "string");
+        let required = row["required"].as_array().unwrap();
+        assert!(required.iter().any(|field| field == "permission_revision"));
+        let update = &path["post"]["requestBody"]["content"]["application/json"]["schema"]["properties"]
+            ["permissions"]["properties"];
+        assert_eq!(update["expected_revision"]["type"], "string");
         let auth = &path["post"]["requestBody"]["content"]["application/json"]["schema"]["properties"]
             ["credential"]["properties"]["auth"]["properties"];
         let request =
