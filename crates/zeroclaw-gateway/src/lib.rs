@@ -7,7 +7,6 @@
 #[cfg(feature = "a2a")]
 pub mod a2a;
 pub mod acp;
-pub mod agent_owned_state;
 pub mod api;
 pub mod api_browse;
 pub mod api_config;
