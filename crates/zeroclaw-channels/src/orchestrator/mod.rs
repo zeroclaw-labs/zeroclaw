@@ -17536,10 +17536,9 @@ pub async fn start_channels_with_authority_and_plugin_webhooks(
 
             println!("🦀 ZeroClaw Channel Server");
             println!("  🤖 Model:    {model} (agent: {agent_alias})");
-            let effective_backend = config.resolve_active_storage().kind();
             println!(
                 "  🧠 Memory:   {} (auto-save: {})",
-                effective_backend,
+                mem.name(),
                 if config.memory.auto_save { "on" } else { "off" }
             );
             let channel_labels: Vec<String> = configured_channels
