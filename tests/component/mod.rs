@@ -7,6 +7,8 @@ mod acp_session_cwd_stdio;
 mod agents_export_cli;
 #[cfg(all(feature = "agent-runtime", not(feature = "gateway")))]
 mod cli_only_build;
+#[cfg(all(feature = "agent-runtime", unix))]
+mod config_auth_publication_cli;
 #[cfg(feature = "agent-runtime")]
 mod config_dir_locale_regression;
 mod config_patch_cli;
