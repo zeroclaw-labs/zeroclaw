@@ -920,3 +920,11 @@ test('releasing a stale utterance leaves its replacement active', async () => {
     releaseVoice(current);
   }
 });
+
+test('narration preserves visible raw HTML and referenced footnote text', async () => {
+  const { speechText } = await import('../lib/speechText.ts');
+  const text = speechText('Answer[^a] and again[^a].\n\n<div>Important warning</div>\n\n[^a]: Check the qualifications.\n\n[^unused]: Unreferenced.');
+  assert.match(text, /<div>Important warning<\/div>/);
+  assert.equal(text.match(/Check the qualifications/g)?.length, 1);
+  assert.doesNotMatch(text, /Unreferenced|\[\^a\]/);
+});
