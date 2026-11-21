@@ -6057,6 +6057,11 @@ mod tests {
         drop(socket);
     }
 
+    // Not on Windows, where small socket buffers can't hold up this write:
+    // Winsock takes a send of any size while less than `SO_SNDBUF` is
+    // queued. Once the browser has read the chunk, the turn's end is
+    // written whole and the conversation rightly stays live.
+    #[cfg(not(windows))]
     #[tokio::test]
     async fn a_chat_whose_reply_end_cannot_be_written_ends() {
         // No pings, which would otherwise find the stuck socket later.
