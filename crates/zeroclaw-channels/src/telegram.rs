@@ -8904,6 +8904,13 @@ Ensure only one `zeroclaw` process is using this bot token."
         Ok(())
     }
 
+    /// Telegram posts its own acknowledgement on receipt; the orchestrator's
+    /// `add_reaction` is the trait no-op. So an empty `ack_reaction_in_progress`
+    /// still leaves a real reaction for `remove_reaction` to clear.
+    fn posts_native_ack(&self) -> bool {
+        true
+    }
+
     /// Withdraw the bot's acknowledgement reaction once the reply is done.
     ///
     /// Telegram gives a bot a single reaction slot per message, so the clear is

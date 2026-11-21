@@ -406,6 +406,7 @@ fn extract_slack_ts(message_id: &str) -> &str {
 fn unicode_emoji_to_slack_name(emoji: &str) -> &str {
     match emoji {
         "\u{1F440}" => "eyes",                        // 👀
+        "\u{23F3}" => "hourglass_flowing_sand",       // ⏳
         "\u{2705}" => "white_check_mark",             // ✅
         "\u{26A0}\u{FE0F}" | "\u{26A0}" => "warning", // ⚠️
         "\u{274C}" => "x",                            // ❌
