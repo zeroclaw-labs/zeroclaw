@@ -159,7 +159,12 @@ impl ResolvedPluginConfig {
         mut self,
         references: impl IntoIterator<Item = SecretPropertyRef>,
     ) -> Self {
-        self.host_only.extend(references);
+        for reference in references {
+            if let Some(public) = self.public_json.as_object_mut() {
+                public.remove(reference.as_str());
+            }
+            self.host_only.insert(reference);
+        }
         self
     }
 
@@ -284,6 +289,61 @@ fn manifest_schema_options<'a>() -> jsonschema::ValidationOptions<'a> {
             .size_limit(MAX_PATTERN_SIZE_BYTES)
             .dfa_size_limit(MAX_PATTERN_DFA_BYTES),
     )
+}
+
+/// Check one secret during write-only provisioning. Other required fields
+/// may still be unconfigured, so the complete object is checked at use time.
+pub fn validate_secret_property(schema: &Value, name: &str, value: &str) -> bool {
+    let Some(properties) = schema.get("properties") else {
+        return false;
+    };
+    if !properties
+        .get(name)
+        .and_then(|property| property.get("x-secret"))
+        .is_some_and(|secret| secret == &Value::Bool(true))
+    {
+        return false;
+    }
+    let pointer = name.replace('~', "~0").replace('/', "~1");
+    const MANIFEST_URI: &str = "urn:zeroclaw:plugin-config";
+    let Ok(registry) = jsonschema::Registry::new()
+        .add(MANIFEST_URI, schema.clone())
+        .and_then(|builder| builder.prepare())
+    else {
+        return false;
+    };
+    let property = serde_json::json!({ "$ref": format!("{MANIFEST_URI}#/properties/{pointer}") });
+    manifest_schema_options()
+        .with_registry(&registry)
+        .build(&property)
+        .is_ok_and(|validator| validator.is_valid(&Value::String(value.to_owned())))
+}
+
+#[cfg(test)]
+#[test]
+fn write_only_provisioning_checks_secret_refs_and_allows_partial_setup() {
+    let schema = serde_json::json!({
+        "type": "object",
+        "required": ["secret", "other"],
+        "properties": {
+            "secret": { "x-secret": true, "$ref": "#/allOf/0/properties/pem" },
+            "other": { "type": "string" }
+        },
+        "allOf": [{ "properties": { "pem": { "type": "string", "pattern": "^-----BEGIN ", "minLength": 16 } } }]
+    });
+
+    assert!(validate_secret_property(
+        &schema,
+        "secret",
+        "-----BEGIN TEST KEY"
+    ));
+    assert!(!validate_secret_property(&schema, "secret", "-----BEGIN "));
+    assert!(!validate_secret_property(
+        &schema,
+        "secret",
+        "plaintext is invalid"
+    ));
+    assert!(!validate_secret_property(&schema, "other", "not a secret"));
 }
 
 fn compile_manifest_config(
@@ -1308,6 +1368,19 @@ x-secret = true
             "reserving a secret hides it from the guest, not from the host"
         );
         assert!(!resolved.public_json().to_string().contains("secret-value"));
+    }
+
+    #[test]
+    fn host_reserved_property_is_hidden_even_in_public_config() {
+        let schema = object_schema(json!({"client_key": {"type": "string"}}));
+        let manifest = manifest(Some(schema), true);
+        let scope = scope(&manifest, true);
+        let values = configured(&[("client_key", "synthetic-key")]);
+        let resolved = resolve_plugin_config(&manifest, &scope, Some(&values))
+            .unwrap()
+            .reserve_for_host([SecretPropertyRef::parse("client_key").unwrap()]);
+        assert!(resolved.is_host_only("client_key"));
+        assert_eq!(resolved.public_json(), &json!({}));
     }
 
     #[test]
