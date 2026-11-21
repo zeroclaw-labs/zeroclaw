@@ -152,6 +152,28 @@ fn is_valid_env_var_name(name: &str) -> bool {
     chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
 }
 
+/// Copy the allowlisted shell environment into a child command that has just
+/// been cleared.
+fn apply_allowed_shell_env_vars(cmd: &mut tokio::process::Command, security: &SecurityPolicy) {
+    let names = collect_allowed_shell_env_vars(security);
+    apply_shell_env_vars(cmd, &names, |name| std::env::var(name).ok());
+}
+
+/// [`apply_allowed_shell_env_vars`] with the values supplied, so a test can
+/// prove what a real child receives for the Windows allowlist on every
+/// platform without mutating the test process environment.
+fn apply_shell_env_vars(
+    cmd: &mut tokio::process::Command,
+    names: &[String],
+    lookup: impl Fn(&str) -> Option<String>,
+) {
+    for name in names {
+        if let Some(value) = lookup(name) {
+            cmd.env(name, value);
+        }
+    }
+}
+
 fn collect_allowed_shell_env_vars(security: &SecurityPolicy) -> Vec<String> {
     let mut out = Vec::new();
     let mut seen = HashSet::new();
@@ -324,12 +346,7 @@ impl Tool for ShellTool {
             })?;
 
         cmd.env_clear();
-
-        for var in collect_allowed_shell_env_vars(&self.security) {
-            if let Ok(val) = std::env::var(&var) {
-                cmd.env(&var, val);
-            }
-        }
+        apply_allowed_shell_env_vars(&mut cmd, &self.security);
 
         // Injected after env_clear so it survives; absent when the turn is unscoped.
         if let Some(session_id) = get_session_id() {
@@ -2023,6 +2040,37 @@ mod tests {
             "ZEROCLAW_TEST_PASSTHROUGH",
             "db://unit-test"
         ));
+    }
+
+    #[test]
+    fn shell_child_receives_windows_profile_roots_after_env_clear() {
+        let names: Vec<String> = crate::tools::shell_env::WINDOWS_SAFE_SHELL_ENV_VARS
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect();
+        let appdata = "/dummy/AppData/Roaming";
+        let local_app_data = "/dummy/AppData/Local";
+        let mut cmd = tokio::process::Command::new(env_print_command());
+        cmd.env_clear();
+        super::apply_shell_env_vars(&mut cmd, &names, |key| match key {
+            "APPDATA" => Some(appdata.to_string()),
+            "LOCALAPPDATA" => Some(local_app_data.to_string()),
+            _ => None,
+        });
+
+        let output = cmd
+            .as_std_mut()
+            .output()
+            .expect("environment print child should run");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            env_output_contains_assignment(&stdout, "APPDATA", appdata),
+            "APPDATA must reach the child after env_clear; child output: {stdout}"
+        );
+        assert!(
+            env_output_contains_assignment(&stdout, "LOCALAPPDATA", local_app_data),
+            "LOCALAPPDATA must reach the child after env_clear; child output: {stdout}"
+        );
     }
 
     #[test]
