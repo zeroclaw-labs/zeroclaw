@@ -2542,10 +2542,11 @@ fn all_tools_with_runtime_on_thread(
         Arc::new(tool)
     });
     register_tool!("send_message_to_peer", {
-        let tool = SendMessageToPeerTool::new_with_live_config_and_capability(
+        let tool = SendMessageToPeerTool::new_with_live_config_security_and_capability(
             Arc::clone(&root_config_shared),
             agent_alias,
             live_config.clone(),
+            security.clone(),
             execution_capability.clone(),
         );
         capability_slots.push(tool.capabilities_slot());
