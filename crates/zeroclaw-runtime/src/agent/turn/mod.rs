@@ -709,10 +709,14 @@ fn modifying_llm_hooks_for_request<'a>(
     hooks: Option<&'a crate::hooks::HookRunner>,
     messages: &[ChatMessage],
     turn_id: &str,
+    session_prompts_enabled: bool,
 ) -> Option<&'a crate::hooks::HookRunner> {
     let hooks = hooks.filter(|hooks| !hooks.is_empty())?;
     if attachment_protocol_scope_active()
-        || crate::agent::prompt::provider_messages_carry_session_prompt_content(messages)
+        || crate::agent::prompt::provider_messages_carry_session_prompt_content(
+            messages,
+            session_prompts_enabled,
+        )
     {
         ::zeroclaw_log::record!(
             DEBUG,
@@ -2331,8 +2335,12 @@ async fn run_tool_call_loop_impl<'a>(
                         None => (None, None),
                     };
                     // Summary preparation uses hooks only for before_llm_call.
-                    let summary_hooks =
-                        modifying_llm_hooks_for_request(hooks, turn_state.history, turn_id);
+                    let summary_hooks = modifying_llm_hooks_for_request(
+                        hooks,
+                        turn_state.history,
+                        turn_id,
+                        config.is_none_or(|c| c.channels.session_prompts_enabled),
+                    );
                     let summary_result = finish_after_max_iterations(
                         injected_memory_preamble,
                         model_provider,
@@ -2489,9 +2497,12 @@ async fn run_tool_call_loop_impl<'a>(
         let pre_hook_messages = provider_request_messages.clone();
         let mut hook_selected_model = None;
 
-        if let Some(hooks) =
-            modifying_llm_hooks_for_request(base_ctx.hooks, &provider_request_messages, turn_id)
-        {
+        if let Some(hooks) = modifying_llm_hooks_for_request(
+            base_ctx.hooks,
+            &provider_request_messages,
+            turn_id,
+            config.is_none_or(|c| c.channels.session_prompts_enabled),
+        ) {
             let mut candidate_model = active_model.to_string();
             match hooks
                 .run_before_llm_call(&mut provider_request_messages, &mut candidate_model)
@@ -4099,7 +4110,12 @@ async fn run_tool_call_loop_impl<'a>(
         None => (None, None),
     };
     // Summary preparation uses hooks only for before_llm_call.
-    let summary_hooks = modifying_llm_hooks_for_request(hooks, turn_state.history, turn_id);
+    let summary_hooks = modifying_llm_hooks_for_request(
+        hooks,
+        turn_state.history,
+        turn_id,
+        config.is_none_or(|c| c.channels.session_prompts_enabled),
+    );
     let summary_result = finish_after_max_iterations(
         injected_memory_preamble,
         model_provider,
@@ -9464,6 +9480,24 @@ mod sop_step_reassembly_tests {
             messages.push(ChatMessage::user("hook-rewrite"));
             crate::hooks::HookResult::Continue(())
         }
+    }
+
+    #[tokio::test]
+    async fn disabled_session_prompts_keep_ordinary_invocation_examples_visible_to_hooks() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut hooks = crate::hooks::HookRunner::new();
+        hooks.register(Box::new(PromptPrivacyHook(calls.clone())));
+        let mut messages = vec![ChatMessage::assistant(
+            r#"<tool_call>{"name":"session_prompt_set","arguments":{"content":"example"}}</tool_call>"#,
+        )];
+        let admitted = modifying_llm_hooks_for_request(Some(&hooks), &messages, "test", false)
+            .expect("ordinary feature-off history must retain hooks");
+        let mut model = "original".to_string();
+        admitted
+            .run_before_llm_call(&mut messages, &mut model)
+            .await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(modifying_llm_hooks_for_request(Some(&hooks), &messages, "test", true).is_none());
     }
 
     // A marked explicit-list exchange remains private even without an attachment

@@ -138,8 +138,11 @@ pub fn redact_session_prompt_tool_exchanges_for_export(
 /// Whether provider-bound messages carry opaque session-prompt content that
 /// the export projection masks. The export classifier is the single owner;
 /// this never mutates or replaces provider working state.
-pub(crate) fn provider_messages_carry_session_prompt_content(messages: &[ChatMessage]) -> bool {
-    redact_session_prompt_tool_exchanges_for_export(messages)
+pub(crate) fn provider_messages_carry_session_prompt_content(
+    messages: &[ChatMessage],
+    session_prompts_enabled: bool,
+) -> bool {
+    redact_session_prompt_history_for_export(messages, session_prompts_enabled)
         .iter()
         .zip(messages)
         .any(|(exported, raw)| exported.content != raw.content)
@@ -2280,16 +2283,23 @@ mod tests {
     // provenance, without treating restored safe placeholders as private input.
     #[test]
     fn provider_message_privacy_matches_session_prompt_export_projection() {
-        assert!(provider_messages_carry_session_prompt_content(&[
-            ChatMessage::system(
+        assert!(provider_messages_carry_session_prompt_content(
+            &[ChatMessage::system(
                 "host policy\n\n## Session Prompts\n- id: \"task\"; content: \"PRIVATE_CANARY\"\n"
-            ),
-        ]));
-        assert!(provider_messages_carry_session_prompt_content(&[
-            ChatMessage::assistant(
-                r#"<tool_call>{"name":"session_prompt_set","arguments":{"id":"task","content":"PRIVATE_CANARY"}}</tool_call>"#
-            ),
-        ]));
+            ),],
+            true
+        ));
+        let invocation = [ChatMessage::assistant(
+            r#"<tool_call>{"name":"session_prompt_set","arguments":{"id":"task","content":"PRIVATE_CANARY"}}</tool_call>"#,
+        )];
+        assert!(provider_messages_carry_session_prompt_content(
+            &invocation,
+            true
+        ));
+        assert!(!provider_messages_carry_session_prompt_content(
+            &invocation,
+            false
+        ));
         for native in [false, true] {
             let mut history = Vec::new();
             crate::agent::turn::history_append::append_tool_round_to_history(
@@ -2305,10 +2315,16 @@ mod tests {
                 "PRIVATE_CANARY",
                 native,
             );
-            assert!(provider_messages_carry_session_prompt_content(&history));
+            assert!(provider_messages_carry_session_prompt_content(
+                &history, true
+            ));
+            assert!(provider_messages_carry_session_prompt_content(
+                &history, false
+            ));
             assert!(history.iter().any(|m| m.content.contains("PRIVATE_CANARY")));
             assert!(!provider_messages_carry_session_prompt_content(
                 &redact_session_prompt_tool_exchanges_for_export(&history),
+                true,
             ));
         }
         for text in [
@@ -2316,10 +2332,13 @@ mod tests {
             "[Session-prompt tool exchange omitted from export]",
             "[Tool results]\n[Session-prompt tool exchange omitted from export]",
         ] {
-            assert!(!provider_messages_carry_session_prompt_content(&[
-                ChatMessage::system("ordinary system"),
-                ChatMessage::user(text),
-            ]));
+            assert!(!provider_messages_carry_session_prompt_content(
+                &[
+                    ChatMessage::system("ordinary system"),
+                    ChatMessage::user(text),
+                ],
+                true
+            ));
         }
     }
 

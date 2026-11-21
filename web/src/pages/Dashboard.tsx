@@ -1294,6 +1294,9 @@ function SessionsTab() {
                     {session.message_count}
                   </span>
                   <span>{formatRelative(session.last_activity)}</span>
+                  {!session.session_key.startsWith("gw_") && (
+                    <span>{t("dashboard.delete_unavailable")}</span>
+                  )}
                 </div>
               </div>
               <div className="flex items-center gap-1 flex-shrink-0">
@@ -1309,9 +1312,9 @@ function SessionsTab() {
                 <button
                   type="button"
                   onClick={() => setPendingDelete(session)}
-                  disabled={deleting === session.session_key}
+                  disabled={deleting === session.session_key || !session.session_key.startsWith("gw_")}
                   className="p-1.5 rounded-lg hover:bg-[var(--pc-hover)] disabled:opacity-50"
-                  title={t("dashboard.delete_session")}
+                  title={t(session.session_key.startsWith("gw_") ? "dashboard.delete_session" : "dashboard.delete_unavailable")}
                   style={{ color: "var(--color-status-error)" }}
                 >
                   <Trash2 className="h-4 w-4" />

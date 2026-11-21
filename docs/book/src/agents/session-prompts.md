@@ -29,21 +29,33 @@ restart preserves the stored owner and attachments.
 
 RPC operations also recheck the caller's current authority after waiting for
 session or storage access. Losing permission while queued cannot authorize
-attachment-owner creation, cancellation, or deletion. Deleting SQLite Chat aliases
-still uses one storage transaction, including their prompt attachments.
-Ordinary JSONL sessions, which cannot enable this feature, retain sequential
-alias cleanup under the storage and authority guards; an I/O failure can leave
-that non-transactional cleanup partially completed.
+attachment-owner creation, cancellation, or deletion. RPC deletion considers
+the raw, `rpc_`, and `gw_` keys as candidates, but similar names and a shared
+principal do not prove that two rows represent one session. If more than one
+distinct candidate exists, deletion reports an ambiguity and preserves them.
+SQLite checks this and deletes the one unambiguous row and its prompt attachments
+in one transaction. JSONL sessions, which cannot enable this feature, apply the
+same refusal to distinct files under their storage and authority guards.
 An attachment-load failure before execution preparation leaves the session
 idle and reports a failed turn to the client.
 
-Custom `SessionBackend` implementations used by RPC must implement the guarded
-`admit_session_prompt_owner_authorized` and `delete_session_key_set_authorized`
-operations when they support the corresponding effects. Resolve the supplied
-authority callback after taking the storage serialization boundary and retain
-its guard through commit. The callback must not re-enter the backend. The
-default implementations reject these effects; forwarding decorators must
-forward the callback and the entire alias set without splitting commits.
+Custom `SessionBackend` implementations used by RPC or operator HTTP deletion
+must implement the guarded `admit_session_deletion` operation and its
+identity-bound handle; prompt storage also requires
+`admit_session_prompt_owner_authorized`. Capture a non-creating observation,
+reject multiple distinct candidates, and compare that observation under the
+storage boundary before signalling or deletion. Resolve current authority
+under that boundary and retain its guard through each effect. Callbacks must not
+re-enter the backend. Defaults reject unsupported effects; forwarding decorators
+must forward the full candidate set and the handle without splitting commits.
+JSONL tracks intervening resets and deletes across store handles in the same
+process; it does not provide cross-process writer fencing or crash-atomic files.
+A gateway deletion also requires the backend to establish that the stored key
+identifies the exact live queue. JSONL refuses gateway names whose normalized
+filename could belong to a different live spelling. Custom deletion handles must
+explicitly report whether that queue identity is exact; the default is false.
+The operator Dashboard deletes gateway sessions only; use the owning interface
+to delete RPC or channel sessions.
 
 `/new` attempts that same durable cleanup even when prompt injection is
 currently disabled, provided a durable session backend is attached. If that
@@ -51,9 +63,11 @@ backend cannot prove that cleanup completed, the command reports failure and
 leaves the existing session intact; it never claims a fresh session while the
 old attachment rows may still exist. When no durable backend is configured and
 prompt injection is disabled, `/new` retains the legacy ephemeral reset
-behavior because that runtime has no attached durable owner it can clear. An
-operator switching back to durable persistence should reset the session after
-the backend is re-enabled before relying on the old durable rows being gone.
+behavior because that runtime has no attached durable owner it can clear. The
+same behavior occurs if persistence is configured but its backend fails to
+open at startup: with prompt injection disabled, `/new` cannot remove old
+durable rows in that state. After the backend is available again, reset the
+session before relying on those rows or their attachments being gone.
 
 ## External database tools, upgrades, and downgrades
 
@@ -314,9 +328,10 @@ registered handlers. Such requests dispatch as prepared: hook transformations,
 model changes, and cancellation do not run. The void `on_llm_input` callback
 still receives its masked export view; provider working history is not masked.
 The same conservative export classifier governs this exclusion, so literal
-attachment headings or invocation-like assistant text can also skip modifying
-hooks. Ordinary requests and restored redaction placeholders retain normal
-hook behavior. Alternative prompt-hook policies require a separate
+attachment headings or, while the feature is enabled, invocation-like assistant
+text can also skip modifying hooks. Host-marked private results remain excluded
+after the feature is disabled. Ordinary requests and restored redaction
+placeholders retain normal hook behavior. Alternative prompt-hook policies require a separate
 architectural decision.
 
 Avoid a standalone `## Session Prompts` heading in custom host prompt text,

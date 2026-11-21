@@ -153,8 +153,39 @@ impl<T> SessionEffectGuard for T {}
 pub type SessionEffectAuthorization<'a> =
     dyn Fn(Option<&str>) -> std::io::Result<Box<dyn SessionEffectGuard + 'a>> + 'a;
 
+/// An exact, non-creating observation of a possible durable deletion target.
+/// Implementations retain their own opaque incarnation proof and compare the
+/// complete candidate set before any authorized effect and before deletion.
+pub trait SessionDeletionAdmission: Send + Sync {
+    fn selected_key(&self) -> Option<&str>;
+    fn principal(&self) -> Option<&str>;
+    /// Whether the exact stored gateway key identifies its live queue without
+    /// a lossy storage normalization. Unknown backends must fail closed.
+    fn gateway_queue_identity_is_exact(&self) -> bool {
+        false
+    }
+    fn with_current(
+        &self,
+        authorize: &SessionEffectAuthorization<'_>,
+        effect: &mut dyn FnMut() -> std::io::Result<()>,
+    ) -> std::io::Result<()>;
+    fn delete(&self, authorize: &SessionEffectAuthorization<'_>) -> std::io::Result<bool>;
+}
+
 /// Trait for session persistence backends shared across async tasks.
 pub trait SessionBackend: Send + Sync {
+    /// Capture deletion identity without creating a missing session. Backends
+    /// without a reliable conditional-deletion primitive fail closed.
+    fn admit_session_deletion(
+        self: Arc<Self>,
+        _candidate_keys: &[&str],
+        _authorize: &SessionEffectAuthorization<'_>,
+    ) -> std::io::Result<Box<dyn SessionDeletionAdmission>> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "identity-bound session deletion unsupported",
+        ))
+    }
     /// Admit prompt access, creating an empty owner before its first message
     /// when necessary. Only a primary-turn/session admission may call this.
     fn admit_session_prompt_owner(

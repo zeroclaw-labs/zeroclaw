@@ -190,12 +190,20 @@ rpc_type! {
 rpc_type! {
     /// Shared param for methods that only need a session ID:
     /// `session/close`, `session/cancel`, `session/messages`,
-    /// `session/state`, `session/delete`.
+    /// `session/state`.
     pub struct SessionIdParams {
         pub session_id: String,
+    }
+}
+
+rpc_type! {
+    /// Parameters for deleting a session from a selected storage domain.
+    pub struct SessionDeleteParams {
+        pub session_id: String,
         /// Optional storage domain for `session/delete`. A live session
-        /// supplies its canonical domain; an omitted reaped or missing ID
-        /// preserves the legacy idempotent Chat deletion behavior.
+        /// supplies its canonical domain. If omitted for a reaped session,
+        /// a uniquely resolved Chat or ACP domain is used; ambiguous or
+        /// missing sessions are refused according to ownership policy.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub chat_mode: Option<ChatMode>,
     }
@@ -2166,7 +2174,8 @@ mod tests {
 
     #[test]
     fn session_id_params_keep_optional_deletion_domain_wire_compatibility() {
-        let old: SessionIdParams = serde_json::from_value(json!({ "session_id": "s" })).unwrap();
+        let old: SessionDeleteParams =
+            serde_json::from_value(json!({ "session_id": "s" })).unwrap();
         assert_eq!(old.chat_mode, None);
         assert!(
             serde_json::to_value(old)
@@ -2174,10 +2183,14 @@ mod tests {
                 .get("chat_mode")
                 .is_none()
         );
-        let scoped: SessionIdParams =
+        let scoped: SessionDeleteParams =
             serde_json::from_value(json!({ "session_id": "s", "chat_mode": "acp" })).unwrap();
         assert_eq!(scoped.chat_mode, Some(ChatMode::Acp));
         assert_eq!(serde_json::to_value(scoped).unwrap()["chat_mode"], "acp");
+        let unrelated: SessionIdParams =
+            serde_json::from_value(json!({ "session_id": "s", "chat_mode": "future-mode" }))
+                .unwrap();
+        assert_eq!(unrelated.session_id, "s");
     }
 
     #[test]

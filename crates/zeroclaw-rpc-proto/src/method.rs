@@ -331,7 +331,7 @@ impl Method {
                 Typed("SessionMessagesResult"),
             ),
             M::SessionState => (Typed("SessionIdParams"), Typed("SessionStateResult")),
-            M::SessionDelete => (Typed("SessionIdParams"), Typed("SessionDeleteResult")),
+            M::SessionDelete => (Typed("SessionDeleteParams"), Typed("SessionDeleteResult")),
             M::SessionApprove => (Typed("SessionApproveParams"), Typed("SessionApproveResult")),
             M::SessionKill => (Typed("SessionKillParams"), Typed("SessionKillResult")),
             M::SessionSteer => (Typed("SessionSteerParams"), Typed("SessionSteerResult")),

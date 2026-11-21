@@ -2082,6 +2082,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'dashboard.no_sessions_match': 'No sessions match the current search and filters',
     'dashboard.view_messages': 'View messages',
     'dashboard.delete_session': 'Delete session',
+    'dashboard.delete_unavailable': 'Delete this session through its owning interface',
     'dashboard.confirm_delete_session_prefix': 'Delete session',
     'dashboard.confirm_delete_suffix': '? This cannot be undone.',
     'dashboard.flip_transcript': 'Flip transcript order',

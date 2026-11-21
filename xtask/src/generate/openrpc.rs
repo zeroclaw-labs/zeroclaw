@@ -357,18 +357,17 @@ mod tests {
             .iter()
             .map(|p| p["name"].as_str().unwrap())
             .collect();
-        assert_eq!(names, ["session_id", "chat_mode"]);
+        assert_eq!(names, ["session_id"]);
         assert_eq!(close["params"][0]["required"], json!(true));
-        assert_eq!(close["params"][1]["required"], json!(false));
         let request = json!({ "session_id": "s1" });
         let parsed: zeroclaw_rpc_proto::types::SessionIdParams =
             serde_json::from_value(request).expect("descriptor-shaped request parses");
         assert_eq!(parsed.session_id, "s1");
-        assert_eq!(parsed.chat_mode, None);
         let delete = by_name("session/delete");
-        assert_eq!(delete["params"], close["params"]);
+        assert_eq!(delete["params"][1]["name"], json!("chat_mode"));
+        assert_eq!(delete["params"][1]["required"], json!(false));
         let request = json!({ "session_id": "s1", "chat_mode": "acp" });
-        let parsed: zeroclaw_rpc_proto::types::SessionIdParams =
+        let parsed: zeroclaw_rpc_proto::types::SessionDeleteParams =
             serde_json::from_value(request).expect("scoped descriptor-shaped request parses");
         assert_eq!(
             parsed.chat_mode,

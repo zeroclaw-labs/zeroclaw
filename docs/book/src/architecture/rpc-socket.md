@@ -235,11 +235,19 @@ In a supervised daemon, RPC `session/delete` shares the gateway's existing
 cancellation registry and actor queue. Chat deletion captures the gateway
 generation, signals cancellation for the authorized predecessor, and waits
 for its gateway permit after acquiring the RPC permit. It revalidates ownership
-and generation before atomically deleting the raw, `rpc_` and `gw_` Chat aliases.
+and generation before deleting an unambiguous raw, `rpc_` or `gw_` Chat row.
+Multiple distinct candidates are refused because they may be different
+sessions even when their owner is the same; SQLite checks this in the deletion
+transaction. An initial best-effort check avoids signalling turns when the
+ambiguity is already visible, but storage makes the authoritative decision.
+Deletion retains the selected row's incarnation across queue waits and refuses
+if it was reset or replaced. For an accepted full stored-key spelling, the
+original wire ID remains in the response while cancellation and fencing use
+the identified owning RPC or gateway queue; unprovable identities are refused.
 Only a successful durable deletion invalidates the captured gateway generation.
 Old WebSockets cannot recreate metadata or write into a same-ID successor;
 a newly connected successor remains usable. Failed storage deletion preserves
-the aliases, attachments and generations, although already-observed cancellation
+the rows, attachments and generations, although already-observed cancellation
 cannot be reversed. ACP deletion remains isolated from the Chat gateway.
 
 The shared gateway coordination lasts for one daemon generation, including

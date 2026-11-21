@@ -3428,6 +3428,29 @@
         ],
         "type": "object"
       },
+      "SessionDeleteParams": {
+        "description": "Parameters for deleting a session from a selected storage domain.",
+        "properties": {
+          "chat_mode": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ChatMode"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Optional storage domain for `session/delete`. A live session\nsupplies its canonical domain. If omitted for a reaped session,\na uniquely resolved Chat or ACP domain is used; ambiguous or\nmissing sessions are refused according to ownership policy."
+          },
+          "session_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id"
+        ],
+        "type": "object"
+      },
       "SessionDeleteResult": {
         "properties": {
           "deleted": {
@@ -3514,19 +3537,8 @@
         "type": "object"
       },
       "SessionIdParams": {
-        "description": "Shared param for methods that only need a session ID:\n`session/close`, `session/cancel`, `session/messages`,\n`session/state`, `session/delete`.",
+        "description": "Shared param for methods that only need a session ID:\n`session/close`, `session/cancel`, `session/messages`,\n`session/state`.",
         "properties": {
-          "chat_mode": {
-            "anyOf": [
-              {
-                "$ref": "#/components/schemas/ChatMode"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "description": "Optional storage domain for `session/delete`. A live session\nsupplies its canonical domain; an omitted reaped or missing ID\npreserves the legacy idempotent Chat deletion behavior."
-          },
           "session_id": {
             "type": "string"
           }
@@ -5015,21 +5027,6 @@
           "schema": {
             "type": "string"
           }
-        },
-        {
-          "name": "chat_mode",
-          "required": false,
-          "schema": {
-            "anyOf": [
-              {
-                "$ref": "#/components/schemas/ChatMode"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "description": "Optional storage domain for `session/delete`. A live session\nsupplies its canonical domain; an omitted reaped or missing ID\npreserves the legacy idempotent Chat deletion behavior."
-          }
         }
       ],
       "result": {
@@ -5160,21 +5157,6 @@
           "schema": {
             "type": "string"
           }
-        },
-        {
-          "name": "chat_mode",
-          "required": false,
-          "schema": {
-            "anyOf": [
-              {
-                "$ref": "#/components/schemas/ChatMode"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "description": "Optional storage domain for `session/delete`. A live session\nsupplies its canonical domain; an omitted reaped or missing ID\npreserves the legacy idempotent Chat deletion behavior."
-          }
         }
       ],
       "result": {
@@ -5203,21 +5185,6 @@
           "required": true,
           "schema": {
             "type": "string"
-          }
-        },
-        {
-          "name": "chat_mode",
-          "required": false,
-          "schema": {
-            "anyOf": [
-              {
-                "$ref": "#/components/schemas/ChatMode"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "description": "Optional storage domain for `session/delete`. A live session\nsupplies its canonical domain; an omitted reaped or missing ID\npreserves the legacy idempotent Chat deletion behavior."
           }
         }
       ],
@@ -5390,21 +5357,6 @@
           "schema": {
             "type": "string"
           }
-        },
-        {
-          "name": "chat_mode",
-          "required": false,
-          "schema": {
-            "anyOf": [
-              {
-                "$ref": "#/components/schemas/ChatMode"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "description": "Optional storage domain for `session/delete`. A live session\nsupplies its canonical domain; an omitted reaped or missing ID\npreserves the legacy idempotent Chat deletion behavior."
-          }
         }
       ],
       "result": {
@@ -5447,7 +5399,7 @@
                 "type": "null"
               }
             ],
-            "description": "Optional storage domain for `session/delete`. A live session\nsupplies its canonical domain; an omitted reaped or missing ID\npreserves the legacy idempotent Chat deletion behavior."
+            "description": "Optional storage domain for `session/delete`. A live session\nsupplies its canonical domain. If omitted for a reaped session,\na uniquely resolved Chat or ACP domain is used; ambiguous or\nmissing sessions are refused according to ownership policy."
           }
         }
       ],
@@ -5465,7 +5417,7 @@
       },
       "x-zeroclaw-params": {
         "shape": "typed",
-        "type": "SessionIdParams"
+        "type": "SessionDeleteParams"
       }
     },
     {
@@ -5595,21 +5547,6 @@
           "required": true,
           "schema": {
             "type": "string"
-          }
-        },
-        {
-          "name": "chat_mode",
-          "required": false,
-          "schema": {
-            "anyOf": [
-              {
-                "$ref": "#/components/schemas/ChatMode"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "description": "Optional storage domain for `session/delete`. A live session\nsupplies its canonical domain; an omitted reaped or missing ID\npreserves the legacy idempotent Chat deletion behavior."
           }
         }
       ],

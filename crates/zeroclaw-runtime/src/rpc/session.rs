@@ -1870,13 +1870,33 @@ impl SessionStore {
         generation: u64,
         authorize: impl FnOnce(Option<&str>) -> Result<G, E>,
     ) -> Result<bool, E> {
+        self.remove_generation_bound_authorized(id, generation, None, |_| {}, authorize)
+            .await
+    }
+
+    /// Settle only the prepared agent and owner, with its channel effect and
+    /// token/session removal under the same incarnation lock.
+    pub(crate) async fn remove_generation_bound_authorized<G, E>(
+        &self,
+        id: &str,
+        generation: u64,
+        expected: Option<(&Arc<Mutex<Agent>>, Option<&str>)>,
+        before_remove: impl FnOnce(&RpcSession),
+        authorize: impl FnOnce(Option<&str>) -> Result<G, E>,
+    ) -> Result<bool, E> {
         let mut sessions = self.sessions.lock().await;
-        let Some(session) = sessions.get(id).filter(|s| s.generation == generation) else {
+        let Some(session) = sessions.get(id).filter(|s| {
+            s.generation == generation
+                && expected.is_none_or(|(agent, owner)| {
+                    Arc::ptr_eq(&s.agent, agent) && s.owner_principal_id.as_deref() == owner
+                })
+        }) else {
             return Ok(false);
         };
         let mut tokens = self.cancel_tokens.lock().unwrap_or_else(|e| e.into_inner());
         let mut causes = self.cancel_causes.lock().unwrap_or_else(|e| e.into_inner());
         let _authority = authorize(session.owner_principal_id.as_deref())?;
+        before_remove(session);
         if tokens
             .get(id)
             .is_some_and(|(_, bound, _)| *bound == Some(generation))
@@ -2647,6 +2667,48 @@ impl SessionStore {
             session_id: id.to_string(),
             session_generation: expected_generation,
             admin_kill_fence,
+        }))
+    }
+
+    /// Signal only inside a caller-provided synchronous identity boundary.
+    /// The live-session and token locks remain held while the boundary checks
+    /// durable identity and invokes the effect.
+    pub(crate) async fn signal_session_deletion_bound<E>(
+        &self,
+        id: &str,
+        expected_generation: u64,
+        expected_access: Option<(u64, Option<&str>)>,
+        guarded: impl FnOnce(Option<&str>, &mut dyn FnMut()) -> Result<(), E>,
+    ) -> Result<Option<LifecycleCancellation<'_>>, E> {
+        let sessions = self.sessions.lock().await;
+        let Some(session) = sessions
+            .get(id)
+            .filter(|s| s.generation == expected_generation)
+        else {
+            return Ok(None);
+        };
+        if expected_access.is_some_and(|(generation, owner)| {
+            generation != session.generation || owner != session.owner_tui_id()
+        }) {
+            return Ok(None);
+        }
+        let tokens = self.cancel_tokens.lock().unwrap_or_else(|e| e.into_inner());
+        let mut causes = self.cancel_causes.lock().unwrap_or_else(|e| e.into_inner());
+        let mut signal = || {
+            if let Some((_, _, token)) = tokens
+                .get(id)
+                .filter(|(_, generation, _)| *generation == Some(expected_generation))
+            {
+                causes.insert(id.to_string(), CancelCause::SessionRemoved);
+                token.cancel();
+            }
+        };
+        guarded(session.owner_principal_id.as_deref(), &mut signal)?;
+        Ok(Some(LifecycleCancellation {
+            store: self,
+            session_id: id.to_string(),
+            session_generation: expected_generation,
+            admin_kill_fence: false,
         }))
     }
 

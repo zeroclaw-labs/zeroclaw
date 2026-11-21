@@ -1,8 +1,8 @@
 //! SQLite-backed session persistence with FTS5 search.
 
 use crate::session_backend::{
-    SessionBackend, SessionContext, SessionMetadata, SessionPromptBudget, SessionPromptOwner,
-    SessionQuery, SessionState,
+    SessionBackend, SessionContext, SessionDeletionAdmission, SessionEffectAuthorization,
+    SessionMetadata, SessionPromptBudget, SessionPromptOwner, SessionQuery, SessionState,
 };
 use crate::session_prompts::{
     MAX_SESSION_PROMPTS, MAX_SESSION_PROMPTS_BYTES, SessionPrompt, SessionPromptSetOutcome,
@@ -24,6 +24,119 @@ const OPEN_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5)
 /// SQLite-backed session store with FTS5 and WAL mode.
 pub struct SqliteSessionBackend {
     conn: Mutex<Connection>,
+}
+
+type DeletionRow = (String, Option<String>, String);
+
+struct SqliteDeletionAdmission {
+    backend: std::sync::Arc<SqliteSessionBackend>,
+    candidates: Vec<String>,
+    selected: Option<DeletionRow>,
+}
+
+fn deletion_row(conn: &Connection, candidates: &[String]) -> std::io::Result<Option<DeletionRow>> {
+    let mut selected = None;
+    for key in candidates {
+        let row: Option<(Option<String>, String)> = conn.query_row(
+            "SELECT principal_id, prompt_incarnation FROM session_metadata WHERE session_key = ?1",
+            params![key],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).optional().map_err(std::io::Error::other)?;
+        if let Some((principal, incarnation)) = row {
+            if selected.is_some() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "ambiguous session keys; refusing deletion",
+                ));
+            }
+            selected = Some((key.clone(), principal, incarnation));
+        }
+    }
+    Ok(selected)
+}
+
+// Check every current owner before exposing whether candidate keys conflict.
+fn authorize_deletion_candidates(
+    conn: &Connection,
+    candidates: &[String],
+    authorize: &SessionEffectAuthorization<'_>,
+) -> std::io::Result<()> {
+    for key in candidates {
+        let principal: Option<Option<String>> = conn
+            .query_row(
+                "SELECT principal_id FROM session_metadata WHERE session_key = ?1",
+                params![key],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(std::io::Error::other)?;
+        if let Some(principal) = principal {
+            let _authority = authorize(principal.as_deref())?;
+        }
+    }
+    Ok(())
+}
+
+impl SessionDeletionAdmission for SqliteDeletionAdmission {
+    fn selected_key(&self) -> Option<&str> {
+        self.selected.as_ref().map(|row| row.0.as_str())
+    }
+
+    fn principal(&self) -> Option<&str> {
+        self.selected.as_ref().and_then(|row| row.1.as_deref())
+    }
+
+    fn gateway_queue_identity_is_exact(&self) -> bool {
+        true
+    }
+
+    fn with_current(
+        &self,
+        authorize: &SessionEffectAuthorization<'_>,
+        effect: &mut dyn FnMut() -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
+        let mut conn = self.backend.conn.lock();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(std::io::Error::other)?;
+        authorize_deletion_candidates(&tx, &self.candidates, authorize)?;
+        if deletion_row(&tx, &self.candidates)? != self.selected {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "session deletion target changed",
+            ));
+        }
+        let _authority = authorize(self.principal())?;
+        effect()?;
+        tx.commit().map_err(std::io::Error::other)
+    }
+
+    fn delete(&self, authorize: &SessionEffectAuthorization<'_>) -> std::io::Result<bool> {
+        let mut conn = self.backend.conn.lock();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(std::io::Error::other)?;
+        authorize_deletion_candidates(&tx, &self.candidates, authorize)?;
+        if deletion_row(&tx, &self.candidates)? != self.selected {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "session deletion target changed",
+            ));
+        }
+        let Some((key, principal, _)) = self.selected.as_ref() else {
+            return Ok(false);
+        };
+        let _authority = authorize(principal.as_deref())?;
+        tx.execute("DELETE FROM sessions WHERE session_key = ?1", params![key])
+            .map_err(std::io::Error::other)?;
+        tx.execute(
+            "DELETE FROM session_metadata WHERE session_key = ?1",
+            params![key],
+        )
+        .map_err(std::io::Error::other)?;
+        tx.commit().map_err(std::io::Error::other)?;
+        Ok(true)
+    }
 }
 
 fn committed_jsonl_import_receipts_exist(conn: &Connection) -> Result<bool> {
@@ -1173,6 +1286,34 @@ impl SqliteSessionBackend {
 }
 
 impl SessionBackend for SqliteSessionBackend {
+    fn admit_session_deletion(
+        self: std::sync::Arc<Self>,
+        candidate_keys: &[&str],
+        authorize: &SessionEffectAuthorization<'_>,
+    ) -> std::io::Result<Box<dyn SessionDeletionAdmission>> {
+        let mut candidates = Vec::new();
+        for key in candidate_keys {
+            if !candidates
+                .iter()
+                .any(|existing: &String| existing.as_str() == *key)
+            {
+                candidates.push((*key).to_string());
+            }
+        }
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(std::io::Error::other)?;
+        authorize_deletion_candidates(&tx, &candidates, authorize)?;
+        let selected = deletion_row(&tx, &candidates)?;
+        tx.commit().map_err(std::io::Error::other)?;
+        drop(conn);
+        Ok(Box::new(SqliteDeletionAdmission {
+            backend: self,
+            candidates,
+            selected,
+        }))
+    }
     fn admit_session_prompt_owner(&self, session_key: &str) -> std::io::Result<SessionPromptOwner> {
         self.admit_session_prompt_owner_authorized(session_key, &|_| Ok(Box::new(())))
     }
@@ -3375,6 +3516,119 @@ mod tests {
                 "{key} prompt attachments must survive"
             );
         }
+    }
+
+    #[test]
+    fn admitted_deletion_rechecks_foreign_owner_before_ambiguity() {
+        let tmp = TempDir::new().unwrap();
+        let backend = std::sync::Arc::new(SqliteSessionBackend::new(tmp.path()).unwrap());
+        backend
+            .append("rpc_alpha", &ChatMessage::user("owned"))
+            .unwrap();
+        backend.set_session_principal("rpc_alpha", "alice").unwrap();
+        let authorize = |owner: Option<&str>| -> std::io::Result<
+            Box<dyn crate::session_backend::SessionEffectGuard>,
+        > {
+            if owner == Some("alice") {
+                Ok(Box::new(()))
+            } else {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "denied",
+                ))
+            }
+        };
+        let admission = backend
+            .clone()
+            .admit_session_deletion(&["rpc_alpha", "gw_alpha"], &authorize)
+            .unwrap();
+        backend
+            .append("gw_alpha", &ChatMessage::user("foreign"))
+            .unwrap();
+        backend.set_session_principal("gw_alpha", "bob").unwrap();
+        assert_eq!(
+            admission
+                .with_current(&authorize, &mut || panic!("must not signal"))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            admission.delete(&authorize).unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert!(backend.session_exists("rpc_alpha"));
+        assert!(backend.session_exists("gw_alpha"));
+    }
+
+    #[test]
+    fn admitted_deletion_refuses_multiple_same_owner_rows_after_reopen() {
+        let tmp = TempDir::new().unwrap();
+        let backend = std::sync::Arc::new(SqliteSessionBackend::new(tmp.path()).unwrap());
+        for key in ["rpc_alpha", "rpc_rpc_alpha"] {
+            backend
+                .append(key, &ChatMessage::user("preserved"))
+                .unwrap();
+            backend.set_session_principal(key, "user:alice").unwrap();
+            backend
+                .set_session_prompt(key, "task", "preserved prompt")
+                .unwrap();
+        }
+        let authorize = |_: Option<&str>| -> std::io::Result<
+            Box<dyn crate::session_backend::SessionEffectGuard>,
+        > { Ok(Box::new(())) };
+        assert!(
+            backend
+                .clone()
+                .admit_session_deletion(&["rpc_alpha", "rpc_rpc_alpha"], &authorize)
+                .is_err()
+        );
+        drop(backend);
+        let reopened = SqliteSessionBackend::new(tmp.path()).unwrap();
+        for key in ["rpc_alpha", "rpc_rpc_alpha"] {
+            assert_eq!(reopened.load(key).len(), 1);
+            assert_eq!(reopened.list_session_prompts(key).unwrap().len(), 1);
+        }
+    }
+
+    #[test]
+    fn admitted_deletion_refuses_reset_successor_and_new_candidate() {
+        let tmp = TempDir::new().unwrap();
+        let backend = std::sync::Arc::new(SqliteSessionBackend::new(tmp.path()).unwrap());
+        let other = SqliteSessionBackend::new(tmp.path()).unwrap();
+        backend
+            .append("rpc_alpha", &ChatMessage::user("original"))
+            .unwrap();
+        let authorize = |_: Option<&str>| -> std::io::Result<
+            Box<dyn crate::session_backend::SessionEffectGuard>,
+        > { Ok(Box::new(())) };
+        let admitted = backend
+            .clone()
+            .admit_session_deletion(&["alpha", "rpc_alpha", "gw_alpha"], &authorize)
+            .unwrap();
+        other.reset_session("rpc_alpha").unwrap();
+        other
+            .append("rpc_alpha", &ChatMessage::user("successor"))
+            .unwrap();
+        other
+            .set_session_prompt("rpc_alpha", "task", "new context")
+            .unwrap();
+        assert!(admitted.delete(&authorize).is_err());
+        drop(admitted);
+        drop(backend);
+        drop(other);
+        let reopened = std::sync::Arc::new(SqliteSessionBackend::new(tmp.path()).unwrap());
+        assert_eq!(reopened.load("rpc_alpha")[0].content, "successor");
+        assert_eq!(reopened.list_session_prompts("rpc_alpha").unwrap().len(), 1);
+        let absent = reopened
+            .clone()
+            .admit_session_deletion(&["rpc_other"], &authorize)
+            .unwrap();
+        reopened
+            .append("rpc_other", &ChatMessage::user("appeared later"))
+            .unwrap();
+        assert!(absent.delete(&authorize).is_err());
+        assert_eq!(reopened.load("rpc_other").len(), 1);
     }
 
     #[test]

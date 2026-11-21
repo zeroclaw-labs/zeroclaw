@@ -71,7 +71,7 @@ per daemon generation and shared with RPC Chat deletion. Gateway restarts retain
 that coordination; daemon reload replaces it. Gateway and RPC turn queues remain
 distinct (depth eight and 32 respectively). Cross-surface deletion takes RPC
 admission before gateway admission, then invalidates the gateway generation only
-after the durable Chat alias-set deletion commits. Standalone gateways construct
+after an unambiguous durable Chat deletion commits. Standalone gateways construct
 their own coordination and do not acquire a dependency on local RPC.
 
 Each registered gateway cancellation entry retains the exact admitted queue
