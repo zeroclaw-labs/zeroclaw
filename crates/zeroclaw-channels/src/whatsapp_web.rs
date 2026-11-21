@@ -1164,6 +1164,7 @@ impl WhatsAppWebChannel {
             return;
         }
 
+        let mut voice_drop = None;
         let voice_text = if let Some(audio) = msg.audio_message.as_option() {
             let is_ptt = audio.ptt == Some(true);
             let non_ptt_enabled = context
@@ -1171,13 +1172,20 @@ impl WhatsAppWebChannel {
                 .as_ref()
                 .is_some_and(|c| c.transcribe_non_ptt_audio);
             if is_ptt || non_ptt_enabled {
-                Self::try_transcribe_voice_note(
+                match Self::try_transcribe_voice_note(
                     client,
                     audio,
                     context.transcription_config.as_ref(),
                     context.transcription_manager.as_deref(),
                 )
                 .await
+                {
+                    Ok(text) => Some(text),
+                    Err(reason) => {
+                        voice_drop = Some(reason);
+                        None
+                    }
+                }
             } else {
                 ::zeroclaw_log::record!(
                     DEBUG,
@@ -1206,6 +1214,14 @@ impl WhatsAppWebChannel {
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
                 &format!("ignoring empty or non-text message from {}", normalized)
             );
+            if let Some(notice) = Self::voice_drop_notice(
+                voice_drop,
+                &context.dm_mention_patterns,
+                &context.group_mention_patterns,
+                is_group,
+            ) {
+                Self::send_voice_drop_notice(client, &info.source.chat, notice).await;
+            }
             return;
         }
 
@@ -1433,17 +1449,19 @@ impl WhatsAppWebChannel {
     }
 
     /// Attempt to download and transcribe a WhatsApp voice note.
-    /// Returns `None` if transcription is disabled, download fails, or
-    /// transcription fails (all logged as warnings).
+    /// Returns why it was not transcribed if transcription is disabled, the
+    /// note is too long, download fails, or transcription fails or is empty
+    /// (all logged).
     #[cfg(feature = "whatsapp-web")]
     async fn try_transcribe_voice_note(
         client: &whatsapp_rust::Client,
         audio: &waproto::whatsapp::message::AudioMessage,
         transcription_config: Option<&zeroclaw_config::schema::TranscriptionConfig>,
         transcription_manager: Option<&super::transcription::TranscriptionManager>,
-    ) -> Option<String> {
-        let config = transcription_config?;
-        let manager = transcription_manager?;
+    ) -> Result<String, VoiceDropReason> {
+        let (Some(config), Some(manager)) = (transcription_config, transcription_manager) else {
+            return Err(VoiceDropReason::NotConfigured);
+        };
 
         // Enforce duration limit
         if let Some(seconds) = audio.seconds
@@ -1457,7 +1475,9 @@ impl WhatsAppWebChannel {
                     seconds, config.max_duration_secs
                 )
             );
-            return None;
+            return Err(VoiceDropReason::TooLong {
+                limit_secs: config.max_duration_secs,
+            });
         }
 
         // Download the encrypted audio
@@ -1472,7 +1492,7 @@ impl WhatsAppWebChannel {
                         .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
                     "failed to download voice note"
                 );
-                return None;
+                return Err(VoiceDropReason::DownloadFailed);
             }
         };
 
@@ -1502,7 +1522,7 @@ impl WhatsAppWebChannel {
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
                     "voice transcription returned empty text, skipping"
                 );
-                None
+                Err(VoiceDropReason::EmptyTranscript)
             }
             Ok(text) => {
                 ::zeroclaw_log::record!(
@@ -1510,7 +1530,7 @@ impl WhatsAppWebChannel {
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
                     &format!("voice note transcribed ({} chars)", text.len())
                 );
-                Some(text)
+                Ok(text)
             }
             Err(e) => {
                 ::zeroclaw_log::record!(
@@ -1520,9 +1540,70 @@ impl WhatsAppWebChannel {
                         .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
                     "voice transcription failed"
                 );
-                None
+                Err(VoiceDropReason::TranscriptionFailed)
             }
         }
+    }
+
+    /// The notice for a voice note that was not transcribed, or `None` when
+    /// the sender must not get one.
+    ///
+    /// A voice note with no transcript is dropped, and silence looks like a
+    /// bot that never heard it. The notice goes only where a normal reply
+    /// would: the caller has already passed the allowlist, chat policy,
+    /// `mention_only` and passive-context gates, and mention patterns that
+    /// apply to this chat leave it silent, because an untranscribed note
+    /// cannot show it was addressed to the bot.
+    #[cfg(feature = "whatsapp-web")]
+    fn voice_drop_notice(
+        reason: Option<VoiceDropReason>,
+        dm_mention_patterns: &[regex::Regex],
+        group_mention_patterns: &[regex::Regex],
+        is_group: bool,
+    ) -> Option<String> {
+        let reason = reason?;
+        super::whatsapp::WhatsAppChannel::apply_mention_gating(
+            dm_mention_patterns,
+            group_mention_patterns,
+            "",
+            is_group,
+        )?;
+        Some(reason.notice())
+    }
+
+    /// Tell the sender why their voice note will not be answered. Best
+    /// effort and bounded by [`VOICE_DROP_NOTICE_TIMEOUT`], so a stalled
+    /// send cannot hold up the messages behind it; a failure is logged.
+    #[cfg(feature = "whatsapp-web")]
+    async fn send_voice_drop_notice(
+        client: &whatsapp_rust::Client,
+        to: &wacore_binary::jid::Jid,
+        notice: String,
+    ) {
+        #[cfg(test)]
+        if VOICE_DROP_NOTICE_SINK
+            .try_with(|sink| sink.lock().push((to.clone(), notice.clone())))
+            .is_ok()
+        {
+            return;
+        }
+        let outgoing = waproto::whatsapp::Message {
+            conversation: Some(notice),
+            ..Default::default()
+        };
+        let send = Box::pin(client.send_message(to.clone(), outgoing));
+        let error = match tokio::time::timeout(VOICE_DROP_NOTICE_TIMEOUT, send).await {
+            Ok(Ok(_)) => return,
+            Ok(Err(e)) => e.to_string(),
+            Err(_) => "timed out".to_string(),
+        };
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({"error": error})),
+            "failed to notify sender about skipped voice note"
+        );
     }
 
     #[cfg(feature = "whatsapp-web")]
@@ -3167,6 +3248,66 @@ fn validate_whatsapp_location_target(
             "WhatsApp Web location marker must be `lat,lng[,name[,address]]` with in-range WGS84 coordinates",
         ))
     })
+}
+
+#[cfg(all(test, feature = "whatsapp-web"))]
+tokio::task_local! {
+    /// Where `send_voice_drop_notice` records `(chat, notice)` instead of
+    /// sending, inside a test's scope. It is the vendor send that is replaced,
+    /// so everything before it (admission, policy, mention gates, the drop
+    /// reason and the target chat) runs as in production without a paired
+    /// account.
+    static VOICE_DROP_NOTICE_SINK: Arc<Mutex<Vec<(wacore_binary::jid::Jid, String)>>>;
+}
+
+/// Ceiling on one voice-drop notice send. It runs inline in the inbound
+/// handler, so an unbounded stall would hold up every message behind it.
+#[cfg(feature = "whatsapp-web")]
+const VOICE_DROP_NOTICE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Why a voice note was not transcribed, and what its sender is told.
+#[cfg(feature = "whatsapp-web")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VoiceDropReason {
+    /// No `[transcription]` is configured for this channel.
+    NotConfigured,
+    /// The note is longer than `transcription.max_duration_secs`.
+    TooLong { limit_secs: u64 },
+    /// The encrypted audio could not be downloaded from WhatsApp.
+    DownloadFailed,
+    /// The transcription provider returned an error.
+    TranscriptionFailed,
+    /// Transcription succeeded but produced nothing usable.
+    EmptyTranscript,
+}
+
+#[cfg(feature = "whatsapp-web")]
+impl VoiceDropReason {
+    /// The sentence the sender sees. Provider and download diagnostics stay
+    /// in the log: the sender gets the reason, never the internals.
+    fn notice(self) -> String {
+        match self {
+            Self::NotConfigured => {
+                i18n::get_required_cli_string("channel-whatsapp-web-voice-drop-not-configured")
+            }
+            Self::TooLong { limit_secs } => {
+                let limit_secs = limit_secs.to_string();
+                i18n::get_required_cli_string_with_args(
+                    "channel-whatsapp-web-voice-drop-too-long",
+                    &[("limit_secs", limit_secs.as_str())],
+                )
+            }
+            Self::DownloadFailed => {
+                i18n::get_required_cli_string("channel-whatsapp-web-voice-drop-download-failed")
+            }
+            Self::TranscriptionFailed => i18n::get_required_cli_string(
+                "channel-whatsapp-web-voice-drop-transcription-failed",
+            ),
+            Self::EmptyTranscript => {
+                i18n::get_required_cli_string("channel-whatsapp-web-voice-drop-empty-transcript")
+            }
+        }
+    }
 }
 
 #[cfg(feature = "whatsapp-web")]
@@ -6381,6 +6522,138 @@ mod tests {
         }
     }
 
+    /// A voice note that cannot be transcribed is answered with a notice in
+    /// the sender's own chat, and only for a sender the allowlist admits.
+    ///
+    /// Driven through the real inbound handler: admission, chat policy, the
+    /// duration check (before any download, so no network) and the drop
+    /// notice all run as in production. Only the vendor send is replaced by
+    /// `VOICE_DROP_NOTICE_SINK`, so no paired account is needed.
+    #[tokio::test]
+    #[cfg(feature = "whatsapp-web")]
+    async fn inbound_voice_drop_notice_reaches_only_an_admitted_sender() {
+        use wacore::types::message::{MessageInfo, MessageSource};
+        use whatsapp_rust::TokioRuntime;
+        use whatsapp_rust::bot::Bot;
+        use whatsapp_rust_tokio_transport::TokioWebSocketTransportFactory;
+        use whatsapp_rust_ureq_http_client::UreqHttpClient;
+        use zeroclaw_config::schema::{WhatsAppChatPolicy as Policy, WhatsAppWebMode as Mode};
+
+        const ALLOWED: &str = "15551234567";
+        const UNKNOWN: &str = "15559999999";
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Arc::new(crate::whatsapp_storage::RusqliteStore::new(tmp.path()).unwrap());
+        let bot = Bot::builder()
+            .with_backend_arc(store)
+            .with_transport_factory(TokioWebSocketTransportFactory::new())
+            .with_http_client(UreqHttpClient::new())
+            .with_runtime(TokioRuntime)
+            .build()
+            .await
+            .unwrap();
+        let client = bot.client();
+
+        let transcription = zeroclaw_config::schema::TranscriptionConfig {
+            enabled: true,
+            api_key: Some("test_key".to_string()),
+            max_duration_secs: 5,
+            ..Default::default()
+        };
+        let manager = Arc::new(
+            super::super::transcription::manager_from_snapshot(&transcription)
+                .expect("an enabled snapshot builds a manager"),
+        );
+
+        let voice_note = |sender: &str| {
+            let sender_jid: Jid = format!("{sender}@s.whatsapp.net")
+                .parse()
+                .expect("sender jid parses");
+            single_message_event(
+                Arc::new(waproto::whatsapp::Message {
+                    audio_message: waproto::whatsapp::message::AudioMessage {
+                        ptt: Some(true),
+                        seconds: Some(30),
+                        ..Default::default()
+                    }
+                    .into(),
+                    ..Default::default()
+                }),
+                Arc::new(MessageInfo {
+                    source: MessageSource {
+                        chat: sender_jid.clone(),
+                        sender: sender_jid,
+                        is_from_me: false,
+                        is_group: false,
+                        ..Default::default()
+                    },
+                    id: format!("voice-{sender}"),
+                    r#type: "media".to_string(),
+                    timestamp: chrono::Utc::now(),
+                    ..Default::default()
+                }),
+            )
+        };
+
+        for mode in [Mode::Business, Mode::Personal] {
+            let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+            let context = WhatsAppInboundContext {
+                tx,
+                alias: Arc::new("voice-drop-notice".to_string()),
+                peer_resolver: Arc::new(|| vec![format!("+{ALLOWED}")]),
+                allowed_groups_resolver: Arc::new(Vec::new),
+                mode: mode.clone(),
+                dm_policy: Policy::Allowlist,
+                group_policy: Policy::Allowlist,
+                self_chat_mode: false,
+                mention_only: false,
+                passive_group_context: false,
+                bot_phone: Arc::new(Mutex::new(None)),
+                bot_lid: Arc::new(Mutex::new(None)),
+                dm_mention_patterns: Arc::new(Vec::new()),
+                group_mention_patterns: Arc::new(Vec::new()),
+                transcription_config: Some(transcription.clone()),
+                transcription_manager: Some(Arc::clone(&manager)),
+                voice_chats: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            };
+
+            for (sender, admitted) in [(UNKNOWN, false), (ALLOWED, true)] {
+                let sink = Arc::new(Mutex::new(Vec::new()));
+                let event = voice_note(sender);
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(1),
+                    VOICE_DROP_NOTICE_SINK.scope(
+                        Arc::clone(&sink),
+                        WhatsAppWebChannel::handle_inbound_message_event(&event, &client, &context),
+                    ),
+                )
+                .await
+                .expect("a voice drop must finish without a paired account");
+
+                let sent = sink.lock().clone();
+                if admitted {
+                    assert_eq!(sent.len(), 1, "{mode:?}: one notice for {sender}: {sent:?}");
+                    let (chat, notice) = &sent[0];
+                    assert_eq!(chat.to_string(), format!("{sender}@s.whatsapp.net"));
+                    assert_eq!(
+                        notice,
+                        &VoiceDropReason::TooLong { limit_secs: 5 }.notice(),
+                        "{mode:?}: the notice names the duration limit"
+                    );
+                } else {
+                    assert!(
+                        sent.is_empty(),
+                        "{mode:?}: a rejected sender gets nothing: {sent:?}"
+                    );
+                }
+                assert!(
+                    rx.try_recv().is_err(),
+                    "{mode:?}: an untranscribed note never reaches the agent"
+                );
+            }
+        }
+    }
+
     /// Rejecting one entry in an offline-drain batch must not abandon later
     /// entries, and the accepted messages must preserve their arrival order.
     #[tokio::test]
@@ -7271,6 +7544,115 @@ mod tests {
         assert_eq!(
             WhatsAppWebChannel::media_fallback_content(String::new(), &msg),
             ""
+        );
+    }
+
+    /// A voice note that is not transcribed must not vanish without a word:
+    /// it never reaches the agent, so the sender would get no answer and no
+    /// reason. Checked ahead of any download, so no network is involved.
+    #[tokio::test]
+    #[cfg(feature = "whatsapp-web")]
+    async fn untranscribed_voice_note_reports_why() {
+        use whatsapp_rust::TokioRuntime;
+        use whatsapp_rust::bot::Bot;
+        use whatsapp_rust_tokio_transport::TokioWebSocketTransportFactory;
+        use whatsapp_rust_ureq_http_client::UreqHttpClient;
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Arc::new(crate::whatsapp_storage::RusqliteStore::new(tmp.path()).unwrap());
+        let bot = Bot::builder()
+            .with_backend_arc(store)
+            .with_transport_factory(TokioWebSocketTransportFactory::new())
+            .with_http_client(UreqHttpClient::new())
+            .with_runtime(TokioRuntime)
+            .build()
+            .await
+            .unwrap();
+        let client = bot.client();
+        let audio = waproto::whatsapp::message::AudioMessage {
+            ptt: Some(true),
+            seconds: Some(30),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            WhatsAppWebChannel::try_transcribe_voice_note(&client, &audio, None, None).await,
+            Err(VoiceDropReason::NotConfigured)
+        );
+
+        let config = zeroclaw_config::schema::TranscriptionConfig {
+            enabled: true,
+            api_key: Some("test_key".to_string()),
+            max_duration_secs: 5,
+            ..Default::default()
+        };
+        let manager = super::super::transcription::manager_from_snapshot(&config)
+            .expect("an enabled snapshot builds a manager");
+        assert_eq!(
+            WhatsAppWebChannel::try_transcribe_voice_note(
+                &client,
+                &audio,
+                Some(&config),
+                Some(&manager)
+            )
+            .await,
+            Err(VoiceDropReason::TooLong { limit_secs: 5 })
+        );
+    }
+
+    /// The notice goes only where a normal reply would. Mention patterns
+    /// that apply to this chat keep it silent: an untranscribed note cannot
+    /// show it was addressed to the bot.
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn voice_drop_notice_respects_mention_patterns() {
+        let reason = Some(VoiceDropReason::EmptyTranscript);
+        let patterns = vec![regex::Regex::new("(?i)@bot").unwrap()];
+        let none: Vec<regex::Regex> = Vec::new();
+
+        assert!(WhatsAppWebChannel::voice_drop_notice(reason, &none, &none, false).is_some());
+        assert!(WhatsAppWebChannel::voice_drop_notice(reason, &none, &none, true).is_some());
+        assert!(WhatsAppWebChannel::voice_drop_notice(reason, &patterns, &none, false).is_none());
+        assert!(WhatsAppWebChannel::voice_drop_notice(reason, &none, &patterns, true).is_none());
+        // Patterns for the other chat type do not apply here.
+        assert!(WhatsAppWebChannel::voice_drop_notice(reason, &none, &patterns, false).is_some());
+        // No drop reason (not audio, or ignored non-PTT audio): no notice.
+        assert!(WhatsAppWebChannel::voice_drop_notice(None, &none, &none, false).is_none());
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn voice_drop_notices_name_the_reason_without_internals() {
+        // Notices follow the process locale, so only check what every
+        // translation shares.
+        let too_long = VoiceDropReason::TooLong { limit_secs: 900 }.notice();
+        assert!(too_long.contains("900"), "{too_long}");
+
+        let notices = [
+            VoiceDropReason::NotConfigured,
+            VoiceDropReason::TooLong { limit_secs: 900 },
+            VoiceDropReason::DownloadFailed,
+            VoiceDropReason::TranscriptionFailed,
+            VoiceDropReason::EmptyTranscript,
+        ]
+        .map(VoiceDropReason::notice);
+        for notice in &notices {
+            assert!(
+                notice.starts_with("⚠️ "),
+                "every notice says what happened up front: {notice}"
+            );
+            assert!(
+                !notice.to_lowercase().contains("error")
+                    && !notice.contains("http")
+                    && !notice.contains("api"),
+                "diagnostics belong in the log, not in the chat: {notice}"
+            );
+        }
+        let distinct: std::collections::HashSet<_> = notices.iter().collect();
+        assert_eq!(
+            distinct.len(),
+            notices.len(),
+            "each reason reads differently"
         );
     }
 
