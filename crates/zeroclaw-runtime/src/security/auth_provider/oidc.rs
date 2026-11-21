@@ -759,8 +759,13 @@ impl OidcAuthProvider {
         // An ID token's `aud` must contain its client and may list other
         // audiences too (OIDC Core §2), so an untyped token must name the
         // configured audience and nothing else: an identifier no client
-        // uses, alone, cannot be an ID token's `aud`.
-        if !typed && !audience_is_exactly(claims.aud.as_ref(), &self.config.audience) {
+        // uses, alone, cannot be an ID token's `aud`. A Security Event Token
+        // such as a back-channel logout token may also be typed `JWT`; its
+        // `events` claim marks it as not an access token.
+        if !typed
+            && (!audience_is_exactly(claims.aud.as_ref(), &self.config.audience)
+                || raw.contains_key("events"))
+        {
             return deny(DenyReason::BadCredential);
         }
         self.claims_to_identity(&claims, raw, VerifiedVia::Jwks { typed })
@@ -949,17 +954,18 @@ impl OidcAuthProvider {
         //
         // An operator-declared `client_id_claim` (JWKS only) replaces that
         // default: the declared claim must name the client, it has no `azp`
-        // fallback, and a present `client_id` or `azp` must agree with it.
+        // fallback, and a present `client_id` or `azp` must agree with it
+        // (a blank one disagrees rather than counting as absent).
         let declared_client_claim = self.declared_client_id_claim(via);
         let named_client = match declared_client_claim {
             Some(name) => {
                 let Some(declared) = nonblank_str_claim(&raw, name) else {
                     return deny(DenyReason::BadCredential);
                 };
-                if claims
-                    .client_id
-                    .as_deref()
-                    .is_some_and(|client_id| client_id != declared)
+                if [claims.client_id.as_deref(), claims.azp.as_deref()]
+                    .into_iter()
+                    .flatten()
+                    .any(|named| named != declared)
                 {
                     return deny(DenyReason::BadCredential);
                 }
@@ -1808,6 +1814,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn waived_typing_refuses_a_back_channel_logout_token_even_for_the_api_audience() {
+        // OIDC Back-Channel Logout allows a logout token typed `JWT`. It
+        // carries no `nonce`, so its `events` claim is the marker that keeps
+        // it out even when its `aud` happens to be the configured audience.
+        let idp = start_idp().await;
+        let provider = OidcAuthProvider::new("test", idp.untyped_config()).unwrap();
+        let accepted = idp.untyped_user_claims();
+        let token = idp.mint_with_header(UNTYPED_JWT_HEADER, &accepted);
+        assert!(provider.verify(&bearer(token)).await.identity().is_some());
+
+        let mut logout = accepted;
+        logout["sid"] = serde_json::json!("08a5019c-17e1-4977-8f42-65a12843ea02");
+        for events in [
+            serde_json::json!({"http://schemas.openid.net/event/backchannel-logout": {}}),
+            serde_json::json!({}),
+            serde_json::json!(null),
+        ] {
+            logout["events"] = events.clone();
+            for header in [UNTYPED_JWT_HEADER, NO_TYP_HEADER] {
+                let token = idp.mint_with_header(header, &logout);
+                let outcome = provider.verify(&bearer(token)).await;
+                assert!(
+                    is_bad_credential(&outcome),
+                    "{events} {header}: {outcome:?}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn waived_typing_without_audience_separation_is_refused_by_the_verifier() {
         // Config validation refuses this entry; the verifier must not rely
         // on that, since a provider can be built from unvalidated config.
@@ -1863,6 +1899,26 @@ mod tests {
         claims["client_id"] = serde_json::json!("someone-else");
         let token = idp.mint_with_header(NO_TYP_HEADER, &claims);
         assert!(is_bad_credential(&provider.verify(&bearer(token)).await));
+    }
+
+    #[tokio::test]
+    async fn a_declared_client_id_claim_contradicted_by_a_present_azp_is_refused() {
+        // A present `azp` must agree with the declared claim; a blank one is
+        // not treated as absent.
+        let idp = start_idp().await;
+        let mut config = idp.untyped_config();
+        config.client_id_claim = "cid".into();
+        let provider = OidcAuthProvider::new("test", config).unwrap();
+        let mut claims = okta_claims(&idp);
+        claims["azp"] = serde_json::json!("zerocode-cli");
+        let token = idp.mint_with_header(NO_TYP_HEADER, &claims);
+        assert!(provider.verify(&bearer(token)).await.identity().is_some());
+        for azp in ["", "  ", "someone-else"] {
+            claims["azp"] = serde_json::json!(azp);
+            let token = idp.mint_with_header(NO_TYP_HEADER, &claims);
+            let outcome = provider.verify(&bearer(token)).await;
+            assert!(is_bad_credential(&outcome), "azp {azp:?}: {outcome:?}");
+        }
     }
 
     #[tokio::test]
