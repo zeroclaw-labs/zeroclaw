@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { Button, Select } from "@/components/ui";
-import { changeHttpCredential, listHttpCredentials, type HttpCredentialRow } from "@/lib/api";
+import { HttpError, changeHttpCredential, listHttpCredentials, type HttpCredentialRow } from "@/lib/api";
 import { t } from "@/lib/i18n";
 import { parseSshDestinations } from "./HttpCredentials";
 
@@ -51,7 +51,8 @@ export default function CredentialPermissions() {
   }
 
   async function save(entry: Grant, replaced?: Grant, remove = false) {
-    if (busy) return;
+    const current = rows.find(item => item.name === entry.alias);
+    if (busy || !current) return;
     setBusy(true);
     setMessage("");
     try {
@@ -66,12 +67,24 @@ export default function CredentialPermissions() {
         setMessage(t("plugin_tls.failed"));
         return;
       }
-      await changeHttpCredential({ name: entry.alias, operation: "replace", permissions });
+      await changeHttpCredential({
+        name: entry.alias,
+        operation: "replace",
+        permissions: { ...permissions, expected_revision: current.permission_revision },
+      });
       setRows((await listHttpCredentials()).credentials);
       setDraft(undefined);
       setEditing(undefined);
       setMessage(t("plugin_tls.saved"));
-    } catch {
+    } catch (error) {
+      if (error instanceof HttpError && error.status === 409) {
+        setDraft(undefined);
+        setEditing(undefined);
+        await listHttpCredentials().then(
+          result => setRows(result.credentials),
+          () => setRows([]),
+        );
+      }
       setMessage(t("plugin_tls.failed"));
     } finally {
       setBusy(false);

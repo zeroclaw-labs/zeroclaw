@@ -129,3 +129,7 @@ tool-web-search-tool-error-searxng-not-configured = L’URL de l’instance Sear
 tool-web-search-tool-note-truncated-results = (résultats supplémentaires omis)
 tool-workspace = Gérer des espaces de travail multi-clients. Sous-commandes : list, switch, create, info, export. Chaque espace de travail fournit une mémoire isolée, des journaux audit, des secrets et des restrictions d'outils.
 tool-weather = Obtenez les conditions météorologiques actuelles et les prévisions pour n'importe où dans le monde. Prend en charge les noms de villes (dans n'importe quelle langue ou script), les codes aéroport IATA (par exemple 'LAX'), les coordonnées GPS (par exemple '51.5,-0.1'), les codes postaux/zip, et la géolocalisation par domaine. Retourne la température, l'apparente, l'humidité, la vitesse/direction du vent, les précipitations, la visibilité, la pression, l'index UV et l'ensoleillement. Prévisions optionnelles de 0 à 3 jours avec détail horaire. Les unités par défaut sont le système métrique (°C, km/h, mm) mais peuvent être définies sur le système impérial (°F, mph, pouces) selon la requête. Aucune clé API n'est requise.
+
+# Managed browser credentials
+tool-browser-credential-submitted = Identifiant envoyé
+tool-browser-credential-submission-failed = Échec de l’envoi de l’identifiant dans le navigateur géré

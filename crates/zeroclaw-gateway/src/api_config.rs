@@ -1371,6 +1371,7 @@ struct HttpCredentialMutation {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct HttpCredentialPermissions {
+    expected_revision: Option<String>,
     http_allowed: Option<bool>,
     http_origins: Option<Vec<String>>,
     browser: Option<BrowserCredentialPermission>,
@@ -1392,6 +1393,43 @@ fn scoped_credential_kind(auth: &zeroclaw_config::schema::ScopedHttpAuth) -> &'s
         ScopedHttpAuth::SshKey { .. } => "ssh_key",
         ScopedHttpAuth::Totp { .. } => "totp",
     }
+}
+
+fn permission_revision(record: &zeroclaw_config::schema::ScopedHttpCredential) -> String {
+    use sha2::{Digest, Sha256};
+    use zeroclaw_config::schema::ScopedHttpAuth;
+
+    let destinations = match &record.auth {
+        ScopedHttpAuth::SshKey { destinations, .. } => Some(destinations),
+        _ => None,
+    };
+    let public_state = serde_json::json!([
+        scoped_credential_kind(&record.auth),
+        record.source,
+        record.origin,
+        record.http_allowed,
+        record.http_grants(),
+        record.browser_grants().collect::<Vec<_>>(),
+        destinations,
+    ]);
+    format!("{:x}", Sha256::digest(public_state.to_string().as_bytes()))
+}
+
+#[cfg(test)]
+#[test]
+fn permission_revision_changes_after_browser_grant_revocation() {
+    let mut record: zeroclaw_config::schema::ScopedHttpCredential =
+        serde_json::from_value(serde_json::json!({
+            "origin": "https://example.com",
+            "browser_origin": "https://example.com",
+            "browser_origins": ["https://example.org"],
+            "auth": { "kind": "totp", "seed": "fixture" }
+        }))
+        .unwrap();
+    let initial = permission_revision(&record);
+    assert_eq!(initial, permission_revision(&record));
+    record.browser_origins.clear();
+    assert_ne!(initial, permission_revision(&record));
 }
 
 struct ScopedCredentialAudit {
@@ -1470,7 +1508,7 @@ pub async fn list_http_credentials(
                 rows.push((
                     name,
                     serde_json::json!({
-                        "name": name, "origin": record.origin, "kind": kind, "source": record.source, "destinations": destinations, "header": header, "http_allowed": http_allowed, "http_origins": record.http_grants(), "browser_origin": record.browser_origin, "browser_origins": record.browser_grants().collect::<Vec<_>>()
+                        "name": name, "permission_revision": permission_revision(&record), "origin": record.origin, "kind": kind, "source": record.source, "destinations": destinations, "header": header, "http_allowed": http_allowed, "http_origins": record.http_grants(), "browser_origin": record.browser_origin, "browser_origins": record.browser_grants().collect::<Vec<_>>()
                     }),
                 ));
             }
@@ -1540,6 +1578,13 @@ pub async fn mutate_http_credential(
                 }) else {
                     return StatusCode::SERVICE_UNAVAILABLE.into_response();
                 };
+                if permissions
+                    .expected_revision
+                    .as_deref()
+                    .is_some_and(|revision| revision != permission_revision(&record))
+                {
+                    return StatusCode::CONFLICT.into_response();
+                }
                 let grant = serde_json::json!({
                     "http_allowed": permissions.http_allowed,
                     "http_origin_count": permissions.http_origins.as_ref().map(Vec::len),
@@ -1756,7 +1801,10 @@ pub async fn mutate_http_credential(
                                 key.starts_with("-----BEGIN OPENSSH PRIVATE KEY-----")
                                     && key.ends_with("-----END OPENSSH PRIVATE KEY-----")
                             }
-                            source => source.command(key).is_some(),
+                            ScopedCredentialSource::OpenBao => {
+                                credential.source.command(key).is_some()
+                            }
+                            _ => false,
                         };
                         valid_key
                             && destinations.len() <= 32

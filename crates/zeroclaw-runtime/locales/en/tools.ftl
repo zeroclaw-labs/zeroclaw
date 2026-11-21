@@ -310,3 +310,7 @@ tool-ssh-task-unsupported = The task SSH broker requires Linux.
 tool-native-ssh-credential = The SSH credential or destination grant is unavailable.
 
 tool-native-ssh-connection = The managed SSH connection could not be established.
+
+# Managed browser credentials
+tool-browser-credential-submitted = Credential submitted
+tool-browser-credential-submission-failed = Managed browser credential submission failed

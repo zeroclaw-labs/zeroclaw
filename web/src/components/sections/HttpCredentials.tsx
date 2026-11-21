@@ -140,7 +140,7 @@ export default function HttpCredentials({ kind }: { kind: HttpCredentialKind }) 
             <Select id="credential-source" value={source}
               aria-label={t("http_credentials.source")}
               onChange={(value) => setSource(value as HttpCredentialSource)}
-              options={Object.keys(sources).map((value) => ({ value, label: t(`http_credentials.source_${value}`) }))}
+              options={Object.keys(sources).filter(value => kind !== "ssh_key" || value === "local" || value === "open_bao").map((value) => ({ value, label: t(`http_credentials.source_${value}`) }))}
             />
           </div>
           <details className="space-y-2 rounded-md border p-3 text-sm">
