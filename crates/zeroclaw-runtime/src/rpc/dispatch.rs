@@ -1403,7 +1403,8 @@ impl RpcDispatcher {
         let Some(grants) = self.stamped_grants() else {
             return Err(rpc_err(AUTH_REQUIRED, "First call must be 'initialize'"));
         };
-        self.selector_session_agent_with_grants(method, grants, alias)
+        let config = self.ctx.config.read();
+        self.selector_session_agent_with_grants(method, grants, &config, alias)
     }
 
     /// The grants stamped on this connection by the last pass through the
@@ -1420,6 +1421,7 @@ impl RpcDispatcher {
         &self,
         method: Method,
         grants: &zeroclaw_api::grants::ResolvedGrants,
+        config: &Config,
         alias: &str,
     ) -> Result<(), JsonRpcError> {
         if !grants.may_use_agent(alias) {
@@ -1435,6 +1437,23 @@ impl RpcDispatcher {
                 },
             );
             return Err(denied);
+        }
+        self.require_agent_takes_turns(config, alias)
+    }
+
+    /// Live-config check that a named agent can take a turn: enabled, with a
+    /// model provider and a risk profile. A runtime profile is optional.
+    /// Unknown aliases are left to existing not-found paths so a grant for a
+    /// name that is not configured stays a grant question, not a dispatch one.
+    fn require_agent_takes_turns(&self, config: &Config, alias: &str) -> Result<(), JsonRpcError> {
+        if config
+            .agent(alias)
+            .is_some_and(|agent| !agent.is_dispatchable())
+        {
+            return Err(rpc_err(
+                INVALID_PARAMS,
+                format!("Agent `{alias}` is not enabled for dispatch"),
+            ));
         }
         Ok(())
     }
@@ -1802,7 +1821,7 @@ impl RpcDispatcher {
         // longer reach another's session by ID, so the outright refusal is
         // lifted and the selector is composed into that principal's own,
         // owner-isolated session.
-        self.selector_session_agent_with_grants(method, grants, alias)?;
+        self.selector_session_agent_with_grants(method, grants, config, alias)?;
         self.confine_session_workspace_with_grants(method, grants, config, alias, workspace)
     }
 
@@ -4580,9 +4599,11 @@ impl RpcDispatcher {
                     .map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?;
                 let grants = self.recheck_authority_after_admission(Method::SessionNew)?;
                 if let Some(grants) = grants.as_ref() {
+                    let config = self.ctx.config.read();
                     self.selector_session_agent_with_grants(
                         Method::SessionNew,
                         grants,
+                        &config,
                         &req.agent_alias,
                     )?;
                 }
@@ -4674,7 +4695,13 @@ impl RpcDispatcher {
             // recorded), and every create-or-resume branch is owner-predicated,
             // so neither branch can hand a constrained principal a session that
             // another principal could reach by ID.
-            self.selector_session_agent_with_grants(Method::SessionNew, grants, &req.agent_alias)?;
+            let config = self.ctx.config.read();
+            self.selector_session_agent_with_grants(
+                Method::SessionNew,
+                grants,
+                &config,
+                &req.agent_alias,
+            )?;
         }
         // Ownership from here on is judged by these grants as well: the stamp
         // predates the wait, and a caller that lost the administrator bypass
@@ -4956,7 +4983,12 @@ impl RpcDispatcher {
         // freshly resolved set.
         let grants = self.recheck_authority_after_admission(Method::SessionNew)?;
         if let Some(grants) = grants.as_ref() {
-            self.selector_session_agent_with_grants(Method::SessionNew, grants, &req.agent_alias)?;
+            self.selector_session_agent_with_grants(
+                Method::SessionNew,
+                grants,
+                &config,
+                &req.agent_alias,
+            )?;
         }
         // The same edit can remove the administrator bypass, so ownership is
         // judged by these grants again: a restore keeps the durable owner and a
@@ -12796,7 +12828,8 @@ impl RpcDispatcher {
         };
         for alias in &agents {
             if executes {
-                self.selector_session_agent_with_grants(method, grants, alias)?;
+                let config = self.ctx.config.read();
+                self.selector_session_agent_with_grants(method, grants, &config, alias)?;
             } else {
                 self.selector_agent(method, alias)?;
             }
@@ -12846,8 +12879,9 @@ impl RpcDispatcher {
         };
         self.refuse_constrained_principal_for_sop(method, &grants)?;
         if let Some(agents) = agents {
+            let config = self.ctx.config.read();
             for alias in agents {
-                self.selector_session_agent_with_grants(method, &grants, &alias)?;
+                self.selector_session_agent_with_grants(method, &grants, &config, &alias)?;
             }
         }
         Ok(())
@@ -16639,6 +16673,7 @@ mod tests {
                 alias.into(),
                 AliasedAgentConfig {
                     enabled: true,
+                    model_provider: "dummy".into(),
                     risk_profile: "cron-profile".into(),
                     ..AliasedAgentConfig::default()
                 },
@@ -37316,7 +37351,12 @@ mod tests {
             let mut config = roster_config_in(&tmp, 4242);
             config.agents.insert(
                 "alpha".into(),
-                zeroclaw_config::schema::AliasedAgentConfig::default(),
+                zeroclaw_config::schema::AliasedAgentConfig {
+                    enabled: true,
+                    model_provider: "dummy".into(),
+                    risk_profile: "fixture".into(),
+                    ..zeroclaw_config::schema::AliasedAgentConfig::default()
+                },
             );
             let reader = config
                 .permission_profiles
@@ -37399,8 +37439,24 @@ mod tests {
         use zeroclaw_config::schema::PermissionProfileConfig;
 
         let mut config = roster_config_in(tmp, 4243);
-        config.agents.insert("alpha".into(), Default::default());
-        config.agents.insert("gamma".into(), Default::default());
+        config.agents.insert(
+            "alpha".into(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: true,
+                model_provider: "dummy".into(),
+                risk_profile: "fixture".into(),
+                ..Default::default()
+            },
+        );
+        config.agents.insert(
+            "gamma".into(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: true,
+                model_provider: "dummy".into(),
+                risk_profile: "fixture".into(),
+                ..Default::default()
+            },
+        );
         let reader = config.permission_profiles.get_mut("reader").unwrap();
         reader.allowed_agents = vec![if referenced { "alpha" } else { "*" }.into()];
         reader
@@ -47074,6 +47130,7 @@ mod tests {
             "alpha".into(),
             AliasedAgentConfig {
                 enabled: true,
+                model_provider: "dummy".into(),
                 risk_profile: "session-profile".into(),
                 ..AliasedAgentConfig::default()
             },
@@ -47204,6 +47261,124 @@ mod tests {
                 );
             }
         });
+    }
+
+    #[test]
+    fn session_new_refuses_a_disabled_granted_agent() {
+        run_on_a_large_stack(|| async move {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let mut config = session_new_roster_config(&tmp, 4242);
+            {
+                let agent = config
+                    .agents
+                    .get_mut("alpha")
+                    .expect("the fixture agent exists");
+                agent.model_provider = "dummy".into();
+                agent.enabled = false;
+            }
+            let ctx = enforcement_ctx(config);
+            let (alice, _rx) = roster_peer(&ctx, 4242).await;
+            let session_id = "sess-disabled-agent".to_string();
+            let params = json!({
+                "agent_alias": "alpha",
+                "chat_mode": "chat",
+                "session_id": session_id,
+                "cwd": tmp.path().join("workspace"),
+            });
+
+            let err = alice
+                .handle_session_new_for_test(&params)
+                .await
+                .expect_err("a granted but disabled agent must not start a session");
+            assert_eq!(err.code, INVALID_PARAMS, "{err:?}");
+            assert!(err.message.contains("not enabled for dispatch"), "{err:?}");
+            assert!(
+                !ctx.sessions.list_ids().await.contains(&session_id),
+                "the refused session/new must not publish a live session"
+            );
+        });
+    }
+
+    #[test]
+    fn session_new_refuses_a_granted_agent_without_a_model_provider() {
+        run_on_a_large_stack(|| async move {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let mut config = session_new_roster_config(&tmp, 4242);
+            config
+                .agents
+                .get_mut("alpha")
+                .expect("the fixture agent exists")
+                .model_provider = Default::default();
+            let ctx = enforcement_ctx(config);
+            let (alice, _rx) = roster_peer(&ctx, 4242).await;
+            let session_id = "sess-unbound-agent".to_string();
+            let params = json!({
+                "agent_alias": "alpha",
+                "chat_mode": "chat",
+                "session_id": session_id,
+                "cwd": tmp.path().join("workspace"),
+            });
+
+            let err = alice
+                .handle_session_new_for_test(&params)
+                .await
+                .expect_err("an agent without a model provider must not start a session");
+            assert_eq!(err.code, INVALID_PARAMS, "{err:?}");
+            assert!(err.message.contains("not enabled for dispatch"), "{err:?}");
+            assert!(
+                !ctx.sessions.list_ids().await.contains(&session_id),
+                "the refused session/new must not publish a live session"
+            );
+        });
+    }
+
+    #[tokio::test]
+    async fn session_prompt_refuses_after_admission_when_the_agent_is_disabled() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = session_cwd_config(&tmp, 4242, None);
+        let agent_workspace = config.agent_workspace_dir("test-agent");
+        let (ctx, chat_backend, _acp_store) = persistence_enforcement_ctx(config);
+        let (provider, mut started_rx, _release_tx) = gated_provider();
+        let sid = "s-prompt-disabled-agent";
+        install_state_test_session_owned_at(
+            &ctx.sessions,
+            &chat_backend,
+            sid,
+            provider,
+            None,
+            Some("user:alice"),
+            &agent_workspace,
+        )
+        .await;
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+
+        let mut disabled = ctx.config.snapshot();
+        disabled
+            .agents
+            .get_mut("test-agent")
+            .expect("the fixture agent exists")
+            .enabled = false;
+        ctx.config_authority.publish_for_test(disabled);
+
+        send_prompt(&mut alice, 7, sid, 3).await;
+        let (response, notifications) = response_and_notifications(&mut rx, 7).await;
+        assert_eq!(
+            response["error"]["code"],
+            json!(INVALID_PARAMS),
+            "{response}"
+        );
+        assert!(
+            response["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("not enabled for dispatch"),
+            "{response}"
+        );
+        assert_turn_refused(&notifications, sid, 3);
+        assert!(
+            started_rx.try_recv().is_err(),
+            "a refused prompt must never reach the provider"
+        );
     }
 
     #[test]
