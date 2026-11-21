@@ -2694,6 +2694,33 @@ pub struct AtlasCloudModelProviderConfig {
     pub base: ModelProviderConfig,
 }
 
+// ── Obscurify.ai ──
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum ObscurifyEndpoint {
+    #[default]
+    Default,
+}
+impl ModelEndpoint for ObscurifyEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => "https://obscurify.ai/v1",
+        }
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.obscurify"]
+pub struct ObscurifyModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
 // ── OVH ──
 
 #[derive(
@@ -3800,6 +3827,7 @@ impl_default_family_endpoint! {
     VercelModelProviderConfig,
     CloudflareModelProviderConfig,
     AtlasCloudModelProviderConfig,
+    ObscurifyModelProviderConfig,
     OvhModelProviderConfig,
     CopilotModelProviderConfig,
     DoubaoModelProviderConfig,

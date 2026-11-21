@@ -525,6 +525,18 @@ model = "..."
 api_key = "..."
 ```
 
+**Obscurify.ai**: slot `obscurify`. OpenAI-compatible endpoint
+`https://obscurify.ai/v1` with bearer-token auth.
+`GET https://obscurify.ai/v1/models` lists model IDs with context lengths
+without a key. Key from the account page at
+[obscurify.ai](https://obscurify.ai).
+
+```toml
+[providers.models.obscurify.default]
+model = "z-ai/glm-5.3"
+api_key = "..."
+```
+
 > Credentials come only from config (`api_key`) or the `--credential` override at run
 > time, these slots do **not** read a per-provider `*_API_KEY` environment variable.
 
