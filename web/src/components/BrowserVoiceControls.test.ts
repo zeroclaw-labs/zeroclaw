@@ -1,3 +1,4 @@
+import { markdownParser } from '@/lib/speechText';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import test from 'node:test';
@@ -282,16 +283,8 @@ test('continuous reading plays every waiting reply in order without replaying hi
   await act(async () => { renderer.unmount(); });
 });
 
-test('waiting replies are not converted again while playback is busy', async () => {
-  const Parser = globalThis.DOMParser;
-  let conversions = 0;
-  class CountingParser extends Parser {
-    override parseFromString(...args: Parameters<DOMParser['parseFromString']>) {
-      conversions++;
-      return super.parseFromString(...args);
-    }
-  }
-  globalThis.DOMParser = CountingParser;
+test('waiting replies are not converted again while playback is busy', async (context) => {
+  const parse = context.mock.method(markdownParser, 'parse');
   const renderer = await mount();
   try {
     const speaker = () => renderer.root.findAllByType('button')[1]!;
@@ -299,19 +292,18 @@ test('waiting replies are not converted again while playback is busy', async () 
     const messages = [reply('old', 'Historical reply'), reply('first', 'First reply')];
     await act(async () => { renderer.update(createElement(Controls, { messages, hydrated: true, typing: false, onTranscript() {} })); });
     assert.deepEqual(spoken, ['First reply']);
-    const before = conversions;
+    const before = parse.mock.callCount();
     const waiting = [...messages, reply('waiting', '**Waiting** reply\n\n' + 'Long paragraph.\n'.repeat(1000))];
     for (let n = 0; n < 5; n++) {
       await act(async () => { renderer.update(createElement(Controls, { messages: waiting, hydrated: true, typing: false, onTranscript() {} })); });
     }
-    assert.equal(conversions, before, 'composer rerenders must not repeatedly render/parse waiting Markdown');
+    assert.equal(parse.mock.callCount(), before, 'composer rerenders must not repeatedly render/parse waiting Markdown');
     await act(async () => { spokenUtterance?.onend?.(); });
     assert.equal(spoken.length, 2);
     assert.match(spoken[1]!, /^Waiting reply/);
-    assert.ok(conversions > before, 'the queued reply is prepared when playback becomes available');
+    assert.ok(parse.mock.callCount() > before, 'the queued reply is prepared when playback becomes available');
   } finally {
     await act(async () => { renderer.unmount(); });
-    globalThis.DOMParser = Parser;
   }
 });
 
@@ -722,7 +714,7 @@ test('visible clients refresh the global timeout without a focus event', async (
     await act(async () => { renderer = create(createElement(Probe)); });
     assert.equal(renderer.root.findByType('output').children[0], '15');
     globalSilenceSeconds = 0;
-    await act(async () => { context.mock.timers.tick(2000); });
+    await act(async () => { context.mock.timers.tick(30_000); });
     assert.equal(renderer.root.findByType('output').children[0], '0');
   } finally {
     await act(async () => { renderer.unmount(); });
@@ -744,7 +736,7 @@ test('global voice refresh is shared and disabled subscribers do not poll', asyn
     assert.equal(reads(), initial);
     await act(async () => { renderer.update(createElement('div', null, createElement(Probe, { enabled: true }), createElement(Probe, { enabled: true }))); });
     const before = reads();
-    await act(async () => { context.mock.timers.tick(2000); });
+    await act(async () => { context.mock.timers.tick(30_000); });
     assert.equal(reads(), before + 1);
     await act(async () => { renderer.unmount(); });
     const stopped = reads();
@@ -912,4 +904,19 @@ test('a late completion from cancelled narration cannot clear replacement playba
     await act(async () => { await renderer.root.findAllByType('button')[0]!.props.onClick(); });
     assert.equal(renderer.root.findAllByType('button')[0]!.props['aria-pressed'], true);
   } finally { await act(async () => { renderer.unmount(); }); }
+});
+
+test('releasing a stale utterance leaves its replacement active', async () => {
+  const { playVoice, releaseVoice, voicePlaybackBusy } = await import('../lib/browserVoice.ts');
+  const stale = new SpeechSynthesisUtterance('stale');
+  const current = new SpeechSynthesisUtterance('current');
+  assert.equal(playVoice(stale), true);
+  releaseVoice(stale);
+  assert.equal(playVoice(current), true);
+  try {
+    releaseVoice(stale, true);
+    assert.equal(voicePlaybackBusy(), true);
+  } finally {
+    releaseVoice(current);
+  }
 });

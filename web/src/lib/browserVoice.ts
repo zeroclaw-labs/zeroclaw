@@ -316,7 +316,7 @@ function subscribeGlobalVoice(listener: (state: GlobalVoiceState) => void) {
     window.addEventListener('focus', refresh);
     window.addEventListener('zeroclaw-config-mutated', refresh);
     document.addEventListener('visibilitychange', refresh);
-    const poll = setInterval(() => void refresh(), 2000);
+    const poll = setInterval(() => void refresh(), 30_000);
     stopGlobalVoiceRefresh = () => {
       active = false;
       clearInterval(poll);

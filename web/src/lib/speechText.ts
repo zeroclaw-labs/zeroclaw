@@ -1,21 +1,43 @@
-import { createElement } from 'react';
-import { renderToStaticMarkup } from 'react-dom/server';
-import Markdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
+import remarkParse from 'remark-parse';
+import { unified } from 'unified';
 
-/** Speak the visible Markdown content, never its formatting or link targets. */
+export const markdownParser = unified().use(remarkParse).use(remarkGfm);
+
+interface ReadableNode {
+  type: string;
+  value?: string;
+  alt?: string | null;
+  children?: readonly ReadableNode[];
+}
+
+const blockTypes = new Set(['paragraph', 'listItem', 'tableRow', 'tableCell', 'blockquote', 'heading']);
+
+function visibleText(node: ReadableNode): string {
+  switch (node.type) {
+    case 'text':
+    case 'inlineCode':
+      return node.value ?? '';
+    case 'code':
+      return '\n' + (node.value ?? '') + '\n';
+    case 'image':
+    case 'imageReference':
+      return node.alt ?? '';
+    case 'break':
+    case 'thematicBreak':
+      return '\n';
+    case 'html':
+    case 'definition':
+    case 'footnoteDefinition':
+      return '';
+    default: {
+      const text = node.children?.map(visibleText).join('') ?? '';
+      return blockTypes.has(node.type) ? '\n' + text + '\n' : text;
+    }
+  }
+}
+
+/** Speak visible Markdown content, without markup or link destinations. */
 export function speechText(markdown: string): string {
-  const html = renderToStaticMarkup(createElement(Markdown, { remarkPlugins: [remarkGfm], children: markdown }));
-  const doc = new DOMParser().parseFromString(html, 'text/html');
-  const blocks = new Set(['P', 'DIV', 'LI', 'TR', 'TH', 'TD', 'PRE', 'BLOCKQUOTE', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6']);
-  const text = (node: Node): string => {
-    if (node.nodeType === 3) return node.textContent ?? '';
-    if (node.nodeType !== 1) return '';
-    const element = node as Element;
-    if (element.tagName === 'IMG') return element.getAttribute('alt') ?? '';
-    if (element.tagName === 'BR' || element.tagName === 'HR') return '\n';
-    const content = Array.from(node.childNodes, text).join('');
-    return blocks.has(element.tagName) ? `\n${content}\n` : content;
-  };
-  return Array.from(doc.body.childNodes, text).join('').replace(/[ \t]+/g, ' ').replace(/ *\n */g, '\n').replace(/\n{3,}/g, '\n\n').trim().replace(/(?:\s*🦀\uFE0F?)+\s*$/u, '').trim();
+  return visibleText(markdownParser.parse(markdown)).replace(/[ \t]+/g, ' ').replace(/ *\n */g, '\n').replace(/\n{3,}/g, '\n\n').trim().replace(/(?:\s*🦀\uFE0F?)+\s*$/u, '').trim();
 }
