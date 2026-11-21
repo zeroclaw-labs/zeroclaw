@@ -390,9 +390,19 @@ pub enum ChannelConversationScope {
     ReplyTarget,
 }
 
+/// Out-of-band control created by an authenticated channel adapter.
+/// Never inferred from message text or replayed from stored conversation input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChannelControl {
+    /// Cancel this sender/call scope without a visible acknowledgement.
+    Interrupt,
+}
+
 /// A message received from or sent to a channel
 #[derive(Debug, Clone, Default)]
 pub struct ChannelMessage {
+    /// Trusted adapter control; passive content may carry a playback observation.
+    pub control: Option<ChannelControl>,
     pub id: String,
     pub sender: String,
     /// Immutable sender identifier assigned by the channel platform, when
@@ -528,7 +538,10 @@ pub enum RoomVisibility {
 pub enum ProgressEvent {
     Received,
     Planning,
+    /// A request is in flight; no generated reasoning has been observed yet.
     WaitingOnModel,
+    /// Nonempty provider reasoning was observed. Contains no reasoning text.
+    Reasoning,
     RunningTool,
     CompactingContext,
     FinalizingResponse,
@@ -889,6 +902,19 @@ impl fmt::Display for FinalizeUndelivered {
 
 impl std::error::Error for FinalizeUndelivered {}
 
+/// The platform may have accepted a final response but its acknowledgement
+/// was lost. Callers must not resend the response or claim it was delivered.
+#[derive(Debug)]
+pub struct FinalizeUncertainDelivery {
+    pub reason: String,
+}
+impl fmt::Display for FinalizeUncertainDelivery {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "channel_delivery_uncertain: {}", self.reason)
+    }
+}
+impl std::error::Error for FinalizeUncertainDelivery {}
+
 /// Core channel trait — implement for any messaging platform.
 ///
 /// Every `Channel` is `Attributable`: the orchestrator's spawn site opens
@@ -1183,6 +1209,34 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
     ) -> anyhow::Result<()> {
         Ok(())
     }
+    /// Stream the currently approved response phase to live call playback.
+    /// The default is inert for transports without live audio.
+    async fn stream_voice_draft(
+        &self,
+        _recipient: &str,
+        _message_id: &str,
+        _phase: usize,
+        _text: &str,
+        _finished: bool,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Prepare audio for the current assistant text phase without delivering it.
+    /// The caller supplies sanitized, leak-checked text and skips this hook when
+    /// outbound hooks still need to approve or rewrite the completed response.
+    /// Finalization remains authoritative: adapters must discard speculative
+    /// audio that does not match the approved final text. Draft cancellation
+    /// must also cancel preparation. Status, reasoning and tool events never
+    /// enter this method. Default: no audio preparation.
+    async fn prepare_voice_draft(
+        &self,
+        _recipient: &str,
+        _message_id: &str,
+        _text: &str,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
 
     /// Show a progress/status update (e.g. tool execution status).
     async fn update_draft_progress(
@@ -1285,6 +1339,25 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
         _suppress_voice: bool,
     ) -> anyhow::Result<()> {
         Ok(())
+    }
+
+    /// Whether force-voice routing can retain this adapter's prepared draft.
+    fn supports_voice_draft_finalization(&self) -> bool {
+        false
+    }
+
+    /// Finalize with an explicit voice request, retaining speculative audio.
+    /// Adapters opting in must honor both flags; suppression takes precedence.
+    async fn finalize_draft_with_modality(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        text: &str,
+        suppress_voice: bool,
+        _force_voice: bool,
+    ) -> anyhow::Result<()> {
+        self.finalize_draft(recipient, message_id, text, suppress_voice)
+            .await
     }
 
     /// Cancel and remove a previously sent draft message if the channel supports it.

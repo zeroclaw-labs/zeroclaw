@@ -1143,8 +1143,9 @@ pub struct TelegramChannel {
     /// Resolves voice peers from canonical config at call-time.
     /// See AGENTS.md "ABSOLUTE RULE — SINGLE SOURCE OF TRUTH" — no cache.
     voice_peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
-    pending_voice:
-        Arc<std::sync::Mutex<std::collections::HashMap<String, (String, std::time::Instant)>>>,
+    /// Canonical owner of speculative audio for each distinct draft. Removing
+    /// a draft transfers finalization ownership or cancels its worker on drop.
+    voice_drafts: Mutex<HashMap<MultiDraftKey, crate::tts::SpeechJob>>,
     /// Per-channel proxy URL override.
     proxy_url: Option<String>,
     #[cfg(test)]
@@ -2767,7 +2768,7 @@ impl TelegramChannel {
             tts_manager: None,
             voice_chats: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             voice_peer_resolver: Arc::new(Vec::new) as Arc<dyn Fn() -> Vec<String> + Send + Sync>,
-            pending_voice: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            voice_drafts: Mutex::new(HashMap::new()),
             proxy_url: None,
             #[cfg(test)]
             fixture_http_client: None,
@@ -3171,7 +3172,7 @@ impl TelegramChannel {
                 // No draft to finalize: deliver voice for the final text only,
                 // matching the non-multi-message finalize path.
                 if !suppress_voice {
-                    self.try_queue_voice_reply(recipient, &text, true, false);
+                    self.try_queue_voice_reply(recipient, &text, Some(message_id), false);
                 }
                 return Ok(());
             };
@@ -3184,7 +3185,7 @@ impl TelegramChannel {
             let mut drafts = self.multi_message_drafts.lock();
             let Some(draft) = drafts.remove(&key) else {
                 if !suppress_voice {
-                    self.try_queue_voice_reply(recipient, &text, true, false);
+                    self.try_queue_voice_reply(recipient, &text, Some(message_id), false);
                 }
                 return Ok(());
             };
@@ -3344,7 +3345,7 @@ impl TelegramChannel {
         // never overtaken by an immediate TTS reply (send_via modality="text"
         // still suppresses it entirely).
         if !suppress_voice {
-            self.try_queue_voice_reply(recipient, &text, true, false);
+            self.try_queue_voice_reply(recipient, &text, Some(message_id), false);
         }
 
         Ok(())
@@ -3352,6 +3353,18 @@ impl TelegramChannel {
 
     /// Override the Telegram Bot API base URL.
     /// Useful for local Bot API servers or testing.
+    #[cfg(test)]
+    pub(crate) fn with_fixture_timeout(mut self, timeout: Duration) -> Self {
+        self.fixture_http_client = Some(
+            reqwest::Client::builder()
+                .no_proxy()
+                .timeout(timeout)
+                .build()
+                .unwrap(),
+        );
+        self
+    }
+
     pub fn with_api_base(mut self, api_base: String) -> Self {
         self.api_base = normalize_telegram_api_base(&api_base);
         self
@@ -4205,180 +4218,184 @@ impl TelegramChannel {
             || self.destination_is_voice_peer(recipient)
     }
 
-    fn try_queue_voice_reply(&self, recipient: &str, content: &str, immediate: bool, force: bool) {
-        if (!force && !self.is_voice_chat(recipient)) || self.tts_manager.is_none() {
+    fn discard_voice_draft(&self, recipient: &str, draft_id: &str) {
+        self.voice_drafts
+            .lock()
+            .remove(&Self::multi_draft_key(recipient, draft_id));
+    }
+
+    fn try_queue_voice_reply(
+        &self,
+        recipient: &str,
+        content: &str,
+        draft_id: Option<&str>,
+        force: bool,
+    ) {
+        // Take ownership before every exit path, including policy suppression
+        // and empty/unspeakable final text, so speculation cannot outlive a turn.
+        let job = draft_id.and_then(|id| {
+            self.voice_drafts
+                .lock()
+                .remove(&Self::multi_draft_key(recipient, id))
+        });
+        self.queue_voice_reply(recipient, content, job, force);
+    }
+
+    fn queue_voice_reply(
+        &self,
+        recipient: &str,
+        content: &str,
+        job: Option<crate::tts::SpeechJob>,
+        force: bool,
+    ) {
+        if !force && !self.is_voice_chat(recipient) {
             return;
         }
-
-        // Only queue substantive natural-language replies for voice.
-        // Skip tool outputs: URLs, JSON, code blocks, errors, short status.
+        let Some(tts_manager) = self.tts_manager.clone() else {
+            return;
+        };
         if let Some(reason) = crate::util::voice_reply_skip_reason(content) {
-            // Stable literal per the logging contract: the classification and
-            // per-event measurements ride solely in `attributes` above.
             ::zeroclaw_log::record!(
                 INFO,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Skip)
-                    .with_attrs(::serde_json::json!({
-                        "recipient": recipient,
-                        "reason": reason,
-                        "content_len": content.len(),
-                        "immediate": immediate,
-                    })),
+                    .with_attrs(
+                        ::serde_json::json!({"reason": reason, "content_len": content.len()})
+                    ),
                 "voice reply skipped"
             );
             return;
         }
-
+        let had_prepared_job = job.is_some();
+        let job = job.unwrap_or_else(|| crate::tts::SpeechJob::start(tts_manager.clone()));
+        let text = content.to_owned();
         let (chat_id, thread_id) = Self::parse_reply_target(recipient);
+        let recipient = recipient.to_owned();
         let voice_chats = self.voice_chats.clone();
         let voice_peer_resolver = self.voice_peer_resolver.clone();
         let api_base = self.api_base.clone();
         let bot_token = self.bot_token.clone();
-        let Some(tts_manager) = self.tts_manager.clone() else {
-            return;
-        };
-
-        if immediate {
-            // Finalize path: text is already the final answer — no debounce.
-            let text = content.to_string();
-            let recipient = recipient.to_string();
-            let proxy_url = self.proxy_url.clone();
-            zeroclaw_spawn::spawn!(async move {
-                let is_config_voice_peer = voice_peer_resolver().contains(&recipient);
-                if !is_config_voice_peer && let Ok(mut vc) = voice_chats.lock() {
-                    vc.remove(&recipient);
-                }
-                match Self::synthesize_and_send_voice(
-                    &api_base,
-                    &bot_token,
-                    proxy_url.as_deref(),
-                    &chat_id,
-                    thread_id.as_deref(),
-                    &text,
-                    &tts_manager,
-                )
-                .await
-                {
-                    Ok(()) => {
-                        ::zeroclaw_log::record!(
-                            INFO,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Note
-                            ),
-                            &format!("voice reply sent ({} chars)", text.len())
-                        );
-                    }
-                    Err(e) => {
-                        ::zeroclaw_log::record!(
-                            WARN,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Note
-                            )
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                            .with_attrs(::serde_json::json!({"error": zeroclaw_runtime::security::scrub(&format!("{}", e))})),
-                            "TTS voice reply failed"
-                        );
-                    }
-                }
-            });
-            return;
-        }
-
-        // Send path: debounce to coalesce multi-part tool-chain responses.
-        if let Ok(mut pv) = self.pending_voice.lock() {
-            pv.insert(
-                recipient.to_string(),
-                (content.to_string(), std::time::Instant::now()),
-            );
-        }
-
-        let pending = self.pending_voice.clone();
-        let recipient = recipient.to_string();
         let proxy_url = self.proxy_url.clone();
         zeroclaw_spawn::spawn!(async move {
-            // Wait 10 seconds — long enough for the agent to finish its
-            // full tool chain and send the final answer.
-            tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
-
-            // Atomic check-and-remove: only one task gets the value
-            let to_voice = pending.lock().ok().and_then(|mut pv| {
-                if let Some((_, ts)) = pv.get(&recipient)
-                    && ts.elapsed().as_secs() >= 8
-                {
-                    return pv.remove(&recipient).map(|(text, _)| text);
+            let mut result = job.finish(&text).await;
+            if had_prepared_job && let Err(error) = &result {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({"error": zeroclaw_runtime::security::scrub(&error.to_string())})),
+                    "Speculative TTS failed; synthesizing approved final response"
+                );
+                // At most one fresh final attempt, using the approved text only.
+                // Failed speculative clips never become a partial voice upload.
+                result = crate::tts::SpeechJob::start(tts_manager.clone())
+                    .finish(&text)
+                    .await;
+            }
+            match result {
+                Ok(parts) => {
+                    Self::deliver_voice_parts(
+                        &api_base,
+                        &bot_token,
+                        proxy_url.as_deref(),
+                        &chat_id,
+                        thread_id.as_deref(),
+                        &recipient,
+                        &voice_chats,
+                        &voice_peer_resolver,
+                        parts,
+                        &tts_manager,
+                    )
+                    .await
                 }
-                None
-            });
-
-            if let Some(text) = to_voice {
-                let is_config_voice_peer = voice_peer_resolver().contains(&recipient);
-                if !is_config_voice_peer && let Ok(mut vc) = voice_chats.lock() {
-                    vc.remove(&recipient);
-                }
-                match Self::synthesize_and_send_voice(
-                    &api_base,
-                    &bot_token,
-                    proxy_url.as_deref(),
-                    &chat_id,
-                    thread_id.as_deref(),
-                    &text,
-                    &tts_manager,
-                )
-                .await
-                {
-                    Ok(()) => {
-                        ::zeroclaw_log::record!(
-                            INFO,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Note
-                            ),
-                            &format!("voice reply sent ({} chars)", text.len())
-                        );
-                    }
-                    Err(e) => {
-                        ::zeroclaw_log::record!(
-                            WARN,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Note
-                            )
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                            .with_attrs(::serde_json::json!({"error": zeroclaw_runtime::security::scrub(&format!("{}", e))})),
-                            "TTS voice reply failed"
-                        );
-                    }
+                Err(error) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_attrs(::serde_json::json!({"error": zeroclaw_runtime::security::scrub(&error.to_string())})),
+                        "TTS voice reply failed"
+                    );
                 }
             }
         });
     }
 
-    /// Synthesize text to speech and send as a Telegram voice note (static version for spawned tasks).
-    async fn synthesize_and_send_voice(
+    /// Discard the ephemeral voice-chat registration and upload one turn's
+    /// audio as a single voice note, logging the outcome.
+    #[allow(clippy::too_many_arguments)]
+    async fn deliver_voice_parts(
         api_base: &str,
         bot_token: &str,
         proxy_url: Option<&str>,
         chat_id: &str,
         thread_id: Option<&str>,
-        text: &str,
+        recipient: &str,
+        voice_chats: &Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+        voice_peer_resolver: &Arc<dyn Fn() -> Vec<String> + Send + Sync>,
+        parts: Vec<Vec<u8>>,
         tts_manager: &crate::tts::TtsManager,
-    ) -> anyhow::Result<()> {
-        let audio_bytes = tts_manager.synthesize_opus(text).await?;
-        let audio_len = audio_bytes.len();
-        ::zeroclaw_log::record!(
-            INFO,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_attrs(::serde_json::json!({"audio_len": audio_len})),
-            "synthesized bytes of audio"
-        );
-
-        if audio_bytes.is_empty() {
-            anyhow::bail!("TTS returned empty audio");
+    ) {
+        if parts.is_empty() {
+            return;
         }
 
-        // synthesize_opus already transcodes to OGG/Opus via ffmpeg internally
+        // A one-off voice note must not leave the chat stuck in voice-reply
+        // mode; only a configured voice peer keeps the registration.
+        let is_config_voice_peer = voice_peer_resolver().iter().any(|p| p == recipient);
+        if !is_config_voice_peer && let Ok(mut vc) = voice_chats.lock() {
+            vc.remove(recipient);
+        }
+
+        let segment_count = parts.len();
+        match Self::send_voice_parts(
+            api_base,
+            bot_token,
+            proxy_url,
+            chat_id,
+            thread_id,
+            parts,
+            tts_manager,
+        )
+        .await
+        {
+            Ok(audio_len) => {
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({
+                            "audio_len": audio_len,
+                            "segments": segment_count,
+                        })),
+                    "voice reply sent"
+                );
+            }
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"error": zeroclaw_runtime::security::scrub(&format!("{}", e))})),
+                    "TTS voice reply failed"
+                );
+            }
+        }
+    }
+
+    /// Concatenate a turn's ordered audio parts into one OGG/Opus container and
+    /// upload it as a Telegram voice note. Returns the uploaded byte length.
+    #[allow(clippy::too_many_arguments)]
+    async fn send_voice_parts(
+        api_base: &str,
+        bot_token: &str,
+        proxy_url: Option<&str>,
+        chat_id: &str,
+        thread_id: Option<&str>,
+        parts: Vec<Vec<u8>>,
+        tts_manager: &crate::tts::TtsManager,
+    ) -> anyhow::Result<usize> {
+        // Re-mux, not byte concatenation: each part is a complete container.
+        let audio_bytes = tts_manager.concat_parts_to_opus(&parts).await?;
+        let audio_len = audio_bytes.len();
+        anyhow::ensure!(!audio_bytes.is_empty(), "TTS returned empty audio");
+
         let (method, field, filename, mime) = telegram_audio_send_spec("opus")?;
 
         let url = format!("{api_base}/bot{bot_token}/{method}");
@@ -4406,14 +4423,7 @@ impl TelegramChannel {
             let body = resp.text().await.unwrap_or_default();
             anyhow::bail!("{method} failed: status={status}, body={body}");
         }
-
-        ::zeroclaw_log::record!(
-            INFO,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_attrs(::serde_json::json!({"audio_len": audio_len})),
-            "sent voice note ( bytes)"
-        );
-        Ok(())
+        Ok(audio_len)
     }
 
     async fn classify_edit_message_response(resp: reqwest::Response) -> EditMessageResult {
@@ -8066,6 +8076,32 @@ impl Channel for TelegramChannel {
         }
     }
 
+    async fn prepare_voice_draft(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        text: &str,
+    ) -> anyhow::Result<()> {
+        if !self.is_voice_chat(recipient)
+            || text.is_empty()
+            || crate::util::voice_reply_skip_reason(text)
+                .is_some_and(|reason| reason != "too_short")
+        {
+            self.discard_voice_draft(recipient, message_id);
+            return Ok(());
+        }
+        let Some(manager) = self.tts_manager.clone() else {
+            return Ok(());
+        };
+        let key = Self::multi_draft_key(recipient, message_id);
+        let mut drafts = self.voice_drafts.lock();
+        drafts
+            .entry(key)
+            .or_insert_with(|| crate::tts::SpeechJob::start(manager))
+            .update(text);
+        Ok(())
+    }
+
     async fn update_draft(
         &self,
         recipient: &str,
@@ -8188,6 +8224,7 @@ impl Channel for TelegramChannel {
         message_id: &str,
         text: &str,
     ) -> anyhow::Result<()> {
+        self.discard_voice_draft(recipient, message_id);
         if self.stream_mode != StreamMode::MultiMessage
             || !Self::is_multi_message_synthetic_draft(message_id)
         {
@@ -8241,10 +8278,17 @@ impl Channel for TelegramChannel {
         text: &str,
         suppress_voice: bool,
     ) -> anyhow::Result<()> {
+        if suppress_voice {
+            self.discard_voice_draft(recipient, message_id);
+        }
         if self.stream_mode == StreamMode::MultiMessage {
-            return self
+            let result = self
                 .finalize_multi_message_draft(recipient, message_id, text, suppress_voice)
                 .await;
+            if result.is_err() {
+                self.discard_voice_draft(recipient, message_id);
+            }
+            return result;
         }
 
         let text = &strip_tool_call_tags(text);
@@ -8253,7 +8297,7 @@ impl Channel for TelegramChannel {
         // Queue TTS voice reply — immediate mode since text is already final.
         // Skipped when suppress_voice is set (explicit text-only routing override).
         if !suppress_voice {
-            self.try_queue_voice_reply(recipient, text, true, false);
+            self.try_queue_voice_reply(recipient, text, Some(message_id), false);
         }
 
         // Clean up rate-limit tracking for this chat
@@ -8445,7 +8489,34 @@ impl Channel for TelegramChannel {
         }
     }
 
+    fn supports_voice_draft_finalization(&self) -> bool {
+        true
+    }
+
+    async fn finalize_draft_with_modality(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        text: &str,
+        suppress_voice: bool,
+        force_voice: bool,
+    ) -> anyhow::Result<()> {
+        if suppress_voice || !force_voice {
+            return self
+                .finalize_draft(recipient, message_id, text, suppress_voice)
+                .await;
+        }
+        let job = self
+            .voice_drafts
+            .lock()
+            .remove(&Self::multi_draft_key(recipient, message_id));
+        crate::util::cancel_draft_best_effort(self, recipient, message_id).await;
+        self.queue_voice_reply(recipient, &strip_tool_call_tags(text), job, true);
+        Ok(())
+    }
+
     async fn cancel_draft(&self, recipient: &str, message_id: &str) -> anyhow::Result<()> {
+        self.discard_voice_draft(recipient, message_id);
         let (chat_id, _) = Self::parse_reply_target(recipient);
         self.last_draft_edit.lock().remove(&chat_id);
 
@@ -8508,7 +8579,7 @@ impl Channel for TelegramChannel {
         // Voice chat mode: queue a voice note. Suppressed messages (errors,
         // system notices) are never voiced.
         if !message.suppress_voice {
-            self.try_queue_voice_reply(&message.recipient, &content, false, message.force_voice);
+            self.try_queue_voice_reply(&message.recipient, &content, None, message.force_voice);
         }
 
         // Voice-only peers (or explicit force_voice): the voice note is the sole
