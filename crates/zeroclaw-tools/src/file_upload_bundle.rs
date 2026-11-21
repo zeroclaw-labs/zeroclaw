@@ -340,7 +340,7 @@ impl Tool for FileUploadBundleTool {
                 }
             };
 
-            if !self.security.is_resolved_path_allowed(&resolved_path) {
+            if !self.security.is_resolved_path_readable(&resolved_path) {
                 return Ok(ToolResult {
                     success: false,
                     output: ToolOutput::default(),

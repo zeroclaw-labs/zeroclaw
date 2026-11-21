@@ -2168,6 +2168,10 @@ pub async fn run(
                 }
             }
             let since = *disconnected_at.get_or_insert_with(Instant::now);
+            // Transport loss terminates ownership of active-turn clipboard
+            // temporaries without touching the composer or queued messages, so
+            // the cached pane stays live for reconnect.
+            chat_pane.cleanup_active_turn_on_disconnect();
             if should_respawn_ephemeral(
                 owned_daemon_pid,
                 ephemeral_respawn_done,
@@ -2872,6 +2876,11 @@ pub async fn run(
         }
     }
 
+    // The event loop is ending by an explicit normal-exit path. Reclaim only
+    // dispatched clipboard temporaries; drafts and queued messages stay owned
+    // by their input state and must never be treated as active turn files.
+    chat_pane.cleanup_active_turn_on_shutdown();
+    acp_pane.cleanup_active_turn_on_shutdown();
     Ok(())
 }
 
@@ -3802,7 +3811,7 @@ fn draw_reload_status_toast(frame: &mut ratatui::Frame, area: Rect, msg: &str) {
     );
 }
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::collections::VecDeque;
 
@@ -5406,7 +5415,7 @@ mod tests {
     /// the final terminal cells a user sees. Reaches the outermost TUI
     /// boundary for the context meter, not a component snapshot.
     #[cfg(test)]
-    fn render_status_bar_cells(ctx: CtxBar, width: u16) -> String {
+    pub(crate) fn render_status_bar_cells(ctx: CtxBar, width: u16) -> String {
         use ratatui::{Terminal, backend::TestBackend};
 
         let backend = TestBackend::new(width, 1);
