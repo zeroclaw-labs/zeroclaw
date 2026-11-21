@@ -191,7 +191,8 @@ pub enum WebhookReject {
 ///
 /// The map is replaced as one unit after every claimant has been validated, so
 /// a partial rebuild or duplicate path cannot leave a mixed-generation route
-/// set effective.
+/// set effective. Lookups return a [`PluginWebhookRoute`], never a sink, so
+/// every send uses the generation that is live when it happens.
 #[derive(Default, Clone)]
 pub struct PluginWebhookRegistry {
     state: Arc<Mutex<PluginWebhookRegistryState>>,
@@ -210,6 +211,29 @@ struct PluginWebhookRegistryState {
 pub struct PluginWebhookRegistryLease {
     registry: PluginWebhookRegistry,
     generation: u64,
+}
+
+/// A path a live channel owned when the gateway looked it up.
+///
+/// The route names the path, not its sink. Every send resolves the owner under
+/// the registry lock, so a generation that starts between lookup and send is
+/// honored: the request reaches the new owner of a re-registered path and is
+/// refused when the path is no longer published. It is never queued on a
+/// retiring channel's receiver.
+#[derive(Clone)]
+pub struct PluginWebhookRoute {
+    registry: PluginWebhookRegistry,
+    path: String,
+}
+
+/// Why a [`PluginWebhookRoute`] could not queue a request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PluginWebhookSendError {
+    /// The current owner's bounded queue is at capacity.
+    Full,
+    /// No current owner can take the request: its receiver is gone, or the
+    /// current generation has not published this path.
+    Closed,
 }
 
 impl PluginWebhookRegistry {
@@ -231,10 +255,14 @@ impl PluginWebhookRegistry {
         }
     }
 
-    /// Clone the bounded sink for `path`, if a live channel owns it.
+    /// Resolve `path` to a route, if a live channel owns it.
     #[must_use]
-    pub fn get(&self, path: &str) -> Option<mpsc::Sender<RawWebhook>> {
-        self.lock_state().routes.get(path).cloned()
+    pub fn get(&self, path: &str) -> Option<PluginWebhookRoute> {
+        let owned = self.lock_state().routes.contains_key(path);
+        owned.then(|| PluginWebhookRoute {
+            registry: self.clone(),
+            path: path.to_string(),
+        })
     }
 
     fn lock_state(&self) -> MutexGuard<'_, PluginWebhookRegistryState> {
@@ -258,6 +286,23 @@ impl PluginWebhookRegistryLease {
     }
 }
 
+impl PluginWebhookRoute {
+    /// Queue `request` on the path's current owner without waiting. A refused
+    /// request is dropped, which drops its reply sender.
+    pub fn try_send(&self, request: RawWebhook) -> Result<(), PluginWebhookSendError> {
+        // Resolve and enqueue under one guard: a generation cannot start or
+        // publish between choosing the owner and queuing on it.
+        let state = self.registry.lock_state();
+        let Some(sink) = state.routes.get(&self.path) else {
+            return Err(PluginWebhookSendError::Closed);
+        };
+        sink.try_send(request).map_err(|error| match error {
+            mpsc::error::TrySendError::Full(_) => PluginWebhookSendError::Full,
+            mpsc::error::TrySendError::Closed(_) => PluginWebhookSendError::Closed,
+        })
+    }
+}
+
 impl Drop for PluginWebhookRegistryLease {
     fn drop(&mut self) {
         let mut state = self.registry.lock_state();
@@ -269,7 +314,126 @@ impl Drop for PluginWebhookRegistryLease {
 
 #[cfg(test)]
 mod tests {
-    use super::PluginWebhookRegistry;
+    use super::{PluginWebhookRegistry, RawWebhook, WebhookOutcome, WebhookReject};
+
+    fn raw_webhook(
+        body: &[u8],
+    ) -> (
+        RawWebhook,
+        tokio::sync::oneshot::Receiver<Result<WebhookOutcome, WebhookReject>>,
+    ) {
+        let (reply, outcome) = tokio::sync::oneshot::channel();
+        let request = RawWebhook {
+            method: "POST".to_string(),
+            query: String::new(),
+            headers: Vec::new(),
+            body: body.to_vec(),
+            cancellation: super::WebhookCancellation::new(),
+            idempotency: None,
+            reply,
+        };
+        (request, outcome)
+    }
+
+    #[test]
+    fn a_route_resolved_before_a_generation_change_never_reaches_the_retired_owner() {
+        let registry = PluginWebhookRegistry::new();
+        let retiring = registry.start_generation();
+        let (retired_sink, mut retired_rx) = tokio::sync::mpsc::channel(4);
+        assert!(retiring.replace(std::collections::HashMap::from([(
+            "gone".to_string(),
+            retired_sink,
+        )])));
+        let route = registry
+            .get("gone")
+            .expect("the retiring generation owns the path");
+
+        // The retiring supervisor still holds its receiver open while the next
+        // generation builds, then publishes a route set without this path.
+        let current = registry.start_generation();
+        let (while_building, _outcome) = raw_webhook(b"while-building");
+        assert!(
+            route.try_send(while_building).is_err(),
+            "a path the building generation has not published refuses the request"
+        );
+        assert!(current.replace(std::collections::HashMap::new()));
+        let (after_publish, _outcome) = raw_webhook(b"after-publish");
+        assert!(
+            route.try_send(after_publish).is_err(),
+            "a path the new generation withdrew refuses the request"
+        );
+
+        assert!(
+            retired_rx.try_recv().is_err(),
+            "a retired generation's receiver must never be handed a request"
+        );
+        drop(retiring);
+    }
+
+    #[test]
+    fn a_route_resolved_before_re_registration_reaches_the_new_owner() {
+        let registry = PluginWebhookRegistry::new();
+        let retiring = registry.start_generation();
+        let (retired_sink, mut retired_rx) = tokio::sync::mpsc::channel(4);
+        assert!(retiring.replace(std::collections::HashMap::from([(
+            "same".to_string(),
+            retired_sink,
+        )])));
+        let route = registry
+            .get("same")
+            .expect("the retiring generation owns the path");
+
+        let current = registry.start_generation();
+        let (current_sink, mut current_rx) = tokio::sync::mpsc::channel(4);
+        assert!(current.replace(std::collections::HashMap::from([(
+            "same".to_string(),
+            current_sink,
+        )])));
+
+        let (request, _outcome) = raw_webhook(b"re-registered");
+        route
+            .try_send(request)
+            .expect("an unchanged path re-registered by the new generation still dispatches");
+        let delivered = current_rx
+            .try_recv()
+            .expect("the new generation's owner receives the request");
+        assert_eq!(delivered.body, b"re-registered");
+        assert!(
+            retired_rx.try_recv().is_err(),
+            "a retired generation's receiver must never be handed a request"
+        );
+        drop(retiring);
+    }
+
+    #[test]
+    fn route_sends_tell_a_full_owner_apart_from_a_missing_one() {
+        use super::PluginWebhookSendError;
+
+        let registry = PluginWebhookRegistry::new();
+        let lease = registry.start_generation();
+        let (sink, receiver) = tokio::sync::mpsc::channel(1);
+        assert!(lease.replace(std::collections::HashMap::from([(
+            "busy".to_string(),
+            sink,
+        )])));
+        let route = registry.get("busy").expect("the generation owns the path");
+
+        assert_eq!(route.try_send(raw_webhook(b"first").0), Ok(()));
+        assert_eq!(
+            route.try_send(raw_webhook(b"second").0),
+            Err(PluginWebhookSendError::Full)
+        );
+        drop(receiver);
+        assert_eq!(
+            route.try_send(raw_webhook(b"third").0),
+            Err(PluginWebhookSendError::Closed)
+        );
+        let _next = registry.start_generation();
+        assert_eq!(
+            route.try_send(raw_webhook(b"fourth").0),
+            Err(PluginWebhookSendError::Closed)
+        );
+    }
 
     #[test]
     fn registry_recovers_after_a_poisoned_lock() {
