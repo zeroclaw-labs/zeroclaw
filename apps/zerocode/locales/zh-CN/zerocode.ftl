@@ -460,6 +460,9 @@ zc-chat-elicitation-outcome-note = { $outcome }（问题：{ $question }）
 zc-chat-session-restarted = 已启动新会话。
 zc-chat-session-cap = 已达到此面板的会话上限（{ $max }）。请先从侧栏关闭一个会话。
 zc-chat-resume-dropped = 有 { $count } 个先前会话无法重新连接，已保留以便重试。
+zc-app-restore-sessions-dropped = 有 { $count } 个已保存的会话已不存在，未重新打开。
+zc-app-restore-sessions-save-failed = 无法保存已打开会话列表：{ $error }
+zc-app-restore-sessions-other-window = 有 { $count } 个已保存的会话已在另一个 zerocode 窗口中打开，未在此处重新打开。
 zc-chat-reconnect-interrupted = 连接已重建，排队消息已保留。正在等待先前轮次停止，然后重新加载持久化对话。
 zc-chat-resyncing = 部分实时更新丢失。正在重新加载此会话，然后再发送排队消息…
 zc-chat-resynced = 实时更新丢失，因此已重新加载持久化对话。任何进行中的审批或提问均已取消。
@@ -712,4 +715,7 @@ zc-config-section-cron-help = 将计划与提示、频道和目标绑定的计�
 zc-config-section-tunnel-help = 可选择通过 Cloudflare 或 ngrok 暴露网关，或仅保持本地访问。
 zc-config-section-onboard-state-help = 快速入门生命周期状态及其按分区记录的旧版完成记录。
 
+zc-chat-restore-environment-refused = 无法从当前终端环境重新连接此已保存的会话。守护进程仍保留原有对话。开始新对话后，此标签页将被替换为空白对话。
+zc-chat-restore-start-new = 按 { $key } 开始新对话。
+zc-chat-restore-new-conversation = 开始新对话
 zc-chat-tool-question = 问题
