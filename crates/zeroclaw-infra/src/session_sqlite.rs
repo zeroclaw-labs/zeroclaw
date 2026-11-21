@@ -1904,6 +1904,17 @@ impl SessionBackend for SqliteSessionBackend {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn linked_sqlite_meets_wal_security_floor() {
+        // RUSTSEC-2026-0459 affects SQLite before 3.54.0. Check the linked
+        // library rather than only the manifest or Cargo.lock version.
+        assert!(
+            rusqlite::version_number() >= 3_054_000,
+            "linked SQLite {} is affected by RUSTSEC-2026-0459",
+            rusqlite::version()
+        );
+    }
+
+    #[test]
     fn guarded_state_and_delete_recheck_owner_and_authority_after_connection_wait() {
         use std::sync::{
             Arc,
