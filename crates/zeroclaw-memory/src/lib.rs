@@ -739,12 +739,11 @@ fn build_memory_with_storage(
                 url, collection
             )
         );
-        return wrap_scanned_and_audit(
-            QdrantMemory::new_lazy("qdrant", &url, &collection, qdrant_api_key, embedder),
-            &config.policy,
-            workspace_dir,
-            config.audit_enabled,
-        );
+        #[allow(clippy::cast_possible_truncation)]
+        let qdrant = QdrantMemory::new_lazy("qdrant", &url, &collection, qdrant_api_key, embedder)
+            .with_hybrid(qdrant_cfg.hybrid)
+            .with_weights(config.vector_weight as f32, config.keyword_weight as f32);
+        return wrap_scanned_and_audit(qdrant, &config.policy, workspace_dir, config.audit_enabled);
     }
 
     if matches!(backend_kind, MemoryBackendKind::Postgres) {
