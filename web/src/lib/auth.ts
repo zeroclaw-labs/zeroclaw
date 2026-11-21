@@ -1,4 +1,4 @@
-const TOKEN_KEY = 'zeroclaw_token';
+export const PAIRING_TOKEN_STORAGE_KEY = 'zeroclaw_token';
 
 // ---------------------------------------------------------------------------
 // Auth mode
@@ -70,6 +70,7 @@ let clockOffsetMs = 0;
 // drafts, loaded data), so only the same account may be let back in place.
 let lastPrincipalId: string | null = null;
 const sessionListeners = new Set<(session: OidcSession | null) => void>();
+const pairingTokenListeners = new Set<() => void>();
 
 /** The current auth mode. */
 export function getAuthMode(): AuthMode {
@@ -151,10 +152,16 @@ export function authHeaders(method: string, init?: HeadersInit): Headers {
 
 function readStoredToken(): string | null {
   try {
-    return localStorage.getItem(TOKEN_KEY);
+    return localStorage.getItem(PAIRING_TOKEN_STORAGE_KEY);
   } catch {
     return null;
   }
+}
+
+/** Observe pairing-token changes made in this tab. */
+export function subscribePairingToken(listener: () => void): () => void {
+  pairingTokenListeners.add(listener);
+  return () => { pairingTokenListeners.delete(listener); };
 }
 
 /**
@@ -172,7 +179,11 @@ export function getToken(): string | null {
  */
 export function setToken(token: string): void {
   try {
-    localStorage.setItem(TOKEN_KEY, token);
+    const previous = localStorage.getItem(PAIRING_TOKEN_STORAGE_KEY);
+    localStorage.setItem(PAIRING_TOKEN_STORAGE_KEY, token);
+    if (previous !== token) {
+      for (const listener of [...pairingTokenListeners]) listener();
+    }
   } catch {
     // localStorage may be unavailable (e.g. in some private browsing modes)
   }
@@ -183,7 +194,11 @@ export function setToken(token: string): void {
  */
 export function clearToken(): void {
   try {
-    localStorage.removeItem(TOKEN_KEY);
+    const previous = localStorage.getItem(PAIRING_TOKEN_STORAGE_KEY);
+    localStorage.removeItem(PAIRING_TOKEN_STORAGE_KEY);
+    if (previous !== null) {
+      for (const listener of [...pairingTokenListeners]) listener();
+    }
   } catch {
     // Ignore
   }

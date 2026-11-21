@@ -94,7 +94,6 @@ fn cli_ftl_sources() -> &'static CliFtlSources {
     CLI_FTL_SOURCES.get_or_init(|| load_cli_ftl_sources(active_locale()))
 }
 
-#[cfg(test)]
 pub(crate) fn get_english_cli_string_with_args(key: &str, args: &[(&str, &str)]) -> String {
     let english = CliFtlSources {
         locale: "en".to_string(),
@@ -506,6 +505,24 @@ mod tests {
                     .unwrap_or_else(|| panic!("{key} should format in {locale}"));
                 assert!(!value.trim().is_empty(), "{key} is empty in {locale}");
             }
+        }
+    }
+
+    #[test]
+    fn goal_sop_unsupported_adapter_text_has_locale_fallback() {
+        let key = "cli-sop-llm-generate-goal-adapter-unsupported";
+        let english = "llm.generate is not available inside a Goal operation because this llm adapter cannot report its model usage to the Goal";
+        let source = load_cli_ftl_sources("en");
+        assert_eq!(
+            format_cli_string_with_args(&source, key, &[]).as_deref(),
+            Some(english)
+        );
+        for locale in available_locales() {
+            let source = load_cli_ftl_sources(locale.code.as_str());
+            let value = format_cli_string_with_args(&source, key, &[])
+                .unwrap_or_else(|| panic!("{key} should format in {}", locale.code));
+            assert!(!value.is_empty());
+            assert_ne!(value, format!("{{{key}}}"));
         }
     }
 

@@ -274,6 +274,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn french_quickstart_goal_summary_distinguishes_publication_and_known_zero() {
+        let bundle = build_ftl_bundle(include_str!("../locales/fr/zerocode.ftl"), "fr");
+        let prepared = format_ftl_message(&bundle, "zc-quickstart-goal-preparation", &[]).unwrap();
+        assert!(prepared.contains("ni enregistrée ni publiée"), "{prepared}");
+        let published = format_ftl_message(
+            &bundle,
+            "zc-quickstart-goal-published-count",
+            &[("count", "0")],
+        )
+        .unwrap();
+        assert!(published.contains("enregistré et publié"), "{published}");
+        assert!(published.contains('0'), "{published}");
+        let unpublished =
+            format_ftl_message(&bundle, "zc-quickstart-goal-not-published", &[]).unwrap();
+        assert!(unpublished.contains("pas été publiée"), "{unpublished}");
+        assert!(!unpublished.contains("enregistr"), "{unpublished}");
+    }
+
+    #[test]
     fn history_turn_notice_falls_back_without_reusing_localized_message_units() {
         let english = include_str!("../locales/en/zerocode.ftl");
         for (locale, source) in [

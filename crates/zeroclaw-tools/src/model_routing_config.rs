@@ -1,3 +1,6 @@
+use crate::model_call::{
+    DirectToolModelCall, ToolModelCallDisposition, ToolModelCallGate, ToolModelCallOutcome,
+};
 use crate::util_helpers::MaybeSet;
 use anyhow::Context;
 use async_trait::async_trait;
@@ -5,7 +8,7 @@ use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::fs;
 use std::sync::Arc;
-use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
+use zeroclaw_api::tool::{GoalChildOperationError, Tool, ToolOutput, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::schema::{ClassificationRule, Config, DelegateTargetConfig, ModelRouteConfig};
 use zeroclaw_providers::ProviderDispatch;
@@ -36,7 +39,19 @@ enum ProbeFailure {
         error: anyhow::Error,
     },
     /// The provider was built and the ping request for `model` failed.
-    Request { model: String, error: anyhow::Error },
+    Request {
+        model: String,
+        error: anyhow::Error,
+    },
+    Refused {
+        model: String,
+        error: anyhow::Error,
+    },
+    Stopped {
+        model: String,
+        call: ToolModelCallDisposition,
+        stop: anyhow::Error,
+    },
 }
 
 #[derive(Debug)]
@@ -49,7 +64,10 @@ enum ProbeConfigFailure {
 impl ProbeFailure {
     fn error(&self) -> &anyhow::Error {
         match self {
-            Self::Construction { error, .. } | Self::Request { error, .. } => error,
+            Self::Construction { error, .. }
+            | Self::Request { error, .. }
+            | Self::Refused { error, .. } => error,
+            Self::Stopped { stop, .. } => stop,
         }
     }
 
@@ -57,7 +75,9 @@ impl ProbeFailure {
     fn model(&self) -> Option<&str> {
         match self {
             Self::Construction { model, .. } => model.as_deref(),
-            Self::Request { model, .. } => Some(model),
+            Self::Request { model, .. }
+            | Self::Refused { model, .. }
+            | Self::Stopped { model, .. } => Some(model),
         }
     }
 
@@ -70,6 +90,13 @@ impl ProbeFailure {
         match self {
             Self::Construction { .. } => true,
             Self::Request { error, .. } => zeroclaw_providers::reliable::is_non_retryable(error),
+            Self::Refused { .. } => false,
+            Self::Stopped { call, .. } => matches!(
+                call,
+                ToolModelCallDisposition::Failed {
+                    non_retryable: true
+                }
+            ),
         }
     }
 }
@@ -83,11 +110,22 @@ impl std::fmt::Display for ProbeFailure {
 pub struct ModelRoutingConfigTool {
     config: Arc<Config>,
     security: Arc<SecurityPolicy>,
+    model_call_gate: Arc<dyn ToolModelCallGate>,
 }
 
 impl ModelRoutingConfigTool {
     pub fn new(config: Arc<Config>, security: Arc<SecurityPolicy>) -> Self {
-        Self { config, security }
+        Self {
+            config,
+            security,
+            model_call_gate: Arc::new(DirectToolModelCall),
+        }
+    }
+
+    /// Use the host's admission and accounting gate for availability probes.
+    pub fn with_model_call_gate(mut self, gate: Arc<dyn ToolModelCallGate>) -> Self {
+        self.model_call_gate = gate;
+        self
     }
 
     fn load_config_without_env(&self) -> anyhow::Result<Config> {
@@ -756,6 +794,56 @@ impl ModelRoutingConfigTool {
             .and_then(|e| e.model.clone());
         let provider_name = format!("{type_k}.{alias_k}");
         if let Err(probe_err) = self.probe_model(&cfg, &provider_name).await {
+            let probe_err = match probe_err {
+                ProbeFailure::Refused { error, .. } => {
+                    if error.is::<GoalChildOperationError>() {
+                        return Err(error.context(format!("model_routing_config: availability probe for '{provider_name}' was not admitted; the saved change was kept")).context(GoalChildOperationError));
+                    }
+                    return Err(
+                        error.context(crate::i18n::get_required_tool_string_with_args(
+                            "tool-model-routing-config-error-probe-not-admitted",
+                            &[("alias", &provider_name)],
+                        )),
+                    );
+                }
+                ProbeFailure::Stopped { call, stop, .. } => {
+                    let diagnostic = if matches!(
+                        call,
+                        ToolModelCallDisposition::Failed {
+                            non_retryable: true
+                        }
+                    ) {
+                        let restored = previous_provider_entry.is_some();
+                        match previous_provider_entry {
+                            Some(previous) => {
+                                if let Some(slot) = cfg.providers.models.ensure(&type_k, &alias_k) {
+                                    *slot = previous;
+                                }
+                            }
+                            None => {
+                                cfg.providers.models.remove_alias(&type_k, &alias_k);
+                            }
+                        }
+                        match cfg.save().await {
+                            Err(error) => format!(
+                                "model_routing_config: saving the rollback for '{provider_name}' failed after its availability probe stopped the Goal: {error:#}"
+                            ),
+                            Ok(()) if restored => format!(
+                                "model_routing_config: availability probe for '{provider_name}' failed and stopped the Goal; the previous settings were restored"
+                            ),
+                            Ok(()) => format!(
+                                "model_routing_config: availability probe for '{provider_name}' failed and stopped the Goal; the newly created alias was removed"
+                            ),
+                        }
+                    } else {
+                        format!(
+                            "model_routing_config: availability probe for '{provider_name}' stopped the Goal; the saved change was kept"
+                        )
+                    };
+                    return Err(stop.context(diagnostic).context(GoalChildOperationError));
+                }
+                other => other,
+            };
             // Name the model the probe actually validated. Only a failure
             // that happened before the effective model was resolved falls
             // back to the saved model, since nothing else exists to name.
@@ -957,18 +1045,42 @@ impl ModelRoutingConfigTool {
                 },
             )?;
 
-        ProviderDispatch::from_ref(&*model_provider)
-            .chat_with_system(
-                Some("Respond with OK."),
-                "ping",
+        let dispatcher = ProviderDispatch::from_ref(&*model_provider);
+        match self
+            .model_call_gate
+            .run(
+                provider_name,
                 &probe_model_name,
-                probe_temperature,
+                Box::pin(dispatcher.chat_with_system(
+                    Some("Respond with OK."),
+                    "ping",
+                    &probe_model_name,
+                    probe_temperature,
+                )),
             )
             .await
-            .map_err(|error| ProbeFailure::Request {
-                model: probe_model_name,
-                error,
-            })?;
+        {
+            ToolModelCallOutcome::Completed(Ok(_)) => (),
+            ToolModelCallOutcome::Completed(Err(error)) => {
+                return Err(ProbeFailure::Request {
+                    model: probe_model_name,
+                    error,
+                });
+            }
+            ToolModelCallOutcome::Refused(error) => {
+                return Err(ProbeFailure::Refused {
+                    model: probe_model_name,
+                    error,
+                });
+            }
+            ToolModelCallOutcome::Stopped { call, stop } => {
+                return Err(ProbeFailure::Stopped {
+                    model: probe_model_name,
+                    call,
+                    stop,
+                });
+            }
+        }
 
         Ok(())
     }
@@ -1790,6 +1902,7 @@ impl Tool for ModelRoutingConfigTool {
 
         match result {
             Ok(outcome) => Ok(outcome),
+            Err(error) if error.is::<GoalChildOperationError>() => Err(error),
             Err(error) => Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
@@ -1813,6 +1926,164 @@ mod tests {
             workspace_dir: std::env::temp_dir(),
             ..SecurityPolicy::default()
         })
+    }
+
+    struct MarkedProbeStop {
+        non_retryable: bool,
+    }
+
+    struct ProbeRefusal {
+        marked: bool,
+    }
+
+    #[async_trait]
+    impl ToolModelCallGate for ProbeRefusal {
+        async fn run(
+            &self,
+            _provider_ref: &str,
+            _model: &str,
+            _call: crate::model_call::ToolModelCallFuture<'_>,
+        ) -> ToolModelCallOutcome {
+            let error = anyhow::Error::msg("probe admission refused");
+            ToolModelCallOutcome::Refused(if self.marked {
+                error.context(GoalChildOperationError)
+            } else {
+                error
+            })
+        }
+    }
+
+    #[async_trait]
+    impl ToolModelCallGate for MarkedProbeStop {
+        async fn run(
+            &self,
+            _provider_ref: &str,
+            _model: &str,
+            _call: crate::model_call::ToolModelCallFuture<'_>,
+        ) -> ToolModelCallOutcome {
+            ToolModelCallOutcome::Stopped {
+                call: ToolModelCallDisposition::Failed {
+                    non_retryable: self.non_retryable,
+                },
+                stop: anyhow::Error::msg("probe test cause").context(GoalChildOperationError),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn marked_probe_stop_propagates_through_execute_and_restores_settings() {
+        let _env_guard = env_override_test_lock().await;
+        let tmp = TempDir::new().unwrap();
+        let mut cfg = (*test_config(&tmp).await).clone();
+        let entry = cfg
+            .providers
+            .models
+            .ensure("openai", "goal_probe_test")
+            .unwrap();
+        entry.api_key = Some("synthetic-test-key".to_string());
+        entry.model = Some("original-model".to_string());
+        entry.uri = Some("https://example.invalid/v1".to_string());
+        cfg.save().await.unwrap();
+        let tool = ModelRoutingConfigTool::new(Arc::new(cfg), test_security())
+            .with_model_call_gate(Arc::new(MarkedProbeStop {
+                non_retryable: true,
+            }));
+        let error = tool
+            .execute(json!({
+                "action": "set_default",
+                "model_provider": "openai.goal_probe_test",
+                "model": "replacement-model"
+            }))
+            .await
+            .expect_err("marked Goal stop must remain an error");
+        assert!(error.is::<GoalChildOperationError>());
+        assert_eq!(error.to_string(), "Goal foreground child operation failed");
+        let chain = format!("{error:#}");
+        assert!(chain.contains("previous settings were restored"));
+        assert!(chain.contains("probe test cause"));
+        let saved =
+            read_saved_provider_entry(&tmp.path().join("config.toml"), "openai", "goal_probe_test")
+                .unwrap();
+        assert_eq!(saved.model.as_deref(), Some("original-model"));
+    }
+
+    #[tokio::test]
+    async fn retryable_marked_probe_stop_keeps_settings_and_original_cause() {
+        let _env_guard = env_override_test_lock().await;
+        let tmp = TempDir::new().unwrap();
+        let mut cfg = (*test_config(&tmp).await).clone();
+        let entry = cfg
+            .providers
+            .models
+            .ensure("openai", "goal_probe_retry")
+            .unwrap();
+        entry.api_key = Some("synthetic-test-key".to_string());
+        entry.model = Some("original-model".to_string());
+        entry.uri = Some("https://example.invalid/v1".to_string());
+        cfg.save().await.unwrap();
+        let tool = ModelRoutingConfigTool::new(Arc::new(cfg), test_security())
+            .with_model_call_gate(Arc::new(MarkedProbeStop {
+                non_retryable: false,
+            }));
+        let error = tool.execute(json!({
+            "action": "set_default", "model_provider": "openai.goal_probe_retry", "model": "replacement-model"
+        })).await.expect_err("marked Goal stop must remain an error");
+        assert!(error.is::<GoalChildOperationError>());
+        let chain = format!("{error:#}");
+        assert!(chain.contains("saved change was kept"));
+        assert!(chain.contains("probe test cause"));
+        let saved = read_saved_provider_entry(
+            &tmp.path().join("config.toml"),
+            "openai",
+            "goal_probe_retry",
+        )
+        .unwrap();
+        assert_eq!(saved.model.as_deref(), Some("replacement-model"));
+    }
+
+    #[tokio::test]
+    async fn probe_refusal_keeps_settings_and_preserves_marked_error() {
+        let _env_guard = env_override_test_lock().await;
+        for marked in [false, true] {
+            let tmp = TempDir::new().unwrap();
+            let mut cfg = (*test_config(&tmp).await).clone();
+            let entry = cfg
+                .providers
+                .models
+                .ensure("openai", "goal_probe_refused")
+                .unwrap();
+            entry.api_key = Some("synthetic-test-key".to_string());
+            entry.model = Some("original-model".to_string());
+            entry.uri = Some("https://example.invalid/v1".to_string());
+            cfg.save().await.unwrap();
+            let tool = ModelRoutingConfigTool::new(Arc::new(cfg), test_security())
+                .with_model_call_gate(Arc::new(ProbeRefusal { marked }));
+            let result = tool.execute(json!({
+                "action": "set_default", "model_provider": "openai.goal_probe_refused", "model": "replacement-model"
+            })).await;
+            if marked {
+                let error = result.expect_err("marked refusal must stop the Goal");
+                assert!(error.is::<GoalChildOperationError>());
+                let chain = format!("{error:#}");
+                assert!(chain.contains("was not admitted; the saved change was kept"));
+                assert!(chain.contains("probe admission refused"));
+            } else {
+                let result = result.expect("unmarked refusal remains a tool result");
+                assert!(!result.success);
+                let expected = crate::i18n::get_required_tool_string_with_args(
+                    "tool-model-routing-config-error-probe-not-admitted",
+                    &[("alias", "openai.goal_probe_refused")],
+                );
+                assert_eq!(result.error.as_deref(), Some(expected.as_str()));
+            }
+            let saved = read_saved_provider_entry(
+                &tmp.path().join("config.toml"),
+                "openai",
+                "goal_probe_refused",
+            )
+            .unwrap();
+            assert_eq!(saved.model.as_deref(), Some("replacement-model"));
+        }
     }
 
     fn readonly_security() -> Arc<SecurityPolicy> {

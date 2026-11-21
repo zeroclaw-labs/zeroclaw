@@ -96,10 +96,26 @@ impl SendMessageToPeerTool {
         self.task_control_plane = Some(handle);
         self
     }
+
+    fn target_agent_alias(&self, target: &str) -> Option<&str> {
+        let target = target.trim().trim_start_matches('@');
+        self.config
+            .agents
+            .keys()
+            .find(|alias| alias.eq_ignore_ascii_case(target))
+            .map(String::as_str)
+    }
 }
 
 #[async_trait]
 impl Tool for SendMessageToPeerTool {
+    fn may_invoke_agent_child(&self, args: &serde_json::Value) -> bool {
+        args.get("target")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|target| self.target_agent_alias(target))
+            .is_some()
+    }
+
     fn requires_unrestricted_principal(&self) -> bool {
         // This path uses agent authority without carrying the session owner.
         true
@@ -234,25 +250,13 @@ impl Tool for SendMessageToPeerTool {
             });
         }
 
-        let target_norm = target.trim_start_matches('@').to_ascii_lowercase();
-        let target_is_agent = self
-            .config
-            .agents
-            .keys()
-            .any(|alias| alias.to_ascii_lowercase() == target_norm);
-
-        if target_is_agent {
-            // The target's resolved alias may differ in case from the
-            // raw input ("@Beta" -> "beta"). Look up the canonical
-            // alias once so the agent loop's `agent_alias` field
-            // matches the [agents.<alias>] config key.
-            let canonical = self
-                .config
-                .agents
-                .keys()
-                .find(|alias| alias.to_ascii_lowercase() == target_norm)
-                .cloned()
-                .unwrap_or_else(|| target.clone());
+        if let Some(canonical) = self.target_agent_alias(&target) {
+            if crate::goal_accounting::GoalForegroundContext::is_participating() {
+                return Ok(ToolResult::err(crate::i18n::get_required_cli_string(
+                    "goal-mode-child-route-unsupported",
+                )));
+            }
+            let canonical = canonical.to_owned();
 
             let admission = self
                 .execution_capability
@@ -515,6 +519,8 @@ where
             delivered: false,
             idem_key: None,
             principal_id: Some(sender_alias.to_string()),
+            session_id: None,
+            execution_epoch: 0,
             started_at: Utc::now().to_rfc3339(),
             finished_at: None,
         })
@@ -1020,6 +1026,8 @@ mod tests {
         assert_eq!(record.originator_route.as_deref(), Some("telegram.prod"));
         assert!(record.parent_id.is_none());
         assert!(record.idem_key.is_none());
+        assert!(record.session_id.is_none());
+        assert_eq!(record.execution_epoch, 0);
         assert_eq!(dispatches.load(Ordering::SeqCst), 1);
     }
 
@@ -1203,6 +1211,54 @@ mod tests {
         assert!(!description.contains("\"@Operator\""));
         assert!(!description.contains("\"gamma\""));
         assert!(description.contains("Do not pass peer group names as the `channel` parameter"));
+    }
+
+    #[tokio::test]
+    async fn goal_refuses_agent_peer_before_task_admission() {
+        use zeroclaw_api::tool::ToolExecutionContext;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = Config::default();
+        for alias in ["sender", "recipient"] {
+            config.agents.insert(
+                alias.into(),
+                AliasedAgentConfig {
+                    channels: vec!["telegram.prod".into()],
+                    ..AliasedAgentConfig::default()
+                },
+            );
+        }
+        config.peer_groups.insert(
+            "ops".into(),
+            PeerGroupConfig {
+                channel: "telegram".into(),
+                agents: vec![AgentAlias::new("sender"), AgentAlias::new("recipient")],
+                external_peers: vec![PeerUsername::new("@Operator")],
+                ..PeerGroupConfig::default()
+            },
+        );
+        let control_plane = ControlPlaneHandle::open(tmp.path()).unwrap();
+        let store = Arc::clone(&control_plane.store);
+        let tool = SendMessageToPeerTool::new(Arc::new(config), "sender")
+            .with_control_plane(control_plane);
+        let args =
+            json!({"channel": "telegram.prod", "target": " @Recipient ", "message": "status"});
+        assert!(tool.may_invoke_agent_child(&args));
+        assert!(!tool.may_invoke_agent_child(&json!({"target": "@Operator"})));
+        let result = tool
+            .execute_with_context(
+                args,
+                &ToolExecutionContext::default().with_goal_foreground(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            result.error.as_deref(),
+            Some(
+                crate::i18n::get_required_cli_string("goal-mode-child-route-unsupported").as_str()
+            )
+        );
+        assert!(store.list_by_agent("recipient").await.unwrap().is_empty());
     }
 
     #[test]

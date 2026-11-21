@@ -619,6 +619,7 @@ cli-sop-run-copy-stale = Run {$run_id} changed in the store since this engine la
 cli-sop-run-copy-revision-unknown = unknown
 cli-sop-run-copy-changed = Run {$run_id} changed in the store since this engine last read it
 cli-sop-run-copy-reload-failed = Run {$run_id} changed in the store since this engine last read it, and reloading it failed: {$error}
+cli-sop-llm-generate-goal-adapter-unsupported = llm.generate is not available inside a Goal operation because this llm adapter cannot report its model usage to the Goal
 # gateway WebSocket SOP approval error frames (UI-surfaced)
 cli-sop-ws-invalid-approval = sop approval_response requires run_id and a decision of approve or deny
 cli-sop-ws-resolve-failed = sop resolve failed: {$error}
@@ -796,6 +797,11 @@ cli-quickstart-step-agent = Agent
 cli-quickstart-error-internal-no-result = internal error: apply_into returned no result despite no validation errors
 cli-quickstart-error-completion-flag = failed to flip quickstart-completed: {$err}
 cli-quickstart-error-persist-config = failed to persist config: {$err}
+cli-quickstart-goal-preparation = Goal policy preparation failed. The configuration was not saved or published.
+cli-quickstart-goal-published = Agent saved and published. Setup did not finish; do not create the agent again.
+cli-quickstart-goal-published-count = Agent saved and published. Do not create it again. Setup did not finish. Goals cancelled: { $count }.
+cli-quickstart-goal-not-published = Configuration was not published. Setup did not finish.
+cli-quickstart-goal-not-published-count = Configuration was not published. Setup did not finish. Goals cancelled: { $count }.
 cli-quickstart-error-publish-config = failed to publish quickstart config: {$err}
 cli-quickstart-error-auth-validation = authorization config rejected before persistence: {$err}
 cli-quickstart-error-not-type-alias-ref = `{$reference}` is not a `<type>.<alias>` reference
@@ -1750,6 +1756,54 @@ rpc-config-set-many-limit = config/set-many accepts at most { $limit } entries i
 rpc-config-set-many-entry-rejected = config/set-many entry { $index } (`{ $prop }`) rejected; nothing was saved: { $reason }
 rpc-cron-agent-principal-required = Agent cron jobs do not carry principal restrictions; only administrators may modify or trigger them.
 cron-rpc-requested-agent-forbidden = The principal is not entitled to the requested agent.
+
+# Goal Mode V1 channel control responses.
+goal-mode-help = Goal commands: start, status, budget, pause, resume, cancel, help.
+goal-mode-disabled = Goal Mode is disabled.
+goal-mode-queued-start = Goal start queued; it begins after the current turn.
+goal-mode-queued-resume = Goal resume queued; it continues after the current turn.
+goal-mode-queued-pause = Goal pause queued; it applies after the current step.
+goal-mode-queued-budget = Goal budget change queued; it applies after the current step.
+goal-mode-started = Goal started.
+goal-mode-completed = Goal completed.
+goal-mode-status = Goal status is available.
+goal-mode-budget = Goal budget is available.
+goal-mode-budget-updated = Goal budget updated.
+goal-mode-paused = Goal paused.
+goal-mode-pause-pending = Goal pause accepted; waiting for the active operation to settle.
+goal-mode-paused-blocked = Goal paused: resolution is required before it can continue.
+goal-mode-already-paused = Goal is already paused.
+goal-mode-resumed = Goal resumed.
+goal-mode-cancelled = Goal cancelled.
+goal-mode-cancel-pending = Goal cancellation accepted; waiting for the active operation to settle.
+goal-mode-already-cancelled = Goal is already cancelled.
+goal-mode-no-current = There is no current Goal for this session.
+goal-mode-session-unavailable = This session is unavailable.
+goal-mode-already-active = A Goal is already active for this session.
+goal-mode-terminal = This Goal is terminal.
+goal-mode-stale = Goal state changed; try the command again.
+goal-mode-command-invalid = That is not a valid Goal command. Use `/goal help` to see the supported commands.
+goal-mode-command-failed = Goal Mode could not complete that command. Try again. If the problem continues, ask an operator to check the configuration and logs.
+
+# Goal start requires explicit limits or configured defaults.
+goal-mode-budget-required = Set --tokens or --cost-usd, or configure goal.default_token_limit and goal.default_cost_limit_usd.
+
+# Goal failure notices describe the terminal transition; the original error is shown separately.
+goal-mode-failure-agent-operation = The agent operation failed, so the Goal was marked as failed.
+goal-mode-failure-tool-results-unpaired = The agent returned unmatched tool calls or results, so the Goal was marked as failed.
+goal-mode-failure-empty-agent-response = The agent returned no usable response, so the Goal was marked as failed.
+goal-mode-failure-verifier-operation = The verifier operation failed, so the Goal was marked as failed.
+goal-mode-failure-verifier-response = The verifier returned an invalid response, so the Goal was marked as failed.
+goal-mode-failure-accounting = Usage accounting was missing or invalid, so the Goal was marked as failed.
+goal-mode-failure-pricing = Usage pricing was unavailable, so the Goal was marked as failed.
+goal-mode-failure-outcome-unknown = The operation's outcome could not be confirmed, so the Goal was marked as failed.
+goal-mode-failure-executor-start = The Goal executor could not start, so the Goal was marked as failed.
+goal-mode-failure-executor = The Goal executor failed, so the Goal was marked as failed.
+goal-mode-failure-candidate-persistence = The accepted candidate could not be saved, so the Goal was marked as failed.
+goal-mode-failure-other = The Goal encountered an unexpected failure and was marked as failed.
+goal-mode-child-foreground-only = Goal Mode permits only synchronous foreground child execution.
+goal-mode-child-route-unsupported = Goal Mode cannot start an agent through this tool. Use a supported foreground delegation tool instead.
+goal-mode-child-recursion-disallowed = A Goal child cannot create another child.
 
 skill-http-request-timeout = HTTP request timed out
 sop-store-busy = SOP storage is busy or unavailable; retry the request.

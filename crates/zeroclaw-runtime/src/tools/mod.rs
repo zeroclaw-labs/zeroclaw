@@ -19,6 +19,7 @@ pub mod delegate;
 mod delegate_progress;
 pub mod deliver_file;
 pub mod file_read;
+pub(crate) mod model_call_gate;
 pub mod model_switch;
 pub mod param_options;
 pub mod read_skill;
@@ -229,6 +230,10 @@ pub struct ArcToolRef(pub Arc<dyn Tool>);
 
 #[async_trait]
 impl Tool for ArcToolRef {
+    fn may_invoke_agent_child(&self, args: &serde_json::Value) -> bool {
+        self.0.may_invoke_agent_child(args)
+    }
+
     fn requires_unrestricted_principal(&self) -> bool {
         self.0.requires_unrestricted_principal()
     }
@@ -367,6 +372,10 @@ impl ::zeroclaw_api::attribution::Attributable for ArcDelegatingTool {
 
 #[async_trait]
 impl Tool for ArcDelegatingTool {
+    fn may_invoke_agent_child(&self, args: &serde_json::Value) -> bool {
+        self.inner.may_invoke_agent_child(args)
+    }
+
     fn requires_unrestricted_principal(&self) -> bool {
         self.inner.requires_unrestricted_principal()
     }
@@ -2553,10 +2562,10 @@ fn all_tools_with_runtime_on_thread(
     });
     register_tool!(
         "model_routing_config",
-        Arc::new(ModelRoutingConfigTool::new(
-            config.clone(),
-            security.clone(),
-        ))
+        Arc::new(
+            ModelRoutingConfigTool::new(config.clone(), security.clone())
+                .with_model_call_gate(Arc::new(model_call_gate::RuntimeToolModelCallGate)),
+        )
     );
     if !is_subagent_caller {
         register_tool!(
@@ -2676,16 +2685,19 @@ fn all_tools_with_runtime_on_thread(
             zeroclaw_providers::provider_runtime_options_for_alias(root_config, family, alias);
         register_tool!(
             "llm_task",
-            Arc::new(LlmTaskTool::new(
-                security.clone(),
-                config.clone(),
-                family.to_string(),
-                alias.to_string(),
-                llm_task_model,
-                entry.temperature,
-                entry.api_key.clone(),
-                llm_task_runtime_options,
-            ))
+            Arc::new(
+                LlmTaskTool::new(
+                    security.clone(),
+                    config.clone(),
+                    family.to_string(),
+                    alias.to_string(),
+                    llm_task_model,
+                    entry.temperature,
+                    entry.api_key.clone(),
+                    llm_task_runtime_options,
+                )
+                .with_model_call_gate(Arc::new(model_call_gate::RuntimeToolModelCallGate))
+            )
         );
     }
 
@@ -4148,6 +4160,40 @@ mod tests {
         ApprovalGroupConfig, ApprovalPolicyConfig, BrowserConfig, Config, FileDownloadConfig,
         MemoryConfig, SopApprovalConfig,
     };
+
+    struct ChildPredicateProbe;
+    zeroclaw_api::mock_tool_attribution!(ChildPredicateProbe);
+
+    #[async_trait]
+    impl Tool for ChildPredicateProbe {
+        fn name(&self) -> &str {
+            "predicate_probe"
+        }
+        fn description(&self) -> &str {
+            "argument-sensitive child predicate"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+        fn may_invoke_agent_child(&self, args: &serde_json::Value) -> bool {
+            args.get("action").and_then(|v| v.as_str()) != Some("list_results")
+        }
+        async fn execute(&self, _: serde_json::Value) -> anyhow::Result<ToolResult> {
+            panic!("predicate must not execute the target")
+        }
+    }
+
+    #[test]
+    fn arc_tool_wrappers_forward_argument_sensitive_child_predicate() {
+        let inner: Arc<dyn Tool> = Arc::new(ChildPredicateProbe);
+        let direct = ArcToolRef(inner.clone());
+        let delegated = ArcDelegatingTool::boxed(inner);
+        for wrapper in [&direct as &dyn Tool, delegated.as_ref()] {
+            assert!(wrapper.may_invoke_agent_child(&serde_json::json!({"action":"delegate"})));
+            assert!(!wrapper.may_invoke_agent_child(&serde_json::json!({"action":"list_results"})));
+            assert!(wrapper.may_invoke_agent_child(&serde_json::json!({})));
+        }
+    }
 
     #[test]
     fn git_write_boundary_rejects_docker_runtime_writes() {

@@ -1915,6 +1915,7 @@ pub async fn run(
                             // failure cannot consume queues or retry state.
                             chat_pane.commit_reconnect_handoff();
                             acp_pane.commit_reconnect_handoff();
+                            quickstart.carry_apply_failure_to(&mut panes.6);
                             let previous_flushed = inbound_router.cancel_pending().await;
                             // Assigned as one tuple: every pane the builder
                             // produces is adopted, and a later pane addition

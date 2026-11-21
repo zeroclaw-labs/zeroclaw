@@ -39,8 +39,9 @@ fn masked_secret(buf: &str) -> String {
 }
 
 use crate::client::{
-    AppliedAgent, QuickstartApplyResult, QuickstartError, QuickstartFieldDescriptor,
-    QuickstartFieldSection, QuickstartStateResult, QuickstartStep, QuickstartSurface, RpcClient,
+    AppliedAgent, QuickstartApplyDetail, QuickstartApplyResult, QuickstartError,
+    QuickstartFieldDescriptor, QuickstartFieldSection, QuickstartStateResult, QuickstartStep,
+    QuickstartSurface, RpcClient,
 };
 use crate::theme;
 use crate::widgets::HelpNode;
@@ -130,6 +131,40 @@ impl Selector {
         };
         sel.title()
     }
+}
+
+fn localize_apply_errors(
+    mut errors: Vec<QuickstartError>,
+    detail: Option<QuickstartApplyDetail>,
+) -> Vec<QuickstartError> {
+    use QuickstartApplyDetail::{GoalPolicyCompletionFailed, GoalPolicyPreparationFailed};
+    let Some((first, detail)) = errors.first_mut().zip(detail) else {
+        return errors;
+    };
+    let (key, count) = match detail {
+        GoalPolicyPreparationFailed => ("zc-quickstart-goal-preparation", None),
+        GoalPolicyCompletionFailed {
+            published: true,
+            cancelled_goals: None,
+        } => ("zc-quickstart-goal-published", None),
+        GoalPolicyCompletionFailed {
+            published: true,
+            cancelled_goals: Some(count),
+        } => ("zc-quickstart-goal-published-count", Some(count)),
+        GoalPolicyCompletionFailed {
+            published: false,
+            cancelled_goals: None,
+        } => ("zc-quickstart-goal-not-published", None),
+        GoalPolicyCompletionFailed {
+            published: false,
+            cancelled_goals: Some(count),
+        } => ("zc-quickstart-goal-not-published-count", Some(count)),
+    };
+    first.message = match count {
+        Some(count) => crate::i18n::t_args(key, &[("count", &count.to_string())]),
+        None => crate::i18n::t(key),
+    };
+    errors
 }
 
 fn retain_filled_selector_errors(
@@ -1087,6 +1122,11 @@ impl PickerOption {
     }
 }
 
+struct ApplyFailureNotice {
+    detail: QuickstartApplyDetail,
+    errors: Vec<QuickstartError>,
+}
+
 pub struct QuickstartPane {
     rpc: Arc<RpcClient>,
     /// Shared state that survives the daemon-reload reconnect. Used
@@ -1099,6 +1139,9 @@ pub struct QuickstartPane {
     last_step: Option<QuickstartStep>,
     state_snapshot: Option<QuickstartStateResult>,
     last_errors: Vec<QuickstartError>,
+    // Unlike form-validation errors, a typed Apply outcome describes an
+    // attempt that already happened and may need to outlive its connection.
+    apply_failure: Option<ApplyFailureNotice>,
     applied_alias: Option<String>,
     busy: bool,
     active_modal: Option<Modal>,
@@ -1137,6 +1180,7 @@ impl QuickstartPane {
             last_step: None,
             state_snapshot: None,
             last_errors: Vec::new(),
+            apply_failure: None,
             applied_alias: None,
             busy: false,
             active_modal: None,
@@ -1184,18 +1228,32 @@ impl QuickstartPane {
     }
 
     pub fn draw(&mut self, frame: &mut Frame, area: Rect) {
+        let (status, style) = self.status_strip_content();
+        let block = theme::panel_block("").padding(Padding::horizontal(1));
+        let status = Paragraph::new(status)
+            .style(style)
+            .wrap(Wrap { trim: true });
+        let status_height = if self.apply_failure.is_some() {
+            let width = block.inner(area).width;
+            let rows = u16::try_from(status.line_count(width)).unwrap_or(u16::MAX);
+            rows.saturating_add(2)
+                .max(3)
+                .min(area.height.saturating_sub(3).max(3))
+        } else {
+            3
+        };
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(2),
                 Constraint::Min(0),
-                Constraint::Length(3),
+                Constraint::Length(status_height),
             ])
             .split(area);
 
         self.draw_title(frame, chunks[0]);
         self.draw_selector_list(frame, chunks[1]);
-        self.draw_status_strip(frame, chunks[2]);
+        frame.render_widget(status.block(block), chunks[2]);
 
         if let Some(modal) = &self.active_modal {
             let (rect, rows) = draw_modal(
@@ -1485,7 +1543,7 @@ impl QuickstartPane {
     }
 
     fn advance_after_validated(&mut self, sel: Selector) {
-        if errors_include_selector(&self.last_errors, sel) {
+        if errors_include_selector(self.visible_errors(), sel) {
             self.keep_selector_selected(sel);
         } else {
             self.advance_after_completed(sel);
@@ -2154,6 +2212,8 @@ impl QuickstartPane {
     }
 
     async fn revalidate(&mut self) {
+        // Accepting a new form selection retires the preceding Apply outcome.
+        self.apply_failure = None;
         let submission = self.form.to_submission();
         match self.rpc.quickstart_validate(&submission).await {
             Ok(crate::client::QuickstartValidateResult::Ok) => {
@@ -2408,13 +2468,39 @@ impl QuickstartPane {
         }
     }
 
+    pub(crate) fn carry_apply_failure_to(&mut self, replacement: &mut Self) {
+        if self.apply_failure.as_ref().is_some_and(|notice| {
+            matches!(
+                notice.detail,
+                QuickstartApplyDetail::GoalPolicyCompletionFailed {
+                    published: true,
+                    ..
+                }
+            )
+        }) {
+            replacement.apply_failure = self.apply_failure.take();
+        }
+    }
+
+    fn visible_errors(&self) -> &[QuickstartError] {
+        // The retained Apply receipt is evidence about an earlier action,
+        // not a replacement for a current form diagnostic.
+        if self.last_errors.is_empty()
+            && let Some(notice) = &self.apply_failure
+        {
+            return &notice.errors;
+        }
+        &self.last_errors
+    }
+
     fn can_create(&self) -> bool {
-        self.form.all_selectors_satisfied() && self.last_errors.is_empty() && !self.busy
+        self.form.all_selectors_satisfied() && self.visible_errors().is_empty() && !self.busy
     }
 
     async fn submit(&mut self) {
         self.busy = true;
         self.last_errors.clear();
+        self.apply_failure = None;
         let submission = self.form.to_submission();
         match self.rpc.quickstart_apply(&submission).await {
             Ok(QuickstartApplyResult::Applied {
@@ -2423,8 +2509,15 @@ impl QuickstartPane {
             }) => {
                 self.handle_apply_success(agent, daemon_restarted);
             }
-            Ok(QuickstartApplyResult::Errors { errors }) => {
-                self.last_errors = errors;
+            Ok(QuickstartApplyResult::Errors { errors, detail }) => {
+                if let Some(detail) = detail.filter(|_| !errors.is_empty()) {
+                    self.apply_failure = Some(ApplyFailureNotice {
+                        detail,
+                        errors: localize_apply_errors(errors, Some(detail)),
+                    });
+                } else {
+                    self.last_errors = errors;
+                }
             }
             Err(err) => {
                 self.last_errors = vec![QuickstartError {
@@ -2458,7 +2551,7 @@ impl QuickstartPane {
         let items: Vec<ListItem> = Selector::ALL
             .iter()
             .map(|sel| {
-                let satisfied = self.form.selector_is_complete(*sel, &self.last_errors);
+                let satisfied = self.form.selector_is_complete(*sel, self.visible_errors());
                 let glyph_style = if satisfied {
                     Style::default()
                         .fg(Color::Green)
@@ -2498,13 +2591,14 @@ impl QuickstartPane {
         frame.render_stateful_widget(list, area, &mut self.list_state);
     }
 
-    fn draw_status_strip(&self, frame: &mut Frame, area: Rect) {
+    fn status_strip_content(&self) -> (String, Style) {
         let can_create = self.can_create();
+        let errors = self.visible_errors();
         let label = if self.busy {
             crate::i18n::t("zc-quickstart-status-submitting")
         } else if let Some(alias) = &self.applied_alias {
             crate::i18n::t_args("zc-quickstart-status-created", &[("alias", alias.as_str())])
-        } else if let Some(first) = self.last_errors.first() {
+        } else if let Some(first) = errors.first() {
             // Name the first actionable field error so the user knows
             // which field is invalid, instead of only a count. The
             // daemon's message often already carries the specifics
@@ -2515,7 +2609,7 @@ impl QuickstartPane {
             } else {
                 format!(" / {}", first.field)
             };
-            let more = self.last_errors.len().saturating_sub(1);
+            let more = errors.len().saturating_sub(1);
             let suffix = if more > 0 {
                 crate::i18n::t_args(
                     "zc-quickstart-status-more-errors",
@@ -2542,17 +2636,12 @@ impl QuickstartPane {
             Style::default()
                 .fg(Color::Green)
                 .add_modifier(Modifier::BOLD)
-        } else if !self.last_errors.is_empty() {
+        } else if !errors.is_empty() {
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
         } else {
             theme::dim_style()
         };
-        let block = theme::panel_block("").padding(Padding::horizontal(1));
-        let p = Paragraph::new(label)
-            .style(style)
-            .block(block)
-            .wrap(Wrap { trim: true });
-        frame.render_widget(p, area);
+        (label, style)
     }
 }
 
@@ -3504,6 +3593,145 @@ fn draw_modal(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quickstart_apply_preserves_legacy_errors_and_localizes_only_the_summary() {
+        let make_reply = |detail: Option<serde_json::Value>| {
+            let mut reply = serde_json::json!({
+                "kind": "errors",
+                "errors": [
+                    {"step": "agent", "field": "", "message": "wire fallback"},
+                    {"step": "agent", "field": "personality_files", "message": "original error"}
+                ]
+            });
+            if let Some(detail) = detail {
+                reply["detail"] = detail;
+            }
+            let QuickstartApplyResult::Errors { errors, detail } =
+                serde_json::from_value(reply).unwrap()
+            else {
+                panic!("expected the existing error envelope");
+            };
+            localize_apply_errors(errors, detail)
+        };
+        for detail in [
+            None,
+            Some(serde_json::Value::Null),
+            Some(serde_json::json!({"kind": "unknown"})),
+            Some(serde_json::json!({
+                "kind": "goal_policy_completion_failed", "published": true, "cancelled_goals": -1
+            })),
+        ] {
+            assert_eq!(make_reply(detail)[0].message, "wire fallback");
+        }
+        let errors = make_reply(Some(serde_json::json!({
+            "kind": "goal_policy_completion_failed", "published": true, "cancelled_goals": 0
+        })));
+        assert_ne!(errors[0].message, "wire fallback");
+        assert!(errors[0].message.contains('0'));
+        assert_eq!(errors[1].message, "original error");
+    }
+
+    #[tokio::test]
+    async fn quickstart_published_failure_remains_visible_after_pane_replacement() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        fn render(pane: &mut QuickstartPane) -> String {
+            let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+            terminal
+                .draw(|frame| pane.draw(frame, frame.area()))
+                .unwrap();
+            terminal
+                .backend()
+                .buffer()
+                .content
+                .chunks(80)
+                .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+
+        fn rendered_text(screen: &str) -> String {
+            screen
+                .lines()
+                .flat_map(|line| line.trim_matches('│').split_whitespace())
+                .collect::<Vec<_>>()
+                .join(" ")
+        }
+
+        for (published, count) in [(true, 0), (true, 17), (false, 17)] {
+            let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+            let outbound = Arc::new(crate::jsonrpc::RpcOutbound::new(tx));
+            let state = crate::app::SharedReconnectState::default();
+            let rpc = Arc::new(RpcClient::with_rpc(Arc::clone(&outbound)));
+            let mut pane = QuickstartPane::new(rpc, Arc::clone(&state));
+
+            let work = tokio::spawn(async move {
+                pane.submit().await;
+                pane
+            });
+            let request = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let request: serde_json::Value = serde_json::from_str(&request).unwrap();
+            assert_eq!(request["method"], crate::client::method::QUICKSTART_APPLY);
+            outbound.dispatch_response(
+                request["id"].as_str().unwrap(),
+                Some(serde_json::json!({
+                    "kind": "errors",
+                    "errors": [{"step": "agent", "field": "", "message": "wire fallback"}],
+                    "detail": {
+                        "kind": "goal_policy_completion_failed",
+                        "published": published,
+                        "cancelled_goals": count,
+                    }
+                })),
+                None,
+            );
+            let mut old = tokio::time::timeout(std::time::Duration::from_secs(2), work)
+                .await
+                .unwrap()
+                .unwrap();
+            let before = render(&mut old);
+            let notice_key = if published {
+                "zc-quickstart-goal-published-count"
+            } else {
+                "zc-quickstart-goal-not-published-count"
+            };
+            let notice = crate::i18n::t_args(notice_key, &[("count", &count.to_string())]);
+            let visible_notice = |screen: &str| rendered_text(screen).contains(notice.as_str());
+            assert!(visible_notice(&before), "{before}");
+            assert!(old.applied_alias.is_none());
+
+            let (tx, _rx) = tokio::sync::mpsc::channel(1);
+            let new_outbound = Arc::new(crate::jsonrpc::RpcOutbound::new(tx));
+            let new_rpc = Arc::new(RpcClient::with_rpc(new_outbound));
+            let mut replacement = QuickstartPane::new(new_rpc, Arc::clone(&state));
+            old.carry_apply_failure_to(&mut replacement);
+
+            let after = render(&mut replacement);
+            assert_eq!(visible_notice(&after), published, "{after}");
+            assert_eq!(replacement.apply_failure.is_some(), published);
+            if published {
+                assert!(old.apply_failure.is_none());
+                assert!(!replacement.can_create());
+                assert_eq!(before, after);
+
+                replacement.keep_selector_selected(Selector::Submit);
+                assert!(!replacement.handle_key(synth_enter()).await);
+                let after_create = render(&mut replacement);
+                let current_error = crate::i18n::t("zc-quickstart-missing-model-provider");
+                assert!(
+                    rendered_text(&after_create).contains(current_error.as_str()),
+                    "{after_create}"
+                );
+                assert!(!visible_notice(&after_create), "{after_create}");
+                assert!(replacement.apply_failure.is_some());
+            }
+            assert!(state.lock().unwrap().pending_quickstart_chat.is_none());
+        }
+    }
 
     fn field_row(key: &str, value: &str) -> FieldFormRow {
         FieldFormRow {

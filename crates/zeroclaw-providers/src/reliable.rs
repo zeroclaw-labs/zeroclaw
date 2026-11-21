@@ -79,6 +79,16 @@ pub async fn scope_provider_attempt_allowlist<F: std::future::Future>(
     PROVIDER_ATTEMPT_ALLOWLIST.scope(allowed, future).await
 }
 
+/// Read the current physical-attempt bound without changing scope semantics.
+/// An explicitly empty set remains a deny-all bound, distinct from `None`.
+#[must_use]
+pub fn current_provider_attempt_allowlist() -> Option<Arc<HashSet<String>>> {
+    PROVIDER_ATTEMPT_ALLOWLIST
+        .try_with(Clone::clone)
+        .ok()
+        .flatten()
+}
+
 /// Return whether a physical provider reference is eligible in the current
 /// turn. Direct side routes (for example the configured vision provider) use
 /// this before dispatch so they cannot bypass Reliable's candidate filter.

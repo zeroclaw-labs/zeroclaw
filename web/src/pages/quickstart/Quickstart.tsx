@@ -28,6 +28,7 @@ import {
 } from "@/lib/api";
 import { Badge, Button, Card, PageHeader } from "@/components/ui";
 import { t } from "@/lib/i18n";
+import { applyErrorMessage } from "./apply-error";
 import {
   requiredQuickstartSelectionsComplete,
   runtimeAfterProviderChange,
@@ -102,7 +103,11 @@ export default function Quickstart() {
   const navigate = useNavigate();
   const [form, setForm] = useState<FormState>(DEFAULT_FORM);
   const [busy, setBusy] = useState(false);
-  const [errors, setErrors] = useState<QuickstartError[]>([]);
+  const [applyError, setApplyError] = useState<{
+    errors: QuickstartError[];
+    detail?: unknown;
+  }>({ errors: [] });
+  const { errors, detail } = applyError;
   const [state, setState] = useState<QuickstartState | null>(null);
   const runIdRef = useRef<string>(
     `${Date.now().toString(16)}${Math.random().toString(16).slice(2, 10)}`,
@@ -160,7 +165,7 @@ export default function Quickstart() {
     const runtimeProfile = runtimeValueForSubmit(form.runtime);
     if (!runtimeProfile) return;
     setBusy(true);
-    setErrors([]);
+    setApplyError({ errors: [] });
     const res = await quickstartApply({
       model_provider: { mode: "fresh", value: form.provider! },
       risk_profile: { mode: "fresh", value: form.risk!.preset_name },
@@ -191,7 +196,7 @@ export default function Quickstart() {
     });
     setBusy(false);
     if (res.kind === "errors") {
-      setErrors(res.errors);
+      setApplyError(res);
       return;
     }
     submittedRef.current = true;
@@ -457,7 +462,7 @@ export default function Quickstart() {
                 {e.step}
                 {e.field ? `.${e.field}` : ""}
               </code>
-              : {e.message}
+              : {i === 0 ? applyErrorMessage(e.message, detail, t) : e.message}
             </li>
           ))}
         </ul>

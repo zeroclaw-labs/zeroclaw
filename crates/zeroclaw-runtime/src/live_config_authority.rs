@@ -1536,15 +1536,18 @@ impl ConfigCommit {
         self.live.handle()
     }
 
-    /// Release serialization explicitly — the writer guard and the
-    /// generation write lease drop here — while the caller continues with
-    /// slow, non-config side effects. The retained destructive
-    /// transactions call this after their required config work, exactly
-    /// where they previously dropped the raw writer guard before
-    /// workspace cleanup.
+    /// Release both writer serialization and generation write participation
+    /// before ordinary non-config side effects. Active Goal-policy cutovers
+    /// instead transfer the same lease through their `release_config_commit`.
     pub fn release_serialization(self) {
+        drop(self.release_writer());
+    }
+
+    /// Release the writer while transferring this admitted generation lease
+    /// to an active Goal cutover until its additional drain completes.
+    pub(crate) fn release_writer(self) -> ConfigWriteLease {
         drop(self.guard);
-        drop(self.lease);
+        self.lease
     }
 }
 
@@ -1577,6 +1580,79 @@ impl From<zeroclaw_config::live::LiveConfigError> for ConfigCommitError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn stale_publication_after_save_preserves_the_exact_live_pair() {
+        let install = tempfile::tempdir().unwrap();
+        let mut original = Config {
+            config_path: install.path().join("config.toml"),
+            data_dir: install.path().join("data"),
+            ..Config::default()
+        };
+        original.heartbeat.enabled = false;
+        original.save().await.unwrap();
+        let authority = LiveConfigAuthority::for_tests(original);
+        let commit = authority.begin_config_commit().await.unwrap();
+        let previous_revision = commit.published_revision();
+        let next_revision = commit.next_revision().unwrap();
+        let mut staged = commit.current_config();
+        staged.heartbeat.enabled = true;
+        staged.mark_dirty("heartbeat.enabled");
+
+        staged.save_dirty().await.unwrap();
+        assert!(matches!(
+            commit.publish(previous_revision, staged.clone()),
+            Err(ConfigCommitError::NotSuccessor)
+        ));
+        let persisted = std::fs::read_to_string(&staged.config_path).unwrap();
+        let persisted = zeroclaw_config::migration::migrate_to_current(&persisted).unwrap();
+        assert!(
+            persisted.heartbeat.enabled,
+            "the exact write already reached disk"
+        );
+        assert!(!authority.snapshot_config().heartbeat.enabled);
+        assert_eq!(authority.published_revision(), previous_revision);
+
+        commit.publish(next_revision, staged).unwrap();
+        assert!(authority.snapshot_config().heartbeat.enabled);
+        assert_eq!(authority.published_revision(), next_revision);
+    }
+
+    #[tokio::test]
+    async fn release_serialization_releases_writer_and_generation_write() {
+        let authority = LiveConfigAuthority::for_tests(Config::default());
+        let commit = authority.begin_config_commit().await.unwrap();
+        assert_eq!(authority.agent_lifecycle().active_config_write_count(), 1);
+        commit.release_serialization();
+        assert!(!authority.config_write_lock_is_held());
+        assert_eq!(authority.agent_lifecycle().active_config_write_count(), 0);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            authority.drain_agent_lifecycle_retaining_ownership(),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn release_writer_retains_the_same_generation_write_until_lease_drop() {
+        let authority = LiveConfigAuthority::for_tests(Config::default());
+        let commit = authority.begin_config_commit().await.unwrap();
+        let lease = commit.release_writer();
+        assert!(!authority.config_write_lock_is_held());
+        assert_eq!(authority.agent_lifecycle().active_config_write_count(), 1);
+        let mut drain = std::pin::pin!(authority.drain_agent_lifecycle_retaining_ownership());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut drain)
+                .await
+                .is_err()
+        );
+        drop(lease);
+        assert_eq!(authority.agent_lifecycle().active_config_write_count(), 0);
+        tokio::time::timeout(std::time::Duration::from_secs(1), drain)
+            .await
+            .unwrap();
+    }
 
     #[test]
     fn cloned_authority_preserves_storage_epoch_and_write_lock_identity() {

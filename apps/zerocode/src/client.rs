@@ -115,6 +115,7 @@ pub mod method {
     // Session
     pub const SESSION_NEW: &str = "session/new";
     pub const SESSION_PROMPT: &str = "session/prompt";
+    pub const SESSION_GOAL: &str = "session/goal";
     pub const SESSION_CONFIGURE: &str = "session/configure";
     pub const SESSION_CANCEL: &str = "session/cancel";
     pub const SESSION_STATE: &str = "session/state";
@@ -328,6 +329,7 @@ pub enum SessionUpdate {
         content: String,
         client_turn_generation: Option<u64>,
         message_count: Option<usize>,
+        goal_owned: bool,
     },
     /// Recorded spend reached `cost.warn_at_percent` of the daily or monthly
     /// limit. The turn continues; this is a heads-up only.
@@ -465,6 +467,10 @@ pub fn parse_session_update(params: &serde_json::Value) -> Option<SessionUpdate>
                 .get("message_count")
                 .and_then(|v| v.as_u64())
                 .map(|n| n as usize),
+            goal_owned: match params.get("goal_owned") {
+                Some(value) => value.as_bool()?,
+                None => false,
+            },
         }),
         "plan" => {
             let entries = params.get("entries")?.clone();
@@ -2906,6 +2912,18 @@ impl RpcClient {
         .await
     }
 
+    pub async fn session_goal(
+        &self,
+        session_id: &str,
+        command: &str,
+    ) -> Result<crate::wire::SessionGoalResult> {
+        self.call(
+            method::SESSION_GOAL,
+            serde_json::json!({ "session_id": session_id, "command": command }),
+        )
+        .await
+    }
+
     /// Apply session-scoped overrides (model, model_provider, temperature) to a
     /// live session. The daemon applies them immediately and returns the merged
     /// set. A `model_provider` override triggers a live provider-box rebuild
@@ -3789,6 +3807,43 @@ pub enum QuickstartValidateResult {
     Errors { errors: Vec<QuickstartError> },
 }
 
+/// Optional, public-safe facts accompanying a supervised Quickstart error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum QuickstartApplyDetail {
+    GoalPolicyPreparationFailed,
+    GoalPolicyCompletionFailed {
+        published: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cancelled_goals: Option<u64>,
+    },
+}
+
+fn deserialize_quickstart_apply_detail<'de, D>(
+    deserializer: D,
+) -> Result<Option<QuickstartApplyDetail>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = <serde_json::Value as serde::Deserialize>::deserialize(deserializer)?;
+    let detail = (|| match value.get("kind")?.as_str()? {
+        "goal_policy_preparation_failed" => {
+            Some(QuickstartApplyDetail::GoalPolicyPreparationFailed)
+        }
+        "goal_policy_completion_failed" => {
+            Some(QuickstartApplyDetail::GoalPolicyCompletionFailed {
+                published: value.get("published")?.as_bool()?,
+                cancelled_goals: match value.get("cancelled_goals") {
+                    None => None,
+                    Some(count) => Some(count.as_u64().filter(|count| *count < (1_u64 << 53))?),
+                },
+            })
+        }
+        _ => None,
+    })();
+    Ok(detail)
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum QuickstartApplyResult {
@@ -3798,6 +3853,12 @@ pub enum QuickstartApplyResult {
     },
     Errors {
         errors: Vec<QuickstartError>,
+        #[serde(
+            default,
+            deserialize_with = "deserialize_quickstart_apply_detail",
+            skip_serializing_if = "Option::is_none"
+        )]
+        detail: Option<QuickstartApplyDetail>,
     },
 }
 

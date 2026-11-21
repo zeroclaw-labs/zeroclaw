@@ -15,6 +15,7 @@ tokio::task_local! {
 #[derive(Debug, Clone, Default)]
 pub struct ToolExecutionContext {
     cancellation_token: Option<CancellationToken>,
+    goal_foreground: bool,
 }
 
 /// The execution future was dropped because its owner cancelled the call.
@@ -22,9 +23,40 @@ pub struct ToolExecutionContext {
 #[error("Tool execution cancelled")]
 pub struct ToolExecutionCancelled;
 
+/// Marks an owned Goal child failure without replacing its underlying cause.
+#[derive(Debug, Clone, Copy, thiserror::Error)]
+#[error("Goal foreground child operation failed")]
+pub struct GoalChildOperationError;
+
 impl ToolExecutionContext {
     pub fn new(cancellation_token: Option<CancellationToken>) -> Self {
-        Self { cancellation_token }
+        Self {
+            cancellation_token,
+            goal_foreground: false,
+        }
+    }
+
+    /// Mark participation in a Goal foreground operation; this carries no authority.
+    pub fn with_goal_foreground(mut self) -> Self {
+        self.goal_foreground = true;
+        self
+    }
+
+    /// Whether this context participates in a Goal foreground operation.
+    pub fn is_goal_foreground(&self) -> bool {
+        self.goal_foreground
+    }
+
+    fn inherited(&self) -> Self {
+        let mut context = self.clone();
+        context.goal_foreground |= Self::current().is_some_and(|outer| outer.goal_foreground);
+        context
+    }
+
+    /// Install this context without racing or dropping the supplied future.
+    /// The caller owns cancellation and any asynchronous cleanup.
+    pub async fn scope_only<F: std::future::Future>(&self, future: F) -> F::Output {
+        TOOL_EXECUTION_CONTEXT.scope(self.inherited(), future).await
     }
 
     pub fn cancellation_token(&self) -> Option<&CancellationToken> {
@@ -46,7 +78,7 @@ impl ToolExecutionContext {
         future: impl std::future::Future<Output = anyhow::Result<T>>,
     ) -> anyhow::Result<T> {
         TOOL_EXECUTION_CONTEXT
-            .scope(self.clone(), async {
+            .scope(self.inherited(), async {
                 match self.cancellation_token() {
                     Some(token) => {
                         tokio::select! {
@@ -532,6 +564,12 @@ pub fn clear_runtime_approval(tool_name: &str, args: &mut serde_json::Value) {
 
 #[async_trait]
 pub trait Tool: Send + Sync + crate::attribution::Attributable {
+    /// Whether these arguments may invoke a native agent child. Wrappers and
+    /// composites must forward this conservatively; this does not grant access.
+    fn may_invoke_agent_child(&self, _args: &serde_json::Value) -> bool {
+        false
+    }
+
     /// True when this tool does work that does not carry the RPC principal's
     /// current authority: nested, scheduled or headless runs, turns on another
     /// agent, shared procedures, or other principals' sessions. Non-admin RPC
@@ -629,6 +667,41 @@ pub trait Tool: Send + Sync + crate::attribution::Attributable {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn goal_context_nested_scopes_preserve_flag_but_mask_token() {
+        let token = CancellationToken::new();
+        let outer = ToolExecutionContext::new(Some(token)).with_goal_foreground();
+        outer
+            .scope_only(async {
+                ToolExecutionContext::default()
+                    .run(async {
+                        let current = ToolExecutionContext::current().unwrap();
+                        assert!(current.is_goal_foreground());
+                        assert!(current.cancellation_token().is_none());
+                        Ok(())
+                    })
+                    .await
+                    .unwrap();
+                assert!(
+                    ToolExecutionContext::current()
+                        .unwrap()
+                        .is_goal_foreground()
+                );
+            })
+            .await;
+        assert!(ToolExecutionContext::current().is_none());
+    }
+
+    #[tokio::test]
+    async fn goal_scope_only_does_not_drop_cancelled_future() {
+        let token = CancellationToken::new();
+        token.cancel();
+        let context = ToolExecutionContext::new(Some(token)).with_goal_foreground();
+        let value = context.scope_only(async { 42 }).await;
+        assert_eq!(value, 42);
+        assert!(ToolExecutionContext::current().is_none());
+    }
 
     #[tokio::test]
     async fn tool_context_masks_and_restores_nested_scopes() {

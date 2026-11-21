@@ -25,7 +25,7 @@ For the build order, tracked-output rules, and drift checks that turn the typed 
 | RPC and TUI config writes | `config/*` RPC methods used by zerocode | Admitted config commit: `save_dirty()` then publish | Published config pair and accepted authorization policy update before success; daemon-owned subsystems that need rebuilding still need reload |
 | Quickstart apply | Shared web, CLI, and zerocode apply path | Staged apply completed as a config commit (supervised surfaces) | Web and RPC can signal daemon reload; standalone CLI applies on next load/reload |
 | Gateway config writes | Config API handlers through `persist_and_swap()` | Admitted config commit: `save_dirty()` then publish | Published config pair and accepted authorization policy update before success; shared with RPC in a supervised run; other daemon subsystems apply after reload |
-| Daemon reload | `/admin/reload`, RPC `config/reload`, or the in-process reload channel | Re-reads `config.toml` | Recreates daemon subsystems in the same PID |
+| Daemon reload | `/admin/reload`, RPC `config/reload`, or the in-process reload channel | Loads `config.toml` once under config-writer admission | Carries that exact candidate into replacement subsystems in the same PID |
 
 Do not hand-edit the generated config reference. If a field, enum, alias
 section, secret marker, or description is wrong there, fix the schema or the
@@ -119,9 +119,15 @@ component has adopted the change.
 
 The daemon owns the long-lived subsystem graph: gateway, channel listeners,
 scheduler, MQTT listener, session wiring, memory backend, provider factories,
-and cost wiring. `POST /admin/reload` signals the daemon loop, which re-reads
-`config.toml` and re-instantiates those subsystems in the same process. The PID
-stays the same, but listeners briefly rebind.
+and cost wiring. `POST /admin/reload` signals the daemon loop, which acquires
+the current generation's config writer before loading `config.toml`. After
+policy preparation it closes generation write admission under the same writer,
+releases serialization, and drains the retiring generation. The exact loaded
+candidate is carried into replacement, without a second disk read. The PID
+stays the same, but listeners briefly rebind. Failed required Goal, connection,
+channel or lifecycle drain prevents replacement. If an otherwise successful
+reload times out draining accepted local, WSS or in-process RPC work, it
+shuts down without starting a replacement generation in that process.
 
 Gateway config writes call `persist_and_swap()`: validate the staged authorization
 policy, save to disk inside an admitted, serialized config commit, publish that
@@ -150,16 +156,52 @@ loop to signal.
 
 The supervised process keeps one canonical published pair: the `Config` together with its revision, an opaque authority epoch plus a checked sequence. Readers receive a read-only live handle (`zeroclaw_config::live::LiveConfigHandle`) and observe the config and its revision as one unit; that handle neither exposes mutation nor maintains a second config copy.
 
-Every participating HTTP, RPC, TUI, Quickstart, pairing, and channel-identity writer admits through the daemon generation's `LiveConfigAuthority` (`begin_config_commit`). The commit acquires the process-wide config writer mutex once, then retains a generation config-write lease through publication. Waiting on the mutex does not hold a config-write lease. A separate agent-alias reservation, such as RPC Quickstart's reservation before admission, can still count toward generation drain. The irreversible phase (persist, then publish under a revision allocated before any disk I/O) runs retained, so a cancelled request cannot abandon a dispatched commit between the atomic file replacement and its publication. Commits fail closed once the generation is closing; a full reload starts a fresh authority with a fresh epoch (sequences compare only within one epoch).
+Every participating HTTP, RPC, TUI, Quickstart, pairing, and channel-identity writer admits through the daemon generation's `LiveConfigAuthority` (`begin_config_commit`). The commit acquires the process-wide config writer mutex once, then retains a generation config-write lease through publication and, for a Goal-policy-changing job, until its Goal drain completes. Waiting on the mutex does not hold a config-write lease. A separate agent-alias reservation, such as RPC Quickstart's reservation before admission, can still count toward generation drain. The irreversible phase (persist, then publish under a revision allocated before any disk I/O) runs retained, so a cancelled request cannot abandon a dispatched commit between the atomic file replacement and its publication. Commits fail closed once the generation is closing; a full reload starts a fresh authority with a fresh epoch (sequences compare only within one epoch).
 
 The derived accepted authorization policy has its own publication and revision counter, separate from the config pair. HTTP config writes publish that policy before the config pair; RPC config writes publish it afterward. These existing orders do not provide one atomic visibility boundary for both publications, and the policy counter is not a `ConfigRevision` sequence.
 
 Other boundaries worth naming:
 
 - A committed publication is not rolled back when a later side effect fails. Quickstart publishes the committed config even when installing personality files subsequently fails. The CLI reports the saved alias and directs workspace-file recovery instead of rerunning Quickstart. Web and RPC still return the same error outcome used for refusal, without a distinct committed outcome, even though they signal reload after this partial success.
-- The config migrate endpoint prepares a fully hydrated candidate (secrets decrypted, env overrides applied, strict validation) *before* replacing the file, so a candidate that cannot hydrate or validate is refused with the original file untouched.
+- The config migrate endpoint prepares a fully hydrated candidate (secrets decrypted, env overrides applied, strict validation) *before* replacing the file, so a candidate that cannot hydrate or validate is refused with the original file untouched. When upgrading a schema version it preserves the versioned pre-upgrade original separately from the restore backup used for the replacement.
 - The `model_routing_config` and `proxy_config` tools still save independently loaded disk snapshots without config-commit admission or publication. `model_routing_config upsert_agent` uses dirty-path persistence so unrelated values and comments survive, but its other actions and `proxy_config` still write full typed snapshots. These non-participating writers can lose same-path concurrent edits or leave published readers stale. Migrating them into the participating writer contract remains separate work.
 - Publication does not itself apply config to running subsystems. The application ledger records acknowledgements from existing RPC model-provider refreshes; other daemon-owned components still require `/admin/reload`. New security overlays and channel handover behavior remain gated by [ADR-012](./decisions/ADR-012-generation-scoped-live-config-apply.md).
+
+### Goal-policy cutover
+
+In the Goal implementation candidate, participating HTTP/RPC writers compare
+the actual current and prospective eligibility under their retained config
+commit. A reduction transactionally cancels every affected nonterminal Goal
+before any policy-driven worker fence, save or publication. The exact task,
+session and epoch remain bound through checkpoint fencing and admitted-work
+drain. Unrelated eligibility-preserving edits are inert; canonical task and
+usage records remain the lifecycle and accounting authorities.
+
+The retained job completes existing auth, alias, session, channel and comment
+effects in their serialized order, releases the writer, then observes its
+additional Goal drains while retaining the same generation config-write lease.
+The job stays visible to generation drain until its Goal drain or closure
+disposition completes. Cancellation of the requester does not cancel that job.
+An abandoned cutover never spawns an unobserved cleanup or reopens
+admission. Unresolved worker or launch duties remain retained and fail closed.
+Independent cutover/restart closures cannot reopen one another.
+
+Cancellation is irreversible even if a later save fails: the old config may
+remain published while the affected Goals are already Cancelled. Successful
+drain can release that job's closure under the unchanged old policy, allowing
+a new explicit Goal; it cannot revive a cancelled task. Published eligibility
+expansion, including Quickstart additions, stays execution-closed until owning
+runtime replacement. Quickstart retains its committed personality-file outcome
+while its caller publishes accepted auth under the same commit; only then is
+writer serialization released for Goal drain; active cutovers retain generation
+participation until completion or drop. Publication or a cleared reload banner
+does not certify Goal policy as `applied_live`.
+
+Fresh/replacement startup installs canonical recovery and reconciles persisted
+Goals against the exact new config before Goal-capable gateway, RPC or channel
+ingress and checked execution reopening. An unavailable registry, malformed
+required identity or failed cancellation refuses startup instead of warning
+and opening admission. Eligible recovery remains paused until explicit Resume.
 
 ## Application status
 
@@ -215,6 +257,10 @@ There is no general transactional rollback for a valid but undesired config
 change after it has been saved and applied. Restore the previous `config.toml`
 from backup, edit the field back through the CLI or dashboard, then reload or
 restart according to the runtime boundary above.
+
+Restoring config does not reconstruct Goals already cancelled by a policy
+revocation. Preserve their audit records; after restoring valid policy and
+replacing the runtime, request a new Goal explicitly if needed.
 
 ## Config-visible is not always runtime-supported
 

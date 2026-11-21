@@ -377,6 +377,13 @@ so the new agent is live without a restart. A separate
 `POST /api/quickstart/validate` endpoint runs the same checks without applying,
 for clients that want to validate first.
 
+If Goal policy preparation or completion fails, the Apply error result can
+include a typed `detail` alongside the existing error list. Preparation
+failure means the configuration was neither saved nor published. Completion
+failure reports whether the configuration was published and, when known, how
+many Goals were cancelled. If the agent was saved and published, do not
+create it again: publication does not confirm that reload or setup finished.
+
 ## After Quickstart
 
 - **Drive it from [zerocode](./zerocode.md):** the terminal interface is the best

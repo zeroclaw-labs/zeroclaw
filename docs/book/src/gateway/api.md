@@ -114,16 +114,43 @@ cache admitted package state between requests.
 `PATCH /api/config` accepts a JSON Patch document (RFC 6902). The supported
 config operations are `add`, `replace`, `remove`, and `test`. ZeroClaw also
 accepts a `comment` extension for config annotations. Config operations run
-against an in-memory copy; once every operation has applied,
-`Config::validate()` runs once on the result. If validation passes, the new
-state is persisted and swapped in. If any operation or final validation fails,
-on-disk and in-memory state are unchanged. Comment annotations are applied
-after the save on a non-fatal, best-effort basis.
+against an in-memory copy; once every operation has applied, validation compares
+the candidate with the pre-edit configuration. The same edit-aware validation
+applies to per-property `PUT`, `DELETE`, and section initialization.
+
+Errors in edited fields, newly introduced errors, and errors that cannot be
+safely attributed reject the write. A pre-existing unrelated error may be
+retained only when validation can safely continue past it without skipping a
+related check; otherwise the write is rejected. Retained diagnostics use the
+`pre_existing_validation_error` warning code in responses that carry warnings.
+If a non-continuable baseline error hides a later error, fixing the first one
+alone can still be rejected because the later error cannot be classified as
+pre-existing. A batch correcting both may be required.
+Initialization responses include a `warnings` field when warnings are present.
+Secret responses do not include warnings; a pre-existing error retained during
+such a write is saved unchanged and reported in the gateway log.
+
+The complete write set is authorized before this cross-field validation. A
+caller without `Config:Read` receives a generic validation failure instead of
+configuration details. On successful writes, any warnings are represented by
+one `config_warning_details_hidden` warning; callers with read access receive
+the full warnings. Secret responses still omit warnings.
+
+For lists addressed by a natural key, indexed validation diagnostics are matched
+to the edited entry when its identity can be resolved. An ambiguous or unknown
+identity is treated as related to the edit and rejected. Removing or reordering
+entries can change a diagnostic's index, so an otherwise unchanged error may be
+treated as new and reject the write.
+
+Accepted state is persisted and swapped in. If any operation or validation
+fails, on-disk and in-memory state are unchanged. Comment annotations are
+applied after the save on a non-fatal, best-effort basis.
 
 `move` and `copy` return `400 op_not_supported` because safe reference-graph
-rewriting is not part of this surface. `test` against a `#[secret]` path is
-rejected with `secret_test_forbidden`: a differential outcome would be the
-only signal a client could read, and that would leak the value.
+rewriting is not part of this surface. `test` additionally requires
+`Config:Read`; testing a `#[secret]` path is rejected with
+`secret_test_forbidden` even for a reader,
+because a differential outcome would leak the value.
 
 Path syntax: JSON Pointer (`/agents/researcher/model_provider`) or the
 dotted form (`agents.researcher.model_provider`). Both are accepted; the
@@ -131,7 +158,9 @@ server normalises.
 
 The CLI counterpart is `zeroclaw config patch <file-or-stdin>`, which applies
 the same op set against the local Config and returns the same structured
-response shape (`--json` for scripts).
+response shape (`--json` for scripts). Unlike the HTTP editor, it uses strict
+`Config::validate()` and rejects any validation error, including pre-existing
+errors unrelated to the edit.
 
 ## Secrets: write-only over HTTP
 

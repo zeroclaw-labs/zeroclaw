@@ -180,6 +180,8 @@ tool-model-routing-config-error-risk-profile-collision = risk profile `{$profile
 tool-model-routing-config-error-missing-runtime-profile = agent `{$agent}` references missing runtime profile `{$profile}`
 tool-model-routing-config-error-shared-runtime-profile = runtime profile `{$profile}` is shared by another agent; refusing an agent-scoped mutation
 tool-model-routing-config-error-runtime-profile-collision = runtime profile `{$profile}` already exists; refusing to overwrite it while isolating agent `{$agent}`
+tool-model-call-gate-goal-unsupported = This tool cannot report its model usage to the Goal, so its model call is not available inside a Goal operation. No request was sent.
+tool-model-routing-config-error-probe-not-admitted = The change to `{$alias}` was saved and kept, but its availability probe was not admitted, so the change is unvalidated.
 
 tool-notion = Interact with Notion: query databases, read/create/update pages, and search the workspace.
 
@@ -274,3 +276,4 @@ tool-a2a-cancel = Cancel an in-flight A2A task on a peer. Returns the updated Ta
 tool-a2a-cancel-desc-peer = Configured peer name hosting the task.
 tool-a2a-cancel-desc-task-id = The task id to cancel.
 tool-a2a-cancel-desc-agent = Optional agent alias or tenant that created the task (from a2a_send). Helps route the cancel to the correct interface when discovery is re-run (the cached route is used first).
+tool-pipeline-error-goal-parallel-child = Goal Mode permits only synchronous foreground child execution.
