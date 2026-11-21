@@ -44,6 +44,17 @@ pub trait EmbeddingProvider: Send + Sync {
     }
 }
 
+/// The text embedded for a search query: `prefix` followed by the query, or
+/// the query unchanged when no prefix is configured. The prefixed text is also
+/// what an embedding cache keys on, so a query never reuses the vector of the
+/// same text stored as a memory.
+pub fn query_embedding_text<'a>(prefix: Option<&str>, query: &'a str) -> std::borrow::Cow<'a, str> {
+    match prefix.filter(|prefix| !prefix.is_empty()) {
+        Some(prefix) => std::borrow::Cow::Owned(format!("{prefix}{query}")),
+        None => std::borrow::Cow::Borrowed(query),
+    }
+}
+
 // ── Noop model_provider (keyword-only fallback) ────────────────────
 
 pub struct NoopEmbedding;
@@ -229,6 +240,20 @@ pub fn create_embedding_provider(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn query_embedding_text_prepends_only_a_non_empty_prefix() {
+        assert_eq!(query_embedding_text(None, "red car"), "red car");
+        assert_eq!(query_embedding_text(Some(""), "red car"), "red car");
+        assert_eq!(
+            query_embedding_text(Some("query: "), "red car"),
+            "query: red car"
+        );
+        assert_eq!(
+            query_embedding_text(Some("Instruct: find it\nQuery:"), "red car"),
+            "Instruct: find it\nQuery:red car"
+        );
+    }
 
     #[test]
     fn noop_name() {

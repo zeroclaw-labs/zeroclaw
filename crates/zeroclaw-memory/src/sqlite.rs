@@ -40,6 +40,8 @@ pub struct SqliteMemory {
     keyword_weight: f32,
     cache_max: usize,
     search_mode: SearchMode,
+    /// Prepended to a recall query, never to stored content, before embedding.
+    query_prefix: Option<String>,
 }
 
 impl SqliteMemory {
@@ -68,6 +70,7 @@ impl SqliteMemory {
             keyword_weight: 0.3,
             cache_max: 10_000,
             search_mode: SearchMode::default(),
+            query_prefix: None,
         })
     }
 
@@ -92,7 +95,17 @@ impl SqliteMemory {
             keyword_weight,
             cache_max,
             search_mode,
+            query_prefix: None,
         })
+    }
+
+    /// Embed recall queries with `prefix` in front, for instruction-tuned
+    /// embedding models that expect the query side to carry an instruction.
+    /// Stored content is embedded unchanged.
+    #[must_use]
+    pub fn with_query_prefix(mut self, prefix: Option<String>) -> Self {
+        self.query_prefix = prefix.filter(|prefix| !prefix.is_empty());
+        self
     }
 
     /// Open and initialize a memory database using the canonical startup
@@ -1088,7 +1101,11 @@ impl SqliteMemory {
         let query_embedding = if self.search_mode == SearchMode::Bm25 {
             None
         } else {
-            self.get_or_compute_embedding(query).await?
+            self.get_or_compute_embedding(&super::embeddings::query_embedding_text(
+                self.query_prefix.as_deref(),
+                query,
+            ))
+            .await?
         };
 
         let conn = self.conn.clone();
@@ -4060,6 +4077,88 @@ mod tests {
                 .fetch_add(texts.len(), std::sync::atomic::Ordering::SeqCst);
             Ok(texts.iter().map(|_| vec![self.fill; self.dims]).collect())
         }
+    }
+
+    /// Records every text it is asked to embed, so a test can see exactly
+    /// which strings reach the embedding model.
+    struct RecordingEmbedding {
+        texts: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl super::super::embeddings::EmbeddingProvider for RecordingEmbedding {
+        fn name(&self) -> &str {
+            "recording"
+        }
+        fn dimensions(&self) -> usize {
+            4
+        }
+        async fn embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+            self.texts
+                .lock()
+                .extend(texts.iter().map(|text| (*text).to_string()));
+            Ok(texts.iter().map(|_| vec![0.5_f32; 4]).collect())
+        }
+    }
+
+    fn recording_sqlite(
+        dir: &Path,
+        prefix: Option<&str>,
+    ) -> (SqliteMemory, Arc<Mutex<Vec<String>>>) {
+        let texts = Arc::new(Mutex::new(Vec::new()));
+        let mem = SqliteMemory::with_embedder(
+            "test",
+            dir,
+            Arc::new(RecordingEmbedding {
+                texts: Arc::clone(&texts),
+            }),
+            0.7,
+            0.3,
+            1000,
+            None,
+            SearchMode::Hybrid,
+        )
+        .unwrap()
+        .with_query_prefix(prefix.map(str::to_string));
+        (mem, texts)
+    }
+
+    #[tokio::test]
+    async fn query_prefix_reaches_the_query_and_never_stored_content() {
+        let tmp = TempDir::new().unwrap();
+        let (mem, texts) = recording_sqlite(tmp.path(), Some("query: "));
+
+        mem.store("car", "red car", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        mem.recall("red car", 5, None, None, None).await.unwrap();
+
+        // The stored memory is embedded as written; the query carries the
+        // prefix, and because the cache keys on the embedded text it is a
+        // fresh embedding rather than the stored memory's vector.
+        assert_eq!(
+            *texts.lock(),
+            vec!["red car".to_string(), "query: red car".to_string()]
+        );
+
+        // A repeated query is served from the cache under its prefixed text.
+        mem.recall("red car", 5, None, None, None).await.unwrap();
+        assert_eq!(texts.lock().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn without_a_query_prefix_query_and_content_share_the_cache() {
+        let tmp = TempDir::new().unwrap();
+        let (mem, texts) = recording_sqlite(tmp.path(), Some(""));
+
+        mem.store("car", "red car", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        mem.recall("red car", 5, None, None, None).await.unwrap();
+
+        // Unchanged behaviour: an empty prefix is no prefix, and the query
+        // reuses the cached vector of identical stored text.
+        assert_eq!(*texts.lock(), vec!["red car".to_string()]);
     }
 
     #[tokio::test]
