@@ -7958,6 +7958,12 @@ pub struct GatewayConfig {
     #[serde(default = "default_true")]
     pub session_persistence: bool,
 
+    /// At gateway startup, import legacy WebChat sessions and disable legacy chat writes.
+    /// Requires session persistence and a restart after older gateway processes have stopped.
+    /// Enable only when clients are ready to use `/acp` for WebChat.
+    #[serde(default)]
+    pub acp_webchat_cutover: bool,
+
     /// Auto-archive stale gateway sessions older than N hours. 0 = disabled. Default: 0.
     #[serde(default)]
     pub session_ttl_hours: u32,
@@ -8103,6 +8109,7 @@ impl Default for GatewayConfig {
             idempotency_ttl_secs: default_idempotency_ttl_secs(),
             idempotency_max_keys: default_gateway_idempotency_max_keys(),
             session_persistence: true,
+            acp_webchat_cutover: false,
             session_ttl_hours: 0,
             websocket_ping_interval_secs: default_gateway_websocket_ping_interval_secs(),
             pairing_code: PairingCodePolicy::default(),
@@ -38149,6 +38156,7 @@ allowed_numbers = ["+1", "+2"]
             idempotency_ttl_secs: 600,
             idempotency_max_keys: 4096,
             session_persistence: true,
+            acp_webchat_cutover: false,
             session_ttl_hours: 0,
             websocket_ping_interval_secs: 30,
             pairing_code: PairingCodePolicy::default(),

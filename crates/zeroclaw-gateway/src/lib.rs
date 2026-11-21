@@ -2096,7 +2096,8 @@ pub async fn run_gateway_with_plugin_webhooks(
                         config.channels.session_backend
                     )
                 );
-                if config.gateway.session_ttl_hours > 0
+                if !config.gateway.acp_webchat_cutover
+                    && config.gateway.session_ttl_hours > 0
                     && let Ok(cleaned) = backend.cleanup_stale(config.gateway.session_ttl_hours)
                     && cleaned > 0
                 {
@@ -2122,6 +2123,20 @@ pub async fn run_gateway_with_plugin_webhooks(
         }
     } else {
         None
+    };
+
+    let session_backend = if config.gateway.acp_webchat_cutover {
+        let legacy = session_backend.as_deref().ok_or_else(|| {
+            anyhow::Error::msg("ACP WebChat cutover requires an available legacy session backend")
+        })?;
+        // The listener is bound but the router is not serving yet. With the
+        // previous gateway stopped, no legacy chat writes can race the copy.
+        zeroclaw_infra::acp_session_store::AcpSessionStore::new(&config.data_dir)?
+            .import_legacy_gateway_sessions(legacy, |alias| config.agent_workspace_dir(alias))?;
+        // Legacy REST and webhook handlers must no longer write to this store.
+        None
+    } else {
+        session_backend
     };
 
     // ── Pairing guard ──────────────────────────────────────
@@ -2832,6 +2847,11 @@ pub async fn run_gateway_with_plugin_webhooks(
     // The read-only package catalog remains discoverable in every gateway
     // build; WASM-specific sources degrade explicitly when support is absent.
     let inner = inner.route("/api/plugins", get(api_plugins::list_plugins));
+    let inner = if config.gateway.acp_webchat_cutover {
+        inner.route("/ws/chat", get(|| async { StatusCode::GONE }))
+    } else {
+        inner.route("/ws/chat", get(ws::handle_ws_chat))
+    };
 
     let inner = inner
         // ── SSE event stream ──
@@ -2839,8 +2859,6 @@ pub async fn run_gateway_with_plugin_webhooks(
         .route("/api/events/history", get(sse::handle_events_history))
         // ── ACP client bridge ──
         .route("/acp", get(acp::handle_ws_acp))
-        // ── WebSocket agent chat ──
-        .route("/ws/chat", get(ws::handle_ws_chat))
         // ── WebSocket SOP runs feed ──
         .route("/ws/sops/runs", get(ws_sop_runs::handle_ws_sop_runs))
         // ── WebSocket canvas updates ──

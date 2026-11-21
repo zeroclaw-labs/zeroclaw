@@ -724,12 +724,36 @@ mod tests {
 
     #[tokio::test]
     async fn acp_ws_front_door_omitted_cwd_uses_agent_workspace() {
+        check_acp_front_door(false).await;
+    }
+
+    #[tokio::test]
+    async fn acp_ws_cutover_restores_legacy_dashboard_session() {
+        check_acp_front_door(true).await;
+    }
+
+    async fn check_acp_front_door(cutover: bool) {
         // `run_gateway` binds the process-global pricing config handle.
         let _pricing_binding = crate::PRICING_BINDING_TEST_LOCK.lock().await;
         let tmp = tempfile::tempdir().unwrap();
         let install_root = tmp.path();
-        let cfg = front_door_config(install_root);
+        let mut cfg = front_door_config(install_root);
         std::fs::create_dir_all(&cfg.data_dir).unwrap();
+        cfg.gateway.acp_webchat_cutover = cutover;
+        if cutover {
+            use zeroclaw_api::model_provider::ChatMessage;
+            cfg.channels.session_backend = "sqlite".into();
+            let legacy = zeroclaw_infra::make_session_backend(&cfg.data_dir, "sqlite").unwrap();
+            legacy
+                .append("gw_team_alpha", &ChatMessage::user("legacy question"))
+                .unwrap();
+            legacy
+                .append("gw_team_alpha", &ChatMessage::assistant("legacy answer"))
+                .unwrap();
+            legacy
+                .set_session_agent_alias("gw_team_alpha", "test-agent")
+                .unwrap();
+        }
         let expected_ws = cfg
             .agent_workspace_dir("test-agent")
             .to_string_lossy()
@@ -776,28 +800,44 @@ mod tests {
         .expect("gateway should accept connections");
 
         let url = format!("ws://127.0.0.1:{port}/acp");
+        if cutover {
+            let legacy = tokio_tungstenite::connect_async(format!("ws://{addr}/ws/chat")).await;
+            assert!(
+                matches!(
+                    legacy,
+                    Err(tokio_tungstenite::tungstenite::Error::Http(ref resp))
+                        if resp.status() == axum::http::StatusCode::GONE
+                ),
+                "legacy /ws/chat must return 410 Gone when acp_webchat_cutover is enabled"
+            );
+        }
         let (mut ws, _resp) = tokio_tungstenite::connect_async(&url)
             .await
             .expect("WebSocket upgrade on /acp should succeed");
 
         ws.send(Message::Text(
-            serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}})
+            serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1}})
                 .to_string()
                 .into(),
         ))
         .await
         .unwrap();
-        ws.send(Message::Text(
+        let req = if cutover {
+            serde_json::json!({
+                "jsonrpc":"2.0","id":2,"method":"session/load",
+                "params":{"sessionId":"team_alpha"}
+            })
+        } else {
             serde_json::json!({
                 "jsonrpc":"2.0","id":2,"method":"session/new",
                 "params":{"agentAlias":"test-agent"}
             })
-            .to_string()
-            .into(),
-        ))
-        .await
-        .unwrap();
+        };
+        ws.send(Message::Text(req.to_string().into()))
+            .await
+            .unwrap();
 
+        let mut replay = Vec::new();
         let workspace_dir = tokio::time::timeout(std::time::Duration::from_secs(10), async {
             while let Some(msg) = ws.next().await {
                 let text = match msg {
@@ -811,19 +851,30 @@ mod tests {
                 };
                 if value.get("id").and_then(|i| i.as_i64()) == Some(2) {
                     if let Some(err) = value.get("error") {
-                        panic!("session/new returned an error: {err}");
+                        panic!("session request returned an error: {err}");
                     }
+                    assert!(value.get("result").is_some());
                     return value["result"]["workspaceDir"].as_str().map(String::from);
                 }
+                if value["method"] == "session/update"
+                    && value["params"]["sessionId"] == "team_alpha"
+                    && let Some(text) = value["params"]["update"]["content"]["text"].as_str()
+                {
+                    replay.push(text.to_owned());
+                }
             }
-            None
+            panic!("ACP socket closed before the session response");
         })
         .await
-        .expect("session/new response should arrive before timeout");
+        .expect("session response should arrive before timeout");
 
         shutdown_tx.send(true).ok();
         server.abort();
 
+        if cutover {
+            assert_eq!(replay, ["legacy question", "legacy answer"]);
+            return;
+        }
         assert_eq!(
             workspace_dir.as_deref(),
             Some(expected_ws.as_str()),

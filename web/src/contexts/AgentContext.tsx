@@ -10,8 +10,8 @@ import {
   WS_CLOSE_CONVERSATION_CLOSED,
   WS_CLOSE_CONVERSATION_LIMIT,
   WS_CLOSE_SESSION_ENDED,
-  WebSocketClient,
 } from '@/lib/ws';
+import { AcpChatSocket } from '@/lib/acpChat';
 import { getActiveSessionId, newSessionId, setActiveSessionId } from '@/lib/chatSessions';
 import { getOidcSession } from '@/lib/auth';
 import { navAccessFor } from '@/lib/navAccess';
@@ -243,6 +243,7 @@ export interface SessionSocket {
   readonly connected: boolean;
   sendMessage(content: string): void;
   sendApprovalResponse(requestId: string, decision: ApprovalDecision): void;
+  abortSession?(): Promise<void>;
 }
 
 export interface AgentSessionRuntime {
@@ -258,7 +259,7 @@ export interface AgentSessionRuntime {
 }
 
 const defaultSessionRuntime: AgentSessionRuntime = {
-  createSocket: (options) => new WebSocketClient(options),
+  createSocket: (options) => new AcpChatSocket(options),
   getMessages: getSessionMessages,
   delete: deleteSession,
   rename: renameSession,
@@ -341,7 +342,7 @@ export function AgentProvider({
   // Count and provenance move together, including batched socket frames.
   const [contextInput, setContextInput] = useState(EMPTY_CONTEXT_INPUT);
 
-  const wsRef = useRef<WebSocketClient | null>(null);
+  const wsRef = useRef<SessionSocket | null>(null);
   // Canonical per-turn stream state. Every production transition that mutates
   // it goes through reduceTurnFrame, which is exercised directly by the
   // frame-sequence regression suite.
@@ -784,6 +785,7 @@ export function AgentProvider({
           toolName: msg.tool ?? 'unknown',
           argumentsSummary: msg.arguments_summary ?? '',
           timeoutSecs: msg.timeout_secs ?? 120,
+          options: msg.approval_options,
           receivedAt: Date.now(),
         });
         break;
@@ -1028,7 +1030,7 @@ export function AgentProvider({
     }
     attachSocketCallbacks(ws);
     ws.connect();
-    wsRef.current = ws as WebSocketClient;
+    wsRef.current = ws;
 
     return () => {
       ws.disconnect();
@@ -1172,6 +1174,15 @@ export function AgentProvider({
     }
   }, [foldTurnStream, perSocket]);
 
+  const abortLiveSession = useCallback(async (target: string | null) => {
+    if (!target) return;
+    if (wsRef.current?.abortSession) {
+      await wsRef.current.abortSession();
+      return;
+    }
+    await abortSession(target);
+  }, []);
+
   const switchModel = useCallback(async (model: string) => {
     if (modelLoading) return; // debounce
     setModelLoading(true);
@@ -1225,7 +1236,7 @@ export function AgentProvider({
         const sessionToAbort = perSocket ? conversationIdRef.current : activeSessionIdRef.current;
         try {
           await Promise.race([
-            sessionToAbort ? abortSession(sessionToAbort) : Promise.resolve(),
+            abortLiveSession(sessionToAbort),
             new Promise((_, reject) =>
               setTimeout(() => reject(new Error('abort-timeout')), 1_500),
             ),
@@ -1276,7 +1287,7 @@ export function AgentProvider({
       // leaves a live, reconnect-capable socket in the ref instead of the old
       // intentionally-closed one — otherwise the page strands offline with no
       // reconnect path until reload.
-      wsRef.current = ws as WebSocketClient;
+      wsRef.current = ws;
       modelSwitchSocketRef.current = ws;
       attachSocketCallbacks(ws);
       ws.connect();
@@ -1296,7 +1307,7 @@ export function AgentProvider({
       setModelLoading(false);
       setError(err instanceof Error ? err.message : t('agent.failed_switch_model'));
     }
-  }, [attachSocketCallbacks, modelLoading, typing, agentAlias, foldTurnStream, perSocket]);
+  }, [attachSocketCallbacks, modelLoading, typing, agentAlias, foldTurnStream, perSocket, abortLiveSession]);
 
   const deleteMessage = useCallback((id: string) => {
     localMessageMutationVersionRef.current += 1;
@@ -1395,7 +1406,7 @@ export function AgentProvider({
         });
         // Assign wsRef before connect() so a synchronous throw can't strand the
         // page on the old intentionally-closed socket (see switchModel).
-        wsRef.current = ws as WebSocketClient;
+        wsRef.current = ws;
         attachSocketCallbacks(ws);
         ws.connect();
       }
@@ -1436,7 +1447,7 @@ export function AgentProvider({
     if (!force && sessionPersistenceRef.current !== true) return false;
 
     if (typingRef.current) {
-      void abortSession(currentSessionId).catch(() => {
+      void abortLiveSession(currentSessionId).catch(() => {
         // Best-effort: never block the switch on a failed abort.
       });
     }
@@ -1463,7 +1474,7 @@ export function AgentProvider({
     setSessionId(nextSessionId);
     onSessionChange?.(nextSessionId);
     return true;
-  }, [agentAlias, onSessionChange, resetTranscriptState]);
+  }, [agentAlias, onSessionChange, resetTranscriptState, abortLiveSession]);
 
   const goToSession = useCallback((nextSessionId: string): boolean => (
     transitionToSession(nextSessionId)
@@ -1582,7 +1593,7 @@ export function AgentProvider({
       const target = perSocket ? conversationIdRef.current : sessionId;
       if (!target) return;
       try {
-        await abortSession(target);
+        await abortLiveSession(target);
       } catch {
         // Best-effort abort
       }
