@@ -1388,19 +1388,20 @@ Examples:
         relay_command: RelayCommands,
     },
 
+    /// Emergency stop (not enforced: every form of this command refuses to run)
     Estop {
         #[command(subcommand)]
         estop_command: Option<EstopSubcommands>,
 
-        /// Level used when engaging estop from `zeroclaw estop`.
+        /// Level (not enforced: every form of this command refuses to run).
         #[arg(long, value_enum)]
         level: Option<EstopLevelArg>,
 
-        /// Domain pattern(s) for `domain-block` (repeatable).
+        /// Domain pattern(s). Accepted but ignored: the command is not enforced.
         #[arg(long = "domain")]
         domains: Vec<String>,
 
-        /// Tool name(s) for `tool-freeze` (repeatable).
+        /// Tool name(s). Accepted but ignored: the command is not enforced.
         #[arg(long = "tool")]
         tools: Vec<String>,
     },
@@ -8638,20 +8639,20 @@ fn list_wss_client_certs(config: &Config, json: bool) -> Result<()> {
 
 #[derive(Subcommand, Debug)]
 enum EstopSubcommands {
-    /// Print current estop status.
+    /// Not enforced: refuses to run.
     Status,
-    /// Resume from an engaged estop level.
+    /// Not enforced: refuses to run.
     Resume {
-        /// Resume only network kill.
+        /// Accepted but ignored: the command is not enforced.
         #[arg(long)]
         network: bool,
-        /// Resume one or more blocked domain patterns.
+        /// Accepted but ignored: the command is not enforced.
         #[arg(long = "domain")]
         domains: Vec<String>,
-        /// Resume one or more frozen tools.
+        /// Accepted but ignored: the command is not enforced.
         #[arg(long = "tool")]
         tools: Vec<String>,
-        /// OTP code. If omitted and OTP is required, a prompt is shown.
+        /// Accepted but ignored: the command is not enforced.
         #[arg(long)]
         otp: Option<String>,
     },
@@ -11826,7 +11827,6 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                     "🌐 Web UI:        not included in this build (CLI-only)"
                 )
             );
-            let effective_memory_backend = config.resolve_active_storage().kind();
             let heartbeat_value = if config.heartbeat.enabled {
                 let interval_minutes = config.heartbeat.interval_minutes.to_string();
                 let heartbeat_every_fallback = format!("every {}min", interval_minutes);
@@ -11847,7 +11847,11 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                     &heartbeat_fallback
                 )
             );
-            let memory_backend = effective_memory_backend.to_string();
+            let runtime_agent = config
+                .resolved_runtime_agent_alias()
+                .filter(|alias| config.agents.get(*alias).is_some_and(|agent| agent.enabled))
+                .or_else(|| agent_aliases.first().map(|alias| alias.as_str()));
+            let memory_backend = zeroclaw_memory::configured_memory_backend(&config, runtime_agent);
             let memory_auto_save = if config.memory.auto_save {
                 t("cli-status-word-on", "on")
             } else {
@@ -12085,7 +12089,7 @@ Add pricing to the active provider profile or supply a catalog entry."
                 ta(
                     "cli-status-estop",
                     &[("v", &config.security.estop.enabled.to_string())],
-                    "E-stop enabled"
+                    "E-stop enabled: (not enforced)"
                 )
             );
             println!();
@@ -12237,12 +12241,7 @@ Add pricing to the active provider profile or supply a catalog entry."
             }
         },
 
-        Commands::Estop {
-            estop_command,
-            level,
-            domains,
-            tools,
-        } => handle_estop_command(&config, estop_command, level, domains, tools),
+        Commands::Estop { .. } => handle_estop_command(),
 
         Commands::Cron { cron_command } => cron::handle_command(cron_command, &config),
 
@@ -14221,206 +14220,15 @@ Add pricing to the active provider profile or supply a catalog entry."
 }
 
 #[cfg(feature = "agent-runtime")]
-fn handle_estop_command(
-    config: &Config,
-    estop_command: Option<EstopSubcommands>,
-    level: Option<EstopLevelArg>,
-    domains: Vec<String>,
-    tools: Vec<String>,
-) -> Result<()> {
-    if !config.security.estop.enabled {
-        bail!("Emergency stop is disabled. Enable [security.estop].enabled = true in config.toml");
-    }
-
-    let config_dir = config
-        .config_path
-        .parent()
-        .context("Config path must have a parent directory")?;
-    let mut manager = security::EstopManager::load(&config.security.estop, config_dir)?;
-
-    match estop_command {
-        Some(EstopSubcommands::Status) => {
-            print_estop_status(&manager.status());
-            Ok(())
-        }
-        Some(EstopSubcommands::Resume {
-            network,
-            domains,
-            tools,
-            otp,
-        }) => {
-            let selector = build_resume_selector(network, domains, tools)?;
-            let mut otp_code = otp;
-            let otp_validator = if config.security.estop.require_otp_to_resume {
-                if !config.security.otp.enabled {
-                    bail!(
-                        "security.estop.require_otp_to_resume=true but security.otp.enabled=false"
-                    );
-                }
-                if otp_code.is_none() {
-                    let entered = secret_prompt("Enter OTP code", false)?;
-                    if !entered.is_empty() {
-                        eprintln!("{}", ta("cli-otp-received", &[], "  ✓ OTP received"));
-                    }
-                    otp_code = Some(entered);
-                }
-
-                let store = security::SecretStore::new(config_dir, config.secrets.encrypt);
-                let (validator, enrollment_uri) =
-                    security::OtpValidator::from_config(&config.security.otp, config_dir, &store)?;
-                if let Some(uri) = enrollment_uri {
-                    println!(
-                        "{}",
-                        t(
-                            "cli-otp-initialized",
-                            "Initialized OTP secret for ZeroClaw."
-                        )
-                    );
-                    println!(
-                        "{}",
-                        ta("cli-otp-enrollment-uri", &[("uri", &uri)], "Enrollment URI")
-                    );
-                }
-                Some(validator)
-            } else {
-                None
-            };
-
-            manager.resume(selector, otp_code.as_deref(), otp_validator.as_ref())?;
-            println!("{}", t("cli-estop-resume-done", "Estop resume completed."));
-            print_estop_status(&manager.status());
-            Ok(())
-        }
-        None => {
-            let engage_level = build_engage_level(level, domains, tools)?;
-            manager.engage(engage_level)?;
-            println!("{}", t("cli-estop-engaged", "Estop engaged."));
-            print_estop_status(&manager.status());
-            Ok(())
-        }
-    }
-}
-
-#[cfg(feature = "agent-runtime")]
-fn build_engage_level(
-    level: Option<EstopLevelArg>,
-    domains: Vec<String>,
-    tools: Vec<String>,
-) -> Result<security::EstopLevel> {
-    let requested = level.unwrap_or(EstopLevelArg::KillAll);
-    match requested {
-        EstopLevelArg::KillAll => {
-            if !domains.is_empty() || !tools.is_empty() {
-                bail!("--domain/--tool are only valid with --level domain-block/tool-freeze");
-            }
-            Ok(security::EstopLevel::KillAll)
-        }
-        EstopLevelArg::NetworkKill => {
-            if !domains.is_empty() || !tools.is_empty() {
-                bail!("--domain/--tool are not valid with --level network-kill");
-            }
-            Ok(security::EstopLevel::NetworkKill)
-        }
-        EstopLevelArg::DomainBlock => {
-            if domains.is_empty() {
-                bail!("--level domain-block requires at least one --domain");
-            }
-            if !tools.is_empty() {
-                bail!("--tool is not valid with --level domain-block");
-            }
-            Ok(security::EstopLevel::DomainBlock(domains))
-        }
-        EstopLevelArg::ToolFreeze => {
-            if tools.is_empty() {
-                bail!("--level tool-freeze requires at least one --tool");
-            }
-            if !domains.is_empty() {
-                bail!("--domain is not valid with --level tool-freeze");
-            }
-            Ok(security::EstopLevel::ToolFreeze(tools))
-        }
-    }
-}
-
-#[cfg(feature = "agent-runtime")]
-fn build_resume_selector(
-    network: bool,
-    domains: Vec<String>,
-    tools: Vec<String>,
-) -> Result<security::ResumeSelector> {
-    let selected =
-        usize::from(network) + usize::from(!domains.is_empty()) + usize::from(!tools.is_empty());
-    if selected > 1 {
-        bail!("Use only one of --network, --domain, or --tool for estop resume");
-    }
-    if network {
-        return Ok(security::ResumeSelector::Network);
-    }
-    if !domains.is_empty() {
-        return Ok(security::ResumeSelector::Domains(domains));
-    }
-    if !tools.is_empty() {
-        return Ok(security::ResumeSelector::Tools(tools));
-    }
-    Ok(security::ResumeSelector::KillAll)
-}
-
-#[cfg(feature = "agent-runtime")]
-fn print_estop_status(state: &security::EstopState) {
-    println!("{}", t("cli-estop-status", "Estop status:"));
-    println!(
-        "  engaged:        {}",
-        if state.is_engaged() { "yes" } else { "no" }
-    );
-    println!(
-        "  kill_all:       {}",
-        if state.kill_all { "active" } else { "inactive" }
-    );
-    println!(
-        "  network_kill:   {}",
-        if state.network_kill {
-            "active"
-        } else {
-            "inactive"
-        }
-    );
-    if state.blocked_domains.is_empty() {
-        println!(
-            "{}",
-            t("cli-estop-domains-none", "  domain_blocks:  (none)")
-        );
-    } else {
-        println!(
-            "{}",
-            ta(
-                "cli-estop-domains",
-                &[("v", &state.blocked_domains.join(", "))],
-                "domain_blocks"
-            )
-        );
-    }
-    if state.frozen_tools.is_empty() {
-        println!("{}", t("cli-estop-tools-none", "  tool_freeze:    (none)"));
-    } else {
-        println!(
-            "{}",
-            ta(
-                "cli-estop-tools",
-                &[("v", &state.frozen_tools.join(", "))],
-                "tool_freeze"
-            )
-        );
-    }
-    if let Some(updated_at) = &state.updated_at {
-        println!(
-            "{}",
-            ta(
-                "cli-estop-updated-at",
-                &[("v", &updated_at.to_string())],
-                "updated_at"
-            )
-        );
-    }
+fn handle_estop_command() -> Result<()> {
+    // No runtime path reads the estop state file, so engaging it would stop
+    // nothing. Refuse every form of the command before looking at its
+    // arguments, so the operator learns at once that nothing was stopped.
+    bail!(ta(
+        "cli-estop-not-enforced",
+        &[],
+        "`zeroclaw estop` is not enforced: no running agent, daemon, or tool reads the estop state file, so engaging it would not stop anything. The estop state was not changed. To halt the agent now, stop the ZeroClaw process itself."
+    ))
 }
 
 fn write_shell_completion<W: Write>(shell: CompletionShell, writer: &mut W) -> Result<()> {
@@ -19957,7 +19765,7 @@ mod tests {
 
     #[test]
     #[cfg(feature = "agent-runtime")]
-    fn cli_parses_estop_default_engage() {
+    fn cli_parses_estop_without_subcommand() {
         let cli = Cli::try_parse_from(["zeroclaw", "estop"]).expect("estop command should parse");
 
         match cli.command {
@@ -19988,6 +19796,50 @@ mod tests {
                 ..
             } => assert_eq!(domains, vec!["*.chase.com".to_string()]),
             other => panic!("expected estop resume command, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    fn run_estop_from_argv(argv: &[&str]) -> Result<()> {
+        let mut full = vec!["zeroclaw", "estop"];
+        full.extend_from_slice(argv);
+        let cli = Cli::try_parse_from(full).expect("estop command should parse");
+        match cli.command {
+            Commands::Estop { .. } => handle_estop_command(),
+            other => panic!("expected estop command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn estop_refuses_every_form_instead_of_reporting_a_stop() {
+        let expected = ta("cli-estop-not-enforced", &[], "");
+        assert!(
+            expected.contains("zeroclaw estop"),
+            "the catalog must define cli-estop-not-enforced, got {expected:?}"
+        );
+
+        let invocations: &[&[&str]] = &[
+            &[],
+            &["--level", "kill-all"],
+            &["--level", "network-kill"],
+            &["--level", "domain-block", "--domain", "*.example.com"],
+            &["--level", "tool-freeze", "--tool", "shell"],
+            &["status"],
+            &["resume"],
+            &["resume", "--network"],
+            &["resume", "--domain", "*.example.com"],
+            &["resume", "--tool", "shell"],
+            &["resume", "--otp", "123456"],
+            &["resume", "--network", "--otp", "123456"],
+            &["--level", "domain-block"],
+            &["--level", "kill-all", "--domain", "*.example.com"],
+            &["resume", "--network", "--tool", "shell"],
+        ];
+        for argv in invocations {
+            let err = run_estop_from_argv(argv)
+                .expect_err("estop must not report success while nothing enforces it");
+            assert_eq!(err.to_string(), expected, "argv: {argv:?}");
         }
     }
 
