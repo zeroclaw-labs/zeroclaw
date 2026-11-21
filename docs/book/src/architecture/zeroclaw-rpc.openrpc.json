@@ -4113,6 +4113,89 @@
             "type": "object"
           },
           {
+            "description": "A foreground delegate's tool call starting or finishing, attributed\nto the parent's `delegate` call. Live only: not in session history.",
+            "oneOf": [
+              {
+                "properties": {
+                  "arguments_summary": {
+                    "description": "Secret-redacted, bounded summary of the call's arguments.",
+                    "type": "string"
+                  },
+                  "phase": {
+                    "const": "started",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "phase",
+                  "arguments_summary"
+                ],
+                "type": "object"
+              },
+              {
+                "properties": {
+                  "output_preview": {
+                    "description": "Bounded, credential-scrubbed preview of the call's output.",
+                    "type": "string"
+                  },
+                  "phase": {
+                    "const": "finished",
+                    "type": "string"
+                  },
+                  "success": {
+                    "type": "boolean"
+                  }
+                },
+                "required": [
+                  "phase",
+                  "success",
+                  "output_preview"
+                ],
+                "type": "object"
+              }
+            ],
+            "properties": {
+              "agent": {
+                "description": "The delegate agent that made the call.",
+                "type": "string"
+              },
+              "depth": {
+                "description": "Nesting below the parent's delegate call: 0 for its direct child,\n1 for a child of that child, and so on.",
+                "format": "uint32",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "parent_tool_call_id": {
+                "description": "The parent turn's `delegate` tool call this activity belongs to.",
+                "type": "string"
+              },
+              "session_id": {
+                "type": "string"
+              },
+              "tool_call_id": {
+                "description": "The child's own tool call id, shared by its start and finish.",
+                "type": "string"
+              },
+              "tool_name": {
+                "type": "string"
+              },
+              "type": {
+                "const": "delegate_activity",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "session_id",
+              "parent_tool_call_id",
+              "agent",
+              "depth",
+              "tool_call_id",
+              "tool_name"
+            ],
+            "type": "object"
+          },
+          {
             "description": "Terminal event for a turn. Replaces the response of `session/prompt`.\n`outcome` distinguishes a clean finish from a user-initiated cancel.",
             "properties": {
               "client_turn_generation": {
