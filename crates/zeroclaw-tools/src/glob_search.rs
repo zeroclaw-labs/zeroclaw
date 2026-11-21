@@ -229,6 +229,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn glob_search_preserves_unicode_paths_and_escaped_literal_brackets() {
+        let dir = TempDir::new().unwrap();
+        let nested = dir.path().join("资料 space");
+        std::fs::create_dir_all(nested.join("directory.txt")).unwrap();
+        for name in ["[draft]🦀.txt", "中.txt", "excluded.md"] {
+            std::fs::write(nested.join(name), "fixture").unwrap();
+        }
+        let tool = GlobSearchTool::new(test_security(dir.path().to_path_buf()));
+        let bracket_path = PathBuf::from("资料 space").join("[draft]🦀.txt");
+        let other_path = PathBuf::from("资料 space").join("中.txt");
+
+        let result = tool
+            .execute(json!({"pattern": "资料 space/*.txt"}))
+            .await
+            .unwrap();
+        assert!(result.success, "{:?}", result.error);
+        assert_eq!(
+            result.output.as_str(),
+            format!(
+                "{}\n{}\n\nTotal: 2 files",
+                bracket_path.display(),
+                other_path.display()
+            )
+        );
+
+        let literal = tool
+            .execute(json!({"pattern": "资料 space/[[]draft[]]🦀.txt"}))
+            .await
+            .unwrap();
+        assert!(literal.success, "{:?}", literal.error);
+        assert_eq!(
+            literal.output.as_str(),
+            format!("{}\n\nTotal: 1 files", bracket_path.display())
+        );
+    }
+
+    #[tokio::test]
     async fn glob_search_multiple_files() {
         let dir = TempDir::new().unwrap();
         std::fs::write(dir.path().join("a.txt"), "").unwrap();
