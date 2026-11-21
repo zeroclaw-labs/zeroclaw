@@ -115,6 +115,7 @@ pub mod method {
     // Session
     pub const SESSION_NEW: &str = "session/new";
     pub const SESSION_PROMPT: &str = "session/prompt";
+    pub const SESSION_GOAL: &str = "session/goal";
     pub const SESSION_CONFIGURE: &str = "session/configure";
     pub const SESSION_CANCEL: &str = "session/cancel";
     pub const SESSION_STATE: &str = "session/state";
@@ -328,6 +329,7 @@ pub enum SessionUpdate {
         content: String,
         client_turn_generation: Option<u64>,
         message_count: Option<usize>,
+        goal_owned: bool,
     },
     /// Recorded spend reached `cost.warn_at_percent` of the daily or monthly
     /// limit. The turn continues; this is a heads-up only.
@@ -465,6 +467,10 @@ pub fn parse_session_update(params: &serde_json::Value) -> Option<SessionUpdate>
                 .get("message_count")
                 .and_then(|v| v.as_u64())
                 .map(|n| n as usize),
+            goal_owned: match params.get("goal_owned") {
+                Some(value) => value.as_bool()?,
+                None => false,
+            },
         }),
         "plan" => {
             let entries = params.get("entries")?.clone();
@@ -2902,6 +2908,18 @@ impl RpcClient {
         self.call(
             method::SESSION_STATE,
             serde_json::json!({ "session_id": session_id }),
+        )
+        .await
+    }
+
+    pub async fn session_goal(
+        &self,
+        session_id: &str,
+        command: &str,
+    ) -> Result<crate::wire::SessionGoalResult> {
+        self.call(
+            method::SESSION_GOAL,
+            serde_json::json!({ "session_id": session_id, "command": command }),
         )
         .await
     }

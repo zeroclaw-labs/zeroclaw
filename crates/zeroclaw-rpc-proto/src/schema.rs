@@ -41,6 +41,9 @@ catalog! {
     // Sessions
     SessionIdParams, ChatMode, SessionNewResult, SessionCloseResult, SessionKillParams,
     SessionKillResult, SessionPromptParams, SessionPromptResult, SessionPromptAck,
+    SessionGoalParams, SessionGoalResult, SessionGoalUpdate, GoalResponseWire, GoalStatusWire,
+    GoalTaskStatusWire, GoalAccountingStateWire, GoalPauseReasonWire, GoalFailureReasonWire,
+    GoalQueuedControlWire, GoalPendingActionWire,
     SessionConfigureParams,
     SessionConfigureResult, SessionCancelResult, SessionGitBranchResult, SessionListParams,
     SessionListResult, SessionEntry, SessionMessagesResult, SessionMessagesParams,

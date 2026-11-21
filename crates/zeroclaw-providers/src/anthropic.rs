@@ -1,3 +1,4 @@
+use crate::dispatch::accounting::{IterationRecord, TerminalRecord, UsageChain};
 use crate::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
     ModelProvider, ProviderCapabilities, StreamChunk, StreamError, StreamEvent, StreamOptions,
@@ -596,10 +597,92 @@ struct NativeChatResponse {
     #[serde(default)]
     stop_details: Option<NativeStopDetails>,
     /// Model that actually served this turn. On a server-side-fallback
-    /// response this may differ from the requested model — the primary signal
-    /// read by [`AnthropicModelProvider::server_fallback_notice`].
+    /// response this may differ from the requested model. It informs the
+    /// fallback notice and can attribute the returned attempt for accounting.
     #[serde(default)]
     model: Option<String>,
+}
+
+impl crate::dispatch::accounting::ObserveRejectedStringWire for NativeChatResponse {
+    fn observe_rejected_usage(wire: &serde_json::Value) {
+        use crate::dispatch::accounting::{
+            attach_current_string_attempt_usage_chain,
+            finish_current_string_attempt_after_completed_response,
+        };
+        use serde_json::Value;
+
+        let usage = wire.get("usage").filter(|value| !value.is_null());
+        let mut malformed = usage.is_some_and(|value| !value.is_object());
+        let mut read = |field: &str| {
+            let value = usage?.get(field).filter(|value| !value.is_null())?;
+            let count = value.as_u64();
+            malformed |= count.is_none();
+            count
+        };
+        let mut counts = AnthropicUsage {
+            input_tokens: read("input_tokens"),
+            output_tokens: read("output_tokens"),
+            cache_read_input_tokens: read("cache_read_input_tokens"),
+            cache_creation_input_tokens: read("cache_creation_input_tokens"),
+            iterations: None,
+        };
+        let mut breakdown_unreadable = false;
+        if let Some(iterations) = usage
+            .and_then(|value| value.get("iterations"))
+            .filter(|value| !value.is_null())
+        {
+            match Vec::<AnthropicUsageIteration>::deserialize(iterations) {
+                Ok(iterations) => counts.iterations = Some(iterations),
+                Err(_) => {
+                    malformed = true;
+                    breakdown_unreadable = true;
+                }
+            }
+        }
+        let top = AnthropicModelProvider::observe_string_response_usage(
+            usage.map(|_| &counts),
+            malformed,
+        );
+        if breakdown_unreadable {
+            // The top-level count may cover several models; none of the
+            // requested/served names defines a safe billing attribution.
+            attach_current_string_attempt_usage_chain(UsageChain {
+                prior: Vec::new(),
+                terminal: TerminalRecord {
+                    model: None,
+                    settled: false,
+                    malformed: true,
+                    observation: top,
+                },
+            });
+            return;
+        }
+        let model = wire
+            .get("model")
+            .and_then(Value::as_str)
+            .filter(|model| !model.trim().is_empty());
+        let fallback = wire
+            .get("content")
+            .and_then(Value::as_array)
+            .is_some_and(|blocks| {
+                blocks
+                    .iter()
+                    .any(|block| block.get("type").and_then(Value::as_str) == Some("fallback"))
+            });
+        if let Some(chain) = AnthropicModelProvider::decode_usage_chain(
+            top,
+            model,
+            counts.iterations.as_deref(),
+            fallback,
+            true,
+        ) {
+            attach_current_string_attempt_usage_chain(chain);
+            // Strict response decoding still returns its original error.
+            // A fully received usage chain must not lose its independently
+            // observed invalid attempts when that error settles.
+            finish_current_string_attempt_after_completed_response();
+        }
+    }
 }
 
 /// `stop_details` on a refusal response. `explanation` is deliberately not
@@ -630,25 +713,37 @@ struct AnthropicUsage {
     /// Disjoint from `cache_read_input_tokens` and `input_tokens`.
     #[serde(default)]
     cache_creation_input_tokens: Option<u64>,
-    /// Per-attempt breakdown on a server-side-fallback response. Absent on a
-    /// normal turn; read by [`AnthropicModelProvider::server_fallback_notice`]
-    /// to tell whether a fallback attempt actually served the turn.
+    /// Per-attempt breakdown used for accounting and fallback notices.
     #[serde(default)]
     iterations: Option<Vec<AnthropicUsageIteration>>,
 }
 
-/// One attempt inside a server-side-fallback response. Tolerant by design:
-/// unknown `type` values and extra fields mean "not a fallback attempt".
+/// One provider-reported iteration. The value fields are validated separately
+/// so a malformed attempt does not discard usable usage from other attempts.
 #[derive(Debug, Deserialize)]
 struct AnthropicUsageIteration {
     /// Attempt type (JSON `type`); `fallback_message` marks the attempt that
-    /// a server-side fallback model served. Any other/absent value is ignored.
+    /// a server-side fallback model served. Notices ignore other types.
+    /// Accounting accepts `message` and a terminal `fallback_message`;
+    /// unknown, absent or out-of-order types make the chain foreign.
     #[serde(rename = "type", default)]
     kind: Option<String>,
+    #[serde(default)]
+    model: Option<serde_json::Value>,
+    #[serde(default)]
+    input_tokens: Option<serde_json::Value>,
+    #[serde(default)]
+    output_tokens: Option<serde_json::Value>,
+    #[serde(default)]
+    cache_read_input_tokens: Option<serde_json::Value>,
+    #[serde(default)]
+    cache_creation_input_tokens: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
 struct NativeContentIn {
+    /// A `fallback` block without an iteration breakdown establishes a
+    /// handoff whose earlier usage is unknown; its payload is not inferred.
     #[serde(rename = "type")]
     kind: String,
     #[serde(default)]
@@ -2166,22 +2261,370 @@ impl AnthropicModelProvider {
 
     fn normalize_usage(usage: Option<&AnthropicUsage>) -> Option<TokenUsage> {
         usage.map(|usage| {
-            let uncached = usage.input_tokens.unwrap_or(0);
-            let cache_read = usage.cache_read_input_tokens.unwrap_or(0);
-            let cache_create = usage.cache_creation_input_tokens.unwrap_or(0);
-            let total = uncached
-                .saturating_add(cache_read)
-                .saturating_add(cache_create);
-            let any_reported = usage.input_tokens.is_some()
-                || usage.cache_read_input_tokens.is_some()
-                || usage.cache_creation_input_tokens.is_some();
-            TokenUsage {
-                input_tokens: if any_reported { Some(total) } else { None },
-                output_tokens: usage.output_tokens,
-                cached_input_tokens: usage.cache_read_input_tokens,
-                cache_creation_input_tokens: usage.cache_creation_input_tokens,
-            }
+            Self::normalize_usage_fields(
+                usage.input_tokens,
+                usage.output_tokens,
+                usage.cache_read_input_tokens,
+                usage.cache_creation_input_tokens,
+            )
         })
+    }
+
+    fn normalize_usage_fields(
+        input: Option<u64>,
+        output: Option<u64>,
+        cache_read: Option<u64>,
+        cache_create: Option<u64>,
+    ) -> TokenUsage {
+        let any_input = input.is_some() || cache_read.is_some() || cache_create.is_some();
+        let total = input
+            .unwrap_or(0)
+            .saturating_add(cache_read.unwrap_or(0))
+            .saturating_add(cache_create.unwrap_or(0));
+        TokenUsage {
+            input_tokens: any_input.then_some(total),
+            output_tokens: output,
+            cached_input_tokens: cache_read,
+            cache_creation_input_tokens: cache_create,
+        }
+    }
+
+    fn checked_total_input(
+        input: Option<u64>,
+        cache_read: Option<u64>,
+        cache_create: Option<u64>,
+    ) -> Option<u64> {
+        input
+            .unwrap_or(0)
+            .checked_add(cache_read.unwrap_or(0))?
+            .checked_add(cache_create.unwrap_or(0))
+    }
+
+    fn observe_string_response_usage(
+        usage: Option<&AnthropicUsage>,
+        malformed: bool,
+    ) -> Option<TokenUsage> {
+        use crate::dispatch::InvalidUsageReason;
+        use crate::dispatch::accounting::{observe_invalid_string_usage, observe_string_usage};
+
+        if let (Some(raw), Some(mut normalized)) = (usage, Self::normalize_usage(usage)) {
+            // Cache counters alone measure only part of native input. Keep
+            // them for the ledger without converting absent base input to zero.
+            if raw.input_tokens.is_none() {
+                normalized.input_tokens = None;
+            }
+            if Self::checked_total_input(
+                raw.input_tokens,
+                raw.cache_read_input_tokens,
+                raw.cache_creation_input_tokens,
+            )
+            .is_none()
+            {
+                // The combined input dimension cannot be represented. Do not
+                // record a saturated total or imply that partition is priced.
+                normalized.input_tokens = None;
+                observe_invalid_string_usage(normalized.clone(), InvalidUsageReason::TotalOverflow);
+            } else if malformed {
+                observe_invalid_string_usage(
+                    normalized.clone(),
+                    InvalidUsageReason::MalformedUsage,
+                );
+            } else {
+                observe_string_usage(Some(normalized.clone()));
+            }
+            Some(normalized)
+        } else {
+            None
+        }
+    }
+
+    fn iteration_record(
+        iteration: &AnthropicUsageIteration,
+        require_explicit_base_input: bool,
+    ) -> IterationRecord {
+        let mut well_formed = true;
+        let mut counter = |value: &Option<serde_json::Value>| match value {
+            None => None,
+            Some(value) => match value.as_u64() {
+                Some(value) => Some(value),
+                None => {
+                    well_formed = false;
+                    None
+                }
+            },
+        };
+        let input = counter(&iteration.input_tokens);
+        let output = counter(&iteration.output_tokens);
+        let cache_read = counter(&iteration.cache_read_input_tokens);
+        let cache_create = counter(&iteration.cache_creation_input_tokens);
+        let overflowed = Self::checked_total_input(input, cache_read, cache_create).is_none();
+        if overflowed {
+            well_formed = false;
+        }
+        let model = iteration
+            .model
+            .as_ref()
+            .and_then(serde_json::Value::as_str)
+            .filter(|model| !model.trim().is_empty())
+            .map(str::to_string);
+        let mut usage = Self::normalize_usage_fields(input, output, cache_read, cache_create);
+        if overflowed || (require_explicit_base_input && input.is_none()) {
+            usage.input_tokens = None;
+        }
+        IterationRecord {
+            model,
+            usage: Some(usage),
+            well_formed,
+        }
+    }
+
+    fn usage_equal(left: Option<&TokenUsage>, right: Option<&TokenUsage>) -> bool {
+        match (left, right) {
+            (Some(left), Some(right)) => {
+                left.input_tokens == right.input_tokens
+                    && left.output_tokens == right.output_tokens
+                    && left.cached_input_tokens == right.cached_input_tokens
+                    && left.cache_creation_input_tokens == right.cache_creation_input_tokens
+            }
+            _ => false,
+        }
+    }
+
+    /// Merge two observations of the same attempt without adding them.
+    fn merge_terminal_usage(
+        top: Option<&TokenUsage>,
+        entry: Option<&TokenUsage>,
+    ) -> Option<TokenUsage> {
+        if top.is_none() && entry.is_none() {
+            return None;
+        }
+        Some(TokenUsage {
+            input_tokens: top
+                .and_then(|u| u.input_tokens)
+                .or_else(|| entry.and_then(|u| u.input_tokens)),
+            output_tokens: top
+                .and_then(|u| u.output_tokens)
+                .or_else(|| entry.and_then(|u| u.output_tokens)),
+            cached_input_tokens: top
+                .and_then(|u| u.cached_input_tokens)
+                .or_else(|| entry.and_then(|u| u.cached_input_tokens)),
+            cache_creation_input_tokens: top
+                .and_then(|u| u.cache_creation_input_tokens)
+                .or_else(|| entry.and_then(|u| u.cache_creation_input_tokens)),
+        })
+    }
+
+    /// Detect a nonconforming response whose top-level usage already sums the
+    /// iteration records, so those observations must not be added again.
+    fn iteration_sum_matches_top(entries: &[IterationRecord], top: Option<&TokenUsage>) -> bool {
+        if entries.len() < 2
+            || entries.iter().any(|entry| {
+                !entry.well_formed
+                    || entry.usage.as_ref().is_none_or(|usage| {
+                        usage.input_tokens.is_none() || usage.output_tokens.is_none()
+                    })
+            })
+        {
+            return false;
+        }
+        fn sum_field(
+            entries: &[IterationRecord],
+            field: impl Fn(&TokenUsage) -> Option<u64>,
+        ) -> Option<Option<u64>> {
+            let mut sum = None::<u64>;
+            for entry in entries {
+                if let Some(value) = entry.usage.as_ref().and_then(&field) {
+                    sum = Some(sum.unwrap_or(0).checked_add(value)?);
+                }
+            }
+            Some(sum)
+        }
+        let Some(sum) = (|| {
+            Some(TokenUsage {
+                input_tokens: sum_field(entries, |u| u.input_tokens)?,
+                output_tokens: sum_field(entries, |u| u.output_tokens)?,
+                cached_input_tokens: sum_field(entries, |u| u.cached_input_tokens)?,
+                cache_creation_input_tokens: sum_field(entries, |u| u.cache_creation_input_tokens)?,
+            })
+        })() else {
+            return false;
+        };
+        Self::usage_equal(Some(&sum), top)
+    }
+
+    /// Project a decoded response into physical usage observations without
+    /// inferring a missing attempt or adding the returned attempt twice.
+    fn usage_chain(response: &NativeChatResponse) -> Option<UsageChain> {
+        Self::usage_chain_with_top(
+            response,
+            Self::normalize_usage(response.usage.as_ref()),
+            false,
+        )
+    }
+
+    fn usage_chain_with_top(
+        response: &NativeChatResponse,
+        top: Option<TokenUsage>,
+        require_explicit_base_input: bool,
+    ) -> Option<UsageChain> {
+        let top_model = response
+            .model
+            .as_deref()
+            .filter(|model| !model.trim().is_empty());
+        let iterations = response
+            .usage
+            .as_ref()
+            .and_then(|usage| usage.iterations.as_deref());
+        let fallback = response
+            .content
+            .iter()
+            .any(|block| block.kind == "fallback");
+        Self::decode_usage_chain(
+            top,
+            top_model,
+            iterations,
+            fallback,
+            require_explicit_base_input,
+        )
+    }
+
+    fn decode_usage_chain(
+        top: Option<TokenUsage>,
+        top_model: Option<&str>,
+        iterations: Option<&[AnthropicUsageIteration]>,
+        fallback: bool,
+        require_explicit_base_input: bool,
+    ) -> Option<UsageChain> {
+        let Some(iterations) = iterations else {
+            return fallback.then(|| UsageChain {
+                prior: Vec::new(),
+                terminal: TerminalRecord {
+                    model: top_model.map(str::to_string),
+                    settled: false,
+                    malformed: false,
+                    observation: top,
+                },
+            });
+        };
+
+        let foreign = iterations.is_empty()
+            || iterations.iter().enumerate().any(|(index, iteration)| {
+                match iteration.kind.as_deref() {
+                    Some("message") => false,
+                    Some("fallback_message") => index + 1 != iterations.len(),
+                    _ => true,
+                }
+            });
+        let mut entries: Vec<_> = iterations
+            .iter()
+            .map(|iteration| Self::iteration_record(iteration, require_explicit_base_input))
+            .collect();
+        let sum_signature = entries.last().is_some_and(|terminal| {
+            !Self::usage_equal(terminal.usage.as_ref(), top.as_ref())
+                && Self::iteration_sum_matches_top(&entries, top.as_ref())
+        });
+        if foreign || sum_signature {
+            return Some(UsageChain {
+                prior: Vec::new(),
+                terminal: TerminalRecord {
+                    model: None,
+                    settled: false,
+                    malformed: false,
+                    observation: top,
+                },
+            });
+        }
+
+        let terminal = entries.pop()?;
+        let model = match (terminal.model.as_deref(), top_model) {
+            (Some(entry), Some(top)) if entry != top => None,
+            (Some(entry), _) => Some(entry.to_string()),
+            (None, Some(top)) => Some(top.to_string()),
+            (None, None) => None,
+        };
+        let settled = terminal.well_formed
+            && terminal
+                .model
+                .as_deref()
+                .is_some_and(|entry| Some(entry) == top_model)
+            && Self::usage_equal(terminal.usage.as_ref(), top.as_ref());
+        Some(UsageChain {
+            prior: entries,
+            terminal: TerminalRecord {
+                model,
+                settled,
+                malformed: !terminal.well_formed,
+                observation: Self::merge_terminal_usage(top.as_ref(), terminal.usage.as_ref()),
+            },
+        })
+    }
+
+    /// Log only structural diagnostics; never copy response content or models.
+    fn log_usage_chain_diagnostics(
+        response: &NativeChatResponse,
+        chain: &UsageChain,
+        fallbacks_sent: bool,
+    ) {
+        let iterations = response
+            .usage
+            .as_ref()
+            .and_then(|usage| usage.iterations.as_ref());
+        let fallback_blocks = response
+            .content
+            .iter()
+            .filter(|block| block.kind == "fallback")
+            .count();
+        let count = iterations.map_or(0, Vec::len);
+        let log = |reason: &str, index: Option<usize>| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_category(::zeroclaw_log::EventCategory::Provider)
+                    .with_attrs(::serde_json::json!({
+                        "reason": reason,
+                        "iteration_index": index,
+                        "iteration_count": count,
+                        "fallback_blocks": fallback_blocks,
+                        "fallbacks_sent": fallbacks_sent,
+                    })),
+                "anthropic usage chain is incomplete"
+            );
+        };
+        for (index, entry) in chain.prior.iter().enumerate() {
+            let incomplete = entry.usage.as_ref().is_none_or(|usage| {
+                usage.input_tokens.is_none()
+                    || usage.output_tokens.is_none()
+                    || usage
+                        .cached_input_tokens
+                        .zip(usage.input_tokens)
+                        .is_some_and(|(cached, input)| cached > input)
+            });
+            if entry.model.is_none() || !entry.well_formed || incomplete {
+                log("incomplete_iteration", Some(index));
+            }
+        }
+        if !chain.terminal.settled {
+            let reason = match iterations {
+                None => "handoff_without_iterations",
+                Some(iterations)
+                    if iterations.is_empty()
+                        || iterations.iter().enumerate().any(
+                            |(index, iteration)| match iteration.kind.as_deref() {
+                                Some("message") => false,
+                                Some("fallback_message") => index + 1 != iterations.len(),
+                                _ => true,
+                            },
+                        ) =>
+                {
+                    "foreign_iterations"
+                }
+                Some(iterations) if iterations.len() > 1 && chain.prior.is_empty() => {
+                    "summed_iterations"
+                }
+                _ => "unsettled_terminal",
+            };
+            log(reason, count.checked_sub(1));
+        }
     }
 
     fn parse_native_response(response: NativeChatResponse) -> ProviderChatResponse {
@@ -2993,21 +3436,40 @@ impl ModelProvider for AnthropicModelProvider {
 
         if !response.status().is_success() {
             let status = response.status();
-            let error = super::api_error("Anthropic", response).await;
+            let error =
+                super::string_wire_api_error::<NativeChatResponse>("Anthropic", response).await;
             return Err(anyhow::Error::new(crate::reliable::ProviderHttpError::new(
                 status,
                 error.to_string(),
             )));
         }
 
-        let chat_response: NativeChatResponse = response.json().await?;
+        let crate::dispatch::accounting::StringWireResponse(chat_response) = response
+            .json::<crate::dispatch::accounting::StringWireResponse<NativeChatResponse>>()
+            .await?;
+        let top = Self::observe_string_response_usage(chat_response.usage.as_ref(), false);
+        let chain = Self::usage_chain_with_top(&chat_response, top, true);
+        let reported_iterations = chain.is_some();
+        if let Some(chain) = chain {
+            crate::dispatch::accounting::attach_current_string_attempt_usage_chain(chain);
+        }
         commit_safeguard_fallback(None);
-        Self::check_refusal(&chat_response, model)?;
+        if let Err(refusal) = Self::check_refusal(&chat_response, model) {
+            if reported_iterations {
+                crate::dispatch::accounting::finish_current_string_attempt_after_completed_response(
+                );
+            }
+            return Err(refusal.into());
+        }
         let safeguard_notice = Self::server_fallback_notice(&chat_response, model);
         let parsed = Self::parse_native_response(chat_response);
         let result = Self::require_terminal_text(parsed);
         if result.is_ok() {
             commit_safeguard_fallback(safeguard_notice);
+        } else if reported_iterations {
+            // The wire response (and its per-model usage) was fully received
+            // even though the String adapter cannot accept its result.
+            crate::dispatch::accounting::finish_current_string_attempt_after_completed_response();
         }
         result
     }
@@ -3116,6 +3578,7 @@ impl ModelProvider for AnthropicModelProvider {
         // Non-streaming: opt into server-side fallback when configured, unless
         // native thinking is active on this request.
         let fallbacks = self.server_fallbacks_for(model, thinking_config.as_ref());
+        let fallbacks_sent = fallbacks.is_some();
         let extra_betas: &[&str] = if fallbacks.is_some() {
             &[ANTHROPIC_SERVER_FALLBACK_BETA]
         } else {
@@ -3156,8 +3619,17 @@ impl ModelProvider for AnthropicModelProvider {
         }
 
         let native_response: NativeChatResponse = response.json().await?;
+        if let Some(chain) = Self::usage_chain(&native_response) {
+            Self::log_usage_chain_diagnostics(&native_response, &chain, fallbacks_sent);
+            crate::dispatch::accounting::attach_current_attempt_usage_chain(chain);
+        }
         commit_safeguard_fallback(None);
-        Self::check_refusal(&native_response, model)?;
+        if let Err(refusal) = Self::check_refusal(&native_response, model) {
+            crate::dispatch::accounting::finish_current_attempt_after_completed_response(
+                refusal.usage.as_deref().cloned(),
+            );
+            return Err(anyhow::Error::new(refusal));
+        }
         let safeguard_notice = Self::server_fallback_notice(&native_response, model);
         let parsed = Self::parse_native_response(native_response);
         if !parsed.is_semantically_empty_terminal() {
@@ -9413,6 +9885,883 @@ data: {\"type\":\"message_stop\"}\n\n";
             .build()
     }
 
+    async fn accounted_messages_response(
+        body: serde_json::Value,
+        fallbacks: bool,
+    ) -> crate::dispatch::AccountedChatOutcome {
+        let (addr, server) = spawn_messages_server(body).await;
+        let provider = AnthropicModelProvider::builder("test")
+            .credential(Some("test-key"))
+            .base_url(&format!("http://{addr}"))
+            .server_fallback_models(if fallbacks {
+                vec!["model-b".to_string()]
+            } else {
+                Vec::new()
+            })
+            .build();
+        let messages = [ChatMessage::user("hello")];
+        let outcome = crate::dispatch::ProviderDispatch::from_ref(&provider)
+            .chat_accounted_outcome(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "model-a",
+                None,
+            )
+            .await;
+        server.abort();
+        outcome
+    }
+
+    fn accounted_body(iterations: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "model": "model-b",
+            "content": [{"type": "text", "text": "done"}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 50, "output_tokens": 5, "iterations": iterations}
+        })
+    }
+
+    fn assert_accounted_attempt(
+        attempt: &crate::dispatch::AccountedAttempt,
+        model: &str,
+        attributed: bool,
+        expected: &str,
+        input: Option<u64>,
+        output: Option<u64>,
+    ) {
+        use crate::dispatch::AttemptUsageOutcome;
+        assert_eq!(attempt.provider_ref(), "test");
+        assert_eq!(attempt.model(), model);
+        assert_eq!(attempt.is_model_attributed(), attributed);
+        let observed = match (expected, attempt.outcome()) {
+            ("complete", AttemptUsageOutcome::Complete(usage))
+            | (
+                "unknown",
+                AttemptUsageOutcome::OutcomeUnknown {
+                    observed: Some(usage),
+                },
+            )
+            | (
+                "invalid",
+                AttemptUsageOutcome::Invalid {
+                    observed: usage, ..
+                },
+            ) => Some(usage),
+            ("missing", AttemptUsageOutcome::Missing) => None,
+            _ => panic!("unexpected {expected} attempt: {:?}", attempt.outcome()),
+        };
+        assert_eq!(observed.and_then(|usage| usage.input_tokens), input);
+        assert_eq!(observed.and_then(|usage| usage.output_tokens), output);
+    }
+
+    #[tokio::test]
+    async fn accounted_server_fallback_preserves_each_attempt_and_refusal() {
+        use crate::dispatch::CallAccountingState;
+        let iterations = serde_json::json!([
+            {"type": "message", "model": "model-a", "input_tokens": 10,
+             "cache_read_input_tokens": 4, "cache_creation_input_tokens": 1, "output_tokens": 2},
+            {"type": "fallback_message", "model": "model-b", "input_tokens": 50, "output_tokens": 5}
+        ]);
+        for refusal in [false, true] {
+            let mut body = accounted_body(iterations.clone());
+            if refusal {
+                body["stop_reason"] = serde_json::json!("refusal");
+            }
+            let outcome = accounted_messages_response(body, true).await;
+            assert_eq!(outcome.result.is_err(), refusal);
+            let report = &outcome.accounting;
+            assert_eq!(report.accounting_state(), CallAccountingState::Complete);
+            assert_eq!(report.attempts().len(), 2);
+            assert_accounted_attempt(
+                &report.attempts()[0],
+                "model-a",
+                true,
+                "complete",
+                Some(15),
+                Some(2),
+            );
+            assert_accounted_attempt(
+                &report.attempts()[1],
+                "model-b",
+                true,
+                "complete",
+                Some(50),
+                Some(5),
+            );
+            assert_eq!(
+                report.rejected_attempts().len(),
+                if refusal { 2 } else { 1 }
+            );
+            assert_eq!(report.accepted_route().is_none(), refusal);
+            if let Ok(response) = &outcome.result {
+                let usage = response.response.usage.as_ref().expect("returned usage");
+                assert_eq!(
+                    (usage.input_tokens, usage.output_tokens),
+                    (Some(50), Some(5))
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn accounted_string_rejected_anthropic_wire_keeps_valid_usage() {
+        use crate::dispatch::{
+            AccountedChatScope, AttemptUsageOutcome, InvalidUsageReason, ProviderDispatch,
+        };
+
+        let (addr, server) = spawn_messages_server(serde_json::json!({
+            "content":[{"type":"text","text":"unused"}],
+            "stop_reason":"end_turn",
+            "usage":{"input_tokens":-1,"output_tokens":3}
+        }))
+        .await;
+        let provider = refusal_test_provider(addr);
+        let dispatch = ProviderDispatch::from_ref(&provider);
+        let baseline = dispatch
+            .chat_with_system(None, "hello", "requested", None)
+            .await
+            .unwrap_err();
+        let scope = AccountedChatScope::new_with_string_usage();
+        let error = scope
+            .scope(dispatch.chat_with_system(None, "hello", "requested", None))
+            .await
+            .unwrap_err();
+        assert_eq!(error.to_string(), baseline.to_string());
+        let report = scope.take();
+        assert_eq!(report.attempts().len(), 1);
+        assert!(report.accepted_route().is_none());
+        assert!(matches!(
+            report.attempts()[0].outcome(),
+            AttemptUsageOutcome::Invalid {
+                observed: usage, reason: InvalidUsageReason::MalformedUsage,
+            } if usage.input_tokens.is_none() && usage.output_tokens == Some(3)
+        ));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn accounted_string_does_not_price_an_unreadable_fallback_chain_as_one_model() {
+        use crate::dispatch::{AccountedChatScope, AttemptUsageOutcome, ProviderDispatch};
+
+        let (addr, server) = spawn_messages_server(serde_json::json!({
+            "model":"served",
+            "content":[{"type":"text","text":"unused"}],
+            "stop_reason":"end_turn",
+            "usage":{"input_tokens":50,"output_tokens":5,"iterations":5}
+        }))
+        .await;
+        let provider = refusal_test_provider(addr);
+        let dispatch = ProviderDispatch::from_ref(&provider);
+        let scope = AccountedChatScope::new_with_string_usage();
+        assert!(
+            scope
+                .scope(dispatch.chat_with_system(None, "hello", "requested", None))
+                .await
+                .is_err()
+        );
+        let report = scope.take();
+        server.abort();
+        assert!(report.accepted_route().is_none());
+        let [attempt] = report.attempts() else {
+            panic!("expected one physical attempt");
+        };
+        assert!(!attempt.is_model_attributed());
+        assert!(matches!(
+            attempt.outcome(),
+            AttemptUsageOutcome::Invalid { observed, .. }
+                if observed.input_tokens == Some(50) && observed.output_tokens == Some(5)
+        ));
+    }
+
+    #[tokio::test]
+    async fn accounted_string_checks_top_level_input_component_sum() {
+        use crate::dispatch::{
+            AccountedChatScope, AttemptUsageOutcome, InvalidUsageReason, ProviderDispatch,
+        };
+
+        for cache_read in [0_u64, 1] {
+            let (addr, server) = spawn_messages_server(serde_json::json!({
+                "content":[{"type":"text","text":"done"}],
+                "stop_reason":"end_turn",
+                "usage":{
+                    "input_tokens":u64::MAX,
+                    "cache_read_input_tokens":cache_read,
+                    "output_tokens":0
+                }
+            }))
+            .await;
+            let provider = refusal_test_provider(addr);
+            let dispatch = ProviderDispatch::from_ref(&provider);
+            let scope = AccountedChatScope::new_with_string_usage();
+            assert_eq!(
+                scope
+                    .scope(dispatch.chat_with_system(None, "hello", "requested", None))
+                    .await
+                    .unwrap(),
+                "done"
+            );
+            let report = scope.take();
+            server.abort();
+            assert_eq!(report.attempts().len(), 1);
+            match (cache_read, report.attempts()[0].outcome()) {
+                (0, AttemptUsageOutcome::Complete(usage)) => {
+                    assert_eq!(
+                        (usage.input_tokens, usage.output_tokens),
+                        (Some(u64::MAX), Some(0))
+                    );
+                }
+                (
+                    1,
+                    AttemptUsageOutcome::Invalid {
+                        observed: usage,
+                        reason: InvalidUsageReason::TotalOverflow,
+                    },
+                ) => {
+                    assert_eq!(usage.input_tokens, None);
+                    assert_eq!(usage.cached_input_tokens, Some(1));
+                    assert_eq!(usage.output_tokens, Some(0));
+                }
+                (_, outcome) => panic!("unexpected input component accounting: {outcome:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn accounted_string_needs_explicit_native_base_input() {
+        use crate::dispatch::{
+            AccountedChatScope, AttemptUsageOutcome, InvalidUsageReason, ProviderDispatch,
+        };
+
+        for (iteration, explicit_zero) in
+            [(false, false), (false, true), (true, false), (true, true)]
+        {
+            let mut usage = serde_json::json!({
+                "output_tokens":3,"cache_creation_input_tokens":7
+            });
+            if explicit_zero {
+                usage["input_tokens"] = serde_json::json!(0);
+            }
+            let body = if iteration {
+                usage["type"] = serde_json::json!("message");
+                usage["model"] = serde_json::json!("model-a");
+                accounted_body(serde_json::json!([
+                    usage,
+                    {"type":"fallback_message","model":"model-b","input_tokens":50,"output_tokens":5}
+                ]))
+            } else {
+                serde_json::json!({
+                    "content":[{"type":"text","text":"done"}],"stop_reason":"end_turn",
+                    "usage":usage
+                })
+            };
+            let (addr, server) = spawn_messages_server(body).await;
+            let provider = refusal_test_provider(addr);
+            let dispatch = ProviderDispatch::from_ref(&provider);
+            let scope = AccountedChatScope::new_with_string_usage();
+            assert_eq!(
+                scope
+                    .scope(dispatch.chat_with_system(None, "hello", "model-a", None))
+                    .await
+                    .unwrap(),
+                "done"
+            );
+            let report = scope.take();
+            server.abort();
+            assert_eq!(report.attempts().len(), if iteration { 2 } else { 1 });
+            let usage = match (explicit_zero, report.attempts()[0].outcome()) {
+                (true, AttemptUsageOutcome::Complete(usage)) => usage,
+                (
+                    false,
+                    AttemptUsageOutcome::Invalid {
+                        observed,
+                        reason: InvalidUsageReason::MissingInput,
+                    },
+                ) => observed,
+                (_, outcome) => panic!("unexpected input observation: {outcome:?}"),
+            };
+            assert_eq!(usage.input_tokens, explicit_zero.then_some(7));
+            assert_eq!(usage.output_tokens, Some(3));
+            assert_eq!(usage.cache_creation_input_tokens, Some(7));
+        }
+    }
+
+    #[tokio::test]
+    async fn accounted_string_server_fallback_preserves_each_iteration() {
+        use crate::dispatch::{
+            AccountedChatScope, AttemptUsageOutcome, CallAccountingState, InvalidUsageReason,
+            ProviderDispatch,
+        };
+
+        for (refusal, content_override, malformed_prior) in [
+            (false, None, false),
+            (true, None, false),
+            (false, None, true),
+            (false, Some(serde_json::json!([])), true),
+            (false, Some(serde_json::Value::Null), true),
+        ] {
+            let mut body = accounted_body(serde_json::json!([
+                {"type": "message", "model": "model-a", "input_tokens": 100, "output_tokens": 10},
+                {"type": "fallback_message", "model": "model-b", "input_tokens": 50, "output_tokens": 5}
+            ]));
+            if refusal {
+                body["stop_reason"] = serde_json::json!("refusal");
+            }
+            let rejected = refusal || content_override.is_some();
+            if let Some(content) = content_override {
+                body["content"] = content;
+            }
+            if malformed_prior {
+                body["usage"]["iterations"][0]["cache_read_input_tokens"] =
+                    serde_json::json!("invalid");
+            }
+            let (addr, server) = spawn_messages_server(body).await;
+            let provider = AnthropicModelProvider::builder("test")
+                .credential(Some("test-key"))
+                .base_url(&format!("http://{addr}"))
+                .server_fallback_models(vec!["model-b".into()])
+                .build();
+            let dispatch = ProviderDispatch::from_ref(&provider);
+            let scope = AccountedChatScope::new_with_string_usage();
+            let result = scope
+                .scope(dispatch.chat_with_system(None, "hello", "model-a", None))
+                .await;
+            server.abort();
+            assert_eq!(result.is_err(), rejected);
+            if let Ok(text) = result {
+                assert_eq!(text, "done");
+                scope.mark_logical_success();
+            }
+            let report = scope.take();
+            assert_eq!(
+                report.accounting_state(),
+                if malformed_prior {
+                    CallAccountingState::Invalid
+                } else {
+                    CallAccountingState::Complete
+                }
+            );
+            assert_eq!(report.attempts().len(), 2);
+            assert_accounted_attempt(
+                &report.attempts()[0],
+                "model-a",
+                true,
+                if malformed_prior {
+                    "invalid"
+                } else {
+                    "complete"
+                },
+                Some(100),
+                Some(10),
+            );
+            if malformed_prior {
+                assert!(matches!(
+                    report.attempts()[0].outcome(),
+                    AttemptUsageOutcome::Invalid {
+                        reason: InvalidUsageReason::MalformedUsage,
+                        ..
+                    }
+                ));
+            }
+            assert_accounted_attempt(
+                &report.attempts()[1],
+                "model-b",
+                true,
+                "complete",
+                Some(50),
+                Some(5),
+            );
+            assert_eq!(report.accepted_route().is_none(), rejected);
+        }
+    }
+
+    #[tokio::test]
+    async fn accounted_server_fallback_retains_lower_bounds_and_attribution() {
+        let first = serde_json::json!({"type": "message", "model": "model-a", "input_tokens": 100, "output_tokens": 10});
+        for (terminal, top_model, expected_model, attributed) in [
+            (
+                serde_json::json!({"type": "fallback_message"}),
+                None,
+                "(unattributed)",
+                false,
+            ),
+            (
+                serde_json::json!({"type": "fallback_message"}),
+                Some("model-b"),
+                "model-b",
+                true,
+            ),
+            (
+                serde_json::json!({"type": "fallback_message", "model": "model-c", "input_tokens": 50, "output_tokens": 5}),
+                Some("model-b"),
+                "(unattributed)",
+                false,
+            ),
+            (
+                serde_json::json!({"type": "fallback_message", "model": "model-b", "input_tokens": 51, "output_tokens": 5}),
+                Some("model-b"),
+                "model-b",
+                true,
+            ),
+            (
+                serde_json::json!({"type": "fallback_message", "model": "model-b", "input_tokens": 50, "output_tokens": 5}),
+                None,
+                "model-b",
+                true,
+            ),
+        ] {
+            for refusal in [false, true] {
+                let mut body = accounted_body(serde_json::json!([first.clone(), terminal]));
+                match top_model {
+                    Some(model) => body["model"] = serde_json::json!(model),
+                    None => {
+                        body.as_object_mut().unwrap().remove("model");
+                    }
+                }
+                if refusal {
+                    body["stop_reason"] = serde_json::json!("refusal");
+                }
+                let outcome = accounted_messages_response(body, true).await;
+                assert_eq!(outcome.result.is_err(), refusal);
+                let attempts = outcome.accounting.attempts();
+                assert_eq!(attempts.len(), 2);
+                assert_accounted_attempt(
+                    &attempts[0],
+                    "model-a",
+                    true,
+                    "complete",
+                    Some(100),
+                    Some(10),
+                );
+                assert_accounted_attempt(
+                    &attempts[1],
+                    expected_model,
+                    attributed,
+                    "unknown",
+                    Some(50),
+                    Some(5),
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn accounted_server_fallback_rejects_foreign_and_summed_shapes() {
+        let invalid_shapes = [
+            serde_json::json!([]),
+            serde_json::json!([{"type": "weird"}]),
+            serde_json::json!([{"type": "compaction"}]),
+            serde_json::json!([{"type": "advisor_message"}]),
+            serde_json::json!([{"model": "model-a"}]),
+            serde_json::json!([{"type": "fallback_message"}, {"type": "message"}]),
+        ];
+        for iterations in invalid_shapes {
+            for refusal in [false, true] {
+                for has_model in [false, true] {
+                    let mut body = accounted_body(iterations.clone());
+                    if !has_model {
+                        body.as_object_mut().unwrap().remove("model");
+                    }
+                    if refusal {
+                        body["stop_reason"] = serde_json::json!("refusal");
+                    }
+                    let outcome = accounted_messages_response(body, true).await;
+                    assert_eq!(outcome.result.is_err(), refusal);
+                    let attempts = outcome.accounting.attempts();
+                    assert_eq!(attempts.len(), 1);
+                    assert_accounted_attempt(
+                        &attempts[0],
+                        "(unattributed)",
+                        false,
+                        "unknown",
+                        Some(50),
+                        Some(5),
+                    );
+                }
+            }
+        }
+        let mut body = accounted_body(serde_json::json!([
+            {"type": "message", "model": "model-a", "input_tokens": 100, "output_tokens": 10},
+            {"type": "fallback_message", "model": "model-b", "input_tokens": 50, "output_tokens": 5}
+        ]));
+        body["usage"]["input_tokens"] = serde_json::json!(150);
+        body["usage"]["output_tokens"] = serde_json::json!(15);
+        let outcome = accounted_messages_response(body, true).await;
+        assert_eq!(outcome.accounting.attempts().len(), 1);
+        assert_accounted_attempt(
+            &outcome.accounting.attempts()[0],
+            "(unattributed)",
+            false,
+            "unknown",
+            Some(150),
+            Some(15),
+        );
+    }
+
+    #[tokio::test]
+    async fn accounted_handoff_without_iterations_is_incomplete_but_single_turn_is_not() {
+        for fallbacks in [false, true] {
+            for refusal in [false, true] {
+                for has_model in [false, true] {
+                    for null_iterations in [false, true] {
+                        let mut body = accounted_body(serde_json::Value::Null);
+                        body["content"] = serde_json::json!([{"type": "fallback"}, {"type": "text", "text": "done"}]);
+                        if !null_iterations {
+                            body["usage"].as_object_mut().unwrap().remove("iterations");
+                        }
+                        if !has_model {
+                            body.as_object_mut().unwrap().remove("model");
+                        }
+                        if refusal {
+                            body["stop_reason"] = serde_json::json!("refusal");
+                        }
+                        let outcome = accounted_messages_response(body, fallbacks).await;
+                        assert_eq!(outcome.result.is_err(), refusal);
+                        assert_eq!(outcome.accounting.attempts().len(), 1);
+                        assert_accounted_attempt(
+                            &outcome.accounting.attempts()[0],
+                            if has_model {
+                                "model-b"
+                            } else {
+                                "(unattributed)"
+                            },
+                            has_model,
+                            "unknown",
+                            Some(50),
+                            Some(5),
+                        );
+                    }
+                }
+            }
+            for refusal in [false, true] {
+                let mut body = accounted_body(serde_json::Value::Null);
+                if refusal {
+                    body["stop_reason"] = serde_json::json!("refusal");
+                }
+                let outcome = accounted_messages_response(body, fallbacks).await;
+                assert_eq!(outcome.result.is_err(), refusal);
+                assert_accounted_attempt(
+                    &outcome.accounting.attempts()[0],
+                    "model-a",
+                    true,
+                    "complete",
+                    Some(50),
+                    Some(5),
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn accounted_fallback_preserves_partial_and_invalid_iteration_usage() {
+        let body = accounted_body(serde_json::json!([
+            {"type": "message", "model": "model-a", "input_tokens": 100},
+            {"type": "message", "input_tokens": 20, "output_tokens": 2},
+            {"type": "message", "model": "model-c", "input_tokens": 10, "output_tokens": 1,
+             "cache_read_input_tokens": "invalid"},
+            {"type": "message", "model": "model-d", "input_tokens": u64::MAX,
+             "cache_read_input_tokens": 1, "output_tokens": 0},
+            {"type": "fallback_message", "model": "model-b", "input_tokens": 50, "output_tokens": 5}
+        ]));
+        let outcome = accounted_messages_response(body, true).await;
+        assert!(outcome.result.is_ok());
+        let attempts = outcome.accounting.attempts();
+        assert_eq!(attempts.len(), 5);
+        assert_accounted_attempt(&attempts[0], "model-a", true, "invalid", Some(100), None);
+        assert_accounted_attempt(
+            &attempts[1],
+            "(unattributed)",
+            false,
+            "unknown",
+            Some(20),
+            Some(2),
+        );
+        assert_accounted_attempt(&attempts[2], "model-c", true, "unknown", Some(10), Some(1));
+        assert_accounted_attempt(&attempts[3], "model-d", true, "invalid", None, Some(0));
+        assert!(matches!(
+            attempts[3].outcome(),
+            crate::dispatch::AttemptUsageOutcome::Invalid { observed, .. }
+                if observed.cached_input_tokens == Some(1)
+        ));
+        assert_accounted_attempt(&attempts[4], "model-b", true, "complete", Some(50), Some(5));
+    }
+
+    #[tokio::test]
+    async fn accounted_fallback_distinguishes_real_unattributed_model_name() {
+        let mut body = accounted_body(serde_json::json!([
+            {"type": "message", "model": "(unattributed)", "input_tokens": 10, "output_tokens": 1},
+            {"type": "message", "input_tokens": 20, "output_tokens": 2},
+            {"type": "fallback_message", "model": "(unattributed)", "input_tokens": 50, "output_tokens": 5}
+        ]));
+        body["model"] = serde_json::json!("(unattributed)");
+        let outcome = accounted_messages_response(body, true).await;
+        assert!(outcome.result.is_ok());
+        let attempts = outcome.accounting.attempts();
+        assert_eq!(attempts.len(), 3);
+        assert_accounted_attempt(
+            &attempts[0],
+            "(unattributed)",
+            true,
+            "complete",
+            Some(10),
+            Some(1),
+        );
+        assert_accounted_attempt(
+            &attempts[1],
+            "(unattributed)",
+            false,
+            "unknown",
+            Some(20),
+            Some(2),
+        );
+        assert_accounted_attempt(
+            &attempts[2],
+            "(unattributed)",
+            true,
+            "complete",
+            Some(50),
+            Some(5),
+        );
+        assert_eq!(
+            outcome
+                .accounting
+                .rejected_attempts()
+                .iter()
+                .map(|a| a.is_model_attributed())
+                .collect::<Vec<_>>(),
+            vec![true, false]
+        );
+    }
+
+    #[tokio::test]
+    async fn accounted_fallback_non_array_iterations_is_decode_error() {
+        let outcome = accounted_messages_response(accounted_body(serde_json::json!(5)), true).await;
+        assert!(outcome.result.is_err());
+        assert!(matches!(
+            outcome.accounting.attempts()[0].outcome(),
+            crate::dispatch::AttemptUsageOutcome::OutcomeUnknown { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn accounted_sticky_and_partial_terminal_usage_are_not_double_counted() {
+        let terminal = serde_json::json!({"type": "fallback_message", "model": "model-b", "input_tokens": 50, "output_tokens": 5});
+        let outcome = accounted_messages_response(
+            accounted_body(serde_json::json!([terminal.clone()])),
+            true,
+        )
+        .await;
+        assert_eq!(outcome.accounting.attempts().len(), 1);
+        assert_accounted_attempt(
+            &outcome.accounting.attempts()[0],
+            "model-b",
+            true,
+            "complete",
+            Some(50),
+            Some(5),
+        );
+
+        for top_model in [None, Some("  ")] {
+            let mut body = accounted_body(serde_json::json!([terminal.clone()]));
+            match top_model {
+                Some(model) => body["model"] = serde_json::json!(model),
+                None => {
+                    body.as_object_mut().unwrap().remove("model");
+                }
+            }
+            let outcome = accounted_messages_response(body, true).await;
+            assert_eq!(outcome.accounting.attempts().len(), 1);
+            assert_accounted_attempt(
+                &outcome.accounting.attempts()[0],
+                "model-b",
+                true,
+                "unknown",
+                Some(50),
+                Some(5),
+            );
+        }
+
+        let mut body = accounted_body(serde_json::json!([terminal]));
+        body["usage"]
+            .as_object_mut()
+            .unwrap()
+            .remove("output_tokens");
+        let outcome = accounted_messages_response(body, true).await;
+        assert_eq!(outcome.accounting.attempts().len(), 1);
+        assert_accounted_attempt(
+            &outcome.accounting.attempts()[0],
+            "model-b",
+            true,
+            "unknown",
+            Some(50),
+            Some(5),
+        );
+        assert_eq!(
+            outcome
+                .result
+                .unwrap()
+                .response
+                .usage
+                .unwrap()
+                .output_tokens,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn accounted_nested_reliable_preserves_fallback_chain_on_refusal() {
+        use crate::dispatch::{AttemptUsageOutcome, ProviderDispatch};
+        use crate::reliable::ReliableModelProvider;
+        let mut refusal = accounted_body(serde_json::json!([
+            {"type": "message", "model": "model-a", "input_tokens": 100, "output_tokens": 10},
+            {"type": "fallback_message", "model": "model-b", "input_tokens": 50, "output_tokens": 5}
+        ]));
+        refusal["stop_reason"] = serde_json::json!("refusal");
+        let (first_addr, first_server) = spawn_messages_server(refusal).await;
+        let (second_addr, second_server) = spawn_messages_server(serde_json::json!({
+            "content": [{"type": "text", "text": "recovered"}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 25, "output_tokens": 4}
+        }))
+        .await;
+        let first = refusal_test_provider(first_addr);
+        let second = refusal_test_provider(second_addr);
+        let inner = ReliableModelProvider::new(
+            "inner",
+            vec![
+                ("first".into(), Box::new(first)),
+                ("second".into(), Box::new(second)),
+            ],
+            0,
+            1,
+        );
+        let outer =
+            ReliableModelProvider::new("outer", vec![("wrapper".into(), Box::new(inner))], 0, 1);
+        let messages = [ChatMessage::user("hello")];
+        let outcome = ProviderDispatch::from_ref(&outer)
+            .chat_accounted_outcome(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "model-a",
+                None,
+            )
+            .await;
+        first_server.abort();
+        second_server.abort();
+        assert!(outcome.result.is_ok());
+        let attempts = outcome.accounting.attempts();
+        assert_eq!(attempts.len(), 3);
+        assert_eq!(
+            attempts
+                .iter()
+                .map(|a| a.provider_ref())
+                .collect::<Vec<_>>(),
+            vec!["first", "first", "second"]
+        );
+        assert_eq!(
+            attempts.iter().map(|a| a.model()).collect::<Vec<_>>(),
+            vec!["model-a", "model-b", "model-a"]
+        );
+        assert!(
+            attempts.iter().all(|a| a.is_model_attributed()
+                && matches!(a.outcome(), AttemptUsageOutcome::Complete(_)))
+        );
+        assert_eq!(outcome.accounting.rejected_attempts().len(), 2);
+        assert_eq!(
+            outcome.result.unwrap().response.usage.unwrap().input_tokens,
+            Some(25)
+        );
+    }
+
+    #[tokio::test]
+    async fn accounted_fallback_timeout_before_body_has_no_invented_usage() {
+        use crate::dispatch::{AccountedChatScope, AttemptUsageOutcome, ProviderDispatch};
+        use axum::{Json, Router, routing::post};
+        let app = Router::new().route("/v1/messages", post(|| async {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            Json(accounted_body(serde_json::json!([
+                {"type": "fallback_message", "model": "model-b", "input_tokens": 50, "output_tokens": 5}
+            ])))
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let provider = refusal_test_provider(addr);
+        let messages = [ChatMessage::user("hello")];
+        let scope = AccountedChatScope::new();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            scope.scope(async {
+                ProviderDispatch::from_ref(&provider)
+                    .chat(
+                        ProviderChatRequest {
+                            messages: &messages,
+                            tools: None,
+                            thinking: None,
+                        },
+                        "model-a",
+                        None,
+                    )
+                    .await
+            }),
+        )
+        .await;
+        server.abort();
+        assert!(result.is_err());
+        let report = scope.take();
+        assert_eq!(report.attempts().len(), 1);
+        assert!(report.accepted_route().is_none());
+        assert!(matches!(
+            report.attempts()[0].outcome(),
+            AttemptUsageOutcome::OutcomeUnknown { observed: None }
+        ));
+    }
+
+    #[tokio::test]
+    async fn accounted_modelless_iterations_keep_only_established_observations() {
+        let body = accounted_body(serde_json::json!([
+            {"type": "message"}, {"type": "fallback_message"}
+        ]));
+        let outcome = accounted_messages_response(body, true).await;
+        assert!(outcome.result.is_ok());
+        let attempts = outcome.accounting.attempts();
+        assert_eq!(attempts.len(), 2);
+        assert_accounted_attempt(&attempts[0], "(unattributed)", false, "missing", None, None);
+        assert_accounted_attempt(&attempts[1], "model-b", true, "unknown", Some(50), Some(5));
+    }
+
+    #[tokio::test]
+    async fn unscoped_anthropic_fallback_remains_a_normal_response() {
+        let body = accounted_body(serde_json::json!([
+            {"type": "message", "model": "model-a", "input_tokens": 100, "output_tokens": 10},
+            {"type": "fallback_message", "model": "model-b", "input_tokens": 50, "output_tokens": 5}
+        ]));
+        let (addr, server) = spawn_messages_server(body).await;
+        let provider = refusal_test_provider(addr);
+        let messages = [ChatMessage::user("hello")];
+        let response = provider
+            .chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "model-a",
+                None,
+            )
+            .await
+            .unwrap();
+        server.abort();
+        assert_eq!(response.usage.unwrap().input_tokens, Some(50));
+    }
+
     /// Shared slot the capturing mock server writes the first request's
     /// headers and JSON body into.
     type CapturedRequest =
@@ -10084,10 +11433,17 @@ data: {\"type\":\"message_stop\"}\n\n";
         });
         let (addr, server) = spawn_messages_server(body).await;
         let provider = refusal_test_provider(addr);
-
-        let result = provider
-            .chat_with_system(Some("be helpful"), "hello", "claude-sonnet-4-6", None)
+        let dispatch = crate::dispatch::ProviderDispatch::new(std::sync::Arc::new(provider));
+        let scope = crate::dispatch::AccountedChatScope::new_with_string_usage();
+        let result = scope
+            .scope(dispatch.chat_with_system(
+                Some("be helpful"),
+                "hello",
+                "claude-sonnet-4-6",
+                None,
+            ))
             .await;
+        let report = scope.take();
         server.abort();
 
         let err = result.expect_err("a refusal must surface as an error");
@@ -10098,6 +11454,10 @@ data: {\"type\":\"message_stop\"}\n\n";
         assert_eq!(
             typed.usage.as_ref().and_then(|usage| usage.input_tokens),
             Some(5)
+        );
+        assert!(
+            matches!(report.attempts()[0].outcome(), crate::dispatch::AttemptUsageOutcome::OutcomeUnknown { observed: Some(usage) }
+            if usage.input_tokens == Some(5) && usage.output_tokens == Some(0))
         );
     }
 

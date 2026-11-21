@@ -26,6 +26,7 @@ pub enum Method {
     SessionNew,
     SessionClose,
     SessionPrompt,
+    SessionGoal,
     SessionConfigure,
     SessionCancel,
     SessionGitBranch,
@@ -165,6 +166,7 @@ impl Method {
         (Method::SessionNew, "session/new"),
         (Method::SessionClose, "session/close"),
         (Method::SessionPrompt, "session/prompt"),
+        (Method::SessionGoal, "session/goal"),
         (Method::SessionConfigure, "session/configure"),
         (Method::SessionCancel, "session/cancel"),
         (Method::SessionGitBranch, "session/git_branch"),
@@ -318,6 +320,7 @@ impl Method {
             M::SessionNew => (Typed("SessionNewParams"), Typed("SessionNewResult")),
             M::SessionClose => (Typed("SessionIdParams"), Typed("SessionCloseResult")),
             M::SessionPrompt => (Typed("SessionPromptParams"), Typed("SessionPromptAck")),
+            M::SessionGoal => (Typed("SessionGoalParams"), Typed("SessionGoalResult")),
             M::SessionConfigure => (
                 Typed("SessionConfigureParams"),
                 Typed("SessionConfigureResult"),

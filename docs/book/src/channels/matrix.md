@@ -462,6 +462,19 @@ values while `message_max_bytes` still bounds the rendered draft. Explicit
 `all` applies to unknown tools; use an exact-name rule when enabling arguments
 for only one extension tool.
 
+These modes keep distinct progress paths and disclosure rules. With
+`show_tool_calls` enabled, standalone tool notifications remain available in
+`off` and `multi_message` modes. `partial` status and legacy tool-progress
+lines use the generic draft path; `single_message` continues to use the native
+`stream_tool_arguments` renderer and Matrix structured-value redaction. For
+each path, the current configured outbound leak detector additionally guards
+the completed visible copy after its last mutation and before display caps,
+then is checked again at the send or draft-update boundary. Disabling that
+detector does not restore bytes already removed by Matrix's native renderer.
+These checks do not rewrite raw tool events or model history, guarantee
+detection of every secret, make a policy change atomic across an await, or
+retract output already sent.
+
 ## 8. Auto-recovery from corrupted local state
 
 The matrix-rust-sdk default SQLite store is single-device and assumes the local view stays in sync with the homeserver. Two failure modes break that assumption irrecoverably; ZeroClaw detects each at startup and (when `password` + `user_id` are both configured) auto-wipes `~/.zeroclaw/state/matrix/` and re-authenticates so a fresh device is created server-side.

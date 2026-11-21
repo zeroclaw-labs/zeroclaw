@@ -229,6 +229,12 @@ struct ApiChatResponse {
     usage: Option<UsageInfo>,
 }
 
+impl crate::dispatch::accounting::ObserveRejectedStringWire for ApiChatResponse {
+    fn observe_rejected_usage(wire: &serde_json::Value) {
+        crate::dispatch::accounting::observe_raw_string_usage(wire.get("usage"), false);
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct UsageInfo {
     #[serde(default)]
@@ -475,16 +481,23 @@ impl CopilotModelProvider {
         let response = req.send().await?;
 
         if !response.status().is_success() {
-            return Err(super::api_error("GitHub Copilot", response).await);
+            return Err(super::string_wire_api_error::<ApiChatResponse>(
+                "GitHub Copilot",
+                response,
+            )
+            .await);
         }
 
-        let api_response: ApiChatResponse = response.json().await?;
+        let crate::dispatch::accounting::StringWireResponse(api_response) = response
+            .json::<crate::dispatch::accounting::StringWireResponse<ApiChatResponse>>()
+            .await?;
         let usage = api_response.usage.map(|u| TokenUsage {
             input_tokens: u.prompt_tokens,
             output_tokens: u.completion_tokens,
             cached_input_tokens: None,
             cache_creation_input_tokens: None,
         });
+        crate::dispatch::accounting::observe_string_usage(usage.clone());
         let choice = api_response.choices.into_iter().next().ok_or_else(|| {
             ::zeroclaw_log::record!(
                 ERROR,
@@ -986,6 +999,73 @@ impl ::zeroclaw_api::attribution::Attributable for CopilotModelProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn goal_string_usage_preserves_copilot_request_and_text() {
+        use axum::{Json, Router, routing::post};
+        use std::sync::Mutex as StdMutex;
+        let captured = Arc::new(StdMutex::new(None));
+        let capture = Arc::clone(&captured);
+        let app = Router::new().route("/chat/completions", post(move |Json(body): Json<serde_json::Value>| {
+            let capture = Arc::clone(&capture);
+            async move {
+                let input = if body["messages"][1]["content"] == "malformed" {
+                    serde_json::json!(-1)
+                } else {
+                    serde_json::json!(8)
+                };
+                *capture.lock().unwrap() = Some(body);
+                Json(serde_json::json!({"choices":[{"message":{"content":"ok"}}],"usage":{"prompt_tokens":input,"completion_tokens":3}}))
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let provider = CopilotModelProvider::builder("test")
+            .github_token(None)
+            .build();
+        *provider.refresh_lock.lock().await = Some(CachedApiKey {
+            token: "fixture".into(),
+            api_endpoint: endpoint,
+            expires_at: chrono::Utc::now().timestamp() + 3600,
+        });
+        let dispatch = crate::dispatch::ProviderDispatch::new(Arc::new(provider));
+        let scope = crate::dispatch::AccountedChatScope::new_with_string_usage();
+        let text = scope
+            .scope(dispatch.chat_with_system(Some("system"), "hello", "model", Some(0.4)))
+            .await
+            .unwrap();
+        let report = scope.take();
+        assert_eq!(text, "ok");
+        assert!(
+            matches!(report.attempts()[0].outcome(), crate::dispatch::AttemptUsageOutcome::Complete(usage)
+            if usage.input_tokens == Some(8) && usage.output_tokens == Some(3))
+        );
+        let body = captured.lock().unwrap().take().unwrap();
+        assert_eq!(body["model"], "model");
+        assert_eq!(body["messages"][0]["content"], "system");
+        assert_eq!(body["messages"][1]["content"], "hello");
+        assert_eq!(body["temperature"], 0.4);
+
+        let scope = crate::dispatch::AccountedChatScope::new_with_string_usage();
+        assert!(
+            scope
+                .scope(dispatch.chat_with_system(Some("system"), "malformed", "model", Some(0.4)))
+                .await
+                .is_err()
+        );
+        let report = scope.take();
+        assert!(report.accepted_route().is_none());
+        assert!(matches!(
+            report.attempts()[0].outcome(),
+            crate::dispatch::AttemptUsageOutcome::Invalid {
+                observed: usage, reason: crate::dispatch::InvalidUsageReason::MalformedUsage,
+            } if usage.input_tokens.is_none() && usage.output_tokens == Some(3)
+        ));
+        server.abort();
+    }
 
     #[test]
     fn new_without_token() {

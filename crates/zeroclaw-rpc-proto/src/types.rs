@@ -267,6 +267,162 @@ rpc_type! {
 }
 
 rpc_type! {
+    /// A transport-neutral Goal control command bound to an existing live
+    /// ZeroCode session. The daemon derives agent, route, and current TUI
+    /// identity from the session; clients cannot submit those authority facts.
+    pub struct SessionGoalParams {
+        pub session_id: String,
+        pub command: String,
+    }
+}
+
+rpc_type! {
+    /// Typed Goal lifecycle result for both local IPC and WSS clients.
+    pub struct SessionGoalResult {
+        pub response: GoalResponseWire,
+    }
+}
+
+rpc_type! {
+    /// Asynchronous Goal lifecycle update. Ordinary agent events, including
+    /// parent-turn chunks and failures, use the normal `session/update` stream.
+    pub enum SessionGoalUpdate {
+        CommandFailed { session_id: String },
+        /// Successful parent candidate presentation fallback after ordinary
+        /// events drain. The legacy name is not a verifier verdict or proof of
+        /// durable candidate persistence; lifecycle updates carry those outcomes.
+        VerifiedCandidate { session_id: String, candidate: String },
+        Completed { session_id: String },
+        PausedForBlocker { session_id: String },
+        Failed {
+            session_id: String,
+            reason: GoalFailureReasonWire,
+        },
+        Lifecycle {
+            session_id: String,
+            response: GoalResponseWire,
+        },
+    }
+}
+
+rpc_type! {
+    /// Read-only Goal status presented to a native RPC client.
+    #[derive(PartialEq)]
+    pub struct GoalStatusWire {
+        pub task_id: String,
+        pub status: GoalTaskStatusWire,
+        pub execution_epoch: i64,
+        pub token_limit: Option<u64>,
+        pub cost_limit_usd: Option<f64>,
+        pub accounting_state: GoalAccountingStateWire,
+        pub pause_reason: Option<GoalPauseReasonWire>,
+        pub resumable: bool,
+    }
+}
+
+rpc_type! {
+    /// Result tags shared by synchronous replies and lifecycle updates.
+    #[serde(tag = "kind", content = "status")]
+    #[derive(PartialEq)]
+    pub enum GoalResponseWire {
+        Help,
+        Disabled,
+        NoCurrentGoal,
+        SessionUnavailable,
+        AlreadyActive,
+        BudgetRequired,
+        Stale,
+        Queued(GoalQueuedControlWire),
+        TransitionPending(GoalPendingActionWire),
+        Started(GoalStatusWire),
+        Status(GoalStatusWire),
+        Budget(GoalStatusWire),
+        BudgetUpdated(GoalStatusWire),
+        Paused(GoalStatusWire),
+        AlreadyPaused(GoalStatusWire),
+        Resumed(GoalStatusWire),
+        Cancelled(GoalStatusWire),
+        AlreadyCancelled(GoalStatusWire),
+        Terminal(GoalStatusWire),
+    }
+}
+
+rpc_type! {
+    #[derive(Copy, PartialEq, Eq)]
+    pub enum GoalFailureReasonWire {
+        AgentOperationFailed,
+        ToolResultsUnpaired,
+        EmptyAgentResponse,
+        VerifierOperationFailed,
+        VerifierResponseInvalid,
+        AccountingIncomplete,
+        PricingIncomplete,
+        OperationOutcomeUnknown,
+        ExecutorStartFailed,
+        ExecutorFailed,
+        CandidatePersistenceFailed,
+        Other,
+    }
+}
+
+rpc_type! {
+    #[derive(Copy, PartialEq, Eq)]
+    pub enum GoalAccountingStateWire {
+        Complete,
+        Missing,
+        Invalid,
+        OutcomeUnknown,
+    }
+}
+
+rpc_type! {
+    #[derive(Copy, PartialEq, Eq)]
+    pub enum GoalTaskStatusWire {
+        Running,
+        Paused,
+        Completed,
+        Failed,
+        Cancelled,
+        Lost,
+        TimedOut,
+    }
+}
+
+rpc_type! {
+    #[derive(Copy, PartialEq, Eq)]
+    pub enum GoalPauseReasonWire {
+        OperatorPaused,
+        NeedsUserInput,
+        HumanEscalation,
+        ExternalDependency,
+        ProviderUnavailable,
+        VerifierBlocked,
+        BudgetExhausted,
+        BudgetUnavailable,
+        #[serde(rename = "daemon_restarted", alias = "daemon_restart")]
+        DaemonRestart,
+    }
+}
+
+rpc_type! {
+    #[derive(Copy, PartialEq, Eq)]
+    pub enum GoalQueuedControlWire {
+        Start,
+        Resume,
+        Pause,
+        Budget,
+    }
+}
+
+rpc_type! {
+    #[derive(Copy, PartialEq, Eq)]
+    pub enum GoalPendingActionWire {
+        Pause,
+        Cancel,
+    }
+}
+
+rpc_type! {
     pub struct SessionConfigureParams {
         pub session_id: String,
         #[serde(default)]
@@ -1778,6 +1934,9 @@ pub enum SessionUpdateEvent {
         /// Absent for legacy callers that do not send one.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         client_turn_generation: Option<u64>,
+        /// Goal output is visible but does not settle a session/prompt.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        goal_owned: bool,
         /// Authoritative projected conversation-entry count after this turn.
         /// Absent for legacy or missing-session terminal events.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1888,8 +2047,11 @@ rpc_type! {
 rpc_type! {
     /// Turn-wide usage totals on `TurnComplete`, the RPC counterpart of the
     /// gateway chat socket's `done` frame. Totals and `usage_by_provider`
-    /// include every billable attempt; the `last_*` fields and context
-    /// limits describe the accepted call that served the turn.
+    /// include recorded usage for billable attempts and may be incomplete.
+    /// The `model` and `last_*` fields describe the accepted attempt; an
+    /// unknown model can be labelled `(unattributed)`. Context limits follow
+    /// the route used to dispatch that call, which can differ from the
+    /// provider-reported model after server-side fallback.
     #[derive(Default, PartialEq)]
     pub struct TurnUsageTotals {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1908,10 +2070,10 @@ rpc_type! {
         pub model: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub last_input_tokens: Option<u64>,
-        /// Proactive-trim budget of the serving route.
+        /// Proactive-trim budget of the route used for the accepted call.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub max_context_tokens: Option<u64>,
-        /// Configured context window of the serving model.
+        /// Configured context window of the route used for the accepted call.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub model_context_window: Option<u64>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -2170,6 +2332,7 @@ mod tests {
             outcome: TurnCompletionOutcome::Cancelled,
             content: "cancelled".into(),
             client_turn_generation: Some(9),
+            goal_owned: false,
             message_count: Some(4),
             safeguard_fallback: None,
             usage: None,
@@ -2179,7 +2342,9 @@ mod tests {
         assert_eq!(v["client_turn_generation"], json!(9));
         assert_eq!(v["message_count"], json!(4));
         assert!(
-            v.get("safeguard_fallback").is_none() && v.get("usage").is_none(),
+            v.get("safeguard_fallback").is_none()
+                && v.get("usage").is_none()
+                && v.get("goal_owned").is_none(),
             "absent extras must not appear on the wire for older clients: {v}"
         );
     }
@@ -2191,6 +2356,7 @@ mod tests {
             outcome: TurnCompletionOutcome::Completed,
             content: "answer".into(),
             client_turn_generation: None,
+            goal_owned: false,
             message_count: Some(2),
             safeguard_fallback: Some(SafeguardFallbackWire {
                 fallback_kind: SafeguardFallbackKindWire::ClientServer,

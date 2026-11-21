@@ -1,5 +1,7 @@
 //! Shared built-in channel slash command catalogue.
 
+pub mod goal;
+
 use serde::Serialize;
 
 /// User-facing surface where a command can be advertised or accepted.
@@ -36,7 +38,7 @@ pub enum BuiltinCommandId {
     Config,
     /// Show or change model thinking/reasoning effort.
     Thinking,
-    /// Manage durable goal-mode work.
+    /// Manage the session-bound Goal lifecycle.
     Goal,
 }
 
@@ -64,7 +66,7 @@ pub enum CommandExecution {
     ClientLocal,
     /// The channel/runtime command handler owns the command.
     RuntimeCommand,
-    /// The durable goal controller/admission path owns the command.
+    /// The surface routes the command to session-bound Goal admission.
     GoalAdmission,
 }
 
@@ -194,9 +196,9 @@ static BUILTIN_COMMANDS: &[CommandSpec] = &[
         id: BuiltinCommandId::Goal,
         name: "goal",
         aliases: &[],
-        usage: "/goal <start <objective>|objective <objective>|status|budget|pause|resume [reason]|cancel|help> ...",
+        usage: "/goal start [--tokens N] [--cost-usd D] OBJECTIVE",
         description_key: "command-goal-description",
-        surfaces: CHANNEL_ONLY,
+        surfaces: CHANNEL_AND_TUI,
         execution: CommandExecution::GoalAdmission,
     },
 ];
@@ -313,7 +315,7 @@ mod tests {
     }
 
     #[test]
-    fn tui_surface_advertises_help_model_and_new_only() {
+    fn tui_surface_advertises_help_model_new_and_goal() {
         let tui_ids: Vec<BuiltinCommandId> = commands_for_surface(CommandSurface::Tui)
             .map(|spec| spec.id)
             .collect();
@@ -323,28 +325,45 @@ mod tests {
                 BuiltinCommandId::Help,
                 BuiltinCommandId::New,
                 BuiltinCommandId::Model,
+                BuiltinCommandId::Goal,
             ]
         );
         assert!(parse_command_token("/help", CommandSurface::Tui).is_some());
         assert!(parse_command_token("/model", CommandSurface::Tui).is_some());
         assert!(parse_command_token("/new", CommandSurface::Tui).is_some());
         assert!(parse_command_token("/new-session", CommandSurface::Tui).is_some());
+        assert_eq!(
+            parse_command_token("/goal", CommandSurface::Tui).map(|parsed| parsed.command.id),
+            Some(BuiltinCommandId::Goal)
+        );
         assert!(parse_command_token("/clear", CommandSurface::Tui).is_none());
     }
 
     #[test]
-    fn goal_is_advertised_only_where_admission_is_implemented() {
-        assert!(parse_command_token("/goal", CommandSurface::Web).is_none());
-        assert!(parse_command_token("/goal", CommandSurface::Tui).is_none());
-        assert!(parse_command_token("/goal", CommandSurface::Channel).is_some());
-        let goal = command_by_name("/goal").expect("goal command should be registered");
-        assert!(
-            goal.usage.contains("start <objective>"),
-            "goal command usage must advertise the required start objective"
-        );
-        assert!(
-            goal.usage.contains("objective <objective>"),
-            "goal command usage must advertise objective amendment syntax"
+    fn goal_is_advertised_only_on_its_channel_and_tui_surfaces() {
+        assert_eq!(BuiltinCommandId::Goal.as_str(), "goal");
+        for surface in [CommandSurface::Channel, CommandSurface::Tui] {
+            assert_eq!(
+                parse_command_token("/goal", surface)
+                    .map(|parsed| (parsed.command.id, parsed.command.execution)),
+                Some((BuiltinCommandId::Goal, CommandExecution::GoalAdmission))
+            );
+            assert_eq!(
+                commands_for_surface(surface)
+                    .filter(|spec| spec.id == BuiltinCommandId::Goal)
+                    .count(),
+                1
+            );
+            assert!(parse_command_token("/goalkeeper", surface).is_none());
+        }
+        for surface in [CommandSurface::Cli, CommandSurface::Web] {
+            assert!(parse_command_token("/goal", surface).is_none());
+            assert!(commands_for_surface(surface).all(|spec| spec.id != BuiltinCommandId::Goal));
+        }
+
+        assert_eq!(
+            command_by_name("/goal").map(|command| command.usage),
+            Some("/goal start [--tokens N] [--cost-usd D] OBJECTIVE")
         );
     }
 }

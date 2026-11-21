@@ -1,7 +1,9 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { Power } from 'lucide-react';
-import { ApiError, ConfigApiCodes, patchConfig } from '@/lib/api';
+import { ApiError, ConfigApiCodes, patchConfig, type ValidationWarning } from '@/lib/api';
 import { t } from '@/lib/i18n';
+import ConfigSaveWarnings from '@/components/ConfigSaveWarnings';
+import { captureConfigWarningAuthority, subscribeConfigWarningAuthority } from '@/lib/configWarningEvents';
 
 export interface EntityEnabledToggleProps {
   /** Dotted prefix of the entity (`agents.clamps`, `channels.discord.clamps`, …).
@@ -24,6 +26,8 @@ export default function EntityEnabledToggle({
 }: EntityEnabledToggleProps) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [warnings, setWarnings] = useState<ValidationWarning[]>([]);
+  useEffect(() => subscribeConfigWarningAuthority(() => setWarnings([])), []);
   // The drift guard (409 `config_changed_externally`) fires when the on-disk
   // config has diverged from the daemon's in-memory state on this path, e.g. a
   // hand-edit, or a daemon left running across an external config write. Track
@@ -37,12 +41,15 @@ export default function EntityEnabledToggle({
     if (busy) return;
     setBusy(true);
     setError(null);
+    setWarnings([]);
     setDriftConflict(false);
+    const authority = captureConfigWarningAuthority();
     try {
-      await patchConfig(
+      const response = await patchConfig(
         [{ op: 'replace', path: `${prefix}.enabled`, value: next }],
-        overrideDrift ? { overrideDrift: true } : undefined,
+        { overrideDrift, warningsHandledLocally: true },
       );
+      setWarnings(authority.isCurrent() ? (response.warnings ?? []) : []);
       onChange(next);
     } catch (e) {
       if (
@@ -54,6 +61,7 @@ export default function EntityEnabledToggle({
         setError(e instanceof Error ? e.message : String(e));
       }
     } finally {
+      authority.dispose();
       setBusy(false);
     }
   };
@@ -111,6 +119,7 @@ export default function EntityEnabledToggle({
           </button>
         </div>
       )}
+      <ConfigSaveWarnings warnings={warnings} onDismiss={() => setWarnings([])} compact />
     </div>
   );
 }
