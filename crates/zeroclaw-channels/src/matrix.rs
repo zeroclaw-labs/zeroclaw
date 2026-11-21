@@ -238,6 +238,8 @@ mod allowlist {
     }
 }
 
+mod approval_args;
+
 // ─── approval ──────────────────────────────────────────────────────────────
 mod approval {
     use rand::{Rng, RngExt};
@@ -5478,7 +5480,7 @@ impl Channel for MatrixChannel {
         let prompt = crate::util::build_approve_deny_approval_prompt(
             &token,
             &request.tool_name,
-            &request.arguments_summary,
+            &approval_args::inert(&request.arguments_summary),
             request.position_counter(),
         );
 
