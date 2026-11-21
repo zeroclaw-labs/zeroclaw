@@ -45,7 +45,9 @@
     "react-markdown": "^10.1.0",
     "react-router-dom": "^7.18.5",
     "rehype-highlight": "^7.0.2",
-    "remark-gfm": "^4.0.1"
+    "remark-gfm": "^4.0.1",
+    "remark-parse": "11.0.0",
+    "unified": "11.0.5"
   },
   "devDependencies": {
     "@tailwindcss/vite": "^4.3.5",
@@ -57,8 +59,8 @@
     "happy-dom": "^21.0.4",
     "jiti": "^2.7.0",
     "openapi-typescript": "^7.13.0",
-    "rollup": "^4.68.1",
     "react-test-renderer": "19.3.1",
+    "rollup": "^4.68.1",
     "tailwindcss": "^4.0.0",
     "typescript": "~5.7.2",
     "vite": "^8.3.6"

@@ -11664,7 +11664,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'nav.integrations': 'Integrações',
     'nav.skills': 'Habilidades',
     'nav.memory': 'Memória',
-    'nav.config': 'Configurações',
+    'nav.config': 'Config',
     'nav.cost': 'Rastreador de Custos',
     'nav.logs': 'Logs',
     'nav.doctor': 'Diagnóstico',

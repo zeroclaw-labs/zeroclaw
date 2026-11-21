@@ -177,18 +177,19 @@ impl DeviceRegistry {
         .transpose()
     }
 
-    fn save_voice_preferences_authorized<R>(
+    fn save_voice_preferences_authorized<G, R>(
         &self,
         key: VoiceDeviceKey<'_>,
         preferences: &VoicePreferences,
-        authorize: impl FnOnce() -> Result<(), R>,
+        authorize: impl FnOnce() -> Result<G, R>,
     ) -> anyhow::Result<Result<bool, R>> {
         let (column, value) = key.column_and_value();
         let mut conn = self.open_db()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        if let Err(refusal) = authorize() {
-            return Ok(Err(refusal));
-        }
+        let _authorization = match authorize() {
+            Ok(authorization) => authorization,
+            Err(refusal) => return Ok(Err(refusal)),
+        };
         let updated = tx.execute(
             &format!("UPDATE devices SET voice_preferences = ?1 WHERE {column} = ?2"),
             rusqlite::params![serde_json::to_string(preferences)?, value],
@@ -933,13 +934,22 @@ fn device_voice_preferences(
             .into_response();
     };
     let hash = super::PairingGuard::token_hash(token);
-    let held = state.pairing.hold_paired_tokens();
-    if !held.contains_hash(&hash) {
-        return (
-            StatusCode::FORBIDDEN,
-            "Voice preferences require a paired device",
-        )
-            .into_response();
+    let authorize = || {
+        let held = state.pairing.hold_paired_tokens();
+        if held.contains_hash(&hash) {
+            Ok(held)
+        } else {
+            Err(Box::new(
+                (
+                    StatusCode::FORBIDDEN,
+                    "Voice preferences require a paired device",
+                )
+                    .into_response(),
+            ))
+        }
+    };
+    if let Err(refusal) = authorize() {
+        return *refusal;
     }
     let Some(registry) = state.device_registry.as_ref() else {
         return (
@@ -948,22 +958,19 @@ fn device_voice_preferences(
         )
             .into_response();
     };
-    registry_voice_preferences(registry, VoiceDeviceKey::TokenHash(&hash), preferences)
+    registry_voice_preferences_authorized(
+        registry,
+        VoiceDeviceKey::TokenHash(&hash),
+        preferences,
+        authorize,
+    )
 }
 
-fn registry_voice_preferences(
+fn registry_voice_preferences_authorized<G>(
     registry: &DeviceRegistry,
     key: VoiceDeviceKey<'_>,
     preferences: Option<VoicePreferences>,
-) -> axum::response::Response {
-    registry_voice_preferences_authorized(registry, key, preferences, || Ok(()))
-}
-
-fn registry_voice_preferences_authorized(
-    registry: &DeviceRegistry,
-    key: VoiceDeviceKey<'_>,
-    preferences: Option<VoicePreferences>,
-    authorize: impl FnOnce() -> Result<(), Box<axum::response::Response>>,
+    authorize: impl FnOnce() -> Result<G, Box<axum::response::Response>>,
 ) -> axum::response::Response {
     if let Some(preferences) = preferences {
         if !preferences.valid() {
@@ -1031,7 +1038,7 @@ pub async fn put_my_voice_preferences(
 }
 
 // Device management uses the same operator admission as list/revoke. A paired
-// bearer is held live through the effect; an administrator cookie may manage
+// bearer is rechecked after SQLite admits the write; an administrator cookie may manage
 // registered devices without pretending to be one of them.
 fn managed_voice_preferences(
     state: &AppState,
@@ -1053,16 +1060,25 @@ fn managed_voice_preferences_authorized(
         return error.into_response();
     }
     let caller_hash = extract_bearer_token(headers).map(super::PairingGuard::token_hash);
-    let held = state.pairing.hold_paired_tokens();
-    if caller_hash
-        .as_deref()
-        .is_some_and(|hash| !held.contains_hash(hash))
-    {
-        return (
-            StatusCode::FORBIDDEN,
-            "Paired operator credential is no longer live",
-        )
-            .into_response();
+    let require_live_bearer = || {
+        let Some(hash) = caller_hash.as_deref() else {
+            return Ok(None);
+        };
+        let held = state.pairing.hold_paired_tokens();
+        if held.contains_hash(hash) {
+            Ok(Some(held))
+        } else {
+            Err(Box::new(
+                (
+                    StatusCode::FORBIDDEN,
+                    "Paired operator credential is no longer live",
+                )
+                    .into_response(),
+            ))
+        }
+    };
+    if let Err(refusal) = require_live_bearer() {
+        return *refusal;
     }
     let Some(registry) = state.device_registry.as_ref() else {
         return (
@@ -1075,7 +1091,10 @@ fn managed_voice_preferences_authorized(
         registry,
         VoiceDeviceKey::DeviceId(device_id),
         preferences,
-        authorize,
+        || {
+            authorize()?;
+            require_live_bearer()
+        },
     )
 }
 
@@ -1272,6 +1291,38 @@ mod tests {
         );
         db.execute_batch("ROLLBACK").unwrap();
         assert!(DeviceRegistry::new(tmp.path()).is_ok());
+    }
+
+    #[test]
+    fn voice_write_does_not_hold_token_set_across_sqlite_wait() {
+        use std::time::{Duration, Instant};
+        let (dir, state, headers, _) = voice_state();
+        let blocker = Connection::open(dir.path().join("devices.db")).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+        let writer_state = state.clone();
+        let writer = std::thread::spawn(move || {
+            device_voice_preferences(&writer_state, &headers, Some(VoicePreferences::default()))
+                .status()
+        });
+        std::thread::sleep(Duration::from_millis(300));
+        let revoker_state = state.clone();
+        let revoker = std::thread::spawn(move || {
+            revoker_state
+                .pairing
+                .revoke_token_hash(&PairingGuard::token_hash("voice-test-b"));
+        });
+        std::thread::sleep(Duration::from_millis(300));
+        let start = Instant::now();
+        assert!(state.pairing.is_authenticated("voice-test-a"));
+        let waited = start.elapsed();
+        blocker.execute_batch("ROLLBACK").unwrap();
+        revoker.join().unwrap();
+        assert_eq!(writer.join().unwrap(), StatusCode::OK);
+        assert!(
+            waited < Duration::from_secs(1),
+            "bearer check waited {waited:?}"
+        );
     }
 
     fn voice_state() -> (tempfile::TempDir, AppState, HeaderMap, HeaderMap) {
