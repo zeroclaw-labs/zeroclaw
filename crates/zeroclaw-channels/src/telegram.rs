@@ -1115,6 +1115,13 @@ pub struct TelegramChannel {
     /// Per-draft MultiMessage streaming state keyed by `(recipient, draft_id)`.
     multi_message_drafts: Mutex<std::collections::HashMap<MultiDraftKey, MultiDraftState>>,
     mention_only: bool,
+    /// When the resolver returns `true` in a `mention_only` group, voice
+    /// notes from allowlisted senders are transcribed without requiring an
+    /// explicit `@mention`: voice notes carry no caption, so the mention gate
+    /// would otherwise silence them entirely. The sender allowlist still
+    /// applies. Resolved at use time (not copied at construction) so a config
+    /// change takes effect without rebuilding the channel.
+    voice_without_mention_resolver: Arc<dyn Fn() -> bool + Send + Sync>,
     /// When `false`, group-chat sessions are shared per chat/topic instead of
     /// per sender. See `with_per_user_session`.
     per_user_session: bool,
@@ -2753,6 +2760,8 @@ impl TelegramChannel {
             multi_message_drafts: Mutex::new(std::collections::HashMap::new()),
             typing_handle: Mutex::new(None),
             mention_only,
+            voice_without_mention_resolver: Arc::new(|| false)
+                as Arc<dyn Fn() -> bool + Send + Sync>,
             per_user_session: true,
             passive_group_context: false,
             bot_username: Mutex::new(None),
@@ -2817,6 +2826,19 @@ impl TelegramChannel {
     /// Record unaddressed group messages as passive context instead of dropping them.
     pub fn with_passive_group_context(mut self, enabled: bool) -> Self {
         self.passive_group_context = enabled;
+        self
+    }
+
+    /// Transcribe voice notes from allowlisted senders in `mention_only`
+    /// groups without requiring an explicit `@mention`. Voice notes carry
+    /// no caption, so the mention gate would otherwise drop every one of
+    /// them in such groups. The sender allowlist still applies. The resolver
+    /// is read at parse time so policy changes apply to live channels.
+    pub fn with_voice_without_mention_resolver(
+        mut self,
+        resolver: Arc<dyn Fn() -> bool + Send + Sync>,
+    ) -> Self {
+        self.voice_without_mention_resolver = resolver;
         self
     }
 
@@ -5664,7 +5686,8 @@ Allowlist Telegram username (without '@') or numeric user ID.",
 
         // The duration check used to run here, before the sender was known.
         // It now runs once the chat is resolved and the sender has passed the
-        // allowlist and mention gate, so the skip can be explained to them —
+        // allowlist and (unless `voice_without_mention` opts voice notes out
+        // of it) the mention gate, so the skip can be explained to them —
         // and so a stranger's oversized recording still costs nothing: the
         // check stays ahead of every download.
         let (_, sender_id, sender_identity) = Self::extract_sender_info(message);
@@ -5676,9 +5699,16 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         }
 
         let voice_caption = message.get("caption").and_then(serde_json::Value::as_str);
-        if self
-            .check_media_mention_gate(message, voice_caption)
-            .is_none()
+        // Voice notes carry no caption, so in a mention_only group the gate
+        // would drop every one of them. The opt-in bypass keeps the gate for
+        // everything else and applies to voice notes only: an `audio` file is
+        // shared content, not a personal address, so it still needs a mention;
+        // the allowlist check above still applies either way.
+        let is_voice_note = message.get("voice").is_some();
+        if !((self.voice_without_mention_resolver)() && is_voice_note)
+            && self
+                .check_media_mention_gate(message, voice_caption)
+                .is_none()
         {
             return UpdateDisposition::SkipPermanent;
         }
@@ -19354,7 +19384,241 @@ mod tests {
         assert!(ch.voice_transcriptions.lock().is_empty());
     }
 
-    /// The voice path must carry the immutable Telegram user ID into
+    #[tokio::test]
+    async fn try_parse_voice_message_bypasses_mention_gate_when_configured() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/bot[^/]+/getFile$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "file_path": "voice/file_1.ogg" }
+            })))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/file/bot[^/]+/voice/file_1\.ogg$"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![0u8; 64]))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/v1/audio/transcriptions$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "text": "hello there" })),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let tc = zeroclaw_config::schema::TranscriptionConfig {
+            enabled: true,
+            api_key: Some("test_key".to_string()),
+            api_url: format!("{}/v1/audio/transcriptions", mock_server.uri()),
+            max_duration_secs: 120,
+            ..Default::default()
+        };
+        // `mention_only` group, but voice notes carry no caption: with the
+        // bypass enabled an allowlisted sender's recording must transcribe.
+        let ch = TelegramChannel::new(
+            "token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            true,
+        )
+        .with_voice_without_mention_resolver(Arc::new(|| true))
+        .with_mock_api_base(mock_server.uri())
+        .with_transcription(tc);
+
+        let update = serde_json::json!({
+            "message": {
+                "message_id": 10,
+                "voice": { "file_id": "voice_file", "duration": 4 },
+                "from": { "id": 123, "username": "alice" },
+                "chat": { "id": -100_200_300, "type": "supergroup" }
+            }
+        });
+
+        let UpdateDisposition::Parsed(message) = ch.try_parse_voice_message(&update).await else {
+            panic!("bypassed voice note in a mention_only group should parse");
+        };
+        assert_eq!(message.content, "[Voice] hello there");
+    }
+
+    #[tokio::test]
+    async fn try_parse_voice_message_bypass_keeps_allowlist_mandatory() {
+        let tc = zeroclaw_config::schema::TranscriptionConfig {
+            enabled: true,
+            api_key: Some("test_key".to_string()),
+            max_duration_secs: 120,
+            ..Default::default()
+        };
+
+        // The bypass skips only the mention gate: a sender the allowlist
+        // rejects must still be dropped before anything is downloaded.
+        let ch = TelegramChannel::new(
+            "token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["alice".into()]),
+            true,
+        )
+        .with_voice_without_mention_resolver(Arc::new(|| true))
+        .with_transcription(tc);
+        let update = serde_json::json!({
+            "message": {
+                "message_id": 11,
+                "voice": { "file_id": "voice_file", "duration": 4 },
+                "from": { "id": 999, "username": "bob" },
+                "chat": { "id": -100_200_300, "type": "supergroup" }
+            }
+        });
+
+        let parsed = ch.try_parse_voice_message(&update).await;
+        assert!(matches!(parsed, UpdateDisposition::SkipPermanent));
+        assert!(ch.voice_transcriptions.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn try_parse_voice_message_bypass_does_not_cover_audio_files() {
+        let tc = zeroclaw_config::schema::TranscriptionConfig {
+            enabled: true,
+            api_key: Some("test_key".to_string()),
+            max_duration_secs: 120,
+            ..Default::default()
+        };
+
+        // The bypass opts voice *notes* out of the mention gate; an ordinary
+        // `audio` file is shared content, not a personal address, so an
+        // unmentioned one must be dropped even with the bypass enabled.
+        let ch = TelegramChannel::new(
+            "token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            true,
+        )
+        .with_voice_without_mention_resolver(Arc::new(|| true))
+        .with_transcription(tc);
+        let update = serde_json::json!({
+            "message": {
+                "message_id": 13,
+                "audio": { "file_id": "audio_file", "duration": 120 },
+                "from": { "id": 123, "username": "alice" },
+                "chat": { "id": -100_200_300, "type": "supergroup" }
+            }
+        });
+
+        let parsed = ch.try_parse_voice_message(&update).await;
+        assert!(matches!(parsed, UpdateDisposition::SkipPermanent));
+        assert!(ch.voice_transcriptions.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn try_parse_voice_message_rereads_the_bypass_policy_on_a_live_channel() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // The policy is resolved at parse time, so flipping the config value
+        // behind the resolver changes the behavior of an existing channel
+        // without rebuilding it (live-config contract).
+        let enabled = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let enabled_flag = Arc::clone(&enabled);
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/bot[^/]+/getFile$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "file_path": "voice/file_1.ogg" }
+            })))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/file/bot[^/]+/voice/file_1\.ogg$"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![0u8; 64]))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/v1/audio/transcriptions$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "text": "hello there" })),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let tc = zeroclaw_config::schema::TranscriptionConfig {
+            enabled: true,
+            api_key: Some("test_key".to_string()),
+            api_url: format!("{}/v1/audio/transcriptions", mock_server.uri()),
+            max_duration_secs: 120,
+            ..Default::default()
+        };
+        let ch = TelegramChannel::new(
+            "token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            true,
+        )
+        .with_voice_without_mention_resolver(Arc::new(move || {
+            enabled_flag.load(std::sync::atomic::Ordering::Relaxed)
+        }))
+        .with_mock_api_base(mock_server.uri())
+        .with_transcription(tc);
+
+        let update = serde_json::json!({
+            "message": {
+                "message_id": 14,
+                "voice": { "file_id": "voice_file", "duration": 4 },
+                "from": { "id": 123, "username": "alice" },
+                "chat": { "id": -100_200_300, "type": "supergroup" }
+            }
+        });
+
+        // Enabled: the unmentioned voice note transcribes.
+        let UpdateDisposition::Parsed(message) = ch.try_parse_voice_message(&update).await else {
+            panic!("bypassed voice note should parse while the policy is enabled");
+        };
+        assert_eq!(message.content, "[Voice] hello there");
+
+        // Disabled behind the channel's back: the same shape of update must
+        // now hit the mention gate and be dropped.
+        enabled.store(false, std::sync::atomic::Ordering::Relaxed);
+        let parsed = ch.try_parse_voice_message(&update).await;
+        assert!(matches!(parsed, UpdateDisposition::SkipPermanent));
+    }
+
+    #[tokio::test]
+    async fn try_parse_voice_message_gate_drops_unmentioned_voice_by_default() {
+        let tc = zeroclaw_config::schema::TranscriptionConfig {
+            enabled: true,
+            api_key: Some("test_key".to_string()),
+            max_duration_secs: 120,
+            ..Default::default()
+        };
+
+        // Flag off (the default): in a mention_only group a captionless voice
+        // note has no way to address the bot, so the gate drops it.
+        let ch = TelegramChannel::new(
+            "token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            true,
+        )
+        .with_transcription(tc);
+        let update = serde_json::json!({
+            "message": {
+                "message_id": 12,
+                "voice": { "file_id": "voice_file", "duration": 4 },
+                "from": { "id": 123, "username": "alice" },
+                "chat": { "id": -100_200_300, "type": "supergroup" }
+            }
+        });
+
+        let parsed = ch.try_parse_voice_message(&update).await;
+        assert!(matches!(parsed, UpdateDisposition::SkipPermanent));
+        assert!(ch.voice_transcriptions.lock().is_empty());
+    }
     /// `ChannelMessage.platform_sender_id`, matching the text and
     /// attachment paths, so downstream sender binding works for voice too.
     #[tokio::test]
