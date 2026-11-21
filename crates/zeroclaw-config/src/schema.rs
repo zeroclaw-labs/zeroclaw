@@ -121,6 +121,7 @@ static RUNTIME_PROXY_CLIENT_CACHE: OnceLock<RwLock<HashMap<String, RuntimeProxyC
 
 struct RuntimeProxyCachedClient {
     generation: u64,
+    runtime_id: tokio::runtime::Id,
     client: reqwest::Client,
 }
 
@@ -936,14 +937,16 @@ pub enum AuthMode {
 /// Prompt-cache entry lifetime to request for this provider's Anthropic
 /// cache markers. `"5m"` is the API default; `"1h"` extends the cache
 /// entry lifetime to one hour so a pause longer than five minutes does
-/// not force a full-price rewrite of the cached prefix. Meaningful only
-/// where Anthropic-shaped `cache_control` markers reach the API: the
-/// native Anthropic provider always places them, compatible providers
-/// only behind `cache_passthrough` (with passthrough off the setting is
-/// inert). One TTL applies to every marker this implementation places;
-/// operator-supplied `cache_control` (via `provider_extra` or raw tool
-/// JSON) sits outside that guarantee and must order 1h before 5m when
-/// mixing lifetimes in one request.
+/// not force a full-price rewrite of the cached prefix; `"off"` places no
+/// markers at all, for a workload that never reuses a prefix and would
+/// otherwise pay the write premium with no read to amortise it.
+/// Meaningful only where Anthropic-shaped `cache_control` markers reach
+/// the API: the native Anthropic provider always places them, compatible
+/// providers only behind `cache_passthrough` (with passthrough off the
+/// setting is inert). One TTL applies to every marker this implementation
+/// places; operator-supplied `cache_control` (via `provider_extra` or raw
+/// tool JSON) sits outside that guarantee and must order 1h before 5m
+/// when mixing lifetimes in one request.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
 )]
@@ -956,6 +959,9 @@ pub enum CacheTtl {
     /// 1-hour cache lifetime; cache writes bill at a premium write rate.
     #[serde(rename = "1h")]
     OneHour,
+    /// Place no prompt-cache breakpoints at all.
+    #[serde(rename = "off")]
+    Off,
 }
 
 /// Named model_provider profile definition.
@@ -4937,6 +4943,13 @@ impl Config {
     pub fn effective_parallel_tools(&self, agent_alias: &str) -> bool {
         self.runtime_profile_for_agent(agent_alias)
             .and_then(|p| p.parallel_tools)
+            .unwrap_or(false)
+    }
+
+    #[must_use]
+    pub fn effective_tool_elicitation(&self, agent_alias: &str) -> bool {
+        self.runtime_profile_for_agent(agent_alias)
+            .and_then(|p| p.tool_elicitation)
             .unwrap_or(false)
     }
 
@@ -12044,21 +12057,28 @@ fn runtime_proxy_cache_key(
 }
 
 fn runtime_proxy_cached_client(cache_key: &str) -> Option<reqwest::Client> {
+    let runtime_id = tokio::runtime::Handle::try_current().ok()?.id();
     let generation = runtime_proxy_current_generation();
     match runtime_proxy_client_cache().read() {
         Ok(guard) => guard
             .get(cache_key)
-            .filter(|entry| entry.generation == generation)
+            .filter(|entry| entry.generation == generation && entry.runtime_id == runtime_id)
             .map(|entry| entry.client.clone()),
         Err(poisoned) => poisoned
             .into_inner()
             .get(cache_key)
-            .filter(|entry| entry.generation == generation)
+            .filter(|entry| entry.generation == generation && entry.runtime_id == runtime_id)
             .map(|entry| entry.client.clone()),
     }
 }
 
 fn set_runtime_proxy_cached_client(cache_key: String, generation: u64, client: reqwest::Client) {
+    // A pooled client's dispatcher belongs to the Tokio runtime that first
+    // uses it. Never hand that client to another runtime after its owner exits.
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    let runtime_id = runtime.id();
     if generation != runtime_proxy_current_generation() {
         return;
     }
@@ -12066,13 +12086,27 @@ fn set_runtime_proxy_cached_client(cache_key: String, generation: u64, client: r
     match runtime_proxy_client_cache().write() {
         Ok(mut guard) => {
             if generation == runtime_proxy_config_generation() {
-                guard.insert(cache_key, RuntimeProxyCachedClient { generation, client });
+                guard.insert(
+                    cache_key,
+                    RuntimeProxyCachedClient {
+                        generation,
+                        runtime_id,
+                        client,
+                    },
+                );
             }
         }
         Err(poisoned) => {
             let mut guard = poisoned.into_inner();
             if generation == runtime_proxy_config_generation() {
-                guard.insert(cache_key, RuntimeProxyCachedClient { generation, client });
+                guard.insert(
+                    cache_key,
+                    RuntimeProxyCachedClient {
+                        generation,
+                        runtime_id,
+                        client,
+                    },
+                );
             }
         }
     }
@@ -15186,6 +15220,9 @@ pub struct RuntimeProfileConfig {
     pub parallel_tools: Option<bool>,
     /// Request one native tool call per provider response when supported. Default off.
     pub single_tool_rounds: Option<bool>,
+    /// Enable pre-turn tool-elicitation hints (prefilter + ephemeral hint).
+    /// `None` inherits (default off).
+    pub tool_elicitation: Option<bool>,
     /// Tool dispatch strategy (e.g. `"auto"`). `None` inherits.
     pub tool_dispatcher: Option<String>,
     /// Tools exempt from within-turn dedup check.
@@ -15254,6 +15291,7 @@ impl Default for RuntimeProfileConfig {
             compact_context: None,
             parallel_tools: None,
             single_tool_rounds: None,
+            tool_elicitation: None,
             tool_dispatcher: None,
             tool_call_dedup_exempt: Vec::new(),
             deferred_builtin_tools: false,
@@ -20184,7 +20222,8 @@ pub struct SecurityConfig {
     #[nested]
     pub otp: OtpConfig,
 
-    /// Emergency-stop state machine configuration.
+    /// Emergency-stop configuration. Not enforced: no runtime path reads the
+    /// estop state, so these settings do not stop anything.
     #[serde(default)]
     #[nested]
     pub estop: EstopConfig,
@@ -20400,15 +20439,17 @@ impl Default for OtpConfig {
 #[prefix = "security.estop"]
 #[serde(deny_unknown_fields)]
 pub struct EstopConfig {
-    /// Enable emergency stop controls.
+    /// Emergency stop switch. Not enforced: no runtime path reads the estop
+    /// state, so enabling it does not stop anything.
     #[serde(default)]
     pub enabled: bool,
 
-    /// File path used to persist estop state.
+    /// File path reserved for estop state. Not enforced: nothing reads its contents.
     #[serde(default = "default_estop_state_file")]
     pub state_file: String,
 
-    /// Require a valid OTP before resume operations.
+    /// Require a valid OTP before resume operations. Not enforced: the resume
+    /// command refuses to run.
     #[serde(default = "default_true")]
     pub require_otp_to_resume: bool,
 }
@@ -29877,6 +29918,17 @@ mod tests {
     }
 
     #[::core::prelude::v1::test]
+    fn cache_ttl_off_is_a_known_lifetime_that_round_trips() {
+        let off: ModelProviderConfig = toml::from_str("cache_ttl = \"off\"").unwrap();
+        assert_eq!(off.cache_ttl, Some(CacheTtl::Off));
+        assert_eq!(
+            toml::to_string(&off).unwrap(),
+            "cache_ttl = \"off\"\n",
+            "off must round-trip its wire string"
+        );
+    }
+
+    #[::core::prelude::v1::test]
     fn cache_ttl_rejects_unknown_lifetime() {
         let parsed = toml::from_str::<ModelProviderConfig>("cache_ttl = \"2h\"");
         assert!(
@@ -35828,6 +35880,30 @@ runtime_profile = "missing"
     }
 
     #[test]
+    async fn runtime_profile_tool_elicitation_is_honored() {
+        let raw = r#"
+[runtime_profiles.hinted]
+tool_elicitation = true
+
+[agents.default]
+runtime_profile = "hinted"
+"#;
+        let parsed = parse_test_config(raw);
+        assert!(parsed.effective_tool_elicitation("default"));
+    }
+
+    #[test]
+    async fn tool_elicitation_defaults_off() {
+        let parsed = parse_test_config(
+            r#"
+[agents.default]
+runtime_profile = "default"
+"#,
+        );
+        assert!(!parsed.effective_tool_elicitation("default"));
+    }
+
+    #[test]
     async fn runtime_profile_unset_max_tool_iterations_uses_default() {
         // A profile that does not set max_tool_iterations (sentinel 0) falls
         // back to the global default rather than 0.
@@ -41033,6 +41109,118 @@ api_token = "tok"
         assert!(err.contains("sub_resource contains invalid characters"));
     }
 
+    #[test]
+    async fn runtime_proxy_client_cache_survives_owner_runtime_shutdown() {
+        let _guard = env_override_lock().await;
+        struct RestoreProxyBypass(Vec<(&'static str, Option<std::ffi::OsString>)>);
+        impl Drop for RestoreProxyBypass {
+            fn drop(&mut self) {
+                for (key, value) in &self.0 {
+                    // SAFETY: the environment test lock outlives this guard.
+                    unsafe {
+                        match value {
+                            Some(value) => std::env::set_var(key, value),
+                            None => std::env::remove_var(key),
+                        }
+                    }
+                }
+            }
+        }
+        let _bypass = RestoreProxyBypass(
+            ["NO_PROXY", "no_proxy"]
+                .into_iter()
+                .map(|key| (key, std::env::var_os(key)))
+                .collect(),
+        );
+        for key in ["NO_PROXY", "no_proxy"] {
+            set_or_clear_env(key, Some("127.0.0.1"));
+        }
+        let previous = runtime_proxy_config();
+        set_runtime_proxy_config(ProxyConfig::default());
+        let result = tokio::task::spawn_blocking(|| {
+            use std::io::{Read, Write};
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let endpoint = format!("http://{}", listener.local_addr().unwrap());
+            listener.set_nonblocking(true).unwrap();
+            let server = std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+                let mut connections: Vec<(std::net::TcpStream, Vec<u8>)> = Vec::new();
+                let mut served_on = Vec::new();
+                while served_on.len() < 4 && std::time::Instant::now() < deadline {
+                    loop {
+                        match listener.accept() {
+                            Ok((socket, _)) => {
+                                socket.set_nonblocking(true).unwrap();
+                                connections.push((socket, Vec::new()));
+                            }
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                            Err(error) => panic!("fixture accept: {error}"),
+                        }
+                    }
+                    for (index, (socket, buffered)) in connections.iter_mut().enumerate() {
+                        let mut chunk = [0u8; 4096];
+                        match socket.read(&mut chunk) {
+                            Ok(count) => buffered.extend_from_slice(&chunk[..count]),
+                            Err(error) if matches!(error.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::ConnectionReset) => {},
+                            Err(error) => panic!("fixture read: {error}"),
+                        }
+                        while let Some(end) = buffered.windows(4).position(|part| part == b"\r\n\r\n") {
+                            buffered.drain(..end + 4);
+                            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok").unwrap();
+                            served_on.push(index);
+                        }
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                served_on
+            });
+            let service = format!("runtime-owner-{}", uuid::Uuid::new_v4());
+            fn request_on(runtime: &tokio::runtime::Runtime, service: &str, endpoint: &str, count: usize) -> Vec<reqwest::Result<String>> {
+                runtime.block_on(async {
+                    let mut results = Vec::new();
+                    for _ in 0..count {
+                        let client = build_runtime_proxy_client_with_timeouts(service, 2, 2);
+                        results.push(async {client.get(endpoint).send().await?.text().await}.await);
+                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    }
+                    results
+                })
+            }
+            let runtime = || tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            let first_owner = runtime();
+            let mut results = request_on(&first_owner, &service, &endpoint, 2);
+            // Keep the first owner's live pool, but stop driving its reactor.
+            // A runtime-blind hit now dispatches into that paused owner and times out.
+            let second_owner = runtime();
+            results.extend(request_on(&second_owner, &service, &endpoint, 1));
+            drop(first_owner);
+            drop(second_owner);
+            // Also exercise cache lookup after its last owner has shut down.
+            let after_shutdown = runtime();
+            results.extend(request_on(&after_shutdown, &service, &endpoint, 1));
+            drop(after_shutdown);
+            (results, server.join().unwrap())
+        }).await;
+        set_runtime_proxy_config(previous);
+        let (results, served_on) = result.unwrap();
+        for result in results {
+            assert_eq!(result.unwrap(), "ok");
+        }
+        assert_eq!(served_on.len(), 4);
+        assert_eq!(
+            served_on[0], served_on[1],
+            "warm requests must reuse a live pooled connection"
+        );
+        assert_ne!(
+            served_on[1], served_on[2],
+            "a new runtime needs its own connection"
+        );
+        assert_ne!(
+            served_on[2], served_on[3],
+            "a shut-down owner cannot supply the next pool"
+        );
+    }
+
     fn runtime_proxy_cache_contains(cache_key: &str) -> bool {
         runtime_proxy_cached_client(cache_key).is_some()
     }
@@ -41142,6 +41330,7 @@ api_token = "tok"
                     cache_key.clone(),
                     RuntimeProxyCachedClient {
                         generation: stale_generation,
+                        runtime_id: tokio::runtime::Handle::current().id(),
                         client: reqwest::Client::new(),
                     },
                 );
@@ -41152,6 +41341,7 @@ api_token = "tok"
                     cache_key.clone(),
                     RuntimeProxyCachedClient {
                         generation: stale_generation,
+                        runtime_id: tokio::runtime::Handle::current().id(),
                         client: reqwest::Client::new(),
                     },
                 );

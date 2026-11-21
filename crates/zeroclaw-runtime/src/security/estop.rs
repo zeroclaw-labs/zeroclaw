@@ -61,6 +61,9 @@ impl EstopState {
     }
 }
 
+// TODO(debt): no runtime path loads `EstopManager` because `zeroclaw estop`
+// refuses to run while nothing enforces the state. Connect it to the daemon's
+// emergency-stop authority when enforcement lands, or remove it.
 #[derive(Debug, Clone)]
 pub struct EstopManager {
     config: EstopConfig,
