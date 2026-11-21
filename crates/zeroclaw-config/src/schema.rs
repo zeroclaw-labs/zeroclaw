@@ -1152,6 +1152,9 @@ pub struct ModelProviderConfig {
     /// Set this only after confirming the configured endpoint and model
     /// accept the native tool schema. Providers routed through
     /// `wire_api = "responses"` are inherently native and ignore this setting.
+    /// Groq and Custom chat-completions aliases default to text-fallback;
+    /// set `native_tools = true` for endpoints and models that support it.
+    /// Hailo-Ollama has no native tool calling and rejects `Some(true)`.
     #[tab(Advanced)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_tools: Option<bool>,
@@ -15169,7 +15172,14 @@ pub struct RuntimeProfileConfig {
     pub parallel_tools: Option<bool>,
     /// Request one native tool call per provider response when supported. Default off.
     pub single_tool_rounds: Option<bool>,
-    /// Tool dispatch strategy (e.g. `"auto"`). `None` inherits.
+    /// Tool dispatch strategy: `"auto"` (default), `"native"`, or `"xml"`.
+    /// `"auto"` selects the native dispatcher only when the provider reports
+    /// native tool calling, while `"native"` and `"xml"` force one strategy
+    /// regardless of provider capability. Forcing `"native"` on a provider
+    /// whose factory disabled native tool calling (for example a
+    /// chat-completions `custom` alias without `native_tools = true`) sends no
+    /// `tools` in the request, so the model cannot emit native tool calls.
+    /// `None` inherits.
     pub tool_dispatcher: Option<String>,
     /// Tools exempt from within-turn dedup check.
     pub tool_call_dedup_exempt: Vec<String>,
