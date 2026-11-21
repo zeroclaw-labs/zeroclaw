@@ -43,6 +43,24 @@ schema-mirror form {{#env-var-name gateway.web_dist_dir}}, see
 [Web dashboard (web_dist_dir)](../gateway/web-dashboard.md) for the full
 setting reference.
 
+## Plugin registry discovery
+
+`ZEROCLAW_PLUGIN_REGISTRY_URL` is an uppercase plugin-discovery variable,
+not a schema-mirror config override. It accepts one HTTP(S) index URL or a
+JSON array of one to eight unique URLs. For example:
+
+```sh
+export ZEROCLAW_PLUGIN_REGISTRY_URL='["https://plugins.example.org/registry.json","https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw-plugins/main/registry.json"]'
+```
+
+A custom value replaces the public default; include the public URL explicitly
+if wanted. URLs are not split on commas. All configured indexes must succeed;
+there is no partial union or stale network fallback. A nonblank
+`--registry <url>` on plugin search/install/update overrides the variable with
+one origin, including when the variable is malformed. Quickstart uses the
+same environment selection. See [multiple registry origins](../plugins/distributing-plugins.md#multiple-registry-origins)
+for cache, collision and offline behavior.
+
 ## Persistence boundary
 
 Values applied via `ZEROCLAW_*` env vars land on the **in-memory** `Config` at load time and are **never** persisted to disk. `zeroclaw config save` masks env-overridden paths back to their disk-or-default values before encryption. A `WARN` log line is emitted whenever a secret-typed path (e.g. an API key) is env-overridden, so audit logs make the injection visible.

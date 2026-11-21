@@ -1380,3 +1380,10 @@ channel-approval-opt-allow-always = 常に許可
 channel-approval-opt-reject = 拒否
 channel-approval-opt-reject-with-edit = 編集して拒否
 tool-git-operations-error-docker-runtime-write-unsupported = Git の書き込みコマンドは Docker ランタイムでは利用できません。コンテナ内に閉じ込めることができないためです。
+
+cli-plugin-registry-command-unavailable = コピー用のインストールコマンドはありません。元のレジストリ URL を別途指定してください。レジストリ ID は URL ではありません。
+cli-quickstart-plugins-load-check-command-unavailable = {$name} はインストールされませんでした。このホストでの読み込みに失敗しました: {$error}。コピー用の再試行コマンドはありません。
+cli-plugin-command-unavailable = コピー用のコマンドはありません。対象の取得元に対応する元の引数を個別に指定してください。
+cli-plugin-displaced-command-unavailable = 更新が中断され、{$name} は元の場所にありません。コピー用の復旧コマンドはありません。
+cli-plugin-not-installed-command-unavailable = {$name} はインストールされていません。コピー用のインストールコマンドはありません。
+cli-plugin-interrupted-command-unavailable = {$name} を更新できませんでした: {$error}。以前のバージョンは {$preserved} に保持されています。コピー用の復旧コマンドはありません。

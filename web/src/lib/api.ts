@@ -115,7 +115,7 @@ export class HttpError extends Error {
  * the behaviour that depends on the code.
  */
 export type ConfigApiCode = components["schemas"]["ConfigApiCode"];
-export type PluginCatalogEntry = components["schemas"]["PluginCatalogEntry"];
+export type PluginCatalogEntry = components["schemas"]["OriginPluginCatalogEntry"];
 export type PluginCatalogIssue = components["schemas"]["PluginCatalogIssue"];
 export type PluginsResponse = components["schemas"]["PluginsResponse"];
 export const ConfigApiCodes = {

@@ -181,8 +181,8 @@ pub fn is_older_version(candidate: &str, installed: &str) -> bool {
 #[derive(Clone, Copy, Debug)]
 pub enum UpdateSource<'a> {
     /// The registry, pinned to `version` when there is one. `registry` is the
-    /// `--registry` URL the operator passed, which the printed command passes
-    /// again; a registry chosen by the environment is inherited without it.
+    /// exact resolved origin when known, which printed approval/retry commands
+    /// pass explicitly rather than re-resolving a mutable environment selection.
     Registry {
         version: Option<&'a str>,
         registry: Option<&'a str>,
@@ -194,32 +194,29 @@ pub enum UpdateSource<'a> {
 /// The `plugin update` command for `name` from `source`, accepting
 /// `increase` with repeated `--allow-token` arguments when it is not empty,
 /// quoted for this host's shell like every other printed command.
-#[must_use]
 pub fn update_command(
     config_dir: &Path,
     name: &str,
     source: UpdateSource<'_>,
     increase: &[AuthorityItem],
-) -> String {
+) -> Option<String> {
     update_command_for(ShellDialect::host(), config_dir, name, source, increase)
 }
 
 /// The `plugin install` command for `name` from `source`: the local
 /// directory, or the registry entry, pinned when there is a version, quoted
 /// like every other printed command.
-#[must_use]
-pub fn install_command(config_dir: &Path, name: &str, source: UpdateSource<'_>) -> String {
+pub fn install_command(config_dir: &Path, name: &str, source: UpdateSource<'_>) -> Option<String> {
     install_command_for(ShellDialect::host(), config_dir, name, source)
 }
 
 /// [`install_command`] rendered for an explicit shell dialect.
-#[must_use]
 pub fn install_command_for(
     dialect: ShellDialect,
     config_dir: &Path,
     name: &str,
     source: UpdateSource<'_>,
-) -> String {
+) -> Option<String> {
     let (target, registry) = match source {
         UpdateSource::Local(dir) => (dir.to_string_lossy().into_owned(), None),
         UpdateSource::Registry { version, registry } => (
@@ -232,31 +229,32 @@ pub fn install_command_for(
     if let Some(url) = registry {
         values.push(url);
     }
-    let (dialect, marker) = dialect.command_form(&values);
+    if !zeroclaw_plugins::registry::registry_command_available(dialect, registry, &values) {
+        return None;
+    }
     let registry = registry
         .map(|url| format!(" --registry {}", dialect.quote_literal(url)))
         .unwrap_or_default();
-    format!(
-        "{marker}{} plugin install {}{registry}",
+    Some(format!(
+        "{} plugin install {}{registry}",
         zeroclaw_invocation_for(dialect, config_dir),
         dialect.quote_literal(&target),
-    )
+    ))
 }
 
 /// [`update_command`] rendered for an explicit shell dialect.
 ///
 /// The version, a `provides` id and a publisher key come from the replacement's
 /// manifest, which is publisher-controlled text, so every value is one quoted
-/// literal argument, and a line no Windows form can pass literally is rendered
-/// as the marked PowerShell form, as the egress commands are.
-#[must_use]
+/// literal argument, and a private origin or a line no Windows form can pass literally
+/// has no copy-ready command.
 pub fn update_command_for(
     dialect: ShellDialect,
     config_dir: &Path,
     name: &str,
     source: UpdateSource<'_>,
     increase: &[AuthorityItem],
-) -> String {
+) -> Option<String> {
     let allowed = increase
         .iter()
         .map(AuthorityItem::token)
@@ -283,7 +281,13 @@ pub fn update_command_for(
     if let Some((_, value)) = &origin {
         values.push(value.as_str());
     }
-    let (dialect, marker) = dialect.command_form(&values);
+    let registry = match source {
+        UpdateSource::Registry { registry, .. } => registry,
+        UpdateSource::Local(_) => None,
+    };
+    if !zeroclaw_plugins::registry::registry_command_available(dialect, registry, &values) {
+        return None;
+    }
     let origin = origin
         .map(|(flag, value)| format!(" {flag} {}", dialect.quote_literal(&value)))
         .unwrap_or_default();
@@ -294,17 +298,16 @@ pub fn update_command_for(
         allow.push_str(" --allow-token ");
         allow.push_str(&dialect.quote_literal(token));
     }
-    format!(
-        "{marker}{} plugin update {}{origin}{allow}",
+    Some(format!(
+        "{} plugin update {}{origin}{allow}",
         zeroclaw_invocation_for(dialect, config_dir),
         dialect.quote_literal(&target),
-    )
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::plugins::egress_ceremony::POWERSHELL_ONLY_MARKER;
 
     fn manifest(extra: &str) -> PluginManifest {
         toml::from_str(&format!(
@@ -444,7 +447,8 @@ mod tests {
                 registry: Some("https://registry.example.com/index.json"),
             },
             &increase,
-        );
+        )
+        .unwrap();
 
         assert_eq!(
             command,
@@ -463,7 +467,8 @@ mod tests {
             "weather",
             UpdateSource::Local(Path::new("/work/weather-plugin")),
             &[AuthorityItem::Capability(PluginCapability::Channel)],
-        );
+        )
+        .unwrap();
 
         assert_eq!(
             command,
@@ -483,7 +488,8 @@ mod tests {
                 registry: None,
             },
             &[],
-        );
+        )
+        .unwrap();
         assert_eq!(
             registry,
             "zeroclaw --config-dir '/cfg' plugin update 'weather'"
@@ -495,7 +501,8 @@ mod tests {
             "weather",
             UpdateSource::Local(Path::new("/work/weather-plugin")),
             &[],
-        );
+        )
+        .unwrap();
         assert_eq!(
             local,
             "zeroclaw --config-dir '/cfg' plugin update 'weather' --from '/work/weather-plugin'"
@@ -540,7 +547,8 @@ mod tests {
             Path::new("/cfg"),
             "weather",
             UpdateSource::Local(Path::new("/work/weather-plugin")),
-        );
+        )
+        .unwrap();
         assert_eq!(
             local,
             "zeroclaw --config-dir '/cfg' plugin install '/work/weather-plugin'"
@@ -554,7 +562,8 @@ mod tests {
                 version: Some("1.2.0"),
                 registry: Some("https://registry.example.com/index.json"),
             },
-        );
+        )
+        .unwrap();
         assert_eq!(
             pinned,
             "zeroclaw --config-dir '/cfg' plugin install 'weather@1.2.0' --registry 'https://registry.example.com/index.json'"
@@ -572,7 +581,8 @@ mod tests {
                 registry: None,
             },
             &[AuthorityItem::Permission(PluginPermission::StateRead)],
-        );
+        )
+        .unwrap();
 
         assert!(!command.contains("--registry"), "{command}");
         assert!(
@@ -582,31 +592,45 @@ mod tests {
     }
 
     #[test]
-    fn a_value_windows_cannot_pass_literally_gets_the_marked_powershell_form() {
-        let plain = update_command_for(
-            ShellDialect::Windows,
-            Path::new(r"C:\zeroclaw"),
-            "weather",
-            UpdateSource::Registry {
-                version: Some("2.0.0"),
-                registry: None,
-            },
-            &[AuthorityItem::Permission(PluginPermission::HttpClient)],
+    fn registry_approval_and_install_refuse_unprintable_commands() {
+        let dir = Path::new(r"C:\zeroclaw");
+        let increase = [AuthorityItem::Permission(PluginPermission::HttpClient)];
+        for (dialect, url) in [
+            (
+                ShellDialect::Windows,
+                "https://registry.invalid/team%20calendar",
+            ),
+            (
+                ShellDialect::Posix,
+                "https://registry.invalid/index?channel=sample",
+            ),
+        ] {
+            let source = UpdateSource::Registry {
+                version: Some("2.0&preview"),
+                registry: Some(url),
+            };
+            assert_eq!(
+                update_command_for(dialect, dir, "calendar", source, &increase),
+                None
+            );
+            assert_eq!(install_command_for(dialect, dir, "calendar", source), None);
+        }
+        let source = UpdateSource::Registry {
+            version: Some("2"),
+            registry: Some("https://registry.invalid/index"),
+        };
+        assert!(
+            update_command_for(ShellDialect::Windows, dir, "calendar", source, &increase).is_some()
         );
-        assert!(!plain.starts_with(POWERSHELL_ONLY_MARKER), "{plain}");
-        assert!(plain.contains("\"weather@2.0.0\""), "{plain}");
-
-        let hostile = update_command_for(
-            ShellDialect::Windows,
-            Path::new(r"C:\zeroclaw"),
-            "weather",
-            UpdateSource::Registry {
-                version: Some("2.0.0"),
-                registry: None,
-            },
-            &[AuthorityItem::Provides("%PATH%".to_string())],
+        assert!(
+            update_command_for(
+                ShellDialect::Windows,
+                dir,
+                "calendar",
+                source,
+                &[AuthorityItem::Provides("100%".into())]
+            )
+            .is_none()
         );
-        assert!(hostile.starts_with(POWERSHELL_ONLY_MARKER), "{hostile}");
-        assert!(hostile.contains("'provides:%PATH%'"), "{hostile}");
     }
 }

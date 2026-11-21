@@ -42,7 +42,8 @@ pub struct AvailablePluginPackage {
 /// One package in the request-time catalog.
 ///
 /// Installed and registry records remain separate because their versions and
-/// metadata can legitimately differ. Package name is the only merged identity.
+/// metadata can legitimately differ. Available publishers retain separate rows;
+/// installed metadata has package-name identity, not recorded publisher provenance.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct PluginCatalogEntry {
@@ -87,7 +88,7 @@ pub struct PluginsResponse {
     pub wasm_plugins_available: bool,
     /// Canonical configured plugin directory, before path expansion.
     pub plugins_dir: String,
-    /// One row per package name across installed and cached-registry sources.
+    /// One row per available publisher/package, plus installed-only packages.
     pub plugins: Vec<PluginCatalogEntry>,
     /// Source failures, kept distinct from a valid empty catalog.
     pub issues: Vec<PluginCatalogIssue>,
@@ -159,6 +160,9 @@ pub async fn list_plugins(State(state): State<AppState>, headers: HeaderMap) -> 
                 signature_mode,
                 trusted_publisher_keys,
                 data_dir,
+                std::env::var(zeroclaw_plugins::registry::REGISTRY_URL_ENV)
+                    .ok()
+                    .as_deref(),
             )
         })
         .await
@@ -182,8 +186,8 @@ pub async fn list_plugins(State(state): State<AppState>, headers: HeaderMap) -> 
 }
 
 #[cfg(not(feature = "plugins-wasm"))]
-fn build_response(plugins_enabled: bool, plugins_dir: String) -> PluginsResponse {
-    PluginsResponse {
+fn build_response(plugins_enabled: bool, plugins_dir: String) -> OriginPluginsResponse {
+    OriginPluginsResponse {
         plugins_enabled,
         wasm_plugins_available: false,
         plugins_dir,
@@ -200,8 +204,9 @@ fn build_response(
     signature_mode: String,
     trusted_publisher_keys: Vec<String>,
     data_dir: std::path::PathBuf,
-) -> PluginsResponse {
-    use zeroclaw_plugins::catalog::package_catalog;
+    selection: Option<&str>,
+) -> OriginPluginsResponse {
+    use zeroclaw_plugins::catalog::origin_package_catalog as package_catalog;
 
     let mut issues = Vec::new();
     let installed = match plugin_path.try_exists() {
@@ -252,8 +257,9 @@ fn build_response(
         }
     };
 
-    let registry = match zeroclaw_plugins::registry::read_cached_registry_index(&data_dir) {
-        Ok(index) => index,
+    let registry = match zeroclaw_plugins::registry::read_cached_registry_collection(&data_dir) {
+        Ok(index) => index
+            .filter(|index| zeroclaw_plugins::registry::cache_matches_selection(index, selection)),
         Err(error) => {
             ::zeroclaw_log::record!(
                 ERROR,
@@ -275,10 +281,10 @@ fn build_response(
 
     let plugins = package_catalog(&installed, registry.as_ref())
         .into_iter()
-        .map(PluginCatalogEntry::from)
+        .map(OriginPluginCatalogEntry::from)
         .collect();
 
-    PluginsResponse {
+    OriginPluginsResponse {
         plugins_enabled,
         wasm_plugins_available: true,
         plugins_dir,
@@ -353,6 +359,7 @@ mod tests {
                 "disabled".to_string(),
                 Vec::new(),
                 temp.path().join("missing-data-directory"),
+                None,
             )
         };
 
@@ -409,6 +416,7 @@ mod tests {
             "disabled".to_string(),
             Vec::new(),
             temp.path().to_path_buf(),
+            Some("https://example.invalid/index.json"),
         );
 
         assert_eq!(response.plugins.len(), 1);
@@ -453,6 +461,7 @@ mod tests {
             "disabled".to_string(),
             Vec::new(),
             temp.path().to_path_buf(),
+            None,
         );
 
         assert!(response.plugins.is_empty());
@@ -463,6 +472,52 @@ mod tests {
                 code: PluginCatalogIssueCode::CacheReadFailed,
             }]
         );
+    }
+
+    #[cfg(feature = "plugins-wasm")]
+    #[test]
+    fn serialized_registry_id_is_the_origin_label_or_null() {
+        use zeroclaw_plugins::catalog::{OriginCatalogEntry, package_catalog};
+
+        let index = serde_json::from_value(serde_json::json!({
+            "plugins": [{"name": "calendar", "version": "1", "url": "https://example.invalid/p.zip"}]
+        }))
+        .unwrap();
+        let metadata = package_catalog(&[], Some(&index))[0];
+        for (origin, expected) in [
+            (
+                Some("https://example.invalid/index.json"),
+                Some("registry:b75c7012ffa635f6acd1a9bdf66cd23af440ba943f6f51f2eedb53e19d0c5131"),
+            ),
+            (None, None),
+        ] {
+            let row = OriginPluginCatalogEntry::from(OriginCatalogEntry { metadata, origin });
+            let json = serde_json::to_value(row).unwrap();
+            assert_eq!(
+                json.pointer("/available/registry_id"),
+                Some(&serde_json::json!(expected))
+            );
+        }
+    }
+
+    #[cfg(feature = "plugins-wasm")]
+    #[test]
+    fn publisher_identity_is_distinct_without_exposing_source_urls() {
+        let catalog: zeroclaw_plugins::registry::RegistryCollection = serde_json::from_value(serde_json::json!({"registries":[
+            {"registry_url":"https://a.invalid/index?credential=private-a","plugins":[{"name":"calendar","version":"1","url":"https://download.invalid/p.zip"}]},
+            {"registry_url":"https://a.invalid/index?credential=private-b","plugins":[{"name":"calendar","version":"1","url":"https://download.invalid/p.zip"}]}
+        ]})).unwrap();
+        let rows: Vec<_> = zeroclaw_plugins::catalog::origin_package_catalog(&[], Some(&catalog))
+            .into_iter()
+            .map(OriginPluginCatalogEntry::from)
+            .collect();
+        assert_ne!(
+            rows[0].available.as_ref().unwrap().registry_id,
+            rows[1].available.as_ref().unwrap().registry_id
+        );
+        let json = serde_json::to_string(&rows).unwrap();
+        assert!(!json.contains("private"));
+        assert!(!json.contains("https://"));
     }
 
     #[cfg(feature = "plugins-wasm")]
@@ -489,14 +544,20 @@ mod tests {
         };
         write_cached_registry_index(temp.path(), registry_url, &index).expect("registry cache");
 
-        let response = build_response(
-            true,
-            "plugins".to_string(),
-            temp.path().join("missing-plugins"),
-            "disabled".to_string(),
-            Vec::new(),
-            temp.path().to_path_buf(),
-        );
+        let response_for = |selection| {
+            build_response(
+                true,
+                "plugins".to_string(),
+                temp.path().join("missing-plugins"),
+                "disabled".to_string(),
+                Vec::new(),
+                temp.path().to_path_buf(),
+                selection,
+            )
+        };
+        assert!(response_for(None).plugins.is_empty());
+        assert!(response_for(Some(" ")).plugins.is_empty());
+        let response = response_for(Some(registry_url));
         let json = serde_json::to_string(&response).expect("catalog response JSON");
 
         assert!(json.contains("mail@1.2.3"));
@@ -505,5 +566,51 @@ mod tests {
         assert!(!json.contains("token=private"));
         assert!(!json.contains("registry_url"));
         assert!(!json.contains("url"));
+    }
+}
+
+/// Additive endpoint DTOs keep existing publicly constructible metadata intact.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub struct OriginAvailablePluginPackage {
+    #[serde(flatten)]
+    pub metadata: AvailablePluginPackage,
+    pub registry_id: Option<String>,
+}
+impl std::ops::Deref for OriginAvailablePluginPackage {
+    type Target = AvailablePluginPackage;
+    fn deref(&self) -> &Self::Target {
+        &self.metadata
+    }
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub struct OriginPluginCatalogEntry {
+    pub name: String,
+    pub installed: Option<InstalledPluginPackage>,
+    pub available: Option<OriginAvailablePluginPackage>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub struct OriginPluginsResponse {
+    pub plugins_enabled: bool,
+    pub wasm_plugins_available: bool,
+    pub plugins_dir: String,
+    pub plugins: Vec<OriginPluginCatalogEntry>,
+    pub issues: Vec<PluginCatalogIssue>,
+}
+#[cfg(feature = "plugins-wasm")]
+impl From<zeroclaw_plugins::catalog::OriginCatalogEntry<'_>> for OriginPluginCatalogEntry {
+    fn from(row: zeroclaw_plugins::catalog::OriginCatalogEntry<'_>) -> Self {
+        Self {
+            name: row.name().to_string(),
+            installed: row.installed().map(InstalledPluginPackage::from),
+            available: row.available().map(|entry| OriginAvailablePluginPackage {
+                metadata: AvailablePluginPackage::from(entry),
+                registry_id: row
+                    .origin
+                    .map(zeroclaw_plugins::registry::registry_origin_label),
+            }),
+        }
     }
 }
