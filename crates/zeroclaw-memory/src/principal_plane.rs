@@ -90,6 +90,17 @@ impl Memory for PrincipalPlaneMemory {
             .await
     }
 
+    async fn recall_for_prompt(
+        &self,
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        self.inner
+            .recall_for_prompt_for_principal(&self.scope, query, limit, session_id)
+            .await
+    }
+
     async fn recall(
         &self,
         query: &str,
@@ -262,6 +273,18 @@ impl Memory for PrincipalPlaneMemory {
     ) -> anyhow::Result<()> {
         self.inner
             .store_for_principal(scope, key, content, category, session_id)
+            .await
+    }
+
+    async fn recall_for_prompt_for_principal(
+        &self,
+        scope: &PrincipalScope,
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        self.inner
+            .recall_for_prompt_for_principal(scope, query, limit, session_id)
             .await
     }
 

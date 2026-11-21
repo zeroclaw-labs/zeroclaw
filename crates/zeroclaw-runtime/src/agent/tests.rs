@@ -804,11 +804,15 @@ async fn auto_save_stores_only_user_messages_in_memory() {
         "Expected exactly 1 user memory entry, got {count}"
     );
 
-    let stored = mem.get("user_msg").await.unwrap();
-    assert!(stored.is_some(), "Expected user_msg key to be present");
+    let stored = mem
+        .list(Some(&zeroclaw_memory::MemoryCategory::Conversation), None)
+        .await
+        .unwrap();
+    assert_eq!(stored.len(), 1);
+    assert!(zeroclaw_memory::is_user_autosave_key(&stored[0].key));
+    assert_eq!(stored[0].session_id, None);
     assert_eq!(
-        stored.unwrap().content,
-        "Remember this fact",
+        stored[0].content, "Remember this fact",
         "Stored memory should match the original user message"
     );
 
@@ -817,6 +821,233 @@ async fn auto_save_stores_only_user_messages_in_memory() {
         assistant.is_none(),
         "assistant_resp should not be auto-saved anymore"
     );
+}
+
+#[tokio::test]
+async fn issue_12002_autosave_preserves_same_session() {
+    use zeroclaw_memory::MemoryCategory;
+
+    let (mem, _tmp) = make_sqlite_memory();
+    let model_provider = Box::new(ScriptedModelProvider::new(vec![
+        text_response("First reply"),
+        text_response("Second reply"),
+    ]));
+    let mut agent = build_agent_with_memory(model_provider, vec![], mem.clone(), true);
+    let turns = [
+        ("First user message: amber", "issue-12002-session-first"),
+        ("Second user message: violet", "issue-12002-session-first"),
+    ];
+
+    for (content, session_id) in turns {
+        agent.set_memory_session_id(Some(session_id.to_string()));
+        agent.turn(content).await.unwrap();
+    }
+
+    let entries = mem
+        .list(Some(&MemoryCategory::Conversation), None)
+        .await
+        .unwrap();
+    assert_eq!(entries.len(), 2, "Both turns must remain in memory");
+    assert_ne!(entries[0].key, entries[1].key);
+    for (content, session_id) in turns {
+        let entry = entries
+            .iter()
+            .find(|entry| entry.content == content)
+            .expect("Each original user message must remain in memory");
+        assert_eq!(entry.session_id.as_deref(), Some(session_id));
+    }
+}
+
+#[tokio::test]
+async fn issue_12002_autosave_preserves_different_sessions() {
+    use zeroclaw_memory::MemoryCategory;
+
+    let (mem, _tmp) = make_sqlite_memory();
+    let model_provider = Box::new(ScriptedModelProvider::new(vec![
+        text_response("First reply"),
+        text_response("Second reply"),
+    ]));
+    let mut agent = build_agent_with_memory(model_provider, vec![], mem.clone(), true);
+    let turns = [
+        ("First user message: amber", "issue-12002-session-first"),
+        ("Second user message: violet", "issue-12002-session-second"),
+    ];
+
+    for (content, session_id) in turns {
+        agent.set_memory_session_id(Some(session_id.to_string()));
+        agent.turn(content).await.unwrap();
+    }
+
+    let entries = mem
+        .list(Some(&MemoryCategory::Conversation), None)
+        .await
+        .unwrap();
+    assert_eq!(entries.len(), 2, "Both turns must remain in memory");
+    assert_ne!(entries[0].key, entries[1].key);
+    for (content, session_id) in turns {
+        let entry = entries
+            .iter()
+            .find(|entry| entry.content == content)
+            .expect("Each original user message must remain in memory");
+        assert_eq!(entry.session_id.as_deref(), Some(session_id));
+    }
+}
+
+#[tokio::test]
+async fn issue_12002_autosave_preserves_identical_inputs_and_legacy_entry() {
+    use zeroclaw_memory::MemoryCategory;
+
+    let (mem, _tmp) = make_sqlite_memory();
+    mem.store(
+        "user_msg",
+        "Legacy user message",
+        MemoryCategory::Conversation,
+        Some("legacy-session"),
+    )
+    .await
+    .unwrap();
+    let mut agent = build_agent_with_memory(
+        Box::new(ScriptedModelProvider::new(vec![])),
+        vec![],
+        mem.clone(),
+        true,
+    );
+    agent.set_memory_session_id(Some("repeated-session".into()));
+    for _ in 0..2 {
+        agent.turn("Identical user input").await.unwrap();
+    }
+
+    let entries = mem.list(None, None).await.unwrap();
+    assert_eq!(entries.len(), 3);
+    let repeated: Vec<_> = entries
+        .iter()
+        .filter(|entry| entry.content == "Identical user input")
+        .collect();
+    assert_eq!(repeated.len(), 2);
+    assert_ne!(repeated[0].key, repeated[1].key);
+    for entry in repeated {
+        assert_eq!(entry.category, MemoryCategory::Conversation);
+        assert_eq!(entry.session_id.as_deref(), Some("repeated-session"));
+        assert!(zeroclaw_memory::is_user_autosave_key(&entry.key));
+    }
+    let legacy = mem.get("user_msg").await.unwrap().unwrap();
+    assert_eq!(legacy.content, "Legacy user message");
+    assert_eq!(legacy.category, MemoryCategory::Conversation);
+    assert_eq!(legacy.session_id.as_deref(), Some("legacy-session"));
+    let scoped = mem
+        .list(
+            Some(&MemoryCategory::Conversation),
+            Some("repeated-session"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(scoped.len(), 2);
+    assert!(
+        scoped
+            .iter()
+            .all(|entry| entry.content == "Identical user input")
+    );
+}
+
+#[tokio::test]
+async fn issue_12002_streamed_autosave_preserves_identical_inputs() {
+    use zeroclaw_memory::MemoryCategory;
+
+    let (mem, _tmp) = make_sqlite_memory();
+    let mut agent = build_agent_with_memory(
+        Box::new(ScriptedModelProvider::new(vec![])),
+        vec![],
+        mem.clone(),
+        true,
+    );
+    agent.set_memory_session_id(Some("streamed-session".into()));
+    for _ in 0..2 {
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
+        agent
+            .turn_streamed("Identical streamed input", event_tx, None)
+            .await
+            .unwrap();
+    }
+
+    let entries = mem.list(None, None).await.unwrap();
+    assert_eq!(entries.len(), 2);
+    assert_ne!(entries[0].key, entries[1].key);
+    for entry in entries {
+        assert_eq!(entry.content, "Identical streamed input");
+        assert_eq!(entry.category, MemoryCategory::Conversation);
+        assert_eq!(entry.session_id.as_deref(), Some("streamed-session"));
+        assert!(zeroclaw_memory::is_user_autosave_key(&entry.key));
+    }
+}
+
+#[tokio::test]
+async fn issue_12002_steering_autosave_preserves_each_admitted_input() {
+    use crate::agent::{SteeringAdmission, SteeringInput};
+    use zeroclaw_memory::MemoryCategory;
+
+    // Exercise both autosave settings through the real streamed/steering entry point.
+    for auto_save in [true, false] {
+        let (mem, _tmp) = make_sqlite_memory();
+        let mut agent = build_agent_with_memory(
+            Box::new(ScriptedModelProvider::new(vec![])),
+            vec![],
+            mem.clone(),
+            auto_save,
+        );
+        agent.set_memory_session_id(Some("steering-session".into()));
+        let (steering_tx, mut steering_rx) = tokio::sync::mpsc::channel(4);
+        for _ in 0..2 {
+            steering_tx
+                .send(SteeringInput::new("Identical steering input"))
+                .await
+                .unwrap();
+        }
+        steering_tx
+            .send(SteeringInput::with_admission(
+                "Refused steering input",
+                Box::new(|| SteeringAdmission::Refused("test sender revoked".into())),
+            ))
+            .await
+            .unwrap();
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
+        agent
+            .turn_streamed_with_steering_state(
+                "Original streamed input",
+                event_tx,
+                None,
+                Some(&mut steering_rx),
+            )
+            .await
+            .unwrap();
+
+        let entries = mem.list(None, None).await.unwrap();
+        if !auto_save {
+            assert!(entries.is_empty());
+            continue;
+        }
+        assert_eq!(entries.len(), 3);
+        let keys: std::collections::HashSet<_> = entries.iter().map(|entry| &entry.key).collect();
+        assert_eq!(keys.len(), 3);
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|entry| entry.content == "Original streamed input")
+                .count(),
+            1
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|entry| entry.content == "Identical steering input")
+                .count(),
+            2
+        );
+        for entry in entries {
+            assert_eq!(entry.category, MemoryCategory::Conversation);
+            assert_eq!(entry.session_id.as_deref(), Some("steering-session"));
+            assert!(zeroclaw_memory::is_user_autosave_key(&entry.key));
+        }
+    }
 }
 
 #[tokio::test]
