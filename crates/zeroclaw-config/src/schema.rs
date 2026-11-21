@@ -15586,7 +15586,9 @@ pub struct SchedulerConfig {
     /// Maximum number of persisted scheduled tasks per polling cycle.
     #[serde(default = "default_scheduler_max_tasks")]
     pub max_tasks: usize,
-    /// Maximum tasks executed in parallel within a single polling cycle.
+    /// Maximum jobs the scheduler runs at once. The limit holds across
+    /// polling cycles: polling continues while jobs run, and a cycle starts
+    /// due jobs only in free slots, so one long job holds one slot.
     #[serde(default = "default_scheduler_max_concurrent")]
     pub max_concurrent: usize,
     /// Run all overdue jobs at scheduler startup. Default: `true`.
