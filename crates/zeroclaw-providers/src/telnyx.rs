@@ -143,6 +143,86 @@ struct ResponseMessage {
     content: String,
 }
 
+impl TelnyxModelProvider {
+    async fn history_inner(
+        &self,
+        messages: &[ChatMessage],
+        model: &str,
+        temperature: Option<f64>,
+        budget: Option<&zeroclaw_api::model_provider::GenerationAttemptBudget>,
+    ) -> anyhow::Result<String> {
+        if let Some(budget) = budget {
+            budget.ensure_available()?;
+        }
+        let api_key = self.api_key.as_ref().ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"missing": "api_key"})),
+                "telnyx: API key not configured"
+            );
+            anyhow::Error::msg(
+                "Telnyx API key not set. Set TELNYX_API_KEY environment variable or run `zeroclaw quickstart --model-provider telnyx --api-key <key>`.",
+            )
+        })?;
+
+        let api_messages: Vec<Message> = messages
+            .iter()
+            .map(|m| Message {
+                role: m.role.clone(),
+                content: m.content.clone(),
+            })
+            .collect();
+
+        let request = ChatRequest {
+            model: model.to_string(),
+            messages: api_messages,
+            temperature,
+        };
+
+        let client = match budget {
+            Some(_) => crate::bounded::client(
+                Client::builder()
+                    .timeout(std::time::Duration::from_secs(120))
+                    .connect_timeout(std::time::Duration::from_secs(10)),
+                None,
+            )?,
+            None => self.client.clone(),
+        };
+        let request = client
+            .post(self.chat_url())
+            .header("Authorization", format!("Bearer {}", api_key))
+            .header("Content-Type", "application/json")
+            .json(&request);
+        let response = crate::bounded::send(request, budget, None).await?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let error = response.text().await?;
+            let sanitized = super::sanitize_api_error(&error);
+            anyhow::bail!("Telnyx API error ({}): {}", status, sanitized);
+        }
+
+        let chat_response: ChatResponse = response.json().await?;
+
+        chat_response
+            .choices
+            .into_iter()
+            .next()
+            .map(|c| c.message.content)
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                    "telnyx: empty choices in response"
+                );
+                anyhow::Error::msg("No response from Telnyx")
+            })
+    }
+}
+
 #[async_trait]
 impl ModelProvider for TelnyxModelProvider {
     // ── ModelProvider-family defaults ──
@@ -230,65 +310,43 @@ impl ModelProvider for TelnyxModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<String> {
-        let api_key = self.api_key.as_ref().ok_or_else(|| {
-            ::zeroclaw_log::record!(
-                ERROR,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({"missing": "api_key"})),
-                "telnyx: API key not configured"
-            );
-            anyhow::Error::msg(
-                "Telnyx API key not set. Set TELNYX_API_KEY environment variable or run `zeroclaw quickstart --model-provider telnyx --api-key <key>`.",
-            )
-        })?;
+        self.history_inner(messages, model, temperature, None).await
+    }
 
-        let api_messages: Vec<Message> = messages
-            .iter()
-            .map(|m| Message {
-                role: m.role.clone(),
-                content: m.content.clone(),
-            })
-            .collect();
-
-        let request = ChatRequest {
-            model: model.to_string(),
-            messages: api_messages,
-            temperature,
-        };
-
-        let response = self
-            .client
-            .post(self.chat_url())
-            .header("Authorization", format!("Bearer {}", api_key))
-            .header("Content-Type", "application/json")
-            .json(&request)
-            .send()
-            .await?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let error = response.text().await?;
-            let sanitized = super::sanitize_api_error(&error);
-            anyhow::bail!("Telnyx API error ({}): {}", status, sanitized);
+    async fn chat_with_attempt_budget(
+        &self,
+        request: crate::traits::ChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        _policy: zeroclaw_api::model_provider::ToolRoundPolicy,
+        budget: &zeroclaw_api::model_provider::GenerationAttemptBudget,
+    ) -> anyhow::Result<crate::traits::ChatResponse> {
+        budget.ensure_available()?;
+        let mut messages = request.messages.to_vec();
+        if let Some(tools) = request.tools.filter(|tools| !tools.is_empty()) {
+            let instructions = crate::traits::build_tool_instructions_text(tools);
+            if let Some(system) = messages.iter_mut().find(|message| message.role == "system") {
+                if !system.content.is_empty() {
+                    system.content.push_str("\n\n");
+                }
+                system.content.push_str(&instructions);
+            } else {
+                messages.insert(0, ChatMessage::system(instructions));
+            }
         }
-
-        let chat_response: ChatResponse = response.json().await?;
-
-        chat_response
-            .choices
-            .into_iter()
-            .next()
-            .map(|c| c.message.content)
-            .ok_or_else(|| {
-                ::zeroclaw_log::record!(
-                    ERROR,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
-                    "telnyx: empty choices in response"
-                );
-                anyhow::Error::msg("No response from Telnyx")
-            })
+        let text = self
+            .history_inner(&messages, model, temperature, Some(budget))
+            .await?;
+        let response = crate::traits::ChatResponse {
+            text: Some(text),
+            tool_calls: Vec::new(),
+            usage: None,
+            reasoning_content: None,
+        };
+        if response.is_semantically_empty_terminal() {
+            return Err(crate::traits::SemanticEmptyTerminalCompletion.into());
+        }
+        Ok(response)
     }
 
     async fn warmup(&self) -> anyhow::Result<()> {
@@ -411,5 +469,24 @@ mod tests {
         let json = r#"{"choices":[{"message":{"content":"Hello from Telnyx!"}}]}"#;
         let resp: ChatResponse = serde_json::from_str(json).unwrap();
         assert_eq!(resp.choices[0].message.content, "Hello from Telnyx!");
+    }
+}
+
+#[cfg(test)]
+mod attempt_budget_tests {
+    use super::*;
+    use crate::bounded::tests as fixture;
+
+    #[tokio::test]
+    async fn telnyx_shares_budget_across_calls() {
+        let server = fixture::server(vec![
+            fixture::Reply::json(200, fixture::CHAT_OK),
+            fixture::Reply::json(200, fixture::CHAT_OK),
+        ])
+        .await;
+        let provider = TelnyxModelProvider::builder("fixture")
+            .api_key(Some("fixture-key"))
+            .build();
+        fixture::assert_two_requests(&provider, &server).await;
     }
 }
