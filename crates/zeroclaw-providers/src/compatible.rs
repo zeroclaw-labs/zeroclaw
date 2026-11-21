@@ -1013,6 +1013,47 @@ impl OpenAiCompatibleModelProvider {
         (result, true)
     }
 
+    fn http_headers(&self) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        if let Some(ua) = self.user_agent.as_deref()
+            && let Ok(value) = HeaderValue::from_str(ua)
+        {
+            headers.insert(USER_AGENT, value);
+        }
+        for (key, value) in &self.extra_headers {
+            match (
+                reqwest::header::HeaderName::from_bytes(key.as_bytes()),
+                HeaderValue::from_str(value),
+            ) {
+                (Ok(name), Ok(val)) => {
+                    headers.insert(name, val);
+                }
+                _ => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"header": key})),
+                        "Skipping invalid extra header name or value"
+                    );
+                }
+            }
+        }
+
+        headers
+    }
+
+    fn bounded_http_client(&self) -> anyhow::Result<Client> {
+        let builder = Client::builder()
+            .timeout(std::time::Duration::from_secs(self.timeout_secs))
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .default_headers(self.http_headers());
+        crate::bounded::client(
+            self.add_tls_cert_to_builder(builder),
+            Some("model_provider.compatible"),
+        )
+    }
+
     fn http_client(&self) -> Client {
         let timeout = self.timeout_secs;
         let has_user_agent = self.user_agent.is_some();
@@ -1024,34 +1065,7 @@ impl OpenAiCompatibleModelProvider {
         let targets_opencode = crate::opencode_session::is_opencode_target(&endpoint);
 
         if has_user_agent || has_extra_headers || has_tls_cert || targets_opencode {
-            let mut headers = HeaderMap::new();
-            if let Some(ua) = self.user_agent.as_deref()
-                && let Ok(value) = HeaderValue::from_str(ua)
-            {
-                headers.insert(USER_AGENT, value);
-            }
-            for (key, value) in &self.extra_headers {
-                match (
-                    reqwest::header::HeaderName::from_bytes(key.as_bytes()),
-                    HeaderValue::from_str(value),
-                ) {
-                    (Ok(name), Ok(val)) => {
-                        headers.insert(name, val);
-                    }
-                    _ => {
-                        ::zeroclaw_log::record!(
-                            WARN,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Note
-                            )
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                            .with_attrs(::serde_json::json!({"header": key})),
-                            "Skipping invalid extra header name or value"
-                        );
-                    }
-                }
-            }
+            let headers = self.http_headers();
 
             let builder = Client::builder()
                 .timeout(std::time::Duration::from_secs(timeout))
@@ -4099,6 +4113,165 @@ impl OpenAiCompatibleModelProvider {
     }
 }
 
+impl OpenAiCompatibleModelProvider {
+    async fn chat_inner(
+        &self,
+        request: ProviderChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        budget: Option<&zeroclaw_api::model_provider::GenerationAttemptBudget>,
+    ) -> anyhow::Result<ProviderChatResponse> {
+        if let Some(budget) = budget {
+            budget.ensure_available()?;
+        }
+        let exact_request_replay = exact_request_replay_active();
+        let credential = self.resolve_credential().await?;
+
+        let normalized = self
+            .normalize_messages_for_upstream(request.messages)
+            .await?;
+        let merge = self.effective_merge_system(model);
+        let (effective_messages, system_merged) = Self::flatten_system_messages(&normalized, merge);
+        let effective_messages = if self.native_tool_calling {
+            effective_messages
+        } else {
+            self.strip_native_tool_messages(&effective_messages)
+        };
+
+        let tools = self.convert_tool_specs_for_model(request.tools, model);
+        let native_request = self.build_native_tool_chat_request(
+            &effective_messages,
+            tools,
+            model,
+            temperature,
+            !merge,
+            system_merged,
+            request.thinking,
+        );
+        let mut payload = serde_json::to_value(native_request)?;
+        let tools_count = payload
+            .get("tools")
+            .and_then(serde_json::Value::as_array)
+            .map_or(0, Vec::len);
+        let reasoning_effort_omitted =
+            self.reasoning_effort.is_some() && payload.get("reasoning_effort").is_none();
+        let reasoning_effort_omission_reason =
+            reasoning_effort_omitted.then_some("model_ineligible");
+        if ::zeroclaw_log::debug_enabled() {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Send)
+                    .with_attrs(::serde_json::json!({
+                        "provider": &self.name,
+                        "alias": &self.alias,
+                        "request_api": "chat_completions",
+                        "model": model,
+                        "stream": false,
+                        "native_tool_calling": self.native_tool_calling,
+                        "tools_count": tools_count,
+                        "tool_choice": payload.get("tool_choice"),
+                        "reasoning_effort_omitted": reasoning_effort_omitted,
+                        "reasoning_effort_omission_reason": reasoning_effort_omission_reason,
+                    })),
+                "compatible provider request prepared"
+            );
+        }
+
+        let url = self.chat_completions_url();
+        let mut previous_error = None;
+        let response = loop {
+            let client = match budget {
+                Some(_) => self.bounded_http_client()?,
+                None => self.http_client(),
+            };
+            let http_request = self.apply_opencode_session_header(
+                self.apply_auth_header(client.post(&url).json(&payload), credential.as_deref())?,
+            );
+            let response =
+                crate::bounded::send(http_request, budget, previous_error.take()).await?;
+            if response.status().is_success() {
+                break response;
+            }
+
+            let status = response.status();
+            let error = response.text().await?;
+            let sanitized = super::sanitize_api_error(&error);
+
+            if !exact_request_replay
+                && tools_count > 0
+                && super::rejects_tools_with_reasoning_effort(status, &error)
+                && ensure_reasoning_effort_none(&mut payload)
+            {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Retry)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "provider": &self.name,
+                            "alias": &self.alias,
+                            "request_api": "chat_completions",
+                            "model": model,
+                            "stream": false,
+                            "tools_count": tools_count,
+                            "reasoning_effort_overridden": true,
+                            "reasoning_effort_fallback": "none",
+                            "reasoning_effort_override_reason": "endpoint_rejected_tools_with_reasoning",
+                            "status": status.as_u16(),
+                        })),
+                    "compatible provider retrying with reasoning effort disabled after endpoint capability rejection"
+                );
+                previous_error = Some(provider_http_error(&self.name, status, &error));
+                continue;
+            }
+
+            if budget.is_none()
+                && !exact_request_replay
+                && tools_count > 0
+                && Self::is_native_tool_schema_unsupported(status, &sanitized)
+            {
+                let fallback_messages =
+                    Self::with_prompt_guided_tool_instructions(request.messages, request.tools);
+                let (message, usage) = self
+                    .chat_with_history_inner(
+                        &fallback_messages,
+                        model,
+                        temperature,
+                        request.thinking,
+                    )
+                    .await?;
+                let mut response = self.parse_native_response(message);
+                response.usage = usage;
+                return Ok(response);
+            }
+
+            return Err(provider_http_error(&self.name, status, &error));
+        };
+
+        let body = response.text().await?;
+        let native_response = parse_chat_response_body(&self.name, &body)?;
+        let usage = native_response.usage.map(UsageInfo::into_provider_usage);
+        let message = native_response
+            .choices
+            .into_iter()
+            .next()
+            .map(|choice| choice.message)
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"model_provider": &self.name})),
+                    "compatible: empty choices in response"
+                );
+                anyhow::Error::msg(format!("No response from {}", self.name))
+            })?;
+
+        let mut result = self.parse_native_response(message);
+        result.usage = usage;
+        Ok(result)
+    }
+}
+
 #[async_trait]
 impl ModelProvider for OpenAiCompatibleModelProvider {
     fn supports_exact_request_replay(
@@ -4610,150 +4783,19 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<ProviderChatResponse> {
-        let exact_request_replay = exact_request_replay_active();
-        let credential = self.resolve_credential().await?;
+        self.chat_inner(request, model, temperature, None).await
+    }
 
-        let normalized = self
-            .normalize_messages_for_upstream(request.messages)
-            .await?;
-        let merge = self.effective_merge_system(model);
-        let (effective_messages, system_merged) = Self::flatten_system_messages(&normalized, merge);
-        let effective_messages = if self.native_tool_calling {
-            effective_messages
-        } else {
-            self.strip_native_tool_messages(&effective_messages)
-        };
-
-        let tools = self.convert_tool_specs_for_model(request.tools, model);
-        let native_request = self.build_native_tool_chat_request(
-            &effective_messages,
-            tools,
-            model,
-            temperature,
-            !merge,
-            system_merged,
-            request.thinking,
-        );
-        let mut payload = serde_json::to_value(native_request)?;
-        let tools_count = payload
-            .get("tools")
-            .and_then(serde_json::Value::as_array)
-            .map_or(0, Vec::len);
-        let reasoning_effort_omitted =
-            self.reasoning_effort.is_some() && payload.get("reasoning_effort").is_none();
-        let reasoning_effort_omission_reason =
-            reasoning_effort_omitted.then_some("model_ineligible");
-        if ::zeroclaw_log::debug_enabled() {
-            ::zeroclaw_log::record!(
-                DEBUG,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Send)
-                    .with_attrs(::serde_json::json!({
-                        "provider": &self.name,
-                        "alias": &self.alias,
-                        "request_api": "chat_completions",
-                        "model": model,
-                        "stream": false,
-                        "native_tool_calling": self.native_tool_calling,
-                        "tools_count": tools_count,
-                        "tool_choice": payload.get("tool_choice"),
-                        "reasoning_effort_omitted": reasoning_effort_omitted,
-                        "reasoning_effort_omission_reason": reasoning_effort_omission_reason,
-                    })),
-                "compatible provider request prepared"
-            );
-        }
-
-        let url = self.chat_completions_url();
-        let response = loop {
-            let response = match self
-                .apply_opencode_session_header(self.apply_auth_header(
-                    self.http_client().post(&url).json(&payload),
-                    credential.as_deref(),
-                )?)
-                .send()
-                .await
-            {
-                Ok(response) => response,
-                Err(chat_error) => return Err(chat_error.into()),
-            };
-            if response.status().is_success() {
-                break response;
-            }
-
-            let status = response.status();
-            let error = response.text().await?;
-            let sanitized = super::sanitize_api_error(&error);
-
-            if !exact_request_replay
-                && tools_count > 0
-                && super::rejects_tools_with_reasoning_effort(status, &error)
-                && ensure_reasoning_effort_none(&mut payload)
-            {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Retry)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({
-                            "provider": &self.name,
-                            "alias": &self.alias,
-                            "request_api": "chat_completions",
-                            "model": model,
-                            "stream": false,
-                            "tools_count": tools_count,
-                            "reasoning_effort_overridden": true,
-                            "reasoning_effort_fallback": "none",
-                            "reasoning_effort_override_reason": "endpoint_rejected_tools_with_reasoning",
-                            "status": status.as_u16(),
-                        })),
-                    "compatible provider retrying with reasoning effort disabled after endpoint capability rejection"
-                );
-                continue;
-            }
-
-            if !exact_request_replay
-                && tools_count > 0
-                && Self::is_native_tool_schema_unsupported(status, &sanitized)
-            {
-                let fallback_messages =
-                    Self::with_prompt_guided_tool_instructions(request.messages, request.tools);
-                let (message, usage) = self
-                    .chat_with_history_inner(
-                        &fallback_messages,
-                        model,
-                        temperature,
-                        request.thinking,
-                    )
-                    .await?;
-                let mut response = self.parse_native_response(message);
-                response.usage = usage;
-                return Ok(response);
-            }
-
-            return Err(provider_http_error(&self.name, status, &error));
-        };
-
-        let body = response.text().await?;
-        let native_response = parse_chat_response_body(&self.name, &body)?;
-        let usage = native_response.usage.map(UsageInfo::into_provider_usage);
-        let message = native_response
-            .choices
-            .into_iter()
-            .next()
-            .map(|choice| choice.message)
-            .ok_or_else(|| {
-                ::zeroclaw_log::record!(
-                    ERROR,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({"model_provider": &self.name})),
-                    "compatible: empty choices in response"
-                );
-                anyhow::Error::msg(format!("No response from {}", self.name))
-            })?;
-
-        let mut result = self.parse_native_response(message);
-        result.usage = usage;
-        Ok(result)
+    async fn chat_with_attempt_budget(
+        &self,
+        request: crate::traits::ChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        _policy: zeroclaw_api::model_provider::ToolRoundPolicy,
+        budget: &zeroclaw_api::model_provider::GenerationAttemptBudget,
+    ) -> anyhow::Result<crate::traits::ChatResponse> {
+        self.chat_inner(request, model, temperature, Some(budget))
+            .await
     }
 
     fn supports_native_tools(&self) -> bool {
@@ -17689,5 +17731,86 @@ mod tests {
             !text.contains("[Tool attachments: 1]"),
             "the declared count header must not ride the delivered text: {text}"
         );
+    }
+}
+
+#[cfg(test)]
+mod attempt_budget_tests {
+    use super::*;
+    use crate::bounded::tests as fixture;
+
+    #[tokio::test]
+    async fn compatible_shares_budget_across_calls() {
+        let server = fixture::server(vec![
+            fixture::Reply::json(200, fixture::CHAT_OK),
+            fixture::Reply::json(200, fixture::CHAT_OK),
+        ])
+        .await;
+        let provider = OpenAiCompatibleModelProvider::builder("fixture")
+            .display_name("fixture")
+            .auth_style(AuthStyle::Bearer)
+            .base_url(&server.url)
+            .credential(Some("fixture-key"))
+            .build();
+        fixture::assert_two_requests(&provider, &server).await;
+    }
+
+    #[tokio::test]
+    async fn denied_internal_retry_preserves_the_provider_cause() {
+        let server = fixture::server(vec![fixture::Reply::json(
+            400,
+            r#"{"error":{"message":"Function tools with reasoning effort are not supported"}}"#,
+        )])
+        .await;
+        let provider = OpenAiCompatibleModelProvider::builder("fixture")
+            .display_name("fixture")
+            .auth_style(AuthStyle::Bearer)
+            .base_url(&server.url)
+            .credential(Some("fixture-key"))
+            .build();
+        let budget = crate::traits::GenerationAttemptBudget::new(1);
+        let tools = [zeroclaw_api::tool::ToolSpec::new(
+            "fixture",
+            "fixture",
+            serde_json::json!({"type":"object"}),
+        )];
+        let error =
+            fixture::at_endpoint(&server.url, fixture::call(&provider, &budget, Some(&tools)))
+                .await
+                .unwrap_err();
+        assert!(
+            error.is::<crate::traits::GenerationAttemptBudgetExhausted>(),
+            "{error:#}"
+        );
+        assert!(format!("{error:#}").contains("reasoning effort"));
+        assert_eq!(server.requests.lock().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn bounded_calls_do_not_switch_to_prompt_history() {
+        let server = fixture::server(vec![
+            fixture::Reply::json(400, "function calling is not supported"),
+            fixture::Reply::json(200, fixture::CHAT_OK),
+        ])
+        .await;
+        let provider = OpenAiCompatibleModelProvider::builder("fixture")
+            .display_name("fixture")
+            .auth_style(AuthStyle::Bearer)
+            .base_url(&server.url)
+            .credential(Some("fixture-key"))
+            .build();
+        let budget = crate::traits::GenerationAttemptBudget::new(2);
+        let tools = [zeroclaw_api::tool::ToolSpec::new(
+            "fixture",
+            "fixture",
+            serde_json::json!({"type":"object"}),
+        )];
+        let error =
+            fixture::at_endpoint(&server.url, fixture::call(&provider, &budget, Some(&tools)))
+                .await
+                .unwrap_err();
+        assert!(!error.is::<crate::traits::GenerationAttemptBudgetExhausted>());
+        assert_eq!(server.requests.lock().len(), 1);
+        assert_eq!(budget.remaining(), 1);
     }
 }

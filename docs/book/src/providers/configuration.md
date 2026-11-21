@@ -140,6 +140,44 @@ thinking_passthrough = true
 - Native extended thinking on the Anthropic provider: #10542.
 - Request-body escape hatch: `provider_extra` above; [reference](../reference/config.md#providers).
 
+## Consolidation tool forcing
+
+[Memory consolidation](../architecture/memory-payload-lifecycle.md#consolidation-extraction)
+uses one internal `extract_consolidation` tool as an output envelope. It never
+dispatches that tool as an action. Forced extraction currently uses the native
+Anthropic path only on factory-verified endpoints, with native thinking omitted
+and server-side model fallbacks disabled. Other providers and unverified custom
+endpoints use prompt-guided extraction, even when they support ordinary native
+tools. An unwired tool-choice override does not establish forcing support.
+
+The model-aware `supports_forced_tool_choice` query defaults to false. Model
+pins and routers resolve it for the actual selected model. Reliable requires
+every reachable eligible route to support it. Vision overrides preserve it.
+Native extraction scopes `TOOL_CHOICE_OVERRIDE` to `any`, supplies just the
+extraction tool, and requests a single tool round. An unexpected or duplicate
+tool call fails validation instead of executing.
+
+The native tool schema is mechanically projected from the canonical memory
+schema. The projection omits the dialect annotation, cross-field conditional,
+and nullable type constraints that the provider cleaner would otherwise
+narrow. Applicable string bounds and enums remain. Every returned candidate
+must still pass the complete canonical schema, including nullability and the
+kind/update dependency, before Rust decoding.
+
+Initial extraction, one schema repair in the same mode, adapter recovery,
+transport retries, and availability failover share a total allowance of two
+client generation submissions. Recovery retains its configured order within
+that allowance. A retry or failover can use the final submission, leaving none
+for schema repair. Invalid output then uses the safe history fallback. A provider
+error saves fallback history before returning to the caller with a fixed error
+summary and the original cause retained. The allowance does not count work
+performed internally by remote providers or gateways.
+
+Providers that cannot enforce the allowance decline extraction without submitting
+generation requests. CLI adapters and directly constructed native Ollama or GLM
+providers use history fallback and return a fixed-context error. Configured
+Ollama and GLM routes use Compatible and support bounded extraction.
+
 ## Field resolution order
 
 For most families, the URL is resolved in this order:

@@ -1526,6 +1526,7 @@ impl BedrockModelProvider {
         auth: &BedrockAuth,
         model: &str,
         request_body: &ConverseRequest,
+        budget: Option<&zeroclaw_api::model_provider::GenerationAttemptBudget>,
     ) -> anyhow::Result<ConverseResponse> {
         let payload = serde_json::to_vec(request_body)?;
 
@@ -1562,18 +1563,21 @@ impl BedrockModelProvider {
             }
         }
 
+        let client = match budget {
+            Some(_) => crate::bounded::timeout_client("model_provider.bedrock", 120)?,
+            None => self.http_client(),
+        };
         let response: reqwest::Response = match auth {
             BedrockAuth::BearerToken(token) => {
                 let region = Self::resolve_region();
                 let url = Self::endpoint_url(&region, model);
 
-                self.http_client()
+                let request = client
                     .post(&url)
                     .header("content-type", "application/json")
                     .header("Authorization", format!("Bearer {token}"))
-                    .body(payload)
-                    .send()
-                    .await?
+                    .body(payload);
+                crate::bounded::send(request, budget, None).await?
             }
             BedrockAuth::SigV4(credentials) => {
                 let url = Self::endpoint_url(&credentials.region, model);
@@ -1603,8 +1607,7 @@ impl BedrockModelProvider {
                     &now,
                 );
 
-                let mut request = self
-                    .http_client()
+                let mut request = client
                     .post(&url)
                     .header("content-type", "application/json")
                     .header("x-amz-date", &amz_date)
@@ -1614,7 +1617,7 @@ impl BedrockModelProvider {
                     request = request.header("x-amz-security-token", session_token);
                 }
 
-                request.body(payload).send().await?
+                crate::bounded::send(request.body(payload), budget, None).await?
             }
         };
 
@@ -1629,95 +1632,17 @@ impl BedrockModelProvider {
 
 // ── ModelProvider trait implementation ───────────────────────────────
 
-#[async_trait]
-impl ModelProvider for BedrockModelProvider {
-    fn capabilities(&self) -> ProviderCapabilities {
-        ProviderCapabilities {
-            native_tool_calling: true,
-            vision: true,
-            prompt_caching: false,
-            extended_thinking: true,
-        }
-    }
-
-    fn supports_native_tools(&self) -> bool {
-        true
-    }
-
-    fn convert_tools(&self, tools: &[ToolSpec]) -> ToolsPayload {
-        let tool_values: Vec<serde_json::Value> = tools
-            .iter()
-            .map(|t| {
-                serde_json::json!({
-                    "toolSpec": {
-                        "name": t.name,
-                        "description": t.description,
-                        "inputSchema": { "json": t.parameters }
-                    }
-                })
-            })
-            .collect();
-        ToolsPayload::Anthropic { tools: tool_values }
-    }
-
-    async fn chat_with_system(
-        &self,
-        system_prompt: Option<&str>,
-        message: &str,
-        model: &str,
-        temperature: Option<f64>,
-    ) -> anyhow::Result<String> {
-        let auth = self.resolve_auth().await?;
-
-        let supports_caching = bedrock_model_supports_prompt_caching(model);
-        let system = system_prompt.map(|text| {
-            let mut blocks = vec![SystemBlock::Text(TextBlock {
-                text: text.to_string(),
-            })];
-            if supports_caching && Self::should_cache_system(text) {
-                blocks.push(SystemBlock::CachePoint(CachePointWrapper {
-                    cache_point: CachePoint::default_cache(),
-                }));
-            }
-            blocks
-        });
-
-        let mut messages = vec![ConverseMessage {
-            role: "user".to_string(),
-            content: Self::parse_user_content_blocks(message),
-        }];
-        Self::sanitize_empty_content_blocks(&mut messages);
-
-        let request = ConverseRequest {
-            system,
-            messages,
-            inference_config: Some(InferenceConfig {
-                max_tokens: self.max_tokens,
-                temperature,
-            }),
-            tool_config: None,
-            additional_model_request_fields: None,
-        };
-
-        let response = self.send_converse_request(&auth, model, &request).await?;
-
-        Self::parse_converse_response(response).text.ok_or_else(|| {
-            ::zeroclaw_log::record!(
-                ERROR,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure),
-                "bedrock: empty text in response"
-            );
-            anyhow::Error::msg("No response from Bedrock")
-        })
-    }
-
-    async fn chat(
+impl BedrockModelProvider {
+    async fn chat_inner(
         &self,
         request: ProviderChatRequest<'_>,
         model: &str,
         temperature: Option<f64>,
+        budget: Option<&zeroclaw_api::model_provider::GenerationAttemptBudget>,
     ) -> anyhow::Result<ProviderChatResponse> {
+        if let Some(budget) = budget {
+            budget.ensure_available()?;
+        }
         let auth = self.resolve_auth().await?;
 
         let (system_blocks, mut converse_messages) = Self::convert_messages(request.messages);
@@ -1810,10 +1735,117 @@ impl ModelProvider for BedrockModelProvider {
         };
 
         let response = self
-            .send_converse_request(&auth, model, &converse_request)
+            .send_converse_request(&auth, model, &converse_request, budget)
             .await?;
 
         Ok(Self::parse_converse_response(response))
+    }
+}
+
+#[async_trait]
+impl ModelProvider for BedrockModelProvider {
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            native_tool_calling: true,
+            vision: true,
+            prompt_caching: false,
+            extended_thinking: true,
+        }
+    }
+
+    fn supports_native_tools(&self) -> bool {
+        true
+    }
+
+    fn convert_tools(&self, tools: &[ToolSpec]) -> ToolsPayload {
+        let tool_values: Vec<serde_json::Value> = tools
+            .iter()
+            .map(|t| {
+                serde_json::json!({
+                    "toolSpec": {
+                        "name": t.name,
+                        "description": t.description,
+                        "inputSchema": { "json": t.parameters }
+                    }
+                })
+            })
+            .collect();
+        ToolsPayload::Anthropic { tools: tool_values }
+    }
+
+    async fn chat_with_system(
+        &self,
+        system_prompt: Option<&str>,
+        message: &str,
+        model: &str,
+        temperature: Option<f64>,
+    ) -> anyhow::Result<String> {
+        let auth = self.resolve_auth().await?;
+
+        let supports_caching = bedrock_model_supports_prompt_caching(model);
+        let system = system_prompt.map(|text| {
+            let mut blocks = vec![SystemBlock::Text(TextBlock {
+                text: text.to_string(),
+            })];
+            if supports_caching && Self::should_cache_system(text) {
+                blocks.push(SystemBlock::CachePoint(CachePointWrapper {
+                    cache_point: CachePoint::default_cache(),
+                }));
+            }
+            blocks
+        });
+
+        let mut messages = vec![ConverseMessage {
+            role: "user".to_string(),
+            content: Self::parse_user_content_blocks(message),
+        }];
+        Self::sanitize_empty_content_blocks(&mut messages);
+
+        let request = ConverseRequest {
+            system,
+            messages,
+            inference_config: Some(InferenceConfig {
+                max_tokens: self.max_tokens,
+                temperature,
+            }),
+            tool_config: None,
+            additional_model_request_fields: None,
+        };
+
+        let response = self
+            .send_converse_request(&auth, model, &request, None)
+            .await?;
+
+        Self::parse_converse_response(response).text.ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                "bedrock: empty text in response"
+            );
+            anyhow::Error::msg("No response from Bedrock")
+        })
+    }
+
+    async fn chat(
+        &self,
+        request: ProviderChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+    ) -> anyhow::Result<ProviderChatResponse> {
+        self.chat_inner(request, model, temperature, None).await
+    }
+
+    async fn chat_with_attempt_budget(
+        &self,
+        request: crate::traits::ChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        _policy: zeroclaw_api::model_provider::ToolRoundPolicy,
+        budget: &zeroclaw_api::model_provider::GenerationAttemptBudget,
+    ) -> anyhow::Result<crate::traits::ChatResponse> {
+        self.chat_inner(request, model, temperature, Some(budget))
+            .await
     }
 
     async fn warmup(&self) -> anyhow::Result<()> {
@@ -3116,5 +3148,45 @@ credential_process=some-command
         assert!(model_provider.cached_credentials().is_none());
         model_provider.cache_credentials(&make_creds(Some(future)));
         assert!(model_provider.cached_credentials().is_some());
+    }
+}
+
+#[cfg(test)]
+mod attempt_budget_tests {
+    use super::*;
+    use crate::bounded::tests as fixture;
+
+    #[tokio::test]
+    async fn bedrock_shares_budget_across_calls() {
+        let server = fixture::server(vec![
+            fixture::Reply::json(200, fixture::BEDROCK_OK),
+            fixture::Reply::json(200, fixture::BEDROCK_OK),
+        ])
+        .await;
+        let provider = BedrockModelProvider::builder("fixture")
+            .bearer_token("fixture-key")
+            .build();
+        fixture::assert_two_requests(&provider, &server).await;
+    }
+    #[tokio::test]
+    async fn sigv4_generation_uses_the_shared_transport_budget() {
+        let server = fixture::server(vec![
+            fixture::Reply::json(200, fixture::BEDROCK_OK),
+            fixture::Reply::json(200, fixture::BEDROCK_OK),
+        ])
+        .await;
+        let creds = AwsCredentials {
+            access_key_id: "fixture-key".into(),
+            secret_access_key: "fixture-secret".into(),
+            session_token: None,
+            region: "us-east-1".into(),
+            expires_at: None,
+        };
+        let mut provider = BedrockModelProvider::builder("fixture")
+            .bearer_token("fixture-key")
+            .build();
+        provider.cache_credentials(&creds);
+        provider.auth = Some(BedrockAuth::SigV4(creds));
+        fixture::assert_two_requests(&provider, &server).await;
     }
 }
