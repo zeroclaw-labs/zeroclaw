@@ -331,6 +331,7 @@ mod tests {
                 access_token: Some("tok".into()),
                 user_id: None,
                 device_id: None,
+                owner_user_id: None,
                 allowed_rooms: vec!["!r:m".into()],
                 interrupt_on_new_message: false,
                 stream_mode: MatrixStreamMode::default(),

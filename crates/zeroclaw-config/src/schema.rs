@@ -37433,6 +37433,7 @@ allowed_contacts = ["+1234567890", "user@icloud.com"]
     #[test]
     async fn matrix_config_serde() {
         let mc = MatrixConfig {
+            owner_user_id: None,
             enabled: true,
             homeserver: "https://matrix.org".into(),
             access_token: Some("syt_token_abc".into()),
@@ -37473,6 +37474,7 @@ allowed_contacts = ["+1234567890", "user@icloud.com"]
     #[test]
     async fn matrix_config_toml_roundtrip() {
         let mc = MatrixConfig {
+            owner_user_id: None,
             enabled: true,
             homeserver: "https://synapse.local:8448".into(),
             access_token: Some("tok".into()),
@@ -37659,6 +37661,7 @@ allowed_users = ["@u:matrix.org"]
             matrix: HashMap::from([(
                 "default".to_string(),
                 MatrixConfig {
+                    owner_user_id: None,
                     enabled: true,
                     homeserver: "https://m.org".into(),
                     access_token: Some("tok".into()),
@@ -48109,6 +48112,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
     #[test]
     async fn matrix_secret_fields_discovered() {
         let mx = MatrixConfig {
+            owner_user_id: None,
             enabled: true,
             homeserver: "https://m.org".into(),
             access_token: Some("tok".into()),
@@ -48148,6 +48152,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
     #[test]
     async fn matrix_secret_fields_empty_not_set() {
         let mx = MatrixConfig {
+            owner_user_id: None,
             enabled: true,
             homeserver: "https://m.org".into(),
             access_token: None,
@@ -48192,6 +48197,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
     #[test]
     async fn set_secret_updates_field() {
         let mut mx = MatrixConfig {
+            owner_user_id: None,
             enabled: true,
             homeserver: "https://m.org".into(),
             access_token: Some("old".into()),
@@ -48225,6 +48231,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
     #[test]
     async fn set_secret_unknown_name_fails() {
         let mut mx = MatrixConfig {
+            owner_user_id: None,
             enabled: true,
             homeserver: "https://m.org".into(),
             access_token: Some("tok".into()),
@@ -48269,6 +48276,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
         config.channels.matrix.insert(
             "default".to_string(),
             MatrixConfig {
+                owner_user_id: None,
                 enabled: true,
                 homeserver: "https://m.org".into(),
                 access_token: Some("mx-tok".into()),
@@ -48312,6 +48320,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
         config.channels.matrix.insert(
             "default".to_string(),
             MatrixConfig {
+                owner_user_id: None,
                 enabled: true,
                 homeserver: "https://m.org".into(),
                 access_token: Some("old".into()),
@@ -48360,6 +48369,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
         config.channels.matrix.insert(
             "default".to_string(),
             MatrixConfig {
+                owner_user_id: None,
                 enabled: true,
                 homeserver: "https://m.org".into(),
                 access_token: Some("old".into()),
@@ -48476,6 +48486,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
         let store = crate::secrets::SecretStore::new(dir.path(), true);
 
         let mut mx = MatrixConfig {
+            owner_user_id: None,
             enabled: true,
             homeserver: "https://m.org".into(),
             access_token: Some("plaintext-token".into()),
@@ -48520,6 +48531,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
         let store = crate::secrets::SecretStore::new(dir.path(), true);
 
         let mut mx = MatrixConfig {
+            owner_user_id: None,
             enabled: true,
             homeserver: "https://m.org".into(),
             access_token: Some("plaintext-token".into()),
@@ -48560,6 +48572,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
         let store = crate::secrets::SecretStore::new(dir.path(), false);
 
         let mut mx = MatrixConfig {
+            owner_user_id: None,
             enabled: true,
             homeserver: "https://m.org".into(),
             access_token: Some("plaintext-token".into()),
@@ -48595,6 +48608,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
 
     fn test_matrix_config() -> MatrixConfig {
         MatrixConfig {
+            owner_user_id: None,
             enabled: true,
             homeserver: "https://m.org".into(),
             access_token: Some("tok".into()),

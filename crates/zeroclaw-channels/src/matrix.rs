@@ -2493,24 +2493,40 @@ mod inbound {
     const OWNER_NOTICE_THROTTLE: Duration = Duration::from_secs(300);
 
     /// Sliding-window throttle admission: returns true (and records `now`)
-    /// when the pair's last notice is older than [`OWNER_NOTICE_THROTTLE`]
-    /// or absent, false otherwise. The map stays bounded in practice because
-    /// every admission rewrites the pair's slot and keys are only created by
-    /// real turn-away events.
+    /// when both the (sender, room) pair and the per-alias aggregate are
+    /// outside the [`OWNER_NOTICE_THROTTLE`] window, false otherwise.
+    ///
+    /// The per-pair slot alone cannot bound the operator's DM: a spammer
+    /// rotating senders (or rooms) would keep every pair inside its own
+    /// budget while the total flow to the owner stays a firehose. The
+    /// aggregate slot caps the whole alias at one notice per window. It
+    /// lives in the same map under `(alias, "")` — a real pair can never
+    /// collide with it because a room id is never empty. The map stays
+    /// bounded in practice because every admission rewrites its slot and
+    /// keys are only created by real turn-away events.
     pub(super) fn owner_notice_throttle_admits(
         throttle: &mut HashMap<(String, String), std::time::Instant>,
+        alias: &str,
         sender: &str,
         room_id: &str,
         now: std::time::Instant,
     ) -> bool {
-        let key = (sender.to_string(), room_id.to_string());
-        match throttle.get(&key) {
-            Some(last) if now.duration_since(*last) < OWNER_NOTICE_THROTTLE => false,
-            _ => {
-                throttle.insert(key, now);
-                true
-            }
+        let pair = (sender.to_string(), room_id.to_string());
+        let aggregate = (alias.to_string(), String::new());
+        let pair_ready = match throttle.get(&pair) {
+            Some(last) => now.duration_since(*last) >= OWNER_NOTICE_THROTTLE,
+            None => true,
+        };
+        let aggregate_ready = match throttle.get(&aggregate) {
+            Some(last) => now.duration_since(*last) >= OWNER_NOTICE_THROTTLE,
+            None => true,
+        };
+        if !pair_ready || !aggregate_ready {
+            return false;
         }
+        throttle.insert(pair, now);
+        throttle.insert(aggregate, now);
+        true
     }
 
     /// Bounded single-line preview of the turned-away message for the owner
@@ -2566,6 +2582,7 @@ mod inbound {
             let mut throttle = ctx.owner_notice_throttle.lock().ok()?;
             if !owner_notice_throttle_admits(
                 &mut throttle,
+                &ctx.alias,
                 sender,
                 room_id,
                 std::time::Instant::now(),
@@ -12693,21 +12710,72 @@ mod tests {
         fn throttle_admits_first_suppresses_within_window_readmits_after() {
             let mut map = HashMap::new();
             let t0 = Instant::now();
-            assert!(owner_notice_throttle_admits(&mut map, "@a:s", "!r:s", t0));
+            assert!(owner_notice_throttle_admits(
+                &mut map, "bot", "@a:s", "!r:s", t0
+            ));
             assert!(!owner_notice_throttle_admits(
                 &mut map,
+                "bot",
                 "@a:s",
                 "!r:s",
                 t0 + Duration::from_secs(10)
             ));
-            // A different (sender, room) pair has its own budget.
-            assert!(owner_notice_throttle_admits(&mut map, "@b:s", "!r:s", t0));
+            // A different (sender, room) pair has its own budget — but the
+            // per-alias aggregate caps the total flow to the owner, so a
+            // spammer rotating pairs cannot turn the DM into a firehose.
+            assert!(!owner_notice_throttle_admits(
+                &mut map,
+                "bot",
+                "@b:s",
+                "!r:s",
+                t0 + Duration::from_secs(10)
+            ));
+            assert!(!owner_notice_throttle_admits(
+                &mut map,
+                "bot",
+                "@a:s",
+                "!other:s",
+                t0 + Duration::from_secs(20)
+            ));
             // Past the window the pair is admitted again.
             assert!(owner_notice_throttle_admits(
                 &mut map,
+                "bot",
                 "@a:s",
                 "!r:s",
                 t0 + Duration::from_secs(301)
+            ));
+        }
+
+        #[test]
+        fn throttle_aggregate_is_per_alias() {
+            // Each channel instance owns its throttle map (see HandlerCtx),
+            // so aliases never share one — model production with two maps.
+            let mut map_a = HashMap::new();
+            let mut map_b = HashMap::new();
+            let t0 = Instant::now();
+            assert!(owner_notice_throttle_admits(
+                &mut map_a, "bot-a", "@a:s", "!r:s", t0
+            ));
+            // A different alias has its own aggregate budget.
+            assert!(owner_notice_throttle_admits(
+                &mut map_b, "bot-b", "@a:s", "!r:s", t0
+            ));
+            // ...and each alias's aggregate is still suppressed within the
+            // window regardless of which pair rotates in.
+            assert!(!owner_notice_throttle_admits(
+                &mut map_a,
+                "bot-a",
+                "@b:s",
+                "!r:s",
+                t0 + Duration::from_secs(10)
+            ));
+            assert!(!owner_notice_throttle_admits(
+                &mut map_b,
+                "bot-b",
+                "@b:s",
+                "!r:s",
+                t0 + Duration::from_secs(10)
             ));
         }
 
