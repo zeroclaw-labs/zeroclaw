@@ -1735,7 +1735,7 @@ mod tests {
         // OIDC Core §2: an ID token's `aud` MUST contain its client and MAY
         // list other audiences. A nonce-free ID token naming both the
         // signing-in client and the API identifier must not pass as an
-        // untyped access token (review finding on #12496 / #12498).
+        // untyped access token.
         let idp = start_idp().await;
         let provider = OidcAuthProvider::new("test", idp.untyped_config()).unwrap();
         for aud in [
