@@ -204,24 +204,6 @@ impl DecisionModel for NativeDecisionClient {
                 json!({ "model": self.model, "state": state, "questions": questions })
             }
         };
-<<<<<<< HEAD
-        // Resolve the client for every request so proxy-generation changes are
-        // observed by long-lived decision providers just like the other
-        // capability adapters.
-        let mut request = self
-            .transport
-            .client(DEFAULT_DECISION_TIMEOUT, "decision")?
-            .post(&self.endpoint)
-            .json(&body);
-        if let Some(api_key) = self
-            .transport
-            .api_key
-            .as_deref()
-            .filter(|key| !key.trim().is_empty())
-        {
-            request = request.bearer_auth(api_key);
-        }
-=======
         // Resolve the client through the live proxy cache for every call.
         // Publishing proxy settings invalidates that cache; retaining a
         // client constructed here would keep routing requests through the
@@ -230,7 +212,6 @@ impl DecisionModel for NativeDecisionClient {
             .transport
             .client(DEFAULT_DECISION_TIMEOUT, "decision")?;
         let request = self.transport.bearer(http.post(&self.endpoint).json(&body));
->>>>>>> my-github/stack/pr9809-05d-config-reflection
         let response = request
             .send()
             .await
