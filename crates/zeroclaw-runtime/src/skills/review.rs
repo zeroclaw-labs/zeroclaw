@@ -100,6 +100,8 @@ pub async fn maybe_run_skill_review(
             runtime: Arc::new(crate::platform::NativeRuntime::new()),
             caller_allowed: None,
             connect_mcp: false,
+            // Background post-turn review: never interactive.
+            interactive: false,
             connect_peripherals: false,
             exclude_memory: false,
             acp_delivery: false,
@@ -146,6 +148,7 @@ pub async fn maybe_run_skill_review(
                         observer,
                         // low so the fork doesn't ramble
                         silent: true,
+                        live_sop_interactive: false,
                         approval: None,
                         multimodal_config: multimodal,
                         config: full_config,

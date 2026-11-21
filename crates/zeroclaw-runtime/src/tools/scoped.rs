@@ -559,6 +559,37 @@ impl ScopedToolRegistry {
     }
 }
 
+/// Whether this process is attached to a human at a terminal: the ONLY
+/// shape in which opening a browser and blocking up to the callback timeout
+/// is sensible. Gateway requests, channel messages, eval runs, and ACP
+/// sessions assemble through this same path but have no terminal — for
+/// them a sign-in prompt would silently stall a random request for minutes,
+/// so they must get the fast background error instead. Both streams must be
+/// TTYs: a redirected stdin (or a piped stderr) with the other attached (or
+/// vice versa) is automation with eyes on the log, not a session.
+fn interactive_session() -> bool {
+    use std::io::IsTerminal;
+    interactive_for(
+        std::io::stdin().is_terminal(),
+        std::io::stderr().is_terminal(),
+    )
+}
+
+/// The pure decision, split out so the rule is unit-testable.
+fn interactive_for(stdin_tty: bool, stderr_tty: bool) -> bool {
+    stdin_tty && stderr_tty
+}
+
+/// Whether an MCP sign-in may run interactively: the entry point that owns
+/// a human must DECLARE the posture (`ScopedAssembly::interactive`), AND
+/// this process must actually be attached to a terminal. Entry declaration
+/// alone is not enough (a `--message` one-shot from a pipe runs the same
+/// code with no terminal); a terminal alone is not enough (a foreground
+/// gateway owns one but its turns answer channel messages).
+fn sign_in_interactive(entry_declared: bool) -> bool {
+    entry_declared && interactive_session()
+}
+
 /// Inputs to [`ScopedToolRegistry::assemble`]. The eager built-ins arrive already
 /// built (`built`); `assemble` does the policy-bearing steps the sites used to repeat.
 pub struct ScopedAssembly<'a> {
@@ -583,6 +614,16 @@ pub struct ScopedAssembly<'a> {
     /// surfaces (the gateway's `/api/tools` registries) MUST pass `false` so they never
     /// hold devices the live turn paths need; execution surfaces pass `true`.
     pub connect_peripherals: bool,
+    /// Documented divergence: interactivity is DECLARED by the entry point
+    /// that owns the human, never probed from this assembly site. Only the
+    /// foreground CLI/zerocode `run` paths pass `true` (the browser sign-in
+    /// for an OAuth MCP server may then open on this machine); every
+    /// unattended surface - daemon workers, channel orchestrator, gateway,
+    /// ACP, delegate, eval, parity - passes `false` so an inbound message
+    /// can never start an interactive flow on a host that happens to own a
+    /// terminal. The assembly still ANDs the process TTY reality before an
+    /// interactive sign-in is attempted.
+    pub interactive: bool,
     /// Documented divergence: ACP excludes persistent memory tools.
     pub exclude_memory: bool,
     /// `deliver_file` hands the client a typed file attachment that only an
@@ -768,6 +809,7 @@ impl ScopedToolRegistry {
             runtime,
             caller_allowed,
             connect_mcp,
+            interactive,
             connect_peripherals,
             exclude_memory,
             acp_delivery,
@@ -1059,7 +1101,23 @@ impl ScopedToolRegistry {
                         agent_mcp_servers.len(),
                         0,
                     );
-                    match tools::McpRegistry::connect_all(&agent_mcp_servers).await {
+                    // Interactivity is DECLARED by the entry point that
+                    // owns the human (assembly field), and only then checked
+                    // against an actually attached terminal: a foreground
+                    // CLI session may run the browser sign-in here, while
+                    // gateway/channel/eval/ACP assemblies pass false even
+                    // when the process owns a terminal, so an inbound
+                    // message never starts an interactive flow on the host.
+                    // The daemon worker paths pass false and never prompt.
+                    let interactive = sign_in_interactive(interactive);
+                    let oauth_manager = zeroclaw_tools::mcp_oauth::shared_oauth_manager(config);
+                    match tools::McpRegistry::connect_all_with_oauth(
+                        &agent_mcp_servers,
+                        oauth_manager.as_ref(),
+                        interactive,
+                    )
+                    .await
+                    {
                         Ok(registry) => Some(Arc::new(registry)),
                         Err(err) => {
                             // Non-fatal (the assembly proceeds without MCP), but an ERROR
@@ -1621,6 +1679,28 @@ mod tests {
     use async_trait::async_trait;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    #[test]
+    fn interactive_requires_both_streams_attached() {
+        // Pure decision matrix: only a real terminal session is
+        // interactive; a single attached stream is automation.
+        assert!(interactive_for(true, true));
+        assert!(!interactive_for(false, true));
+        assert!(!interactive_for(true, false));
+        assert!(!interactive_for(false, false));
+    }
+
+    #[test]
+    fn undeclared_entry_is_never_interactive_regardless_of_terminal() {
+        // The entry declaration is a hard gate: gateway/channel/ACP/daemon
+        // assemblies pass false and no terminal shape can upgrade them.
+        assert!(!sign_in_interactive(false));
+        // A declared entry still requires the terminal fact; in a test
+        // process (piped streams) the conjunction must be false.
+        use std::io::IsTerminal;
+        let attached = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
+        assert_eq!(sign_in_interactive(true), attached);
+    }
+
     struct MockTool(&'static str);
 
     impl zeroclaw_api::attribution::Attributable for MockTool {
@@ -1755,6 +1835,7 @@ mod tests {
         config.pipeline.max_steps = 20;
         config.pipeline.allowed_tools = vec!["shell".to_string(), "file_write".to_string()];
         ScopedToolRegistry::assemble(ScopedAssembly {
+            interactive: false,
             config: &config,
             agent_alias: "default",
             security: &security,
@@ -1962,6 +2043,7 @@ mod tests {
             ..SecurityPolicy::default()
         });
         let assembled = ScopedToolRegistry::assemble(ScopedAssembly {
+            interactive: false,
             config: &config,
             agent_alias: "default",
             security: &security,
@@ -2063,6 +2145,7 @@ mod tests {
         });
         let config = Config::default();
         let assembled = ScopedToolRegistry::assemble(ScopedAssembly {
+            interactive: false,
             config: &config,
             agent_alias: "default",
             security: &security,
@@ -2106,6 +2189,7 @@ mod tests {
     ) -> Vec<String> {
         let config = Config::default();
         let out = ScopedToolRegistry::assemble(ScopedAssembly {
+            interactive: false,
             config: &config,
             agent_alias: "default",
             security: &security,
@@ -2154,6 +2238,7 @@ mod tests {
         listing: bool,
     ) -> ScopedAssembled {
         ScopedToolRegistry::assemble(ScopedAssembly {
+            interactive: false,
             config,
             agent_alias: "default",
             security,
@@ -2539,6 +2624,7 @@ mod tests {
             built.delegate_handle = Some(Arc::clone(&parent));
             let mut assembled = ScopedToolRegistry::assemble_prepared(
                 ScopedAssembly {
+                    interactive: false,
                     config: &config,
                     agent_alias: "test-agent",
                     security: &security,
@@ -2609,6 +2695,7 @@ mod tests {
         built.delegate_handle = Some(Arc::clone(&parent));
         ScopedToolRegistry::assemble_prepared(
             ScopedAssembly {
+                interactive: false,
                 config: &config,
                 agent_alias: "default",
                 security: &security,
@@ -2745,6 +2832,7 @@ mod tests {
             .upgrade()
             .unwrap();
         let mut assembled = ScopedToolRegistry::assemble(ScopedAssembly {
+            interactive: false,
             config: &config,
             agent_alias: "default",
             security: &security,
@@ -2894,6 +2982,7 @@ mod tests {
         };
         let security = Arc::new(SecurityPolicy::default());
         let assembled = ScopedToolRegistry::assemble(ScopedAssembly {
+            interactive: false,
             config: &config,
             agent_alias: "default",
             security: &security,
@@ -2958,6 +3047,7 @@ mod tests {
         let config = Config::default();
         let security = Arc::new(SecurityPolicy::default());
         let out = ScopedToolRegistry::assemble(ScopedAssembly {
+            interactive: false,
             config: &config,
             agent_alias: "default",
             security: &security,
@@ -3038,6 +3128,7 @@ mod tests {
         let out = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             ScopedToolRegistry::assemble(ScopedAssembly {
+                interactive: false,
                 config: &config,
                 agent_alias: "unscoped",
                 security: &security,
@@ -3185,6 +3276,7 @@ mod tests {
         let out = tokio::time::timeout(
             std::time::Duration::from_secs(10),
             ScopedToolRegistry::assemble(ScopedAssembly {
+                interactive: false,
                 config,
                 agent_alias: "scoped",
                 security: &security,
@@ -3354,6 +3446,7 @@ mod tests {
             std::time::Duration::from_secs(10),
             ScopedToolRegistry::assemble_prepared(
                 ScopedAssembly {
+                    interactive: false,
                     config,
                     agent_alias: "scoped",
                     security: &security,
@@ -3689,6 +3782,7 @@ mod tests {
         let config = Config::default();
         let security = Arc::new(SecurityPolicy::default());
         let out = ScopedToolRegistry::assemble(ScopedAssembly {
+            interactive: false,
             config: &config,
             agent_alias: "default",
             security: &security,
@@ -3813,6 +3907,7 @@ mod tests {
         let out = tokio::time::timeout(
             std::time::Duration::from_secs(10),
             ScopedToolRegistry::assemble(ScopedAssembly {
+                interactive: false,
                 config: &config,
                 agent_alias: "test-agent",
                 security: &security,

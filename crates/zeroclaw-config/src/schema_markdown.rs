@@ -866,6 +866,9 @@ mod tests {
             "url",
             "headers",
             "tool_timeout_secs",
+            "oauth",
+            "oauth_client_id",
+            "oauth_scopes",
         ] {
             assert!(
                 table.contains(&format!("<code>{field}</code>")),

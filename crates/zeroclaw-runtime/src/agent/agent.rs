@@ -3461,6 +3461,9 @@ impl Agent {
                 // admits only the named ones.
                 caller_allowed: principal_allowed_tools.as_deref(),
                 connect_mcp: initialize_mcp,
+                // Streamed Agent sessions serve remote clients (dashboard /
+                // RPC), never a human at this process's terminal.
+                interactive: false,
                 connect_peripherals: false,
                 exclude_memory,
                 acp_delivery,
@@ -4592,6 +4595,11 @@ impl Agent {
                                 tools_registry: &self.tools,
                                 observer: self.observer.as_ref(),
                                 silent: false,
+                                // Streamed Agent turns serve remote clients
+                                // (dashboard/RPC), never a human at this
+                                // process's terminal: unattended posture even
+                                // though output streams.
+                                live_sop_interactive: false,
                                 approval: self.approval_manager.as_deref(),
                                 multimodal_config: &self.multimodal_config,
                                 // Inlined `full_config()` (per-field borrow) so it coexists with
@@ -5237,6 +5245,7 @@ impl Agent {
                                     tools_registry: &self.tools,
                                     observer: self.observer.as_ref(),
                                     silent: true,
+                                    live_sop_interactive: false,
                                     approval: self.approval_manager.as_deref(),
                                     multimodal_config: &self.multimodal_config,
                                     // Inlined `full_config()` (per-field borrow) so it coexists with
@@ -6785,6 +6794,7 @@ mod tests {
         )
         .unwrap();
         crate::tools::scoped::ScopedToolRegistry::assemble(crate::tools::scoped::ScopedAssembly {
+            interactive: false,
             config: &config,
             agent_alias: "default",
             security: &security,
@@ -7112,6 +7122,7 @@ mod tests {
         .unwrap();
         let registry = crate::tools::scoped::ScopedToolRegistry::assemble(
             crate::tools::scoped::ScopedAssembly {
+                interactive: false,
                 config: &config,
                 agent_alias: "default",
                 security: &security,
@@ -7297,6 +7308,7 @@ mod tests {
         )
         .expect("the tool factory builds");
         crate::tools::scoped::ScopedToolRegistry::assemble(crate::tools::scoped::ScopedAssembly {
+            interactive: false,
             config,
             agent_alias: "alpha",
             security,
@@ -7815,6 +7827,7 @@ mod tests {
         .expect("the tool factory builds");
         let registry = crate::tools::scoped::ScopedToolRegistry::assemble(
             crate::tools::scoped::ScopedAssembly {
+                interactive: false,
                 config: &config,
                 agent_alias: "alpha",
                 security: &security,
@@ -12242,6 +12255,7 @@ mod tests {
             );
             let security = Arc::new(crate::security::SecurityPolicy::default());
             let assembled = ScopedToolRegistry::assemble(ScopedAssembly {
+                interactive: false,
                 config: &config,
                 agent_alias: "default",
                 security: &security,

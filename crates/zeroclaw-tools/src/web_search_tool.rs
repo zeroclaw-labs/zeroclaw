@@ -2102,10 +2102,10 @@ fn duckduckgo_gap(entropy: u64) -> Duration {
 
 /// Non-cryptographic entropy for scrape jitter and header rotation.
 ///
-/// Deliberately not `rand`: this crate does not otherwise depend on it, and
-/// the requirement here is only "not a fixed, fingerprintable pattern", not
-/// unpredictability against an adversary. A seeded xorshift64 over one atomic
-/// meets that at zero dependency cost.
+/// Deliberately not `rand`: the crate only carries it for the CSPRNG secrets
+/// in `mcp_oauth`, and the requirement here is only "not a fixed,
+/// fingerprintable pattern", not unpredictability against an adversary. A
+/// seeded xorshift64 over one atomic meets that at zero extra cost.
 fn scrape_entropy() -> u64 {
     static STATE: AtomicU64 = AtomicU64::new(0);
 

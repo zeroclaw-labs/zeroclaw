@@ -73,6 +73,7 @@ pub mod llm_task;
 pub mod mcp_client;
 pub mod mcp_context;
 pub mod mcp_deferred;
+pub mod mcp_oauth;
 pub mod mcp_prompt;
 pub mod mcp_prompts_tool;
 pub mod mcp_protocol;

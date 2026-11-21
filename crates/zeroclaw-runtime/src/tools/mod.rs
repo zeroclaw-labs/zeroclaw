@@ -4511,6 +4511,7 @@ mod tests {
         assert!(built.poll_handle.is_none());
         assert!(built.ask_user_handle.is_none());
         let assembled = ScopedToolRegistry::assemble(ScopedAssembly {
+            interactive: false,
             config: &config,
             agent_alias: "lean",
             security: &security,
@@ -5666,6 +5667,8 @@ permissions = ["http_client"]
             runtime,
             caller_allowed: None,
             connect_mcp: false,
+            // Plugin-collision probe is a test surface: unattended.
+            interactive: false,
             connect_peripherals: true,
             exclude_memory: false,
             acp_delivery: false,
@@ -8589,6 +8592,7 @@ permissions = ["http_client"]
         // The scoped assembly mints `execute_pipeline` and the MCP capability
         // tools. `acp_delivery` keeps `deliver_file`, which only ACP turns admit.
         let assembled = scoped::ScopedToolRegistry::assemble(scoped::ScopedAssembly {
+            interactive: false,
             config: &cfg,
             agent_alias: "test-agent",
             security: &security,

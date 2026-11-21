@@ -1856,6 +1856,10 @@ impl DelegateTool {
                 runtime,
                 caller_allowed: None,
                 connect_mcp: true,
+                // A delegated child runs unattended: it must never start an
+                // interactive sign-in on the host, even when the parent's
+                // session is interactive.
+                interactive: false,
                 connect_peripherals: false,
                 exclude_memory: false,
                 acp_delivery: false,
@@ -5575,6 +5579,8 @@ impl DelegateTool {
                             runtime: bounded_runtime,
                             caller_allowed: None,
                             connect_mcp: false,
+                            // Bounded children are unattended surfaces.
+                            interactive: false,
                             connect_peripherals: false,
                             exclude_memory: false,
                             acp_delivery: false,
@@ -5757,6 +5763,7 @@ impl DelegateTool {
                         tools_registry: &sub_tools,
                         observer: loop_observer,
                         silent: true,
+                        live_sop_interactive: false,
                         approval: approval_manager.as_ref(),
                         multimodal_config: target_config
                             .map_or(&self.multimodal_config, |config| &config.multimodal),
@@ -9543,6 +9550,7 @@ mod tests {
         built.delegate_handle = Some(parent);
         built.unfiltered_tool_arcs = actual;
         crate::tools::scoped::ScopedToolRegistry::assemble(crate::tools::scoped::ScopedAssembly {
+            interactive: false,
             config: &fixture.config,
             agent_alias: "caller",
             security: &fixture.delegate.security,
@@ -22682,6 +22690,7 @@ command = "rm independent-delegate-marker"
                 );
                 let scoped = crate::tools::scoped::ScopedToolRegistry::assemble(
                     crate::tools::scoped::ScopedAssembly {
+                        interactive: false,
                         config: &config,
                         agent_alias: "caller",
                         security: &caller,

@@ -157,6 +157,7 @@ async fn parity_l1_engine_honors_excluded_tools() {
                 temperature: None,
             },
             ResolvedIo {
+                live_sop_interactive: false,
                 tools_registry: &tools_registry,
                 observer: &observability::NoopObserver {},
                 silent: true,
@@ -262,6 +263,7 @@ async fn parity_l2_builtin_filter_semantic_parity() {
     let security = a4_policy();
 
     let assembled = ScopedToolRegistry::assemble(ScopedAssembly {
+        interactive: false,
         config: &Config::default(),
         agent_alias: "default",
         security: &security,
@@ -413,6 +415,7 @@ async fn parity_l2_sop_live_step_agent_isolation() {
     // security-relevant comparison is over that shared name universe.
     let universe = ["file_read", "shell", "memory_recall"];
     let assembled = ScopedToolRegistry::assemble(ScopedAssembly {
+        interactive: false,
         config: &config,
         agent_alias: "restricted",
         security: &security,
