@@ -31,7 +31,7 @@
 #   services.zeroclaw.instances.me = {
 #     environmentFile = "/run/agenix/zeroclaw-bot-token";
 #     settings = {
-#       schema_version = 4;   # always set it; see the `settings` option
+#       schema_version = 5;   # always set it; see the `settings` option
 #       providers.models.anthropic.default.model = "claude-sonnet-4-6";
 #       agents.default = {
 #         model_provider = "anthropic.default";
@@ -178,7 +178,7 @@ let
           default = { };
           example = literalExpression ''
             {
-              schema_version = 4;
+              schema_version = 5;
               providers.models.anthropic.default.model = "claude-sonnet-4-6";
               agents.default = {
                 model_provider = "anthropic.default";
@@ -200,7 +200,7 @@ let
           '';
           description = ''
             ZeroClaw configuration as a Nix attrset. Set `schema_version` to
-            the version the attrset is written for (`4` for the current
+            the version the attrset is written for (`5` for the current
             shape). The module renders the attrset as written and does not add
             it: a file without it is read as the oldest schema and migrated,
             unless its sections are plainly in the current shape.
