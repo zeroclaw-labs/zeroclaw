@@ -219,7 +219,7 @@ export function ConfigDraftProvider({ children }: { children: ReactNode }) {
       return { saved: true, results: [], warnings: [] };
     }
     try {
-      const resp = await patchConfig(ops);
+      const resp = await patchConfig(ops, { warningsHandledLocally: true });
       // Successful save: clear everything that just landed.
       setDrafts({});
       setComments({});

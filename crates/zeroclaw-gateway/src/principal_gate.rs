@@ -543,9 +543,15 @@ pub struct ConfigWriteAuthorization {
     /// wildcard selector.
     enforced: Option<ConfigWriteSet>,
     authority: Option<Arc<GatewayInboundAuth>>,
+    can_read_config: bool,
 }
 
 impl ConfigWriteAuthorization {
+    /// Whether this caller may receive diagnostics about other config paths.
+    pub(crate) fn can_read_config(&self) -> bool {
+        self.can_read_config
+    }
+
     /// Refuse when `dirty`, the paths about to be persisted, reaches
     /// beyond the authorized write set: the handler could not identify its
     /// complete write set up front, and a scoped principal is refused
@@ -587,10 +593,14 @@ impl ConfigWriteAuthorization {
     }
 }
 
-fn unenforced(authority: Option<Arc<GatewayInboundAuth>>) -> ConfigWriteAuthorization {
+fn unenforced(
+    authority: Option<Arc<GatewayInboundAuth>>,
+    can_read_config: bool,
+) -> ConfigWriteAuthorization {
     ConfigWriteAuthorization {
         enforced: None,
         authority,
+        can_read_config,
     }
 }
 
@@ -619,6 +629,28 @@ fn current_grants(
         .map_err(WriteDenied::authority_lost)
 }
 
+/// Recheck read authority under the same guard used for the eventual write.
+/// PATCH `test` can reveal a value before the write set is authorized.
+pub(crate) fn authorize_config_read(
+    request: &RequestPrincipal,
+    guard: &ConfigWriteGuard,
+) -> Result<(), WriteDenied> {
+    let Some(axum::Extension(request)) = request else {
+        return Ok(());
+    };
+    let Some(conn) = &request.principal else {
+        return Ok(());
+    };
+    let grants = current_grants(request, conn, guard)?;
+    if grants.admin || may_read_config(&grants) {
+        Ok(())
+    } else {
+        Err(WriteDenied::forbidden(
+            "Principal lacks the config `read` grant required for a test operation".to_owned(),
+        ))
+    }
+}
+
 /// Authorize one mutation's complete write set for the request's
 /// principal, before the mutation's first side effect and under the config
 /// write lock. Every path needs both the Config verb its effect requires
@@ -631,15 +663,15 @@ pub fn authorize_config_write(
     guard: &ConfigWriteGuard,
 ) -> Result<ConfigWriteAuthorization, WriteDenied> {
     let Some(axum::Extension(request)) = request else {
-        return Ok(unenforced(None));
+        return Ok(unenforced(None, true));
     };
     let authority = Some(Arc::clone(&request.authority));
     let Some(conn) = &request.principal else {
-        return Ok(unenforced(authority));
+        return Ok(unenforced(authority, true));
     };
     let grants = current_grants(request, conn, guard)?;
     if grants.admin {
-        return Ok(unenforced(authority));
+        return Ok(unenforced(authority, true));
     }
     for (path, verb) in &writes.writes {
         if !grants.permits(Resource::Config, *verb) {
@@ -657,6 +689,7 @@ pub fn authorize_config_write(
     Ok(ConfigWriteAuthorization {
         enforced: Some(writes),
         authority,
+        can_read_config: may_read_config(&grants),
     })
 }
 
@@ -670,15 +703,15 @@ pub fn authorize_whole_config_write(
     guard: &ConfigWriteGuard,
 ) -> Result<ConfigWriteAuthorization, WriteDenied> {
     let Some(axum::Extension(request)) = request else {
-        return Ok(unenforced(None));
+        return Ok(unenforced(None, true));
     };
     let authority = Some(Arc::clone(&request.authority));
     let Some(conn) = &request.principal else {
-        return Ok(unenforced(authority));
+        return Ok(unenforced(authority, true));
     };
     let grants = current_grants(request, conn, guard)?;
     if grants.admin {
-        return Ok(unenforced(authority));
+        return Ok(unenforced(authority, true));
     }
     for verb in verbs {
         if !grants.permits(Resource::Config, *verb) {
@@ -694,7 +727,7 @@ pub fn authorize_whole_config_write(
                 .to_owned(),
         ));
     }
-    Ok(unenforced(authority))
+    Ok(unenforced(authority, may_read_config(&grants)))
 }
 
 /// Route-layer middleware for the config/onboarding route group.
@@ -1301,6 +1334,336 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn denied_config_writes_do_not_expose_cross_field_diagnostics() {
+        let tmp = tempfile::tempdir().unwrap();
+        let idp = introspection_idp(&["ops"]).await;
+        // This principal may update a different Config path, but has no Read
+        // grant and cannot write the memory setting under test.
+        let mut config = editor_config(&tmp, &idp.uri(), &[Verb::Update], &["agents.public.*"]);
+        config.memory.backend = "sqlite".into();
+        config.memory.types.enabled = false;
+        config.memory.consolidation_extract_facts = false;
+        let mut private_agent = zeroclaw_config::schema::AliasedAgentConfig::default();
+        private_agent.memory.backend = zeroclaw_config::multi_agent::MemoryBackendKind::None;
+        config
+            .agents
+            .insert("private_fixture".into(), private_agent);
+        let router = router_for(config);
+
+        let put = serde_json::json!({ "path": "memory.types.enabled", "value": true });
+        let (status, body) = send(
+            &router,
+            "PUT",
+            "/api/config/prop",
+            OPERATOR.0,
+            OPERATOR.1,
+            Some(put.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.to_string().contains("private_fixture"), "{body}");
+
+        let patch = serde_json::json!([
+            { "op": "replace", "path": "/memory/types/enabled", "value": true }
+        ]);
+        for (method, path, input) in [
+            ("PUT", "/api/config/prop", put),
+            ("PATCH", "/api/config", patch),
+        ] {
+            let (status, body) = send(&router, method, path, SCOPED.0, SCOPED.1, Some(input)).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{method}: {body}");
+            assert!(
+                !body.to_string().contains("private_fixture"),
+                "{method}: {body}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn denied_config_removals_do_not_expose_cross_field_diagnostics() {
+        let tmp = tempfile::tempdir().unwrap();
+        let idp = introspection_idp(&["ops"]).await;
+        let mut config = editor_config(&tmp, &idp.uri(), &[Verb::Delete], &["agents.public.*"]);
+        config.memory.backend = "sqlite".into();
+        config.memory.types.enabled = true;
+        config.memory.consolidation_extract_facts = false;
+        let router = router_for(config);
+
+        let (status, body) = send(
+            &router,
+            "DELETE",
+            "/api/config/prop?path=memory.backend",
+            OPERATOR.0,
+            OPERATOR.1,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.to_string().contains("memory.types.enabled"), "{body}");
+
+        for (method, path, input) in [
+            ("DELETE", "/api/config/prop?path=memory.backend", None),
+            (
+                "PATCH",
+                "/api/config",
+                Some(serde_json::json!([{ "op": "remove", "path": "/memory/backend" }])),
+            ),
+        ] {
+            let (status, body) = send(&router, method, path, SCOPED.0, SCOPED.1, input).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{method}: {body}");
+            assert!(
+                !body.to_string().contains("memory.types.enabled"),
+                "{method}: {body}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn config_writer_without_read_does_not_receive_unrelated_warnings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reader_tmp = tempfile::tempdir().unwrap();
+        let idp = introspection_idp(&["ops"]).await;
+        let mut config = editor_config(&tmp, &idp.uri(), &[Verb::Update], &["agents.public.*"]);
+        config.memory.backend = "sqlite".into();
+        config.memory.types.enabled = true;
+        config.memory.consolidation_extract_facts = false;
+        for alias in ["private_one", "private_two"] {
+            let mut agent = zeroclaw_config::schema::AliasedAgentConfig::default();
+            agent.memory.backend = zeroclaw_config::multi_agent::MemoryBackendKind::None;
+            config.agents.insert(alias.into(), agent);
+        }
+        config.agents.insert(
+            "public".into(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+        );
+        let mut reader_config = config.clone();
+        reader_config.config_path = reader_tmp.path().join("config.toml");
+        reader_config.data_dir = reader_tmp.path().join("data");
+        reader_config
+            .permission_profiles
+            .get_mut("config-reader")
+            .unwrap()
+            .grants
+            .insert(Resource::Config, vec![Verb::Read, Verb::Update]);
+        let router = router_for(config);
+        let reader_router = router_for(reader_config);
+
+        let (status, body) = send(
+            &router,
+            "PUT",
+            "/api/config/prop",
+            SCOPED.0,
+            SCOPED.1,
+            Some(put_model("public", "updated")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(!body.to_string().contains("private_one"), "{body}");
+        assert!(!body.to_string().contains("private_two"), "{body}");
+        assert_eq!(body["warnings"][0]["code"], "config_warning_details_hidden");
+
+        let (status, body) = send(
+            &router,
+            "PATCH",
+            "/api/config",
+            SCOPED.0,
+            SCOPED.1,
+            Some(serde_json::json!([
+                { "op": "replace", "path": "/agents/public/workspace/path", "value": "patched" }
+            ])),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(!body.to_string().contains("private_one"), "{body}");
+        assert!(!body.to_string().contains("private_two"), "{body}");
+        assert_eq!(body["warnings"][0]["code"], "config_warning_details_hidden");
+
+        // A scoped reader retains the full warnings after the same save.
+        let (status, body) = send(
+            &reader_router,
+            "PUT",
+            "/api/config/prop",
+            SCOPED.0,
+            SCOPED.1,
+            Some(put_model("public", "updated")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.to_string().contains("private_one"), "{body}");
+        assert!(body.to_string().contains("private_two"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn config_init_without_read_hides_retained_warning_details() {
+        let tmp = tempfile::tempdir().unwrap();
+        let idp = introspection_idp(&["ops"]).await;
+        let mut config = editor_config(
+            &tmp,
+            &idp.uri(),
+            &[Verb::Create, Verb::Update],
+            &["transcription.openai", "transcription.openai.*"],
+        );
+        config.gateway.host.clear();
+        let router = router_for(config);
+        let (status, body) = send(
+            &router,
+            "POST",
+            "/api/config/init?section=transcription.openai",
+            SCOPED.0,
+            SCOPED.1,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body["initialized"],
+            serde_json::json!(["transcription.openai"])
+        );
+        assert_eq!(body["warnings"][0]["code"], "config_warning_details_hidden");
+        assert!(!body.to_string().contains("gateway.host"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn config_writer_without_read_receives_generic_validation_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let idp = introspection_idp(&["ops"]).await;
+        let mut config =
+            editor_config(&tmp, &idp.uri(), &[Verb::Update], &["memory.types.enabled"]);
+        config.memory.backend = "sqlite".into();
+        config.memory.types.enabled = false;
+        config.memory.consolidation_extract_facts = false;
+        let mut private_agent = zeroclaw_config::schema::AliasedAgentConfig::default();
+        private_agent.memory.backend = zeroclaw_config::multi_agent::MemoryBackendKind::None;
+        config
+            .agents
+            .insert("private_fixture".into(), private_agent);
+        let router = router_for(config);
+
+        let (status, body) = send(
+            &router,
+            "PUT",
+            "/api/config/prop",
+            SCOPED.0,
+            SCOPED.1,
+            Some(serde_json::json!({ "path": "memory.types.enabled", "value": true })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["code"], "validation_failed", "{body}");
+        assert!(!body.to_string().contains("private_fixture"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn config_patch_test_requires_read_access() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reader_tmp = tempfile::tempdir().unwrap();
+        let idp = introspection_idp(&["ops"]).await;
+        let mut config = editor_config(&tmp, &idp.uri(), &[Verb::Update], &["agents.public.*"]);
+        config.memory.types.enabled = false;
+        config.memory.consolidation_extract_facts = false;
+        let mut private_agent = zeroclaw_config::schema::AliasedAgentConfig::default();
+        private_agent.memory.backend = zeroclaw_config::multi_agent::MemoryBackendKind::None;
+        config
+            .agents
+            .insert("private_fixture".into(), private_agent);
+        config.agents.insert(
+            "public".into(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+        );
+        let actual = config
+            .get_prop("agents.private_fixture.memory.backend")
+            .unwrap();
+
+        let mut reader_config = config.clone();
+        reader_config.config_path = reader_tmp.path().join("config.toml");
+        reader_config.data_dir = reader_tmp.path().join("data");
+        reader_config
+            .permission_profiles
+            .get_mut("config-reader")
+            .unwrap()
+            .grants
+            .insert(Resource::Config, vec![Verb::Read, Verb::Update]);
+        let router = router_for(config);
+        let reader_router = router_for(reader_config);
+
+        let patch = |value: &str| {
+            serde_json::json!([
+                { "op": "test", "path": "/agents/private_fixture/memory/backend", "value": value }
+            ])
+        };
+        let (status, body) = send(
+            &reader_router,
+            "PATCH",
+            "/api/config",
+            SCOPED.0,
+            SCOPED.1,
+            Some(patch(&actual)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "reader match: {body}");
+        let (status, body) = send(
+            &reader_router,
+            "PATCH",
+            "/api/config",
+            SCOPED.0,
+            SCOPED.1,
+            Some(patch("wrong")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "reader mismatch: {body}");
+        assert!(
+            body.to_string().contains(&actual),
+            "reader mismatch: {body}"
+        );
+        let (status, body) = send(
+            &reader_router,
+            "PATCH",
+            "/api/config",
+            SCOPED.0,
+            SCOPED.1,
+            Some(serde_json::json!([
+                { "op": "test", "path": "/gateway/webhook_secret", "value": "probe" }
+            ])),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "reader secret: {body}");
+        assert_eq!(body["code"], "secret_test_forbidden", "{body}");
+
+        for value in [actual.as_str(), "wrong"] {
+            let (status, body) = send(
+                &router,
+                "PATCH",
+                "/api/config",
+                SCOPED.0,
+                SCOPED.1,
+                Some(patch(value)),
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "write-only test: {body}");
+            assert!(
+                !body.to_string().contains(&actual),
+                "write-only test: {body}"
+            );
+        }
+
+        let before = agent_model(&router, "public").await;
+        let (status, body) = send(
+            &router,
+            "PATCH",
+            "/api/config",
+            SCOPED.0,
+            SCOPED.1,
+            Some(serde_json::json!([
+                { "op": "replace", "path": "/agents/public/workspace/path", "value": "not-saved" },
+                { "op": "test", "path": "/agents/private_fixture/memory/backend", "value": actual }
+            ])),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "mixed patch: {body}");
+        assert_eq!(agent_model(&router, "public").await, before);
+    }
+
+    #[tokio::test]
     async fn verbs_follow_the_effect_of_the_mutation_not_the_http_method() {
         let tmp = tempfile::tempdir().unwrap();
         let idp = introspection_idp(&["ops"]).await;
@@ -1308,7 +1671,7 @@ mod tests {
             &tmp,
             &idp.uri(),
             &[Verb::Update],
-            &["agents.*"],
+            &["agents.*", "providers.models.openai.*"],
         ));
         create_agent(&router, "alpha").await;
 
@@ -1342,18 +1705,44 @@ mod tests {
         );
         assert_eq!(agent_model(&router, "beta").await.0, StatusCode::NOT_FOUND);
 
-        // So is a PUT that would bring a new map key into being.
-        let (status, _) = send(
+        // So is a PUT that would bring a valid new map key into being.
+        let provider_path = "providers.models.openai.gamma.model";
+        let provider_value = serde_json::json!({ "path": provider_path, "value": "gpt-4o" });
+        let (status, body) = send(
             &router,
             "PUT",
             "/api/config/prop",
             SCOPED.0,
             SCOPED.1,
-            Some(put_model("gamma", "m1")),
+            Some(provider_value.clone()),
         )
         .await;
         assert_eq!(status, StatusCode::FORBIDDEN);
-        assert_eq!(agent_model(&router, "gamma").await.0, StatusCode::NOT_FOUND);
+        assert!(
+            body["error"].as_str().unwrap().contains("`create`"),
+            "{body}"
+        );
+        let (status, _) = send(
+            &router,
+            "GET",
+            &format!("/api/config/prop?path={provider_path}"),
+            OPERATOR.0,
+            OPERATOR.1,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        // The same input is valid and succeeds when creation is authorized.
+        let (status, body) = send(
+            &router,
+            "PUT",
+            "/api/config/prop",
+            OPERATOR.0,
+            OPERATOR.1,
+            Some(provider_value),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
 
         // Removing the entry is a `delete`, whatever the method.
         let (status, body) = send(
