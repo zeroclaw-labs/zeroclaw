@@ -265,3 +265,14 @@ mod session_tool_marker_guard {
         );
     }
 }
+
+pub mod task_ssh;
+
+#[cfg(target_os = "linux")]
+pub mod task_ssh_broker;
+
+/// Localized diagnostic for the broker entry point on unsupported platforms.
+#[cfg(not(target_os = "linux"))]
+pub fn unsupported_task_ssh_message() -> String {
+    i18n::get_required_tool_string("tool-ssh-task-unsupported")
+}
