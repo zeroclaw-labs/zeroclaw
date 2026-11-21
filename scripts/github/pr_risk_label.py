@@ -428,23 +428,35 @@ def item_paths(item: dict[str, Any]) -> tuple[str, ...]:
     return (current,)
 
 
-def file_bound_to_head(item: dict[str, Any], head_sha: str) -> bool:
+def file_bound_to_revision(item: dict[str, Any], revision: str) -> bool:
     contents_url = item.get("contents_url")
     if isinstance(contents_url, str):
         refs = parse_qs(urlparse(contents_url).query).get("ref", [])
-        return refs == [head_sha]
+        return refs == [revision]
 
     for key, marker in (("raw_url", "raw"), ("blob_url", "blob")):
         value = item.get(key)
         if not isinstance(value, str):
             continue
         parts = urlparse(value).path.split("/")
-        if len(parts) >= 5 and parts[3] == marker and parts[4] == head_sha:
+        if len(parts) >= 5 and parts[3] == marker and parts[4] == revision:
             return True
     return False
 
 
-def validate_files(files: Any, expected_count: int, head_sha: str | None = None) -> list[dict[str, Any]]:
+def has_removed_files(files: Any) -> bool:
+    """Whether a not-yet-validated PR file list reports any removed file."""
+    return isinstance(files, list) and any(
+        isinstance(item, dict) and item.get("status") == "removed" for item in files
+    )
+
+
+def validate_files(
+    files: Any,
+    expected_count: int,
+    head_sha: str | None = None,
+    merge_base_sha: str | None = None,
+) -> list[dict[str, Any]]:
     require(
         0 < expected_count <= MAX_PR_FILES,
         "PR file count is incomplete or exceeds the safe API boundary",
@@ -469,7 +481,18 @@ def validate_files(files: Any, expected_count: int, head_sha: str | None = None)
         if "patch" in item:
             require(item["patch"] is None or isinstance(item["patch"], str), "PR patch is malformed")
         if head_sha is not None:
-            require(file_bound_to_head(item, head_sha), "PR file evidence is not bound to the captured head SHA")
+            # A removed file has no content at head, so GitHub reports it at
+            # the merge-base of the PR base and head instead.
+            if status == "removed":
+                require(
+                    merge_base_sha is not None and file_bound_to_revision(item, merge_base_sha),
+                    "PR removed-file evidence is not bound to the captured merge-base SHA",
+                )
+            else:
+                require(
+                    file_bound_to_revision(item, head_sha),
+                    "PR file evidence is not bound to the captured head SHA",
+                )
         result.append(item)
     return result
 
@@ -979,6 +1002,22 @@ class GitHubAPI:
     def get_pull(self, number: int) -> Any:
         return self.request("GET", repository_path(self.repository, f"pulls/{number}"))
 
+    def get_merge_base(self, base_sha: str, head_sha: str) -> str:
+        comparison = self.request(
+            "GET",
+            f"{repository_path(self.repository, f'compare/{base_sha}...{head_sha}')}?{urlencode({'per_page': 1})}",
+        )
+        require(isinstance(comparison, dict), "GitHub comparison is malformed")
+        base_commit = comparison.get("base_commit")
+        merge_base_commit = comparison.get("merge_base_commit")
+        require(
+            isinstance(base_commit, dict)
+            and base_commit.get("sha") == base_sha
+            and isinstance(merge_base_commit, dict),
+            "GitHub comparison is not bound to the captured base SHA",
+        )
+        return parse_sha(merge_base_commit.get("sha"), "PR merge-base SHA")
+
     def paginate(self, path: str, expected_count: int | None = None) -> list[Any]:
         if expected_count is not None:
             require(0 <= expected_count <= MAX_PR_FILES, "pagination file count is outside the safe API boundary")
@@ -1011,11 +1050,9 @@ def evaluate(api: Any, pr_number: int, policy_path: Path) -> dict[str, Any]:
     pr = api.get_pull(pr_number)
     head_sha, base_sha, live_labels, changed_file_count = parse_pr_metadata(pr)
     require(0 < changed_file_count <= MAX_PR_FILES, "PR file count is incomplete or exceeds the safe API boundary")
-    files = validate_files(
-        api.paginate(repository_path(api.repository, f"pulls/{pr_number}/files"), changed_file_count),
-        changed_file_count,
-        head_sha,
-    )
+    raw_files = api.paginate(repository_path(api.repository, f"pulls/{pr_number}/files"), changed_file_count)
+    merge_base_sha = api.get_merge_base(base_sha, head_sha) if has_removed_files(raw_files) else None
+    files = validate_files(raw_files, changed_file_count, head_sha, merge_base_sha)
     classification = classify(files, policy, api, base_sha, head_sha)
 
     latest_pr = api.get_pull(pr_number)
