@@ -133,7 +133,8 @@ message draft. By default, 15 seconds of silence after recognized speech sends
 that draft automatically. The shared timeout is adjustable in Browser voice and
 audio settings; set it to `0` for manual-only sending. Click the microphone again
 to stop dictation and review the draft, or use Send to submit it manually.
-Stopping dictation manually cancels its pending automatic send. Empty capture is
+Stopping dictation manually cancels its pending automatic send, and so does typing
+in the message box: an edited draft waits for Send. Empty capture is
 never submitted, and hiding or leaving the conversation cancels capture.
 
 Reading uses a voice reported by the browser. The selector identifies local and

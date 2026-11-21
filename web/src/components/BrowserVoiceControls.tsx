@@ -8,9 +8,10 @@ import { beginVoiceCapture, playVoice, releaseVoice, voicePlaybackBusy, voicePla
 
 const readableMessage = (message: ChatMessage) => speechText(displayMessageText(message));
 
-export default function BrowserVoiceControls({ messages, hydrated, typing, onTranscript, onSilence, captureRef }: {
+export default function BrowserVoiceControls({ messages, hydrated, typing, onTranscript, onSilence, captureRef, autoSendCancelRef }: {
   messages: ChatMessage[]; hydrated: boolean; typing: boolean; onTranscript: (text: string) => void;
   captureRef?: Ref<() => void>;
+  autoSendCancelRef?: Ref<() => void>;
   onSilence?: () => void;
 }) {
   const { preferences: prefs, ready } = useVoicePreferences();
@@ -62,6 +63,14 @@ export default function BrowserVoiceControls({ messages, hydrated, typing, onTra
     setListening(false);
   };
   useImperativeHandle(captureRef, () => stopCapture);
+  // The person edited the draft, so it is no longer only what they dictated:
+  // cancel the automatic send. A live capture keeps listening and still stops
+  // after the silence timeout, but this dictation no longer sends on its own.
+  const cancelAutoSend = () => {
+    submitCancellation.current++;
+    if (!recognition.current) clearSilence();
+  };
+  useImperativeHandle(autoSendCancelRef, () => cancelAutoSend);
   const stopAll = () => { stopCapture(); stopSpeech(); };
   const speak = (message: ChatMessage) => {
     if (!ready || !prefs.reading || !visible() || recognition.current) return false;

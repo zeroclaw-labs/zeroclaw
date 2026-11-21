@@ -435,6 +435,7 @@ export function AgentChatInner({
 
   const [voiceSubmitRequested, setVoiceSubmitRequested] = useState<string | null>(null);
   const cancelVoiceCapture = useRef<(() => void) | null>(null);
+  const cancelVoiceAutoSend = useRef<(() => void) | null>(null);
   const handleSend = () => {
     const trimmed = input.trim();
     if (!trimmed) return;
@@ -555,6 +556,8 @@ export function AgentChatInner({
 
   const handleTextareaChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
     const value = e.target.value;
+    // Typing takes the draft back from dictation; it must not be sent without a click.
+    cancelVoiceAutoSend.current?.();
     applyInput(value);
     // Show the command popover while typing the command token (a single
     // leading '/' with no space yet). Hide once the user moves to arguments or
@@ -966,7 +969,7 @@ export function AgentChatInner({
           </div>
         )}
         <div className="flex items-end gap-3 max-w-4xl mx-auto">
-          <BrowserVoiceControls key={draftKey} captureRef={cancelVoiceCapture} onSilence={() => setVoiceSubmitRequested(draftKey)} messages={messages} hydrated={hydrated} typing={typing} onTranscript={text => applyInput(prev => `${prev}${prev && !/\s$/.test(prev) ? ' ' : ''}${text}`)} />
+          <BrowserVoiceControls key={draftKey} captureRef={cancelVoiceCapture} autoSendCancelRef={cancelVoiceAutoSend} onSilence={() => setVoiceSubmitRequested(draftKey)} messages={messages} hydrated={hydrated} typing={typing} onTranscript={text => applyInput(prev => `${prev}${prev && !/\s$/.test(prev) ? ' ' : ''}${text}`)} />
           {operator && (
             <>
               <input
