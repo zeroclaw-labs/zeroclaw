@@ -54,8 +54,6 @@ pub mod git;
 pub mod gmail_push;
 #[cfg(feature = "channel-imessage")]
 pub mod imessage;
-#[cfg(feature = "channel-irc")]
-pub mod irc;
 #[cfg(feature = "channel-lark")]
 pub mod lark;
 #[cfg(feature = "channel-line")]
@@ -84,8 +82,6 @@ pub mod signal;
 pub mod slack;
 #[cfg(feature = "channel-telegram")]
 pub mod telegram;
-#[cfg(feature = "channel-twitch")]
-pub mod twitch;
 #[cfg(feature = "channel-twitter")]
 pub mod twitter;
 #[cfg(feature = "channel-voice-call")]

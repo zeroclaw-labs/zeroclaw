@@ -214,7 +214,6 @@ Each channel gets a `channel:<name>` label in addition to the base `channel` lab
 | `channel:discord` | `discord.rs`, `discord_history.rs` |
 | `channel:email` | `email_channel.rs`, `gmail_push.rs` |
 | `channel:imessage` | `imessage.rs` |
-| `channel:irc` | `irc.rs` |
 | `channel:lark` | `lark.rs` |
 | `channel:line` | `line.rs`, `channels/line.md` |
 | `channel:linq` | `linq.rs` |

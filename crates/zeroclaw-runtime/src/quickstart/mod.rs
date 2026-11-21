@@ -3115,7 +3115,7 @@ mod tests {
 
     #[test]
     fn non_webhook_channel_quickstart_fields_exclude_webhook_requirements() {
-        for channel_type in ["irc", "lark"] {
+        for channel_type in ["email", "lark"] {
             let rows = super::field_shape(super::FieldSection::Channel, channel_type);
             assert!(
                 rows.iter()

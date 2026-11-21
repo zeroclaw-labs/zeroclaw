@@ -101,7 +101,11 @@ Replies to an inbound message are passive (the triggering `msg_id` is echoed), s
 
 ## IRC
 
-Classic IRC. Supports SASL, NickServ auth, and multiple channels.
+IRC is a [plugin channel](./overview.md#plugin-channels): install the `irc`
+package from the plugin registry instead of building it in. It connects over
+TLS, supports SASL PLAIN and EXTERNAL, NickServ, and multiple channels. See the
+[`irc` plugin guide](https://github.com/zeroclaw-labs/zeroclaw-plugins/tree/main/plugins/irc) for setup and for moving a former
+`[channels.irc.<alias>]` instance.
 
 ## Mochat
 
