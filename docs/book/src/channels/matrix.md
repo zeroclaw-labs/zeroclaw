@@ -160,6 +160,23 @@ Work through in order.
 
 The sender must be in the agent's peer set, see [Who can talk to the agent](#who-can-talk-to-the-agent) at the top of this page. For diagnosis, temporarily set `external_peers = ["*"]` and restart the daemon.
 
+### Owner notice for turned-away senders
+
+A turned-away sender gets no public reply — the message is dropped silently. To surface attempts to the operator, set `owner_user_id` on the channel alias:
+
+```toml
+[channels.matrix.mybot]
+# ...connection settings...
+owner_user_id = "@operator:matrix.example.org"
+```
+
+When set, the channel sends the operator a DM naming the sender, the source room, and a bounded single-line preview (160 chars) of the turned-away message, plus an authorization hint. Notes:
+
+- The DM room is created on first use (encrypted, `is_direct`) and reused; switching `owner_user_id` re-targets the notice.
+- Notices are throttled to one per (sender, room) pair per 5 minutes — Matrix has no transport-level flood gate like Telegram's, so without this a spammer could flood the operator's DM.
+- Unlike Telegram's `owner_chat_id` there is **no sender-echo guard**: Matrix sends no public stub, so the notice is the only signal — an operator testing from an unauthorized MXID still receives it.
+- Blank `owner_user_id` behaves as unset.
+
 ### C. Token and identity
 
 Secrets are encrypted at rest and not retrievable: `zeroclaw config get` prints `[masked]` for any secret field. To run the checks below, use the access token you minted in [§3](#3-token-path-alternative-obtaining-access_token-and-device_id) (or mint a fresh one) and your own homeserver URL.
