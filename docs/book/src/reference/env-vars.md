@@ -60,6 +60,12 @@ Aliases (the `<alias>` segments in the examples above, `home`, `prod_v2`, `mymat
 
 `prod_v2` is a single alias token; `home__api_key` parses as two segments (alias `home`, field `api_key`). Configs with non-conforming aliases produce a load-time error naming the offending alias.
 
+## Agent admission
+
+A `ZEROCLAW_agents__<alias>__*` variable whose alias is not in the config file defines that agent at load, on every load. The reserved `default` agent is never created this way: its variables are withheld, none of their values is applied, the daemon still starts, and a `WARN` with `error_key` `config.env_agent_override_refused` names the alias and the first variable. Once the file holds an `agents.default` entry (a migration can synthesize one), the same variables apply to it.
+
+An agent defined by the environment is live: it keeps the memory and knowledge it captured across restarts, like an agent in the file. For the same reason, a variable that names an agent after that agent was deleted defines it again at the next load, over any knowledge a failed delete left behind; load cannot tell that from an env-defined agent reading its own knowledge, so it does not check. Remove an agent's variables before deleting it, and keep them removed until a delete that reported retained state has converged.
+
 ## Errors
 
 Unresolvable `ZEROCLAW_<lowercase_*>` names (typos, paths that don't match any prop in the schema) abort startup with a hard error naming the offending env var. Env-var names without the `ZEROCLAW_` prefix are not read by this override layer.
