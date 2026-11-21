@@ -4,7 +4,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use std::borrow::Cow;
 use zeroclaw_config::schema::MediaPipelineConfig;
 
-use super::super::transcription::TranscriptionManager;
+use zeroclaw_providers::transcription::TranscriptionManager;
 
 // Re-export media types from zeroclaw-types for backwards compatibility.
 pub use zeroclaw_api::media::{MarkerKind, MediaAttachment, MediaKind, RenderedMarker};

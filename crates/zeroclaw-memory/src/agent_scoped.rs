@@ -678,10 +678,10 @@ impl ::zeroclaw_api::attribution::Attributable for AgentScopedMemory {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::embeddings::EmbeddingProvider;
     use crate::sqlite::SqliteMemory;
     use crate::traits::{MemoryKind, SemanticSubtype};
     use tempfile::TempDir;
+    use zeroclaw_api::embedding::EmbeddingProvider;
     use zeroclaw_config::schema::SearchMode;
 
     fn fresh_sqlite() -> (TempDir, Arc<SqliteMemory>) {

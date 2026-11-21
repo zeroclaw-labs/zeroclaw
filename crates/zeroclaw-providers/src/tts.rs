@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+use crate::transport::HttpTransportConfig;
 use anyhow::{Context, Result, bail};
 use reqwest::header::HeaderValue;
 
@@ -22,44 +23,14 @@ const FFMPEG_TRANSCODE_TIMEOUT: std::time::Duration = std::time::Duration::from_
 
 // ── TtsProvider trait ────────────────────────────────────────────
 
-/// Trait for pluggable TTS backends.
-#[async_trait::async_trait]
-pub trait TtsProvider: Send + Sync + ::zeroclaw_api::attribution::Attributable {
-    /// ModelProvider identifier (e.g. `"openai"`, `"elevenlabs"`).
-    fn name(&self) -> &str;
-
-    /// Synthesize `text` using the given `voice`, returning raw audio bytes.
-    async fn synthesize(&self, text: &str, voice: &str) -> Result<Vec<u8>>;
-
-    /// The audio container/format of the bytes returned by
-    /// [`synthesize`](Self::synthesize) (e.g. `"opus"`, `"wav"`, `"mp3"`).
-    /// Channels use this to pick the correct upload MIME type and Telegram
-    /// send method — only `opus`/`ogg` is a true voice note.
-    fn output_format(&self) -> &str;
-
-    /// Voices supported by this model_provider.
-    fn supported_voices(&self) -> Vec<String>;
-
-    /// Audio output formats supported by this model_provider.
-    fn supported_formats(&self) -> Vec<String>;
-}
+use zeroclaw_api::tts::TtsProvider;
 
 // ── OpenAI TTS ───────────────────────────────────────────────────
 
 /// OpenAI TTS model_provider (`POST /v1/audio/speech`).
 pub struct OpenAiTtsProvider {
     alias: String,
-    api_key: String,
-    model: String,
-    speed: f64,
-    /// Full endpoint URL. Defaults to the OpenAI production endpoint; can be
-    /// overridden via `[providers.tts.openai.<alias>].uri` to point at any
-    /// OpenAI-compatible TTS backend (Groq, Azure, self-hosted proxies).
-    base_url: String,
-    /// Audio response format. Defaults to `"opus"`; override to `"wav"` for
-    /// Orpheus-class models or `"mp3"` for broader compatibility.
-    response_format: String,
-    client: reqwest::Client,
+    client: crate::protocols::openai::audio::SpeechClient,
 }
 
 impl OpenAiTtsProvider {
@@ -76,30 +47,28 @@ impl OpenAiTtsProvider {
             )?;
 
         Ok(Self {
-            alias: alias.to_string(),
-            api_key,
-            model: config
-                .model
-                .clone()
-                .filter(|m| !m.trim().is_empty())
-                .unwrap_or_else(|| "tts-1".to_string()),
-            speed: config.speed.unwrap_or(1.0),
-            base_url: config
-                .uri
-                .clone()
-                .filter(|u| !u.trim().is_empty())
-                .unwrap_or_else(|| "https://api.openai.com/v1/audio/speech".to_string()),
-            response_format: config
-                .response_format
-                .clone()
-                .filter(|f| !f.trim().is_empty())
-                .unwrap_or_else(|| "opus".to_string()),
-            client: zeroclaw_config::schema::apply_runtime_proxy_to_builder(
-                reqwest::Client::builder().timeout(TTS_HTTP_TIMEOUT),
-                "channel.tts.openai",
-            )
-            .build()
-            .context("Failed to build HTTP client for OpenAI TTS")?,
+            alias: alias.to_owned(),
+            client: crate::protocols::openai::audio::SpeechClient {
+                transport: HttpTransportConfig::with_base_url("", Some(api_key)),
+                endpoint: config
+                    .uri
+                    .clone()
+                    .filter(|uri| !uri.trim().is_empty())
+                    .unwrap_or_else(|| "https://api.openai.com/v1/audio/speech".into()),
+                model: config
+                    .model
+                    .clone()
+                    .filter(|model| !model.trim().is_empty())
+                    .unwrap_or_else(|| "tts-1".into()),
+                speed: Some(config.speed.unwrap_or(1.0)),
+                response_format: Some(
+                    config
+                        .response_format
+                        .clone()
+                        .filter(|format| !format.trim().is_empty())
+                        .unwrap_or_else(|| "opus".into()),
+                ),
+            },
         })
     }
 }
@@ -111,44 +80,11 @@ impl TtsProvider for OpenAiTtsProvider {
     }
 
     fn output_format(&self) -> &str {
-        &self.response_format
+        self.client.response_format.as_deref().unwrap_or("mp3")
     }
 
     async fn synthesize(&self, text: &str, voice: &str) -> Result<Vec<u8>> {
-        let body = serde_json::json!({
-            "model": self.model,
-            "input": text,
-            "voice": voice,
-            "speed": self.speed,
-            "response_format": self.response_format,
-        });
-
-        let resp = self
-            .client
-            .post(&self.base_url)
-            .bearer_auth(&self.api_key)
-            .json(&body)
-            .send()
-            .await
-            .context("Failed to send OpenAI TTS request")?;
-
-        let status = resp.status();
-        if !status.is_success() {
-            let error_body: serde_json::Value = resp
-                .json()
-                .await
-                .unwrap_or_else(|_| serde_json::json!({"error": "unknown"}));
-            let msg = error_body["error"]["message"]
-                .as_str()
-                .unwrap_or("unknown error");
-            bail!("OpenAI TTS API error ({}): {}", status, msg);
-        }
-
-        let bytes = resp
-            .bytes()
-            .await
-            .context("Failed to read OpenAI TTS response body")?;
-        Ok(bytes.to_vec())
+        self.client.synthesize(text, voice).await
     }
 
     fn supported_voices(&self) -> Vec<String> {
@@ -1368,7 +1304,12 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            OpenAiTtsProvider::new("test", &config).unwrap().api_key,
+            OpenAiTtsProvider::new("test", &config)
+                .unwrap()
+                .client
+                .transport
+                .api_key
+                .unwrap(),
             "synthetic-tts-key"
         );
         assert_eq!(
@@ -2074,8 +2015,11 @@ mod tests {
             ..TtsProviderConfig::default()
         };
         let provider = OpenAiTtsProvider::new("test", &cfg).unwrap();
-        assert_eq!(provider.base_url, "https://api.openai.com/v1/audio/speech");
-        assert_eq!(provider.response_format, "opus");
+        assert_eq!(
+            provider.client.endpoint,
+            "https://api.openai.com/v1/audio/speech"
+        );
+        assert_eq!(provider.client.response_format.as_deref().unwrap(), "opus");
     }
 
     #[test]
