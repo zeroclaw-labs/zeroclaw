@@ -266,7 +266,25 @@ fn editor_save_keys() -> String {
     [editor_key(E::Save), editor_key(E::Confirm)].join("/")
 }
 
-fn scalar_validation_status_key(kind: PropKind, value: &str) -> Option<&'static str> {
+/// True for a field whose Rust type is `Option<…>`, read from the schema's
+/// `type_hint`. An empty edit on such a field is sent as an empty string,
+/// which `config/set` applies by clearing the field back to its default (for
+/// the `[cost]` limits, no limit). The server may still refuse an empty value
+/// for a field its validation requires.
+fn type_hint_is_optional(type_hint: &str) -> bool {
+    type_hint
+        .replace(char::is_whitespace, "")
+        .starts_with("Option<")
+}
+
+fn scalar_validation_status_key(
+    kind: PropKind,
+    value: &str,
+    optional: bool,
+) -> Option<&'static str> {
+    if optional && value.is_empty() {
+        return None;
+    }
     match kind {
         PropKind::Integer => value
             .parse::<i64>()
@@ -297,8 +315,9 @@ fn secret_map_key_validation_key(key: &str) -> Option<&'static str> {
     }
 }
 
-fn scalar_validation_status(kind: PropKind, value: &str, prop: &str) -> Option<String> {
-    scalar_validation_status_key(kind, value).map(|key| crate::i18n::t_args(key, &[("prop", prop)]))
+fn scalar_validation_status(field: &ConfigFieldEntry, value: &str) -> Option<String> {
+    scalar_validation_status_key(field.kind, value, type_hint_is_optional(&field.type_hint))
+        .map(|key| crate::i18n::t_args(key, &[("prop", &field.path)]))
 }
 
 fn config_i18n_key(kind: &str, stable_key: &str, suffix: Option<&str>) -> String {
@@ -4621,9 +4640,7 @@ impl App {
                 }
                 if let Screen::FieldEdit { field_idx, .. } = &self.screen {
                     let field = &self.fields[*field_idx];
-                    if let Some(status) =
-                        scalar_validation_status(field.kind, &self.edit_buf, &field.path)
-                    {
+                    if let Some(status) = scalar_validation_status(field, &self.edit_buf) {
                         self.status_msg = Some(status);
                         return Ok(());
                     }
@@ -6623,19 +6640,96 @@ mod tests {
     #[test]
     fn config_scalar_validation_rejects_invalid_integer() {
         assert_eq!(
-            scalar_validation_status_key(PropKind::Integer, "20a"),
+            scalar_validation_status_key(PropKind::Integer, "20a", false),
             Some("zc-config-status-invalid-integer")
         );
-        assert_eq!(scalar_validation_status_key(PropKind::Integer, "20"), None);
+        assert_eq!(
+            scalar_validation_status_key(PropKind::Integer, "20", false),
+            None
+        );
     }
 
     #[test]
     fn config_scalar_validation_rejects_invalid_float() {
         assert_eq!(
-            scalar_validation_status_key(PropKind::Float, "0.7x"),
+            scalar_validation_status_key(PropKind::Float, "0.7x", false),
             Some("zc-config-status-invalid-float")
         );
-        assert_eq!(scalar_validation_status_key(PropKind::Float, "0.7"), None);
+        assert_eq!(
+            scalar_validation_status_key(PropKind::Float, "0.7", false),
+            None
+        );
+    }
+
+    #[test]
+    fn config_scalar_validation_lets_an_optional_number_be_cleared() {
+        for kind in [PropKind::Float, PropKind::Integer] {
+            assert_eq!(scalar_validation_status_key(kind, "", true), None);
+            assert!(
+                scalar_validation_status_key(kind, "", false).is_some(),
+                "a required {kind:?} still refuses an empty edit"
+            );
+            assert!(
+                scalar_validation_status_key(kind, "x", true).is_some(),
+                "an optional {kind:?} still refuses text that is not a number"
+            );
+        }
+        assert!(type_hint_is_optional("Option<f64>"));
+        assert!(type_hint_is_optional("Option < u64 >"));
+        assert!(!type_hint_is_optional("f64"));
+        assert!(!type_hint_is_optional("Vec<Option<f64>>"));
+    }
+
+    /// Clearing an `Option<f64>` such as `cost.daily_limit_usd` and confirming
+    /// sends `config/set` with an empty value, which the daemon applies by
+    /// clearing it back to its default, no limit for this field. A required
+    /// number still refuses an empty edit.
+    #[tokio::test]
+    async fn clearing_an_optional_number_sends_an_unset() {
+        let (mut manager, seen) = test_manager_with_recording_rpc();
+        let mut limit = field("cost.daily_limit_usd");
+        limit.kind = PropKind::Float;
+        limit.type_hint = "Option<f64>".into();
+        limit.value = Some(serde_json::Value::String("10.0".into()));
+        limit.populated = true;
+        let mut required = field("cost.warn_at_percent");
+        required.kind = PropKind::Integer;
+        required.type_hint = "u8".into();
+        required.value = Some(serde_json::Value::String("80".into()));
+        required.populated = true;
+        manager.fields = vec![limit, required];
+        let edit = |field_idx| Screen::FieldEdit {
+            section_idx: 0,
+            prefix: "cost".into(),
+            breadcrumb: vec!["cost".into()],
+            field_idx,
+        };
+
+        manager.screen = edit(1);
+        manager.prepare_edit_at(1);
+        manager.edit_buf.clear();
+        manager.edit_cursor = 0;
+        press_enter(&mut manager).await;
+        assert!(
+            manager.status_msg.is_some(),
+            "required number refuses empty"
+        );
+        assert!(seen.lock().unwrap().is_empty(), "no RPC for a refused edit");
+
+        manager.status_msg = None;
+        manager.screen = edit(0);
+        manager.prepare_edit_at(0);
+        manager.edit_buf.clear();
+        manager.edit_cursor = 0;
+        press_enter(&mut manager).await;
+        assert!(manager.status_msg.is_none(), "{:?}", manager.status_msg);
+        let requests = seen.lock().unwrap().clone();
+        let set = requests
+            .iter()
+            .find(|r| r["method"] == "config/set")
+            .expect("config/set must be sent");
+        assert_eq!(set["params"]["prop"], "cost.daily_limit_usd");
+        assert_eq!(set["params"]["value"], "");
     }
 
     #[tokio::test]

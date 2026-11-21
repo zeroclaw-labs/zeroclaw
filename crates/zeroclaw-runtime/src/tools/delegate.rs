@@ -23362,10 +23362,37 @@ command = "rm independent-delegate-marker"
         target_ceiling_cents: u32,
         track_per_agent: bool,
     ) -> DelegateCostFixture {
+        use zeroclaw_config::schema::{CostConfig, RuntimeProfileConfig};
+
+        delegate_cost_fixture_with(
+            mock_uri,
+            CostConfig {
+                enabled: cost_tracking_enabled,
+                track_per_agent,
+                daily_limit_usd: Some(daily_limit_usd),
+                monthly_limit_usd: Some(10_000.0),
+                ..CostConfig::default()
+            },
+            RuntimeProfileConfig {
+                agentic: true,
+                max_tool_iterations: 5,
+                max_cost_per_day_cents: target_ceiling_cents,
+                ..RuntimeProfileConfig::default()
+            },
+        )
+        .await
+    }
+
+    /// `delegate_cost_fixture_opts` with the `[cost]` section and the shared
+    /// runtime profile given whole, so a test can leave either at its
+    /// schema defaults.
+    async fn delegate_cost_fixture_with(
+        mock_uri: String,
+        cost: zeroclaw_config::schema::CostConfig,
+        runtime_profile: zeroclaw_config::schema::RuntimeProfileConfig,
+    ) -> DelegateCostFixture {
         use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
-        use zeroclaw_config::schema::{
-            CostConfig, OllamaModelProviderConfig, RuntimeProfileConfig,
-        };
+        use zeroclaw_config::schema::OllamaModelProviderConfig;
 
         let tmp = TempDir::new().unwrap();
         let data_dir = tmp.path().join("data");
@@ -23375,13 +23402,7 @@ command = "rm independent-delegate-marker"
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         };
-        root_config.cost = CostConfig {
-            enabled: cost_tracking_enabled,
-            track_per_agent,
-            daily_limit_usd,
-            monthly_limit_usd: 10_000.0,
-            ..CostConfig::default()
-        };
+        root_config.cost = cost;
         root_config.providers.models.ollama.insert(
             "default".to_string(),
             OllamaModelProviderConfig {
@@ -23413,15 +23434,9 @@ command = "rm independent-delegate-marker"
                 ..RiskProfileConfig::default()
             },
         );
-        root_config.runtime_profiles.insert(
-            "delegate_cost_runtime".to_string(),
-            RuntimeProfileConfig {
-                agentic: true,
-                max_tool_iterations: 5,
-                max_cost_per_day_cents: target_ceiling_cents,
-                ..RuntimeProfileConfig::default()
-            },
-        );
+        root_config
+            .runtime_profiles
+            .insert("delegate_cost_runtime".to_string(), runtime_profile);
         let target_config = AliasedAgentConfig {
             model_provider: "ollama.default".into(),
             risk_profile: "delegate_cost_profile".into(),
@@ -23845,6 +23860,50 @@ command = "rm independent-delegate-marker"
         );
     }
 
+    /// Caller and target on a runtime profile that leaves
+    /// `max_cost_per_day_cents` unwritten, `[cost]` with no limit written,
+    /// and a priced model: what a delegated run gets when nobody chose a
+    /// ceiling.
+    #[tokio::test]
+    async fn default_profile_delegate_with_priced_spend_past_five_dollars() {
+        use zeroclaw_config::schema::{CostConfig, RuntimeProfileConfig};
+
+        let (server, requests) = start_usage_chat_server(1).await;
+        let fixture = delegate_cost_fixture_with(
+            server.uri.clone(),
+            CostConfig::default(),
+            RuntimeProfileConfig {
+                agentic: true,
+                max_tool_iterations: 5,
+                ..RuntimeProfileConfig::default()
+            },
+        )
+        .await;
+        // $6.00 of the target's own priced spend today: above $5.00, below
+        // the $10.00 shared daily limit.
+        record_agent_seed_spend(&fixture, "target", 6.0);
+
+        let result = fixture
+            .tool
+            .execute(json!({"agent": "target", "prompt": "produce a status line"}))
+            .await
+            .expect("delegate execute returns a result");
+        assert!(
+            result.success,
+            "no ceiling was written, so none refuses the delegate: {result:?}"
+        );
+        assert_eq!(
+            requests.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the delegated provider is reached"
+        );
+        let stats = poll_agent_cost(&fixture.data_dir, "target").await;
+        assert_eq!(
+            stats.request_count, 2,
+            "the delegate's own call lands on the ledger beside the seeded spend"
+        );
+    }
+
     #[tokio::test]
     async fn sync_delegate_shared_daily_limit_still_binds() {
         let (server, requests) = start_usage_chat_server(1).await;
@@ -23953,8 +24012,8 @@ command = "rm independent-delegate-marker"
         root_config.cost = CostConfig {
             enabled: true,
             track_per_agent: true,
-            daily_limit_usd,
-            monthly_limit_usd: 10_000.0,
+            daily_limit_usd: Some(daily_limit_usd),
+            monthly_limit_usd: Some(10_000.0),
             ..CostConfig::default()
         };
         root_config.providers.models.ollama.insert(
@@ -24063,8 +24122,8 @@ command = "rm independent-delegate-marker"
         root_config.cost = CostConfig {
             enabled: true,
             track_per_agent: true,
-            daily_limit_usd,
-            monthly_limit_usd: 10_000.0,
+            daily_limit_usd: Some(daily_limit_usd),
+            monthly_limit_usd: Some(10_000.0),
             ..CostConfig::default()
         };
         root_config.providers.models.ollama.insert(
@@ -24506,8 +24565,8 @@ command = "rm independent-delegate-marker"
         root_config.cost = CostConfig {
             enabled: true,
             track_per_agent: true,
-            daily_limit_usd: 1000.0,
-            monthly_limit_usd: 10_000.0,
+            daily_limit_usd: Some(1000.0),
+            monthly_limit_usd: Some(10_000.0),
             ..CostConfig::default()
         };
         for (alias, uri) in [("default", hop_mock_uri), ("leaf", leaf_mock_uri)] {
@@ -24995,7 +25054,7 @@ command = "rm independent-delegate-marker"
 
         async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
             let mut reloaded = self.tracker.config();
-            reloaded.daily_limit_usd = self.lowered_daily_limit_usd;
+            reloaded.daily_limit_usd = Some(self.lowered_daily_limit_usd);
             self.tracker.update_config(reloaded);
             self.flipped
                 .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -25214,8 +25273,8 @@ command = "rm independent-delegate-marker"
                 CostConfig {
                     enabled: true,
                     track_per_agent: true,
-                    daily_limit_usd: 1000.0,
-                    monthly_limit_usd: 10_000.0,
+                    daily_limit_usd: Some(1000.0),
+                    monthly_limit_usd: Some(10_000.0),
                     ..CostConfig::default()
                 },
                 workspace.path(),
@@ -25319,8 +25378,8 @@ command = "rm independent-delegate-marker"
                 CostConfig {
                     enabled: true,
                     track_per_agent: true,
-                    daily_limit_usd: 1000.0,
-                    monthly_limit_usd: 10_000.0,
+                    daily_limit_usd: Some(1000.0),
+                    monthly_limit_usd: Some(10_000.0),
                     ..CostConfig::default()
                 },
                 workspace.path(),
@@ -25432,8 +25491,8 @@ command = "rm independent-delegate-marker"
                 CostConfig {
                     enabled: true,
                     track_per_agent: true,
-                    daily_limit_usd: 1000.0,
-                    monthly_limit_usd: 10_000.0,
+                    daily_limit_usd: Some(1000.0),
+                    monthly_limit_usd: Some(10_000.0),
                     ..CostConfig::default()
                 },
                 workspace.path(),

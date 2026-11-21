@@ -831,8 +831,8 @@ mod graceful_summary_metering_tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let cfg = CostConfig {
             enabled: true,
-            daily_limit_usd: -1.0,
-            monthly_limit_usd: -1.0,
+            daily_limit_usd: Some(-1.0),
+            monthly_limit_usd: Some(-1.0),
             ..CostConfig::default()
         };
         let tracker = Arc::new(crate::cost::CostTracker::new(cfg, tmp.path()).unwrap());

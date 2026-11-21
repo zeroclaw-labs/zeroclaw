@@ -1396,7 +1396,7 @@ tags = ["auto-generated"]
         let cost_dir = tempfile::tempdir().unwrap();
         let cost_config = zeroclaw_config::schema::CostConfig {
             enabled: true,
-            daily_limit_usd: 0.001, // very low limit
+            daily_limit_usd: Some(0.001), // very low limit
             ..zeroclaw_config::schema::CostConfig::default()
         };
         let tracker = Arc::new(CostTracker::new(cost_config, cost_dir.path()).unwrap());
