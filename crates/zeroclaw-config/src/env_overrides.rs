@@ -7,6 +7,7 @@ use std::sync::LazyLock;
 
 const PREFIX: &str = "ZEROCLAW_";
 const SEP: &str = "__";
+const OPENAI_STT_API_KEY_PATH: &str = "transcription.openai.api_key";
 
 /// `[todotracker]` was a daemon schema section in v0.8.3 only; TodoWrite
 /// display config now lives in ZeroCode's `zerocode-config.toml`. Removing the
@@ -139,6 +140,51 @@ pub fn apply_env_overrides(config: &mut Config) -> Result<AppliedOverrides> {
         }
         paths.insert(path);
     }
+
+    // Keep the ecosystem-standard names as a narrow bridge into the canonical
+    // typed config field. This runs after ZEROCLAW_<path> overrides, so the
+    // schema-mirror value remains authoritative when both are set. Explicit
+    // config (including a decrypted secret) wins because the bridge only fills
+    // a missing or whitespace-only key.
+    let has_openai_stt_key = config
+        .transcription
+        .openai
+        .as_ref()
+        .and_then(|openai| openai.api_key.as_deref())
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty());
+    if config.transcription.openai.is_some()
+        && !paths.contains(OPENAI_STT_API_KEY_PATH)
+        && !has_openai_stt_key
+        && let Some((env_name, value)) = ["TRANSCRIPTION_API_KEY", "OPENAI_API_KEY"]
+            .into_iter()
+            .find_map(|name| {
+                std::env::var(name)
+                    .ok()
+                    .map(|value| (name, value.trim().to_string()))
+                    .filter(|(_, value)| !value.is_empty())
+            })
+    {
+        let snapshot = raw_value_for_path(config, OPENAI_STT_API_KEY_PATH).unwrap_or_default();
+        snapshots
+            .entry(OPENAI_STT_API_KEY_PATH.to_string())
+            .or_insert(snapshot);
+        if let Some(openai) = config.transcription.openai.as_mut() {
+            openai.api_key = Some(value);
+        }
+        paths.insert(OPENAI_STT_API_KEY_PATH.to_string());
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({
+                    "path": OPENAI_STT_API_KEY_PATH,
+                    "env_var": env_name,
+                })),
+            "Secret applied from OpenAI STT environment bridge"
+        );
+    }
+
     if !paths.is_empty() {
         ::zeroclaw_log::record!(
             INFO,
@@ -280,6 +326,41 @@ mod tests {
         fn drop(&mut self) {
             // SAFETY: tests serialize on `env_test_lock()`.
             unsafe { std::env::remove_var(self.0) };
+        }
+    }
+
+    struct EnvSnapshot(Vec<(&'static str, Option<std::ffi::OsString>)>);
+    impl EnvSnapshot {
+        fn clear(names: &[&'static str]) -> Self {
+            let previous = names
+                .iter()
+                .map(|name| (*name, std::env::var_os(name)))
+                .collect();
+            let snapshot = Self(previous);
+            for name in names {
+                // SAFETY: callers serialize on `env_test_lock()`.
+                unsafe { std::env::remove_var(name) };
+            }
+            snapshot
+        }
+
+        fn set(&self, name: &'static str, value: &str) {
+            // SAFETY: callers serialize on `env_test_lock()`.
+            unsafe { std::env::set_var(name, value) };
+        }
+    }
+
+    impl Drop for EnvSnapshot {
+        fn drop(&mut self) {
+            for (name, value) in &self.0 {
+                // SAFETY: callers serialize on `env_test_lock()`.
+                unsafe {
+                    match value {
+                        Some(value) => std::env::set_var(name, value),
+                        None => std::env::remove_var(name),
+                    }
+                }
+            }
         }
     }
 
@@ -670,5 +751,213 @@ mod tests {
                 .all(|notice| !notice.changes_file()),
             "an ignored variable is not a change to write"
         );
+    }
+
+    #[tokio::test]
+    async fn openai_stt_environment_does_not_enable_an_absent_provider() {
+        let _guard = super::env_test_lock().await;
+        let env = EnvSnapshot::clear(&[
+            "TRANSCRIPTION_API_KEY",
+            "OPENAI_API_KEY",
+            "ZEROCLAW_transcription__openai__api_key",
+        ]);
+        env.set("TRANSCRIPTION_API_KEY", "transcription-key");
+        env.set("OPENAI_API_KEY", "openai-key");
+
+        let mut config = Config::default();
+        let applied = apply_env_overrides(&mut config).expect("apply succeeds");
+
+        assert!(
+            config.transcription.openai.is_none(),
+            "ecosystem aliases must not enable a provider that was not configured",
+        );
+        assert!(
+            !applied.paths.contains(OPENAI_STT_API_KEY_PATH),
+            "an unused environment alias must not be reported as an applied override",
+        );
+    }
+
+    #[tokio::test]
+    async fn openai_stt_environment_bridge_uses_config_precedence_and_fills_existing_table() {
+        let _guard = super::env_test_lock().await;
+        let env = EnvSnapshot::clear(&[
+            "TRANSCRIPTION_API_KEY",
+            "OPENAI_API_KEY",
+            "ZEROCLAW_transcription__openai__api_key",
+        ]);
+        env.set("TRANSCRIPTION_API_KEY", "  transcription-key  ");
+        env.set("OPENAI_API_KEY", "openai-key");
+
+        let mut configured = Config::default();
+        configured.transcription.openai = Some(crate::schema::OpenAiSttConfig {
+            api_key: Some("configured-key".to_string()),
+            model: "whisper-1".to_string(),
+        });
+        let configured_overrides = apply_env_overrides(&mut configured).expect("apply succeeds");
+        assert_eq!(
+            configured
+                .transcription
+                .openai
+                .as_ref()
+                .and_then(|openai| openai.api_key.as_deref()),
+            Some("configured-key"),
+            "an explicit config credential must beat ecosystem env vars",
+        );
+        assert!(!configured_overrides.paths.contains(OPENAI_STT_API_KEY_PATH),);
+
+        let mut existing_table = Config::default();
+        existing_table.transcription.openai = Some(crate::schema::OpenAiSttConfig {
+            api_key: None,
+            model: "custom-whisper-model".to_string(),
+        });
+        let applied = apply_env_overrides(&mut existing_table).expect("apply succeeds");
+        let openai = existing_table
+            .transcription
+            .openai
+            .as_ref()
+            .expect("existing table stays present");
+        assert_eq!(openai.api_key.as_deref(), Some("transcription-key"));
+        assert_eq!(openai.model, "custom-whisper-model");
+        assert!(applied.paths.contains(OPENAI_STT_API_KEY_PATH));
+        assert!(Config::prop_is_secret(OPENAI_STT_API_KEY_PATH));
+    }
+
+    #[tokio::test]
+    async fn openai_stt_bridge_falls_back_to_openai_key_and_masks_existing_table() {
+        let _guard = super::env_test_lock().await;
+        let env = EnvSnapshot::clear(&[
+            "TRANSCRIPTION_API_KEY",
+            "OPENAI_API_KEY",
+            "ZEROCLAW_transcription__openai__api_key",
+        ]);
+        env.set("TRANSCRIPTION_API_KEY", "  ");
+        env.set("OPENAI_API_KEY", "  openai-key  ");
+
+        let mut config = Config::default();
+        config.transcription.openai = Some(crate::schema::OpenAiSttConfig {
+            api_key: None,
+            model: "whisper-1".to_string(),
+        });
+        let applied = apply_env_overrides(&mut config).expect("apply succeeds");
+        assert_eq!(
+            config
+                .transcription
+                .openai
+                .as_ref()
+                .and_then(|openai| openai.api_key.as_deref()),
+            Some("openai-key"),
+        );
+        assert!(applied.paths.contains(OPENAI_STT_API_KEY_PATH));
+
+        let mut to_save = config.clone();
+        mask_env_overrides_for_save(&mut to_save, &applied.snapshots).expect("mask succeeds");
+        assert!(
+            to_save
+                .transcription
+                .openai
+                .as_ref()
+                .is_some_and(|openai| openai.api_key.is_none()),
+            "saving must restore the existing table's missing key",
+        );
+        assert!(
+            !toml::to_string(&to_save)
+                .expect("serialize config")
+                .contains("openai-key"),
+            "the environment credential must not be serialized",
+        );
+    }
+
+    #[tokio::test]
+    async fn openai_stt_bridge_does_not_persist_an_environment_key() {
+        let _guard = super::env_test_lock().await;
+        let env = EnvSnapshot::clear(&[
+            "TRANSCRIPTION_API_KEY",
+            "OPENAI_API_KEY",
+            "ZEROCLAW_transcription__openai__api_key",
+        ]);
+        env.set("TRANSCRIPTION_API_KEY", "bridge-only-fixture");
+
+        let directory = tempfile::tempdir().expect("temporary config directory");
+        let config_path = directory.path().join("config.toml");
+        let mut config = Config {
+            config_path: config_path.clone(),
+            data_dir: directory.path().join("data"),
+            ..Config::default()
+        };
+        config.transcription.enabled = true;
+        config.transcription.openai = Some(crate::schema::OpenAiSttConfig {
+            api_key: None,
+            model: "whisper-1".to_string(),
+        });
+        config.save().await.expect("write the pre-bridge config");
+        config.loaded_from = Some(config_path.clone());
+
+        let applied = apply_env_overrides(&mut config).expect("apply succeeds");
+        config.env_overridden_paths = applied.paths;
+        config.pre_override_snapshots = applied.snapshots;
+        config
+            .set_prop_persistent("gateway.request_timeout_secs", "91")
+            .expect("mark an unrelated config edit dirty");
+        config.save().await.expect("save the unrelated config edit");
+
+        let contents = std::fs::read_to_string(&config_path).expect("saved config exists");
+        assert!(
+            contents.contains("[transcription.openai]"),
+            "the explicitly configured provider section must remain durable: {contents}",
+        );
+        assert!(
+            !contents.contains("bridge-only-fixture"),
+            "the bridged credential must not be serialized",
+        );
+        let reloaded = crate::migration::migrate_to_current(&contents)
+            .expect("saved config can be loaded again");
+        let openai = reloaded
+            .transcription
+            .openai
+            .expect("the explicitly configured provider remains enabled");
+        assert!(openai.api_key.is_none());
+        assert_eq!(openai.model, "whisper-1");
+        assert_eq!(reloaded.gateway.request_timeout_secs, 91);
+    }
+
+    #[tokio::test]
+    async fn schema_mirror_openai_stt_key_beats_native_bridge() {
+        let _guard = super::env_test_lock().await;
+        let env = EnvSnapshot::clear(&[
+            "TRANSCRIPTION_API_KEY",
+            "OPENAI_API_KEY",
+            "ZEROCLAW_transcription__openai__api_key",
+        ]);
+        env.set("TRANSCRIPTION_API_KEY", "transcription-key");
+        env.set("OPENAI_API_KEY", "openai-key");
+        env.set("ZEROCLAW_transcription__openai__api_key", "zeroclaw-key");
+
+        let mut config = Config::default();
+        config.transcription.openai = Some(crate::schema::OpenAiSttConfig::default());
+        let applied = apply_env_overrides(&mut config).expect("apply succeeds");
+        assert_eq!(
+            config
+                .transcription
+                .openai
+                .as_ref()
+                .and_then(|openai| openai.api_key.as_deref()),
+            Some("zeroclaw-key"),
+        );
+        assert!(applied.paths.contains(OPENAI_STT_API_KEY_PATH));
+
+        env.set("ZEROCLAW_transcription__openai__api_key", "");
+        let mut explicitly_cleared = Config::default();
+        explicitly_cleared.transcription.openai = Some(crate::schema::OpenAiSttConfig::default());
+        let cleared = apply_env_overrides(&mut explicitly_cleared).expect("apply succeeds");
+        assert!(
+            explicitly_cleared
+                .transcription
+                .openai
+                .as_ref()
+                .and_then(|openai| openai.api_key.as_deref())
+                .is_none(),
+            "an explicit empty schema-mirror value must not be refilled by native aliases",
+        );
+        assert!(cleared.paths.contains(OPENAI_STT_API_KEY_PATH));
     }
 }
