@@ -21,7 +21,7 @@ use zeroclaw_api::jsonrpc::{
 use zeroclaw_api::model_provider::{ChatMessage, ConversationMessage, ToolCall};
 use zeroclaw_api::plan::PlanEntry;
 use zeroclaw_config::schema::{Config, ResolvedContextLimits};
-use zeroclaw_infra::acp_session_store::AcpSessionStore;
+use zeroclaw_infra::acp_session_store::{AcpSessionData, AcpSessionRestore, AcpSessionStore};
 use zeroclaw_memory::Memory;
 use zeroclaw_providers::SafeguardFallbackNotice;
 use zeroclaw_runtime::agent::SteeringInput;
@@ -861,6 +861,8 @@ impl AcpServer {
             "session/cancel" => self.handle_session_cancel(&request.params).await,
             "session/event" | "session/update" => self.handle_session_event(&request.params).await,
             "_zeroclaw/session/steer" => self.handle_session_steer(&request.params).await,
+            "_zeroclaw/session/rename" => self.handle_session_rename(&request.params).await,
+            "_zeroclaw/session/list" => self.handle_session_list().await,
             _ => {
                 ::zeroclaw_log::record!(
                     WARN,
@@ -1416,6 +1418,101 @@ impl AcpServer {
         }))
     }
 
+    async fn handle_session_list(&self) -> RpcResult {
+        // The current ACP server carries unscoped sessions only.
+        let store = self.store.clone().ok_or_else(|| RpcError {
+            code: INTERNAL_ERROR,
+            message: "ACP session storage is unavailable".into(),
+            data: None,
+        })?;
+        let rows = tokio::task::spawn_blocking(move || store.list_sessions_owned(None)).await;
+        let Ok(Ok(rows)) = rows else {
+            return Err(RpcError {
+                code: INTERNAL_ERROR,
+                message: "Failed to list ACP sessions".into(),
+                data: None,
+            });
+        };
+        let sessions: Vec<_> = rows
+            .into_iter()
+            .map(|(session, name)| {
+                serde_json::json!({
+                    "sessionId": session.session_uuid,
+                    "name": name,
+                    "agentAlias": session.agent_alias,
+                    "workspaceDir": session.workspace_dir,
+                    "messageCount": session.message_count,
+                    "createdAt": session.created_at,
+                    "lastActivity": session.last_activity,
+                })
+            })
+            .collect();
+        Ok(serde_json::json!({"sessions": sessions}))
+    }
+
+    async fn handle_session_rename(&self, params: &Value) -> RpcResult {
+        let session_id = params["sessionId"].as_str().filter(|id| !id.is_empty());
+        let name = params["name"]
+            .as_str()
+            .map(str::trim)
+            .filter(|name| !name.is_empty());
+        let (Some(session_id), Some(name)) = (session_id, name) else {
+            return Err(RpcError {
+                code: INVALID_PARAMS,
+                message: "Non-empty sessionId and name are required".into(),
+                data: None,
+            });
+        };
+        let store = self.store.clone().ok_or_else(|| RpcError {
+            code: INTERNAL_ERROR,
+            message: "ACP session storage is unavailable".into(),
+            data: None,
+        })?;
+        let id = session_id.to_owned();
+        let persisted_name = name.to_owned();
+        let result = tokio::task::spawn_blocking(move || {
+            store.rename_session_authorized(&id, &persisted_name, None, |_| Ok(()))
+        })
+        .await;
+        match result {
+            Ok(Ok(true)) => Ok(serde_json::json!({"sessionId": session_id, "name": name})),
+            Ok(Ok(false)) => Err(RpcError {
+                code: FORBIDDEN,
+                message: "Session cannot be renamed".into(),
+                data: None,
+            }),
+            _ => Err(RpcError {
+                code: INTERNAL_ERROR,
+                message: "Failed to rename ACP session".into(),
+                data: None,
+            }),
+        }
+    }
+
+    fn load_unscoped_session_for_restore(
+        store: &AcpSessionStore,
+        session_id: &str,
+    ) -> Result<Box<AcpSessionData>, RpcError> {
+        match store.load_session_for_restore_owned(session_id, None) {
+            Ok(Some(AcpSessionRestore::Restorable(data))) => Ok(data),
+            Ok(Some(AcpSessionRestore::Missing)) => Err(RpcError {
+                code: SESSION_NOT_FOUND,
+                message: format!("Session not found: {session_id}"),
+                data: None,
+            }),
+            Ok(None) | Ok(Some(AcpSessionRestore::Killed)) => Err(RpcError {
+                code: FORBIDDEN,
+                message: format!("Session cannot be restored: {session_id}"),
+                data: None,
+            }),
+            Err(error) => Err(RpcError {
+                code: INTERNAL_ERROR,
+                message: format!("Failed to load session: {error}"),
+                data: None,
+            }),
+        }
+    }
+
     async fn handle_session_load(&self, params: &Value) -> RpcResult {
         let session_id = params
             .get("sessionId")
@@ -1492,25 +1589,9 @@ impl AcpServer {
             loading.insert(session_id.clone());
         }
 
-        // Flatten both the SQLite error and the not-found case into a single
-        // Result so the cleanup match below runs for every failure after the
-        // reservation was inserted.
-        let data = store
-            .load_session(&session_id)
-            .map_err(|e| RpcError {
-                code: INTERNAL_ERROR,
-                message: format!("Failed to load session: {e}"),
-                data: None,
-            })
-            .and_then(|opt| {
-                opt.ok_or_else(|| RpcError {
-                    code: SESSION_NOT_FOUND,
-                    message: format!("Session not found: {session_id}"),
-                    data: None,
-                })
-            });
+        let data = Self::load_unscoped_session_for_restore(store, &session_id);
 
-        // On error (SQLite failure or not-found), release the reservation.
+        // Every restore failure releases the reserved slot.
         let data = match data {
             Ok(d) => d,
             Err(e) => {
@@ -1833,22 +1914,9 @@ impl AcpServer {
             loading.insert(session_id.clone());
         }
 
-        let data = store
-            .load_session(&session_id)
-            .map_err(|e| RpcError {
-                code: INTERNAL_ERROR,
-                message: format!("Failed to load session: {e}"),
-                data: None,
-            })
-            .and_then(|opt| {
-                opt.ok_or_else(|| RpcError {
-                    code: SESSION_NOT_FOUND,
-                    message: format!("Session not found: {session_id}"),
-                    data: None,
-                })
-            });
+        let data = Self::load_unscoped_session_for_restore(store, &session_id);
 
-        // On error (SQLite failure or not-found), release the reservation.
+        // Every restore failure releases the reserved slot.
         let data = match data {
             Ok(d) => d,
             Err(e) => {
@@ -12002,5 +12070,65 @@ mod tests {
         )
         .expect_err("WebChat session ids must be UUIDs");
         assert_eq!(error.code, INVALID_PARAMS);
+    }
+
+    #[tokio::test]
+    async fn unscoped_restore_distinguishes_missing_and_forbidden() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = AcpSessionStore::new(dir.path()).unwrap();
+        store
+            .create_session("foreign", "alpha", "/tmp", Some("owner"))
+            .unwrap();
+        store
+            .create_session("killed", "alpha", "/tmp", None)
+            .unwrap();
+        store.create_session("live", "alpha", "/tmp", None).unwrap();
+        assert!(store.mark_session_killed("killed").unwrap());
+        let server = AcpServer::new_with_store(
+            Config::default(),
+            AcpServerConfig::default(),
+            Arc::new(store),
+        );
+        for (id, code) in [
+            ("missing", SESSION_NOT_FOUND),
+            ("foreign", FORBIDDEN),
+            ("killed", FORBIDDEN),
+        ] {
+            let params = serde_json::json!({"sessionId": id});
+            assert_eq!(
+                server.handle_session_load(&params).await.unwrap_err().code,
+                code
+            );
+            assert_eq!(
+                server
+                    .handle_session_resume(&params)
+                    .await
+                    .unwrap_err()
+                    .code,
+                code
+            );
+        }
+        assert!(server.loading_sessions.lock().await.is_empty());
+        for id in ["foreign", "killed"] {
+            let params = serde_json::json!({"sessionId": id, "name": "Project"});
+            assert_eq!(
+                server
+                    .handle_session_rename(&params)
+                    .await
+                    .unwrap_err()
+                    .code,
+                FORBIDDEN
+            );
+        }
+        let params = serde_json::json!({"sessionId": "live", "name": " Project "});
+        assert_eq!(
+            server.handle_session_rename(&params).await.unwrap(),
+            serde_json::json!({"sessionId": "live", "name": "Project"})
+        );
+        let list = server.handle_session_list().await.unwrap();
+        let sessions = list["sessions"].as_array().unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0]["sessionId"], "live");
+        assert_eq!(sessions[0]["name"], "Project");
     }
 }
