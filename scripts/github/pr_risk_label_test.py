@@ -25,6 +25,7 @@ POLICY_PATH = ROOT / ".github/risk-labeler.yml"
 WORKFLOW_PATH = ROOT / ".github/workflows/pr-risk-labeler.yml"
 HEAD = "a" * 40
 BASE = "b" * 40
+MERGE_BASE = "d" * 40
 EXPECTED_HIGH_GLOBS = (
     "crates/zeroclaw-runtime/src/security/**",
     "crates/zeroclaw-runtime/src/approval/**",
@@ -87,6 +88,18 @@ def changed_file(
     return value
 
 
+def removed_file(path: str, revision: str = MERGE_BASE, **extra: object) -> dict[str, object]:
+    """A removed file as GitHub reports it: bound to the merge-base, not head."""
+    return changed_file(
+        path,
+        0,
+        1,
+        status="removed",
+        contents_url=f"https://api.github.com/repos/zeroclaw-labs/zeroclaw/contents/{path}?ref={revision}",
+        **extra,
+    )
+
+
 def workflow_step_run(step_name: str) -> str:
     lines = WORKFLOW_PATH.read_text(encoding="utf-8").splitlines()
     step_index = lines.index(f"      - name: {step_name}")
@@ -110,6 +123,12 @@ class FakeAPI:
         self.pr["changed_files"] = len(files)
         self.sources: dict[tuple[str, str], dict[str, str]] = {}
         self.paginated_paths: list[str] = []
+        self.merge_base = MERGE_BASE
+        self.merge_base_requests: list[tuple[str, str]] = []
+
+    def get_merge_base(self, base_sha: str, head_sha: str) -> str:
+        self.merge_base_requests.append((base_sha, head_sha))
+        return self.merge_base
 
     def get_pull(self, number: int) -> dict[str, object]:
         return self.pr
@@ -157,6 +176,17 @@ class RelabelingAPI(FakeAPI):
         kept = [label for label in self.pr["labels"] if label["name"] not in self.removed]
         relabeled["labels"] = [*kept, *({"name": name} for name in self.added)]
         return relabeled
+
+
+class RecordingAPI(classifier.GitHubAPI):
+    def __init__(self, response: object) -> None:
+        super().__init__("zeroclaw-labs/zeroclaw", "token")
+        self.response = response
+        self.calls: list[str] = []
+
+    def request(self, method: str, path: str) -> object:
+        self.calls.append(path)
+        return self.response
 
 
 class PaginatedAPI(classifier.GitHubAPI):
@@ -591,6 +621,62 @@ class RiskClassifierTest(unittest.TestCase):
                 )
             )
 
+    def test_removed_file_evidence_binds_to_merge_base(self) -> None:
+        # GitHub reports a removed file at the merge-base, which differs from
+        # the PR base SHA once the base branch has moved past the fork point.
+        api = FakeAPI(pull(), [changed_file("src/lib.rs"), removed_file("src/old.rs")])
+        self.assertEqual(evaluate(api)["proposed_risk"], "risk:medium")
+        self.assertEqual(api.merge_base_requests, [(BASE, HEAD)])
+
+    def test_pr_of_only_removed_files_is_bound_to_merge_base(self) -> None:
+        api = FakeAPI(pull(), [removed_file("src/old.rs"), removed_file("docs/old.md")])
+        self.assertEqual(evaluate(api)["proposed_risk"], "risk:medium")
+        self.assertEqual(api.merge_base_requests, [(BASE, HEAD)])
+
+    def test_merge_base_is_not_resolved_without_removed_files(self) -> None:
+        api = FakeAPI(pull(), [changed_file("src/lib.rs")])
+        evaluate(api)
+        self.assertEqual(api.merge_base_requests, [])
+
+    def test_removed_file_evidence_must_match_merge_base(self) -> None:
+        for revision in (HEAD, BASE, "c" * 40):
+            with self.subTest(revision=revision):
+                with self.assertRaisesRegex(classifier.RiskReportError, "captured merge-base SHA"):
+                    evaluate(FakeAPI(pull(), [removed_file("src/old.rs", revision)]))
+
+    def test_removed_file_evidence_without_merge_base_fails_closed(self) -> None:
+        with self.assertRaisesRegex(classifier.RiskReportError, "captured merge-base SHA"):
+            classifier.validate_files([removed_file("src/old.rs")], 1, HEAD)
+
+    def test_non_removed_file_bound_to_merge_base_fails_closed(self) -> None:
+        with self.assertRaisesRegex(classifier.RiskReportError, "captured head SHA"):
+            classifier.validate_files(
+                [changed_file("src/lib.rs", contents_url=removed_file("src/lib.rs")["contents_url"])],
+                1,
+                HEAD,
+                MERGE_BASE,
+            )
+
+    def test_github_api_resolves_merge_base_from_captured_compare(self) -> None:
+        api = RecordingAPI({"base_commit": {"sha": BASE}, "merge_base_commit": {"sha": MERGE_BASE}})
+        self.assertEqual(api.get_merge_base(BASE, HEAD), MERGE_BASE)
+        self.assertEqual(
+            api.calls,
+            [f"/repos/zeroclaw-labs/zeroclaw/compare/{BASE}...{HEAD}?per_page=1"],
+        )
+
+    def test_github_api_merge_base_fails_closed_on_unbound_or_malformed_compare(self) -> None:
+        for response in (
+            [],
+            {"merge_base_commit": {"sha": MERGE_BASE}},
+            {"base_commit": {"sha": "c" * 40}, "merge_base_commit": {"sha": MERGE_BASE}},
+            {"base_commit": {"sha": BASE}},
+            {"base_commit": {"sha": BASE}, "merge_base_commit": {"sha": "not-a-sha"}},
+        ):
+            with self.subTest(response=response):
+                with self.assertRaises(classifier.RiskReportError):
+                    RecordingAPI(response).get_merge_base(BASE, HEAD)
+
     def test_pagination_stops_at_expected_count_and_fails_on_overflow(self) -> None:
         api = PaginatedAPI([[{}] * 100, [{}] * 50, [{}]])
         self.assertEqual(len(api.paginate("/repos/zeroclaw-labs/zeroclaw/pulls/1/files", 150)), 150)
@@ -796,6 +882,8 @@ pub fn allowed() -> bool {
         for status in ("added", "removed", "renamed", "copied"):
             with self.subTest(status=status):
                 file = changed_file(path, 1, 1, TEST_PATCH, status=status)
+                if status == "removed":
+                    file = removed_file(path, patch=TEST_PATCH)
                 if status in {"renamed", "copied"}:
                     file["previous_filename"] = path
                 api = FakeAPI(pull(), [file])
