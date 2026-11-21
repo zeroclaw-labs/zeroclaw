@@ -1737,7 +1737,19 @@ rpc-auth-remote-token-required = Remote connections must present auth_token in i
 rpc-auth-inproc-token-required = In-process connections must present auth_token in initialize
 rpc-auth-first-call-initialize = First call must be 'initialize'
 rpc-auth-revalidation-due = Credential revalidation due: re-initialize to revalidate
+rpc-auth-config-cascade-write-denied = Principal is not granted config write access to "{ $path }", which this change also rewrites
 rpc-auth-pairing-revoked = Pairing token revoked: re-pair and re-initialize
+rpc-plugin-webhook-local-ipc-only = { $method } is served only on the local IPC endpoint
+rpc-plugin-webhook-channel-not-granted = Principal is not granted the channel that owns this webhook path (required by plugin-webhook/dispatch)
+rpc-plugin-webhook-channel-not-granted-audit = Principal is not granted channel { $channel } (required by plugin-webhook/dispatch)
+rpc-plugin-webhook-channel-unbound = Channel { $channel } has no binding in the live config, so it takes no webhooks delivered over the RPC socket
+rpc-plugin-webhook-channel-refuses = Channel { $channel } refuses webhooks delivered over the RPC socket (accept_injected_webhooks = false)
+rpc-plugin-webhook-agent-refuses = Agent { $agent } refuses turns from webhooks delivered over the RPC socket (accept_injected_webhooks = false), so channel { $channel } cannot take them
+rpc-plugin-webhook-request-id-invalid = request_id must be 1 to { $max } bytes of printable ASCII without spaces
+rpc-plugin-webhook-request-id-in-flight = request_id is already in flight on this connection
+rpc-plugin-webhook-body-too-large = body_b64 exceeds the plugin webhook body limit
+rpc-plugin-webhook-body-not-base64 = body_b64 is not standard base64
+rpc-plugin-webhook-request-invalid = invalid plugin webhook request: { $error }
 
 cron-agent-job-failed = The scheduled task could not be completed. Please try again or ask an administrator to check the logs.
 

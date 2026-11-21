@@ -93,9 +93,33 @@ expect "infra plugin webhook ingress" "true" \
     "crates/zeroclaw-infra/src/plugin_webhook.rs"
 expect "infra plugin webhook ingress submodule" "true" \
     "crates/zeroclaw-infra/src/plugin_webhook/tests.rs"
+# The infra crate root holds the ingress's dedup limit helpers, and the infra
+# manifest defines its dependencies.
+expect "infra crate root" "true" "crates/zeroclaw-infra/src/lib.rs"
+expect "infra manifest" "true" "crates/zeroclaw-infra/Cargo.toml"
 expect "mixed unrelated then plugin webhook" "true" \
     "web/src/pages/AgentChat.tsx" \
     "crates/zeroclaw-gateway/src/plugin_webhook.rs"
+
+# The standalone gateway's forwarding path must run the backend job: the
+# two-process IPC e2e, the fixture helpers it shares with the activation
+# e2e, the gateway's core connection, and the RPC client, its request
+# plumbing in zeroclaw-api, and the wire crate run their plugin webhook
+# coverage only here.
+expect "root plugin webhook IPC e2e" "true" \
+    "tests/plugin_webhook_ipc_e2e.rs"
+expect "shared channel fixture helpers" "true" \
+    "tests/support/plugin_channel_fixture.rs"
+expect "gateway core connection" "true" \
+    "crates/zeroclaw-gateway/src/core_rpc.rs"
+expect "rpc client crate" "true" \
+    "crates/zeroclaw-rpc-client/src/client.rs"
+expect "rpc wire crate" "true" \
+    "crates/zeroclaw-rpc-proto/src/types.rs"
+expect "rpc client request plumbing" "true" \
+    "crates/zeroclaw-api/src/jsonrpc.rs"
+expect "gateway plugin webhook forwarder" "true" \
+    "crates/zeroclaw-gateway/src/plugin_webhook/forward.rs"
 
 expect "wit contracts" "true" "wit/v0/tool-plugin.wit"
 expect "workspace manifest" "true" "Cargo.toml"
@@ -134,8 +158,10 @@ expect "other ci scripts" "false" "scripts/ci/check_binary_size.sh"
 # The activation and channel e2e targets are matched by exact path, not by a
 # `tests/*` wildcard, so unrelated root tests must stay outside this job.
 expect "other root tests" "false" "tests/test_live.rs"
-# Only the plugin webhook paths of the gateway, api, and infra crates are
-# listed; the rest of those crates stays with the default-feature Test job.
+expect "other root test support" "false" "tests/support/helpers.rs"
+# Only the plugin webhook paths of the gateway, api, and infra crates (and
+# the api's JSON-RPC plumbing) are listed; the rest of those crates stays with
+# the default-feature Test job.
 expect "other gateway source" "false" "crates/zeroclaw-gateway/src/ws.rs"
 expect "other gateway test" "false" "crates/zeroclaw-gateway/tests/nodes_mdns.rs"
 expect "other api source" "false" "crates/zeroclaw-api/src/lib.rs"

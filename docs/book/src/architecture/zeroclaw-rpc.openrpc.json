@@ -2770,6 +2770,208 @@
         ],
         "type": "string"
       },
+      "PluginWebhookCancelParams": {
+        "description": "`plugin-webhook/cancel` params.",
+        "properties": {
+          "request_id": {
+            "description": "The `request_id` of a dispatch in flight on this connection.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "request_id"
+        ],
+        "type": "object"
+      },
+      "PluginWebhookCancelResult": {
+        "description": "`plugin-webhook/cancel` result.",
+        "properties": {
+          "cancelled": {
+            "description": "`true` when a dispatch with that id was in flight on this\nconnection. The dispatch's own response stays authoritative for\nits outcome.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "cancelled"
+        ],
+        "type": "object"
+      },
+      "PluginWebhookDispatchOutcome": {
+        "description": "How the core ingress answered one dispatch.",
+        "oneOf": [
+          {
+            "const": "ack",
+            "description": "The plugin accepted the request; no response body.",
+            "type": "string"
+          },
+          {
+            "const": "reply",
+            "description": "The plugin answered with `body`.",
+            "type": "string"
+          },
+          {
+            "const": "not_found",
+            "description": "No live route owns the path, or the path is malformed.",
+            "type": "string"
+          },
+          {
+            "const": "queue_full",
+            "description": "The route queue or this connection's in-flight limit is full.",
+            "type": "string"
+          },
+          {
+            "const": "unavailable",
+            "description": "The route or plugin could not take the request, or the daemon runs\nno plugin webhook ingress.",
+            "type": "string"
+          },
+          {
+            "const": "unauthorized",
+            "description": "The plugin rejected the request's credentials.",
+            "type": "string"
+          },
+          {
+            "const": "bad_request",
+            "description": "The plugin rejected the payload as malformed.",
+            "type": "string"
+          },
+          {
+            "const": "invalid_response",
+            "description": "The plugin's response broke the host response rules.",
+            "type": "string"
+          },
+          {
+            "const": "timeout",
+            "description": "No outcome within the deadline, counted from enqueue.",
+            "type": "string"
+          },
+          {
+            "const": "cancelled",
+            "description": "Cancelled by `plugin-webhook/cancel`. When the connection closes or\nthe daemon reloads, in-flight dispatches end with no response.",
+            "type": "string"
+          }
+        ]
+      },
+      "PluginWebhookDispatchParams": {
+        "description": "`plugin-webhook/dispatch` params: one inbound webhook request for the\nchannel plugin that owns `path`. Every field is required.",
+        "properties": {
+          "body_b64": {
+            "description": "Exact body bytes, standard base64 with padding.",
+            "type": "string"
+          },
+          "headers": {
+            "description": "Request headers in order; repeated names are kept.",
+            "items": {
+              "$ref": "#/components/schemas/PluginWebhookHeader"
+            },
+            "type": "array"
+          },
+          "method": {
+            "description": "`GET` or `POST`.",
+            "type": "string"
+          },
+          "path": {
+            "description": "Route path (the `{path}` of `/plugin/{path}`). An unknown or\nmalformed path is the `not_found` outcome.",
+            "type": "string"
+          },
+          "query": {
+            "description": "Raw query string without the leading `?`.",
+            "type": "string"
+          },
+          "request_id": {
+            "description": "Caller-chosen id naming this dispatch for `plugin-webhook/cancel`:\n1 to 128 bytes of printable ASCII without spaces, unique among the\nconnection's in-flight dispatches.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "request_id",
+          "path",
+          "method",
+          "query",
+          "headers",
+          "body_b64"
+        ],
+        "type": "object"
+      },
+      "PluginWebhookDispatchResult": {
+        "description": "`plugin-webhook/dispatch` result.",
+        "properties": {
+          "body": {
+            "description": "Present only when `outcome` is `reply`; at most 4096 UTF-8 bytes.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "outcome": {
+            "$ref": "#/components/schemas/PluginWebhookDispatchOutcome"
+          }
+        },
+        "required": [
+          "outcome"
+        ],
+        "type": "object"
+      },
+      "PluginWebhookHeader": {
+        "description": "One request header forwarded to the plugin. The core lowercases the\nname; the value may hold only visible ASCII, space and tab.",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "value": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "value"
+        ],
+        "type": "object"
+      },
+      "PluginWebhookRouteInfo": {
+        "description": "One published plugin webhook route and the channel instance that owns it.",
+        "properties": {
+          "channel_alias": {
+            "description": "Configured channel alias of the owning instance.",
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          },
+          "plugin": {
+            "description": "Plugin package name.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path",
+          "plugin",
+          "channel_alias"
+        ],
+        "type": "object"
+      },
+      "PluginWebhookRoutesResult": {
+        "description": "`plugin-webhook/routes` result: a diagnostic snapshot of the routes.",
+        "properties": {
+          "generation": {
+            "description": "Route generation of this daemon generation's registry. It\nincrements each time the channel supervisor starts a generation and\nrestarts after a reload, so compare it only within one connection.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "routes": {
+            "description": "Sorted by `path`.",
+            "items": {
+              "$ref": "#/components/schemas/PluginWebhookRouteInfo"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "generation",
+          "routes"
+        ],
+        "type": "object"
+      },
       "ProviderUsageTotals": {
         "description": "Per-(provider, model) usage for one turn. Counts every billable\nattempt, including rejected fallback attempts.",
         "properties": {
@@ -7596,6 +7798,129 @@
       "x-zeroclaw-authorization": {
         "kind": "grant",
         "resource": "tui",
+        "verb": "read"
+      },
+      "x-zeroclaw-params": {
+        "shape": "none"
+      }
+    },
+    {
+      "name": "plugin-webhook/dispatch",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "body_b64",
+          "required": true,
+          "schema": {
+            "description": "Exact body bytes, standard base64 with padding.",
+            "type": "string"
+          }
+        },
+        {
+          "name": "headers",
+          "required": true,
+          "schema": {
+            "description": "Request headers in order; repeated names are kept.",
+            "items": {
+              "$ref": "#/components/schemas/PluginWebhookHeader"
+            },
+            "type": "array"
+          }
+        },
+        {
+          "name": "method",
+          "required": true,
+          "schema": {
+            "description": "`GET` or `POST`.",
+            "type": "string"
+          }
+        },
+        {
+          "name": "path",
+          "required": true,
+          "schema": {
+            "description": "Route path (the `{path}` of `/plugin/{path}`). An unknown or\nmalformed path is the `not_found` outcome.",
+            "type": "string"
+          }
+        },
+        {
+          "name": "query",
+          "required": true,
+          "schema": {
+            "description": "Raw query string without the leading `?`.",
+            "type": "string"
+          }
+        },
+        {
+          "name": "request_id",
+          "required": true,
+          "schema": {
+            "description": "Caller-chosen id naming this dispatch for `plugin-webhook/cancel`:\n1 to 128 bytes of printable ASCII without spaces, unique among the\nconnection's in-flight dispatches.",
+            "type": "string"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/PluginWebhookDispatchResult"
+        },
+        "x-zeroclaw-shape": "typed"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "channels",
+        "verb": "execute"
+      },
+      "x-zeroclaw-params": {
+        "shape": "typed",
+        "type": "PluginWebhookDispatchParams"
+      }
+    },
+    {
+      "name": "plugin-webhook/cancel",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "request_id",
+          "required": true,
+          "schema": {
+            "description": "The `request_id` of a dispatch in flight on this connection.",
+            "type": "string"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/PluginWebhookCancelResult"
+        },
+        "x-zeroclaw-shape": "typed"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "channels",
+        "verb": "execute"
+      },
+      "x-zeroclaw-params": {
+        "shape": "typed",
+        "type": "PluginWebhookCancelParams"
+      }
+    },
+    {
+      "name": "plugin-webhook/routes",
+      "paramStructure": "by-name",
+      "params": [],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/PluginWebhookRoutesResult"
+        },
+        "x-zeroclaw-shape": "typed"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "channels",
         "verb": "read"
       },
       "x-zeroclaw-params": {
