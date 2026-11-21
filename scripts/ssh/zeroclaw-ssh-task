@@ -48,9 +48,20 @@ def parse_args(args):
     return options, host, args
 
 
+def openssh_environment():
+    """Exclude the task wrapper from OpenSSH's own proxy invocations."""
+    env = os.environ.copy()
+    wrapper = pathlib.Path(__file__).resolve()
+    paths = env.get('PATH', os.defpath).split(os.pathsep)
+    env['PATH'] = os.pathsep.join(
+        path for path in paths if (pathlib.Path(path) / 'ssh').resolve() != wrapper
+    )
+    return env
+
+
 def ssh_config(options, host):
     p = subprocess.run([SSH, '-G', '-o', 'ForkAfterAuthentication=no', *options, '--', host], check=True,
-                       capture_output=True, text=True, timeout=10)
+                       capture_output=True, text=True, timeout=10, env=openssh_environment())
     config = {}
     for line in p.stdout.splitlines():
         if ' ' in line:
@@ -143,7 +154,7 @@ class Pool:
                 def spawn():
                     process = subprocess.Popen(command, stdin=subprocess.DEVNULL,
                                                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-                                               start_new_session=True)
+                                               start_new_session=True, env=openssh_environment())
                     log.attach(process.stderr)
                     return process
                 entry = dict(key=key, process=None, future=self.spawner.submit(spawn), path=path,

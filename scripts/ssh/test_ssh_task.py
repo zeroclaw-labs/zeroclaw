@@ -20,6 +20,19 @@ module = importlib.util.module_from_spec(spec)
 loader.exec_module(module)
 
 
+class OpenSshEnvironmentTests(unittest.TestCase):
+    def test_openssh_path_omits_only_the_task_wrapper(self):
+        with tempfile.TemporaryDirectory() as directory:
+            wrappers = pathlib.Path(directory) / 'wrappers'
+            wrappers.mkdir()
+            (wrappers / 'ssh').symlink_to(path.resolve())
+            value = os.pathsep.join((str(wrappers), '/usr/bin', '/bin'))
+            with patch.dict(os.environ, {'PATH': value}):
+                self.assertEqual(module.openssh_environment()['PATH'],
+                                 os.pathsep.join(('/usr/bin', '/bin')))
+                self.assertEqual(os.environ['PATH'], value)
+
+
 class FakeMaster:
     starts = []
     fail = False
