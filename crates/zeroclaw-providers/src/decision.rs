@@ -54,10 +54,9 @@ fn endpoint_for(base_url: &str, wire_api: DecisionWireApi) -> Result<String> {
 }
 
 struct NativeDecisionClient {
-    http: reqwest::Client,
+    transport: HttpTransportConfig,
     endpoint: String,
     model: String,
-    api_key: Option<String>,
     wire_api: DecisionWireApi,
 }
 
@@ -65,15 +64,9 @@ impl NativeDecisionClient {
     fn new(config: DecisionProviderConfig) -> Result<Self> {
         let endpoint = endpoint_for(&config.transport.base_url, config.wire_api)?;
         Ok(Self {
-            http: config
-                .transport
-                .client(DEFAULT_DECISION_TIMEOUT, "decision")?,
+            transport: config.transport,
             endpoint,
             model: config.model,
-            api_key: config
-                .transport
-                .api_key
-                .filter(|key| !key.trim().is_empty()),
             wire_api: config.wire_api,
         })
     }
@@ -210,10 +203,14 @@ impl DecisionModel for NativeDecisionClient {
                 json!({ "model": self.model, "state": state, "questions": questions })
             }
         };
-        let mut request = self.http.post(&self.endpoint).json(&body);
-        if let Some(api_key) = &self.api_key {
-            request = request.bearer_auth(api_key);
-        }
+        // Resolve the client through the live proxy cache for every call.
+        // Publishing proxy settings invalidates that cache; retaining a
+        // client constructed here would keep routing requests through the
+        // previous proxy policy for the lifetime of this provider.
+        let http = self
+            .transport
+            .client(DEFAULT_DECISION_TIMEOUT, "decision")?;
+        let request = self.transport.bearer(http.post(&self.endpoint).json(&body));
         let response = request
             .send()
             .await
