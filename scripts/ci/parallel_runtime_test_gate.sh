@@ -52,13 +52,35 @@ else
     deadline_note="no deadline"
 fi
 
+# That process group is not the terminal's, so Ctrl-C or a hangup reaches only
+# this shell, which would wait for the pass and then start the next one. A timed
+# pass therefore runs in the background while this shell waits for it. On a
+# signal, ask timeout to stop the pass, which it does for the whole group, then
+# end this shell by the same signal so whatever called it stops too.
+stop_pass() {
+    kill -TERM "$pass_pid" 2>/dev/null || true
+    wait "$pass_pid" 2>/dev/null || true
+    trap - "$1"
+    kill -s "$1" "$$"
+}
+
 for crate in "${crates[@]}"; do
     # Compile outside the deadline so a cold build is never mistaken for a hang.
     cargo test --locked --quiet -p "$crate" --lib --no-run
     for ((run = 1; run <= runs; run++)); do
         echo "==> parallel runtime regression: $crate run $run/$runs ($threads threads, $deadline_note)"
         status=0
-        ${deadline[@]+"${deadline[@]}"} cargo test --locked --quiet -p "$crate" --lib -- --test-threads="$threads" || status=$?
+        if ((${#deadline[@]})); then
+            "${deadline[@]}" cargo test --locked --quiet -p "$crate" --lib -- --test-threads="$threads" &
+            pass_pid=$!
+            trap 'stop_pass INT' INT
+            trap 'stop_pass HUP' HUP
+            trap 'stop_pass TERM' TERM
+            wait "$pass_pid" || status=$?
+            trap - INT HUP TERM
+        else
+            cargo test --locked --quiet -p "$crate" --lib -- --test-threads="$threads" || status=$?
+        fi
         case "$status" in
             0) ;;
             124|137)
