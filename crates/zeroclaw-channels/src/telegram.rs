@@ -1119,6 +1119,9 @@ pub struct TelegramChannel {
     /// per sender. See `with_per_user_session`.
     per_user_session: bool,
     passive_group_context: bool,
+    /// Whether `edited_message` updates are processed as inbound messages
+    /// (opt-in, wired from `channels.telegram.<alias>.edited_messages`).
+    edited_messages: bool,
     bot_username: Mutex<Option<String>>,
     bot_id: Mutex<Option<i64>>,
     /// Outcome of the most recent `getUpdates` exchange and when it completed,
@@ -2755,6 +2758,7 @@ impl TelegramChannel {
             mention_only,
             per_user_session: true,
             passive_group_context: false,
+            edited_messages: false,
             bot_username: Mutex::new(None),
             bot_id: Mutex::new(None),
             poll_health: Mutex::new(None),
@@ -2817,6 +2821,12 @@ impl TelegramChannel {
     /// Record unaddressed group messages as passive context instead of dropping them.
     pub fn with_passive_group_context(mut self, enabled: bool) -> Self {
         self.passive_group_context = enabled;
+        self
+    }
+
+    /// Process Telegram `edited_message` updates as inbound messages.
+    pub fn with_edited_messages(mut self, enabled: bool) -> Self {
+        self.edited_messages = enabled;
         self
     }
 
@@ -3411,8 +3421,31 @@ impl TelegramChannel {
         }
     }
 
+    /// The message payload of an update, whether it arrived as a new
+    /// `message` or as an `edited_message` (Telegram delivers the full
+    /// post-edit message under the latter key). Callers run the identical
+    /// pipeline for both; the edit itself is flagged on the parsed
+    /// `ChannelMessage` by `process_update`.
+    fn update_message(update: &serde_json::Value) -> Option<&serde_json::Value> {
+        update
+            .get("message")
+            .or_else(|| update.get("edited_message"))
+    }
+
+    /// Update types the long-poll subscribes to. `edited_message` joins the
+    /// stream only when the alias opted in (`edited_messages`); without the
+    /// subscription Telegram never delivers edits at all, so the wire stays
+    /// byte-identical to before for everyone else.
+    fn allowed_updates(&self) -> serde_json::Value {
+        if self.edited_messages {
+            serde_json::json!(["message", "callback_query", "edited_message"])
+        } else {
+            serde_json::json!(["message", "callback_query"])
+        }
+    }
+
     fn extract_update_message_target(update: &serde_json::Value) -> Option<(String, i64)> {
-        let message = update.get("message")?;
+        let message = Self::update_message(update)?;
         let chat_id = message
             .get("chat")
             .and_then(|chat| chat.get("id"))
@@ -4788,7 +4821,7 @@ impl TelegramChannel {
     }
 
     async fn handle_unauthorized_message(&self, update: &serde_json::Value) {
-        let Some(message) = update.get("message") else {
+        let Some(message) = Self::update_message(update) else {
             return;
         };
 
@@ -5411,7 +5444,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         &self,
         update: &serde_json::Value,
     ) -> UpdateDisposition {
-        let Some(message) = update.get("message") else {
+        let Some(message) = Self::update_message(update) else {
             return UpdateDisposition::SkipPermanent;
         };
         let Some(attachment) = Self::parse_attachment_metadata(message) else {
@@ -5654,7 +5687,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         let Some(manager) = self.transcription_manager.as_deref() else {
             return UpdateDisposition::SkipPermanent;
         };
-        let Some(message) = update.get("message") else {
+        let Some(message) = Self::update_message(update) else {
             return UpdateDisposition::SkipPermanent;
         };
 
@@ -6065,7 +6098,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
     }
 
     fn parse_update_message(&self, update: &serde_json::Value) -> Option<ChannelMessage> {
-        let message = update.get("message")?;
+        let message = Self::update_message(update)?;
 
         let text = message.get("text").and_then(serde_json::Value::as_str)?;
 
@@ -7408,6 +7441,21 @@ Allowlist Telegram username (without '@') or numeric user ID.",
     ) -> UpdateOutcome {
         let uid = update.get("update_id").and_then(serde_json::Value::as_i64);
 
+        // Telegram delivers an edited message as the full post-edit payload
+        // under `edited_message`. Processing is opt-in
+        // (`channels.telegram.<alias>.edited_messages`); when enabled, the
+        // edit flows through the exact pipeline of an ordinary message
+        // (authorization, mention gate, reply-to-bot bypass, attachments)
+        // and the parsed message is marked so the orchestrator can apply
+        // the edit policy (freshness gate, latest-wins coalescing).
+        let edited = update.get("edited_message").is_some();
+        if edited && !self.edited_messages {
+            if uid.is_some() {
+                *transient_retry = None;
+            }
+            return UpdateOutcome::Advanced;
+        }
+
         // ── Handle callback_query (inline keyboard taps) ──
         if let Some(cb) = update.get("callback_query") {
             let cb_data = cb
@@ -7457,7 +7505,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             }
         };
 
-        let msg = match disposition {
+        let mut msg = match disposition {
             UpdateDisposition::Parsed(m) => m,
             UpdateDisposition::SkipPermanent => {
                 Box::pin(self.handle_unauthorized_message(update)).await;
@@ -7470,6 +7518,20 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 return Self::pause_for_transient_update(uid, transient_retry).await;
             }
         };
+
+        if edited {
+            msg.edited = true;
+            // The freshness policy keys on the ORIGINAL send time (`date`),
+            // not the edit time (`edit_date`): editing an old message
+            // clarifies history, it is not a live prompt.
+            if let Some(original_date) = update
+                .get("edited_message")
+                .and_then(|message| message.get("date"))
+                .and_then(serde_json::Value::as_u64)
+            {
+                msg.timestamp = original_date;
+            }
+        }
 
         if self.dispatch_incoming_message(tx, update, *msg).await {
             if uid.is_some() {
@@ -8585,7 +8647,7 @@ impl Channel for TelegramChannel {
                 "offset": offset,
                 "limit": TELEGRAM_POLL_LIMIT,
                 "timeout": 0,
-                "allowed_updates": ["message", "callback_query"]
+                "allowed_updates": self.allowed_updates()
             });
             match self.http_client().post(&url).json(&probe).send().await {
                 Err(e) => {
@@ -8713,7 +8775,7 @@ impl Channel for TelegramChannel {
                 "offset": offset,
                 "limit": TELEGRAM_POLL_LIMIT,
                 "timeout": poll_timeout_secs,
-                "allowed_updates": ["message", "callback_query"]
+                "allowed_updates": self.allowed_updates()
             });
 
             let resp = match self.http_client().post(&url).json(&body).send().await {
@@ -18290,6 +18352,165 @@ mod tests {
     }
 
     #[test]
+    fn parse_update_edited_message_mention_only_group_requires_mention() {
+        let mention_only = true;
+        let ch = TelegramChannel::new(
+            "token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            mention_only,
+        );
+        {
+            let mut cache = ch.bot_username.lock();
+            *cache = Some("mybot".to_string());
+        }
+
+        // An edit that leaves the message unaddressed must not trigger.
+        let update = serde_json::json!({
+            "update_id": 60,
+            "edited_message": {
+                "message_id": 61,
+                "text": "just chatting",
+                "date": 1_700_000_000,
+                "edit_date": 1_700_000_100,
+                "from": { "id": 555, "username": "alice" },
+                "chat": { "id": -100_200_300, "type": "group" }
+            }
+        });
+
+        assert!(ch.parse_update_message(&update).is_none());
+    }
+
+    #[test]
+    fn parse_update_edited_message_mention_passes_gate() {
+        let mention_only = true;
+        let ch = TelegramChannel::new(
+            "token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            mention_only,
+        );
+        {
+            let mut cache = ch.bot_username.lock();
+            *cache = Some("mybot".to_string());
+        }
+
+        // The edit adds the mention: the edited message is now addressed.
+        let update = serde_json::json!({
+            "update_id": 62,
+            "edited_message": {
+                "message_id": 63,
+                "text": "@mybot status please",
+                "date": 1_700_000_000,
+                "edit_date": 1_700_000_100,
+                "from": { "id": 555, "username": "alice" },
+                "chat": { "id": -100_200_300, "type": "group" }
+            }
+        });
+
+        let parsed = ch
+            .parse_update_message(&update)
+            .expect("an edit that adds a mention must pass the gate");
+        assert_eq!(parsed.content, "@mybot status please");
+    }
+
+    #[test]
+    fn parse_update_edited_message_reply_to_bot_bypasses_mention_only_gate() {
+        let mention_only = true;
+        let ch = TelegramChannel::new(
+            "token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            mention_only,
+        );
+        {
+            let mut cache = ch.bot_username.lock();
+            *cache = Some("mybot".to_string());
+        }
+        {
+            let mut cache = ch.bot_id.lock();
+            *cache = Some(42);
+        }
+
+        let update = serde_json::json!({
+            "update_id": 64,
+            "edited_message": {
+                "message_id": 65,
+                "text": "do this instead",
+                "date": 1_700_000_000,
+                "edit_date": 1_700_000_100,
+                "from": { "id": 555, "username": "alice" },
+                "chat": { "id": -100_200_300, "type": "group" },
+                "reply_to_message": {
+                    "message_id": 50,
+                    "from": { "id": 42, "username": "mybot", "is_bot": true },
+                    "text": "original"
+                }
+            }
+        });
+
+        let parsed = ch
+            .parse_update_message(&update)
+            .expect("reply-to-bot edit should bypass mention_only gate");
+        assert_eq!(parsed.content, "> @mybot:\n> original\n\ndo this instead");
+    }
+
+    #[test]
+    fn parse_update_edited_message_unaddressed_becomes_passive_context() {
+        let mention_only = true;
+        let ch = TelegramChannel::new(
+            "token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            mention_only,
+        )
+        .with_passive_group_context(true);
+        {
+            let mut cache = ch.bot_username.lock();
+            *cache = Some("mybot".to_string());
+        }
+
+        let update = serde_json::json!({
+            "update_id": 66,
+            "edited_message": {
+                "message_id": 67,
+                "text": "just chatting",
+                "date": 1_700_000_000,
+                "edit_date": 1_700_000_100,
+                "from": { "id": 555, "username": "alice" },
+                "chat": { "id": -100_200_300, "type": "group" }
+            }
+        });
+
+        let parsed = ch
+            .parse_update_message(&update)
+            .expect("unaddressed edit must be recorded as passive context");
+        assert!(parsed.passive_context);
+    }
+
+    #[test]
+    fn allowed_updates_subscribes_to_edited_message_only_when_enabled() {
+        let ch = TelegramChannel::new(
+            "token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        );
+        assert_eq!(
+            ch.allowed_updates(),
+            serde_json::json!(["message", "callback_query"]),
+            "without the opt-in the wire stream must stay unchanged"
+        );
+
+        let ch = ch.with_edited_messages(true);
+        assert_eq!(
+            ch.allowed_updates(),
+            serde_json::json!(["message", "callback_query", "edited_message"]),
+            "the opt-in must subscribe to edits or Telegram never delivers them"
+        );
+    }
+
+    #[test]
     fn parse_update_reply_to_non_bot_still_dropped_in_mention_only() {
         let mention_only = true;
         let ch = TelegramChannel::new(
@@ -25320,6 +25541,94 @@ mod tests {
         assert!(
             side_effects.is_empty(),
             "passive observation must stay silent, but the bot called: {side_effects:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_update_marks_edited_message_and_anchors_original_date() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(
+                r"/bot[^/]+/(sendChatAction|setMessageReaction)$",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": true
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_edited_messages(true)
+        .with_api_base(mock_server.uri());
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<ChannelMessage>(4);
+        let mut transient_retry = None;
+        let update = serde_json::json!({
+            "update_id": 70,
+            "edited_message": {
+                "message_id": 71,
+                "chat": { "id": 12345, "type": "private" },
+                "from": { "username": "alice", "id": 99 },
+                "text": "edited question",
+                "date": 1_700_000_000,
+                "edit_date": 1_700_000_100
+            }
+        });
+
+        let outcome = ch.process_update(&update, &tx, &mut transient_retry).await;
+        assert!(matches!(outcome, UpdateOutcome::Advanced));
+
+        let delivered = rx
+            .try_recv()
+            .expect("enabled edited_message must be delivered downstream");
+        assert!(
+            delivered.edited,
+            "edit must be flagged for the orchestrator"
+        );
+        assert_eq!(
+            delivered.timestamp, 1_700_000_000,
+            "freshness keys on the original message date, not the edit date"
+        );
+        assert_eq!(delivered.content, "edited question");
+    }
+
+    #[tokio::test]
+    async fn process_update_ignores_edited_message_when_disabled() {
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        );
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<ChannelMessage>(4);
+        let mut transient_retry = None;
+        let update = serde_json::json!({
+            "update_id": 72,
+            "edited_message": {
+                "message_id": 73,
+                "chat": { "id": 12345, "type": "private" },
+                "from": { "username": "alice", "id": 99 },
+                "text": "edited question",
+                "date": 1_700_000_000,
+                "edit_date": 1_700_000_100
+            }
+        });
+
+        let outcome = ch.process_update(&update, &tx, &mut transient_retry).await;
+        assert!(matches!(outcome, UpdateOutcome::Advanced));
+        assert!(
+            rx.try_recv().is_err(),
+            "edited_message must be dropped while edited_messages is disabled"
         );
     }
 
