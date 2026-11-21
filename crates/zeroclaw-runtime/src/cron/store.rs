@@ -15,6 +15,7 @@ const MAX_CRON_OUTPUT_BYTES: usize = 16 * 1024;
 
 #[cfg(test)]
 thread_local! {
+    static PATCH_WRITER_ACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static PATCH_WRITER_WAIT: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> = const { std::cell::RefCell::new(None) };
 }
 
@@ -2203,12 +2204,6 @@ fn with_existing_initialized_connection<T>(
         )
     })?;
     initialize_schema(&conn, config)?;
-    #[cfg(test)]
-    let conn = {
-        let mut conn = conn;
-        install_patch_writer_wait_handler(&mut conn)?;
-        conn
-    };
 
     f(&conn).map(Some)
 }
@@ -2508,11 +2503,13 @@ const MIGRATION_CONTENTION_CONTEXT: &str = concat!(
 fn install_patch_writer_wait_handler(conn: &mut Connection) -> Result<()> {
     if PATCH_WRITER_WAIT.with(|sender| sender.borrow().is_some()) {
         conn.busy_handler(Some(|attempt| {
-            PATCH_WRITER_WAIT.with(|sender| {
-                if let Some(sender) = sender.borrow_mut().take() {
-                    let _ = sender.send(());
-                }
-            });
+            if PATCH_WRITER_ACTIVE.get() {
+                PATCH_WRITER_WAIT.with(|sender| {
+                    if let Some(sender) = sender.borrow_mut().take() {
+                        let _ = sender.send(());
+                    }
+                });
+            }
             std::thread::sleep(std::time::Duration::from_millis(10));
             attempt < 500
         }))?;
@@ -2525,8 +2522,12 @@ fn install_patch_writer_wait_handler(conn: &mut Connection) -> Result<()> {
 /// it — unlike a deferred transaction's read-to-write upgrade, which SQLite
 /// fails immediately without consulting the busy handler.
 fn begin_immediate<'c>(conn: &'c Connection, phase: &str) -> Result<Transaction<'c>> {
-    Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
-        .with_context(|| format!("Failed to begin cron {phase} transaction"))
+    #[cfg(test)]
+    let previous = PATCH_WRITER_ACTIVE.replace(phase == "job patch");
+    let result = Transaction::new_unchecked(conn, TransactionBehavior::Immediate);
+    #[cfg(test)]
+    PATCH_WRITER_ACTIVE.set(previous);
+    result.with_context(|| format!("Failed to begin cron {phase} transaction"))
 }
 
 fn table_exists(conn: &Connection, name: &str) -> Result<bool> {
