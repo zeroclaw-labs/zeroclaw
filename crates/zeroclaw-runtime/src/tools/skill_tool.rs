@@ -6,7 +6,6 @@ use crate::tools::shell_env::SAFE_SHELL_ENV_VARS;
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::policy::ShellTarget;
 
@@ -14,8 +13,6 @@ use zeroclaw_config::policy::ShellTarget;
 /// set `timeout_secs` (seconds). A skill may raise this via `timeout_secs` in
 /// its SKILL.toml `[[tools]]` entry.
 const SKILL_SHELL_TIMEOUT_SECS: u64 = 60;
-/// Maximum output size in bytes (1 MB).
-const MAX_OUTPUT_BYTES: usize = 1_048_576;
 
 const MAX_TOOL_NAME_LEN: usize = 64;
 
@@ -203,6 +200,18 @@ impl Tool for SkillShellTool {
             });
         }
 
+        if let Some(error) = super::runtime_command_error::memory_watchdog_support_error(
+            self.security.shell_max_memory_mb,
+            self.runtime.name(),
+            "none",
+        ) {
+            return Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(error),
+            });
+        }
+
         let mut cmd = match self
             .runtime
             .build_shell_command(&command, &self.security.workspace_dir)
@@ -242,55 +251,12 @@ impl Tool for SkillShellTool {
             cmd.env(SESSION_ID_ENV_VAR, session_id);
         }
 
-        let result =
-            tokio::time::timeout(Duration::from_secs(self.timeout_secs), cmd.output()).await;
-
-        match result {
-            Ok(Ok(output)) => {
-                let mut stdout = super::shell_output::decode_shell_output(&output.stdout);
-                let mut stderr = super::shell_output::decode_shell_output(&output.stderr);
-
-                if stdout.len() > MAX_OUTPUT_BYTES {
-                    let mut b = MAX_OUTPUT_BYTES.min(stdout.len());
-                    while b > 0 && !stdout.is_char_boundary(b) {
-                        b -= 1;
-                    }
-                    stdout.truncate(b);
-                    stdout.push_str("\n... [output truncated at 1MB]");
-                }
-                if stderr.len() > MAX_OUTPUT_BYTES {
-                    let mut b = MAX_OUTPUT_BYTES.min(stderr.len());
-                    while b > 0 && !stderr.is_char_boundary(b) {
-                        b -= 1;
-                    }
-                    stderr.truncate(b);
-                    stderr.push_str("\n... [stderr truncated at 1MB]");
-                }
-
-                Ok(ToolResult {
-                    success: output.status.success(),
-                    output: stdout.into(),
-                    error: if stderr.is_empty() {
-                        None
-                    } else {
-                        Some(stderr)
-                    },
-                })
-            }
-            Ok(Err(e)) => Ok(ToolResult {
-                success: false,
-                output: ToolOutput::default(),
-                error: Some(format!("Failed to execute command: {e}")),
-            }),
-            Err(_) => Ok(ToolResult {
-                success: false,
-                output: ToolOutput::default(),
-                error: Some(format!(
-                    "Command timed out after {}s and was killed",
-                    self.timeout_secs
-                )),
-            }),
-        }
+        Ok(super::shell::run_shell_command(
+            cmd,
+            self.timeout_secs,
+            self.security.shell_max_memory_mb,
+        )
+        .await)
     }
 }
 
@@ -522,6 +488,8 @@ mod tests {
     use crate::platform::DockerRuntime;
     use crate::security::{AutonomyLevel, SecurityPolicy};
     use crate::skills::SkillTool;
+    #[cfg(windows)]
+    use std::time::Duration;
     use zeroclaw_api::attribution::{Attributable, ToolProvenance};
     use zeroclaw_config::schema::DockerRuntimeConfig;
 
@@ -730,6 +698,25 @@ mod tests {
         let result = tool.execute(serde_json::json!({})).await.unwrap();
         assert!(result.success);
         assert!(result.output.contains("hello-skill"));
+    }
+
+    #[tokio::test]
+    async fn skill_shell_memory_rejects_container_runtime_before_spawn() {
+        let mut manifest = sample_skill_tool();
+        manifest.command = "echo hello".to_string();
+        let security = Arc::new(SecurityPolicy {
+            shell_max_memory_mb: 128,
+            ..(*test_security()).clone()
+        });
+        let tool = SkillShellTool::new_with_runtime(
+            "test",
+            &manifest,
+            security,
+            Arc::new(DockerRuntime::new(DockerRuntimeConfig::default())),
+        );
+        let result = tool.execute(serde_json::json!({})).await.unwrap();
+        assert!(!result.success);
+        assert!(result.error.unwrap().contains("requires a native"));
     }
 
     #[cfg(windows)]
