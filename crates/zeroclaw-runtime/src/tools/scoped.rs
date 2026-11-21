@@ -2460,6 +2460,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         )
         .unwrap();
         built.tools.retain(|tool| tool.name() == "memory_export");
@@ -2720,6 +2721,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         )
         .unwrap();
         let parent = Arc::clone(built.delegate_handle.as_ref().unwrap());

@@ -86,6 +86,7 @@ use crate::sessions::{
     SessionDeleteTool, SessionResetTool, SessionsCurrentTool, SessionsHistoryTool,
     SessionsListTool, SessionsSendTool,
 };
+use crate::sessions_prompt::SessionsPromptTool;
 #[cfg(feature = "tools-external")]
 use crate::text_browser::TextBrowserTool;
 use crate::tool_search::ToolSearchTool;
@@ -176,6 +177,7 @@ tool_attribution!(SessionResetTool, ToolKind::Plugin);
 tool_attribution!(SessionsCurrentTool, ToolKind::Plugin);
 tool_attribution!(SessionsHistoryTool, ToolKind::Plugin);
 tool_attribution!(SessionsListTool, ToolKind::Plugin);
+tool_attribution!(SessionsPromptTool, ToolKind::Plugin);
 tool_attribution!(SessionsSendTool, ToolKind::Plugin);
 #[cfg(feature = "tools-external")]
 tool_attribution!(TextBrowserTool, ToolKind::Plugin);
