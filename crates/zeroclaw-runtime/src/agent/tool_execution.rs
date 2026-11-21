@@ -2251,13 +2251,10 @@ mod tests {
         );
     }
 
-    /// Characterization: `scrub_credentials` is a shared best-effort scrubber
-    /// keyed off `name<sep>value` pairs. It does not cover `Authorization:
-    /// Bearer <token>` (the space after `Bearer` breaks the value match). This
-    /// gap predates this change; pinning it keeps the PR's security claim
-    /// precise and makes any future tightening of the regex a visible change.
+    /// The shared scrubber redacts the token after an `Authorization: Bearer`
+    /// scheme word in a failed tool's model-visible output.
     #[tokio::test]
-    async fn failure_output_scrub_leaves_bearer_prefixed_token_but_still_runs() {
+    async fn failure_output_scrub_redacts_bearer_prefixed_token() {
         let tools: Vec<Box<dyn Tool>> = vec![Box::new(ConfigurableFailingTool {
             output: zeroclaw_api::tool::ToolOutput::text(
                 "upstream said: Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.payload.sig ; \
@@ -2286,8 +2283,8 @@ mod tests {
         .expect("execute_one_tool should return an outcome for a failing tool");
 
         assert!(
-            outcome.output.contains("eyJhbGciOiJIUzI1NiJ9.payload.sig"),
-            "known gap: Bearer-prefixed tokens are not covered by the shared scrubber: {}",
+            !outcome.output.contains("eyJhbGciOiJIUzI1NiJ9.payload.sig"),
+            "the Bearer-prefixed token must be scrubbed: {}",
             outcome.output
         );
         assert!(
@@ -2297,12 +2294,10 @@ mod tests {
         );
     }
 
-    /// Characterization: signed-URL query parameters (`sig=`,
-    /// `X-Amz-Signature=`) are not credential key names in the shared
-    /// scrubber, so they pass through. Pre-existing gap; pinned for the same
-    /// reason as the Bearer case above.
+    /// The shared scrubber redacts signed-URL query parameters (`sig=`) in a
+    /// failed tool's model-visible output.
     #[tokio::test]
-    async fn failure_output_scrub_leaves_signed_url_query_params_but_still_runs() {
+    async fn failure_output_scrub_redacts_signed_url_query_params() {
         let tools: Vec<Box<dyn Tool>> = vec![Box::new(ConfigurableFailingTool {
             output: zeroclaw_api::tool::ToolOutput::text(
                 "redirect target: \
@@ -2332,8 +2327,8 @@ mod tests {
         .expect("execute_one_tool should return an outcome for a failing tool");
 
         assert!(
-            outcome.output.contains("sig=aBcD1234eFgH5678iJkL"),
-            "known gap: signed-URL params are not covered by the shared scrubber: {}",
+            !outcome.output.contains("aBcD1234eFgH5678iJkL"),
+            "the signed-URL param must be scrubbed: {}",
             outcome.output
         );
         assert!(
