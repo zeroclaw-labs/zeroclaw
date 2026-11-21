@@ -307,13 +307,9 @@ impl<M: Memory> Memory for ScannedMemory<M> {
 
     fn refresh_embedder(
         &self,
-        model_provider: &str,
-        api_key: Option<&str>,
-        model: &str,
-        dimensions: usize,
+        embedder: std::sync::Arc<dyn zeroclaw_api::embedding::EmbeddingProvider>,
     ) {
-        self.inner
-            .refresh_embedder(model_provider, api_key, model, dimensions);
+        self.inner.refresh_embedder(embedder);
     }
 
     async fn store(

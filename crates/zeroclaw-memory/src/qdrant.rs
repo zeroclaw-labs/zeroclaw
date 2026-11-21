@@ -1,4 +1,3 @@
-use super::embeddings::EmbeddingProvider;
 use super::traits::{Memory, MemoryCategory, MemoryEntry, is_recent_recall_query};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -9,6 +8,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::OnceCell;
 use uuid::Uuid;
+use zeroclaw_api::embedding::EmbeddingProvider;
 use zeroclaw_api::session_keys::sanitize_session_key;
 
 /// Qdrant vector database memory backend.
@@ -700,22 +700,8 @@ impl Memory for QdrantMemory {
 
     fn refresh_embedder(
         &self,
-        model_provider: &str,
-        api_key: Option<&str>,
-        model: &str,
-        dimensions: usize,
+        embedder: std::sync::Arc<dyn zeroclaw_api::embedding::EmbeddingProvider>,
     ) {
-        // Rebuild from the freshly-resolved settings and swap in place. The
-        // Qdrant collection was created for the old vector dimensions; a
-        // dimension change still needs a manual reindex/collection rebuild, but
-        // the live handle no longer embeds against a stale endpoint/key
-        let embedder: Arc<dyn EmbeddingProvider> =
-            Arc::from(super::embeddings::create_embedding_provider(
-                model_provider,
-                api_key,
-                model,
-                dimensions,
-            ));
         self.swap_embedder(embedder);
     }
 
@@ -1367,7 +1353,7 @@ mod tests {
             &endpoint,
             "mem",
             None,
-            Arc::new(super::super::embeddings::NoopEmbedding),
+            Arc::new(zeroclaw_providers::embedding::NoopEmbedding),
         );
         let scoped = mem.list_for_agents(&["alpha"], None, None).await.unwrap();
         let unscoped = Memory::list(&mem, None, None).await.unwrap();
@@ -1440,17 +1426,11 @@ mod tests {
             "http://localhost:6333",
             "mem",
             None,
-            Arc::new(super::super::embeddings::NoopEmbedding), // dims 0
+            Arc::new(zeroclaw_providers::embedding::NoopEmbedding), // dims 0
         );
         assert_eq!(mem.embedder_dimensions(), 0);
 
-        Memory::refresh_embedder(
-            &mem,
-            "openai",
-            Some("sk-test"),
-            "text-embedding-3-small",
-            1536,
-        );
+        Memory::refresh_embedder(&mem, crate::test_embedder(1536));
 
         assert_eq!(
             mem.embedder_dimensions(),

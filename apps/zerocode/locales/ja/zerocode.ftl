@@ -406,7 +406,7 @@ zc-quickstart-modal-action-on-file-rows = ファイル行で
 zc-quickstart-modal-action-save = 保存
 zc-quickstart-modal-type-prefix = タイプ:
 zc-quickstart-field-label-alias = エイリアス
-zc-quickstart-field-help-alias = このプロバイダーインスタンスの一意の識別子です。設定にすでに同じエイリアスが存在する場合は「default」から変更してください。
+zc-quickstart-field-help-alias = 新しい接続のエイリアス。保存される参照は <プロバイダー種別>.<エイリアス> です。ドットはエイリアスの一部です。既に存在する場合は別名を選んでください。
 zc-quickstart-model-loading = { $provider } のモデルを読み込み中...
 zc-quickstart-model-retrying = { $provider } のモデルカタログを再試行中...
 zc-quickstart-model-catalog-empty = カタログを利用できません - モデル名を入力してください
@@ -647,6 +647,7 @@ zc-config-group-operations = 運用
 zc-config-group-other = その他
 
 zc-config-section-providers-models-label = モデルプロバイダー
+zc-config-section-providers-registry-label = プロバイダーレジストリ
 zc-config-section-model-routes-label = モデルルート
 zc-config-section-embedding-routes-label = 埋め込みルート
 zc-config-section-risk-profiles-label = リスクプロファイル
@@ -689,6 +690,8 @@ zc-config-section-media-pipeline-label = メディアパイプライン
 zc-config-section-multimodal-label = マルチモーダル
 
 zc-config-section-providers-models-help = 設定するモデルプロバイダー（Anthropic、OpenAI、OpenRouter、Ollama、OpenAI互換ゲートウェイなど）を選択します。プロバイダーごとに複数のエイリアスを作成できます。
+zc-config-section-providers-registry-help = 再利用可能なプロバイダー接続、モデル、プリセット、フォールバック参照を設定します。名前は完全なキーで、ドットを含められます。
+zc-config-registry-help = 接続、モデル、モデルプリセット、フォールバックを JSON としてまとめて編集します。Enter で改行、Ctrl+S で保存します。継承するオプションは項目を省略し、消去する場合は文字列 "null" を使用します。参照は検証され、変更していないマスク済み認証情報は保持されます。`revision` は同時実行制御トークンです。別のエディターでレジストリを変更した後、またはデーモンを再起動した後は再読み込みしてください。
 zc-config-section-model-routes-help = reasoning、fast、code などのモデルルーティングヒントを設定します。各ルートはヒントをプロバイダーとモデルに対応付けます。
 zc-config-section-embedding-routes-help = 埋め込みルーティングヒントを設定します。各ルートはヒントを埋め込み対応のプロバイダーとモデルに対応付けます。
 zc-config-section-risk-profiles-help = 許可リスト、拒否リスト、承認しきい値をまとめたリスクプロファイルを設定します。

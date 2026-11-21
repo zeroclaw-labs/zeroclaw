@@ -97,7 +97,8 @@ pub struct DiscordChannel {
     /// Voice transcription config — when set, audio attachments are
     /// downloaded, transcribed, and their text inlined into the message.
     transcription: Option<zeroclaw_config::schema::TranscriptionConfig>,
-    transcription_manager: Option<std::sync::Arc<super::transcription::TranscriptionManager>>,
+    transcription_manager:
+        Option<std::sync::Arc<zeroclaw_providers::transcription::TranscriptionManager>>,
     /// Workspace directory for saving downloaded inbound media attachments.
     workspace_dir: Option<PathBuf>,
     /// Streaming mode: Off, Partial (draft edits), or MultiMessage (paragraph splits).
@@ -274,26 +275,13 @@ impl DiscordChannel {
         self
     }
 
-    /// Configure voice transcription from a `[transcription]` snapshot.
-    ///
-    /// Compatibility and test path. The daemon routes every channel through
-    /// `with_transcription_manager` with a manager built from live
-    /// config and the owning agent's resolved provider; this path can only see
-    /// the legacy section, so it binds a lone registered provider and
-    /// otherwise leaves the choice unbound (see
-    /// `transcription::manager_from_snapshot`).
-    pub fn with_transcription(self, config: zeroclaw_config::schema::TranscriptionConfig) -> Self {
-        let manager = super::transcription::manager_from_snapshot(&config);
-        self.with_transcription_manager(config, manager)
-    }
-
     /// Store an already-built transcription manager, or nothing. The config is
     /// recorded only alongside a manager, so a channel never advertises
     /// transcription it cannot perform.
     pub(crate) fn with_transcription_manager(
         mut self,
         config: zeroclaw_config::schema::TranscriptionConfig,
-        manager: Option<std::sync::Arc<super::transcription::TranscriptionManager>>,
+        manager: Option<std::sync::Arc<zeroclaw_providers::transcription::TranscriptionManager>>,
     ) -> Self {
         if let Some(manager) = manager {
             self.transcription_manager = Some(manager);
@@ -1214,7 +1202,7 @@ async fn process_attachments(
     attachments: &[serde_json::Value],
     client: &reqwest::Client,
     workspace_dir: Option<&Path>,
-    transcription_manager: Option<&super::transcription::TranscriptionManager>,
+    transcription_manager: Option<&zeroclaw_providers::transcription::TranscriptionManager>,
 ) -> (String, Vec<MediaAttachment>) {
     let mut text_parts: Vec<String> = Vec::new();
     let mut media: Vec<MediaAttachment> = Vec::new();
@@ -7085,9 +7073,9 @@ mod tests {
 
     #[tokio::test]
     async fn process_attachments_preserves_audio_when_transcription_fails() {
-        use crate::transcription::TranscriptionManager;
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
+        use zeroclaw_providers::transcription::TranscriptionManager;
 
         let media_server = MockServer::start().await;
         let whisper_server = MockServer::start().await;
@@ -7114,10 +7102,14 @@ mod tests {
             "filename": "voice.ogg",
             "url": audio_url,
         })];
-        let transcription =
-            TranscriptionManager::new(&local_whisper_transcription_config(&whisper_server))
-                .expect("transcription manager")
-                .with_agent_transcription_provider("local_whisper");
+        let transcription = TranscriptionManager::from_config_for_agent(
+            &zeroclaw_config::schema::Config::from_transcription_input(
+                &local_whisper_transcription_config(&whisper_server),
+            ),
+            None,
+        )
+        .expect("transcription manager")
+        .with_agent_transcription_provider("asr.local_whisper");
 
         let client = reqwest::Client::new();
         let (text, media) =
@@ -7135,9 +7127,9 @@ mod tests {
 
     #[tokio::test]
     async fn process_attachments_preserves_audio_when_transcription_is_empty() {
-        use crate::transcription::TranscriptionManager;
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
+        use zeroclaw_providers::transcription::TranscriptionManager;
 
         let media_server = MockServer::start().await;
         let whisper_server = MockServer::start().await;
@@ -7161,10 +7153,14 @@ mod tests {
             "filename": "voice.ogg",
             "url": audio_url,
         })];
-        let transcription =
-            TranscriptionManager::new(&local_whisper_transcription_config(&whisper_server))
-                .expect("transcription manager")
-                .with_agent_transcription_provider("local_whisper");
+        let transcription = TranscriptionManager::from_config_for_agent(
+            &zeroclaw_config::schema::Config::from_transcription_input(
+                &local_whisper_transcription_config(&whisper_server),
+            ),
+            None,
+        )
+        .expect("transcription manager")
+        .with_agent_transcription_provider("asr.local_whisper");
 
         let client = reqwest::Client::new();
         let (text, media) =

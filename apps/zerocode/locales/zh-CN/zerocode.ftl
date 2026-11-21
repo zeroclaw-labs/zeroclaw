@@ -406,7 +406,7 @@ zc-quickstart-modal-action-on-file-rows = 在文件行上
 zc-quickstart-modal-action-save = 保存
 zc-quickstart-modal-type-prefix = 类型：
 zc-quickstart-field-label-alias = 别名
-zc-quickstart-field-help-alias = 此提供方实例的唯一标识符。如果您的配置中已存在使用该别名的实例，请将其从 "default" 改为其他值。
+zc-quickstart-field-help-alias = 新连接的别名；保存的引用格式为 <提供方类型>.<别名>。点号属于别名的一部分。如果已存在，请选择其他名称。
 zc-quickstart-model-loading = 正在加载 { $provider } 的模型...
 zc-quickstart-model-retrying = 正在重试加载 { $provider } 的模型目录...
 zc-quickstart-model-catalog-empty = 目录不可用 - 输入模型名称
@@ -648,6 +648,7 @@ zc-config-group-operations = 运维
 zc-config-group-other = 其他
 
 zc-config-section-providers-models-label = 模型提供商
+zc-config-section-providers-registry-label = 提供商注册表
 zc-config-section-model-routes-label = 模型路由
 zc-config-section-embedding-routes-label = 嵌入路由
 zc-config-section-risk-profiles-label = 风险配置文件
@@ -690,6 +691,8 @@ zc-config-section-media-pipeline-label = 媒体管道
 zc-config-section-multimodal-label = 多模态
 
 zc-config-section-providers-models-help = 选择要配置的模型提供商（Anthropic、OpenAI、OpenRouter、Ollama、自定义 OpenAI 兼容网关等）。每个提供商支持多个别名。
+zc-config-section-providers-registry-help = 配置可复用的提供商连接、模型、预设和 fallback 引用。名称是完整键，可以包含点号。
+zc-config-registry-help = 以 JSON 统一编辑 connections、models、model_presets 和 fallback。Enter 插入换行，Ctrl+S 保存。对于继承的选项，省略字段表示继承，使用字符串 "null" 表示清除。引用会经过校验，未修改的遮罩凭据会保留。`revision` 是并发控制令牌；其他编辑器修改注册表或守护进程重启后请重新加载。
 zc-config-section-model-routes-help = 命名的模型路由提示（例如 reasoning、fast 或 code）。每条路由将提示映射到提供商和模型。
 zc-config-section-embedding-routes-help = 命名的嵌入路由提示。每条路由将提示映射到支持嵌入的提供商和模型。
 zc-config-section-risk-profiles-help = 命名的风险配置，用于绑定允许列表、拒绝列表和审批阈值。

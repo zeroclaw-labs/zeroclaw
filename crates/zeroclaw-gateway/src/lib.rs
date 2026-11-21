@@ -175,12 +175,17 @@ use zeroclaw_runtime::security::pairing::{
     GATEWAY_ADMIN_TOKEN_HEADER, PairingCodePolicy, PairingGuard, PairingLimits, constant_time_eq,
     gateway_admin_token_path, is_public_bind,
 };
+#[cfg(test)]
 use zeroclaw_runtime::tools;
 use zeroclaw_runtime::tools::CanvasStore;
 use zeroclaw_runtime::tools::scoped;
 
 /// Maximum request body size (64KB) — prevents memory exhaustion
 pub const MAX_BODY_SIZE: usize = 65_536;
+/// Provider registry snapshots contain the complete connection/model catalog,
+/// so they need a route-specific ceiling instead of the small JSON control
+/// plane limit applied to ordinary config mutations.
+pub const MAX_PROVIDER_REGISTRY_BODY_SIZE: usize = 4 * 1024 * 1024;
 /// Default request timeout (30s) — prevents slow-loris attacks.
 pub const REQUEST_TIMEOUT_SECS: u64 = 30;
 
@@ -936,12 +941,71 @@ impl DashboardFeed {
     }
 }
 
+struct GatewayBootSelection {
+    model_ref: String,
+    model_id: Option<String>,
+    temperature: Option<f64>,
+}
+impl GatewayBootSelection {
+    fn provider_ref(&self) -> String {
+        self.model_ref.clone()
+    }
+    fn alias(&self) -> &str {
+        &self.model_ref
+    }
+    fn model(&self) -> &str {
+        self.model_id.as_deref().unwrap_or_default()
+    }
+    fn temperature(&self) -> Option<f64> {
+        self.temperature
+    }
+}
+fn resolve_gateway_boot_selection(config: &Config) -> GatewayBootSelection {
+    let model_ref = config
+        .resolved_runtime_agent_alias()
+        .and_then(|alias| config.agent(alias))
+        .map(|agent| agent.model_provider.as_str().to_owned())
+        .or_else(|| {
+            config
+                .provider_registry()
+                .ok()?
+                .models
+                .iter()
+                .find(|(_, model)| model.capability() == zeroclaw_api::capability::Capability::Chat)
+                .map(|(reference, _)| reference.to_string())
+        })
+        .unwrap_or_default();
+    GatewayBootSelection {
+        model_id: config.resolve_model_id(&model_ref),
+        temperature: config.resolve_model_temperature(&model_ref),
+        model_ref,
+    }
+}
+
+async fn create_gateway_boot_provider(
+    config: Arc<Config>,
+    provider_ref: &str,
+) -> Result<Arc<dyn ModelProvider>> {
+    let provider_ref = provider_ref.to_string();
+    zeroclaw_providers::model::build_nonblocking(move || {
+        zeroclaw_providers::model::build_reliable_provider(
+            &config,
+            &provider_ref,
+            zeroclaw_providers::model::ProviderOverrides::default(),
+        )
+        .map(|resolved| Arc::from(resolved.provider))
+    })
+    .await
+}
+
 /// The config/onboarding route group. Authentication is enforced
 /// structurally by the `route_layer` at the tail (see [`principal_gate`]),
 /// never per handler: every route whose handler lives in `api_config`,
 /// `api_quickstart`, or `api_sections` MUST be registered on THIS router,
 /// whatever its URL prefix.
-fn config_admin_router(route_auth: principal_gate::ConfigRouteAuth) -> Router<AppState> {
+fn config_admin_router_without_registry(
+    route_auth: principal_gate::ConfigRouteAuth,
+) -> Router<AppState> {
     Router::new()
         .route(
             "/api/config",
@@ -977,7 +1041,7 @@ fn config_admin_router(route_auth: principal_gate::ConfigRouteAuth) -> Router<Ap
             post(api_config::handle_rename_map_key),
         )
         .route(
-            "/api/config/model-providers/{type}/{alias}/refresh-context-window",
+            "/api/config/models/{model_ref}/refresh-context-window",
             post(api_config::handle_refresh_context_window),
         )
         .route(
@@ -1030,6 +1094,42 @@ fn config_admin_router(route_auth: principal_gate::ConfigRouteAuth) -> Router<Ap
             route_auth,
             principal_gate::config_route_auth,
         ))
+}
+
+/// The provider registry is a complete snapshot rather than a small control
+/// plane patch. Keep its authentication and route registration identical to
+/// the other config routes, but give it an explicit larger body ceiling.
+fn config_registry_router(
+    route_auth: principal_gate::ConfigRouteAuth,
+    timeout_secs: u64,
+) -> Router<AppState> {
+    Router::new()
+        .route(
+            "/api/config/provider-registry",
+            get(api_config::handle_registry_get).put(api_config::handle_registry_put),
+        )
+        .layer(axum::extract::DefaultBodyLimit::max(
+            MAX_PROVIDER_REGISTRY_BODY_SIZE,
+        ))
+        .route_layer(axum::middleware::from_fn_with_state(
+            route_auth,
+            principal_gate::config_route_auth,
+        ))
+        .layer(RequestBodyLimitLayer::new(MAX_PROVIDER_REGISTRY_BODY_SIZE))
+        .layer(TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            Duration::from_secs(timeout_secs),
+        ))
+}
+
+/// Standard config-router helper used by embedded/test assemblies. The
+/// supervised gateway uses the two pieces separately so the registry route is
+/// merged after the gateway-wide 64 KiB body layer.
+#[cfg(test)]
+fn config_admin_router(route_auth: principal_gate::ConfigRouteAuth) -> Router<AppState> {
+    let registry_auth = route_auth.clone();
+    config_admin_router_without_registry(route_auth)
+        .merge(config_registry_router(registry_auth, REQUEST_TIMEOUT_SECS))
 }
 
 /// How long a stopping gateway lets its connections finish the requests in
@@ -1494,35 +1594,15 @@ pub async fn run_gateway_with_plugin_webhooks(
     let actual_port = actual_addr.port();
     let display_addr = format!("{host}:{actual_port}");
 
-    // Seed the install-wide default provider from the first entry that
-    // actually declares a `model`. Entries without one cannot serve as the
-    // default (there is no model string to pair with the provider), so
-    // skipping them keeps the boot family, credentials, runtime options, and
-    // model coherent — the previous "first entry, whatever it is" pick could
-    // build the provider from one entry while `resolve_default_model` sourced
-    // the model from another.
-    let (boot_family, boot_alias, boot_entry) = config
-        .providers
-        .models
-        .first_entry_with_model()
-        .map(|(f, a, e)| (f.to_string(), a.to_string(), Some(e)))
-        .unwrap_or_else(|| ("openrouter".to_string(), "default".to_string(), None));
-    let fallback = boot_entry;
-    let model_provider_name = boot_family.as_str();
+    // Resolve the provider profile, selected nested model entry, and model id
+    // as one borrowed view of Config. Keeping these facts together prevents a
+    // nested-only profile from being paired with another profile's provider.
+    let boot = resolve_gateway_boot_selection(&config);
+    let boot_provider_ref = boot.provider_ref();
+    let model_provider_name = boot_provider_ref.as_str();
     let (model_provider, boot_provider_failed): (Arc<dyn ModelProvider>, bool) =
-        match zeroclaw_providers::create_resilient_model_provider_from_ref(
-            &config,
-            model_provider_name,
-            fallback.and_then(|e| e.api_key.as_deref()),
-            fallback.and_then(|e| e.uri.as_deref()),
-            &config.reliability,
-            &zeroclaw_providers::provider_runtime_options_for_alias(
-                &config,
-                &boot_family,
-                &boot_alias,
-            ),
-        ) {
-            Ok(p) => (Arc::from(p), false),
+        match create_gateway_boot_provider(Arc::new(config.clone()), &boot_provider_ref).await {
+            Ok(provider) => (provider, false),
             Err(e) => {
                 ::zeroclaw_log::record!(
                     WARN,
@@ -1530,12 +1610,12 @@ pub async fn run_gateway_with_plugin_webhooks(
                         .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                         .with_attrs(::serde_json::json!({
                             "model_provider": model_provider_name,
-                            "alias": boot_alias,
+                            "alias": boot.alias(),
                             "error": format!("{e}"),
                         })),
                     "Gateway: seed model_provider failed to construct; booting in \
                      needs_quickstart mode so /quickstart and /admin/reload stay \
-                     reachable. Fix the [providers.models.<type>.<alias>] entry \
+                     reachable. Fix the [providers.models.<key>] entry and its provider connection \
                      and POST /admin/reload."
                 );
                 (
@@ -1546,39 +1626,28 @@ pub async fn run_gateway_with_plugin_webhooks(
         };
     let model = if boot_provider_failed {
         String::new()
+    } else if boot.model().trim().is_empty() {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({"display_addr": display_addr})),
+            &format!(
+                "Gateway booting without a configured model. Visit http://{display_addr}/quickstart to complete browser quickstart. Chat endpoints will return 503 needs_quickstart until at least one [providers.models.<key>] chat model = \"...\" is set."
+            )
+        );
+        String::new()
     } else {
-        // `first_entry_with_model` guarantees a non-empty model for the boot
-        // entry, so reaching the empty fallback means no entry declares a
-        // model at all — the needs_quickstart onboarding path.
-        let model = fallback
-            .and_then(|e| e.model.as_deref())
-            .map(str::trim)
-            .filter(|m| !m.is_empty())
-            .map(ToString::to_string);
-        if model.is_none() {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"display_addr": display_addr})),
-                &format!(
-                    "Gateway booting without a configured model. Visit http://{display_addr}/quickstart to complete browser quickstart. Chat endpoints will return 503 needs_quickstart until at least one [providers.models.<type>.<alias>] model = \"...\" is set."
-                )
-            );
-        }
-        model.unwrap_or_default()
+        boot.model().trim().to_string()
     };
     // Preserve `Option<f64>` end-to-end. Substituting a hardcoded default
     // here would clobber the "let the provider decide" intent for models
     // (e.g. claude-opus-4-7) that reject `temperature`.
-    let temperature: Option<f64> = fallback.and_then(|e| e.temperature);
+    let temperature = boot.temperature();
     let mem: Arc<dyn Memory> = if config.agents.is_empty() {
         Arc::new(zeroclaw_memory::NoneMemory::new("none"))
     } else {
-        match zeroclaw_memory::create_memory_from_config(
-            &config,
-            fallback.and_then(|e| e.api_key.as_deref()),
-        ) {
+        match zeroclaw_memory::create_memory_from_config(&config) {
             Ok(m) => Arc::from(m),
             Err(e) => {
                 ::zeroclaw_log::record!(
@@ -1621,15 +1690,6 @@ pub async fn run_gateway_with_plugin_webhooks(
     let canvas_store = canvas_store.unwrap_or_default();
     let agent_alias_opt = default_agent_alias(&config);
 
-    let (composio_key, composio_entity_id) = if config.composio.enabled {
-        (
-            config.composio.api_key.as_deref(),
-            Some(config.composio.entity_id.as_str()),
-        )
-    } else {
-        (None, None)
-    };
-
     let agent_setup: Option<(
         zeroclaw_config::schema::RiskProfileConfig,
         Arc<SecurityPolicy>,
@@ -1651,31 +1711,29 @@ pub async fn run_gateway_with_plugin_webhooks(
 
     let (tools_registry_raw, _delegate_handle_gw) = match (&agent_alias_opt, agent_setup) {
         (Some(agent_alias), Some((risk_profile, security))) => {
-            match tools::all_tools_with_runtime(
-                Arc::new(config.clone()),
-                &security,
-                &risk_profile,
-                agent_alias,
-                Arc::clone(&runtime),
-                Arc::clone(&mem),
-                composio_key,
-                composio_entity_id,
-                &config.browser,
-                &config.http_request,
-                &config.web_fetch,
-                &config.data_dir,
-                &config.agents,
-                config
-                    .model_provider_for_agent(agent_alias)
-                    .and_then(|e| e.api_key.as_deref()),
-                &config,
-                Some(canvas_store.clone()),
-                false,
-                None,
-                sop_engine.clone(),
-                sop_audit.clone(),
-                None,
-            ) {
+            let all_tools_result = {
+                let registry_config = Arc::new(config.clone());
+                let registry_runtime: std::sync::Arc<
+                    dyn zeroclaw_config::platform::RuntimeAdapter,
+                > = Arc::clone(&runtime);
+                let registry_memory: std::sync::Arc<dyn zeroclaw_memory::Memory> = Arc::clone(&mem);
+                let registry_request = zeroclaw_runtime::composition::ToolRequest {
+                    config: &registry_config,
+                    agent_alias,
+                    security: &security,
+                    runtime: &registry_runtime,
+                    memory: &registry_memory,
+                };
+                let mut registry_inputs = zeroclaw_runtime::composition::NativeRecipeInputs::new(
+                    &registry_request,
+                    &config.data_dir,
+                );
+                registry_inputs.canvas_store = Some(canvas_store.clone());
+                registry_inputs.sop_engine = sop_engine.clone();
+                registry_inputs.sop_audit = sop_audit.clone();
+                zeroclaw_runtime::tools::build_native_registry(registry_inputs, &risk_profile)
+            };
+            match all_tools_result {
                 Ok(all_tools_result) => {
                     let assembled = scoped::ScopedToolRegistry::assemble(scoped::ScopedAssembly {
                         config: &config,
@@ -1802,31 +1860,28 @@ pub async fn run_gateway_with_plugin_webhooks(
                 continue;
             }
         };
-        let agent_tools_result = match tools::all_tools_with_runtime(
-            Arc::new(config.clone()),
-            &security,
-            &risk_profile,
-            &alias,
-            Arc::clone(&runtime),
-            Arc::clone(&mem),
-            composio_key,
-            composio_entity_id,
-            &config.browser,
-            &config.http_request,
-            &config.web_fetch,
-            &config.data_dir,
-            &config.agents,
-            config
-                .model_provider_for_agent(&alias)
-                .and_then(|e| e.api_key.as_deref()),
-            &config,
-            Some(canvas_store.clone()),
-            false,
-            None,
-            sop_engine.clone(),
-            sop_audit.clone(),
-            None,
-        ) {
+        let agent_tools_result = {
+            let registry_config = Arc::new(config.clone());
+            let registry_runtime: std::sync::Arc<dyn zeroclaw_config::platform::RuntimeAdapter> =
+                Arc::clone(&runtime);
+            let registry_memory: std::sync::Arc<dyn zeroclaw_memory::Memory> = Arc::clone(&mem);
+            let registry_request = zeroclaw_runtime::composition::ToolRequest {
+                config: &registry_config,
+                agent_alias: &alias,
+                security: &security,
+                runtime: &registry_runtime,
+                memory: &registry_memory,
+            };
+            let mut registry_inputs = zeroclaw_runtime::composition::NativeRecipeInputs::new(
+                &registry_request,
+                &config.data_dir,
+            );
+            registry_inputs.canvas_store = Some(canvas_store.clone());
+            registry_inputs.sop_engine = sop_engine.clone();
+            registry_inputs.sop_audit = sop_audit.clone();
+            zeroclaw_runtime::tools::build_native_registry(registry_inputs, &risk_profile)
+        };
+        let agent_tools_result = match agent_tools_result {
             Ok(result) => result,
             Err(e) => {
                 ::zeroclaw_log::record!(
@@ -2562,11 +2617,9 @@ pub async fn run_gateway_with_plugin_webhooks(
     let no_relayed_pairing = axum::middleware::from_fn(relay_ingress::no_pairing_through_a_relay);
 
     // Build router with middleware
+    let config_route_auth = principal_gate::ConfigRouteAuth::new(&inbound_auth, &state.config);
     let inner = Router::new()
-        .merge(config_admin_router(principal_gate::ConfigRouteAuth::new(
-            &inbound_auth,
-            &state.config,
-        )))
+        .merge(config_admin_router_without_registry(config_route_auth.clone()))
         .merge(api_oidc::routes())
         .merge(api_oidc_enroll::routes(Arc::clone(&inbound_auth), shared_cert_audit))
         // ── Admin routes (for CLI management) ──
@@ -2879,7 +2932,17 @@ pub async fn run_gateway_with_plugin_webhooks(
             StatusCode::REQUEST_TIMEOUT,
             Duration::from_secs(gateway_request_timeout_secs(&config.gateway)),
         ));
-    let inner = inner.merge(upload_router);
+    let inner = inner
+        .merge(upload_router)
+        // Keep this merge after the gateway-wide body limit: the registry
+        // router carries its own larger, route-specific limit.
+        .merge(
+            config_registry_router(
+                config_route_auth,
+                gateway_request_timeout_secs(&config.gateway),
+            )
+            .with_state(state.clone()),
+        );
 
     // Manual cron-trigger and A2A task routes live on their own sub-router so
     // they can opt out of the 30s gateway-wide TimeoutLayer. Both run a
@@ -3545,7 +3608,7 @@ impl ModelProvider for UnconfiguredModelProvider {
         anyhow::bail!(
             "needs_quickstart: gateway booted without a working model_provider. \
              Complete browser quickstart at /quickstart, or fix \
-             [providers.models.<type>.<alias>] and POST /admin/reload."
+             [providers.models.<key>] and its provider connection, then POST /admin/reload."
         )
     }
 }
@@ -3573,7 +3636,7 @@ fn needs_quickstart_for(model: &str) -> Option<anyhow::Error> {
         );
         Some(anyhow::Error::msg(
             "needs_quickstart: gateway has no model configured. Complete \
-             browser quickstart at /quickstart, or set [providers.models.<type>.<alias>] \
+             browser quickstart at /quickstart, or set [providers.models.<key>] \
              model = \"...\" before sending messages.",
         ))
     } else {
@@ -4189,18 +4252,11 @@ async fn handle_webhook(
     let model_label = {
         let cfg = state.config.read();
         let resolved_agent_alias = resolve_gateway_chat_agent_alias(&cfg, agent_override);
-        let resolved_provider = resolved_agent_alias
+        // Resolve the exact model key through config's canonical read boundary.
+        resolved_agent_alias
             .as_deref()
-            .and_then(|alias| cfg.resolved_model_provider_for_agent(alias));
-        resolved_provider
-            .and_then(|(_, _, entry)| {
-                entry
-                    .model
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|model| !model.is_empty())
-                    .map(ToString::to_string)
-            })
+            .and_then(|alias| cfg.agents.get(alias))
+            .and_then(|agent| cfg.resolve_model_id(agent.model_provider.as_str()))
             .or_else(|| cfg.resolve_default_model())
             .unwrap_or_else(|| "<unresolved>".to_string())
     };
@@ -4750,19 +4806,18 @@ async fn dispatch_gateway_turn_streaming_with_agent(
 ) -> anyhow::Result<String> {
     let config = state.config.read().clone();
     let agent_alias = require_gateway_chat_agent_alias(&config, agent_override)?;
-    let mut agent =
-        zeroclaw_runtime::agent::Agent::from_live_config_with_session_cwd_and_mcp_backchannel(
-            state.config.clone(),
-            &agent_alias,
-            None,
-            true,
-            false,
-            false,
-            state.sop_engine.clone(),
-            state.sop_audit.clone(),
-            Some(state.canvas_store.clone()),
-        )
-        .await?;
+    let mut agent = zeroclaw_runtime::agent::Agent::from_live_config_with_context(
+        state.config.clone(),
+        &agent_alias,
+        zeroclaw_runtime::agent::AgentBuildContext {
+            approval_backchannel: true,
+            sop_engine: state.sop_engine.clone(),
+            sop_audit: state.sop_audit.clone(),
+            canvas_store: Some(state.canvas_store.clone()),
+            ..Default::default()
+        },
+    )
+    .await?;
     #[cfg(test)]
     agent.set_turn_datetime_for_test(gateway_fixture_turn_datetime);
     if let Some(session) = session_id {
@@ -5962,6 +6017,7 @@ mod tests {
     #[test]
     fn security_body_limit_is_64kb() {
         assert_eq!(MAX_BODY_SIZE, 65_536);
+        assert_eq!(MAX_PROVIDER_REGISTRY_BODY_SIZE, 4 * 1024 * 1024);
     }
 
     #[test]
@@ -6310,7 +6366,9 @@ mod tests {
             ..Config::default()
         };
         let registry = with_registry.then(|| Arc::new(api_pairing::DeviceRegistry::new(&data_dir)));
-        let state_authority = zeroclaw_runtime::LiveConfigAuthority::new(config);
+        let state_authority = zeroclaw_runtime::LiveConfigAuthority::new(
+            zeroclaw_config::migration::admit_test_input(&config),
+        );
         AppState {
             config: state_authority.live_handle(),
             config_authority: state_authority.clone(),
@@ -6435,15 +6493,11 @@ path = "{trigger_path}"
         sop_config.sops_dir = Some(sops_dir.to_string_lossy().into_owned());
         sop_config.persist_runs = false;
         state.publish_test_config(|c| c.sop = sop_config.clone());
-        let data_dir = state.config.read().data_dir.clone();
-        let install_root = state.config.read().install_root_dir();
         let (engine, audit) = zeroclaw_runtime::sop::build_sop_engine(
-            sop_config,
-            &std::collections::HashMap::new(),
-            &data_dir,
-            &install_root,
+            &state.config.read(),
             Arc::clone(&state.mem),
             Default::default(),
+            None,
         );
         state.sop_engine = Some(engine);
         state.sop_audit = Some(audit);
@@ -6492,15 +6546,11 @@ path = "{trigger_path}"
         sop_config.sops_dir = Some(sops_dir.to_string_lossy().into_owned());
         sop_config.persist_runs = false;
         state.publish_test_config(|c| c.sop = sop_config.clone());
-        let data_dir = state.config.read().data_dir.clone();
-        let install_root = state.config.read().install_root_dir();
         let (engine, audit) = zeroclaw_runtime::sop::build_sop_engine(
-            sop_config,
-            &std::collections::HashMap::new(),
-            &data_dir,
-            &install_root,
+            &state.config.read(),
             Arc::clone(&state.mem),
             Default::default(),
+            None,
         );
         state.sop_engine = Some(engine);
         state.sop_audit = Some(audit);
@@ -7391,6 +7441,84 @@ path = "{trigger_path}"
                 .is_some_and(|value| value.starts_with("text/html")),
             "similarly named SPA routes should not be reserved as API paths"
         );
+    }
+
+    #[tokio::test]
+    async fn gateway_boot_uses_canonical_model_definition() {
+        use axum::routing::post;
+        use serde_json::{Value, json};
+        use zeroclaw_api::model_provider::{ChatMessage, ChatRequest};
+
+        type Capture = Arc<Mutex<Option<Value>>>;
+
+        async fn capture_request(
+            State(capture): State<Capture>,
+            Json(body): Json<Value>,
+        ) -> Json<Value> {
+            *capture.lock() = Some(body);
+            Json(json!({
+                "choices": [{
+                    "message": {"role": "assistant", "content": "ok"},
+                    "finish_reason": "stop"
+                }]
+            }))
+        }
+
+        let capture: Capture = Arc::new(Mutex::new(None));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock model endpoint");
+        let address = listener.local_addr().expect("mock endpoint address");
+        let app = Router::new()
+            .route("/v1/chat/completions", post(capture_request))
+            .with_state(Arc::clone(&capture));
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve mock model endpoint");
+        });
+
+        let config = Config {
+            providers: toml::from_str(&format!(
+                r#"
+[connections."gateway"]
+kind = "custom"
+uri = "http://{address}/v1"
+auth = {{ mode = "api_key", api_key = "sk-test" }}
+[models."chat.gateway"]
+capability = "chat"
+provider = "gateway"
+model = "nested-boot-model"
+options = {{ temperature = 0.25, max_tokens = 192 }}
+"#
+            ))
+            .expect("canonical gateway model fixture parses"),
+            ..Config::default()
+        };
+
+        let admitted = zeroclaw_config::migration::admit_test_input(&config);
+        let boot = resolve_gateway_boot_selection(&admitted);
+        assert_eq!(boot.provider_ref(), "chat.gateway");
+        assert_eq!(boot.model(), "nested-boot-model");
+        assert_eq!(boot.temperature(), Some(0.25));
+        let provider = create_gateway_boot_provider(Arc::new(admitted), &boot.provider_ref())
+            .await
+            .expect("canonical boot provider should construct");
+        let messages = [ChatMessage::user("hello")];
+        provider
+            .chat(
+                ChatRequest::new(&messages),
+                boot.model(),
+                boot.temperature(),
+            )
+            .await
+            .expect("canonical boot provider should reach configured endpoint");
+
+        let body = capture.lock().clone().expect("mock endpoint was called");
+        assert_eq!(body["model"], "nested-boot-model");
+        assert_eq!(body["temperature"], 0.25);
+        assert_eq!(body["max_tokens"], 192);
+        server.abort();
     }
 
     #[tokio::test]
@@ -9964,7 +10092,9 @@ path = "{trigger_path}"
     /// cloned with its tokens; the test re-pairs inside the fresh guard
     /// before calling this.
     fn pairing_persistence_state(config: Config, guard: PairingGuard) -> AppState {
-        let state_authority = zeroclaw_runtime::LiveConfigAuthority::new(config);
+        let state_authority = zeroclaw_runtime::LiveConfigAuthority::new(
+            zeroclaw_config::migration::admit_test_input(&config),
+        );
         AppState {
             config: state_authority.live_handle(),
             config_authority: state_authority.clone(),
@@ -12950,7 +13080,9 @@ data: [DONE]\n\n";
             },
         );
 
-        let state_authority = zeroclaw_runtime::LiveConfigAuthority::new(config);
+        let state_authority = zeroclaw_runtime::LiveConfigAuthority::new(
+            zeroclaw_config::migration::admit_test_input(&config),
+        );
         let state = AppState {
             config: state_authority.live_handle(),
             config_authority: state_authority.clone(),
@@ -13260,7 +13392,9 @@ data: [DONE]\n\n";
         let mut config = Config::default();
         config.gateway.webhook_secret = Some(secret.clone());
 
-        let state_authority = zeroclaw_runtime::LiveConfigAuthority::new(config);
+        let state_authority = zeroclaw_runtime::LiveConfigAuthority::new(
+            zeroclaw_config::migration::admit_test_input(&config),
+        );
         let state = AppState {
             config: state_authority.live_handle(),
             config_authority: state_authority.clone(),
@@ -13349,7 +13483,9 @@ data: [DONE]\n\n";
         let mut config = Config::default();
         config.gateway.webhook_secret = Some(valid_secret.clone());
 
-        let state_authority = zeroclaw_runtime::LiveConfigAuthority::new(config);
+        let state_authority = zeroclaw_runtime::LiveConfigAuthority::new(
+            zeroclaw_config::migration::admit_test_input(&config),
+        );
         let state = AppState {
             config: state_authority.live_handle(),
             config_authority: state_authority.clone(),
@@ -13443,7 +13579,9 @@ data: [DONE]\n\n";
         let mut config = Config::default();
         config.gateway.webhook_secret = Some(secret.clone());
 
-        let state_authority = zeroclaw_runtime::LiveConfigAuthority::new(config);
+        let state_authority = zeroclaw_runtime::LiveConfigAuthority::new(
+            zeroclaw_config::migration::admit_test_input(&config),
+        );
         let state = AppState {
             config: state_authority.live_handle(),
             config_authority: state_authority.clone(),
@@ -14778,7 +14916,9 @@ data: [DONE]\n\n";
             linq_signing_secrets.insert(alias.to_string(), Arc::from(secret));
         }
 
-        let state_authority = zeroclaw_runtime::LiveConfigAuthority::new(config);
+        let state_authority = zeroclaw_runtime::LiveConfigAuthority::new(
+            zeroclaw_config::migration::admit_test_input(&config),
+        );
         AppState {
             config: state_authority.live_handle(),
             config_authority: state_authority.clone(),
@@ -16011,27 +16151,28 @@ mod accept_error_tests {
         };
         std::fs::create_dir_all(&config.data_dir).unwrap();
         config.gateway.require_pairing = false;
-        config.providers.models.ollama.insert(
-            "priced".to_string(),
-            zeroclaw_config::schema::OllamaModelProviderConfig {
-                base: zeroclaw_config::schema::ModelProviderConfig {
-                    uri: Some("http://127.0.0.1:9".to_string()),
-                    model: Some("priced-model".to_string()),
-                    live_pricing: true,
-                    ..Default::default()
-                },
-                ..Default::default()
+        config.providers = serde_json::from_value(serde_json::json!({
+            "connections": {
+                "ollama.priced": {
+                    "kind": "ollama",
+                    "uri": "http://127.0.0.1:9",
+                    "api": {"chat": {"live_pricing": true}}
+                }
             },
-        );
-
-        // The exact property path the config API accepts for this flag, taken
-        // from the schema rather than spelled by hand.
-        let live_pricing_path = config
-            .prop_fields()
-            .into_iter()
-            .map(|field| field.name)
-            .find(|name| name.contains(".priced.") && name.contains("live"))
-            .expect("the schema exposes the provider's live-pricing flag");
+            "models": {
+                "ollama.priced": {
+                    "capability": "chat",
+                    "provider": "ollama.priced",
+                    "model": "priced-model"
+                }
+            }
+        }))
+        .expect("canonical pricing fixture deserializes");
+        let expected = zeroclaw_config::provider_registry::editor::snapshot(&config)
+            .expect("canonical pricing fixture snapshots");
+        let mut registry = expected.clone();
+        registry["connections"]["ollama.priced"]["api"]["chat"]["live_pricing"] =
+            serde_json::json!(false);
 
         let (addr_tx, addr_rx) = tokio::sync::oneshot::channel();
         let addr_tx = std::sync::Mutex::new(Some(addr_tx));
@@ -16067,12 +16208,12 @@ mod accept_error_tests {
         );
 
         let body = serde_json::json!({
-            "path": live_pricing_path,
-            "value": false,
+            "expected": expected,
+            "registry": registry,
         })
         .to_string();
         let request = format!(
-            "PUT /api/config/prop HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\n\
+            "PUT /api/config/provider-registry HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\n\
              Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
         );

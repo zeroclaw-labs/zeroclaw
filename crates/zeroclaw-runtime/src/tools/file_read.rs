@@ -1253,7 +1253,7 @@ mod tests {
                 backend: "none".into(),
                 ..MemoryConfig::default()
             };
-            Arc::from(zeroclaw_memory::create_memory(&cfg, &std::env::temp_dir(), None).unwrap())
+            Arc::from(zeroclaw_memory::create_memory(&cfg, &std::env::temp_dir()).unwrap())
         }
 
         pub fn make_observer() -> Arc<dyn Observer> {

@@ -89,16 +89,18 @@ pub fn handle_command(command: crate::SopCommands, config: &crate::config::Confi
                 return Ok(());
             }
 
+            let registry = config.provider_registry()?;
             let mut any_warnings = !failed.is_empty();
             for sop in &targets {
                 let mut warnings = validate_sop(sop);
                 if let Some(spec) = &sop.decision
-                    && !config.decision_models.contains_key(&spec.model)
+                    && registry
+                        .resolve_decision(&spec.model.as_str().into())
+                        .is_err()
                 {
-                    warnings.push(format!(
-                        "[decision] model '{}' is not configured in [decision_models]; \
-                         runs will fall back to the strictest mode",
-                        spec.model
+                    warnings.push(get_required_cli_string_with_args(
+                        "cli-sop-decision-model-not-configured",
+                        &[("model", &spec.model)],
                     ));
                 }
                 if warnings.is_empty() {

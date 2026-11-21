@@ -406,7 +406,7 @@ zc-quickstart-modal-action-on-file-rows = sur les lignes de fichiers
 zc-quickstart-modal-action-save = enregistrer
 zc-quickstart-modal-type-prefix = Type :
 zc-quickstart-field-label-alias = Alias
-zc-quickstart-field-help-alias = Identifiant unique pour cette instance de fournisseur. Changez « default » si votre configuration en contient déjà un avec cet alias.
+zc-quickstart-field-help-alias = Alias de la nouvelle connexion ; la référence enregistrée est <type de fournisseur>.<alias>. Les points font partie de l’alias. Choisissez un autre nom s’il existe déjà.
 zc-quickstart-model-loading = Chargement des modèles pour { $provider }...
 zc-quickstart-model-retrying = Nouvelle tentative de catalogue de modèles pour { $provider }...
 zc-quickstart-model-catalog-empty = catalogue indisponible - saisissez un nom de modèle
@@ -648,6 +648,7 @@ zc-config-group-operations = Opérations
 zc-config-group-other = Autre
 
 zc-config-section-providers-models-label = Fournisseurs de modèles
+zc-config-section-providers-registry-label = Registre des fournisseurs
 zc-config-section-model-routes-label = Routes de modèles
 zc-config-section-embedding-routes-label = Routes d’embeddings
 zc-config-section-risk-profiles-label = Profils de risque
@@ -690,6 +691,8 @@ zc-config-section-media-pipeline-label = Pipeline multimédia
 zc-config-section-multimodal-label = Multimodal
 
 zc-config-section-providers-models-help = Choisissez un fournisseur de modèles à configurer (Anthropic, OpenAI, OpenRouter, Ollama, passerelles personnalisées compatibles avec OpenAI, etc.). Plusieurs alias par fournisseur sont pris en charge.
+zc-config-section-providers-registry-help = Configurez les connexions réutilisables, les modèles, les préréglages et les références de secours des fournisseurs. Les noms sont des clés exactes et peuvent contenir des points.
+zc-config-registry-help = Modifiez ensemble les connexions, modèles, préréglages de modèles et références de secours au format JSON. Entrée insère une ligne ; Ctrl+S enregistre. Pour les options héritées, omettez un champ pour hériter de sa valeur et utilisez la chaîne "null" pour l'effacer. Les références sont validées et les identifiants masqués inchangés sont conservés. `revision` est un jeton de concurrence ; rechargez après la modification du registre par un autre éditeur ou le redémarrage du daemon.
 zc-config-section-model-routes-help = Indices nommés de routage des modèles (par exemple, reasoning, fast ou code). Chaque route associe un indice à un fournisseur et à un modèle.
 zc-config-section-embedding-routes-help = Indices nommés de routage des embeddings. Chaque route associe un indice à un fournisseur et à un modèle prenant en charge les embeddings.
 zc-config-section-risk-profiles-help = Profils de risque nommés qui associent des listes d’autorisation, des listes de refus et des seuils d’approbation.

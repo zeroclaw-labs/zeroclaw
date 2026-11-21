@@ -247,10 +247,10 @@ impl PipelineTool {
             zeroclaw_api::tool::clear_runtime_approval(tool_arc.name(), &mut args);
 
             let context = context.clone();
-            join_set.spawn(async move {
+            join_set.spawn(crate::llm_task::inherit_model_config_scope(async move {
                 let result = tool_arc.execute_with_context(args, &context).await;
                 (i, tool_name, result)
-            });
+            }));
         }
 
         let mut results: Vec<StepResult> = Vec::with_capacity(steps.len());

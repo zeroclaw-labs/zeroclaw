@@ -271,36 +271,19 @@ fn effort_turn_route(
         })?;
     crate::agent::eval::log_effort_route_selection(&selection, message.len(), "direct");
     Ok(Some(EffortTurnRoute {
-        model_provider: selection.route.model_provider.clone(),
-        model: selection.route.model.clone(),
-        allowed_provider_refs: Arc::new(selection.allowed_provider_refs),
+        model_provider: selection.route.model_ref.clone(),
+        model: selection.route.effective_model(config),
+        allowed_provider_refs: Arc::new(selection.allowed_profile_refs(config)),
     }))
 }
 
 fn effort_scoped_provider_config(
     config: &Config,
     allowed_provider_refs: &HashSet<String>,
-) -> Box<Config> {
+) -> anyhow::Result<Box<Config>> {
     let mut scoped = Box::new(config.clone());
-    for (_, _, profile) in scoped.providers.models.iter_entries_mut() {
-        profile
-            .fallback
-            .retain(|candidate| allowed_provider_refs.contains(candidate.trim()));
-    }
-    let excluded_profiles: Vec<(String, String)> = scoped
-        .providers
-        .models
-        .iter_entries()
-        .filter(|(family, alias, _)| !allowed_provider_refs.contains(&format!("{family}.{alias}")))
-        .map(|(family, alias, _)| (family.to_string(), alias.to_string()))
-        .collect();
-    for (family, alias) in excluded_profiles {
-        scoped.providers.models.remove_alias(&family, &alias);
-    }
-    scoped
-        .model_routes
-        .retain(|route| allowed_provider_refs.contains(&route.model_provider));
-    scoped
+    scoped.restrict_chat_inputs(allowed_provider_refs)?;
+    Ok(scoped)
 }
 
 // Cost tracking moved to `super::cost`.
@@ -846,7 +829,7 @@ pub(crate) fn build_system_prompt_for_turn(
     tools_registry: &[Box<dyn Tool>],
     excluded_tools: &[String],
     activated_tools: Option<&Arc<Mutex<crate::tools::ActivatedToolSet>>>,
-    strict_tool_parsing: bool,
+    text_tool_calls_disabled: bool,
     skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode,
     compact_context: bool,
     max_system_prompt_chars: usize,
@@ -905,7 +888,7 @@ pub(crate) fn build_system_prompt_for_turn(
     }
     let expose_text_tool_protocol = apply_text_tool_prompt_policy(
         native_tools,
-        strict_tool_parsing,
+        text_tool_calls_disabled,
         &mut turn_tool_descs,
         &mut turn_deferred_section,
     );
@@ -1080,7 +1063,7 @@ pub async fn agent_turn(
     dedup_exempt_tools: &[String],
     activated_tools: Option<&std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
     model_switch_callback: Option<ModelSwitchCallback>,
-    strict_tool_parsing: bool,
+    text_tool_calls_disabled: bool,
     parallel_tools: bool,
     max_tool_result_chars: usize,
     keep_tool_context_turns: usize,
@@ -1114,7 +1097,7 @@ pub async fn agent_turn(
         dedup_exempt_tools,
         activated_tools,
         model_switch_callback,
-        strict_tool_parsing,
+        text_tool_calls_disabled,
         parallel_tools,
         max_tool_result_chars,
         keep_tool_context_turns,
@@ -1144,7 +1127,7 @@ async fn agent_turn_with_sop_reassembly(
     observer: &dyn Observer,
     provider_name: &str,
     model: &str,
-    temperature: Option<f64>,
+    temperature: impl Into<zeroclaw_providers::temperature::Temperature>,
     silent: bool,
     channel_name: &str,
     channel_reply_target: Option<&str>,
@@ -1157,7 +1140,7 @@ async fn agent_turn_with_sop_reassembly(
     dedup_exempt_tools: &[String],
     activated_tools: Option<&std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
     model_switch_callback: Option<ModelSwitchCallback>,
-    strict_tool_parsing: bool,
+    text_tool_calls_disabled: bool,
     parallel_tools: bool,
     max_tool_result_chars: usize,
     keep_tool_context_turns: usize,
@@ -1171,6 +1154,7 @@ async fn agent_turn_with_sop_reassembly(
     sop_reassembly: Option<SopStepReassembly<'_>>,
     capability_binding: Option<&crate::composition::BoundCapabilities>,
 ) -> Result<String> {
+    let temperature = temperature.into();
     let turn_id = turn_id.map_or_else(|| uuid::Uuid::new_v4().to_string(), str::to_string);
     // No caller of this wrapper retries model switches with the same turn
     // id, so this frame is the outermost owner of the turn: it backstops
@@ -1259,7 +1243,7 @@ async fn agent_turn_with_sop_reassembly(
                 excluded_tools,
                 dedup_exempt_tools,
                 pacing: &zeroclaw_config::schema::PacingConfig::default(),
-                strict_tool_parsing,
+                text_tool_calls_disabled,
                 parallel_tools,
                 max_tool_result_chars,
                 keep_tool_context_turns,
@@ -1399,12 +1383,12 @@ fn retain_registered_tool_descriptions(
 
 pub fn apply_text_tool_prompt_policy(
     native_tools: bool,
-    strict_tool_parsing: bool,
+    text_tool_calls_disabled: bool,
     tool_descs: &mut Vec<(&str, &str)>,
     deferred_section: &mut String,
 ) -> bool {
-    let expose_text_tool_protocol = !native_tools && !strict_tool_parsing;
-    if !native_tools && strict_tool_parsing {
+    let expose_text_tool_protocol = !native_tools && !text_tool_calls_disabled;
+    if !native_tools && text_tool_calls_disabled {
         tool_descs.clear();
         deferred_section.clear();
     }
@@ -1469,13 +1453,14 @@ pub struct AgentRunOverrides {
     pub sop_step_scope: Option<crate::sop::active_scope::HeadlessStepScope>,
 }
 
-fn agent_provider_composite(
-    config: &zeroclaw_config::schema::Config,
-    agent_alias: &str,
-) -> Option<String> {
+fn agent_provider_composite(config: &Config, agent_alias: &str) -> Option<String> {
+    let reference = config.agent(agent_alias)?.model_provider.as_str();
     config
-        .resolved_model_provider_for_agent(agent_alias)
-        .map(|(ty, alias, _)| format!("{ty}.{alias}"))
+        .provider_registry()
+        .ok()?
+        .resolve_chat(&reference.into())
+        .ok()?;
+    Some(reference.to_owned())
 }
 
 /// Return the owned agent config direct-turn setup needs, with runtime-profile
@@ -1538,18 +1523,40 @@ fn project_cli_terminal_completion_error(error: anyhow::Error) -> anyhow::Error 
     anyhow::Error::msg(user_message)
 }
 
-/// Compatibility adapter for [`run_with_capabilities`]: builds the
-/// config-backed capabilities, which reproduce the provider, memory and
-/// observer construction this entry point performed inline.
-///
-/// Returns the inner future directly rather than wrapping it in another
-/// `async fn` state machine: the turn future is deep enough that one more
-/// layer overflows the auto-trait recursion limit where callers require
-/// `Send`.
+/// Invocation data; configured defaults remain in the admitted Config.
+pub struct AgentRunRequest<'a> {
+    pub agent_alias: &'a str,
+    pub message: Option<String>,
+    pub model: crate::agent::agent::ModelOverrides<'a>,
+    pub peripheral_overrides: Vec<String>,
+    pub interactive: bool,
+    pub session_state_file: Option<PathBuf>,
+    pub allowed_tools: Option<Vec<String>>,
+    pub origin: TurnOrigin,
+    pub capabilities: Option<crate::composition::BoundCapabilities>,
+}
+
+impl<'a> AgentRunRequest<'a> {
+    pub fn new(agent_alias: &'a str) -> Self {
+        Self {
+            agent_alias,
+            message: None,
+            model: Default::default(),
+            peripheral_overrides: Vec::new(),
+            interactive: false,
+            session_state_file: None,
+            allowed_tools: None,
+            origin: TurnOrigin::SubTurn,
+            capabilities: None,
+        }
+    }
+}
+
+/// Compatibility adapter. New callers should use the named request entry.
 #[allow(clippy::too_many_arguments)]
-pub fn run(
+pub fn run<'a>(
     config: Config,
-    agent_alias: &str,
+    agent_alias: &'a str,
     message: Option<String>,
     provider_override: Option<String>,
     model_override: Option<String>,
@@ -1560,38 +1567,41 @@ pub fn run(
     allowed_tools: Option<Vec<String>>,
     origin: TurnOrigin,
     overrides: AgentRunOverrides,
-) -> impl std::future::Future<Output = Result<String>> + '_ {
-    run_inner(
-        config,
-        None,
-        None,
-        agent_alias,
-        message,
-        provider_override,
-        model_override,
-        temperature,
-        peripheral_overrides,
-        interactive,
-        session_state_file,
-        allowed_tools,
-        origin,
-        overrides,
-    )
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String>> + Send + 'a>> {
+    #[cfg(test)]
+    let config = zeroclaw_config::migration::admit_test_input(&config);
+    let config = Arc::new(config);
+    Box::pin(async move {
+        run_with_request(
+            config,
+            AgentRunRequest {
+                agent_alias,
+                message,
+                model: crate::agent::agent::ModelOverrides {
+                    provider: provider_override.as_deref(),
+                    model: model_override.as_deref(),
+                    temperature,
+                },
+                peripheral_overrides,
+                interactive,
+                session_state_file,
+                allowed_tools,
+                origin,
+                capabilities: None,
+            },
+            overrides,
+        )
+        .await
+    })
 }
 
-/// Run an agent turn (or an interactive session) with supplied capabilities.
-///
-/// The provider for the turn and for any mid-turn model switch, the agent's
-/// memory, the observer, and any source-supplied tools come from
-/// `capabilities`; `principal` reaches the provider source with each provider
-/// request. An `overrides.memory` handle still takes precedence over the
-/// memory source, as it does for [`run`].
-#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
-pub async fn run_with_capabilities(
+/// Compatibility entry for callers that supply their runtime sources and principal.
+#[allow(clippy::too_many_arguments)]
+pub fn run_with_capabilities<'a>(
     config: Config,
     capabilities: RuntimeCapabilities,
     principal: Option<PrincipalId>,
-    agent_alias: &str,
+    agent_alias: &'a str,
     message: Option<String>,
     provider_override: Option<String>,
     model_override: Option<String>,
@@ -1602,44 +1612,71 @@ pub async fn run_with_capabilities(
     allowed_tools: Option<Vec<String>>,
     origin: TurnOrigin,
     overrides: AgentRunOverrides,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String>> + Send + 'a>> {
+    #[cfg(test)]
+    let config = zeroclaw_config::migration::admit_test_input(&config);
+    Box::pin(async move {
+        run_with_request(
+            Arc::new(config),
+            AgentRunRequest {
+                agent_alias,
+                message,
+                model: crate::agent::agent::ModelOverrides {
+                    provider: provider_override.as_deref(),
+                    model: model_override.as_deref(),
+                    temperature,
+                },
+                peripheral_overrides,
+                interactive,
+                session_state_file,
+                allowed_tools,
+                origin,
+                capabilities: Some(crate::composition::BoundCapabilities {
+                    capabilities,
+                    principal,
+                }),
+            },
+            overrides,
+        )
+        .await
+    })
+}
+
+/// Store the runner on the heap before composing caller scopes. Polling stays
+/// in the caller task, preserving attribution, admission and cancellation.
+pub fn run_with_request<'a>(
+    config: Arc<Config>,
+    request: AgentRunRequest<'a>,
+    overrides: AgentRunOverrides,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String>> + Send + 'a>> {
+    #[cfg(test)]
+    let config = Arc::new(zeroclaw_config::migration::admit_test_input(&config));
+    Box::pin(run_inner(config, request, overrides))
+}
+
+async fn run_inner(
+    mut config: Arc<Config>,
+    request: AgentRunRequest<'_>,
+    mut overrides: AgentRunOverrides,
 ) -> Result<String> {
-    run_inner(
-        config,
-        Some(capabilities),
-        principal,
+    use ::zeroclaw_log::Instrument;
+    let AgentRunRequest {
         agent_alias,
         message,
-        provider_override,
-        model_override,
-        temperature,
+        model,
         peripheral_overrides,
         interactive,
         session_state_file,
         allowed_tools,
         origin,
-        overrides,
-    )
-    .await
-}
-
-#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
-async fn run_inner(
-    mut config: Config,
-    capabilities: Option<RuntimeCapabilities>,
-    principal: Option<PrincipalId>,
-    agent_alias: &str,
-    message: Option<String>,
-    provider_override: Option<String>,
-    model_override: Option<String>,
-    temperature: Option<f64>,
-    peripheral_overrides: Vec<String>,
-    interactive: bool,
-    session_state_file: Option<PathBuf>,
-    allowed_tools: Option<Vec<String>>,
-    origin: TurnOrigin,
-    mut overrides: AgentRunOverrides,
-) -> Result<String> {
-    use ::zeroclaw_log::Instrument;
+        capabilities: supplied_capabilities,
+    } = request;
+    let (capabilities, principal) = supplied_capabilities
+        .map(|bound| (Some(bound.capabilities), bound.principal))
+        .unwrap_or_default();
+    let provider_override = model.provider.map(str::to_owned);
+    let model_override = model.model.map(str::to_owned);
+    let temperature = model.temperature;
     let execution_admission = if let Some(admission) = overrides.execution_admission.take() {
         Some(admission)
     } else if let Some(capability) = overrides.execution_capability.as_ref() {
@@ -1657,10 +1694,10 @@ async fn run_inner(
             admission.alias() == agent_alias,
             "agent execution admission alias changed during construction"
         );
-        config = admission.config().as_ref().clone();
+        config = admission.config();
     }
     if overrides.suppress_memory_auto_save {
-        config.memory.auto_save = false;
+        Arc::make_mut(&mut config).memory.auto_save = false;
     }
     let capabilities = capabilities.unwrap_or_else(|| RuntimeCapabilities::config_backed(&config));
     let agent = resolved_agent_for_turn(&config, agent_alias)?;
@@ -1750,11 +1787,6 @@ async fn run_inner(
             None => Arc::new(SecurityPolicy::for_agent(&config, agent_alias)?),
         };
 
-        let agent_provider_resolved = config
-            .resolved_model_provider_for_agent(agent_alias)
-            .map(|(ty, alias, cfg)| (ty, alias.to_string(), cfg.clone()));
-        let agent_model_provider = agent_provider_resolved.as_ref().map(|(_, _, cfg)| cfg);
-
         let mem: Arc<dyn Memory> = if memory_free {
             Arc::new(zeroclaw_memory::NoneMemory::new("none"))
         } else {
@@ -1801,11 +1833,8 @@ async fn run_inner(
             == crate::composition::RegistryConstruction::NativeCompat
             && config.sop.runtime_enabled()
         {
-            let (engine, audit) = crate::sop::build_sop_engine_with_capability(
-                config.sop.clone(),
-                &config.decision_models,
-                &config.data_dir,
-                &config.install_root_dir(),
+            let (engine, audit) = crate::sop::build_sop_engine(
+                &config,
                 Arc::clone(&mem),
                 Default::default(),
                 execution_capability.clone(),
@@ -1816,6 +1845,7 @@ async fn run_inner(
         };
         let all_tools_result = match selected_recipe {
             Some(recipe) => recipe(crate::composition::NativeRecipeInputs {
+                model_config: None,
                 request: &tool_request,
                 workspace_dir: &config.data_dir,
                 canvas_store: None,
@@ -1921,82 +1951,91 @@ async fn run_inner(
 
         // ── Resolve model_provider ─────────────────────────────────────────
         let agent_provider_ref = agent_provider_composite(&config, agent_alias);
-        let automatic_model_routing = provider_override.is_none() && model_override.is_none();
-        let mut provider_name = provider_override
-            .as_deref()
-            .or(agent_provider_ref.as_deref())
-            .ok_or_else(|| {
-                ::zeroclaw_log::record!(
-                    ERROR,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                        .with_category(::zeroclaw_log::EventCategory::Agent)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({"agent_alias": agent_alias})),
-                    "agent loop refused: agent.model_provider unresolved and no --provider override"
-                );
-                anyhow::Error::msg(format!(
-                    "agents.{agent_alias}.model_provider does not resolve and no provider override \
-                     was passed on the CLI. Either set `[agents.{agent_alias}] model_provider` or \
-                     pass --provider."
-                ))
-            })?
-            .to_string();
-
-        let mut model_name = match model_override
-            .as_deref()
-            .or(agent_model_provider.and_then(|e| e.model.as_deref()))
-        {
-            Some(m) => m.to_string(),
-            None => anyhow::bail!(
-                "no model configured for agent {agent_alias}: \
-             [providers.models.{provider_name}.<alias>].model is unset and --model was not passed"
-            ),
-        };
-        let mut effort_provider_config = None;
-        let mut active_effort_provider_refs: Option<Arc<HashSet<String>>> = None;
-        if automatic_model_routing && let Some(initial_message) = message.as_deref() {
-            let effective_message =
-                crate::agent::thinking::strip_thinking_directive(initial_message);
-            if let Some(selection) = effort_turn_route(
-                &config,
-                agent.resolved.effort_routing.as_ref(),
-                effective_message.as_ref(),
-            )? {
-                provider_name = selection.model_provider;
-                model_name = selection.model;
-                effort_provider_config = Some(effort_scoped_provider_config(
-                    &config,
-                    selection.allowed_provider_refs.as_ref(),
-                ));
-                active_effort_provider_refs = Some(selection.allowed_provider_refs);
-            }
+        // Guard first (same diagnostics as before): without a `--provider`
+        // override, the agent's ref must resolve to a configured profile.
+        if provider_override.is_none() && agent_provider_ref.is_none() {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_category(::zeroclaw_log::EventCategory::Agent)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"agent_alias": agent_alias})),
+                "agent loop refused: agent.model_provider unresolved and no --provider override"
+            );
+            anyhow::bail!(
+                "agents.{agent_alias}.model_provider does not resolve and no provider override \
+                 was passed on the CLI. Either set `[agents.{agent_alias}] model_provider` or \
+                 pass --provider."
+            );
         }
+        // The RAW effective ref the runtime builds from (a `--provider`
+        // override wins over the agent's configured ref): a three-segment
+        // ref names the model entry to select, which the two-segment
+        // composite above cannot express.
+        let effective_model_ref = provider_override
+            .as_deref()
+            .unwrap_or(agent.model_provider.as_str());
+
+        // Build the complete model runtime from that reference. The raw ref
+        // — two- or three-segment, or a bare family for `--provider
+        // <family>` — reaches the construction chain; the committed name is
+        // the normalised two-segment billing key. Sampling and capacity are
+        // resolved from the selected entry at the request boundary.
+        let automatic_model_routing = provider_override.is_none() && model_override.is_none();
+        let mut active_effort_provider_refs: Option<Arc<HashSet<String>>> = None;
+        let selection = if automatic_model_routing {
+            match message.as_deref() {
+                Some(message) => effort_turn_route(
+                    &config,
+                    agent.resolved.effort_routing.as_ref(),
+                    crate::agent::thinking::strip_thinking_directive(message).as_ref(),
+                )?,
+                None => None,
+            }
+        } else {
+            None
+        };
+        let build_config = selection
+            .as_ref()
+            .map(|selection| {
+                effort_scoped_provider_config(&config, &selection.allowed_provider_refs)
+                    .map(Arc::from)
+            })
+            .transpose()?
+            .unwrap_or_else(|| Arc::clone(&config));
+        let build_ref = selection.as_ref().map_or(effective_model_ref, |selection| {
+            selection.model_provider.as_str()
+        });
+        let build_override = selection
+            .as_ref()
+            .map(|selection| selection.model.as_str())
+            .or(model_override.as_deref());
+        if let Some(selection) = selection.as_ref() {
+            active_effort_provider_refs = Some(Arc::clone(&selection.allowed_provider_refs));
+        }
+        let entry_model = bound_capabilities
+            .build_model(
+                build_config,
+                agent_alias,
+                build_ref,
+                build_override,
+                crate::composition::ModelBuildIntent::Explicit,
+            )
+            .await?;
+        let mut provider_name = entry_model.provider_name();
+        let (mut model_provider, identity, _) = entry_model.into_parts();
+        let mut capacity_ref = identity.provider_ref();
+        let mut model_name = identity.model_id;
         let mut context_limits =
-            config.resolved_context_limits_for_route(agent_alias, &provider_name, &model_name);
+            config.resolved_context_limits_for_route(agent_alias, &capacity_ref, &model_name);
 
         {
             let span = zeroclaw_log::Span::current();
-            let mp_composite = match agent_provider_resolved.as_ref() {
-                Some((ty, alias, _)) => format!("{ty}.{alias}"),
-                None => provider_name.clone(),
-            };
+            let mp_composite = agent_provider_composite(&config, agent_alias)
+                .unwrap_or_else(|| provider_name.clone());
             span.record("model_provider", mp_composite.as_str());
             span.record("model", model_name.as_str());
         }
-
-        // The source resolves credentials, endpoint and alias-owned options
-        // from the provider actually requested, so a --provider override never
-        // inherits the agent alias's key or options. An effort route hands the
-        // source the route-scoped config, so fallbacks stay inside that route.
-        let provider_config = effort_provider_config.as_deref().unwrap_or(&config);
-        let mut model_provider: Box<dyn ModelProvider> =
-            capabilities.model_provider(&crate::composition::ProviderRequest {
-                config: provider_config,
-                agent_alias,
-                provider_ref: Some(&provider_name),
-                model: Some(&model_name),
-                principal: principal.as_ref(),
-            })?;
 
         let mut turn_guard = crate::observability::AgentTurnGuard::start(
             observer.as_ref(),
@@ -2204,7 +2243,7 @@ async fn run_inner(
             &tools_registry,
             &prompt_excluded_tools,
             activated_handle.as_ref(),
-            agent.resolved.strict_tool_parsing,
+            !config.model_text_extraction(&capacity_ref).tool_calls,
             eff_prompt_injection_mode,
             eff_compact_context,
             eff_max_system_prompt_chars,
@@ -2268,11 +2307,12 @@ async fn run_inner(
                 thinking_level,
                 &agent.resolved.thinking,
             );
-            let effective_temperature: Option<f64> = temperature.map(|t| {
-                crate::agent::thinking::clamp_temperature(
-                    t + thinking_params.temperature_adjustment,
-                )
-            });
+            // Keep invocation input separate: each attempt resolves the selected
+            // model's default, then applies the turn's thinking adjustment.
+            let effective_temperature = zeroclaw_providers::temperature::Temperature::adjusted(
+                temperature,
+                thinking_params.temperature_adjustment,
+            );
 
             // Compute per-turn excluded MCP tools from tool_filter_groups before
             // building the turn prompt so tool availability matches the specs
@@ -2305,7 +2345,7 @@ async fn run_inner(
                 &tools_registry,
                 &excluded_tools,
                 activated_handle.as_ref(),
-                agent.resolved.strict_tool_parsing,
+                !config.model_text_extraction(&capacity_ref).tool_calls,
                 eff_prompt_injection_mode,
                 eff_compact_context,
                 eff_max_system_prompt_chars,
@@ -2441,7 +2481,7 @@ async fn run_inner(
                         &tools_registry,
                         &excluded_tools,
                         activated_handle.as_ref(),
-                        agent.resolved.strict_tool_parsing,
+                        !config.model_text_extraction(&capacity_ref).tool_calls,
                         eff_prompt_injection_mode,
                         eff_compact_context,
                         eff_max_system_prompt_chars,
@@ -2460,7 +2500,7 @@ async fn run_inner(
                                     exec: ResolvedAgentExecution::resolve(
                                     ResolvedModelAccess {
                                         model_provider: model_provider.as_ref(),
-                                        provider_name: &provider_name,
+                                        provider_name: &capacity_ref,
                                         model: &model_name,
                                         dispatch_model: &model_name,
                                         temperature: effective_temperature,
@@ -2483,7 +2523,7 @@ async fn run_inner(
                                         excluded_tools: &excluded_tools,
                                         dedup_exempt_tools: &agent.resolved.tool_call_dedup_exempt,
                                         pacing: &config.pacing,
-                                        strict_tool_parsing: agent.resolved.strict_tool_parsing,
+                                        text_tool_calls_disabled: !config.model_text_extraction(&capacity_ref).tool_calls,
                                         parallel_tools: agent.resolved.parallel_tools,
                                         max_tool_result_chars: agent.resolved.max_tool_result_chars,
                                         keep_tool_context_turns: agent.resolved.keep_tool_context_turns,
@@ -2562,26 +2602,32 @@ async fn run_inner(
                                 )
                             );
 
-                            let switch_provider_config = active_effort_provider_refs
-                                .as_deref()
-                                .map(|allowed| effort_scoped_provider_config(&config, allowed));
-                            let switch_provider_config =
-                                switch_provider_config.as_deref().unwrap_or(&config);
-                            model_provider = Box::new(capabilities.providers.switched_model_provider(
-                                &crate::composition::ProviderRequest {
-                                    config: switch_provider_config,
-                                    agent_alias,
-                                    provider_ref: Some(&new_model_provider),
-                                    model: Some(&new_model),
-                                    principal: principal.as_ref(),
-                                },
-                            )?);
-
-                            provider_name = new_model_provider;
-                            model_name = new_model;
+                            // Rebuild the complete runtime from scratch — same
+                            // constructor as the initial construction. The
+                            // selected target owns its credentials; the raw ref
+                            // (three-segment switches carry the entry's tuning)
+                            // reaches the construction chain, and the derived
+                            // values (temperature, billing name) move with the
+                            // new model.
+                            let switch_config = active_effort_provider_refs.as_deref().map(|allowed|
+                                effort_scoped_provider_config(&config, allowed).map(Arc::from)
+                            ).transpose()?.unwrap_or_else(|| Arc::clone(&config));
+                            let model = bound_capabilities.build_model(
+                                switch_config,
+                                agent_alias,
+                                &new_model_provider,
+                                Some(&new_model),
+                                crate::composition::ModelBuildIntent::Switch,
+                            )
+                            .await?;
+                            provider_name = model.provider_name();
+                            let (provider, identity, _) = model.into_parts();
+                            capacity_ref = identity.provider_ref();
+                            model_provider = provider;
+                            model_name = identity.model_id;
                             context_limits = config.resolved_context_limits_for_route(
                                 agent_alias,
-                                &provider_name,
+                                &capacity_ref,
                                 &model_name,
                             );
 
@@ -2615,17 +2661,37 @@ async fn run_inner(
                     // internally when the provider call or its output is
                     // unusable. Default path stays the deterministic generator.
                     let creation_result = if config.skills.skill_creation.reflection_enabled {
+                        let temperature_input =
+                            zeroclaw_providers::temperature::Temperature::from(temperature);
+                        let sampling_ref = config
+                            .agent(agent_alias)
+                            .filter(|_| !provider_name.contains('.'))
+                            .map_or(capacity_ref.as_str(), |agent| agent.model_provider.as_str());
+                        let access = ResolvedModelAccess {
+                            model_provider: model_provider.as_ref(),
+                            provider_name: &provider_name,
+                            model: &model_name,
+                            dispatch_model: &model_name,
+                            temperature: temperature_input,
+                        };
+                        let policy_config = Arc::clone(&config);
+                        let resolver =
+                            Arc::new(move |model: &str| policy_config.model_text_extraction(model))
+                                as Arc<dyn Fn(&str) -> zeroclaw_api::TextExtraction + Send + Sync>;
                         TOOL_LOOP_COST_TRACKING_CONTEXT
                             .scope(
                                 cost_tracking_context.clone(),
-                                creator.create_from_execution_reflected(
-                                    &msg,
-                                    &tool_calls,
-                                    &response,
-                                    None,
-                                    &provider_name,
-                                    model_provider.as_ref(),
-                                    &model_name,
+                                zeroclaw_api::scope_text_extraction(
+                                    Some(resolver),
+                                    creator.create_from_execution_reflected(
+                                        &msg,
+                                        &tool_calls,
+                                        &response,
+                                        None,
+                                        access,
+                                        temperature_input
+                                            .for_call(Some(Arc::clone(&config)), sampling_ref),
+                                    ),
                                 ),
                             )
                             .await
@@ -2860,11 +2926,14 @@ async fn run_inner(
                     thinking_level,
                     &agent.resolved.thinking,
                 );
-                let turn_temperature: Option<f64> = temperature.map(|t| {
-                    crate::agent::thinking::clamp_temperature(
-                        t + thinking_params.temperature_adjustment,
-                    )
-                });
+                // Same composition as the first message: explicit CLI flag
+                // over the model runtime's config-derived temperature. Before
+                // each attempt reads the active model's default, including a
+                // retry immediately after an interactive model switch.
+                let turn_temperature = zeroclaw_providers::temperature::Temperature::adjusted(
+                    temperature,
+                    thinking_params.temperature_adjustment,
+                );
 
                 if automatic_model_routing
                     && let Some(selection) = effort_turn_route(
@@ -2878,23 +2947,27 @@ async fn run_inner(
                         || active_effort_provider_refs.as_deref()
                             != Some(selection.allowed_provider_refs.as_ref())
                     {
-                        let scoped_config = effort_scoped_provider_config(
+                        let scoped_config = Arc::from(effort_scoped_provider_config(
                             &config,
-                            selection.allowed_provider_refs.as_ref(),
-                        );
-                        model_provider =
-                            capabilities.model_provider(&crate::composition::ProviderRequest {
-                                config: &scoped_config,
+                            &selection.allowed_provider_refs,
+                        )?);
+                        let built = bound_capabilities
+                            .build_model(
+                                scoped_config,
                                 agent_alias,
-                                provider_ref: Some(&selection.model_provider),
-                                model: Some(&selection.model),
-                                principal: principal.as_ref(),
-                            })?;
-                        provider_name = selection.model_provider;
-                        model_name = selection.model;
+                                &selection.model_provider,
+                                Some(&selection.model),
+                                crate::composition::ModelBuildIntent::Explicit,
+                            )
+                            .await?;
+                        provider_name = built.provider_name();
+                        let (provider, identity, _) = built.into_parts();
+                        capacity_ref = identity.provider_ref();
+                        model_provider = provider;
+                        model_name = identity.model_id;
                         context_limits = config.resolved_context_limits_for_route(
                             agent_alias,
-                            &provider_name,
+                            &capacity_ref,
                             &model_name,
                         );
                         turn_guard.set_model_route(provider_name.clone(), model_name.clone());
@@ -3095,7 +3168,7 @@ async fn run_inner(
                             &tools_registry,
                             &excluded_tools,
                             activated_handle.as_ref(),
-                            agent.resolved.strict_tool_parsing,
+                            !config.model_text_extraction(&capacity_ref).tool_calls,
                             eff_prompt_injection_mode,
                             eff_compact_context,
                             eff_max_system_prompt_chars,
@@ -3114,7 +3187,7 @@ async fn run_inner(
                                     exec: ResolvedAgentExecution::resolve(
                                         ResolvedModelAccess {
                                             model_provider: model_provider.as_ref(),
-                                            provider_name: &provider_name,
+                                            provider_name: &capacity_ref,
                                             model: &model_name,
                                             dispatch_model: &model_name,
                                             temperature: turn_temperature,
@@ -3139,7 +3212,7 @@ async fn run_inner(
                                                 .resolved
                                                 .tool_call_dedup_exempt,
                                             pacing: &config.pacing,
-                                            strict_tool_parsing: agent.resolved.strict_tool_parsing,
+                                            text_tool_calls_disabled: !config.model_text_extraction(&capacity_ref).tool_calls,
                                             parallel_tools: agent.resolved.parallel_tools,
                                             max_tool_result_chars: agent
                                                 .resolved
@@ -3228,26 +3301,27 @@ async fn run_inner(
                                     )
                                 );
 
-                                let switch_provider_config = active_effort_provider_refs
-                                    .as_deref()
-                                    .map(|allowed| effort_scoped_provider_config(&config, allowed));
-                                let switch_provider_config =
-                                    switch_provider_config.as_deref().unwrap_or(&config);
-                                model_provider = Box::new(capabilities.providers.switched_model_provider(
-                                    &crate::composition::ProviderRequest {
-                                        config: switch_provider_config,
-                                        agent_alias,
-                                        provider_ref: Some(&new_model_provider),
-                                        model: Some(&new_model),
-                                        principal: principal.as_ref(),
-                                    },
-                                )?);
-
-                                provider_name = new_model_provider;
-                                model_name = new_model;
-                                context_limits = config.resolved_context_limits_for_route(
+                                // Same rebuild as the one-shot path above —
+                                // one construction site for both loops.
+                                let switch_config = active_effort_provider_refs.as_deref().map(|allowed|
+                                    effort_scoped_provider_config(&config, allowed).map(Arc::from)
+                                ).transpose()?.unwrap_or_else(|| Arc::clone(&config));
+                                let model = bound_capabilities.build_model(
+                                    switch_config,
                                     agent_alias,
-                                    &provider_name,
+                                    &new_model_provider,
+                                    Some(&new_model),
+                                    crate::composition::ModelBuildIntent::Switch,
+                                )
+                                .await?;
+                                provider_name = model.provider_name();
+                                let (provider, identity, _) = model.into_parts();
+                                capacity_ref = identity.provider_ref();
+                                model_provider = provider;
+                                model_name = identity.model_id;
+                                    context_limits = config.resolved_context_limits_for_route(
+                                    agent_alias,
+                                    &capacity_ref,
                                     &model_name,
                                 );
 
@@ -3496,6 +3570,8 @@ pub async fn process_message(
     origin: TurnOrigin,
     internal_principal: Option<zeroclaw_api::ingress::InternalPrincipal>,
 ) -> Result<String> {
+    #[cfg(test)]
+    let config = zeroclaw_config::migration::admit_test_input(&config);
     process_message_shared(
         Arc::new(config),
         agent_alias,
@@ -3522,6 +3598,8 @@ pub(crate) fn process_message_shared<'a>(
     origin: TurnOrigin,
     internal_principal: Option<zeroclaw_api::ingress::InternalPrincipal>,
 ) -> impl std::future::Future<Output = Result<String>> + 'a {
+    #[cfg(test)]
+    let config = Arc::new(zeroclaw_config::migration::admit_test_input(&config));
     process_message_inner(
         config,
         None,
@@ -3773,6 +3851,10 @@ async fn process_message_inner(
     internal_principal: Option<zeroclaw_api::ingress::InternalPrincipal>,
 ) -> Result<String> {
     use ::zeroclaw_log::Instrument;
+    #[cfg(test)]
+    if execution_admission.is_none() {
+        config = Arc::new(zeroclaw_config::migration::admit_test_input(&config));
+    }
     if let Some(admission) = execution_admission.as_ref() {
         admission.revalidate()?;
         anyhow::ensure!(
@@ -3844,31 +3926,9 @@ async fn process_message_inner(
         let observer: Arc<dyn Observer> = Arc::clone(&capabilities.observer);
         // What operations started inside this turn inherit: a spawned
         // sub-agent, a delegate, a peer turn, a cross-agent SOP step.
-        let bound_capabilities = crate::composition::BoundCapabilities {
-            capabilities: capabilities.clone(),
-            principal: principal.clone(),
-        };
         let runtime: Arc<dyn platform::RuntimeAdapter> =
             Arc::from(platform::create_runtime(&config.runtime)?);
         let security = Arc::new(SecurityPolicy::for_agent(&config, agent_alias)?);
-        let (provider_name, provider_alias, agent_model_provider) = match config
-            .resolved_model_provider_for_agent(agent_alias)
-        {
-            Some(resolved) => (resolved.0, resolved.1.to_string(), Some(resolved.2.clone())),
-            None => {
-                let agent_ref = agent.model_provider.as_str();
-                if !agent_ref.is_empty() {
-                    anyhow::bail!(
-                        "agents.{agent_alias}.model_provider = \"{agent_ref}\" does not resolve to \
-                     a configured [providers.models.<type>.<alias>] entry"
-                    );
-                }
-                anyhow::bail!(
-                    "agents.{agent_alias}.model_provider is empty \u{2014} set it to a configured \
-                 \"<type>.<alias>\" (e.g. \"anthropic.{agent_alias}\")"
-                );
-            }
-        };
         let approval_manager = ApprovalManager::for_non_interactive(&risk_profile);
         let mem: Arc<dyn Memory> = capabilities.agent_memory(&config, agent_alias).await?;
 
@@ -3890,11 +3950,8 @@ async fn process_message_inner(
             == crate::composition::RegistryConstruction::NativeCompat
             && config.sop.runtime_enabled()
         {
-            let (engine, audit) = crate::sop::build_sop_engine_with_capability(
-                config.sop.clone(),
-                &config.decision_models,
-                &config.data_dir,
-                &config.install_root_dir(),
+            let (engine, audit) = crate::sop::build_sop_engine(
+                &config,
                 Arc::clone(&mem),
                 Default::default(),
                 execution_capability.clone(),
@@ -3905,6 +3962,7 @@ async fn process_message_inner(
         };
         let all_tools_result_pm = match selected_recipe {
             Some(recipe) => recipe(crate::composition::NativeRecipeInputs {
+                model_config: None,
                 request: &tool_request,
                 workspace_dir: &config.data_dir,
                 canvas_store: None,
@@ -3962,7 +4020,7 @@ async fn process_message_inner(
         .await;
         // process_message injects one combined MCP prompt block: deferred tool-search
         // listing + pinned resources, composed by the harness. `mut` because the
-        // text-tool prompt policy below may clear it for a non-native strict target.
+        // text-tool prompt policy below may clear it when extraction is disabled.
         let mut deferred_section = assembled.combined_mcp_prompt_section();
         let scoped::ScopedAssembled {
             registry,
@@ -4000,48 +4058,52 @@ async fn process_message_inner(
             );
         }
 
-        let mut model_name = match agent_model_provider
-            .as_ref()
-            .and_then(|e| e.model.as_deref())
-            .map(str::trim)
-            .filter(|m| !m.is_empty())
-        {
-            Some(m) => m.to_string(),
-            None => anyhow::bail!(
-                "agents.{agent_alias}.model_provider resolves to a model_provider entry with no \
-             `model` set. Configure [providers.models.{provider_name}.<alias>] model = \"...\"."
-            ),
-        };
-        let mut model_provider_ref = format!("{provider_name}.{provider_alias}");
-        let mut effort_provider_config = None;
-        let mut effort_provider_refs: Option<Arc<HashSet<String>>> = None;
-        let effective_message = crate::agent::thinking::strip_thinking_directive(message);
-        if let Some(selection) = effort_turn_route(
+        // Build the complete model runtime from the agent's configured ref —
+        // the same constructor every other path uses. A three-segment ref
+        // carries the selected entry's tuning, and the raw ref reaches the
+        // construction chain (a normalised two-segment ref would clobber the
+        // selected entry's overlay with `models.default`'s).
+        let effort_selection = effort_turn_route(
             &config,
             agent.resolved.effort_routing.as_ref(),
-            effective_message.as_ref(),
-        )? {
-            model_provider_ref = selection.model_provider;
-            model_name = selection.model;
-            effort_provider_config = Some(effort_scoped_provider_config(
-                &config,
-                selection.allowed_provider_refs.as_ref(),
-            ));
-            effort_provider_refs = Some(selection.allowed_provider_refs);
-        }
-        // Without an effort route the source resolves the agent's own provider;
-        // with one, it receives the selected route and the route-scoped config.
-        let provider_config = effort_provider_config.as_deref().unwrap_or(&config);
-        let model_provider: Box<dyn ModelProvider> =
-            capabilities.model_provider(&crate::composition::ProviderRequest {
-                config: provider_config,
+            crate::agent::thinking::strip_thinking_directive(message).as_ref(),
+        )?;
+        let effort_provider_refs = effort_selection
+            .as_ref()
+            .map(|selection| Arc::clone(&selection.allowed_provider_refs));
+        let build_config = effort_selection
+            .as_ref()
+            .map(|selection| {
+                effort_scoped_provider_config(&config, &selection.allowed_provider_refs)
+                    .map(Arc::from)
+            })
+            .transpose()?
+            .unwrap_or_else(|| Arc::clone(&config));
+        let build_ref = effort_selection
+            .as_ref()
+            .map_or(agent.model_provider.as_str(), |selection| {
+                selection.model_provider.as_str()
+            });
+        let build_override = effort_selection
+            .as_ref()
+            .map(|selection| selection.model.as_str());
+        let bound_capabilities = crate::composition::BoundCapabilities {
+            capabilities: capabilities.clone(),
+            principal: principal.clone(),
+        };
+        let entry_model = bound_capabilities
+            .build_model(
+                build_config,
                 agent_alias,
-                provider_ref: effort_provider_refs
-                    .as_ref()
-                    .map(|_| model_provider_ref.as_str()),
-                model: Some(&model_name),
-                principal: principal.as_ref(),
-            })?;
+                build_ref,
+                build_override,
+                crate::composition::ModelBuildIntent::AgentDefault,
+            )
+            .await?;
+        let provider_name = entry_model.provider_name();
+        let (model_provider, identity, _) = entry_model.into_parts();
+        let model_provider_ref = identity.provider_ref();
+        let model_name = identity.model_id;
 
         // Datasheet context describes native peripheral tools, so a
         // supplied-only registry does not get it.
@@ -4195,7 +4257,7 @@ async fn process_message_inner(
         )?;
         let expose_text_tool_protocol = apply_text_tool_prompt_policy(
             native_tools,
-            agent.resolved.strict_tool_parsing,
+            !config.model_text_extraction(&model_provider_ref).tool_calls,
             &mut tool_descs,
             &mut deferred_section,
         );
@@ -4254,14 +4316,10 @@ async fn process_message_inner(
             thinking_level,
             &agent.resolved.thinking,
         );
-        let effective_temperature: Option<f64> = agent_model_provider
-            .as_ref()
-            .and_then(|e| e.temperature)
-            .map(|t| {
-                crate::agent::thinking::clamp_temperature(
-                    t + thinking_params.temperature_adjustment,
-                )
-            });
+        let effective_temperature = zeroclaw_providers::temperature::Temperature::adjusted(
+            None,
+            thinking_params.temperature_adjustment,
+        );
 
         // Prepend thinking system prompt prefix when present.
         if let Some(ref prefix) = thinking_params.system_prompt_prefix {
@@ -4360,7 +4418,7 @@ async fn process_message_inner(
                     &mut None,
                     &tools_registry,
                     observer.as_ref(),
-                    &model_provider_ref,
+                    &provider_name,
                     &model_name,
                     effective_temperature,
                     true,
@@ -4378,7 +4436,7 @@ async fn process_message_inner(
                     &agent.resolved.tool_call_dedup_exempt,
                     activated_handle_pm.as_ref(),
                     None,
-                    agent.resolved.strict_tool_parsing,
+                    !config.model_text_extraction(&model_provider_ref).tool_calls,
                     agent.resolved.parallel_tools,
                     agent.resolved.max_tool_result_chars,
                     agent.resolved.keep_tool_context_turns,
@@ -4462,28 +4520,33 @@ mod tests {
         use zeroclaw_config::schema::{Config, ModelRouteConfig};
 
         let mut config = Config::default();
-        config
-            .providers
-            .models
-            .ensure("custom", "local")
-            .unwrap()
-            .fallback
-            .push(zeroclaw_config::providers::ModelProviderRef::new(
+        config.providers.fallback.insert(
+            zeroclaw_config::provider_registry::ModelRef::new("custom.local"),
+            vec![zeroclaw_config::provider_registry::ModelRef::new(
                 "custom.cloud",
-            ));
+            )],
+        );
         config.providers.models.ensure("custom", "cloud").unwrap();
+        zeroclaw_config::migration::bind_test_route_model(
+            &mut config,
+            "custom.local",
+            "small",
+            None,
+        );
+        zeroclaw_config::migration::bind_test_route_model(
+            &mut config,
+            "custom.cloud",
+            "large",
+            None,
+        );
         config.model_routes = vec![
             ModelRouteConfig {
                 hint: "local".into(),
-                model_provider: "custom.local".into(),
-                model: "small".into(),
-                api_key: None,
+                model_ref: "custom.local".into(),
             },
             ModelRouteConfig {
                 hint: "cloud".into(),
-                model_provider: "custom.cloud".into(),
-                model: "large".into(),
-                api_key: None,
+                model_ref: "custom.cloud".into(),
             },
         ];
         let policy = EffortRoutingConfig {
@@ -4492,25 +4555,28 @@ mod tests {
             cloud_escalation: CloudEscalationPolicy::Auto,
         };
 
-        let local = effort_turn_route(&config, Some(&policy), "say hello")
-            .unwrap()
-            .unwrap();
+        let local = effort_turn_route(
+            &zeroclaw_config::migration::admit_test_input(&config),
+            Some(&policy),
+            "say hello",
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(local.model_provider, "custom.local");
         assert_eq!(local.model, "small");
         assert_eq!(
             local.allowed_provider_refs.as_ref(),
             &std::collections::HashSet::from(["custom.local".to_string()])
         );
-        let local_config =
-            effort_scoped_provider_config(&config, local.allowed_provider_refs.as_ref());
+        let local_config = effort_scoped_provider_config(
+            &zeroclaw_config::migration::admit_test_input(&config),
+            local.allowed_provider_refs.as_ref(),
+        )
+        .unwrap();
         assert!(
-            local_config
-                .providers
-                .models
-                .find("custom", "local")
-                .unwrap()
-                .fallback
-                .is_empty(),
+            !local_config.providers.fallback.contains_key(
+                &zeroclaw_config::provider_registry::ModelRef::new("custom.local")
+            ),
             "a local turn must prune a configured cloud reliability fallback"
         );
         assert!(
@@ -4522,9 +4588,13 @@ mod tests {
             "direct turns must remove excluded profiles so side routes such as vision cannot construct them"
         );
 
-        let cloud = effort_turn_route(&config, Some(&policy), &"a".repeat(201))
-            .unwrap()
-            .unwrap();
+        let cloud = effort_turn_route(
+            &zeroclaw_config::migration::admit_test_input(&config),
+            Some(&policy),
+            &"a".repeat(201),
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(cloud.model_provider, "custom.cloud");
         assert_eq!(cloud.model, "large");
         assert_eq!(
@@ -4544,8 +4614,13 @@ mod tests {
 
         let mut duplicate_route = config;
         let mut final_local_route = duplicate_route.model_routes[0].clone();
-        final_local_route.model_provider = "custom.final".into();
-        final_local_route.model = "final-small".into();
+        final_local_route.model_ref = "custom.final".into();
+        zeroclaw_config::migration::bind_test_route_model(
+            &mut duplicate_route,
+            "custom.final",
+            "final-small",
+            None,
+        );
         duplicate_route.model_routes.push(final_local_route);
         let selected = effort_turn_route(&duplicate_route, Some(&policy), "say hello")
             .unwrap()
@@ -6323,7 +6398,7 @@ mod tests {
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -6338,7 +6413,7 @@ mod tests {
                 activated_tools: None,
                 model_switch_callback: None,
                 pacing: &zeroclaw_config::schema::PacingConfig::default(),
-                strict_tool_parsing: false,
+                text_tool_calls_disabled: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 keep_tool_context_turns: 2,
@@ -6572,7 +6647,7 @@ mod tests {
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -6587,7 +6662,7 @@ mod tests {
                 activated_tools: None,
                 model_switch_callback: None,
                 pacing: &zeroclaw_config::schema::PacingConfig::default(),
-                strict_tool_parsing: false,
+                text_tool_calls_disabled: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 keep_tool_context_turns: 2,
@@ -7006,7 +7081,7 @@ mod tests {
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -7021,7 +7096,7 @@ mod tests {
                 activated_tools: None,
                 model_switch_callback: None,
                 pacing: &zeroclaw_config::schema::PacingConfig::default(),
-                strict_tool_parsing: false,
+                text_tool_calls_disabled: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 keep_tool_context_turns: 2,
@@ -7093,7 +7168,7 @@ mod tests {
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -7108,7 +7183,7 @@ mod tests {
                 activated_tools: None,
                 model_switch_callback: None,
                 pacing: &zeroclaw_config::schema::PacingConfig::default(),
-                strict_tool_parsing: false,
+                text_tool_calls_disabled: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 keep_tool_context_turns: 2,
@@ -7209,7 +7284,7 @@ mod tests {
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -7224,7 +7299,7 @@ mod tests {
                 activated_tools: None,
                 model_switch_callback: None,
                 pacing: &zeroclaw_config::schema::PacingConfig::default(),
-                strict_tool_parsing: false,
+                text_tool_calls_disabled: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 keep_tool_context_turns: 2,
@@ -7381,7 +7456,7 @@ mod tests {
                         provider_name: "mock-provider",
                         model: "mock-model",
                         dispatch_model: "mock-model",
-                        temperature: Some(0.0),
+                        temperature: Some(0.0).into(),
                     },
                     tools_registry: &tools_registry,
                     observer: &observer,
@@ -7397,7 +7472,7 @@ mod tests {
                     activated_tools: None,
                     model_switch_callback: None,
                     pacing: &zeroclaw_config::schema::PacingConfig::default(),
-                    strict_tool_parsing: false,
+                    text_tool_calls_disabled: false,
                     parallel_tools: false,
                     max_tool_result_chars: 0,
                     keep_tool_context_turns: 2,
@@ -7481,7 +7556,7 @@ mod tests {
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -7496,7 +7571,7 @@ mod tests {
                 activated_tools: None,
                 model_switch_callback: None,
                 pacing: &zeroclaw_config::schema::PacingConfig::default(),
-                strict_tool_parsing: false,
+                text_tool_calls_disabled: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 keep_tool_context_turns: 2,
@@ -7580,7 +7655,7 @@ mod tests {
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -7595,7 +7670,7 @@ mod tests {
                 activated_tools: None,
                 model_switch_callback: None,
                 pacing: &zeroclaw_config::schema::PacingConfig::default(),
-                strict_tool_parsing: false,
+                text_tool_calls_disabled: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 keep_tool_context_turns: 2,
@@ -7664,7 +7739,7 @@ mod tests {
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -7679,7 +7754,7 @@ mod tests {
                 activated_tools: None,
                 model_switch_callback: None,
                 pacing: &zeroclaw_config::schema::PacingConfig::default(),
-                strict_tool_parsing: false,
+                text_tool_calls_disabled: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 keep_tool_context_turns: 2,
@@ -7751,7 +7826,7 @@ mod tests {
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -7766,7 +7841,7 @@ mod tests {
                 activated_tools: None,
                 model_switch_callback: None,
                 pacing: &zeroclaw_config::schema::PacingConfig::default(),
-                strict_tool_parsing: false,
+                text_tool_calls_disabled: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 keep_tool_context_turns: 2,
@@ -7839,7 +7914,7 @@ mod tests {
                     provider_name: "scripted",
                     model: "scripted-model",
                     dispatch_model: "scripted-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -7854,7 +7929,7 @@ mod tests {
                 activated_tools: None,
                 model_switch_callback: None,
                 pacing: &zeroclaw_config::schema::PacingConfig::default(),
-                strict_tool_parsing: false,
+                text_tool_calls_disabled: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 keep_tool_context_turns: 2,
@@ -7914,7 +7989,7 @@ mod tests {
                         provider_name: "scripted",
                         model: "scripted-model",
                         dispatch_model: "scripted-model",
-                        temperature: Some(0.0),
+                        temperature: Some(0.0).into(),
                     },
                     tools_registry: &tools_registry,
                     observer: &observer,
@@ -7929,7 +8004,7 @@ mod tests {
                     activated_tools: None,
                     model_switch_callback: None,
                     pacing: &zeroclaw_config::schema::PacingConfig::default(),
-                    strict_tool_parsing: false,
+                    text_tool_calls_disabled: false,
                     parallel_tools: false,
                     max_tool_result_chars: 0,
                     keep_tool_context_turns: 2,
@@ -8112,7 +8187,7 @@ mod tests {
                         provider_name: "scripted",
                         model: "scripted-model",
                         dispatch_model: "scripted-model",
-                        temperature: Some(0.0),
+                        temperature: Some(0.0).into(),
                     },
                     tools_registry: &tools_registry,
                     observer: &observer,
@@ -8127,7 +8202,7 @@ mod tests {
                     activated_tools: None,
                     model_switch_callback: None,
                     pacing: &zeroclaw_config::schema::PacingConfig::default(),
-                    strict_tool_parsing: false,
+                    text_tool_calls_disabled: false,
                     parallel_tools: false,
                     max_tool_result_chars: 0,
                     keep_tool_context_turns: 2,
@@ -8247,7 +8322,7 @@ mod tests {
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -8262,7 +8337,7 @@ mod tests {
                 activated_tools: None,
                 model_switch_callback: None,
                 pacing: &zeroclaw_config::schema::PacingConfig::default(),
-                strict_tool_parsing: false,
+                text_tool_calls_disabled: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 keep_tool_context_turns: 2,
@@ -8334,7 +8409,7 @@ mod tests {
                     provider_name: "scripted",
                     model: "scripted-model",
                     dispatch_model: "scripted-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -8349,7 +8424,7 @@ mod tests {
                 activated_tools: None,
                 model_switch_callback: None,
                 pacing: &zeroclaw_config::schema::PacingConfig::default(),
-                strict_tool_parsing: false,
+                text_tool_calls_disabled: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 keep_tool_context_turns: 2,
@@ -8420,7 +8495,7 @@ mod tests {
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -8435,7 +8510,7 @@ mod tests {
                 activated_tools: None,
                 model_switch_callback: None,
                 pacing: &zeroclaw_config::schema::PacingConfig::default(),
-                strict_tool_parsing: false,
+                text_tool_calls_disabled: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 keep_tool_context_turns: 2,
@@ -8591,7 +8666,7 @@ mod tests {
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -8606,7 +8681,7 @@ mod tests {
                 activated_tools: None,
                 model_switch_callback: None,
                 pacing: &zeroclaw_config::schema::PacingConfig::default(),
-                strict_tool_parsing: false,
+                text_tool_calls_disabled: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 keep_tool_context_turns: 2,
@@ -8762,7 +8837,7 @@ mod tests {
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -8777,7 +8852,7 @@ mod tests {
                 activated_tools: None,
                 model_switch_callback: None,
                 pacing: &zeroclaw_config::schema::PacingConfig::default(),
-                strict_tool_parsing: false,
+                text_tool_calls_disabled: false,
                 parallel_tools: true,
                 max_tool_result_chars: 0,
                 keep_tool_context_turns: 2,
@@ -8899,7 +8974,7 @@ mod tests {
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -8914,7 +8989,7 @@ mod tests {
                 activated_tools: None,
                 model_switch_callback: None,
                 pacing: &zeroclaw_config::schema::PacingConfig::default(),
-                strict_tool_parsing: false,
+                text_tool_calls_disabled: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 keep_tool_context_turns: 2,
@@ -9134,7 +9209,22 @@ mod tests {
                     .collect(),
             );
             let workspace = tempdir().unwrap();
-            let mut config = zeroclaw_config::schema::Config::default();
+            let mut config = zeroclaw_config::schema::Config {
+                providers: toml::from_str(
+                    r#"
+[connections.fixture]
+kind = "custom"
+capabilities = ["chat"]
+[models.mock-provider]
+capability = "chat"
+provider = "fixture"
+model = "mock-model"
+options = { extract_text_tool_calls = true }
+"#,
+                )
+                .unwrap(),
+                ..Default::default()
+            };
             config.runtime_profiles.insert(
                 "scoped".to_string(),
                 zeroclaw_config::schema::RuntimeProfileConfig {
@@ -9207,7 +9297,7 @@ mod tests {
                         provider_name: "mock-provider",
                         model: "mock-model",
                         dispatch_model: "mock-model",
-                        temperature: Some(0.0),
+                        temperature: Some(0.0).into(),
                     },
                     tools_registry: &tools_registry,
                     observer: &observer,
@@ -9222,7 +9312,7 @@ mod tests {
                     activated_tools: Some(&activated),
                     model_switch_callback: None,
                     pacing: &pacing,
-                    strict_tool_parsing: false,
+                    text_tool_calls_disabled: false,
                     parallel_tools: false,
                     max_tool_result_chars: 0,
                     keep_tool_context_turns: 2,
@@ -9501,7 +9591,7 @@ mod tests {
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -9516,7 +9606,7 @@ mod tests {
                 activated_tools: Some(&activated),
                 model_switch_callback: None,
                 pacing: &pacing,
-                strict_tool_parsing: false,
+                text_tool_calls_disabled: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 keep_tool_context_turns: 2,
@@ -9656,7 +9746,7 @@ mod tests {
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -9671,7 +9761,7 @@ mod tests {
                 activated_tools: None,
                 model_switch_callback: None,
                 pacing: &zeroclaw_config::schema::PacingConfig::default(),
-                strict_tool_parsing: false,
+                text_tool_calls_disabled: false,
                 parallel_tools: true,
                 max_tool_result_chars: 0,
                 keep_tool_context_turns: 2,
@@ -9838,7 +9928,7 @@ mod tests {
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -9853,7 +9943,7 @@ mod tests {
                 activated_tools: None,
                 model_switch_callback: None,
                 pacing: &zeroclaw_config::schema::PacingConfig::default(),
-                strict_tool_parsing: false,
+                text_tool_calls_disabled: false,
                 parallel_tools: true,
                 max_tool_result_chars: 0,
                 keep_tool_context_turns: 2,
@@ -9956,7 +10046,7 @@ mod tests {
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -9971,7 +10061,7 @@ mod tests {
                 activated_tools: None,
                 model_switch_callback: None,
                 pacing: &zeroclaw_config::schema::PacingConfig::default(),
-                strict_tool_parsing: false,
+                text_tool_calls_disabled: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 keep_tool_context_turns: 2,
@@ -10058,7 +10148,7 @@ mod tests {
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -10073,7 +10163,7 @@ mod tests {
                 activated_tools: None,
                 model_switch_callback: None,
                 pacing: &zeroclaw_config::schema::PacingConfig::default(),
-                strict_tool_parsing: false,
+                text_tool_calls_disabled: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 keep_tool_context_turns: 2,
@@ -10152,7 +10242,7 @@ mod tests {
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -10167,7 +10257,7 @@ mod tests {
                 activated_tools: None,
                 model_switch_callback: None,
                 pacing: &zeroclaw_config::schema::PacingConfig::default(),
-                strict_tool_parsing: false,
+                text_tool_calls_disabled: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 keep_tool_context_turns: 2,
@@ -10254,7 +10344,7 @@ mod tests {
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -10269,7 +10359,7 @@ mod tests {
                 activated_tools: None,
                 model_switch_callback: None,
                 pacing: &zeroclaw_config::schema::PacingConfig::default(),
-                strict_tool_parsing: false,
+                text_tool_calls_disabled: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 keep_tool_context_turns: 2,
@@ -10359,7 +10449,7 @@ mod tests {
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -10374,7 +10464,7 @@ mod tests {
                 activated_tools: None,
                 model_switch_callback: None,
                 pacing: &zeroclaw_config::schema::PacingConfig::default(),
-                strict_tool_parsing: false,
+                text_tool_calls_disabled: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 keep_tool_context_turns: 2,
@@ -10470,7 +10560,7 @@ mod tests {
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -10485,7 +10575,7 @@ mod tests {
                 activated_tools: None,
                 model_switch_callback: None,
                 pacing: &zeroclaw_config::schema::PacingConfig::default(),
-                strict_tool_parsing: false,
+                text_tool_calls_disabled: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 keep_tool_context_turns: 2,
@@ -10573,7 +10663,7 @@ mod tests {
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -10588,7 +10678,7 @@ mod tests {
                 activated_tools: None,
                 model_switch_callback: None,
                 pacing: &zeroclaw_config::schema::PacingConfig::default(),
-                strict_tool_parsing: false,
+                text_tool_calls_disabled: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 keep_tool_context_turns: 2,
@@ -10760,7 +10850,7 @@ mod tests {
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -10775,7 +10865,7 @@ mod tests {
                 activated_tools: None,
                 model_switch_callback: None,
                 pacing: &zeroclaw_config::schema::PacingConfig::default(),
-                strict_tool_parsing: false,
+                text_tool_calls_disabled: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 keep_tool_context_turns: 2,
@@ -10906,7 +10996,7 @@ mod tests {
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -10921,7 +11011,7 @@ mod tests {
                 activated_tools: None,
                 model_switch_callback: None,
                 pacing: &zeroclaw_config::schema::PacingConfig::default(),
-                strict_tool_parsing: false,
+                text_tool_calls_disabled: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 keep_tool_context_turns: 2,
@@ -11022,7 +11112,7 @@ mod tests {
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -11037,7 +11127,7 @@ mod tests {
                 activated_tools: None,
                 model_switch_callback: None,
                 pacing: &zeroclaw_config::schema::PacingConfig::default(),
-                strict_tool_parsing: false,
+                text_tool_calls_disabled: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 keep_tool_context_turns: 2,
@@ -11124,7 +11214,7 @@ mod tests {
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -11139,7 +11229,7 @@ mod tests {
                 activated_tools: None,
                 model_switch_callback: None,
                 pacing: &zeroclaw_config::schema::PacingConfig::default(),
-                strict_tool_parsing: false,
+                text_tool_calls_disabled: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 keep_tool_context_turns: 2,
@@ -11230,7 +11320,7 @@ mod tests {
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -11245,7 +11335,7 @@ mod tests {
                 activated_tools: None,
                 model_switch_callback: None,
                 pacing: &zeroclaw_config::schema::PacingConfig::default(),
-                strict_tool_parsing: false,
+                text_tool_calls_disabled: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 keep_tool_context_turns: 2,
@@ -11338,7 +11428,7 @@ mod tests {
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -11353,7 +11443,7 @@ mod tests {
                 activated_tools: None,
                 model_switch_callback: None,
                 pacing: &zeroclaw_config::schema::PacingConfig::default(),
-                strict_tool_parsing: false,
+                text_tool_calls_disabled: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 keep_tool_context_turns: 2,
@@ -11464,7 +11554,7 @@ mod tests {
                                 provider_name: "mock-provider",
                                 model: "mock-model",
                                 dispatch_model: "mock-model",
-                                temperature: Some(0.0),
+                                temperature: Some(0.0).into(),
                             },
                             tools_registry: &tools_registry,
                             observer: &observer,
@@ -11481,7 +11571,7 @@ mod tests {
                             activated_tools: None,
                             model_switch_callback: None,
                             pacing: &zeroclaw_config::schema::PacingConfig::default(),
-                            strict_tool_parsing: false,
+                            text_tool_calls_disabled: false,
                             parallel_tools: false,
                             max_tool_result_chars: 0,
                             keep_tool_context_turns: 2,
@@ -11564,7 +11654,7 @@ mod tests {
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -11579,7 +11669,7 @@ mod tests {
                 activated_tools: None,
                 model_switch_callback: None,
                 pacing: &zeroclaw_config::schema::PacingConfig::default(),
-                strict_tool_parsing: false,
+                text_tool_calls_disabled: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 keep_tool_context_turns: 2,
@@ -11662,7 +11752,7 @@ mod tests {
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -11677,7 +11767,7 @@ mod tests {
                 activated_tools: None,
                 model_switch_callback: None,
                 pacing: &zeroclaw_config::schema::PacingConfig::default(),
-                strict_tool_parsing: false,
+                text_tool_calls_disabled: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 keep_tool_context_turns: 2,
@@ -11755,7 +11845,7 @@ mod tests {
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -11770,7 +11860,7 @@ mod tests {
                 activated_tools: None,
                 model_switch_callback: None,
                 pacing: &zeroclaw_config::schema::PacingConfig::default(),
-                strict_tool_parsing: false,
+                text_tool_calls_disabled: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 keep_tool_context_turns: 2,
@@ -11846,7 +11936,7 @@ mod tests {
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -11861,7 +11951,7 @@ mod tests {
                 activated_tools: None,
                 model_switch_callback: None,
                 pacing: &zeroclaw_config::schema::PacingConfig::default(),
-                strict_tool_parsing: false,
+                text_tool_calls_disabled: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 keep_tool_context_turns: 2,
@@ -11943,7 +12033,7 @@ mod tests {
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -11958,7 +12048,7 @@ mod tests {
                 activated_tools: None,
                 model_switch_callback: None,
                 pacing: &zeroclaw_config::schema::PacingConfig::default(),
-                strict_tool_parsing: false,
+                text_tool_calls_disabled: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 keep_tool_context_turns: 2,
@@ -12067,7 +12157,7 @@ mod tests {
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -12082,7 +12172,7 @@ mod tests {
                 activated_tools: None,
                 model_switch_callback: None,
                 pacing: &zeroclaw_config::schema::PacingConfig::default(),
-                strict_tool_parsing: false,
+                text_tool_calls_disabled: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 keep_tool_context_turns: 2,
@@ -12197,7 +12287,7 @@ mod tests {
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -12212,7 +12302,7 @@ mod tests {
                 activated_tools: None,
                 model_switch_callback: None,
                 pacing: &zeroclaw_config::schema::PacingConfig::default(),
-                strict_tool_parsing: false,
+                text_tool_calls_disabled: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 keep_tool_context_turns: 2,
@@ -12315,7 +12405,7 @@ mod tests {
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -12330,7 +12420,7 @@ mod tests {
                 activated_tools: None,
                 model_switch_callback: None,
                 pacing: &zeroclaw_config::schema::PacingConfig::default(),
-                strict_tool_parsing: false,
+                text_tool_calls_disabled: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 keep_tool_context_turns: 2,
@@ -12411,7 +12501,7 @@ mod tests {
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -12426,7 +12516,7 @@ mod tests {
                 activated_tools: None,
                 model_switch_callback: None,
                 pacing: &zeroclaw_config::schema::PacingConfig::default(),
-                strict_tool_parsing: false,
+                text_tool_calls_disabled: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 keep_tool_context_turns: 2,
@@ -12511,7 +12601,7 @@ mod tests {
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -12526,7 +12616,7 @@ mod tests {
                 activated_tools: None,
                 model_switch_callback: None,
                 pacing: &zeroclaw_config::schema::PacingConfig::default(),
-                strict_tool_parsing: false,
+                text_tool_calls_disabled: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 keep_tool_context_turns: 2,
@@ -12594,7 +12684,7 @@ mod tests {
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -12609,7 +12699,7 @@ mod tests {
                 activated_tools: None,
                 model_switch_callback: None,
                 pacing: &zeroclaw_config::schema::PacingConfig::default(),
-                strict_tool_parsing: false,
+                text_tool_calls_disabled: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 keep_tool_context_turns: 2,
@@ -12678,7 +12768,7 @@ mod tests {
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -12693,7 +12783,7 @@ mod tests {
                 activated_tools: None,
                 model_switch_callback: None,
                 pacing: &zeroclaw_config::schema::PacingConfig::default(),
-                strict_tool_parsing: false,
+                text_tool_calls_disabled: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 keep_tool_context_turns: 2,
@@ -12762,7 +12852,7 @@ mod tests {
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -12777,7 +12867,7 @@ mod tests {
                 activated_tools: None,
                 model_switch_callback: None,
                 pacing: &zeroclaw_config::schema::PacingConfig::default(),
-                strict_tool_parsing: false,
+                text_tool_calls_disabled: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 keep_tool_context_turns: 2,
@@ -12848,7 +12938,7 @@ This is an example, not an invocation."#;
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -12863,7 +12953,7 @@ This is an example, not an invocation."#;
                 activated_tools: None,
                 model_switch_callback: None,
                 pacing: &zeroclaw_config::schema::PacingConfig::default(),
-                strict_tool_parsing: false,
+                text_tool_calls_disabled: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 keep_tool_context_turns: 2,
@@ -12938,7 +13028,7 @@ This is an example, not an invocation."#;
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -12953,7 +13043,7 @@ This is an example, not an invocation."#;
                 activated_tools: None,
                 model_switch_callback: None,
                 pacing: &zeroclaw_config::schema::PacingConfig::default(),
-                strict_tool_parsing: false,
+                text_tool_calls_disabled: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 keep_tool_context_turns: 2,
@@ -13040,7 +13130,7 @@ This is an example, not an invocation."#;
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -13055,7 +13145,7 @@ This is an example, not an invocation."#;
                 activated_tools: None,
                 model_switch_callback: None,
                 pacing: &zeroclaw_config::schema::PacingConfig::default(),
-                strict_tool_parsing: false,
+                text_tool_calls_disabled: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 keep_tool_context_turns: 2,
@@ -13126,7 +13216,7 @@ Done."#;
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -13141,7 +13231,7 @@ Done."#;
                 activated_tools: None,
                 model_switch_callback: None,
                 pacing: &zeroclaw_config::schema::PacingConfig::default(),
-                strict_tool_parsing: false,
+                text_tool_calls_disabled: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 keep_tool_context_turns: 2,
@@ -13215,7 +13305,7 @@ Done."#;
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -13230,7 +13320,7 @@ Done."#;
                 activated_tools: None,
                 model_switch_callback: None,
                 pacing: &zeroclaw_config::schema::PacingConfig::default(),
-                strict_tool_parsing: false,
+                text_tool_calls_disabled: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 keep_tool_context_turns: 2,
@@ -13302,7 +13392,7 @@ Done."#;
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -13317,7 +13407,7 @@ Done."#;
                 activated_tools: None,
                 model_switch_callback: None,
                 pacing: &zeroclaw_config::schema::PacingConfig::default(),
-                strict_tool_parsing: false,
+                text_tool_calls_disabled: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 keep_tool_context_turns: 2,
@@ -13390,7 +13480,7 @@ This is an example, not an invocation."#;
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -13405,7 +13495,7 @@ This is an example, not an invocation."#;
                 activated_tools: None,
                 model_switch_callback: None,
                 pacing: &zeroclaw_config::schema::PacingConfig::default(),
-                strict_tool_parsing: false,
+                text_tool_calls_disabled: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 keep_tool_context_turns: 2,
@@ -13535,7 +13625,7 @@ This is an example, not an invocation."#;
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -13550,7 +13640,7 @@ This is an example, not an invocation."#;
                 activated_tools: None,
                 model_switch_callback: None,
                 pacing: &zeroclaw_config::schema::PacingConfig::default(),
-                strict_tool_parsing: false,
+                text_tool_calls_disabled: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 keep_tool_context_turns: 2,
@@ -13631,7 +13721,7 @@ This is an example, not an invocation."#;
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -13646,7 +13736,7 @@ This is an example, not an invocation."#;
                 activated_tools: None,
                 model_switch_callback: None,
                 pacing: &zeroclaw_config::schema::PacingConfig::default(),
-                strict_tool_parsing: false,
+                text_tool_calls_disabled: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 keep_tool_context_turns: 2,
@@ -13730,7 +13820,7 @@ This is an example, not an invocation."#;
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -13745,7 +13835,7 @@ This is an example, not an invocation."#;
                 activated_tools: None,
                 model_switch_callback: None,
                 pacing: &zeroclaw_config::schema::PacingConfig::default(),
-                strict_tool_parsing: false,
+                text_tool_calls_disabled: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 keep_tool_context_turns: 2,
@@ -13841,6 +13931,23 @@ This is an example, not an invocation."#;
         let observer = NoopObserver;
         let (tx, mut rx) = tokio::sync::mpsc::channel(16);
 
+        let config = zeroclaw_config::schema::Config {
+            providers: toml::from_str(
+                r#"
+[connections.fixture]
+kind = "custom"
+capabilities = ["chat"]
+[models.mock-provider]
+capability = "chat"
+provider = "fixture"
+model = "mock-model"
+options = { extract_text_reasoning = true }
+"#,
+            )
+            .unwrap(),
+            ..Default::default()
+        };
+
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
             served_route_sink: None,
@@ -13852,14 +13959,14 @@ This is an example, not an invocation."#;
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
-                config: None,
+                config: Some(&config),
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -13867,7 +13974,7 @@ This is an example, not an invocation."#;
                 activated_tools: None,
                 model_switch_callback: None,
                 pacing: &zeroclaw_config::schema::PacingConfig::default(),
-                strict_tool_parsing: false,
+                text_tool_calls_disabled: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 keep_tool_context_turns: 2,
@@ -13987,7 +14094,7 @@ This is an example, not an invocation."#;
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -14002,7 +14109,7 @@ This is an example, not an invocation."#;
                 activated_tools: None,
                 model_switch_callback: None,
                 pacing: &zeroclaw_config::schema::PacingConfig::default(),
-                strict_tool_parsing: false,
+                text_tool_calls_disabled: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 keep_tool_context_turns: 2,
@@ -14092,7 +14199,7 @@ This is an example, not an invocation."#;
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -14107,7 +14214,7 @@ This is an example, not an invocation."#;
                 activated_tools: None,
                 model_switch_callback: None,
                 pacing: &zeroclaw_config::schema::PacingConfig::default(),
-                strict_tool_parsing: false,
+                text_tool_calls_disabled: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 keep_tool_context_turns: 2,
@@ -14208,7 +14315,7 @@ This is an example, not an invocation."#;
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -14223,7 +14330,7 @@ This is an example, not an invocation."#;
                 activated_tools: None,
                 model_switch_callback: None,
                 pacing: &zeroclaw_config::schema::PacingConfig::default(),
-                strict_tool_parsing: false,
+                text_tool_calls_disabled: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 keep_tool_context_turns: 2,
@@ -15127,7 +15234,7 @@ This is an example, not an invocation."#;
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -15142,7 +15249,7 @@ This is an example, not an invocation."#;
                 activated_tools: None,
                 model_switch_callback: None,
                 pacing: &zeroclaw_config::schema::PacingConfig::default(),
-                strict_tool_parsing: false,
+                text_tool_calls_disabled: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 keep_tool_context_turns: 2,
@@ -15245,7 +15352,7 @@ This is an example, not an invocation."#;
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -15260,7 +15367,7 @@ This is an example, not an invocation."#;
                 activated_tools: None,
                 model_switch_callback: None,
                 pacing: &zeroclaw_config::schema::PacingConfig::default(),
-                strict_tool_parsing: false,
+                text_tool_calls_disabled: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 keep_tool_context_turns: 2,
@@ -15358,7 +15465,7 @@ This is an example, not an invocation."#;
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -15373,7 +15480,7 @@ This is an example, not an invocation."#;
                 activated_tools: None,
                 model_switch_callback: None,
                 pacing: &zeroclaw_config::schema::PacingConfig::default(),
-                strict_tool_parsing: false,
+                text_tool_calls_disabled: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 keep_tool_context_turns: 2,
@@ -15471,7 +15578,7 @@ This is an example, not an invocation."#;
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -15486,7 +15593,7 @@ This is an example, not an invocation."#;
                 activated_tools: None,
                 model_switch_callback: None,
                 pacing: &zeroclaw_config::schema::PacingConfig::default(),
-                strict_tool_parsing: false,
+                text_tool_calls_disabled: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 keep_tool_context_turns: 2,
@@ -15642,7 +15749,7 @@ This is an example, not an invocation."#;
                     provider_name: "router",
                     model: "hint:fast",
                     dispatch_model: "hint:fast",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -15657,7 +15764,7 @@ This is an example, not an invocation."#;
                 activated_tools: None,
                 model_switch_callback: None,
                 pacing: &zeroclaw_config::schema::PacingConfig::default(),
-                strict_tool_parsing: false,
+                text_tool_calls_disabled: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 keep_tool_context_turns: 2,
@@ -15803,7 +15910,7 @@ This is an example, not an invocation."#;
     }
 
     #[test]
-    fn agent_turn_strict_tool_parsing_ignores_activated_tool_text_from_wrapper() {
+    fn agent_turn_text_tool_calls_disabled_ignores_activated_tool_text_from_wrapper() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -15870,16 +15977,16 @@ This is an example, not an invocation."#;
                 None, // turn_id: self-minted
             )
             .await
-            .expect("strict wrapper path should preserve fallback-looking text");
+            .expect("disabled extraction should preserve tool-like text");
 
             assert_eq!(invocations.load(Ordering::SeqCst), 0);
             assert!(
                 result.contains("<tool_call>"),
-                "strict parser should return fallback-looking text, got: {result}"
+                "disabled extraction should return tool-like text, got: {result}"
             );
             assert!(
-                !result.contains("private reasoning"),
-                "strict parser should still strip think tags from final text, got: {result}"
+                !result.contains("<think>private reasoning</think>"),
+                "unset reasoning policy retains historical extraction, got: {result}"
             );
         });
     }
@@ -17798,7 +17905,7 @@ Let me check the result."#;
     }
 
     #[test]
-    fn strict_non_native_prompt_policy_hides_text_tool_protocol_inputs() {
+    fn disabled_text_tool_extraction_hides_text_tool_protocol_inputs() {
         let mut tool_descs = vec![("shell", "Run commands")];
         let mut deferred_section = "## Deferred MCP Tools\n\n- mcp__example".to_string();
 
@@ -17808,11 +17915,11 @@ Let me check the result."#;
         assert!(!expose_text_protocol);
         assert!(
             tool_descs.is_empty(),
-            "strict non-native prompt paths must not advertise text tools"
+            "text extraction disabled paths must not advertise text tools"
         );
         assert!(
             deferred_section.is_empty(),
-            "strict non-native prompt paths must not advertise deferred text tools"
+            "text extraction disabled paths must not advertise deferred text tools"
         );
     }
 
@@ -18668,7 +18775,7 @@ Let me check the result."#;
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -18683,7 +18790,7 @@ Let me check the result."#;
                 activated_tools: None,
                 model_switch_callback: None,
                 pacing: &zeroclaw_config::schema::PacingConfig::default(),
-                strict_tool_parsing: false,
+                text_tool_calls_disabled: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 keep_tool_context_turns: 2,
@@ -18862,7 +18969,7 @@ Let me check the result."#;
                             provider_name: "mock-provider",
                             model: "mock-model",
                             dispatch_model: "mock-model",
-                            temperature: Some(0.0),
+                            temperature: Some(0.0).into(),
                         },
                         tools_registry:
                             &crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![]),
@@ -18878,7 +18985,7 @@ Let me check the result."#;
                         activated_tools: None,
                         model_switch_callback: None,
                         pacing: &zeroclaw_config::schema::PacingConfig::default(),
-                        strict_tool_parsing: false,
+                        text_tool_calls_disabled: false,
                         parallel_tools: false,
                         max_tool_result_chars: 0,
                         keep_tool_context_turns: 2,
@@ -18992,7 +19099,7 @@ Let me check the result."#;
                             provider_name: "reliable-test",
                             model: "test-model",
                             dispatch_model: "test-model",
-                            temperature: Some(0.0),
+                            temperature: Some(0.0).into(),
                         },
                         tools_registry: &tools_registry,
                         observer: &observer,
@@ -19007,7 +19114,7 @@ Let me check the result."#;
                         activated_tools: None,
                         model_switch_callback: None,
                         pacing: &zeroclaw_config::schema::PacingConfig::default(),
-                        strict_tool_parsing: false,
+                        text_tool_calls_disabled: false,
                         parallel_tools: false,
                         max_tool_result_chars: 0,
                         keep_tool_context_turns: 2,
@@ -19212,7 +19319,7 @@ Let me check the result."#;
                             provider_name: "reliable-test",
                             model: "test-model",
                             dispatch_model: "test-model",
-                            temperature: Some(0.0),
+                            temperature: Some(0.0).into(),
                         },
                         tools_registry: &tools_registry,
                         observer: &observer,
@@ -19227,7 +19334,7 @@ Let me check the result."#;
                         activated_tools: None,
                         model_switch_callback: None,
                         pacing: &zeroclaw_config::schema::PacingConfig::default(),
-                        strict_tool_parsing: false,
+                        text_tool_calls_disabled: false,
                         parallel_tools: false,
                         max_tool_result_chars: 0,
                         keep_tool_context_turns: 2,
@@ -19321,7 +19428,7 @@ Let me check the result."#;
                     provider_name: "recording-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
                     vec![],
@@ -19338,7 +19445,7 @@ Let me check the result."#;
                 activated_tools: None,
                 model_switch_callback: None,
                 pacing: &zeroclaw_config::schema::PacingConfig::default(),
-                strict_tool_parsing: false,
+                text_tool_calls_disabled: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 keep_tool_context_turns: 2,
@@ -19451,7 +19558,7 @@ Let me check the result."#;
                             provider_name: "mock-provider",
                             model: "mock-model",
                             dispatch_model: "mock-model",
-                            temperature: Some(0.0),
+                            temperature: Some(0.0).into(),
                         },
                         tools_registry:
                             &crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![]),
@@ -19467,7 +19574,7 @@ Let me check the result."#;
                         activated_tools: None,
                         model_switch_callback: None,
                         pacing: &zeroclaw_config::schema::PacingConfig::default(),
-                        strict_tool_parsing: false,
+                        text_tool_calls_disabled: false,
                         parallel_tools: false,
                         max_tool_result_chars: 0,
                         keep_tool_context_turns: 2,
@@ -19554,7 +19661,7 @@ Let me check the result."#;
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
                     vec![],
@@ -19571,7 +19678,7 @@ Let me check the result."#;
                 activated_tools: None,
                 model_switch_callback: None,
                 pacing: &zeroclaw_config::schema::PacingConfig::default(),
-                strict_tool_parsing: false,
+                text_tool_calls_disabled: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 keep_tool_context_turns: 2,
@@ -19654,7 +19761,7 @@ Let me check the result."#;
                     provider_name: "anthropic.personal",
                     model: "claude-opus-4-8",
                     dispatch_model: "claude-opus-4-8",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
                     vec![],
@@ -19671,7 +19778,7 @@ Let me check the result."#;
                 activated_tools: None,
                 model_switch_callback: None,
                 pacing: &zeroclaw_config::schema::PacingConfig::default(),
-                strict_tool_parsing: false,
+                text_tool_calls_disabled: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 keep_tool_context_turns: 2,
@@ -19826,7 +19933,7 @@ Let me check the result."#;
             };
 
             crate::skills::review::maybe_run_skill_review(
-                Some(&config),
+                Some(&zeroclaw_config::migration::admit_test_input(&config)),
                 workspace.path().to_path_buf(),
                 review_config,
                 false,
@@ -19835,7 +19942,7 @@ Let me check the result."#;
                 &model_provider,
                 "mock-provider",
                 "mock-model",
-                None,
+                None.into(),
                 &NoopObserver,
                 &config.multimodal,
                 &zeroclaw_config::schema::PacingConfig::default(),
@@ -19916,7 +20023,7 @@ Let me check the result."#;
                     &model_provider,
                     "mock-provider",
                     "mock-model",
-                    None,
+                    None.into(),
                     &observer,
                     &zeroclaw_config::schema::MultimodalConfig::default(),
                     &zeroclaw_config::schema::PacingConfig::default(),
@@ -20004,7 +20111,7 @@ Let me check the result."#;
                     &model_provider,
                     "mock-provider",
                     "mock-model",
-                    None,
+                    None.into(),
                     &observer,
                     &zeroclaw_config::schema::MultimodalConfig::default(),
                     &zeroclaw_config::schema::PacingConfig::default(),
@@ -20114,7 +20221,7 @@ Let me check the result."#;
             &model_provider,
             "mock-provider",
             "mock-model",
-            None,
+            None.into(),
             &observer,
             &zeroclaw_config::schema::MultimodalConfig::default(),
             &zeroclaw_config::schema::PacingConfig::default(),
@@ -20194,9 +20301,14 @@ Let me check the result."#;
                     &tool_calls,
                     "All tests passed.",
                     None,
-                    "mock-provider",
-                    &model_provider,
-                    "mock-model",
+                    ResolvedModelAccess {
+                        model_provider: &model_provider,
+                        provider_name: "mock-provider",
+                        model: "mock-model",
+                        dispatch_model: "mock-model",
+                        temperature: None.into(),
+                    },
+                    None.into(),
                 ),
             )
             .await
@@ -20656,7 +20768,10 @@ Let me check the result."#;
             },
         );
 
-        let result = super::agent_provider_composite(&config, "my_agent");
+        let result = super::agent_provider_composite(
+            &zeroclaw_config::migration::admit_test_input(&config),
+            "my_agent",
+        );
 
         // Must be the full dotted ref so the alias-aware factory path is taken.
         assert_eq!(
@@ -20860,6 +20975,118 @@ Let me check the result."#;
         .expect("single-shot run should finish");
         assert_eq!(response, "final answer");
 
+        server_handle.abort();
+    }
+
+    /// The run entry must build from the agent's RAW ref: a three-segment
+    /// agent ref names a specific model entry, and a profile hosting several
+    /// entries without a `models.default` resolves nothing at the
+    /// two-segment composite. Passing the composite into the model
+    /// construction stranded such configs with "no model configured".
+    #[tokio::test]
+    async fn run_resolves_three_segment_agent_ref_without_default_entry() {
+        use axum::{Json, Router, routing::post};
+        use tempfile::TempDir;
+        use tokio::net::TcpListener;
+        use zeroclaw_config::schema::{AliasedAgentConfig, ModelEntryConfig, RiskProfileConfig};
+
+        let seen_models = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let capture = Arc::clone(&seen_models);
+        let app = Router::new().route(
+            "/chat/completions",
+            post(move |Json(body): Json<serde_json::Value>| {
+                let model = body["model"].as_str().unwrap_or_default().to_string();
+                capture.lock().unwrap().push(model);
+                async move {
+                    Json(serde_json::json!({
+                        "choices": [{"message": {"content": "ok"}}]
+                    }))
+                }
+            }),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test provider");
+        let mock_addr = listener.local_addr().expect("test provider address");
+        let server_handle = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("test provider serves");
+        });
+
+        let tmp = TempDir::new().expect("temp dir");
+        let workspace_dir = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace_dir).expect("workspace directory");
+        let mut config = zeroclaw_config::schema::Config {
+            data_dir: workspace_dir,
+            config_path: tmp.path().join("config.toml"),
+            ..Default::default()
+        };
+        let provider = config
+            .providers
+            .models
+            .ensure("custom", "gw")
+            .expect("custom provider slot");
+        provider.api_key = Some("test-key".to_string());
+        provider.uri = Some(format!("http://{mock_addr}"));
+        provider.models.insert(
+            "fast".to_string(),
+            ModelEntryConfig {
+                id: Some("fast-model".to_string()),
+                ..Default::default()
+            },
+        );
+        provider.models.insert(
+            "big".to_string(),
+            ModelEntryConfig {
+                id: Some("big-model".to_string()),
+                ..Default::default()
+            },
+        );
+        config.memory.backend = "none".to_string();
+        config.memory.auto_save = false;
+        config.risk_profiles.insert(
+            "test-profile".to_string(),
+            RiskProfileConfig {
+                level: crate::security::AutonomyLevel::Full,
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.agents.insert(
+            "test-agent".to_string(),
+            AliasedAgentConfig {
+                model_provider: "custom.gw.fast".into(),
+                risk_profile: "test-profile".into(),
+                ..Default::default()
+            },
+        );
+
+        let response = super::run(
+            config,
+            "test-agent",
+            Some("hi".to_string()),
+            None,
+            None,
+            None,
+            Vec::new(),
+            false,
+            Some(tmp.path().join("session.json")),
+            None,
+            TurnOrigin::SubTurn,
+            super::AgentRunOverrides::default(),
+        )
+        .await
+        .expect("a three-segment agent ref must resolve the named entry");
+
+        assert_eq!(response, "ok");
+        let seen = seen_models.lock().unwrap();
+        assert_eq!(
+            seen.as_slice(),
+            ["fast-model"],
+            "the request must dispatch the named entry's model id, got: {seen:?}"
+        );
+        drop(seen);
         server_handle.abort();
     }
 
@@ -21222,25 +21449,35 @@ Let me check the result."#;
             Arc::new(zeroclaw_memory::NoneMemory::new("test"));
 
         // Build the real eager built-in registry, as process_message does.
-        let built = crate::tools::all_tools(
-            Arc::new(config.clone()),
-            &security,
-            &risk,
-            "test",
-            mem,
-            None,
-            None,
-            &config.browser,
-            &config.http_request,
-            &config.web_fetch,
-            &security.workspace_dir,
-            &config.agents,
-            None,
-            &config,
-            None,
-            false,
-            None,
-        )
+        let built = {
+            let registry_config = Arc::new(config.clone());
+            (|| -> anyhow::Result<_> {
+                let registry_environment: Option<crate::tools::ForwardedEnvironment> = None;
+                let registry_path = registry_environment
+                    .as_ref()
+                    .and_then(|env| env.get("PATH"))
+                    .map(std::ffi::OsStr::new);
+                let registry_runtime: std::sync::Arc<
+                    dyn zeroclaw_config::platform::RuntimeAdapter,
+                > = std::sync::Arc::from(zeroclaw_config::platform::create_runtime_with_path(
+                    &registry_config.runtime,
+                    registry_path,
+                )?);
+                let registry_memory: std::sync::Arc<dyn zeroclaw_memory::Memory> = mem;
+                let registry_request = crate::composition::ToolRequest {
+                    config: &registry_config,
+                    agent_alias: "test",
+                    security: &security,
+                    runtime: &registry_runtime,
+                    memory: &registry_memory,
+                };
+                let registry_inputs = crate::composition::NativeRecipeInputs::new(
+                    &registry_request,
+                    &security.workspace_dir,
+                );
+                crate::tools::build_native_registry(registry_inputs, &risk)
+            })()
+        }
         .expect("tool registry builds");
 
         let before = tool_names(&built.tools);
@@ -21526,7 +21763,7 @@ Let me check the result."#;
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: observer.as_ref(),
@@ -21541,7 +21778,7 @@ Let me check the result."#;
                 activated_tools: None,
                 model_switch_callback: None,
                 pacing: &zeroclaw_config::schema::PacingConfig::default(),
-                strict_tool_parsing: false,
+                text_tool_calls_disabled: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 keep_tool_context_turns: 2,
@@ -21629,7 +21866,7 @@ Let me check the result."#;
                             provider_name: "mock-provider",
                             model: "mock-model",
                             dispatch_model: "mock-model",
-                            temperature: Some(0.0),
+                            temperature: Some(0.0).into(),
                         },
                         tools_registry: &tools_registry,
                         observer: &NoopObserver,
@@ -21644,7 +21881,7 @@ Let me check the result."#;
                         activated_tools: None,
                         model_switch_callback: None,
                         pacing: &zeroclaw_config::schema::PacingConfig::default(),
-                        strict_tool_parsing: false,
+                        text_tool_calls_disabled: false,
                         parallel_tools: false,
                         max_tool_result_chars: 0,
                         keep_tool_context_turns: 2,
@@ -21908,7 +22145,7 @@ Let me check the result."#;
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
                     Vec::new(),
@@ -21926,7 +22163,7 @@ Let me check the result."#;
                 activated_tools: None,
                 model_switch_callback: None,
                 pacing: &zeroclaw_config::schema::PacingConfig::default(),
-                strict_tool_parsing: false,
+                text_tool_calls_disabled: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 keep_tool_context_turns: 2,
@@ -22121,7 +22358,7 @@ Let me check the result."#;
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -22137,7 +22374,7 @@ Let me check the result."#;
                 activated_tools: None,
                 model_switch_callback: None,
                 pacing: &zeroclaw_config::schema::PacingConfig::default(),
-                strict_tool_parsing: false,
+                text_tool_calls_disabled: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 keep_tool_context_turns: 2,
@@ -22230,7 +22467,7 @@ Let me check the result."#;
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
                     Vec::new(),
@@ -22248,7 +22485,7 @@ Let me check the result."#;
                 activated_tools: None,
                 model_switch_callback: None,
                 pacing: &zeroclaw_config::schema::PacingConfig::default(),
-                strict_tool_parsing: false,
+                text_tool_calls_disabled: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 keep_tool_context_turns: 2,
@@ -22554,7 +22791,7 @@ Let me check the result."#;
                         provider_name: "budget-provider",
                         model: first_model,
                         dispatch_model: first_model,
-                        temperature: Some(0.0),
+                        temperature: Some(0.0).into(),
                     },
                     tools_registry: &tools_registry,
                     observer: &NoopObserver,
@@ -22570,7 +22807,7 @@ Let me check the result."#;
                     activated_tools: None,
                     model_switch_callback: None,
                     pacing: &zeroclaw_config::schema::PacingConfig::default(),
-                    strict_tool_parsing: false,
+                    text_tool_calls_disabled: false,
                     parallel_tools: false,
                     max_tool_result_chars: 0,
                     keep_tool_context_turns: 2,
@@ -22972,7 +23209,7 @@ Let me check the result."#;
                         provider_name: "mock-provider",
                         model: "plain-model",
                         dispatch_model: "plain-model",
-                        temperature: Some(0.0),
+                        temperature: Some(0.0).into(),
                     },
                     tools_registry: &tools_registry,
                     observer: &observer,
@@ -22988,7 +23225,7 @@ Let me check the result."#;
                     activated_tools: None,
                     model_switch_callback: None,
                     pacing: &zeroclaw_config::schema::PacingConfig::default(),
-                    strict_tool_parsing: false,
+                    text_tool_calls_disabled: false,
                     parallel_tools: false,
                     max_tool_result_chars: 0,
                     keep_tool_context_turns: 2,
@@ -23102,7 +23339,7 @@ Let me check the result."#;
                         provider_name: "mock-provider",
                         model: "plain-model",
                         dispatch_model: "plain-model",
-                        temperature: Some(0.0),
+                        temperature: Some(0.0).into(),
                     },
                     tools_registry: &tools_registry,
                     observer: &observer,
@@ -23118,7 +23355,7 @@ Let me check the result."#;
                     activated_tools: None,
                     model_switch_callback: None,
                     pacing: &zeroclaw_config::schema::PacingConfig::default(),
-                    strict_tool_parsing: false,
+                    text_tool_calls_disabled: false,
                     parallel_tools: false,
                     max_tool_result_chars: 0,
                     keep_tool_context_turns: 2,
@@ -23374,7 +23611,7 @@ Let me check the result."#;
                         provider_name: "mock-provider",
                         model: "plain-model",
                         dispatch_model: "plain-model",
-                        temperature: Some(0.0),
+                        temperature: Some(0.0).into(),
                     },
                     tools_registry: &tools_registry,
                     observer: &observer,
@@ -23390,7 +23627,7 @@ Let me check the result."#;
                     activated_tools: None,
                     model_switch_callback: None,
                     pacing: &zeroclaw_config::schema::PacingConfig::default(),
-                    strict_tool_parsing: false,
+                    text_tool_calls_disabled: false,
                     parallel_tools: false,
                     max_tool_result_chars: 0,
                     keep_tool_context_turns: 2,
@@ -23852,6 +24089,109 @@ Let me check the result."#;
     }
 
     #[tokio::test]
+    async fn run_skill_reflection_inherits_selected_temperature_on_wire() {
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+        use zeroclaw_config::schema::{AliasedAgentConfig, ModelEntryConfig, RiskProfileConfig};
+
+        for (configured_temperature, invocation_temperature, expected) in [
+            (Some(0.2), None, 0.2),
+            (None, None, 0.9),
+            (Some(0.2), Some(0.6), 0.6),
+        ] {
+            let server = MockServer::start().await;
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let response_calls = Arc::clone(&calls);
+            Mock::given(method("POST"))
+            .respond_with(move |_: &wiremock::Request| {
+                let call = response_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let message = match call {
+                    0 => serde_json::json!({"content": null, "tool_calls": [
+                        {"id": "read-first", "type": "function", "function": {
+                            "name": "file_read", "arguments": "{\"path\":\"first.txt\"}"
+                        }},
+                        {"id": "read-second", "type": "function", "function": {
+                            "name": "file_read", "arguments": "{\"path\":\"second.txt\"}"
+                        }}
+                    ]}),
+                    1 => serde_json::json!({"content": "done"}),
+                    _ => serde_json::json!({"content": "---\nname: read-files\ndescription: Read two files.\n---\n\nRead the requested files."}),
+                };
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "choices": [{"message": message}]
+                }))
+            })
+            .mount(&server)
+            .await;
+            let (temp, mut config) = isolated_run_test_config();
+            let workspace = temp.path().join("workspace");
+            std::fs::create_dir_all(&workspace).unwrap();
+            std::fs::write(workspace.join("first.txt"), "first fixture").unwrap();
+            std::fs::write(workspace.join("second.txt"), "second fixture").unwrap();
+            config.memory.backend = "none".into();
+            config.skills.skill_creation.enabled = true;
+            config.skills.skill_creation.reflection_enabled = true;
+            let profile = config.providers.models.ensure("custom", "gw").unwrap();
+            profile.uri = Some(server.uri());
+            profile.native_tools = Some(true);
+            profile.temperature = Some(0.9);
+            profile.models.insert(
+                "selected".into(),
+                ModelEntryConfig {
+                    id: Some("reflection-id".into()),
+                    temperature: configured_temperature,
+                    ..Default::default()
+                },
+            );
+            config.agents.insert(
+                "worker".into(),
+                AliasedAgentConfig {
+                    model_provider: "custom.gw.selected".into(),
+                    risk_profile: "default".into(),
+                    workspace: zeroclaw_config::multi_agent::AgentWorkspaceConfig {
+                        path: Some(workspace),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            );
+            config
+                .risk_profiles
+                .insert("default".into(), RiskProfileConfig::default());
+            let run = super::run(
+                config,
+                "worker",
+                Some("Read both files".into()),
+                None,
+                None,
+                invocation_temperature,
+                Vec::new(),
+                false,
+                None,
+                None,
+                TurnOrigin::SubTurn,
+                super::AgentRunOverrides::default(),
+            );
+            let result = run.await.unwrap();
+            assert_eq!(result, "done");
+            let requests = server.received_requests().await.unwrap();
+            assert_eq!(
+                requests.len(),
+                3,
+                "the third request must be post-turn reflection"
+            );
+            let body: serde_json::Value = serde_json::from_slice(&requests[2].body).unwrap();
+            assert_eq!(body["model"], "reflection-id");
+            assert_eq!(body["temperature"], expected);
+            assert!(
+                body["messages"][0]["content"]
+                    .as_str()
+                    .unwrap()
+                    .contains("reusable agent skill")
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn run_brackets_successful_turn_with_agent_start_and_agent_end() {
         use axum::{Router, routing::post};
         use tokio::net::TcpListener;
@@ -24130,24 +24470,34 @@ Let me check the result."#;
     async fn run_model_switch_emits_single_balanced_pair_for_the_switched_route() {
         use axum::{Json, Router, extract::State, routing::post};
         use tokio::net::TcpListener;
-        use zeroclaw_config::scattered_types::{CloudEscalationPolicy, EffortRoutingConfig};
         use zeroclaw_config::schema::{
-            AliasedAgentConfig, ModelProviderConfig, ModelRouteConfig, OllamaModelProviderConfig,
-            RiskProfileConfig, RuntimeProfileConfig,
+            AliasedAgentConfig, ModelProviderConfig, OllamaModelProviderConfig, RiskProfileConfig,
         };
 
         let _hook_lock = observability::HOOK_TEST_LOCK.lock().await;
 
-        // The simple prompt stays on the local route. First response: a native
-        // tool call requesting a different model on that allowed provider.
+        // This positive-switch test has no effort profile: a local-only effort
+        // admission would correctly reject the other connection profile.
+        // First response: a native tool call requesting the switched profile.
         // Second response (only reachable once the switched-to model is
         // actually in use): plain "done".
         type CallCount = Arc<std::sync::atomic::AtomicUsize>;
 
         async fn respond_switch_then_done(
             State(calls): State<CallCount>,
+            Json(body): Json<serde_json::Value>,
         ) -> Json<serde_json::Value> {
             let call = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            assert_eq!(body["temperature"], if call == 0 { 0.2 } else { 0.8 });
+            assert_eq!(
+                body["model"],
+                if call == 0 {
+                    "run-lifecycle-switch-default-model"
+                } else {
+                    "run-lifecycle-switch-vision-model"
+                },
+                "the switched non-vision selection must use its configured vision route"
+            );
             if call == 0 {
                 Json(serde_json::json!({
                     "choices": [{
@@ -24158,7 +24508,7 @@ Let me check the result."#;
                                 "type": "function",
                                 "function": {
                                     "name": "model_switch",
-                                    "arguments": "{\"action\":\"set\",\"model_provider\":\"ollama.default\",\"model\":\"switched-model\"}"
+                                    "arguments": "{\"action\":\"set\",\"model_provider\":\"ollama.switched\",\"model\":\"switched-model\"}"
                                 }
                             }]
                         }
@@ -24193,6 +24543,15 @@ Let me check the result."#;
                 OllamaModelProviderConfig {
                     base: ModelProviderConfig {
                         model: Some(format!("run-lifecycle-switch-{alias}-model")),
+                        temperature: Some(0.9),
+                        models: std::collections::HashMap::from([(
+                            "default".to_string(),
+                            zeroclaw_config::schema::ModelEntryConfig {
+                                id: Some(format!("run-lifecycle-switch-{alias}-model")),
+                                temperature: Some(if alias == "default" { 0.2 } else { 0.8 }),
+                                ..Default::default()
+                            },
+                        )]),
                         timeout_secs: Some(5),
                         uri: Some(format!("http://{addr}")),
                         vision: Some(vision),
@@ -24207,38 +24566,16 @@ Let me check the result."#;
             AliasedAgentConfig {
                 model_provider: "ollama.default".into(),
                 risk_profile: "default".into(),
-                runtime_profile: "effort".into(),
                 ..Default::default()
             },
         );
-        config.model_routes = vec![
-            ModelRouteConfig {
-                hint: "local".into(),
-                model_provider: "ollama.default".into(),
-                model: "run-lifecycle-switch-default-model".into(),
-                api_key: None,
-            },
-            ModelRouteConfig {
-                hint: "cloud".into(),
-                model_provider: "ollama.switched".into(),
-                model: "switched-model".into(),
-                api_key: None,
-            },
-        ];
-        config.runtime_profiles.insert(
-            "effort".to_string(),
-            RuntimeProfileConfig {
-                effort_routing: Some(EffortRoutingConfig {
-                    local_hint: "local".into(),
-                    cloud_hint: "cloud".into(),
-                    cloud_escalation: CloudEscalationPolicy::Auto,
-                }),
+        config.risk_profiles.insert(
+            "default".to_string(),
+            RiskProfileConfig {
+                auto_approve: vec!["model_switch".into()],
                 ..Default::default()
             },
         );
-        config
-            .risk_profiles
-            .insert("default".to_string(), RiskProfileConfig::default());
         config.multimodal.vision_model_provider = Some("ollama.vision".to_string());
 
         let capturing = Arc::new(CapturingObserver::default());
@@ -24307,7 +24644,7 @@ Let me check the result."#;
             .expect("AgentEnd for the switch agent should be present");
         assert_eq!(
             end_route,
-            ("ollama.default".to_string(), "switched-model".to_string()),
+            ("ollama.switched".to_string(), "switched-model".to_string()),
             "AgentEnd must be attributed to the switched-TO route (set_model_route), \
              not the original one, got {events:?}"
         );
@@ -24416,18 +24753,26 @@ Let me check the result."#;
                 ..Default::default()
             },
         );
+        zeroclaw_config::migration::bind_test_route_model(
+            &mut config,
+            "ollama.local",
+            "local-model",
+            None,
+        );
+        zeroclaw_config::migration::bind_test_route_model(
+            &mut config,
+            "ollama.cloud",
+            "cloud-model",
+            None,
+        );
         config.model_routes = vec![
             ModelRouteConfig {
                 hint: "local".into(),
-                model_provider: "ollama.local".into(),
-                model: "local-model".into(),
-                api_key: None,
+                model_ref: "ollama.local".into(),
             },
             ModelRouteConfig {
                 hint: "cloud".into(),
-                model_provider: "ollama.cloud".into(),
-                model: "cloud-model".into(),
-                api_key: None,
+                model_ref: "ollama.cloud".into(),
             },
         ];
         config.runtime_profiles.insert(
@@ -24572,9 +24917,6 @@ Let me check the result."#;
                     model: Some("local-model".to_string()),
                     timeout_secs: Some(5),
                     uri: Some(format!("http://{local_addr}")),
-                    fallback: vec![zeroclaw_config::providers::ModelProviderRef::new(
-                        "ollama.cloud",
-                    )],
                     ..Default::default()
                 },
                 ..Default::default()
@@ -24601,18 +24943,26 @@ Let me check the result."#;
                 ..Default::default()
             },
         );
+        zeroclaw_config::migration::bind_test_route_model(
+            &mut config,
+            "ollama.local",
+            "local-model",
+            None,
+        );
+        zeroclaw_config::migration::bind_test_route_model(
+            &mut config,
+            "ollama.cloud",
+            "cloud-model",
+            None,
+        );
         config.model_routes = vec![
             ModelRouteConfig {
                 hint: "local".into(),
-                model_provider: "ollama.local".into(),
-                model: "local-model".into(),
-                api_key: None,
+                model_ref: "ollama.local".into(),
             },
             ModelRouteConfig {
                 hint: "cloud".into(),
-                model_provider: "ollama.cloud".into(),
-                model: "cloud-model".into(),
-                api_key: None,
+                model_ref: "ollama.cloud".into(),
             },
         ];
         config.runtime_profiles.insert(
@@ -24929,7 +25279,7 @@ mod capability_entry_point_tests {
         let principal = PrincipalId::for_oidc("https://issuer.example", "subject-vision");
 
         let error = super::process_message_with_capabilities(
-            Arc::new(config),
+            Arc::new(zeroclaw_config::migration::admit_test_input(&config)),
             capabilities_with_providers(Arc::clone(&providers) as _),
             Some(principal.clone()),
             "test-agent",
@@ -25003,7 +25353,7 @@ mod capability_entry_point_tests {
         let principal = PrincipalId::for_oidc("https://issuer.example", "subject-2");
 
         let reply = super::process_message_with_capabilities(
-            Arc::new(config),
+            Arc::new(zeroclaw_config::migration::admit_test_input(&config)),
             recording_capabilities(
                 Arc::clone(&providers),
                 Arc::clone(&memory),
@@ -25999,21 +26349,25 @@ mod capability_entry_point_tests {
                 ..Default::default()
             },
         );
-        config.providers.models.openai.insert(
-            "fast".to_string(),
-            OpenAIModelProviderConfig {
-                base: ModelProviderConfig {
-                    model: Some("gpt-4o-mini".to_string()),
-                    // Unroutable: only the supplied provider can answer.
-                    uri: Some("http://127.0.0.1:9".to_string()),
-                    ..Default::default()
-                },
-            },
-        );
+        config.providers = toml::from_str(
+            r#"
+[connections."skill"]
+kind = "custom"
+uri = "http://127.0.0.1:9"
+capabilities = ["chat"]
+
+[models."custom.skill"]
+capability = "chat"
+provider = "skill"
+model = "gpt-4o-mini"
+options = { extract_text_tool_calls = true }
+"#,
+        )
+        .unwrap();
         config.agents.insert(
             "skill-agent".to_string(),
             AliasedAgentConfig {
-                model_provider: "openai.fast".into(),
+                model_provider: "custom.skill".into(),
                 risk_profile: "skill-hooks".into(),
                 ..Default::default()
             },
