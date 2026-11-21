@@ -150,6 +150,8 @@ export default function BrowserVoiceControls({ messages, hydrated, typing, onTra
     captureLease.current = beginVoiceCapture();
     if (!captureLease.current) { setError(t('voice.playback_busy')); return; }
     const version = ++generation.current;
+    // Taken before the first await: an edit while the mic starts cancels this dictation's send.
+    const submissionEpoch = submitCancellation.current;
     setListening(true);
     if (prefs.recognition === 'local') {
       const status = await localRecognitionStatus(prefs.language);
@@ -170,7 +172,6 @@ export default function BrowserVoiceControls({ messages, hydrated, typing, onTra
       releaseCapture(); setListening(false); setError(t('voice.local_unavailable')); return;
     }
     capture.lang = prefs.language; capture.continuous = true; capture.interimResults = true;
-    const submissionEpoch = submitCancellation.current;
     const submitAfterRevalidation = async () => {
       try {
         const currentTimeout = await readGlobalVoiceTimeout();

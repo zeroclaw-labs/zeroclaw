@@ -641,6 +641,32 @@ test('an edit after the browser ends recognition cancels the pending send', asyn
   } finally { context.mock.timers.reset(); await act(async () => { renderer.unmount(); }); }
 });
 
+test('an edit while the microphone is still starting cancels that dictation\'s automatic send', async (context) => {
+  let submitted = 0;
+  const autoSendCancelRef = React.createRef<() => void>();
+  let renderer!: ReactTestRenderer;
+  await act(async () => { renderer = create(createElement(Controls, { messages: [], hydrated: true, typing: false, onTranscript() {}, onSilence() { submitted++; }, autoSendCancelRef }), options); });
+  const available = FakeRecognition.available;
+  let languagePackReady!: (status: string) => void;
+  FakeRecognition.available = () => new Promise<string>(resolve => { languagePackReady = resolve; });
+  const previous = capture;
+  context.mock.timers.enable({ apis: ['setTimeout'] });
+  try {
+    // The microphone lights up, then waits for the on-device language check.
+    await act(async () => { renderer.root.findAllByType('button')[0]!.props.onClick(); });
+    assert.equal(renderer.root.findAllByType('button')[0]!.props['aria-pressed'], true);
+    await act(async () => { autoSendCancelRef.current?.(); });
+    await act(async () => { languagePackReady('available'); });
+    assert.notEqual(capture, previous, 'capture started after the check');
+    capture.onresult!({ resultIndex: 0, results: [{ isFinal: true, 0: { transcript: 'Dictated after the edit' } }] });
+    await act(async () => { context.mock.timers.tick(15000); });
+    assert.equal(submitted, 0);
+  } finally {
+    FakeRecognition.available = available;
+    context.mock.timers.reset(); await act(async () => { renderer.unmount(); });
+  }
+});
+
 test('an edit during capture keeps listening, ends on silence without sending, and the next dictation sends', async (context) => {
   let submitted = 0;
   const autoSendCancelRef = React.createRef<() => void>();
