@@ -23,10 +23,11 @@ PROFILE_ID_RE = re.compile(r"^[a-z][a-z0-9-]*$")
 PACKAGE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
 FEATURE_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_:+./-]*$")
 FEATURE_NAME_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_:+.-]*$")
-VERSION_RE = re.compile(r"^[0-9A-Za-z][0-9A-Za-z.+-]*$")
+VERSION_PATTERN = r"[0-9A-Za-z][0-9A-Za-z.+-]*"
+VERSION_RE = re.compile(rf"^{VERSION_PATTERN}$")
 PACKAGE_FIELD_RE = re.compile(
     r"(?P<name>[A-Za-z0-9][A-Za-z0-9_-]*)"
-    r"\s+v(?P<version>[0-9A-Za-z][0-9A-Za-z.+-]*)"
+    rf"\s+v(?P<version>{VERSION_PATTERN})"
     r"(?:\s+\([^\t\r\n]+\))?"
 )
 
@@ -318,8 +319,6 @@ def parse_tree(raw: str, profile_id: str, root_package: str) -> dict[str, Any]:
             raise fail(f"profile {profile_id}: malformed Cargo tree line {number}: {line!r}")
         name = match.group("name")
         version = match.group("version")
-        if VERSION_RE.fullmatch(version) is None:
-            raise fail(f"profile {profile_id}: malformed package version on line {number}")
         features = parse_feature_field(
             feature_field.removeprefix("features:"),
             f"profile {profile_id} line {number}",
