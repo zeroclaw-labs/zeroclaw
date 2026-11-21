@@ -498,7 +498,7 @@ mod tests {
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let memory: Arc<dyn Memory> =
-            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path()).unwrap());
         let audit = Arc::new(SopAuditLogger::new(memory.clone()));
 
         let tool = SopAdvanceTool::new(engine).with_audit(audit.clone());
@@ -534,7 +534,7 @@ mod tests {
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let memory: Arc<dyn Memory> =
-            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path()).unwrap());
         let audit = Arc::new(SopAuditLogger::new(memory.clone()));
 
         let tool = SopAdvanceTool::new(engine).with_audit(audit.clone());

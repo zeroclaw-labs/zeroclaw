@@ -164,7 +164,7 @@ fn trap_config(root: &Path) -> Config {
             ..Default::default()
         },
     );
-    config
+    zeroclaw_config::migration::admit_test_input(&config)
 }
 
 struct SourceTool(String);

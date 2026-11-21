@@ -21,6 +21,11 @@ pub struct OpenRouterModelProvider {
     alias: String,
     credential: Option<String>,
     timeout_secs: u64,
+    timeout_configured: bool,
+    timeout_disabled: bool,
+    stream_request_timeout: super::StreamRequestTimeout,
+    read_timeout_secs: Option<u64>,
+    read_timeout_disabled: bool,
     max_tokens: Option<u32>,
     extra_body: Option<serde_json::Value>,
     #[cfg(test)]
@@ -33,7 +38,6 @@ pub(crate) const BASE_URL: &str = "https://openrouter.ai/api/v1";
 pub(crate) fn endpoint_url(path: &str) -> String {
     format!("{BASE_URL}/{}", path.trim_start_matches('/'))
 }
-const OPENROUTER_CONNECT_TIMEOUT_SECS: u64 = 10;
 /// Maximum silence between body reads for OpenRouter SSE streams.
 const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
@@ -213,6 +217,11 @@ pub struct OpenRouterBuilder {
     alias: String,
     credential: Option<String>,
     timeout_secs: Option<u64>,
+    timeout_configured: bool,
+    timeout_disabled: bool,
+    stream_request_timeout: super::StreamRequestTimeout,
+    read_timeout_secs: Option<u64>,
+    read_timeout_disabled: bool,
     max_tokens: Option<u32>,
     extra_body: Option<serde_json::Value>,
     #[cfg(test)]
@@ -220,6 +229,10 @@ pub struct OpenRouterBuilder {
 }
 
 impl OpenRouterBuilder {
+    pub(crate) fn stream_request_timeout(mut self, timeout: super::StreamRequestTimeout) -> Self {
+        self.stream_request_timeout = timeout;
+        self
+    }
     /// Explicit API credential. Whitespace-only inputs collapse to
     /// `None`.
     pub fn credential(mut self, credential: Option<&str>) -> Self {
@@ -236,7 +249,25 @@ impl OpenRouterBuilder {
     pub fn timeout_secs(mut self, secs: u64) -> Self {
         if secs > 0 {
             self.timeout_secs = Some(secs);
+            self.timeout_configured = true;
         }
+        self
+    }
+
+    pub(crate) fn without_timeout(mut self) -> Self {
+        self.timeout_disabled = true;
+        self
+    }
+
+    pub(crate) fn read_timeout_secs(mut self, secs: u64) -> Self {
+        if secs > 0 {
+            self.read_timeout_secs = Some(secs);
+        }
+        self
+    }
+
+    pub(crate) fn without_read_timeout(mut self) -> Self {
+        self.read_timeout_disabled = true;
         self
     }
 
@@ -266,6 +297,11 @@ impl OpenRouterBuilder {
             timeout_secs: self
                 .timeout_secs
                 .unwrap_or(zeroclaw_api::model_provider::BASELINE_TIMEOUT_SECS),
+            timeout_configured: self.timeout_configured,
+            timeout_disabled: self.timeout_disabled,
+            stream_request_timeout: self.stream_request_timeout,
+            read_timeout_secs: self.read_timeout_secs,
+            read_timeout_disabled: self.read_timeout_disabled,
             max_tokens: self.max_tokens,
             extra_body: self.extra_body,
             #[cfg(test)]
@@ -282,6 +318,11 @@ impl OpenRouterModelProvider {
             alias: alias.to_string(),
             credential: None,
             timeout_secs: None,
+            timeout_configured: false,
+            timeout_disabled: false,
+            stream_request_timeout: None,
+            read_timeout_secs: None,
+            read_timeout_disabled: false,
             max_tokens: None,
             extra_body: None,
             #[cfg(test)]
@@ -550,27 +591,44 @@ impl OpenRouterModelProvider {
         Ok(value)
     }
 
-    fn http_client(&self) -> Client {
-        zeroclaw_config::schema::build_runtime_proxy_client_with_timeouts(
-            "model_provider.openrouter",
-            self.timeout_secs,
-            OPENROUTER_CONNECT_TIMEOUT_SECS,
-        )
+    fn http_client(&self) -> anyhow::Result<Client> {
+        crate::transport::ChatHttpPolicy {
+            request_timeout: (!self.timeout_disabled)
+                .then(|| std::time::Duration::from_secs(self.timeout_secs)),
+            read_timeout: self
+                .read_timeout_secs
+                .filter(|_| !self.read_timeout_disabled)
+                .map(std::time::Duration::from_secs),
+            ..Default::default()
+        }
+        .client("model_provider.openrouter")
     }
 
-    /// HTTP client for streaming SSE connections. Streaming responses can
-    /// legitimately outlive the normal request timeout while still making
-    /// progress, so bound only connection setup and idle body reads here.
-    fn streaming_http_client(&self) -> Client {
-        self.streaming_http_client_with_idle_timeout(STREAM_IDLE_TIMEOUT)
+    fn streaming_timeouts(&self) -> super::StreamTimeouts {
+        super::StreamTimeouts {
+            request: super::stream_request_timeout(
+                &self.stream_request_timeout,
+                (self.timeout_configured && !self.timeout_disabled)
+                    .then(|| Duration::from_secs(self.timeout_secs)),
+            ),
+            read: (!self.read_timeout_disabled).then(|| {
+                self.read_timeout_secs
+                    .map_or(super::StreamIdleBound::Fixed(STREAM_IDLE_TIMEOUT), |secs| {
+                        super::StreamIdleBound::Read(Duration::from_secs(secs))
+                    })
+            }),
+        }
     }
 
-    fn streaming_http_client_with_idle_timeout(&self, idle_timeout: Duration) -> Client {
-        zeroclaw_config::schema::build_runtime_proxy_client_with_read_timeout(
-            "model_provider.openrouter",
-            idle_timeout.as_secs(),
-            OPENROUTER_CONNECT_TIMEOUT_SECS,
-        )
+    /// Use the same resolved deadlines for transport and diagnostics.
+    fn streaming_http_client(&self) -> anyhow::Result<Client> {
+        let timeouts = self.streaming_timeouts();
+        crate::transport::ChatHttpPolicy {
+            request_timeout: timeouts.request,
+            read_timeout: timeouts.read.map(|timeout| timeout.duration()),
+            ..Default::default()
+        }
+        .client("model_provider.openrouter")
     }
 
     fn streaming_endpoint_url(&self, path: &str) -> String {
@@ -603,7 +661,7 @@ impl ModelProvider for OpenRouterModelProvider {
         // Hit a lightweight endpoint to establish TLS + HTTP/2 connection pool.
         // This prevents the first real chat request from timing out on cold start.
         if let Some(credential) = self.credential.as_ref() {
-            self.http_client()
+            self.http_client()?
                 .get(endpoint_url("auth/key"))
                 .header("Authorization", format!("Bearer {credential}"))
                 .send()
@@ -617,7 +675,7 @@ impl ModelProvider for OpenRouterModelProvider {
         // OpenRouter's /models endpoint is public — no credential required.
         // Returns ~300 models across every model_provider OpenRouter proxies.
         let response = self
-            .http_client()
+            .http_client()?
             .get(endpoint_url("models"))
             .send()
             .await?
@@ -672,7 +730,7 @@ impl ModelProvider for OpenRouterModelProvider {
 
         let body = self.merge_extra_body(&request)?;
         let response = self
-            .http_client()
+            .http_client()?
             .post(endpoint_url("chat/completions"))
             .header("Authorization", format!("Bearer {credential}"))
             .header("HTTP-Referer", "https://github.com/zeroclaw-labs/zeroclaw")
@@ -745,7 +803,7 @@ impl ModelProvider for OpenRouterModelProvider {
 
         let body = self.merge_extra_body(&request)?;
         let response = self
-            .http_client()
+            .http_client()?
             .post(endpoint_url("chat/completions"))
             .header("Authorization", format!("Bearer {credential}"))
             .header("HTTP-Referer", "https://github.com/zeroclaw-labs/zeroclaw")
@@ -816,7 +874,7 @@ impl ModelProvider for OpenRouterModelProvider {
 
         let body = self.merge_extra_body(&native_request)?;
         let response = self
-            .http_client()
+            .http_client()?
             .post(endpoint_url("chat/completions"))
             .header("Authorization", format!("Bearer {credential}"))
             .header("HTTP-Referer", "https://github.com/zeroclaw-labs/zeroclaw")
@@ -925,13 +983,23 @@ impl ModelProvider for OpenRouterModelProvider {
             }
         };
 
-        let client = self.streaming_http_client();
+        let client = match self.streaming_http_client() {
+            Ok(client) => client,
+            Err(error) => {
+                return stream::once(async move {
+                    Err(StreamError::Http(format!("building HTTP client: {error}")))
+                })
+                .boxed();
+            }
+        };
+        let timeouts = self.streaming_timeouts();
         let endpoint_url = self.streaming_endpoint_url("chat/completions");
         let count_tokens = options.count_tokens;
 
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(100);
 
         let handle = ::zeroclaw_spawn::spawn!(async move {
+            let timeouts = timeouts.start();
             let response = match client
                 .post(endpoint_url)
                 .header("Authorization", format!("Bearer {credential}"))
@@ -947,9 +1015,9 @@ impl ModelProvider for OpenRouterModelProvider {
                 Err(e) => {
                     let _ = tx
                         .send(Err(if e.is_connect() {
-                            StreamError::ConnectFailed(super::format_error_chain(&e))
+                            StreamError::ConnectFailed(timeouts.error_message(&e))
                         } else {
-                            StreamError::Http(super::format_error_chain(&e))
+                            StreamError::Http(timeouts.error_message(&e))
                         }))
                         .await;
                     return;
@@ -970,7 +1038,7 @@ impl ModelProvider for OpenRouterModelProvider {
                 return;
             }
 
-            let mut event_stream = sse_bytes_to_events(response, count_tokens);
+            let mut event_stream = sse_bytes_to_events(response, count_tokens, timeouts);
             while let Some(event) = event_stream.next().await {
                 if tx.send(event).await.is_err() {
                     break;
@@ -1053,7 +1121,7 @@ impl ModelProvider for OpenRouterModelProvider {
 
         let body = self.merge_extra_body(&native_request)?;
         let response = self
-            .http_client()
+            .http_client()?
             .post(endpoint_url("chat/completions"))
             .header("Authorization", format!("Bearer {credential}"))
             .header("HTTP-Referer", "https://github.com/zeroclaw-labs/zeroclaw")
@@ -1234,7 +1302,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stream_chat_allows_active_stream_past_request_timeout() {
+    async fn streaming_total_deadline_is_independent_of_read_progress() {
         use axum::{Json, Router, body::Body, http::header, response::IntoResponse, routing::post};
         use futures_util::StreamExt as _;
         use std::convert::Infallible;
@@ -1281,49 +1349,63 @@ data: [DONE]
                 .expect("serve OpenRouter streaming test");
         });
 
-        let provider = OpenRouterModelProvider::builder("test")
-            .credential(Some("test-key"))
-            .timeout_secs(1)
-            .streaming_base_url(&format!("http://{addr}"))
-            .build();
-        let messages = vec![ChatMessage {
-            role: "user".into(),
-            content: "hello".into(),
-        }];
-        let request = crate::traits::ChatRequest {
-            messages: &messages,
-            tools: None,
-            thinking: None,
-        };
-        let mut stream = provider.stream_chat(
-            request,
-            "anthropic/claude-haiku-4-5",
-            Some(0.0),
-            crate::traits::StreamOptions::new(true),
-        );
+        for deadline in ["inherit", "finite", "clear"] {
+            let mut builder = OpenRouterModelProvider::builder("test")
+                .credential(Some("test-key"))
+                .streaming_base_url(&format!("http://{addr}"));
+            if deadline != "inherit" {
+                builder = builder.timeout_secs(1);
+            }
+            if deadline == "clear" {
+                builder = builder.without_timeout();
+            }
+            let provider = builder.build();
+            let messages = vec![ChatMessage {
+                role: "user".into(),
+                content: "hello".into(),
+            }];
+            let request = crate::traits::ChatRequest {
+                messages: &messages,
+                tools: None,
+                thinking: None,
+            };
+            let mut stream = provider.stream_chat(
+                request,
+                "anthropic/claude-haiku-4-5",
+                Some(0.0),
+                crate::traits::StreamOptions::new(true),
+            );
 
-        let first = tokio::time::timeout(Duration::from_secs(1), stream.next())
-            .await
-            .expect("stream should yield the first SSE event")
-            .expect("stream should yield at least one event")
-            .expect("first SSE event should be readable");
-        match first {
-            StreamEvent::TextDelta(chunk) => assert_eq!(chunk.delta, "first"),
-            event => panic!("expected first text delta, got {event:?}"),
+            let first = tokio::time::timeout(Duration::from_secs(1), stream.next())
+                .await
+                .expect("stream should yield the first SSE event")
+                .expect("stream should yield at least one event")
+                .expect("first SSE event should be readable");
+            match first {
+                StreamEvent::TextDelta(chunk) => assert_eq!(chunk.delta, "first"),
+                event => panic!("expected first text delta, got {event:?}"),
+            }
+
+            let second = tokio::time::timeout(Duration::from_secs(3), stream.next())
+                .await
+                .expect("request must settle")
+                .expect("stream should yield an event");
+            if deadline == "finite" {
+                assert!(
+                    second.is_err(),
+                    "finite total deadline should terminate the delayed stream"
+                );
+                continue;
+            }
+            let second = second.expect("second SSE event should be readable");
+            match second {
+                StreamEvent::TextDelta(chunk) => assert_eq!(chunk.delta, "second"),
+                event => panic!("expected second text delta, got {event:?}"),
+            }
+
+            let final_event = stream.next().await.expect("stream should yield Final");
+            assert!(matches!(final_event, Ok(StreamEvent::Final)));
         }
-
-        let second = tokio::time::timeout(Duration::from_secs(3), stream.next())
-            .await
-            .expect("stream should remain open past the request timeout")
-            .expect("stream should yield the second SSE event")
-            .expect("second SSE event should be readable");
-        match second {
-            StreamEvent::TextDelta(chunk) => assert_eq!(chunk.delta, "second"),
-            event => panic!("expected second text delta, got {event:?}"),
-        }
-
-        let final_event = stream.next().await.expect("stream should yield Final");
-        assert!(matches!(final_event, Ok(StreamEvent::Final)));
 
         server.abort();
     }
@@ -1361,9 +1443,11 @@ data: [DONE]
 
         let provider = OpenRouterModelProvider::builder("test")
             .credential(Some("test-key"))
+            .read_timeout_secs(1)
             .build();
         let response = provider
-            .streaming_http_client_with_idle_timeout(Duration::from_secs(1))
+            .streaming_http_client()
+            .expect("HTTP client should build")
             .get(format!("http://{addr}/stream"))
             .send()
             .await

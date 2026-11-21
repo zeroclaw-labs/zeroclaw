@@ -268,16 +268,12 @@ impl Memory for AgentScopedMemory {
 
     fn refresh_embedder(
         &self,
-        model_provider: &str,
-        api_key: Option<&str>,
-        model: &str,
-        dimensions: usize,
+        embedder: std::sync::Arc<dyn zeroclaw_api::embedding::EmbeddingProvider>,
     ) {
         // Transparent wrapper: forward the embedder refresh to the wrapped
         // per-agent backend so an active agent's memory stops using a stale
         // endpoint/key after a provider-profile `config/set`
-        self.inner
-            .refresh_embedder(model_provider, api_key, model, dimensions);
+        self.inner.refresh_embedder(embedder);
     }
 
     async fn store(
@@ -678,10 +674,10 @@ impl ::zeroclaw_api::attribution::Attributable for AgentScopedMemory {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::embeddings::EmbeddingProvider;
     use crate::sqlite::SqliteMemory;
     use crate::traits::{MemoryKind, SemanticSubtype};
     use tempfile::TempDir;
+    use zeroclaw_api::embedding::EmbeddingProvider;
     use zeroclaw_config::schema::SearchMode;
 
     fn fresh_sqlite() -> (TempDir, Arc<SqliteMemory>) {
@@ -754,13 +750,7 @@ mod tests {
             AgentScopedMemory::new(as_dyn(inner.clone()), "agent-1", Vec::<String>::new());
         assert_eq!(inner.embedder_dimensions(), 0);
 
-        Memory::refresh_embedder(
-            &wrapper,
-            "openai",
-            Some("sk-test"),
-            "text-embedding-3-small",
-            1536,
-        );
+        Memory::refresh_embedder(&wrapper, crate::test_embedder(1536));
 
         assert_eq!(
             inner.embedder_dimensions(),

@@ -16,8 +16,8 @@ const ZAI_RECALL_TEMPERATURE: f64 = 0.0;
 #[ignore = "requires live ZAI_API_KEY"]
 async fn live_zai_jwt_auth_chat() {
     let key = std::env::var("ZAI_API_KEY").expect("ZAI_API_KEY must be set");
-    let model_provider =
-        create_model_provider("zai", Some(&key)).expect("should create ZAI model_provider");
+    let model_provider = create_model_provider("zai", Some(&key), &Default::default())
+        .expect("should create ZAI model_provider");
 
     let result = model_provider
         .chat_with_system(
@@ -43,8 +43,8 @@ async fn live_zai_jwt_auth_chat() {
 #[ignore = "requires live ZAI_API_KEY"]
 async fn live_zai_jwt_auth_multi_turn() {
     let key = std::env::var("ZAI_API_KEY").expect("ZAI_API_KEY must be set");
-    let model_provider =
-        create_model_provider("zai", Some(&key)).expect("should create ZAI model_provider");
+    let model_provider = create_model_provider("zai", Some(&key), &Default::default())
+        .expect("should create ZAI model_provider");
 
     let messages = vec![
         ChatMessage::system("You are a concise assistant. Reply in one short sentence."),

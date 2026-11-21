@@ -8,9 +8,10 @@ use async_trait::async_trait;
 use cpal::Sample;
 use tokio::sync::mpsc;
 
-use crate::transcription::TranscriptionManager;
+#[cfg(test)]
 use zeroclaw_config::schema::TranscriptionConfig;
 use zeroclaw_config::schema::VoiceWakeConfig;
+use zeroclaw_providers::transcription::TranscriptionManager;
 
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
 
@@ -135,14 +136,13 @@ pub struct VoiceWakeChannel {
 }
 
 impl VoiceWakeChannel {
-    /// Create a new `VoiceWakeChannel` from its config sections.
+    /// Build with a resolver over the current admitted configuration.
     pub fn new(
         alias: impl Into<String>,
         config: VoiceWakeConfig,
-        transcription_config: TranscriptionConfig,
+        factory: impl Fn() -> Result<TranscriptionManager> + Send + Sync + 'static,
     ) -> Self {
-        let transcription_manager_factory =
-            Arc::new(move || TranscriptionManager::new(&transcription_config));
+        let transcription_manager_factory = Arc::new(factory);
         Self {
             config,
             alias: alias.into(),
@@ -160,16 +160,6 @@ impl VoiceWakeChannel {
         self.transcription_manager_factory = Arc::new(move || {
             Ok(base_factory()?.with_agent_transcription_provider(provider.clone()))
         });
-        self
-    }
-
-    /// Replace the compatibility transcription factory with the channel
-    /// runtime's live-config resolver.
-    pub(crate) fn with_transcription_manager_factory(
-        mut self,
-        factory: impl Fn() -> Result<TranscriptionManager> + Send + Sync + 'static,
-    ) -> Self {
-        self.transcription_manager_factory = Arc::new(factory);
         self
     }
 
@@ -575,6 +565,17 @@ mod tests {
     use super::*;
     use zeroclaw_config::traits::ChannelConfig;
 
+    fn channel(
+        alias: impl Into<String>,
+        config: VoiceWakeConfig,
+        section: TranscriptionConfig,
+    ) -> VoiceWakeChannel {
+        let full = zeroclaw_config::schema::Config::from_transcription_input(&section);
+        VoiceWakeChannel::new(alias, config, move || {
+            TranscriptionManager::from_config_with_provider(&full, String::new())
+        })
+    }
+
     // ── State machine tests ────────────────────────────────
 
     #[test]
@@ -826,13 +827,13 @@ mod tests {
     fn voice_wake_channel_name() {
         let config = VoiceWakeConfig::default();
         let transcription_config = TranscriptionConfig::default();
-        let channel = VoiceWakeChannel::new("testbot", config, transcription_config);
+        let channel = channel("testbot", config, transcription_config);
         assert_eq!(channel.name(), "voice_wake");
     }
 
     #[test]
     fn voice_wake_does_not_support_outbound_send() {
-        let channel = VoiceWakeChannel::new(
+        let channel = channel(
             "testbot",
             VoiceWakeConfig::default(),
             TranscriptionConfig::default(),
@@ -844,7 +845,7 @@ mod tests {
 
     #[tokio::test]
     async fn with_agent_transcription_provider_binds_provider_not_alias() {
-        let channel = VoiceWakeChannel::new(
+        let channel = channel(
             "frontdoor",
             VoiceWakeConfig::default(),
             TranscriptionConfig::default(),
@@ -864,7 +865,7 @@ mod tests {
 
     #[tokio::test]
     async fn agent_transcription_provider_defaults_empty_when_unset() {
-        let channel = VoiceWakeChannel::new(
+        let channel = channel(
             "frontdoor",
             VoiceWakeConfig::default(),
             TranscriptionConfig::default(),
@@ -886,7 +887,7 @@ mod tests {
     async fn dotted_typed_provider_dispatches_through_voice_wake_manager() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
-        use zeroclaw_config::schema::{Config, LocalWhisperTranscriptionProviderConfig};
+        use zeroclaw_config::schema::Config;
 
         let server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -899,20 +900,26 @@ mod tests {
             .await;
 
         let mut runtime_config = Config::default();
-        runtime_config.providers.transcription.local_whisper.insert(
-            "office".to_string(),
-            LocalWhisperTranscriptionProviderConfig {
-                uri: format!("{}/v1/transcribe", server.uri()),
-                ..LocalWhisperTranscriptionProviderConfig::default()
-            },
+        runtime_config.providers.connections.insert(
+            "local_whisper.office".into(),
+            serde_json::from_value(serde_json::json!({
+                "kind": "local_whisper",
+                "uri": format!("{}/v1/transcribe", server.uri()),
+                "api": {"asr": {}}
+            }))
+            .expect("canonical local whisper connection"),
+        );
+        runtime_config.providers.models.insert_canonical_model(
+            "local_whisper.office".into(),
+            serde_json::from_value(serde_json::json!({
+                "capability": "asr",
+                "provider": "local_whisper.office",
+                "model": "whisper-1"
+            }))
+            .expect("canonical local whisper model"),
         );
 
-        let channel = VoiceWakeChannel::new(
-            "frontdoor",
-            VoiceWakeConfig::default(),
-            TranscriptionConfig::default(),
-        )
-        .with_transcription_manager_factory(move || {
+        let channel = VoiceWakeChannel::new("frontdoor", VoiceWakeConfig::default(), move || {
             TranscriptionManager::from_config_with_provider(
                 &runtime_config,
                 "local_whisper.office".to_string(),
@@ -934,7 +941,7 @@ mod tests {
             api_key: Some("test-groq-key".to_string()),
             ..TranscriptionConfig::default()
         };
-        let channel = VoiceWakeChannel::new(
+        let channel = channel(
             "frontdoor",
             VoiceWakeConfig::default(),
             transcription_config,
@@ -958,7 +965,7 @@ mod tests {
             api_key: Some("test-groq-key".to_string()),
             ..TranscriptionConfig::default()
         };
-        let channel = VoiceWakeChannel::new(
+        let channel = channel(
             "frontdoor",
             VoiceWakeConfig::default(),
             transcription_config,

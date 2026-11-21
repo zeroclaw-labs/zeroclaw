@@ -1692,10 +1692,11 @@ mod tests {
         let control_plane = ControlPlaneHandle::open(workspace.path())
             .expect("isolated control plane should initialize");
         let task_store = Arc::clone(&control_plane.store);
+        let config = zeroclaw_config::migration::admit_test_input(&config);
         let authority = crate::LiveConfigAuthority::new(config.clone());
         let lifecycle = authority.agent_lifecycle();
         let tool = SendMessageToPeerTool::new_with_capability(
-            Arc::new(config.clone()),
+            Arc::new(zeroclaw_config::migration::admit_test_input(&config)),
             "sender",
             Some(authority.execution_capability()),
         )
@@ -1955,6 +1956,7 @@ mod tests {
 
         let control_plane = ControlPlaneHandle::open(workspace.path())
             .expect("isolated control plane should initialize");
+        let config = zeroclaw_config::migration::admit_test_input(&config);
         let authority = crate::LiveConfigAuthority::new(config.clone());
         let tool = SendMessageToPeerTool::new_with_capability(
             Arc::new(config.clone()),

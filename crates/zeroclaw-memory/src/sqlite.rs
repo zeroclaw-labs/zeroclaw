@@ -1,4 +1,3 @@
-use super::embeddings::EmbeddingProvider;
 use super::traits::{
     ExportFilter, Memory, MemoryCategory, MemoryEntry, MemoryStats, StoreOptions,
     is_recent_recall_query,
@@ -17,6 +16,7 @@ use std::sync::{Mutex as StdMutex, MutexGuard};
 use std::thread;
 use std::time::Duration;
 use uuid::Uuid;
+use zeroclaw_api::embedding::EmbeddingProvider;
 use zeroclaw_api::memory_traits::PrincipalScope;
 use zeroclaw_api::session_keys::sanitize_session_key;
 use zeroclaw_config::schema::SearchMode;
@@ -47,7 +47,7 @@ impl SqliteMemory {
         Self::with_embedder(
             alias,
             workspace_dir,
-            Arc::new(super::embeddings::NoopEmbedding),
+            Arc::new(zeroclaw_providers::embedding::NoopEmbedding),
             0.7,
             0.3,
             10_000,
@@ -63,7 +63,9 @@ impl SqliteMemory {
         Ok(Self {
             alias: alias.to_string(),
             conn: Arc::new(Mutex::new(conn)),
-            embedder: Arc::new(RwLock::new(Arc::new(super::embeddings::NoopEmbedding))),
+            embedder: Arc::new(RwLock::new(Arc::new(
+                zeroclaw_providers::embedding::NoopEmbedding,
+            ))),
             vector_weight: 0.7,
             keyword_weight: 0.3,
             cache_max: 10_000,
@@ -557,7 +559,7 @@ impl SqliteMemory {
 
     pub fn stored_embedding_identity(
         &self,
-    ) -> anyhow::Result<Option<super::embeddings::EmbeddingIdentity>> {
+    ) -> anyhow::Result<Option<zeroclaw_api::embedding::EmbeddingIdentity>> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
             "SELECT key, value FROM memory_meta WHERE key IN \
@@ -579,7 +581,7 @@ impl SqliteMemory {
         }
         Ok(match (provider, model, dimensions) {
             (Some(provider), Some(model), Some(dimensions)) => {
-                Some(super::embeddings::EmbeddingIdentity {
+                Some(zeroclaw_api::embedding::EmbeddingIdentity {
                     provider,
                     model,
                     dimensions,
@@ -594,7 +596,7 @@ impl SqliteMemory {
     /// tracking, and after a match check confirms nothing changed.
     pub fn record_embedding_identity(
         &self,
-        identity: &super::embeddings::EmbeddingIdentity,
+        identity: &zeroclaw_api::embedding::EmbeddingIdentity,
     ) -> anyhow::Result<()> {
         let conn = self.conn.lock();
         let tx = conn.unchecked_transaction()?;
@@ -605,7 +607,7 @@ impl SqliteMemory {
 
     pub fn invalidate_embeddings_for_identity_change(
         &self,
-        new_identity: &super::embeddings::EmbeddingIdentity,
+        new_identity: &zeroclaw_api::embedding::EmbeddingIdentity,
     ) -> anyhow::Result<usize> {
         let conn = self.conn.lock();
         let tx = conn.unchecked_transaction()?;
@@ -621,7 +623,7 @@ impl SqliteMemory {
 
     fn write_identity_rows(
         conn: &Connection,
-        identity: &super::embeddings::EmbeddingIdentity,
+        identity: &zeroclaw_api::embedding::EmbeddingIdentity,
     ) -> anyhow::Result<()> {
         let mut stmt =
             conn.prepare("INSERT OR REPLACE INTO memory_meta (key, value) VALUES (?1, ?2)")?;
@@ -1492,7 +1494,7 @@ impl SqliteMemory {
     /// is storage layout, not an authorization mechanism.
     ///
     /// The encoding is length-prefixed (`<byte-len>:<bytes>` per segment) so
-    /// the mapping from (owner, namespace, tenant, key) to physical key is
+    /// the mapping from(owner, namespace, tenant, key) to physical key is
     /// injective: no choice of colon-bearing owner/namespace/tenant/key can
     /// produce the same string as a different tuple, and an absent tenant
     /// (`None`, encoded as `-`) is distinct from an empty one (`Some("")`,
@@ -1623,21 +1625,8 @@ impl Memory for SqliteMemory {
 
     fn refresh_embedder(
         &self,
-        model_provider: &str,
-        api_key: Option<&str>,
-        model: &str,
-        dimensions: usize,
+        embedder: std::sync::Arc<dyn zeroclaw_api::embedding::EmbeddingProvider>,
     ) {
-        // Rebuild from the freshly-resolved settings and swap in place. No
-        // provider state is duplicated into a separate cache — the endpoint/key
-        // come from the canonical config via the runtime resolver.
-        let embedder: Arc<dyn EmbeddingProvider> =
-            Arc::from(super::embeddings::create_embedding_provider(
-                model_provider,
-                api_key,
-                model,
-                dimensions,
-            ));
         self.swap_embedder(embedder);
     }
 
@@ -2440,7 +2429,23 @@ impl Memory for SqliteMemory {
 
         let mut count = 0;
         for (id, content) in &entries {
-            if let Ok(Some(emb)) = self.get_or_compute_embedding(content).await {
+            let embedding = match self.get_or_compute_embedding(content).await {
+                Ok(embedding) => embedding,
+                Err(_) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({
+                                "error_key": "memory.reindex_embedding_failed",
+                                "memory_id": id,
+                            })),
+                        "memory reindex: embedding failed; leaving row without a vector for retry"
+                    );
+                    continue;
+                }
+            };
+            if let Some(emb) = embedding {
                 let bytes = vector::vec_to_bytes(&emb);
                 let conn = self.conn.clone();
                 let id = id.clone();
@@ -3930,7 +3935,7 @@ mod tests {
     #[test]
     fn open_with_timeout_succeeds_when_fast() {
         let tmp = TempDir::new().unwrap();
-        let embedder = Arc::new(super::super::embeddings::NoopEmbedding);
+        let embedder = Arc::new(zeroclaw_providers::embedding::NoopEmbedding);
         let mem = SqliteMemory::with_embedder(
             "test",
             tmp.path(),
@@ -3954,7 +3959,7 @@ mod tests {
         let mem = SqliteMemory::with_embedder(
             "test",
             tmp.path(),
-            Arc::new(super::super::embeddings::NoopEmbedding),
+            Arc::new(zeroclaw_providers::embedding::NoopEmbedding),
             0.7,
             0.3,
             1000,
@@ -3982,7 +3987,7 @@ mod tests {
     struct FailingEmbedding;
 
     #[async_trait::async_trait]
-    impl super::super::embeddings::EmbeddingProvider for FailingEmbedding {
+    impl zeroclaw_api::embedding::EmbeddingProvider for FailingEmbedding {
         fn name(&self) -> &str {
             "failing"
         }
@@ -4048,7 +4053,7 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl super::super::embeddings::EmbeddingProvider for StubEmbedding {
+    impl zeroclaw_api::embedding::EmbeddingProvider for StubEmbedding {
         fn name(&self) -> &str {
             "stub"
         }
@@ -4137,13 +4142,7 @@ mod tests {
         let (_tmp, mem) = temp_sqlite(); // NoopEmbedding, dims 0
         assert_eq!(mem.embedder_dimensions(), 0);
 
-        Memory::refresh_embedder(
-            &mem,
-            "openai",
-            Some("sk-test"),
-            "text-embedding-3-small",
-            1536,
-        );
+        Memory::refresh_embedder(&mem, crate::test_embedder(1536));
 
         assert_eq!(
             mem.embedder_dimensions(),
@@ -4163,7 +4162,7 @@ mod tests {
     struct KeyedEmbedding;
 
     #[async_trait::async_trait]
-    impl super::super::embeddings::EmbeddingProvider for KeyedEmbedding {
+    impl zeroclaw_api::embedding::EmbeddingProvider for KeyedEmbedding {
         fn name(&self) -> &str {
             "keyed"
         }
@@ -4205,7 +4204,7 @@ mod tests {
     struct MissingModalityEmbedding;
 
     #[async_trait::async_trait]
-    impl super::super::embeddings::EmbeddingProvider for MissingModalityEmbedding {
+    impl zeroclaw_api::embedding::EmbeddingProvider for MissingModalityEmbedding {
         fn name(&self) -> &str {
             "missing-modality"
         }
@@ -4572,7 +4571,7 @@ mod tests {
     #[test]
     fn with_embedder_noop() {
         let tmp = TempDir::new().unwrap();
-        let embedder = Arc::new(super::super::embeddings::NoopEmbedding);
+        let embedder = Arc::new(zeroclaw_providers::embedding::NoopEmbedding);
         let mem = SqliteMemory::with_embedder(
             "test",
             tmp.path(),
@@ -4608,6 +4607,58 @@ mod tests {
         assert_eq!(results.len(), 2);
     }
 
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn reindex_logs_empty_embedding_responses_and_preserves_rows_for_retry() {
+        struct EmptyEmbedding;
+
+        #[async_trait::async_trait]
+        impl EmbeddingProvider for EmptyEmbedding {
+            fn name(&self) -> &str {
+                "empty"
+            }
+            fn dimensions(&self) -> usize {
+                4
+            }
+            async fn embed(&self, _texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+                Ok(Vec::new())
+            }
+        }
+
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut events = zeroclaw_log::subscribe_or_install();
+        let (_tmp, mem) = temp_sqlite();
+        mem.store("retry", "retained content", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        let entry = mem.get("retry").await.unwrap().unwrap();
+        mem.swap_embedder(Arc::new(EmptyEmbedding));
+
+        assert_eq!(mem.reindex().await.unwrap(), 0);
+        let mut diagnostic = None;
+        while let Ok(event) = events.try_recv() {
+            if event["attributes"]["error_key"] == "memory.reindex_embedding_failed"
+                && event["attributes"]["memory_id"] == entry.id
+            {
+                diagnostic = Some(event);
+                break;
+            }
+        }
+        let diagnostic =
+            diagnostic.expect("reindex must report a skipped empty embedding response");
+        assert_eq!(diagnostic["severity_text"], "WARN");
+        assert_eq!(
+            mem.get("retry").await.unwrap().unwrap().content,
+            entry.content
+        );
+
+        mem.swap_embedder(Arc::new(FixedEmbedding(4)));
+        assert_eq!(mem.reindex().await.unwrap(), 1);
+        assert_eq!(mem.reindex().await.unwrap(), 0);
+    }
+
     // ── Embedding identity primitives──────────────
 
     /// Embedder that returns a fixed vector, so store() persists real
@@ -4615,7 +4666,7 @@ mod tests {
     struct FixedEmbedding(usize);
 
     #[async_trait::async_trait]
-    impl super::super::embeddings::EmbeddingProvider for FixedEmbedding {
+    impl zeroclaw_api::embedding::EmbeddingProvider for FixedEmbedding {
         fn name(&self) -> &str {
             "fixed"
         }
@@ -4631,8 +4682,8 @@ mod tests {
         provider: &str,
         model: &str,
         dimensions: usize,
-    ) -> super::super::embeddings::EmbeddingIdentity {
-        super::super::embeddings::EmbeddingIdentity {
+    ) -> zeroclaw_api::embedding::EmbeddingIdentity {
+        zeroclaw_api::embedding::EmbeddingIdentity {
             provider: provider.into(),
             model: model.into(),
             dimensions,
@@ -4808,7 +4859,7 @@ mod tests {
         let mem = SqliteMemory::with_embedder(
             "test",
             tmp.path(),
-            Arc::new(super::super::embeddings::NoopEmbedding),
+            Arc::new(zeroclaw_providers::embedding::NoopEmbedding),
             0.7,
             0.3,
             1000,
@@ -4834,7 +4885,7 @@ mod tests {
         let mem = SqliteMemory::with_embedder(
             "test",
             tmp.path(),
-            Arc::new(super::super::embeddings::NoopEmbedding),
+            Arc::new(zeroclaw_providers::embedding::NoopEmbedding),
             0.7,
             0.3,
             1000,
@@ -6136,7 +6187,7 @@ mod tests {
         let mem = SqliteMemory::with_embedder(
             "test",
             tmp.path(),
-            Arc::new(super::super::embeddings::NoopEmbedding),
+            Arc::new(zeroclaw_providers::embedding::NoopEmbedding),
             0.7,
             0.3,
             1000,
@@ -6171,7 +6222,7 @@ mod tests {
         let mem = SqliteMemory::with_embedder(
             "test",
             tmp.path(),
-            Arc::new(super::super::embeddings::NoopEmbedding),
+            Arc::new(zeroclaw_providers::embedding::NoopEmbedding),
             0.7,
             0.3,
             1000,

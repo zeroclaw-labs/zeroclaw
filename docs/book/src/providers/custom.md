@@ -8,17 +8,23 @@ Three ways to add a provider ZeroClaw doesn't ship with:
 
 ## OpenAI-compatible endpoint: use the `custom` slot
 
-If the service speaks OpenAI chat-completions, this is a config-only change. The `custom` slot requires `uri` (the family's endpoint enum has no default); reference it from an agent's `model_provider`.
+If the service speaks OpenAI chat-completions, this is a config-only change.
+Define one reusable connection and reference it from an exact model entry:
 
 This is the same `OpenAiCompatibleModelProvider` runtime impl used by `groq`, `mistral`, `xai`, and every other vendor with its own canonical slot in the [catalog](./catalog.md). The difference is which family slot you use: `custom` is the catch-all for endpoints not represented by a vendor slot.
 
 Gateways that cannot accept image-bearing tool results are handled by default: `tool_result_image_policy` defaults to `"relocate"`, which moves the declared image out of the tool result into a following user message such gateways accept, so a vision model still sees it with no extra config. Override it only for different handling: `"image_url"` keeps the image inside the tool message (for gateways that accept it), or `"omit"` drops those payloads while retaining the surrounding tool text. Tool images are declared in an `attachments` array on the native tool-result carrier, so omitting them never edits the result text. This policy governs the native `role = "tool"` carrier's `attachments` array only; prompt-mode tool results (the count-line carrier delivered in a user message) resolve their declared images through a separate path and are unaffected by the setting. To opt into `omit`:
 
 ```toml
-[providers.models.custom.gateway]
+[providers.connections."gateway.prod"]
+kind = "custom"
 uri = "https://gateway.example.com/v1"
+
+[providers.models."chat.gateway"]
+capability = "chat"
+provider = "gateway.prod"
 model = "my-model"
-tool_result_image_policy = "omit"
+options = { tool_result_image_policy = "omit" }
 ```
 
 ### Connection warmup
@@ -82,18 +88,31 @@ Slots `lmstudio`, `osaurus`, `litellm` follow the same pattern, see the [catalog
 
 ## Wire protocol: `wire_api = "responses"`
 
-New **OpenAI** provider slots that are *written to config* (`providers.models.openai.<alias>`, as created by `zeroclaw quickstart` or the gateway/config UI) default to `wire_api = "responses"` because OpenAI's recent GPT models use `POST /v1/responses` as the primary wire. Other bring-your-own-endpoint slots (`custom`, `llamacpp`, and OpenAI-compatible vendors) still default to the chat-completions wire; an endpoint that only speaks the OpenAI **responses** wire (some self-hosted vLLM / TGI deployments) needs an explicit `wire_api = "responses"` opt-in on the alias entry.
+New **OpenAI** provider slots that are *written to config* (`providers.models."<model-ref>"`, as created by `zeroclaw quickstart` or the gateway/config UI) default to `wire_api = "responses"` because OpenAI's recent GPT models use `POST /v1/responses` as the primary wire. Other bring-your-own-endpoint slots (`custom`, `llamacpp`, and OpenAI-compatible vendors) still default to the chat-completions wire; an endpoint that only speaks the OpenAI **responses** wire (some self-hosted vLLM / TGI deployments) needs an explicit `wire_api = "responses"` opt-in on the alias entry.
 
 When set to `"responses"`, the provider is built as an `OpenAiResponsesModelProvider` (full streaming tool calls over the responses protocol) instead of a chat-completions provider. Set `"chat_completions"` to force the legacy wire. Two cases keep chat-completions at runtime for backward compatibility, so no existing setup changes wire on upgrade:
 
-- A **persisted** `providers.models.openai.<alias>` entry that omits `wire_api` deserializes as unset and stays on chat-completions.
+- A **persisted** `providers.models."<model-ref>"` entry that omits `wire_api` deserializes as unset and stays on chat-completions.
 - A **bare** `model_provider = "openai"` reference (or a dotted ref to a nonexistent alias) has no config entry to read; it is built from the family fallback and stays on chat-completions. The responses default applies only when a slot is actually written to config.
 
 `wire_api` is honored by the bring-your-own-endpoint families where the wire is operator-configurable: `openai`, `llamacpp`, and `custom` (plus the generic openai-compatible path). Branded vendor slots (`groq`, `mistral`, `deepseek`, …) have a fixed wire protocol and ignore the field, with one exception: `opencode` honors `wire_api = "responses"` because OpenCode Zen serves both wires. With no `uri` override, the OpenCode responses route targets `https://opencode.ai/zen/v1/responses`:
 
 ```toml
-[providers.models.opencode.default]
-model    = "big-pickle"
+[providers]
+
+[providers.connections]
+
+[providers.connections."opencode.default"]
+kind = "opencode"
+
+[providers.models]
+
+[providers.models."opencode.default"]
+capability = "chat"
+provider = "opencode.default"
+model = "big-pickle"
+
+[providers.models."opencode.default".api]
 wire_api = "responses"
 ```
 
@@ -108,11 +127,22 @@ The value is an opaque 128-bit hex token derived from the active conversation sc
 Nothing needs configuring. To pin the value yourself, for instance to share one affinity scope across replicas, set it explicitly and ZeroClaw leaves it alone:
 
 ```toml
-[providers.models.opencode.default]
-model = "big-pickle"
+[providers]
 
-[providers.models.opencode.default.extra_headers]
+[providers.connections]
+
+[providers.connections."opencode.default"]
+kind = "opencode"
+
+[providers.connections."opencode.default".extra_headers]
 x-opencode-session = "my-fixed-scope"
+
+[providers.models]
+
+[providers.models."opencode.default"]
+capability = "chat"
+provider = "opencode.default"
+model = "big-pickle"
 ```
 
 Hosts other than `opencode.ai` and its subdomains never receive the header. To keep it that way, OpenCode requests follow a redirect only within the same host: a redirect to a different host is not followed, and the request fails with that redirect status.

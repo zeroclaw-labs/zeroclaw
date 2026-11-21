@@ -314,7 +314,7 @@ fn make_memory() -> Arc<dyn Memory> {
         backend: "none".into(),
         ..MemoryConfig::default()
     };
-    Arc::from(zeroclaw_memory::create_memory(&cfg, &std::env::temp_dir(), None).unwrap())
+    Arc::from(zeroclaw_memory::create_memory(&cfg, &std::env::temp_dir()).unwrap())
 }
 
 fn make_sqlite_memory() -> (Arc<dyn Memory>, tempfile::TempDir) {
@@ -323,7 +323,7 @@ fn make_sqlite_memory() -> (Arc<dyn Memory>, tempfile::TempDir) {
         backend: "sqlite".into(),
         ..MemoryConfig::default()
     };
-    let mem = Arc::from(zeroclaw_memory::create_memory(&cfg, tmp.path(), None).unwrap());
+    let mem = Arc::from(zeroclaw_memory::create_memory(&cfg, tmp.path()).unwrap());
     (mem, tmp)
 }
 
@@ -384,6 +384,44 @@ fn build_agent_with_config(
         .tool_dispatcher(Box::new(NativeToolDispatcher))
         .workspace_dir(std::env::temp_dir())
         .config(config)
+        .build()
+        .unwrap()
+}
+
+fn build_agent_with_reasoning_extraction(
+    model_provider: Box<dyn ModelProvider>,
+    dispatcher: Box<dyn ToolDispatcher>,
+) -> Agent {
+    let config = zeroclaw_config::schema::Config {
+        providers: toml::from_str(
+            r#"
+[connections.fixture]
+kind = "custom"
+capabilities = ["chat"]
+[models.reasoning-fixture]
+capability = "chat"
+provider = "fixture"
+model = "test-model"
+options = { extract_text_reasoning = true }
+"#,
+        )
+        .unwrap(),
+        ..Default::default()
+    };
+    Agent::builder()
+        .model_provider(model_provider)
+        .model_provider_name("reasoning-fixture".into())
+        .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+            vec![],
+        ))
+        .memory(make_memory())
+        .observer(make_observer())
+        .tool_dispatcher(dispatcher)
+        .workspace_dir(std::env::temp_dir())
+        .provider_switch_config(crate::agent::agent::ProviderSwitchConfig {
+            config: Some(Arc::new(config)),
+            ..Default::default()
+        })
         .build()
         .unwrap()
 }
@@ -467,7 +505,7 @@ async fn turn_with_no_effective_tools_still_strips_reasoning_tags() {
     let provider = Box::new(ScriptedModelProvider::new(vec![text_response(
         "<think>hidden scratchpad</think>visible answer",
     )]));
-    let mut agent = build_agent_with(provider, vec![], Box::new(XmlToolDispatcher));
+    let mut agent = build_agent_with_reasoning_extraction(provider, Box::new(XmlToolDispatcher));
 
     let response = agent.turn("hi").await.unwrap();
 
@@ -947,7 +985,8 @@ async fn turn_rejects_think_tag_only_response_and_records_usage() {
         }),
         reasoning_content: None,
     }]));
-    let mut agent = build_agent_with(model_provider, vec![], Box::new(NativeToolDispatcher));
+    let mut agent =
+        build_agent_with_reasoning_extraction(model_provider, Box::new(NativeToolDispatcher));
     let cost_context = ToolLoopCostTrackingContext::usage_only();
     let turn_usage = Arc::new(parking_lot::Mutex::new(TurnUsage::default()));
 
