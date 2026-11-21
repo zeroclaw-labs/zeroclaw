@@ -28,7 +28,7 @@ pub(super) struct EntryLayoutInput<'a> {
     pub index: usize,
     pub entry: &'a ChatEntry,
     pub highlighted: bool,
-    pub disclosure: ToolDisclosure,
+    pub disclosure: Option<ToolDisclosure>,
 }
 
 /// Coupled committed layout indexes. Production consumers only borrow this view.
