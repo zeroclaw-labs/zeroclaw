@@ -19,6 +19,21 @@ pub fn run(_tag: Option<&str>) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn cli_reference_line(line: &str) -> String {
+    // clap-markdown keeps punctuation in its contents links. mdBook drops it
+    // when deriving the heading ID (e.g. "mcp.servers" becomes "mcpservers").
+    if line.starts_with("* [`")
+        && let Some((label, fragment)) = line.strip_suffix(')').and_then(|s| s.split_once("`↴](#"))
+    {
+        let id: String = fragment
+            .chars()
+            .filter(|c| c.is_alphanumeric() || matches!(c, '-' | '_'))
+            .collect();
+        return format!("{label}`↴](#{id})");
+    }
+    line.strip_prefix("###### ").unwrap_or(line).to_owned()
+}
+
 pub fn build_refs(root: &Path) -> anyhow::Result<()> {
     let ref_dir = ref_dir(root);
     println!("==> Generating reference/cli.md and reference/config.md from code");
@@ -38,15 +53,9 @@ pub fn build_refs(root: &Path) -> anyhow::Result<()> {
     if !help.status.success() {
         anyhow::bail!("cargo run markdown-help failed");
     }
-    let cli_content: String = String::from_utf8_lossy(&help.stdout)
+    let cli_content = String::from_utf8_lossy(&help.stdout)
         .lines()
-        .map(|l| {
-            if let Some(rest) = l.strip_prefix("###### ") {
-                rest
-            } else {
-                l
-            }
-        })
+        .map(cli_reference_line)
         .collect::<Vec<_>>()
         .join("\n");
     let cli_content = crate::cmd::mdbook::placeholders::normalize(&(cli_content + "\n"));
@@ -140,7 +149,21 @@ pub(crate) fn compose_rustdocflags(inherited: Option<&str>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::compose_rustdocflags;
+    use super::{cli_reference_line, compose_rustdocflags};
+
+    #[test]
+    fn cli_contents_links_match_mdbook_heading_ids() {
+        assert_eq!(
+            cli_reference_line(
+                "* [`zeroclaw onboard mcp.servers`↴](#zeroclaw-onboard-mcp.servers)"
+            ),
+            "* [`zeroclaw onboard mcp.servers`↴](#zeroclaw-onboard-mcpservers)"
+        );
+        let link = "* [`zeroclaw onboard peer_groups`↴](#zeroclaw-onboard-peer_groups)";
+        assert_eq!(cli_reference_line(link), link);
+        let example = "See [custom heading](#custom.id) for `mcp.servers`.";
+        assert_eq!(cli_reference_line(example), example);
+    }
 
     #[test]
     fn compose_with_no_inherited_returns_site_default() {

@@ -7,7 +7,7 @@ Run ZeroClaw in Docker, Podman, Kubernetes, or any OCI runtime.
 Pushed to GitHub Container Registry (`ghcr.io`) on every stable release:
 
 - `ghcr.io/zeroclaw-labs/zeroclaw:latest`: latest stable
-- `ghcr.io/zeroclaw-labs/zeroclaw:v0.7.5`: pinned
+- `ghcr.io/zeroclaw-labs/zeroclaw:v0.9.0`: pinned
 - `ghcr.io/zeroclaw-labs/zeroclaw:debian`: Debian-based image (larger, broader glibc support)
 
 Multi-arch: `linux/amd64`, `linux/arm64`.
@@ -32,8 +32,8 @@ docker build -f Dockerfile.alpine -t zeroclaw:alpine \
 </div>
 
 A build context carries no `.git` (`.dockerignore`), so that `--build-arg` is what
-lets `zeroclaw --version` name its commit; without it the image reports
-`0.8.5 (unknown)`. Images published to `ghcr.io` are stamped by the release
+lets `zeroclaw --version` name its commit; without it the package version is followed by
+`(unknown)`. Images published to `ghcr.io` are stamped by the release
 workflow and need nothing passed by hand.
 
 For a multi-platform registry image, create a builder once and push the manifest. If you already have a buildx builder selected, omit the first command:
@@ -65,8 +65,8 @@ docker compose -f docker-compose.yml -f docker-compose.alpine.yml up --build
 
 </div>
 
-Compose passes no build args here, so an image built this way reports `0.8.5
-(unknown)`; the published `ghcr.io` image the default compose file pulls is
+Compose passes no build args here, so an image built this way reports the package version followed by
+`(unknown)`; the published `ghcr.io` image the default compose file pulls is
 stamped by the release workflow.
 
 The Alpine image uses the same `/zeroclaw-data` mount, schema-mirror environment variables, dashboard path, and gateway port as the existing images.
@@ -81,17 +81,20 @@ The Alpine image uses the same `/zeroclaw-data` mount, schema-mirror environment
 docker run -d \
   --name zeroclaw \
   -v zeroclaw-data:/zeroclaw-data \
-  -p 42617:42617 \
+  -p 127.0.0.1:42617:42617 \
   ghcr.io/zeroclaw-labs/zeroclaw:latest
 ```
 
 </div>
 
-The official image already binds `[::]` with `allow_public_bind = true` and
-`require_pairing = false` baked into its default config, so this direct
-`docker run` example is reachable out of the box. The Compose examples below
-still pin both gateway bind settings so persisted or custom configs cannot
-silently restore a loopback-only listener.
+On a fresh volume, the v0.9.0 release image listens on `[::]` inside the container
+and uses the schema default of `require_pairing = true`. The port mapping above
+publishes the gateway on the host's loopback interface. Check the effective
+setting if you reuse a volume or build your own image:
+
+```sh
+docker exec zeroclaw zeroclaw config get gateway.require_pairing
+```
 
 The image expects persistent state at `/zeroclaw-data`. On first run, it bootstraps a default config: you still need to run quickstart before it's useful:
 
@@ -185,12 +188,11 @@ boundaries are involved and only one of them is enforced:
   `"127.0.0.1:42617:42617"` publishes to the container host only;
   `"42617:42617"` publishes on every host interface Docker is configured with.
 
-The authentication boundary is {{#env-var-name gateway.require_pairing}}, which
-defaults to `true` in the schema but is `false` in the image's baked config. With
-pairing disabled the gateway answers unauthenticated requests on `/webhook`,
-`/api/config`, `/api/memory`, `/api/browse`, and the session endpoints. To serve
-other hosts, drop the `127.0.0.1:` prefix **and** enable pairing or put the
-gateway behind an authenticating reverse proxy or tunnel.
+The gateway checks {{#env-var-name gateway.require_pairing}} for protected endpoints.
+The release image and a build from the repository's root `Dockerfile` have different
+initial settings: the root `Dockerfile` explicitly disables pairing. Before
+making the gateway reachable from other hosts, verify pairing with the config
+and environment you intend to deploy.
 
 ### Rootless Compose with the Debian image
 
@@ -325,13 +327,15 @@ journalctl -u zeroclaw -f
 
 There is no `systemctl enable` step for generated units: the `[Install] WantedBy=` line is what brings it up on boot.
 
-- **Version pinning vs `:latest`.** Pin a tag or digest (`Image=ghcr.io/zeroclaw-labs/zeroclaw:v0.7.5` or `...@sha256:...`) for reproducible, auditable deploys; upgrading is then a reviewable tag bump in the committed `.container` file. `Pull=newer` + `AutoUpdate=registry` instead give rolling upgrades, driven by `podman-auto-update.timer` (`sudo systemctl enable --now podman-auto-update.timer`). Pick reproducibility or currency; the deploy loop is the same either way.
+- **Version pinning vs `:latest`.** Pin a tag or digest (`Image=ghcr.io/zeroclaw-labs/zeroclaw:v0.9.0` or `...@sha256:...`) for reproducible, auditable deploys; upgrading is then a reviewable tag bump in the committed `.container` file. `Pull=newer` + `AutoUpdate=registry` instead give rolling upgrades, driven by `podman-auto-update.timer` (`sudo systemctl enable --now podman-auto-update.timer`). Pick reproducibility or currency; the deploy loop is the same either way.
 - **Rootless variant.** Drop the file in `~/.config/containers/systemd/`, use `systemctl --user daemon-reload && systemctl --user restart zeroclaw`, and run `loginctl enable-linger $USER` so it survives logout (same lingering note as [Service & daemon](../ops/service.md)).
 - **WSL2.** Modern WSL2 runs systemd (`[boot] systemd=true` in `/etc/wsl.conf`, then `wsl --shutdown`), so this exact quadlet pattern works inside a WSL distro: no Windows-specific dialect.
 
 ## Config inside containers
 
-The image expects config under `/zeroclaw-data/.zeroclaw/`. Mount your local config in:
+To use a config file from the host, put it at `./data/.zeroclaw/config.toml`
+and mount the entire `./data` directory. Give the container user (UID 65534 in
+the release image) write access so Quickstart and pairing can persist changes.
 
 <div class="os-tabs-src">
 
@@ -339,9 +343,10 @@ The image expects config under `/zeroclaw-data/.zeroclaw/`. Mount your local con
 
 ```sh
 docker run -d --name zeroclaw \
-  -v $(pwd)/my-config.toml:/zeroclaw-data/.zeroclaw/config.toml:ro \
-  -v zeroclaw-state:/zeroclaw-data/workspace \
-  -p 42617:42617 \
+  -v "$PWD/data:/zeroclaw-data" \
+  -e ZEROCLAW_gateway__host=0.0.0.0 \
+  -e ZEROCLAW_gateway__allow_public_bind=true \
+  -p 127.0.0.1:42617:42617 \
   ghcr.io/zeroclaw-labs/zeroclaw:latest
 ```
 
@@ -355,13 +360,17 @@ See [Providers → Container-friendly overrides](../providers/configuration.md#c
 
 ## Channels that poll (Telegram, email): just work
 
-Outbound-initiated channels don't need any special container configuration. Telegram polling, IMAP, MQTT, Nostr relays: all pull; the container only needs egress.
+Telegram polling, IMAP, MQTT and Nostr relays need outbound connectivity.
+The [Discord bot](../channels/discord.md) connects to Discord's Gateway over
+an outbound WebSocket. [Slack Socket Mode](../channels/slack.md) also opens
+an outbound connection. The [GitHub App channel](../channels/git-github-app.md) polls
+GitHub's API. You can run these transports without publishing a gateway port.
 
 ## Channels that receive webhooks: need ingress
 
-Discord, Slack, GitHub, and most webhook channels need inbound HTTP. Two options:
+For a transport configured to receive HTTP callbacks, such as the webhook channel, provide an HTTPS endpoint the sender can reach. Two options:
 
-1. **Expose the gateway**: `-p 42617:42617` + reverse proxy with TLS in front, point the webhook URL at the public address
+1. **Reverse proxy**: publish the receiver on host loopback and forward the callback path through a TLS reverse proxy on that host.
 2. **Use a tunnel**: ngrok, Cloudflare Tunnel, or Tailscale Funnel; set the tunnel URL as the webhook target
 
 Configure a tunnel by setting the top-level `[tunnel]` `tunnel_provider` (override env var: {{#env-var-name tunnel.tunnel_provider}}) to one of the supported providers and filling the matching `tunnel.*` block; the full provider list and per-provider fields are in the [Config reference](../reference/config.md#tunnel). The resulting public URL is what you point your webhook senders at.
@@ -383,7 +392,7 @@ spec:
     spec:
       containers:
         - name: zeroclaw
-          image: ghcr.io/zeroclaw-labs/zeroclaw:v0.7.5
+          image: ghcr.io/zeroclaw-labs/zeroclaw:v0.9.0
           ports:
             - containerPort: 42617
           volumeMounts:
@@ -430,7 +439,7 @@ docker compose exec zeroclaw zeroclaw gateway get-paircode --new
 
 - **macOS hostname quirks (Docker Desktop, colima, Rancher Desktop).** `host.docker.internal` works out of the box on **Docker Desktop** for macOS. On **colima**, it is only reachable if you installed with `colima start --network-address` (otherwise the container can't see the host at all; connect via the VM's gateway IP, usually `192.168.5.2`, or tunnel through a shared network). **Rancher Desktop** behaves like Docker Desktop for recent versions but has had `host.docker.internal` resolve-failures on older releases. If provider calls fail with `connection refused` to `host.docker.internal`, verify with `docker run --rm alpine getent hosts host.docker.internal`: empty output means the hostname isn't resolvable and you need an explicit IP.
 - **Host-side services.** If a provider is Ollama on the host, `uri = "http://host.docker.internal:11434"` (under `[providers.models.ollama.<alias>]`) works on Docker Desktop. On Linux Docker you may need `--add-host=host.docker.internal:host-gateway`.
-- **Memory persistence.** Agent memory (the SQLite `brain.db`) lives under the config directory at `/zeroclaw-data/.zeroclaw/agents/<alias>/workspace/memory/`, with shared instance databases under `/zeroclaw-data/data/`. Mounting `/zeroclaw-data` persists all of it; skip the volume and every restart loses conversation history.
+- **Memory persistence.** Agent memory (the SQLite `brain.db`) lives under the config directory at `/zeroclaw-data/.zeroclaw/agents/<alias>/workspace/memory/`, with shared instance databases under `/zeroclaw-data/data/`. Mount `/zeroclaw-data` to persist both when replacing the container. An ordinary restart retains the writable layer. Removing the container discards that layer.
 - **Bind-mounting `/zeroclaw-data`.** A host bind mount on `/zeroclaw-data` replaces the entire image directory, including the default config and (previously) the dashboard bundle. The dashboard is now installed at `/usr/share/zeroclawlabs/web/dist`, outside the mount, so a bind mount no longer hides it. On first run, mount an empty host directory and the container bootstraps a fresh config; the gateway auto-detects the dashboard from its image path.
 - **No hardware passthrough by default.** GPIO / USB need explicit `--device` flags (`--device /dev/ttyUSB0`), and the container user needs matching GID for `dialout`/`gpio` groups.
 
