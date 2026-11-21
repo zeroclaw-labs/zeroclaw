@@ -1,5 +1,5 @@
 import type { WorkspaceLayout } from '@/components/ChatTabBar';
-import { getActiveSessionId, newSessionId } from '@/lib/chatSessions';
+import { gatewaySessionKey, getActiveSessionId, newSessionId } from '@/lib/chatSessions';
 import { generateUUID } from '@/lib/uuid';
 import type { Session } from '@/types/api';
 
@@ -58,7 +58,7 @@ export function ownedGatewaySession(sessions: Session[], alias: string, id: stri
   if (matches.length !== 1) return undefined;
   const row = matches[0];
   return row && row.agent_alias === alias && row.channel_id === null
-    && row.session_key === `gw_${row.session_id}` ? row.session_id : undefined;
+    && row.session_key === gatewaySessionKey(row.session_id) ? row.session_id : undefined;
 }
 
 export function tabForRoute(tabs: ChatTab[], alias: string, session?: string, preferredKey?: string): ChatTab {

@@ -12,6 +12,11 @@ import { generateUUID } from './uuid';
  */
 const ACTIVE_SESSION_KEY_PREFIX = 'zeroclaw_active_session';
 
+/** REST routes address the full storage key; WebSockets take the display ID. */
+export function gatewaySessionKey(displayId: string): string {
+  return `gw_${displayId}`;
+}
+
 /**
  * Pre-multi-session key. It held one fixed session id per alias, which is
  * exactly what the pointer now holds, so it is adopted on first read and then

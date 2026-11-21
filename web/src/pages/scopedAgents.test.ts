@@ -139,6 +139,15 @@ test("an unavailable linked conversation opens the agent's ordinary chat", async
   assert.notEqual(r.root.findByType(AgentProvider).props.initialSessionId, "unavailable");
 });
 
+test("a display ID beginning with gw_ reads the exact persisted session key", async () => {
+  sessionList = async () => Response.json({ sessions: [{
+    session_id: "gw_saved", session_key: "gw_gw_saved", agent_alias: "support", channel_id: null,
+  }] });
+  const r = await render("/agent/support?session=gw_gw_saved", createElement(ChatWorkspace, { initialAlias: "support" }), "/agent/:alias");
+  assert.equal(r.root.findByType(AgentProvider).props.initialSessionId, "gw_saved");
+  assert.ok(requested.some((url) => url.endsWith("/api/sessions/gw_gw_saved/messages")));
+});
+
 test("a second notification window delegates to the open workspace", {
   skip: typeof navigator === "undefined" || !navigator.locks || typeof BroadcastChannel === "undefined",
 }, async () => {
@@ -159,6 +168,33 @@ test("a second notification window delegates to the open workspace", {
     assert.ok(first.root.findAllByType(AgentProvider).some((pane) => pane.props.initialSessionId === "active"));
   } finally {
     await act(async () => { second?.unmount(); });
+  }
+});
+
+test("a notification selects the window holding its pane among two ordinary windows", {
+  skip: typeof navigator === "undefined" || !navigator.locks || typeof BroadcastChannel === "undefined",
+}, async () => {
+  const first = await render("/agent/support", createElement(ChatWorkspace, { initialAlias: "support" }), "/agent/:alias");
+  const windows: ReactTestRenderer[] = [];
+  async function open(path: string) {
+    await act(async () => {
+      windows.push(create(createElement(MemoryRouter, { initialEntries: [path] },
+        createElement(ChatWorkspace, { initialAlias: "support" }))));
+    });
+    await settle();
+    return windows[windows.length - 1]!;
+  }
+  try {
+    const other = await open("/agent/support");
+    const id = other.root.findByType(AgentProvider).props.initialSessionId;
+    assert.notEqual(first.root.findByType(AgentProvider).props.initialSessionId, id);
+    sessionList = async () => Response.json({sessions: [{session_id: id, session_key: `gw_${id}`, agent_alias: "support", channel_id: null}]});
+    const alert = await open(`/agent/support?notify=1&session=gw_${id}`);
+    assert.match(text(alert.root), /existing ZeroClaw window/);
+    assert.equal(first.root.findAllByType(AgentProvider).length, 1);
+    assert.equal(other.root.findByType(AgentProvider).props.initialSessionId, id);
+  } finally {
+    await act(async () => { for (const win of windows) win.unmount(); });
   }
 });
 

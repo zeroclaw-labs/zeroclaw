@@ -6,7 +6,7 @@ import { ChatTabBar, type TabIndicator, type WorkspaceLayout } from '@/component
 import { basePath } from '@/lib/basePath';
 import { getSessions } from '@/lib/api';
 import { t } from '@/lib/i18n';
-import { useNotificationWindow } from './useNotificationWindow';
+import { useNotificationWindow, useWindowPanes } from './useNotificationWindow';
 import {
   applySessionChange,
   loadPersisted,
@@ -52,7 +52,7 @@ export interface ChatWorkspaceProps {
  */
 export default function ChatWorkspace({ initialAlias, allowedAliases }: ChatWorkspaceProps) {
   const location = useLocation();
-  const notificationWindow = useNotificationWindow(initialAlias);
+  const { state: notificationWindow, windowId } = useNotificationWindow(initialAlias);
   const requested = linkedSession(location.search);
   const [resolved, setResolved] = useState<{ alias: string; routeKey: string; requested?: string; session?: string }>();
   useEffect(() => {
@@ -75,11 +75,11 @@ export default function ChatWorkspace({ initialAlias, allowedAliases }: ChatWork
   if (notificationWindow === 'waiting' || !route || (allowedAliases && !allowedAliases.has(route.alias))) return null;
   const waiting = route.routeKey !== location.key || route.alias !== initialAlias || route.requested !== requested;
   return <Workspace initialAlias={route.alias} allowedAliases={allowedAliases}
-    session={route.session} routeKey={route.routeKey} waiting={waiting} />;
+    session={route.session} routeKey={route.routeKey} waiting={waiting} windowId={windowId} />;
 }
 
-function Workspace({ initialAlias, allowedAliases, session, routeKey, waiting }: ChatWorkspaceProps & {
-  session?: string; routeKey: string; waiting: boolean;
+function Workspace({ initialAlias, allowedAliases, session, routeKey, waiting, windowId }: ChatWorkspaceProps & {
+  session?: string; routeKey: string; waiting: boolean; windowId: string;
 }) {
   const persisted = useRef<Partial<PersistedState>>(loadPersisted());
 
@@ -99,6 +99,7 @@ function Workspace({ initialAlias, allowedAliases, session, routeKey, waiting }:
   const [activeKey, setActiveKey] = useState<string>(() => {
     return tabForRoute(tabs, initialAlias, session, persisted.current.activeKey).key;
   });
+  useWindowPanes(windowId, tabs);
   const [layout, setLayout] = useState<WorkspaceLayout>(persisted.current.layout ?? 'tabs');
   const [splitKeys, setSplitKeys] = useState<[string, string | null]>(
     persisted.current.splitKeys ?? ['', null],
