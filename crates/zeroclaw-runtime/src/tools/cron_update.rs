@@ -146,7 +146,7 @@ impl Tool for CronUpdateTool {
                         // NOTE: oneOf is correct for OpenAI-compatible APIs (including OpenRouter).
                         // Gemini does not support oneOf in tool schemas; if Gemini native tool calling
                         // is ever wired up, SchemaCleanr::clean_for_gemini must be applied before
-                        // tool specs are sent. See src/tools/schema.rs.
+                        // tool specs are sent. See `zeroclaw_api::schema::SchemaCleanr::clean_for_gemini`.
                         "schedule": {
                             "description": "New schedule for the job. Exactly one of three forms must be used.",
                             "oneOf": [

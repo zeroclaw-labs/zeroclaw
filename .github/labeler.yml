@@ -371,7 +371,6 @@
 "runtime:wasm":
   - changed-files:
       - any-glob-to-any-file:
-          - "crates/zeroclaw-runtime/src/platform/wasm.rs"
           - "crates/zeroclaw-plugins/src/wasm_tool.rs"
           - "crates/zeroclaw-plugins/src/wasm_channel.rs"
 
@@ -433,8 +432,6 @@
       - any-glob-to-any-file:
           - "crates/zeroclaw-tools/src/claude_code.rs"
           - "crates/zeroclaw-tools/src/claude_code_runner.rs"
-          - "src/tools/claude_code.rs"
-          - "src/tools/claude_code_runner.rs"
 
 "provider:compatible":
   - changed-files:
@@ -514,11 +511,6 @@
 "tool:browser":
   - changed-files:
       - any-glob-to-any-file:
-          - "src/tools/browser.rs"
-          - "src/tools/browser_delegate.rs"
-          - "src/tools/browser_open.rs"
-          - "src/tools/text_browser.rs"
-          - "src/tools/screenshot.rs"
           - "crates/zeroclaw-tools/src/browser.rs"
           - "crates/zeroclaw-tools/src/browser_delegate.rs"
           - "crates/zeroclaw-tools/src/browser_open.rs"
@@ -528,7 +520,6 @@
 "tool:composio":
   - changed-files:
       - any-glob-to-any-file:
-          - "src/tools/composio.rs"
           - "crates/zeroclaw-tools/src/composio.rs"
 
 "tool:cron":
@@ -550,10 +541,6 @@
 "tool:file":
   - changed-files:
       - any-glob-to-any-file:
-          - "src/tools/file_edit.rs"
-          - "src/tools/file_write.rs"
-          - "src/tools/glob_search.rs"
-          - "src/tools/content_search.rs"
           - "crates/zeroclaw-tools/src/file_edit.rs"
           - "crates/zeroclaw-runtime/src/tools/file_read.rs"
           - "crates/zeroclaw-tools/src/file_write.rs"
@@ -563,23 +550,16 @@
 "tool:google-workspace":
   - changed-files:
       - any-glob-to-any-file:
-          - "src/tools/google_workspace.rs"
           - "crates/zeroclaw-tools/src/google_workspace.rs"
 
 "tool:pushover":
   - changed-files:
       - any-glob-to-any-file:
-          - "src/tools/pushover.rs"
           - "crates/zeroclaw-tools/src/pushover.rs"
 
 "tool:mcp":
   - changed-files:
       - any-glob-to-any-file:
-          - "src/tools/mcp_client.rs"
-          - "src/tools/mcp_deferred.rs"
-          - "src/tools/mcp_protocol.rs"
-          - "src/tools/mcp_tool.rs"
-          - "src/tools/mcp_transport.rs"
           - "crates/zeroclaw-tools/src/mcp_client.rs"
           - "crates/zeroclaw-tools/src/mcp_deferred.rs"
           - "crates/zeroclaw-tools/src/mcp_protocol.rs"
@@ -589,9 +569,6 @@
 "tool:memory":
   - changed-files:
       - any-glob-to-any-file:
-          - "src/tools/memory_forget.rs"
-          - "src/tools/memory_recall.rs"
-          - "src/tools/memory_store.rs"
           - "crates/zeroclaw-tools/src/memory_forget.rs"
           - "crates/zeroclaw-tools/src/memory_recall.rs"
           - "crates/zeroclaw-tools/src/memory_store.rs"
@@ -604,7 +581,6 @@
 "tool:shell":
   - changed-files:
       - any-glob-to-any-file:
-          - "src/tools/cli_discovery.rs"
           - "crates/zeroclaw-runtime/src/tools/shell.rs"
           - "crates/zeroclaw-gateway/src/node_tool.rs"
           - "crates/zeroclaw-tools/src/cli_discovery.rs"
@@ -621,10 +597,6 @@
 "tool:web":
   - changed-files:
       - any-glob-to-any-file:
-          - "src/tools/web_fetch.rs"
-          - "src/tools/web_search_tool.rs"
-          - "src/tools/web_search_provider_routing.rs"
-          - "src/tools/http_request.rs"
           - "crates/zeroclaw-tools/src/web_fetch.rs"
           - "crates/zeroclaw-tools/src/web_search_tool.rs"
           - "crates/zeroclaw-tools/src/web_search_provider_routing.rs"
@@ -639,8 +611,6 @@
 "tool:cloud":
   - changed-files:
       - any-glob-to-any-file:
-          - "src/tools/cloud_ops.rs"
-          - "src/tools/cloud_patterns.rs"
           - "crates/zeroclaw-tools/src/cloud_ops.rs"
           - "crates/zeroclaw-tools/src/cloud_patterns.rs"
 
