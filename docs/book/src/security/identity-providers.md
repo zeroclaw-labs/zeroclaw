@@ -14,7 +14,7 @@ The daemon verifies every access token with the same rules, whether it arrives t
   - `introspection`: RFC 7662 token introspection whose answer carries `active: true`, `token_type: Bearer`, the configured `audience` and a `client_id`. The discovery document must list `introspection_endpoint`. This mode needs the entry's `client_secret`.
 - **Nothing that marks it as another kind of token.** In either mode, the token (or the introspection answer) must not carry a `nonce` claim. A `typ` or `token_use` claim, if present, must name an access token: `typ` `Bearer` or `at+jwt`, and `token_use` exactly `access`.
 - **The audience.** The access token's `aud` must contain the configured `audience`.
-- **Roles or groups without an extra scope.** ZeroClaw requests only the `openid` scope, so the values at `claim_path` must be in the access token (or the introspection answer) by default. Otherwise, map people one by one, for example with `claim_path = "sub"`.
+- **Roles or groups in the token.** The values at `claim_path` must be in the access token (or the introspection answer). ZeroClaw requests only `openid` unless the entry sets `scopes` (for the device grant and browser sign-in) or `service_scopes` (for `client_credentials`), so a provider that releases groups only for another scope needs that scope listed there. Otherwise, map people one by one, for example with `claim_path = "sub"`.
 - **Client authentication by request.** The authorization-code exchange (dashboard sign-in, `zeroclaw oidc login --browser` and the gateway's browser enrollment) sends the `client_secret` in the form body (`client_secret_post`). Introspection, the device grant and `client_credentials` send it with HTTP Basic (`client_secret_basic`). A provider that accepts only the method registered for a client may need a separate `[oidc.<alias>]` entry and client for the device grant or `client_credentials`. Dashboard sign-in with `introspection` can't be split that way: one client makes both the exchange and the introspection call, so it has to accept both methods.
 - **A working-session token lifetime,** such as one to eight hours. The dashboard doesn't use refresh tokens, so a session ends when its access token expires.
 
@@ -47,7 +47,7 @@ Each provider below signed in an administrator and a member account through dash
 
 - Register the client with `token_endpoint_auth_method: client_secret_post`, `access_token_signed_response_alg: RS256` and PKCE `S256`. The default `client_secret_basic` fails the code exchange.
 - Set the client's `audience` to the configured `audience`, with `requested_audience_mode: implicit`. Authelia's default, `explicit`, adds an audience only when the client asks for one, and ZeroClaw doesn't.
-- Map people one by one (`claim_path = "sub"`). Authelia's group claim needs a `groups` scope, which ZeroClaw doesn't request.
+- Map people one by one (`claim_path = "sub"`). Authelia's group claim needs a `groups` scope. It can now be requested with `scopes = ["openid", "groups"]`, but that hasn't been tested with Authelia.
 - `introspection` doesn't work: Authelia's introspection answer has no `token_type`.
 - Authelia serves its issuer over HTTPS only, so its certificate must chain to a certificate authority the daemon trusts (see [Limitations](#limitations-in-v090)).
 
@@ -69,7 +69,6 @@ Any other provider, hosted or self-hosted, hasn't been tested. Check it against 
 ## Limitations in v0.9.0
 
 - **No RFC 8707 `resource` parameter.** Providers that issue a verifiable access token only for a named resource, such as Logto, can't sign people in yet.
-- **No configurable scopes.** Every request asks for `openid` only, so claims that a provider releases only for another scope (often `groups`) never arrive.
 - **No private certificate authority per provider.** The issuer's TLS certificate must chain to a certificate authority the daemon already trusts. There's no setting to add one for a single provider.
 - **The CLI's gateway admin commands don't work when the gateway serves TLS itself** ([#12091](https://github.com/zeroclaw-labs/zeroclaw/issues/12091)).
   - The affected commands are `zeroclaw gateway get-paircode` in every form, `zeroclaw sop pending`, `logs`, `approve` and `deny`, and `zeroclaw gateway restart`.
