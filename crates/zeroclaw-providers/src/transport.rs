@@ -84,6 +84,10 @@ pub(crate) struct HttpTransportConfig {
     pub(crate) extra_headers: BTreeMap<String, String>,
     pub(crate) request_timeout_secs: Option<Override<NonZeroU64>>,
     pub(crate) tls_ca_cert_path: Option<String>,
+    /// Existing capability adapters follow provider redirects by default.
+    /// Native protocols can opt out when forwarding credentials to a new
+    /// origin would violate their protocol boundary.
+    pub(crate) follow_redirects: bool,
 }
 
 impl std::fmt::Debug for HttpTransportConfig {
@@ -104,6 +108,7 @@ impl HttpTransportConfig {
             extra_headers: connection.extra_headers().cloned().unwrap_or_default(),
             request_timeout_secs,
             tls_ca_cert_path: connection.tls_ca_cert_path().map(ToOwned::to_owned),
+            follow_redirects: true,
         })
     }
 
@@ -114,7 +119,13 @@ impl HttpTransportConfig {
             extra_headers: BTreeMap::new(),
             request_timeout_secs: None,
             tls_ca_cert_path: None,
+            follow_redirects: true,
         }
+    }
+
+    pub(crate) fn without_redirects(mut self) -> Self {
+        self.follow_redirects = false;
+        self
     }
 
     pub fn client(&self, default_timeout: Duration, service_key: &str) -> Result<Client> {
@@ -134,14 +145,16 @@ impl HttpTransportConfig {
         timeout.hash(&mut fingerprint);
         self.extra_headers.hash(&mut fingerprint);
         certificate.hash(&mut fingerprint);
+        self.follow_redirects.hash(&mut fingerprint);
         let profile = format!("provider-http:{:016x}", fingerprint.finish());
         zeroclaw_config::schema::try_build_runtime_proxy_client_with(
             service_key,
             &profile,
             |builder| {
-                let mut builder = builder
-                    .redirect(reqwest::redirect::Policy::none())
-                    .default_headers(self.headers()?);
+                let mut builder = builder.default_headers(self.headers()?);
+                if !self.follow_redirects {
+                    builder = builder.redirect(reqwest::redirect::Policy::none());
+                }
                 if let Some(timeout) = timeout {
                     builder = builder.timeout(timeout);
                 }

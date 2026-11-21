@@ -34,7 +34,8 @@ impl DecisionProviderConfig {
             transport: HttpTransportConfig::from_connection(
                 resolved.selection.connection,
                 resolved.request_timeout_secs.clone(),
-            )?,
+            )?
+            .without_redirects(),
             model: resolved.model.to_owned(),
             wire_api: resolved.wire_api,
         })
