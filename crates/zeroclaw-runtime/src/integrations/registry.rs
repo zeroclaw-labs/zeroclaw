@@ -350,6 +350,7 @@ mod tests {
                 excluded_tools: vec![],
                 reply_min_interval_secs: 0,
                 reply_queue_depth_max: 0,
+                edited_messages: false,
             },
         );
         let entries = all_integrations(&config);

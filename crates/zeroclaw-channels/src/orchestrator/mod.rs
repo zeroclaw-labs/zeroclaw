@@ -48341,6 +48341,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 passive_context: false,
                 explicitly_addressed: false,
                 conversation_scope: zeroclaw_api::channel::ChannelConversationScope::Sender,
+                edited: false,
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![zeroclaw_api::media::MediaAttachment {
@@ -52038,6 +52039,7 @@ This is an example JSON object for profile settings."#;
                 passive_context: false,
                 explicitly_addressed: false,
                 conversation_scope: zeroclaw_api::channel::ChannelConversationScope::Sender,
+                edited: false,
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![zeroclaw_api::media::MediaAttachment {
