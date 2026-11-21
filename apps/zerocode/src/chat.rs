@@ -5035,23 +5035,24 @@ impl Chat {
             Ok(result) => {
                 let model = result.overrides.model.unwrap_or_default();
                 let model_provider = result.overrides.model_provider.unwrap_or_default();
-                let summary = if !model_provider.is_empty() {
-                    crate::i18n::t_args(
-                        "zc-model-switch-provider-ok",
-                        &[("provider", &model_provider), ("model", &model)],
-                    )
-                } else {
-                    crate::i18n::t_args("zc-model-switch-model-ok", &[("model", &model)])
-                };
-                state.info_message = Some(crate::widgets::InfoMessage::note(summary));
                 let provider_ref = (!model_provider.is_empty()).then_some(model_provider.as_str());
                 let resolved_model = if !model.is_empty() {
-                    Some(model.clone())
+                    Some(model)
                 } else if let Some(r) = provider_ref {
                     Self::configured_model(rpc, r).await
                 } else {
                     None
                 };
+                let model_label = resolved_model.as_deref().unwrap_or_default();
+                let summary = if !model_provider.is_empty() {
+                    crate::i18n::t_args(
+                        "zc-model-switch-provider-ok",
+                        &[("provider", &model_provider), ("model", model_label)],
+                    )
+                } else {
+                    crate::i18n::t_args("zc-model-switch-model-ok", &[("model", model_label)])
+                };
+                state.info_message = Some(crate::widgets::InfoMessage::note(summary));
                 state.set_model_identity(provider_ref, resolved_model.as_deref());
                 // A model_provider switch changes the catalog — drop the cache
                 // so the next `/model` use refetches.
@@ -13196,6 +13197,63 @@ mod tests {
         assert!(
             rx.try_recv().is_err(),
             "canonical names must never use flattened profile paths"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_model_switch_notice_uses_resolved_registry_model() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = RpcClient::with_rpc(Arc::clone(&rpc));
+        let task = tokio::spawn(async move {
+            let mut active = state();
+            active.set_model_identity(Some("chat.old"), Some("old-model"));
+            Chat::apply_session_override(
+                &client,
+                &mut active,
+                crate::client::SessionOverrides {
+                    model_provider: Some("chat.demo.gateway".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await;
+            active
+        });
+        let configure = next_rpc_request(&mut rx, "session configure").await;
+        assert_eq!(configure["method"], "session/configure");
+        respond_ok(
+            &rpc,
+            &configure,
+            serde_json::json!({
+                "session_id": "sess-1",
+                "overrides": {"model_provider": "chat.demo.gateway"}
+            }),
+        );
+        let registry = next_rpc_request(&mut rx, "canonical registry").await;
+        assert_eq!(registry["method"], "config/provider-registry");
+        respond_ok(
+            &rpc,
+            &registry,
+            serde_json::json!({"models": {
+                "chat.demo.gateway": {"capability": "chat", "provider": "gateway.prod", "model": "upstream-id"}
+            }}),
+        );
+        let active = task.await.unwrap();
+        assert_eq!(
+            active.model_provider_ref.as_deref(),
+            Some("chat.demo.gateway")
+        );
+        assert_eq!(active.model.as_deref(), Some("upstream-id"));
+        assert_eq!(
+            active.info_message.unwrap().text,
+            crate::i18n::t_args(
+                "zc-model-switch-provider-ok",
+                &[("provider", "chat.demo.gateway"), ("model", "upstream-id")]
+            )
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "one registry lookup serves both UI labels"
         );
     }
 
