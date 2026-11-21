@@ -662,6 +662,14 @@ impl AgentWakeBackend for RuntimeAgentWakeBackend {
                 )
                 .await;
                 settle_wake_task(&task_store, &plan.task, &result).await;
+                // The turn is over, so release its lifecycle lease now rather
+                // than when the drain below yields the next plan. Draining can
+                // wait out registration retries indefinitely, and a lease held
+                // there would count a finished turn as active and block
+                // deleting an otherwise idle target. A follow-up takes its own
+                // fresh admission; clones still owned by detached work the
+                // turn spawned keep the shared lease alive on their own.
+                drop(plan.admission.take());
 
                 // Drain wakes that coalesced while this turn ran until one is
                 // ready to run. A follow-up the operator no longer permits
@@ -2265,13 +2273,17 @@ mod tests {
 
     /// Delegates to a real store, except that one numbered `create` waits for
     /// `release` and then fails. That pins a registration failure to a chosen
-    /// wake while the test arranges other wakes around it.
+    /// wake while the test arranges other wakes around it. Independently,
+    /// every `create` fails immediately while `failing` is set, signalling
+    /// `failed` first, so a test can hold the worker in registration backoff.
     struct GatedCreateRegistry {
         inner: Arc<dyn TaskRegistry>,
         creates: std::sync::atomic::AtomicUsize,
         gated_call: usize,
         entered: Arc<tokio::sync::Notify>,
         release: Arc<tokio::sync::Notify>,
+        failing: Arc<std::sync::atomic::AtomicBool>,
+        failed: Arc<tokio::sync::Notify>,
     }
 
     #[async_trait]
@@ -2285,6 +2297,10 @@ mod tests {
                 self.entered.notify_one();
                 self.release.notified().await;
                 anyhow::bail!("gated registration failure");
+            }
+            if self.failing.load(std::sync::atomic::Ordering::SeqCst) {
+                self.failed.notify_one();
+                anyhow::bail!("registration store unavailable");
             }
             self.inner.create(rec).await
         }
@@ -2417,10 +2433,36 @@ mod tests {
                 gated_call,
                 entered: Arc::clone(entered),
                 release: Arc::clone(release),
+                failing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                failed: Arc::new(tokio::sync::Notify::new()),
             }),
             boot_id: real.boot_id,
         };
         (gated, store)
+    }
+
+    /// A control plane over a real store whose registrations fail immediately,
+    /// signalling `failed`, for as long as `failing` is set.
+    fn failing_control_plane(
+        dir: &Path,
+        failing: &Arc<std::sync::atomic::AtomicBool>,
+        failed: &Arc<tokio::sync::Notify>,
+    ) -> (ControlPlaneHandle, Arc<dyn TaskRegistry>) {
+        let real = ControlPlaneHandle::open(dir).expect("isolated control plane");
+        let store = Arc::clone(&real.store);
+        let flaky = ControlPlaneHandle {
+            store: Arc::new(GatedCreateRegistry {
+                inner: Arc::clone(&store),
+                creates: std::sync::atomic::AtomicUsize::new(0),
+                gated_call: 0,
+                entered: Arc::new(tokio::sync::Notify::new()),
+                release: Arc::new(tokio::sync::Notify::new()),
+                failing: Arc::clone(failing),
+                failed: Arc::clone(failed),
+            }),
+            boot_id: real.boot_id,
+        };
+        (flaky, store)
     }
 
     /// Wait until another wake is held against `key`: parked as a pending
@@ -2949,6 +2991,105 @@ mod tests {
         );
         assert_eq!(tasks[0].principal_id.as_deref(), Some("sender-1"));
         assert_eq!(*request_count.lock(), 1, "the revoked wake never runs");
+        server.abort();
+    }
+
+    /// A finished turn must not keep its lifecycle lease while the worker
+    /// retries registering the next wake. Runs against the real lifecycle
+    /// coordinator: while the store keeps refusing the follow-up's
+    /// registration, the idle target must have no active turns and deleting
+    /// it must be admitted. Once the store recovers, the accepted wake still
+    /// runs.
+    #[tokio::test]
+    async fn registration_backoff_releases_the_finished_turns_lifecycle_lease() {
+        let provider_entered = Arc::new(tokio::sync::Notify::new());
+        let provider_release = Arc::new(tokio::sync::Notify::new());
+        let (server, mock_addr, request_count) =
+            gated_mock_provider(&provider_entered, &provider_release).await;
+
+        let workspace = tempfile::TempDir::new().expect("temp data dir");
+        let config = mock_provider_config(workspace.path(), mock_addr);
+        let authority = crate::LiveConfigAuthority::new(config.clone());
+        let lifecycle = authority.agent_lifecycle();
+
+        let failing = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let failed = Arc::new(tokio::sync::Notify::new());
+        let (control_plane, store) = failing_control_plane(workspace.path(), &failing, &failed);
+        let coordinator = Arc::new(SharedWakeCoordinator::new());
+        let backend = RuntimeAgentWakeBackend::for_tests(
+            Arc::new(config),
+            Some(authority.live_handle()),
+            Some(authority.execution_capability()),
+            Some(control_plane),
+            Arc::clone(&coordinator),
+        );
+
+        assert_eq!(
+            backend
+                .wake(&scope(), Some("sender-1"), "recipient", "first")
+                .await,
+            Ok(())
+        );
+        tokio::time::timeout(Duration::from_secs(10), provider_entered.notified())
+            .await
+            .expect("first turn reaches mock provider");
+        assert_eq!(
+            lifecycle.active_turn_count("recipient"),
+            1,
+            "the running turn holds a real lifecycle lease"
+        );
+
+        // The store goes down before the accepted follow-up registers.
+        failing.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            backend
+                .wake(&scope(), Some("sender-2"), "recipient", "second")
+                .await,
+            Ok(())
+        );
+        provider_release.notify_one();
+
+        // Two failed attempts: the worker has settled the first turn and is
+        // retrying. On this single-threaded runtime it is parked in its
+        // backoff sleep whenever this task runs.
+        for attempt in 1..=2 {
+            tokio::time::timeout(Duration::from_secs(10), failed.notified())
+                .await
+                .unwrap_or_else(|_| panic!("registration attempt {attempt} must fail"));
+        }
+        assert_eq!(
+            lifecycle.active_turn_count("recipient"),
+            0,
+            "a finished turn must not count as active during registration backoff"
+        );
+        let delete = lifecycle
+            .begin_delete("recipient")
+            .expect("an idle agent can be deleted during registration backoff");
+        // Abandon the delete uncommitted: the alias stays and the probe ends.
+        drop(delete);
+
+        // The store recovers; the accepted wake retries and runs.
+        failing.store(false, std::sync::atomic::Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(10), provider_entered.notified())
+            .await
+            .expect("the accepted wake runs once registration recovers");
+        provider_release.notify_one();
+
+        await_slots_released(&coordinator).await;
+        let tasks = tasks_for(store.as_ref(), "recipient").await;
+        let principals: Vec<_> = tasks
+            .iter()
+            .map(|task| task.principal_id.as_deref())
+            .collect();
+        assert_eq!(tasks.len(), 2, "{principals:?}");
+        assert!(principals.contains(&Some("sender-1")));
+        assert!(principals.contains(&Some("sender-2")));
+        for task in &tasks {
+            let snapshot = await_terminal(store.as_ref(), &task.id).await;
+            assert_eq!(snapshot.task.status, TaskStatus::Completed);
+        }
+        assert_eq!(*request_count.lock(), 2);
+        assert_eq!(lifecycle.active_turn_count("recipient"), 0);
         server.abort();
     }
 

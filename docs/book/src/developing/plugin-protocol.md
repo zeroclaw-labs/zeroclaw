@@ -513,7 +513,9 @@ Every call passes five host-owned checks before spawning a turn:
    returns to the pending slot (unless a newer wake has already replaced it)
    and is retried with capped exponential backoff, re-checking the live grant
    and target before each attempt, so an accepted wake runs exactly once or is
-   cancelled by an operator edit.
+   cancelled by an operator edit. The finished turn's lifecycle lease is
+   released before the worker drains or retries, so an idle target stays
+   deletable while a follow-up waits for the store.
    Idle pairs also spend from the per-instance continuous token bucket, admit
    against `AgentExecutionCapability`, record a durable `TaskRecord`, and run
    under `InternalPrincipal::PluginTool`.
