@@ -211,7 +211,8 @@ pub struct SlackChannel {
     /// Voice transcription config — when set, audio file attachments are
     /// downloaded, transcribed, and their text inlined into the message.
     transcription: Option<zeroclaw_config::schema::TranscriptionConfig>,
-    transcription_manager: Option<std::sync::Arc<super::transcription::TranscriptionManager>>,
+    transcription_manager:
+        Option<std::sync::Arc<zeroclaw_providers::transcription::TranscriptionManager>>,
     /// Enable progressive draft message updates via `chat.update`.
     stream_drafts: bool,
     /// Minimum interval (ms) between draft edits to stay within Slack rate limits.
@@ -622,7 +623,7 @@ impl SlackChannel {
     /// otherwise leaves the choice unbound (see
     /// `transcription::manager_from_snapshot`).
     pub fn with_transcription(self, config: zeroclaw_config::schema::TranscriptionConfig) -> Self {
-        let manager = super::transcription::manager_from_snapshot(&config);
+        let manager = zeroclaw_providers::transcription::manager_from_snapshot(&config);
         self.with_transcription_manager(config, manager)
     }
 
@@ -632,7 +633,7 @@ impl SlackChannel {
     pub(crate) fn with_transcription_manager(
         mut self,
         config: zeroclaw_config::schema::TranscriptionConfig,
-        manager: Option<std::sync::Arc<super::transcription::TranscriptionManager>>,
+        manager: Option<std::sync::Arc<zeroclaw_providers::transcription::TranscriptionManager>>,
     ) -> Self {
         if let Some(manager) = manager {
             self.transcription_manager = Some(manager);
