@@ -31,12 +31,38 @@ jobs:
       - name: Install cargo-deny
         run: cargo install cargo-deny --locked
 
+      - name: Install cargo-audit
+        run: |
+          curl -LsSf https://github.com/rustsec/rustsec/releases/download/cargo-audit%2Fv0.22.2/cargo-audit-x86_64-unknown-linux-gnu-v0.22.2.tgz \
+            | tar zxf - -C ~/.cargo/bin --strip-components=1
+
       - name: Run advisory scan
         id: scan
         continue-on-error: true
         shell: bash
         run: |
-          cargo deny check advisories 2>&1 | tee /tmp/advisory-output.txt
+          {
+            scan_exit_code=0
+            printf 'Scoped advisory policy\n'
+            python3 - <<'PY' || scan_exit_code=1
+          import subprocess
+          import sys
+          import tomllib
+
+          with open(".cargo/audit.toml", "rb") as policy_file:
+              ignored = tomllib.load(policy_file).get("advisories", {}).get("ignore", [])
+          if "RUSTSEC-2026-0382" in ignored:
+              subprocess.run(["cargo", "fetch", "--locked"], check=True)
+              subprocess.run(
+                  [sys.executable, "scripts/ci/webpki_advisory_scope.py"], check=True
+              )
+          PY
+            printf '\ncargo-deny (resolved dependency graph)\n'
+            cargo deny check advisories || scan_exit_code=1
+            printf '\ncargo-audit (full Cargo.lock)\n'
+            cargo audit || scan_exit_code=1
+            exit "$scan_exit_code"
+          } 2>&1 | tee /tmp/advisory-output.txt
           exit "${PIPESTATUS[0]}"
 
       - name: Open issue on advisory failure
@@ -74,9 +100,9 @@ jobs:
             printf '## Advisory scan failed\n\n'
             printf 'Workflow run: %s\n\n' "${RUN_URL}"
             printf '```\n%s\n```\n\n' "${advisory_output}"
-            printf 'Review `deny.toml` for the current ignore list. If this advisory is a known\n'
-            printf 'acceptable risk, add an entry with a `reason` field. If it requires a\n'
-            printf 'dependency update, open a tracking issue and link it here.\n\n'
+            printf 'Review `deny.toml` and `.cargo/audit.toml` for the current advisory policy.\n'
+            printf 'Document any accepted risk with a rationale and tracking issue. If a\n'
+            printf 'dependency update is needed, link its remediation issue here.\n\n'
             if [[ "$GITHUB_REPOSITORY" == "zeroclaw-labs/zeroclaw" ]]; then
               printf 'cc @JordanTheJet @Audacity88\n'
             fi

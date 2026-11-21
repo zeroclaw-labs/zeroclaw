@@ -5,10 +5,12 @@ use crate::tools::shell_env::{ForwardedEnvironment, SAFE_SHELL_ENV_VARS};
 use async_trait::async_trait;
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsStr;
 use std::sync::Arc;
 use std::time::Duration;
 use zeroclaw_api::platform::is_android;
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult, with_ephemeral_workspace_warning};
+use zeroclaw_config::policy::ShellTarget;
 
 /// Maximum output size in bytes (1MB).
 const MAX_OUTPUT_BYTES: usize = 1_048_576;
@@ -69,17 +71,10 @@ pub struct ShellTool {
     /// real shell environment (PATH, credentials, etc.) reach subprocesses
     /// even though the daemon itself may have a stripped-down env.
     ///
-    /// The value is an immutable [`ForwardedEnvironment`] (`Arc<HashMap>`): the
-    /// SAME handle is shared with the owning `Agent` and the RPC session so
-    /// admission can inspect the incarnation without copying values into a
-    /// second authorization cache. Behind a `RwLock` because a sealed registry
-    /// stores this tool inside an `Arc<dyn Tool>` (see `ArcDelegatingTool`): a
-    /// session RESUMED by a different connection re-derives this environment
-    /// through `rebind_forwarded_env(&self, ..)`, which needs interior
-    /// mutability since `&mut` cannot reach through the shared `Arc`. Rebinding
-    /// swaps the handle wholesale; it never mutates a map an in-flight turn is
-    /// already executing with.
-    tui_env: std::sync::RwLock<Option<ForwardedEnvironment>>,
+    /// Immutable for the session incarnation. The same Arc is held by the
+    /// Agent and RpcSession, so admission and subprocess execution inspect
+    /// one map throughout that incarnation.
+    tui_env: Option<ForwardedEnvironment>,
     persistent_writes: bool,
 }
 
@@ -91,7 +86,7 @@ impl ShellTool {
             runtime,
             sandbox: Arc::new(crate::security::NoopSandbox),
             timeout_secs,
-            tui_env: std::sync::RwLock::new(None),
+            tui_env: None,
             persistent_writes: true,
         }
     }
@@ -107,7 +102,7 @@ impl ShellTool {
             runtime,
             sandbox,
             timeout_secs,
-            tui_env: std::sync::RwLock::new(None),
+            tui_env: None,
             persistent_writes: true,
         }
     }
@@ -127,7 +122,7 @@ impl ShellTool {
     /// Pass `Some(env)` to enable forwarding; `None` is a no-op (same as not
     /// calling this method at all).
     pub fn with_tui_env(mut self, env: Option<HashMap<String, String>>) -> Self {
-        self.tui_env = std::sync::RwLock::new(env.map(Arc::new));
+        self.tui_env = env.map(Arc::new);
         self
     }
 
@@ -135,7 +130,7 @@ impl ShellTool {
     /// also hand the same `Arc` to the `Agent`/RPC session use this so the
     /// tool, the agent and admission all observe one immutable map.
     pub(crate) fn with_shared_tui_env(mut self, env: Option<ForwardedEnvironment>) -> Self {
-        self.tui_env = std::sync::RwLock::new(env);
+        self.tui_env = env;
         self
     }
 }
@@ -198,25 +193,6 @@ impl Tool for ShellTool {
         "Execute a shell command in the workspace directory"
     }
 
-    /// Re-point the forwarded client environment for a REUSED shell tool. The
-    /// value passed in is already filtered for the current connection's
-    /// entitlement (empty = overlay nothing), so a session resumed by a
-    /// principal that no longer keeps a forwarded environment stops overlaying
-    /// the environment the first `initialize` captured. An empty map installs
-    /// `None` so `execute` skips the overlay branch entirely. Takes `&self` and
-    /// swaps through the `RwLock` because the sealed registry holds this tool
-    /// behind a shared `Arc`.
-    fn rebind_forwarded_env(&self, env: Option<std::collections::HashMap<String, String>>) {
-        // An empty map installs `None` so `execute` skips the overlay branch
-        // entirely; a non-empty map is wrapped in a fresh `Arc` and swapped in
-        // wholesale, so an in-flight turn keeps the handle it began with.
-        *self
-            .tui_env
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-            env.filter(|map| !map.is_empty()).map(Arc::new);
-    }
-
     fn parameters_schema(&self) -> serde_json::Value {
         json!({
             "type": "object",
@@ -255,11 +231,24 @@ impl Tool for ShellTool {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
-        match self.security.validate_command_execution_for_shell(
-            command,
-            approved,
-            self.runtime.shell_dialect(),
-        ) {
+        // The forwarded map is immutable for the session incarnation, so the
+        // policy's choice of grammar, launcher resolution and the child
+        // process all read the same `PATH`.
+        let tui_env_snapshot = self.tui_env.as_ref();
+        let effective_path = tui_env_snapshot
+            .and_then(|env| env.get("PATH"))
+            .map(OsStr::new);
+        // The policy reads the command in the grammar of the program this
+        // runtime will resolve on that `PATH`. Nothing is built until the
+        // policy accepts the command.
+        let shell = self
+            .security
+            .command_shell(ShellTarget::of(self.runtime.as_ref(), effective_path));
+
+        match self
+            .security
+            .validate_command_execution_in(command, approved, shell)
+        {
             Ok(_) => {}
             Err(reason) => {
                 return Ok(ToolResult {
@@ -276,7 +265,7 @@ impl Tool for ShellTool {
         // null device only on the native Windows execution path.
         if let Some(path) = self
             .security
-            .forbidden_workspace_path_argument_for_shell(command, self.runtime.shell_dialect())
+            .forbidden_workspace_path_argument_in(command, shell)
         {
             return Ok(ToolResult {
                 success: false,
@@ -288,10 +277,11 @@ impl Tool for ShellTool {
         // Execute with timeout to prevent hanging commands.
         // Clear the environment to prevent leaking API keys and other secrets
         // (CWE-200), then re-add only safe, functional variables.
-        let mut cmd = match self
-            .runtime
-            .build_shell_command(command, &self.security.workspace_dir)
-        {
+        let mut cmd = match self.runtime.build_shell_command_with_effective_path(
+            command,
+            &self.security.workspace_dir,
+            effective_path,
+        ) {
             Ok(cmd) => cmd,
             Err(e) => {
                 return Ok(ToolResult {
@@ -304,19 +294,34 @@ impl Tool for ShellTool {
             }
         };
 
+        // Hold the built program to the grammar the command was checked in,
+        // before a host sandbox replaces it with its own launcher.
+        if let Err(reason) = self
+            .security
+            .confirm_built_shell(shell, cmd.as_std().get_program())
+        {
+            return Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(reason),
+            });
+        }
+
         // Apply sandbox wrapping before execution.
         // The Sandbox trait operates on std::process::Command, so use as_std_mut
         // to get a mutable reference to the underlying command.
-        self.sandbox.wrap_command(cmd.as_std_mut()).map_err(|e| {
-            ::zeroclaw_log::record!(
-                ERROR,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                "shell tool: sandbox wrap_command failed"
-            );
-            anyhow::Error::msg(format!("Sandbox error: {e}"))
-        })?;
+        self.sandbox
+            .wrap_shell_command(cmd.as_std_mut(), self.runtime.shell_program())
+            .map_err(|e| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    "shell tool: sandbox wrap_command failed"
+                );
+                anyhow::Error::msg(format!("Sandbox error: {e}"))
+            })?;
 
         cmd.env_clear();
 
@@ -333,15 +338,8 @@ impl Tool for ShellTool {
 
         // Overlay TUI env on top of the safe-env snapshot. TUI vars win on
         // conflict — the user's real PATH etc. should take precedence over
-        // whatever the daemon process inherited. Snapshot once: the value can
-        // be rebound on session resume, so read it under the lock and clone the
-        // `Arc` handle out (cheap; no map copy).
-        let tui_env_snapshot = self
-            .tui_env
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
-        if let Some(ref tui_env) = tui_env_snapshot {
+        // whatever the daemon process inherited.
+        if let Some(tui_env) = tui_env_snapshot {
             for (k, v) in tui_env.iter() {
                 cmd.env(k, v);
             }
@@ -354,17 +352,30 @@ impl Tool for ShellTool {
         if is_android() {
             let ambient = std::env::var("PATH").unwrap_or_default();
             let tui_path = tui_env_snapshot
-                .as_ref()
                 .and_then(|env| env.get("PATH"))
                 .map(String::as_str);
             cmd.env("PATH", android_child_path(tui_path, &ambient));
         }
 
         let timeout_secs = self.timeout_secs;
-        // Run in own process group so `ChildGroupGuard` can reap the
-        // whole subtree (backgrounded jobs, subshells) on any exit path.
+        // A process group alone still inherits the daemon's controlling terminal.
+        // A new session detaches it and gives ChildGroupGuard the same child-owned PGID.
         #[cfg(unix)]
-        cmd.process_group(0);
+        {
+            use std::os::unix::process::CommandExt;
+
+            // SAFETY: setsid is async-signal-safe; the post-fork hook takes no
+            // locks and allocates nothing before exec.
+            unsafe {
+                cmd.as_std_mut().pre_exec(|| {
+                    if libc::setsid() == -1 {
+                        Err(std::io::Error::last_os_error())
+                    } else {
+                        Ok(())
+                    }
+                });
+            }
+        }
         cmd.kill_on_drop(true);
         // `output()` pipes stdio implicitly; `spawn()` does not.
         cmd.stdout(std::process::Stdio::piped());
@@ -445,7 +456,7 @@ impl Tool for ShellTool {
         // Inject the warning into whichever field the dispatcher surfaces to the
         // model — `output` on success, `error` on failure — so it is never lost.
         if !self.persistent_writes {
-            result.output = with_ephemeral_workspace_warning(&result.output).into();
+            result.output.map_text(with_ephemeral_workspace_warning);
             if let Some(err) = result.error.take() {
                 result.error = Some(with_ephemeral_workspace_warning(&err));
             }
@@ -568,6 +579,115 @@ fn android_child_path(tui_path: Option<&str>, ambient_path: &str) -> String {
         "/system/bin:/system/xbin".to_string()
     } else {
         format!("/system/bin:/system/xbin:{base}")
+    }
+}
+
+/// Doubles for the regressions that hold a command's grammar to the shell
+/// that runs it, shared by the shell tool, the shell-backed skill tool and
+/// the cron scheduler.
+#[cfg(all(test, unix))]
+pub(crate) mod shell_grammar_test_support {
+    use crate::platform::RuntimeAdapter;
+    use crate::security::SecurityPolicy;
+    use std::ffi::OsStr;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use zeroclaw_api::runtime_traits::ShellDialect;
+
+    /// Bash ends `<<$'EOF'` at the `EOF` line and prints the `echo` line as
+    /// heredoc body. Any other POSIX shell ends it at the literal `$EOF`
+    /// line and runs the `echo`, printing [`RAN_OUTSIDE_BASH`]. The portable
+    /// grammar refuses it.
+    pub(crate) const BASH_ONLY_HEREDOC: &str =
+        "cat <<$'EOF'\nheredoc body\n$EOF\necho OUTSIDE_BASH_$((40+2))\nEOF";
+    /// Printed only when [`BASH_ONLY_HEREDOC`] runs outside bash.
+    pub(crate) const RAN_OUTSIDE_BASH: &str = "OUTSIDE_BASH_42";
+
+    /// The host's canonical bash.
+    pub(crate) fn host_bash() -> Option<PathBuf> {
+        zeroclaw_config::platform::resolve_executable(OsStr::new("bash")).ok()
+    }
+
+    /// A canonical POSIX shell on this host that is not bash.
+    pub(crate) fn host_shell_other_than_bash() -> Option<PathBuf> {
+        ["/bin/sh", "dash", "zsh", "ksh", "mksh"]
+            .into_iter()
+            .find_map(|shell| {
+                let resolved =
+                    zeroclaw_config::platform::resolve_executable(OsStr::new(shell)).ok()?;
+                (resolved.file_name() != Some(OsStr::new("bash"))).then_some(resolved)
+            })
+    }
+
+    /// A wildcard policy with no sandbox, rooted at `workspace`.
+    pub(crate) fn wildcard_policy(workspace: &Path) -> SecurityPolicy {
+        SecurityPolicy {
+            autonomy: zeroclaw_config::policy::AutonomyLevel::Full,
+            workspace_dir: workspace.to_path_buf(),
+            allowed_commands: vec!["*".into()],
+            block_high_risk_commands: false,
+            sandbox_enabled: Some(false),
+            ..SecurityPolicy::default()
+        }
+    }
+
+    /// A runtime that reports one shell program and builds another, as one
+    /// whose shell was resolved earlier, on another `PATH`, can.
+    pub(crate) struct MispredictingRuntime {
+        reported: PathBuf,
+        built: PathBuf,
+        builds: AtomicUsize,
+    }
+
+    impl MispredictingRuntime {
+        pub(crate) fn new(reported: PathBuf, built: PathBuf) -> Self {
+            Self {
+                reported,
+                built,
+                builds: AtomicUsize::new(0),
+            }
+        }
+
+        pub(crate) fn builds(&self) -> usize {
+            self.builds.load(Ordering::SeqCst)
+        }
+    }
+
+    impl RuntimeAdapter for MispredictingRuntime {
+        fn name(&self) -> &str {
+            "mispredicting"
+        }
+
+        fn has_filesystem_access(&self) -> bool {
+            true
+        }
+
+        fn storage_path(&self) -> PathBuf {
+            std::env::temp_dir()
+        }
+
+        fn supports_long_running(&self) -> bool {
+            true
+        }
+
+        fn shell_dialect(&self) -> ShellDialect {
+            ShellDialect::Posix
+        }
+
+        fn shell_program(&self) -> Option<&OsStr> {
+            Some(self.reported.as_os_str())
+        }
+
+        fn build_shell_command(
+            &self,
+            command: &str,
+            workspace_dir: &Path,
+        ) -> anyhow::Result<tokio::process::Command> {
+            self.builds.fetch_add(1, Ordering::SeqCst);
+            let mut process = tokio::process::Command::new(&self.built);
+            process.arg("-c").arg(command).current_dir(workspace_dir);
+            Ok(process)
+        }
     }
 }
 
@@ -905,6 +1025,103 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_child_cannot_open_owners_controlling_terminal() {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        use std::os::unix::process::CommandExt;
+        use std::process::{Command, Stdio};
+
+        const CHILD_MODE: &str = "ZEROCLAW_TEST_SHELL_TERMINAL_CHILD";
+        const TEST_NAME: &str =
+            "tools::shell::tests::shell_child_cannot_open_owners_controlling_terminal";
+
+        if std::env::var_os(CHILD_MODE).is_none() {
+            let mut master_fd = -1;
+            let mut slave_fd = -1;
+            // SAFETY: the output pointers are valid, and optional settings are null.
+            let result = unsafe {
+                libc::openpty(
+                    &mut master_fd,
+                    &mut slave_fd,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            };
+            assert_eq!(result, 0, "openpty: {}", std::io::Error::last_os_error());
+            // SAFETY: openpty supplied two distinct, owned descriptors.
+            let (master, slave) = unsafe {
+                (
+                    OwnedFd::from_raw_fd(master_fd),
+                    OwnedFd::from_raw_fd(slave_fd),
+                )
+            };
+            for fd in [master.as_raw_fd(), slave.as_raw_fd()] {
+                // SAFETY: both descriptors remain live throughout this setup.
+                assert_ne!(
+                    unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) },
+                    -1
+                );
+            }
+
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
+                .args(["--exact", TEST_NAME, "--nocapture", "--test-threads=1"])
+                .env(CHILD_MODE, "1")
+                .stdin(Stdio::from(slave))
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            // SAFETY: only libc syscalls and errno conversion run between fork and exec.
+            unsafe {
+                command.pre_exec(|| {
+                    if libc::setsid() == -1
+                        || libc::ioctl(libc::STDIN_FILENO, libc::TIOCSCTTY as _, 0) == -1
+                        || libc::tcsetpgrp(libc::STDIN_FILENO, libc::getpgrp()) == -1
+                    {
+                        Err(std::io::Error::last_os_error())
+                    } else {
+                        Ok(())
+                    }
+                });
+            }
+            let mut command = tokio::process::Command::from(command);
+            command.kill_on_drop(true);
+            let output = tokio::time::timeout(Duration::from_secs(10), command.output())
+                .await
+                .expect("isolated PTY test should finish")
+                .expect("isolated PTY test should spawn");
+            assert!(
+                output.status.success(),
+                "isolated PTY test failed: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        let tty = std::fs::File::open("/dev/tty").expect("test owner must have a terminal");
+        // SAFETY: tty is live; the process-group query takes no pointers.
+        let owner_group = unsafe { libc::getpgrp() };
+        assert_eq!(unsafe { libc::tcgetpgrp(tty.as_raw_fd()) }, owner_group);
+        // Admit the probe so policy rejection cannot masquerade as terminal isolation.
+        let security = Arc::new(SecurityPolicy {
+            allowed_roots_read_only: vec!["/dev/tty".into()],
+            ..(*unrestricted_shell_test_security()).clone()
+        });
+        let tool = ShellTool::new(security, test_runtime()).with_timeout_secs(2);
+        let result = tool
+            .execute(json!({
+                "command": "if ( : < /dev/tty ) 2> /dev/null; then printf attached; else printf detached; fi"
+            }))
+            .await
+            .unwrap();
+        assert!(result.success, "{:?}", result.error);
+        assert_eq!(result.output.trim(), "detached");
+        // SAFETY: tty still refers to this subprocess's isolated terminal.
+        assert_eq!(unsafe { libc::tcgetpgrp(tty.as_raw_fd()) }, owner_group);
+    }
+
     #[tokio::test]
     async fn shell_executes_allowed_command() {
         let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime());
@@ -966,7 +1183,9 @@ mod tests {
         let runtime: Arc<dyn RuntimeAdapter> =
             Arc::new(NativeRuntime::with_shell("powershell".into()));
         let tool = ShellTool::new(security, runtime);
-        let command = "[Console]::Write('标准输出'); $bytes = [Text.Encoding]::UTF8.GetBytes('标准错误'); [Console]::OpenStandardError().Write($bytes, 0, $bytes.Length)";
+        // This full-script fixture is intentionally outside the bounded grammar.
+        // Emit UTF-8 bytes explicitly so this test isolates hidden redirected capture/decoding.
+        let command = "$stdout = [Text.Encoding]::UTF8.GetBytes('标准输出'); [Console]::OpenStandardOutput().Write($stdout, 0, $stdout.Length); $stderr = [Text.Encoding]::UTF8.GetBytes('标准错误'); [Console]::OpenStandardError().Write($stderr, 0, $stderr.Length)";
 
         let result = tool
             .execute(json!({"command": command, "approved": true}))
@@ -1038,6 +1257,40 @@ mod tests {
                 "POSIX must reject a redirect to `nul` as an unsafe file target: {cmd}"
             );
         }
+    }
+
+    /// Reported regression: with the default forbidden `/dev`, the workspace
+    /// path scan glued the closing `)` or backtick of a substitution onto a
+    /// `2>/dev/null` redirect and refused `/dev/null)`. The commands must run,
+    /// and a forbidden path inside a substitution must still be refused under
+    /// its own name.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_allows_null_redirects_inside_posix_substitutions() {
+        let tool = wrapped_shell(unrestricted_shell_test_security());
+        for (cmd, expected) in [
+            ("x=$(echo zc-subst 2>/dev/null); echo \"$x\"", "zc-subst"),
+            ("(echo zc-group 2>/dev/null)", "zc-group"),
+            ("echo \"`echo zc-tick 2>/dev/null`\"", "zc-tick"),
+        ] {
+            let result = tool
+                .execute(json!({ "command": cmd }))
+                .await
+                .expect("command should return a result");
+            assert!(result.success, "{cmd} must run, got: {result:?}");
+            assert!(result.output.contains(expected), "{cmd}: {result:?}");
+        }
+
+        let result = tool
+            .execute(json!({ "command": "x=$(cat /etc/passwd 2>/dev/null)" }))
+            .await
+            .expect("command should return a result");
+        assert_path_argument_blocked(&result, "forbidden path inside $(...)");
+        let error = result.error.as_deref().unwrap_or("");
+        assert!(
+            error.ends_with("/etc/passwd"),
+            "the blocked path must not carry the closing `)`: {error:?}"
+        );
     }
 
     #[tokio::test]
@@ -1843,6 +2096,96 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn shell_reaps_descendants_after_timeout_or_cancellation() {
+        for cancel in [false, true] {
+            let workspace = tempfile::tempdir().unwrap();
+            let security = Arc::new(SecurityPolicy {
+                workspace_dir: workspace.path().to_path_buf(),
+                ..(*unrestricted_shell_test_security()).clone()
+            });
+            let tool = ShellTool::new(security, test_runtime()).with_timeout_secs(if cancel {
+                10
+            } else {
+                1
+            });
+            // The descendant publishes its own PID, then becomes the sleep, so
+            // the PID file proves it is running and names the process to check.
+            let task = zeroclaw_spawn::spawn!(async move {
+                tool.execute(json!({
+                    "command": "sh -c 'echo $$ > pid.tmp && mv pid.tmp descendant.pid && exec sleep 30' & wait"
+                }))
+                .await
+            });
+            let pid_file = workspace.path().join("descendant.pid");
+            let pid: libc::pid_t = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if let Ok(text) = std::fs::read_to_string(&pid_file) {
+                        break text.trim().parse().expect("descendant PID");
+                    }
+                    assert!(
+                        !task.is_finished(),
+                        "shell exited before starting its descendant"
+                    );
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("shell descendant should start");
+
+            if cancel {
+                task.abort();
+                assert!(task.await.unwrap_err().is_cancelled());
+            } else {
+                let result = task.await.unwrap().unwrap();
+                assert!(!result.success);
+                assert!(result.error.unwrap().contains("timed out"));
+            }
+            let exited = tokio::time::timeout(Duration::from_secs(2), async {
+                while descendant_running(pid) {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .is_ok();
+            if !exited {
+                // SAFETY: kill only signals the PID the descendant reported.
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+            }
+            assert!(
+                exited,
+                "descendant {pid} survived {}",
+                if cancel { "cancellation" } else { "timeout" }
+            );
+        }
+    }
+
+    /// True while `pid` names a live process. A killed descendant whose new
+    /// parent has not reaped it yet still answers `kill(pid, 0)`, so a zombie
+    /// counts as exited. Only `kill(pid, 0)` failing or `ps` reporting a
+    /// zombie state counts as exited; a `ps` that fails or reports no state
+    /// counts as running, and the caller's next poll repeats both checks.
+    #[cfg(unix)]
+    fn descendant_running(pid: libc::pid_t) -> bool {
+        // SAFETY: signal 0 only checks that the PID exists.
+        if unsafe { libc::kill(pid, 0) } != 0 {
+            return false;
+        }
+        let Ok(output) = std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+        else {
+            return true;
+        };
+        let state = String::from_utf8_lossy(&output.stdout);
+        let state = state.trim();
+        if !output.status.success() || state.is_empty() {
+            return true;
+        }
+        !state.starts_with('Z')
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn shell_drains_large_stdout_while_child_runs() {
         let tool =
             ShellTool::new(unrestricted_shell_test_security(), test_runtime()).with_timeout_secs(2);
@@ -2110,6 +2453,78 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn effective_path_resolves_independent_native_runtime_launcher() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let launcher_dir = tempfile::tempdir().expect("launcher tempdir should be created");
+        let launcher = launcher_dir.path().join("tui-only-shell");
+        std::fs::write(
+            &launcher,
+            "#!/bin/sh\necho TUI_PATH_SHIM_RAN\nfor arg in \"$@\"; do echo \"arg:$arg\"; done\n",
+        )
+        .expect("recording shell should be written");
+        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755))
+            .expect("recording shell should be executable");
+        let split_path = std::env::join_paths([
+            std::path::PathBuf::new(),
+            std::path::PathBuf::from("relative-decoy"),
+            launcher_dir.path().to_path_buf(),
+        ])
+        .expect("test PATH should be joined")
+        .into_string()
+        .expect("test PATH should be UTF-8");
+
+        let tool = ShellTool::new(
+            unrestricted_shell_test_security(),
+            Arc::new(NativeRuntime::with_shell("tui-only-shell".into())),
+        )
+        .with_tui_env(Some(HashMap::from([("PATH".into(), split_path)])));
+        let result = tool
+            .execute(json!({"command": "echo direct_tui_path"}))
+            .await
+            .expect("shell tool should return a result");
+
+        assert!(
+            result.success && result.output.contains("TUI_PATH_SHIM_RAN"),
+            "TUI-only launcher should execute, got output={:?} error={:?}",
+            result.output,
+            result.error
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn effective_path_with_no_absolute_entries_fails_closed() {
+        let unusable_path = std::env::join_paths([
+            std::path::PathBuf::new(),
+            std::path::PathBuf::from("relative-only"),
+        ])
+        .expect("test PATH should be joined")
+        .into_string()
+        .expect("test PATH should be UTF-8");
+        let tool = ShellTool::new(
+            unrestricted_shell_test_security(),
+            Arc::new(NativeRuntime::with_shell("tui-only-shell".into())),
+        )
+        .with_tui_env(Some(HashMap::from([("PATH".into(), unusable_path)])));
+        let result = tool
+            .execute(json!({"command": "echo must_not_run"}))
+            .await
+            .expect("shell tool should return a failed result");
+
+        assert!(!result.success, "unusable TUI PATH must fail closed");
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("effective child PATH")),
+            "unexpected error: {:?}",
+            result.error
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn shell_without_tui_env_does_not_inject_extra_vars() {
         // Without tui_env, a non-safe var must NOT appear.
@@ -2209,5 +2624,173 @@ mod tests {
             env_output_contains_assignment(&result.output, "SSH_AUTH_SOCK", "/tmp/fake.sock"),
             "SSH_AUTH_SOCK from tui_env must reach subprocess"
         );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod shell_grammar_tests {
+    use super::shell_grammar_test_support::{
+        BASH_ONLY_HEREDOC, MispredictingRuntime, RAN_OUTSIDE_BASH, host_bash,
+        host_shell_other_than_bash, wildcard_policy,
+    };
+    use super::*;
+    use crate::platform::NativeRuntime;
+
+    fn error_of(result: &ToolResult) -> &str {
+        result.error.as_deref().unwrap_or_default()
+    }
+
+    /// A command read as bash is refused when the runtime built another
+    /// shell to run it, and never spawned there.
+    #[tokio::test]
+    async fn a_bash_read_never_runs_in_the_shell_the_runtime_built_instead() {
+        let (Some(bash), Some(other)) = (host_bash(), host_shell_other_than_bash()) else {
+            eprintln!("skipping: needs bash and another POSIX shell");
+            return;
+        };
+        let workspace = tempfile::tempdir().unwrap();
+        let runtime = Arc::new(MispredictingRuntime::new(bash, other));
+        let tool = ShellTool::new(Arc::new(wildcard_policy(workspace.path())), runtime.clone());
+        let result = tool
+            .execute(json!({"command": BASH_ONLY_HEREDOC}))
+            .await
+            .unwrap();
+        assert!(!result.success, "{result:?}");
+        assert!(
+            error_of(&result).contains("checked as a bash command"),
+            "{result:?}"
+        );
+        assert!(!result.output.contains(RAN_OUTSIDE_BASH), "{result:?}");
+        assert_eq!(runtime.builds(), 1);
+    }
+
+    /// A command the policy refuses never reaches the runtime's builder
+    /// (choosing the grammar resolves the program and builds nothing).
+    #[tokio::test]
+    async fn a_refused_command_never_reaches_the_builder() {
+        let Some(other) = host_shell_other_than_bash() else {
+            eprintln!("skipping: needs a POSIX shell other than bash");
+            return;
+        };
+        let workspace = tempfile::tempdir().unwrap();
+        let runtime = Arc::new(MispredictingRuntime::new(other.clone(), other));
+        let tool = ShellTool::new(Arc::new(wildcard_policy(workspace.path())), runtime.clone());
+        let result = tool
+            .execute(json!({"command": BASH_ONLY_HEREDOC}))
+            .await
+            .unwrap();
+        assert!(!result.success, "{result:?}");
+        assert_eq!(runtime.builds(), 0);
+    }
+
+    /// A host sandbox that puts its own launcher in front of the shell, as
+    /// Firejail, Bubblewrap and Seatbelt do.
+    struct LauncherSandbox {
+        launcher: std::path::PathBuf,
+    }
+
+    impl Sandbox for LauncherSandbox {
+        fn wrap_command(&self, cmd: &mut std::process::Command) -> std::io::Result<()> {
+            let mut wrapped = std::process::Command::new(&self.launcher);
+            wrapped.arg(cmd.get_program()).args(cmd.get_args());
+            if let Some(dir) = cmd.get_current_dir() {
+                wrapped.current_dir(dir);
+            }
+            *cmd = wrapped;
+            Ok(())
+        }
+
+        fn is_available(&self) -> bool {
+            true
+        }
+
+        fn name(&self) -> &str {
+            "launcher"
+        }
+
+        fn description(&self) -> &str {
+            "runs the command through a launcher"
+        }
+    }
+
+    /// The built program is checked before a host sandbox wraps it, so its
+    /// launcher does not stand in for the shell and refuse a bash command.
+    #[tokio::test]
+    async fn the_built_shell_is_checked_before_a_host_sandbox_wraps_it() {
+        let (Some(bash), Ok(env)) = (
+            host_bash(),
+            zeroclaw_config::platform::resolve_executable(OsStr::new("env")),
+        ) else {
+            eprintln!("skipping: needs bash and env");
+            return;
+        };
+        let workspace = tempfile::tempdir().unwrap();
+        let policy = SecurityPolicy {
+            sandbox_enabled: Some(true),
+            sandbox_backend: Some("firejail".into()),
+            ..wildcard_policy(workspace.path())
+        };
+        let tool = ShellTool::new_with_sandbox(
+            Arc::new(policy),
+            Arc::new(NativeRuntime::with_shell(
+                bash.to_string_lossy().into_owned(),
+            )),
+            Arc::new(LauncherSandbox { launcher: env }),
+        );
+        let result = tool
+            .execute(json!({"command": BASH_ONLY_HEREDOC}))
+            .await
+            .unwrap();
+        assert!(result.success, "{result:?}");
+        assert!(result.output.contains("heredoc body"), "{result:?}");
+        assert!(!result.output.contains(RAN_OUTSIDE_BASH), "{result:?}");
+    }
+
+    /// The forwarded `PATH`, with a directory holding `bash` linked to
+    /// `target` ahead of this process's own.
+    fn forwarded_path_with_bash(dir: &std::path::Path, target: &std::path::Path) -> String {
+        std::os::unix::fs::symlink(target, dir.join("bash")).unwrap();
+        let own = std::env::var_os("PATH").unwrap_or_default();
+        let entries = std::iter::once(dir.to_path_buf())
+            .chain(std::env::split_paths(&own).collect::<Vec<_>>());
+        std::env::join_paths(entries)
+            .unwrap()
+            .into_string()
+            .unwrap()
+    }
+
+    /// A bare `bash` is read as whatever it names on the TUI's forwarded
+    /// `PATH`: bash's grammar when that is bash, and the portable grammar
+    /// when it is a link to another shell, which would run the hidden line.
+    #[tokio::test]
+    async fn a_bare_bash_is_read_as_what_it_names_on_the_forwarded_path() {
+        let (Some(bash), Some(other)) = (host_bash(), host_shell_other_than_bash()) else {
+            eprintln!("skipping: needs bash and another POSIX shell");
+            return;
+        };
+        for (target, runs) in [(&bash, true), (&other, false)] {
+            let workspace = tempfile::tempdir().unwrap();
+            let bin = tempfile::tempdir().unwrap();
+            let path = forwarded_path_with_bash(bin.path(), target);
+            let tool = ShellTool::new(
+                Arc::new(wildcard_policy(workspace.path())),
+                Arc::new(NativeRuntime::with_shell("bash".into())),
+            )
+            .with_tui_env(Some(HashMap::from([("PATH".to_string(), path)])));
+            let result = tool
+                .execute(json!({"command": BASH_ONLY_HEREDOC}))
+                .await
+                .unwrap();
+            assert_eq!(result.success, runs, "{target:?}: {result:?}");
+            assert!(!result.output.contains(RAN_OUTSIDE_BASH), "{result:?}");
+            if runs {
+                assert!(result.output.contains("heredoc body"), "{result:?}");
+            } else {
+                assert!(
+                    error_of(&result).contains("security policy"),
+                    "{target:?}: {result:?}"
+                );
+            }
+        }
     }
 }

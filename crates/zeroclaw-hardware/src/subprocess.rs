@@ -769,18 +769,28 @@ mod tests {
             result_json
         );
         let script_path = write_protocol_helper(dir.path(), &script);
+        // On macOS the first exec of a newly written file may wait for a malware scan, and those
+        // scans queue, so in a parallel suite this fixture can take seconds to start. The answer
+        // deadline allows for that; the one-second bound starts only once the fixture has
+        // recorded its descendant, just before it answers.
         let tool = SubprocessTool::new(make_manifest("pipe_holder_tool", vec![]), script_path)
-            .with_timeouts(Duration::from_secs(1), Duration::from_millis(100));
-        let execution_result =
-            timeout(Duration::from_secs(1), tool.execute(serde_json::json!({}))).await;
-        let descendant_pid = wait_for_pid_file(&pid_path).await;
+            .with_timeouts(Duration::from_secs(30), Duration::from_millis(100));
+        let execution =
+            zeroclaw_spawn::spawn!(async move { tool.execute(serde_json::json!({})).await });
+        while !execution.is_finished() && !pid_path.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let execution_result = timeout(Duration::from_secs(1), execution).await;
 
-        let _ = std::process::Command::new("/bin/kill")
-            .args(["-KILL", descendant_pid.trim()])
-            .status();
+        if let Ok(descendant_pid) = std::fs::read_to_string(&pid_path) {
+            let _ = std::process::Command::new("/bin/kill")
+                .args(["-KILL", descendant_pid.trim()])
+                .status();
+        }
 
         let result = execution_result
-            .expect("pipe-holding plugin must return before the test deadline")
+            .expect("pipe-holding plugin must return promptly once it has answered")
+            .expect("test execution task should complete")
             .expect("execute should not return Err");
         assert!(
             result.success,

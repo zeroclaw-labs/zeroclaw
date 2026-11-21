@@ -297,6 +297,10 @@ pub enum BudgetCheck {
         limit_usd: f64,
         /// Aggregation period whose limit would be exceeded.
         period: UsagePeriod,
+        /// Agent alias whose own daily spend tripped a per-agent ceiling.
+        /// `None` for the shared (process-wide) limits; consumers use it to
+        /// name the tripped ceiling in user-facing refusals.
+        agent_alias: Option<String>,
     },
 }
 
@@ -313,6 +317,14 @@ pub struct CostSummary {
     pub total_tokens: u64,
     /// Number of requests
     pub request_count: usize,
+    /// Ledger lines the summary scan could not read as complete cost
+    /// records. This is a ledger-wide integrity count, not a count scoped
+    /// to the summary's window, agent, or task: a torn line has no
+    /// readable timestamp, so it can't be attributed to a scope. Non-zero
+    /// means the ledger is damaged and the totals above may exclude
+    /// whatever those lines held; the raw lines stay in the ledger.
+    #[serde(default)]
+    pub rejected_records: usize,
     /// Breakdown by model
     pub by_model: std::collections::HashMap<String, ModelStats>,
     /// Breakdown by agent alias. Empty when `[cost].track_per_agent =
@@ -381,6 +393,7 @@ impl Default for CostSummary {
             monthly_cost_usd: 0.0,
             total_tokens: 0,
             request_count: 0,
+            rejected_records: 0,
             by_model: std::collections::HashMap::new(),
             by_agent: std::collections::HashMap::new(),
         }

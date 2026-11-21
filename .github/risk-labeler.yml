@@ -1,0 +1,77 @@
+{
+  "risk:high": [
+    {
+      "changed-files": {
+        "any-glob-to-any-file": [
+          "crates/zeroclaw-runtime/src/security/**",
+          "crates/zeroclaw-runtime/src/approval/**",
+          "crates/zeroclaw-runtime/src/trust/**",
+          "crates/zeroclaw-providers/src/auth/**",
+          "wit/**",
+          ".cargo/**",
+          "rust-toolchain",
+          "rust-toolchain.toml",
+          ".github/CODEOWNERS",
+          ".github/risk-labeler.yml",
+          ".github/workflows/pr-risk-labeler.yml",
+          ".github/workflows/*release*.yml",
+          ".github/workflows/*publish*.yml",
+          ".github/workflows/pub-*.yml",
+          "scripts/github/pr_risk_label.py",
+          "scripts/release/**"
+        ]
+      }
+    },
+    {
+      "changed-lines": {
+        "any-rule-to-any-added-line": [
+          {
+            "name": "workflow permission expansion",
+            "paths": [".github/workflows/**"],
+            "pattern": "^\\s*(?:[A-Za-z0-9_-]+:\\s*write(?:-all)?|permissions:\\s*(?:write|write-all))\\s*(?:#.*)?$"
+          },
+          {
+            "name": "secret access",
+            "paths": [".github/workflows/**", ".github/actions/**", "scripts/**", "dev/**"],
+            "pattern": "(?:\\bsecrets\\.|\\bsecrets\\s*:|\\$\\{\\{\\s*secrets\\.)"
+          },
+          {
+            "name": "OIDC token access",
+            "paths": [".github/workflows/**"],
+            "pattern": "^\\s*id-token:\\s*write\\s*(?:#.*)?$"
+          },
+          {
+            "name": "artifact publication",
+            "paths": [".github/workflows/**"],
+            "pattern": "(?:actions/(?:upload|download)-artifact|actions/attest|gh\\s+release\\s+(?:create|upload)|cargo\\s+publish|docker/(?:login|build-push)-action|push:\\s*true)"
+          },
+          {
+            "name": "release behavior",
+            "paths": [".github/workflows/**", "scripts/release/**", "docs/book/src/maintainers/release-runbook.md"],
+            "pattern": "(?:\\brelease\\b|\\btags\\s*:|\\bv[0-9]+\\.[0-9]+\\.[0-9]+\\b)"
+          },
+          {
+            "name": "elevated pull_request_target",
+            "paths": [".github/workflows/**"],
+            "pattern": "^\\s*pull_request_target:\\s*(?:#.*)?$"
+          },
+          {
+            "name": "toolchain install or container baseline",
+            "paths": [".github/workflows/**", ".github/actions/**", "scripts/**", "dev/**", "Dockerfile", "**/Dockerfile", "Containerfile", "**/Containerfile"],
+            "pattern": "(?:\\bFROM\\s+|\\bcargo\\s+install\\b|\\b(?:curl|wget)\\b.*\\|\\s*(?:sh|bash)|\\b(?:apt-get|apt|brew|npm|pnpm|yarn)\\s+install\\b|\\bdocker\\s+(?:build|pull|push)\\b)"
+          },
+          {
+            "name": "release floor",
+            "paths": ["Cargo.toml", "**/Cargo.toml", "rust-toolchain", "rust-toolchain.toml", "docs/book/src/maintainers/release-runbook.md"],
+            "pattern": "(?:rust-version|MSRV|minimum supported Rust|version floor)"
+          },
+          {
+            "name": "WIT contract",
+            "paths": ["**/*.wit", "wit/**", "crates/**/wit/**", "docs/book/src/developing/plugin-protocol.md"],
+            "pattern": "(?:\\bworld\\b|\\binterface\\b|\\bimport\\b|\\bexport\\b|\\bfunc\\b|\\brecord\\b|\\bvariant\\b|\\bresource\\b)"
+          }
+        ]
+      }
+    }
+  ]
+}

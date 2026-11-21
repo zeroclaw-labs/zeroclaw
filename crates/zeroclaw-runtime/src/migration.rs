@@ -609,6 +609,71 @@ mod tests {
         assert_eq!(results[0].key, "reindex_key");
     }
 
+    #[tokio::test]
+    async fn migration_without_reindex_never_calls_configured_embedding_endpoint() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let source = TempDir::new().unwrap();
+        let target = TempDir::new().unwrap();
+        let source_db_dir = source.path().join("memory");
+        fs::create_dir_all(&source_db_dir).unwrap();
+        let source_db = source_db_dir.join("brain.db");
+        let conn = Connection::open(&source_db).unwrap();
+        conn.execute_batch("CREATE TABLE memories (key TEXT, content TEXT, category TEXT);")
+            .unwrap();
+        conn.execute(
+            "INSERT INTO memories (key, content, category) VALUES (?1, ?2, ?3)",
+            params!["imported", "historical private content", "core"],
+        )
+        .unwrap();
+        drop(conn);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = listener.local_addr().unwrap();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&requests);
+        let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let server = zeroclaw_spawn::spawn!(async move {
+            loop {
+                tokio::select! {
+                    _ = &mut stop_rx => break,
+                    accepted = listener.accept() => {
+                        let (mut stream, _) = accepted.unwrap();
+                        observed.fetch_add(1, Ordering::SeqCst);
+                        let mut request = [0u8; 4096];
+                        let _ = stream.read(&mut request).await;
+                        let body = r#"{"data":[{"embedding":[0.1,0.2],"index":0}]}"#;
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        let _ = stream.write_all(response.as_bytes()).await;
+                    }
+                }
+            }
+        });
+
+        let mut config = test_config(target.path());
+        config.memory.embedding_provider = format!("custom:http://{endpoint}");
+        config.memory.embedding_model = "test-embedding-model".into();
+        config.memory.embedding_dimensions = 2;
+        migrate_openclaw_memory(&config, Some(source.path().to_path_buf()), false, false)
+            .await
+            .unwrap();
+
+        stop_tx.send(()).unwrap();
+        server.await.unwrap();
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            0,
+            "ordinary import must not call the configured embedding endpoint"
+        );
+        let imported = SqliteMemory::new("test", target.path()).unwrap();
+        assert!(imported.get("imported").await.unwrap().is_some());
+    }
+
     #[test]
     fn migration_target_rejects_none_backend() {
         let target = TempDir::new().unwrap();

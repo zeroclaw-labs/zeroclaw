@@ -104,6 +104,10 @@ mod tests {
         let v: toml::Value = toml::from_str(&s).expect("valid TOML");
         let tags = v["tags"].as_array().unwrap();
         assert_eq!(tags.len(), tag_specs().len());
+        assert!(
+            tags.iter()
+                .all(|tag| tag["stem"].as_str() != Some("compat-tools"))
+        );
         let ver = v["version"].as_str().unwrap();
         let dist = tags
             .iter()
@@ -187,7 +191,7 @@ mod tests {
     }
 
     #[test]
-    fn dist_tag_is_lean_while_all_tag_is_kitchen_sink() {
+    fn dist_tag_carries_adapters_while_all_tag_is_kitchen_sink() {
         let s = render(&root()).unwrap();
         let v: toml::Value = toml::from_str(&s).unwrap();
         let tags = v["tags"].as_array().unwrap();
@@ -199,19 +203,19 @@ mod tests {
             .iter()
             .find(|t| t["stem"].as_str() == Some("all-features"))
             .unwrap();
-        let dist_features = dist["features"].as_str().unwrap();
+        let dist_features: Vec<_> = dist["features"].as_str().unwrap().split(',').collect();
         for feature in
             crate::generate::spec::resolve_feature_list(&root(), &Selection::Dist).unwrap()
         {
             assert!(
-                dist_features.contains(&feature),
+                dist_features.contains(&feature.as_str()),
                 "dist feature {feature} not rendered"
             );
         }
         for feature in crate::generate::spec::features_outside_dist(&root()).unwrap() {
             assert!(
-                !dist_features.contains(&feature),
-                "{feature} leaked into lean dist"
+                !dist_features.contains(&feature.as_str()),
+                "{feature} leaked into standard dist"
             );
         }
         assert!(all["features"].as_str().unwrap().contains("hardware"));

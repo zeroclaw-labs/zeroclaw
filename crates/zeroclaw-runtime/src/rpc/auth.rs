@@ -147,6 +147,10 @@ impl AuthDenied {
 /// registry, resolver, roster and flags consistent.
 pub struct AcceptedAuthState {
     registry: ProviderRegistry,
+    /// Each OIDC provider's issuer and client, by provider name, compiled
+    /// with `registry` so a bound credential is checked against the same
+    /// state that would send it.
+    oidc_bindings: std::collections::HashMap<String, OidcBinding>,
     resolver: PrincipalResolver,
     uid_roster: Arc<UidRoster>,
     local_roster_configured: bool,
@@ -156,6 +160,25 @@ pub struct AcceptedAuthState {
     /// The configuration this state was compiled from (see [`auth_inputs`]),
     /// or `None` for the deny-all state, which was compiled from nothing.
     auth_inputs: Option<serde_json::Value>,
+}
+
+/// The issuer and client an OIDC provider verifies tokens against. A token
+/// issued under one of them is bound to it: see
+/// [`RpcInboundAuth::authenticate_bound`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OidcBinding {
+    pub issuer: String,
+    pub client_id: String,
+}
+
+impl OidcBinding {
+    #[must_use]
+    pub fn of(entry: &zeroclaw_config::schema::OidcConfig) -> Self {
+        Self {
+            issuer: entry.issuer.clone(),
+            client_id: entry.effective_client_id().to_string(),
+        }
+    }
 }
 
 /// The parts of a configuration an accepted authorization state is compiled
@@ -194,8 +217,14 @@ impl AcceptedAuthState {
                 config.oidc[alias].clone(),
             )?))?;
         }
+        let oidc_bindings = config
+            .oidc
+            .iter()
+            .map(|(alias, entry)| (format!("oidc.{alias}"), OidcBinding::of(entry)))
+            .collect();
         Ok(Self {
             registry,
+            oidc_bindings,
             resolver: PrincipalResolver::with_generation(
                 ResolverPolicy::from_config(config)?,
                 generation,
@@ -228,6 +257,7 @@ impl AcceptedAuthState {
             .expect("unique peercred provider");
         Self {
             registry,
+            oidc_bindings: std::collections::HashMap::new(),
             resolver: PrincipalResolver::with_generation(ResolverPolicy::default(), generation),
             uid_roster,
             local_roster_configured: true,
@@ -250,11 +280,11 @@ impl AcceptedAuthState {
         identity: &AuthenticatedIdentity,
         evidence: &LocalCredentialEvidence,
         native_token_hash: Option<&str>,
-        pairing: &PairingGuard,
+        is_paired: &dyn Fn(&str) -> bool,
     ) -> Result<(), DenyReason> {
         let reverified = match evidence {
             LocalCredentialEvidence::NativeTokenHash => native_token_hash
-                .is_some_and(|hash| pairing.token_hash_is_paired(hash))
+                .is_some_and(is_paired)
                 .then(|| AuthenticatedIdentity::shared_operator(AuthMethod::Native)),
             LocalCredentialEvidence::Peercred { uid }
                 if *uid == self.daemon_uid && self.trust_daemon_uid.load(Ordering::Relaxed) =>
@@ -322,6 +352,12 @@ pub struct RpcInboundAuth {
     /// publication carrying an older revision is refused, so a slow writer
     /// cannot reinstall superseded policy.
     accepted_revision: AtomicU64,
+    /// Test-only pause inside [`Self::authenticate`], where provider
+    /// verification awaits. Taken by the first authentication that reaches
+    /// it.
+    #[cfg(test)]
+    authenticate_pause:
+        std::sync::Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
 }
 
 impl RpcInboundAuth {
@@ -343,7 +379,31 @@ impl RpcInboundAuth {
             state: RwLock::new(Arc::new(state)),
             pairing,
             accepted_revision: AtomicU64::new(0),
+            #[cfg(test)]
+            authenticate_pause: std::sync::Mutex::new(None),
         })
+    }
+
+    /// Test-only: park the next authentication where provider verification
+    /// awaits. Returns `(arrived, release)`.
+    #[cfg(test)]
+    pub(crate) fn pause_next_authentication(
+        &self,
+    ) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+        let arrived = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        *self.authenticate_pause.lock().unwrap() =
+            Some((Arc::clone(&arrived), Arc::clone(&release)));
+        (arrived, release)
+    }
+
+    /// Test-only: whether a policy publication has claimed the accepted-state
+    /// lock and is waiting behind a reader that still holds it, such as an
+    /// [`AuthorityLease`]. False once no reader holds it, whether the
+    /// publication is then running, finished, or never came.
+    #[cfg(test)]
+    pub(crate) fn publication_queued_behind_a_lease(&self) -> bool {
+        self.state.is_locked_exclusive() && self.state.try_read_recursive().is_some()
     }
 
     /// Test-only permissive layer: empty auth config, fresh pairing guard.
@@ -479,7 +539,7 @@ impl RpcInboundAuth {
             &auth.identity,
             &auth.local_evidence,
             auth.native_token_hash.as_deref(),
-            &self.pairing,
+            &|hash| self.pairing.token_hash_is_paired(hash),
         )?;
         state.resolve(&auth.identity)
     }
@@ -505,10 +565,133 @@ impl RpcInboundAuth {
                 &auth.identity,
                 &auth.local_evidence,
                 auth.native_token_hash.as_deref(),
-                &self.pairing,
+                &|hash| self.pairing.token_hash_is_paired(hash),
             )?;
         }
         state.resolve(&auth.identity)
+    }
+
+    /// Whether the credential behind `auth` is still live: not expired, not
+    /// past its revalidation deadline, and, for a native pairing token, still
+    /// paired.
+    pub fn credential_is_live(&self, auth: &ConnectionAuth) -> Result<(), AuthDenied> {
+        credential_unexpired(auth)?;
+        if let Some(hash) = auth.native_token_hash.as_deref()
+            && !self.pairing.token_hash_is_paired(hash)
+        {
+            return Err(AuthDenied::auth_required(
+                crate::i18n::get_required_cli_string("rpc-auth-pairing-revoked"),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Hold the accepted authorization state and the paired-token set still
+    /// until the returned lease is dropped: no policy publication can install
+    /// a new state and no pairing can be revoked meanwhile.
+    ///
+    /// A surface that must not let a revocation land between its final
+    /// authority check and the effect that check guards takes the lease,
+    /// checks with [`AuthorityLease::current_grants`], performs the effect,
+    /// then drops it. A publication or revocation that arrives meanwhile
+    /// completes after the effect, so the effect is ordered before it.
+    ///
+    /// Keep the hold short and synchronous. While a publication or revocation
+    /// is queued behind it, new readers of the same lock wait too, so do not
+    /// reach this layer's other methods on the holding thread; the lease
+    /// answers from what it holds.
+    pub fn hold_authority(&self) -> AuthorityLease<'_> {
+        // State before pairing: a publication takes the state lock and may
+        // consult the pairing set, never the reverse.
+        let state = self.state.read();
+        let pairings = self.pairing.hold_paired_tokens();
+        AuthorityLease { state, pairings }
+    }
+}
+
+/// The accepted authorization state and the paired-token set, held still by
+/// [`RpcInboundAuth::hold_authority`].
+pub struct AuthorityLease<'a> {
+    state: parking_lot::RwLockReadGuard<'a, Arc<AcceptedAuthState>>,
+    pairings: zeroclaw_config::pairing::HeldPairedTokens<'a>,
+}
+
+impl AuthorityLease<'_> {
+    /// [`RpcInboundAuth::current_grants`] answered from the held state: the
+    /// credential is unexpired and still paired, and the grants resolve under
+    /// the policy that stays in force until the lease is dropped.
+    pub fn current_grants(&self, auth: &ConnectionAuth) -> Result<ResolvedGrants, AuthDenied> {
+        credential_unexpired(auth)?;
+        let is_paired = |hash: &str| self.pairings.contains_hash(hash);
+        if let Some(hash) = auth.native_token_hash.as_deref()
+            && !is_paired(hash)
+        {
+            return Err(AuthDenied::auth_required(
+                crate::i18n::get_required_cli_string("rpc-auth-pairing-revoked"),
+            ));
+        }
+        if auth.generation != self.state.resolver.generation() {
+            self.state
+                .revalidates_local_evidence(
+                    &auth.identity,
+                    &auth.local_evidence,
+                    auth.native_token_hash.as_deref(),
+                    &is_paired,
+                )
+                .map_err(AuthDenied::from_deny_reason)?;
+        }
+        self.state
+            .resolve(&auth.identity)
+            .map(|resolved| resolved.grants)
+            .map_err(AuthDenied::from_deny_reason)
+    }
+}
+
+/// Whether `auth`'s credential is inside its lifetime: not expired and not
+/// past its revalidation deadline.
+fn credential_unexpired(auth: &ConnectionAuth) -> Result<(), AuthDenied> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    if let Some(expires_at) = auth.principal.expires_at
+        && expires_at <= now
+    {
+        return Err(AuthDenied::auth_required(
+            crate::i18n::get_required_cli_string("rpc-auth-credential-expired"),
+        ));
+    }
+    if let Some(revalidate_by) = auth.principal.revalidate_by
+        && revalidate_by <= now
+    {
+        return Err(AuthDenied::auth_required(
+            crate::i18n::get_required_cli_string("rpc-auth-revalidation-due"),
+        ));
+    }
+    Ok(())
+}
+
+impl RpcInboundAuth {
+    /// The grants `auth` holds under the accepted policy in force now, not
+    /// the ones stamped on it at admission: a live credential, a fresh
+    /// resolution, and a generation that did not move underneath that
+    /// resolution.
+    ///
+    /// A surface that acts on an admitted binding after a wait calls this at
+    /// the effect, so a revocation that lands during the wait binds it.
+    pub fn current_grants(&self, auth: &ConnectionAuth) -> Result<ResolvedGrants, AuthDenied> {
+        self.credential_is_live(auth)?;
+        let resolved = self
+            .resolve_current(auth)
+            .map_err(AuthDenied::from_deny_reason)?;
+        if resolved.generation != self.generation() {
+            // The accepted state moved between the resolution and this read.
+            // Fail closed rather than act under a policy nobody observed.
+            return Err(AuthDenied::auth_required(
+                crate::i18n::get_required_cli_string("rpc-auth-revalidation-due"),
+            ));
+        }
+        Ok(resolved.grants)
     }
 
     /// Authenticate one `initialize` handshake into a [`ConnectionAuth`].
@@ -519,7 +702,62 @@ impl RpcInboundAuth {
         auth_token: Option<&str>,
         auth_provider: Option<&str>,
     ) -> Result<ConnectionAuth, AuthDenied> {
+        self.authenticate_checked(
+            transport,
+            transport_credential,
+            auth_token,
+            auth_provider,
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::authenticate`] for a bearer bound to one OIDC provider as it
+    /// was configured when the bearer was issued. Refused before the bearer
+    /// is sent anywhere when, in the accepted state this verification uses,
+    /// the provider by that name names another issuer or client, or is gone.
+    pub async fn authenticate_bound(
+        &self,
+        transport: TransportKind,
+        auth_token: &str,
+        auth_provider: &str,
+        binding: &OidcBinding,
+    ) -> Result<ConnectionAuth, AuthDenied> {
+        self.authenticate_checked(
+            transport,
+            Credential::None,
+            Some(auth_token),
+            Some(auth_provider),
+            Some(binding),
+        )
+        .await
+    }
+
+    async fn authenticate_checked(
+        &self,
+        transport: TransportKind,
+        transport_credential: Credential,
+        auth_token: Option<&str>,
+        auth_provider: Option<&str>,
+        binding: Option<&OidcBinding>,
+    ) -> Result<ConnectionAuth, AuthDenied> {
+        #[cfg(test)]
+        {
+            let pause = self.authenticate_pause.lock().unwrap().take();
+            if let Some((arrived, release)) = pause {
+                arrived.notify_one();
+                release.notified().await;
+            }
+        }
         let state = self.state();
+        // Checked against the same state whose registry would send the
+        // bearer: a provider repointed or removed since it was issued never
+        // receives it.
+        if let Some(binding) = binding
+            && state.oidc_bindings.get(auth_provider.unwrap_or_default()) != Some(binding)
+        {
+            return Err(AuthDenied::from_deny_reason(DenyReason::UnknownProvider));
+        }
         // The generation the provider is about to verify against. Provider
         // verification below may await an IdP round trip; a trusted config
         // write can install a new generation during that await. Captured
@@ -575,6 +813,14 @@ impl RpcInboundAuth {
                         crate::i18n::get_required_cli_string("rpc-auth-remote-token-required"),
                     ));
                 }
+                // An in-process duplex is same-host but vouched for by
+                // nothing: no socket mode, no pipe ACL, no peer uid. It gets
+                // no compatibility path, roster or not.
+                TransportKind::Inproc => {
+                    return Err(AuthDenied::auth_required(
+                        crate::i18n::get_required_cli_string("rpc-auth-inproc-token-required"),
+                    ));
+                }
             }
         };
 
@@ -608,7 +854,7 @@ impl RpcInboundAuth {
                     &identity,
                     &local_evidence,
                     native_token_hash.as_deref(),
-                    &self.pairing,
+                    &|hash| self.pairing.token_hash_is_paired(hash),
                 )
                 .map_err(AuthDenied::from_deny_reason)?;
         }
@@ -678,6 +924,76 @@ mod tests {
         .expect("valid")
     }
 
+    /// Wait until `queued()` holds, failing if `writer` finishes first.
+    fn wait_until_queued(queued: impl Fn() -> bool, writer: &std::thread::JoinHandle<impl Send>) {
+        let started = std::time::Instant::now();
+        while !queued() {
+            assert!(
+                !writer.is_finished(),
+                "the writer finished while a lease was held"
+            );
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(10),
+                "the writer never reached its lock"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    /// Negative control for the upload race tests: while a lease is held a
+    /// publication queues and the probe reports it; once the lease is
+    /// released the publication goes through and the probe turns false. A
+    /// lease released before an upload's write therefore changes what those
+    /// tests observe at the write.
+    #[test]
+    fn a_publication_waits_for_a_held_lease_and_proceeds_once_it_is_released() {
+        let auth = Arc::new(auth_for(&base_config(), &["zc_tok"]));
+        let before = auth.generation();
+        let lease = auth.hold_authority();
+        let publisher = {
+            let auth = Arc::clone(&auth);
+            std::thread::spawn(move || auth.refresh_from_config(&base_config()).unwrap())
+        };
+        wait_until_queued(|| auth.publication_queued_behind_a_lease(), &publisher);
+        drop(lease);
+        assert_eq!(publisher.join().unwrap(), before + 1);
+        assert!(!auth.publication_queued_behind_a_lease());
+        assert_eq!(auth.generation(), before + 1);
+    }
+
+    /// The same control for an unpairing, which queues at the paired-token
+    /// lock rather than the accepted-state lock.
+    #[test]
+    fn an_unpairing_waits_for_a_held_lease_and_proceeds_once_it_is_released() {
+        let auth = Arc::new(auth_for(&base_config(), &["zc_tok"]));
+        let lease = auth.hold_authority();
+        let revoker = {
+            let auth = Arc::clone(&auth);
+            std::thread::spawn(move || auth.pairing().revoke_token("zc_tok"))
+        };
+        wait_until_queued(
+            || auth.pairing().token_write_queued_behind_a_hold(),
+            &revoker,
+        );
+        drop(lease);
+        assert!(
+            revoker.join().unwrap(),
+            "the token was paired and is now revoked"
+        );
+        assert!(!auth.pairing().token_write_queued_behind_a_hold());
+        assert!(!auth.pairing().token_is_paired("zc_tok"));
+    }
+
+    /// A lease answers from what it holds: a publication that landed before
+    /// it was taken is what it sees.
+    #[test]
+    fn a_lease_taken_after_a_publication_sees_that_publication() {
+        let auth = auth_for(&base_config(), &["zc_tok"]);
+        let generation = auth.refresh_from_config(&base_config()).unwrap();
+        let lease = auth.hold_authority();
+        assert_eq!(lease.state.resolver.generation(), generation);
+    }
+
     #[tokio::test]
     async fn local_with_no_roster_keeps_the_legacy_trusted_path() {
         let auth = auth_for(&base_config(), &[]);
@@ -687,6 +1003,41 @@ mod tests {
             .expect("legacy local path");
         assert_eq!(conn.principal.id.as_str(), PrincipalId::SHARED_OPERATOR);
         assert!(conn.grants.admin, "single-operator behavior is unchanged");
+    }
+
+    #[tokio::test]
+    async fn inproc_with_no_roster_gets_no_compatibility_path() {
+        // Same daemon state as the legacy local path above; the in-process
+        // duplex still has to present a credential.
+        let auth = auth_for(&base_config(), &[]);
+        let denied = auth
+            .authenticate(TransportKind::Inproc, Credential::None, None, None)
+            .await
+            .unwrap_err();
+        assert_eq!(denied.code, AUTH_REQUIRED);
+        // The refusal names the one way in: a duplex has no peer uid, so
+        // pointing at a mapped local uid would send the caller nowhere.
+        assert_eq!(
+            denied.message,
+            crate::i18n::get_required_cli_string("rpc-auth-inproc-token-required")
+        );
+        assert!(denied.message.contains("auth_token"), "{}", denied.message);
+        assert!(!denied.message.contains("uid"), "{}", denied.message);
+    }
+
+    #[tokio::test]
+    async fn inproc_with_a_paired_token_authenticates_as_that_token_does_elsewhere() {
+        let auth = auth_for(&base_config(), &["zc_tok"]);
+        let conn = auth
+            .authenticate(
+                TransportKind::Inproc,
+                Credential::None,
+                Some("zc_tok"),
+                None,
+            )
+            .await
+            .expect("paired token is accepted on the duplex");
+        assert_eq!(conn.principal.id.as_str(), PrincipalId::SHARED_OPERATOR);
     }
 
     #[tokio::test]
@@ -1450,6 +1801,61 @@ mod tests {
             interactive_clients: vec!["daemon-client".into()],
             ..zeroclaw_config::schema::OidcConfig::default()
         }
+    }
+
+    /// A bearer bound to one OIDC provider is verified only by it: when the
+    /// accepted state's provider by that name names another issuer or
+    /// client, or there is none, the bearer is refused before it is sent
+    /// anywhere.
+    #[tokio::test]
+    async fn a_bound_bearer_never_reaches_another_provider() {
+        let corp = introspection_idp("alice", &["ops"]).await;
+        let mut config = base_config();
+        config.permission_profiles.insert(
+            "operator".into(),
+            PermissionProfileConfig {
+                grants: std::collections::HashMap::from([(Resource::Sessions, vec![Verb::Read])]),
+                ..PermissionProfileConfig::default()
+            },
+        );
+        config
+            .oidc
+            .insert("corp".into(), oidc_entry(&corp.uri(), "ops", "operator"));
+        let auth = auth_for(&config, &[]);
+        let bound = OidcBinding::of(&config.oidc["corp"]);
+        let introspections = || async {
+            corp.received_requests()
+                .await
+                .unwrap_or_default()
+                .iter()
+                .filter(|request| request.url.path() == "/introspect")
+                .count()
+        };
+        auth.authenticate_bound(TransportKind::Wss, "corp-at", "oidc.corp", &bound)
+            .await
+            .expect("the provider it is bound to verifies it");
+        let sent = introspections().await;
+        let elsewhere = OidcBinding {
+            issuer: "https://elsewhere.example".into(),
+            ..bound.clone()
+        };
+        let other_client = OidcBinding {
+            client_id: "another-client".into(),
+            ..bound.clone()
+        };
+        for (case, binding, provider) in [
+            ("another issuer", &elsewhere, "oidc.corp"),
+            ("another client", &other_client, "oidc.corp"),
+            ("no such provider", &bound, "oidc.gone"),
+        ] {
+            assert!(
+                auth.authenticate_bound(TransportKind::Wss, "corp-at", provider, binding)
+                    .await
+                    .is_err(),
+                "{case}: a bound bearer was admitted"
+            );
+        }
+        assert_eq!(introspections().await, sent, "a bound bearer was sent");
     }
 
     /// Two independent issuers verify side by side, resolve to distinct

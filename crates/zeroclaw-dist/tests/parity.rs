@@ -146,20 +146,34 @@ struct MatrixEntry {
     experimental: bool,
 }
 
-/// Parses the single `matrix.include` block of the release workflow into its
-/// entries, keyed by the fields this registry mirrors.
+/// Parses the `build` job's `matrix.include` block of the release workflow
+/// into its entries, keyed by the fields this registry mirrors. Other jobs
+/// carry include blocks of their own (the per-target plugin smoke runs one
+/// leg per archive), so the parser scopes itself to the job that produces
+/// the archives.
 fn release_matrix_entries(workflow: &str) -> Vec<MatrixEntry> {
     let lines: Vec<&str> = workflow.lines().collect();
-    let include_lines: Vec<usize> = lines
+    let build_index = lines
+        .iter()
+        .position(|line| *line == "  build:")
+        .expect("release workflow has no top-level build job");
+    let build_end = lines
         .iter()
         .enumerate()
-        .filter(|(_, line)| line.trim() == "include:")
+        .skip(build_index + 1)
+        .find(|(_, line)| {
+            let trimmed = line.trim();
+            !trimmed.is_empty() && !trimmed.starts_with('#') && indent_of(line) <= 2
+        })
         .map(|(index, _)| index)
+        .unwrap_or(lines.len());
+    let include_lines: Vec<usize> = (build_index..build_end)
+        .filter(|index| lines[*index].trim() == "include:")
         .collect();
     assert_eq!(
         include_lines.len(),
         1,
-        "expected exactly one matrix include block in the release workflow"
+        "expected exactly one matrix include block in the release build job"
     );
     let include_index = include_lines[0];
     let include_indent = indent_of(lines[include_index]);

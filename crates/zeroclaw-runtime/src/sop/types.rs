@@ -5,6 +5,9 @@ use std::path::PathBuf;
 
 use super::scope::StepToolScope;
 use super::step_contract::{StepFailure, StepRouting};
+use crate::live_config_authority::{
+    AgentExecutionAdmission, AgentExecutionCapability, AgentExecutionError, AgentExecutionSelection,
+};
 
 // ── Priority ────────────────────────────────────────────────────
 
@@ -406,6 +409,18 @@ pub struct SopStep {
     /// resumes (the gate prompt gains an "Edit" choice). Absent = no editing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub edit: Option<String>,
+    /// Conditional part (`- decide:` bullet): a yes/no question the SOP's
+    /// decision model answers about the triggering event when the run starts,
+    /// in the same call as the SOP's gate. The step runs only on "yes"
+    /// (p(yes) at or above `[decision] part_threshold`); on "no" it is recorded
+    /// as skipped and the run moves on. If the model cannot answer, it runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decide: Option<String>,
+    /// Skip this step when step N's `decide` question was answered "yes"
+    /// (`- unless_decided: N` bullet). Lets one decision select between
+    /// alternative sets of steps, e.g. a scope hold instead of a full review.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unless_decided: Option<u32>,
 }
 
 impl Default for SopStep {
@@ -430,6 +445,8 @@ impl Default for SopStep {
             policy: None,
             gate_prompt: None,
             edit: None,
+            decide: None,
+            unless_decided: None,
         }
     }
 }
@@ -826,6 +843,14 @@ pub struct SopRun {
     /// load.
     #[serde(default)]
     pub initiating_agent: Option<String>,
+    /// The owner whose private memory plane this run belongs to, for a run
+    /// started in a session pinned to its owner. Its audit rows and its
+    /// steps' memory stay on that owner's plane wherever the run is driven,
+    /// including after it parks at an approval and resumes on the headless
+    /// driver, possibly in a later daemon generation. `None` for an unowned
+    /// run; runs persisted before this field restore as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_owner: Option<zeroclaw_api::memory_traits::PrincipalScope>,
     pub trigger_event: SopEvent,
     /// Stable per-run boundary marker for untrusted trigger framing.
     #[serde(default)]
@@ -866,6 +891,12 @@ pub struct SopRun {
     /// step-level confirmations and checkpoints still apply.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decided_mode: Option<SopExecutionMode>,
+    /// p(yes) the decision model gave each conditional-part step (`decide`)
+    /// at dispatch, keyed by step number. A step whose answer is below the
+    /// SOP's `part_threshold` is skipped; a step missing here runs. Also
+    /// exposed to `when:` conditions as `$.decisions.<step>`.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub decisions: std::collections::BTreeMap<u32, f64>,
 }
 
 impl ::zeroclaw_api::attribution::Attributable for SopRun {
@@ -893,6 +924,18 @@ pub struct SopRunSummary {
     /// True while the run is live (in the engine's active set) rather than
     /// a retained terminal record.
     pub active: bool,
+}
+
+impl SopRun {
+    /// Owned sessions may access only the exact private plane recorded at
+    /// admission. Legacy/unowned runs are not public. Unowned operator paths
+    /// retain their administrative access; an agent alias is not a user owner.
+    pub(crate) fn is_accessible_from(
+        &self,
+        owner: Option<&zeroclaw_api::memory_traits::PrincipalScope>,
+    ) -> bool {
+        owner.is_none_or(|owner| self.memory_owner.as_ref() == Some(owner))
+    }
 }
 
 impl SopRunSummary {
@@ -1059,6 +1102,36 @@ pub struct DeterministicSavings {
     pub total_runs: u64,
 }
 
+/// Non-serialized authority witness carried by an executable SOP action.
+///
+/// Capture generations when the engine produces the action. An unnamed live
+/// step inherits the executing agent, so its target is resolved by the consumer,
+/// using only these captured generations rather than a fresh admission token.
+#[derive(Clone)]
+pub struct SopExecutionWitness {
+    selection: AgentExecutionSelection,
+}
+
+impl fmt::Debug for SopExecutionWitness {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SopExecutionWitness")
+            .finish_non_exhaustive()
+    }
+}
+
+impl SopExecutionWitness {
+    pub fn capture(capability: &AgentExecutionCapability) -> Self {
+        Self {
+            selection: capability.capture_selection(),
+        }
+    }
+
+    pub fn admit(&self, alias: &str) -> Result<AgentExecutionAdmission, AgentExecutionError> {
+        self.selection.resolve_and_admit(alias)
+    }
+}
+
 /// What the engine instructs the caller to do next after a state transition.
 #[derive(Debug, Clone)]
 pub enum SopRunAction {
@@ -1090,6 +1163,9 @@ pub enum SopRunAction {
         run_id: String,
         step: SopStep,
         context: String,
+        /// The exact authority generations selected when this executable action
+        /// was produced. `None` is retained for unmanaged standalone callers.
+        execution_witness: Option<SopExecutionWitness>,
     },
     /// Pause and wait for operator approval before executing this step.
     WaitApproval {
@@ -1572,10 +1648,11 @@ path = "/sop/test"
 
     #[test]
     fn sop_run_serde_roundtrip() {
-        let run = SopRun {
+        let mut run = SopRun {
             run_id: "run-001".into(),
             sop_name: "test-sop".into(),
             initiating_agent: None,
+            memory_owner: None,
             trigger_event: SopEvent {
                 source: SopTriggerSource::Manual,
                 topic: None,
@@ -1603,6 +1680,7 @@ path = "/sop/test"
             revision: 0,
             revision_base: 0,
             decided_mode: None,
+            decisions: std::collections::BTreeMap::new(),
         };
         let json = serde_json::to_string(&run).unwrap();
         let parsed: SopRun = serde_json::from_str(&json).unwrap();
@@ -1610,5 +1688,17 @@ path = "/sop/test"
         assert_eq!(parsed.status, SopRunStatus::Running);
         assert_eq!(parsed.step_results.len(), 1);
         assert_eq!(parsed.step_results[0].status, SopStepStatus::Completed);
+
+        // An unowned run is written without the owner key, the shape of a run
+        // persisted before runs recorded an owner, and it restores unowned.
+        assert!(!json.contains("memory_owner"), "{json}");
+        assert_eq!(parsed.memory_owner, None);
+        // An owned run keeps its owner through the store's serialization.
+        let owner = zeroclaw_api::memory_traits::PrincipalScope::new("user:alice")
+            .with_agent(Some("ops".to_string()));
+        run.memory_owner = Some(owner.clone());
+        let json = serde_json::to_string(&run).unwrap();
+        let parsed: SopRun = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.memory_owner, Some(owner));
     }
 }

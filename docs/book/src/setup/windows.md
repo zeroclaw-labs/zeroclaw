@@ -10,7 +10,7 @@ If you're running WSL2, you can follow the [Linux setup](./linux.md) instead; `i
 
 ### Option 1: Prebuilt binary (recommended)
 
-Download the latest Windows release zip, extract `zeroclaw.exe`, and put it on your `PATH`.
+Download the latest Windows release zip, verify its `SHA256SUMS` entry, extract `zeroclaw.exe`, and put it on your `PATH`. Both downloads use the same resolved release tag. A missing or mismatched checksum stops installation before extraction.
 
 From a PowerShell prompt:
 
@@ -19,7 +19,9 @@ From a PowerShell prompt:
 # Installation and PATH setup are idempotent. If zeroclaw is already at the
 # latest release and on the user PATH, those steps are skipped; Quickstart
 # still runs at the end.
-$ver = (Invoke-RestMethod 'https://api.github.com/repos/zeroclaw-labs/zeroclaw/releases/latest').tag_name.TrimStart('v')
+$ErrorActionPreference = 'Stop'
+$tag = (Invoke-RestMethod 'https://api.github.com/repos/zeroclaw-labs/zeroclaw/releases/latest').tag_name
+$ver = $tag.TrimStart('v')
 $dst = "$env:USERPROFILE\.zeroclaw\bin"
 $exe = "$dst\zeroclaw.exe"
 
@@ -28,10 +30,50 @@ $current = if (Test-Path $exe) {
 } else { '' }
 
 if ($current -ne $ver) {
-    $url = "https://github.com/zeroclaw-labs/zeroclaw/releases/download/v$ver/zeroclaw-x86_64-pc-windows-msvc.zip"
-    New-Item -ItemType Directory -Force -Path $dst | Out-Null
-    Invoke-WebRequest -Uri $url -OutFile "$env:TEMP\zeroclaw.zip" -UseBasicParsing
-    Expand-Archive -Force -Path "$env:TEMP\zeroclaw.zip" -DestinationPath $dst
+    & {
+        param(
+            [string]$ReleaseTag,
+            [string]$DestinationPath = (Join-Path $env:USERPROFILE '.zeroclaw/bin')
+        )
+
+        $ErrorActionPreference = 'Stop'
+        if (-not $ReleaseTag) {
+            $ReleaseTag = (Invoke-RestMethod -Uri 'https://api.github.com/repos/zeroclaw-labs/zeroclaw/releases/latest').tag_name
+        }
+        if ($ReleaseTag -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$') {
+            throw 'The release response did not contain a valid version tag.'
+        }
+
+        $asset = 'zeroclaw-x86_64-pc-windows-msvc.zip'
+        $releaseUrl = "https://github.com/zeroclaw-labs/zeroclaw/releases/download/$ReleaseTag"
+        $workDir = Join-Path ([IO.Path]::GetTempPath()) ('zeroclaw-install-' + [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path $workDir | Out-Null
+        try {
+            $archive = Join-Path $workDir $asset
+            $manifest = Join-Path $workDir 'SHA256SUMS'
+            Invoke-WebRequest -Uri "$releaseUrl/SHA256SUMS" -OutFile $manifest -UseBasicParsing
+            Invoke-WebRequest -Uri "$releaseUrl/$asset" -OutFile $archive -UseBasicParsing
+
+            $entrySuffix = '[ *]' + [regex]::Escape($asset) + '$'
+            $entries = @(Get-Content -LiteralPath $manifest | Where-Object { $_ -cmatch $entrySuffix })
+            if ($entries.Count -ne 1) {
+                throw "SHA256SUMS must contain exactly one checksum for $asset."
+            }
+            if ($entries[0] -cnotmatch ('^[0-9a-fA-F]{64} ' + $entrySuffix)) {
+                throw "Invalid SHA256SUMS entry for $asset."
+            }
+            $expected = $entries[0].Substring(0, 64)
+            $actual = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash
+            if ($actual -ne $expected) {
+                throw "SHA256 mismatch for $asset. The archive was not extracted."
+            }
+
+            Write-Host "SHA256 verified: $asset ($ReleaseTag)"
+            Expand-Archive -LiteralPath $archive -DestinationPath $DestinationPath -Force
+        } finally {
+            Remove-Item -LiteralPath $workDir -Recurse -Force
+        }
+    } -ReleaseTag $tag -DestinationPath $dst
 }
 
 $environment = [Environment]
@@ -59,6 +101,8 @@ zeroclaw --version    # matches the latest release
 
 ### Option 2: `setup.bat` (from a release)
 
+Run from a repository checkout or unpacked source archive, which includes `scripts/install_windows_prebuilt.ps1`. Verification or download failure stops this mode; choose `--dist` explicitly if you want to build from source instead.
+
 ```cmd
 setup.bat --prebuilt
 ```
@@ -69,7 +113,7 @@ Flags:
 |---|---|
 | `--prebuilt` | Download prebuilt binary from GitHub Releases (fastest once reached; current script still checks for `cargo` first) |
 | `--minimal`  | Build core only (no channels, no hardware) |
-| `--dist`     | Build the lean release distribution feature set |
+| `--dist`     | Build the standard distribution for minimal/full runtime tools |
 | `--default`  | Build with Cargo's default feature set |
 | `--all`      | Build with every registered feature |
 
@@ -170,7 +214,7 @@ docker build -t zeroclaw:local -f Dockerfile.debian .
   [wsl2]
   networkingMode=mirrored
   ```
-- **Daemon under Docker, not Task Scheduler.** Inside the container there is no Windows Task Scheduler. Use Docker's [restart policy](https://docs.docker.com/engine/containers/start-containers-automatically/), `--restart=unless-stopped` as in the example above, for daemon-mode startup. The published image runs as PID 1 / nonroot user; the container *is* the service; don't run `zeroclaw service install` inside it.
+- **Daemon under Docker, not Task Scheduler.** Inside the container there is no Windows Task Scheduler. Use Docker's [restart policy](https://docs.docker.com/engine/containers/start-containers-automatically/), `--restart=unless-stopped` as in the example above, for daemon-mode startup. The published image runs as PID 1 / nonroot user; the container _is_ the service; don't run `zeroclaw service install` inside it.
 - **Skill sandbox via host Docker socket.** ZeroClaw's skill-execution sandbox can shell out to Docker. If you're running ZeroClaw itself in a container and want skill sandboxing to also use Docker, mount the host Docker socket so child containers run on the host daemon rather than nesting Docker-in-Docker:
   ```
   # PowerShell / cmd.exe: use a single leading slash.
@@ -215,7 +259,9 @@ zeroclaw service logs
 
 > **About `--service-init`.** The CLI exposes a `--service-init [auto|systemd|openrc]` flag for cross-platform consistency, but on Windows it is a no-op; the scheduled-task path is always used.
 
-Logs go to `%USERPROFILE%\.zeroclaw\logs\` (specifically, `<config_dir>/logs/` where `<config_dir>` defaults to `%USERPROFILE%\.zeroclaw\`). The scheduled-task wrapper itself, however, lives next to the config file at `%USERPROFILE%\.zeroclaw\zeroclaw-daemon.cmd`. Only the daemon output files (`daemon.stdout.log` / `daemon.stderr.log`) are written under `logs\`.
+Logs go to `%USERPROFILE%\.zeroclaw\logs\` (specifically, `<config_dir>/logs/` where `<config_dir>` defaults to `%USERPROFILE%\.zeroclaw\`). The task runs the ZeroClaw binary directly through an internal runner, which keeps each `daemon.stdout.log` and `daemon.stderr.log` file within 8 MiB while retaining recent output. To replace an existing task, including an older `.cmd` wrapper or this direct runner, first run `schtasks /Change /TN "ZeroClaw Daemon" /Disable`, reboot Windows, then run `zeroclaw service install`. Installation refuses to replace a task in any state except Disabled because Task Scheduler's Ready state does not prove that its processes exited; `zeroclaw service stop` alone is insufficient. The installer checks that the task is Disabled but cannot verify that Windows rebooted, so complete that step before reinstalling. The old wrapper file may remain but is no longer used. The runner restricts the config root and log files to the task account and rejects reparse-point paths, so existing paths owned by another account must be corrected before the task can start. Literal `%` signs in executable or config paths are unsupported because Task Scheduler expands them in action paths.
+
+Windows currently attaches an empty console window to this interactive scheduled task. Leave it open while the service runs; closing it may stop the runner and daemon. Background launch without that window is tracked in [#10991](https://github.com/zeroclaw-labs/zeroclaw/issues/10991).
 
 > **Server / multi-user installs.** Native Windows Service / LocalSystem support is on the roadmap but not yet implemented. For now, on a server box, install ZeroClaw under the account that the agent should run as; the scheduled-task path will start it on that user's login. If you need it to start before any user logs in, use **Task Scheduler → ZeroClaw Daemon → Properties → General → "Run whether user is logged on or not."**
 

@@ -7,13 +7,17 @@ pub mod context;
 pub mod dispatch;
 pub mod fs;
 pub mod git;
+pub mod inproc;
 pub mod local;
 pub mod locales;
+pub mod orphans;
 pub mod session;
+pub mod subscription;
 pub mod transport;
 pub mod tui_identity;
 pub mod turn;
 pub mod types;
+pub mod upload;
 pub mod wss;
 
 /// How long a cancelled listener waits for the connections it accepted to

@@ -1,0 +1,110 @@
+{
+  "frames": [
+    {
+      "channel": "sse",
+      "dir": "send",
+      "payload": {
+        "method": "GET",
+        "path": "/api/events"
+      }
+    },
+    {
+      "channel": "http",
+      "dir": "send",
+      "payload": {
+        "body": {
+          "message": "Trigger an observed turn."
+        },
+        "headers": {
+          "X-Session-Id": "golden-events"
+        },
+        "method": "POST",
+        "path": "/webhook?agent=web"
+      }
+    },
+    {
+      "channel": "http",
+      "dir": "recv",
+      "payload": {
+        "body": {
+          "model": "fixture-model",
+          "response": "Observed reply."
+        },
+        "status": 200
+      }
+    },
+    {
+      "channel": "sse",
+      "dir": "recv",
+      "payload": {
+        "content_type": "text/event-stream",
+        "status": 200
+      }
+    },
+    {
+      "channel": "sse",
+      "dir": "recv",
+      "payload": {
+        "data": {
+          "agent_alias": "web",
+          "channel": "daemon",
+          "model": "fixture-model",
+          "model_provider": "custom.fixture",
+          "source": "observability",
+          "timestamp": "<timestamp>",
+          "turn_id": "<uuid:1>",
+          "type": "agent_start"
+        },
+        "event": null
+      }
+    },
+    {
+      "channel": "sse",
+      "dir": "recv",
+      "payload": {
+        "data": {
+          "agent_alias": "web",
+          "channel": "daemon",
+          "messages_count": 2,
+          "model": "fixture-model",
+          "model_provider": "custom.fixture",
+          "source": "observability",
+          "timestamp": "<timestamp>",
+          "turn_id": "<uuid:1>",
+          "type": "llm_request"
+        },
+        "event": null
+      }
+    },
+    {
+      "channel": "sse",
+      "dir": "recv",
+      "payload": {
+        "data": {
+          "agent_alias": "web",
+          "channel": "daemon",
+          "cost_usd": null,
+          "duration_ms": "<duration>",
+          "input_tokens": 10,
+          "model": "fixture-model",
+          "model_provider": "custom.fixture",
+          "output_tokens": 5,
+          "source": "observability",
+          "timestamp": "<timestamp>",
+          "tokens_used": 15,
+          "turn_id": "<uuid:1>",
+          "type": "agent_end"
+        },
+        "event": null
+      }
+    },
+    {
+      "channel": "provider",
+      "dir": "meta",
+      "payload": {
+        "requests": 1
+      }
+    }
+  ],
+  "scenario": "events_stream_observes_webhook_turn"
+}

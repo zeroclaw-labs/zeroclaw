@@ -2,7 +2,7 @@
 //! source per-user, so it must expose feature selection (overridable), not a
 //! fixed set. We generate a sentinel-delimited zone defining the zeroclaw +
 //! zerocode packages with explicit per-package defaults. The zeroclaw default
-//! is the canonical lean Dist feature list; the zerocode default is resolved
+//! is the canonical Dist feature list; the zerocode default is resolved
 //! from the `zerocode` package's own feature set (currently empty).
 
 use super::spec::{self, Selection};
@@ -63,7 +63,7 @@ pub fn render_zone(root: &Path) -> anyhow::Result<String> {
     // --no-default-features --features <list>. Callers pass their package
     // default; users override with `.override { features = [ ... ]; }`.
     let lines = [
-        "        # Default feature sets: zeroclaw uses canonical lean Dist,".to_string(),
+        "        # Default feature sets: zeroclaw uses canonical Dist,".to_string(),
         "        # zerocode uses its own package features (currently empty).".to_string(),
         "        # Override per-package, e.g. `packages.zeroclaw.override { features = [ ... ]; }`.".to_string(),
         format!("        zeroclawDefaultFeatures = [ {feature_list} ];"),
@@ -169,7 +169,7 @@ mod tests {
     }
 
     #[test]
-    fn zone_default_is_lean_dist() {
+    fn zone_default_is_standard_dist() {
         let z = render_zone(&root()).unwrap();
         let zeroclaw_line = z
             .lines()
@@ -184,7 +184,7 @@ mod tests {
         for feature in spec::features_outside_dist(&root()).unwrap() {
             assert!(
                 !zeroclaw_line.contains(&format!("\"{feature}\"")),
-                "{feature} leaked into lean dist"
+                "{feature} leaked into standard dist"
             );
         }
     }

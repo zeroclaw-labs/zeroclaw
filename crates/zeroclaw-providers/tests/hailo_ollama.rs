@@ -3030,26 +3030,21 @@ async fn post_connect_transport_failure_quarantines_endpoint() {
 
 #[tokio::test]
 async fn connection_establishment_failure_does_not_quarantine_endpoint() {
-    // Reserve the port with a socket that is bound but never placed in the
-    // listening state, and keep it alive for the whole test. The reservation
-    // stops a parallel fixture from claiming the port, while the absent
-    // `listen()` call makes every connect attempt refuse deterministically
-    // instead of racing another server onto a released address.
-    let reservation = tokio::net::TcpSocket::new_v4().expect("create reservation socket");
-    reservation
-        .bind("127.0.0.1:0".parse().expect("loopback reservation address"))
-        .expect("reserve unused port");
-    let addr = reservation.local_addr().expect("unused address");
-
-    let endpoint = format!("http://{addr}");
-    let provider = hailo_provider(&endpoint);
+    // Port 1 is below every ephemeral range, so no parallel fixture can be
+    // handed it. With no listener there, the kernel refuses the connection
+    // immediately on Linux and macOS. Unlike a released ephemeral port, it
+    // cannot be claimed by a racing fixture; unlike a bound-but-not-listening
+    // socket, it does not hang on macOS. The trade-off is assuming no test-host
+    // service listens on port 1.
+    let endpoint = "http://127.0.0.1:1";
+    let provider = hailo_provider(endpoint);
     let first_error = provider
         .simple_chat("first", "qwen3:1.7b", Some(0.2))
         .await
-        .expect_err("unused port must refuse connection")
+        .expect_err("refused port must fail the connection")
         .to_string();
     assert!(
-        !first_error.contains(&endpoint),
+        !first_error.contains(endpoint),
         "Hailo transport errors must redact endpoint identity: {first_error}"
     );
     assert_eq!(first_error, "Hailo-Ollama connection failed");
@@ -3062,6 +3057,11 @@ async fn connection_establishment_failure_does_not_quarantine_endpoint() {
         !second_error.contains("quarantined"),
         "connection establishment failure incorrectly quarantined: {second_error}"
     );
+    assert!(
+        !second_error.contains(endpoint),
+        "Hailo transport errors must redact endpoint identity: {second_error}"
+    );
+    assert_eq!(second_error, "Hailo-Ollama connection failed");
     let catalog_error = provider
         .list_models()
         .await
@@ -3069,7 +3069,7 @@ async fn connection_establishment_failure_does_not_quarantine_endpoint() {
         .to_string();
     assert_eq!(catalog_error, "Hailo-Ollama connection failed");
     assert!(
-        !catalog_error.contains(&endpoint),
+        !catalog_error.contains(endpoint),
         "Hailo catalog errors must redact endpoint identity: {catalog_error}"
     );
 }

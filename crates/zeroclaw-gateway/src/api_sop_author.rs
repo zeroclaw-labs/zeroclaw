@@ -316,20 +316,34 @@ pub async fn handle_sop_run(
                     // belong to (a standalone gateway) detaches.
                     match state.sop_driver_handles.as_ref() {
                         Some(handles) => {
-                            zeroclaw_runtime::sop::spawn_and_register_sop_driver(
+                            zeroclaw_runtime::sop::spawn_and_register_sop_driver_with_capability(
                                 handles,
                                 config,
                                 std::sync::Arc::clone(engine),
                                 Some(std::sync::Arc::clone(audit)),
                                 action.as_ref().clone(),
+                                Some(
+                                    zeroclaw_runtime::live_config_authority::AgentExecutionCapability::from_parts(
+                                        state.config.clone(),
+                                        state.agent_lifecycle.clone(),
+                                    ),
+                                ),
                             );
                         }
-                        None => drop(zeroclaw_runtime::sop::spawn_headless_run_driver(
-                            config,
-                            std::sync::Arc::clone(engine),
-                            Some(std::sync::Arc::clone(audit)),
-                            action.as_ref().clone(),
-                        )),
+                        None => {
+                            zeroclaw_runtime::sop::spawn_headless_run_driver_with_capability(
+                                config,
+                                std::sync::Arc::clone(engine),
+                                Some(std::sync::Arc::clone(audit)),
+                                action.as_ref().clone(),
+                                Some(
+                                    zeroclaw_runtime::live_config_authority::AgentExecutionCapability::from_parts(
+                                        state.config.clone(),
+                                        state.agent_lifecycle.clone(),
+                                    ),
+                                ),
+                            );
+                        }
                     }
                 }
                 return Json(serde_json::json!({ "run_id": run_id })).into_response();
@@ -668,13 +682,19 @@ pub async fn handle_sop_decide(
     }
 
     if let Some(outcome) = resolved_outcome {
-        let config = state.config.read();
-        zeroclaw_runtime::sop::drive_resumed_broker_action(
+        let config = state.config.read().clone();
+        zeroclaw_runtime::sop::drive_resumed_broker_action_with_capability(
             &config,
             std::sync::Arc::clone(engine),
             state.sop_audit.clone(),
             state.sop_driver_handles.as_ref(),
             &outcome,
+            Some(
+                zeroclaw_runtime::live_config_authority::AgentExecutionCapability::from_parts(
+                    state.config.clone(),
+                    state.agent_lifecycle.clone(),
+                ),
+            ),
         );
     }
 
@@ -720,12 +740,9 @@ fn authorize_sop_cancel(
             subject,
         ));
     }
-    let effective_client_ip = if state.trust_forwarded_headers {
-        super::forwarded_client_ip(headers)
-    } else {
-        Some(peer.ip())
-    };
-    if effective_client_ip.is_some_and(|ip| ip.is_loopback()) {
+    // Same locality rule as the rate-limit key: a forwarded loopback address
+    // is never local, even when the peer itself is loopback.
+    if super::request_is_local(Some(*peer), headers, state.trust_forwarded_headers) {
         return Ok(zeroclaw_runtime::sop::approval::ApprovalPrincipal::cli(
             None,
         ));
@@ -1950,6 +1967,82 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
         assert_eq!(run_status(&state, &run_id), Some(SopRunStatus::Running));
+    }
+
+    #[tokio::test]
+    async fn authoring_cancel_rejects_forwarded_loopback_with_loopback_peer() {
+        let (mut state, run_id) = authoring_state_with_running_run("unused");
+        state.pairing = Arc::new(PairingGuard::new(
+            false,
+            &[],
+            zeroclaw_config::pairing::PairingCodePolicy::default(),
+        ));
+        state.trust_forwarded_headers = true;
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", HeaderValue::from_static("127.0.0.1"));
+
+        let response = handle_sop_cancel(
+            State(state.clone()),
+            loopback_peer(),
+            headers,
+            Path(("deploy".to_string(), run_id.clone())),
+            Bytes::new(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(run_status(&state, &run_id), Some(SopRunStatus::Running));
+    }
+
+    #[tokio::test]
+    async fn authoring_cancel_rejects_forwarded_loopback_with_remote_peer() {
+        let (mut state, run_id) = authoring_state_with_running_run("unused");
+        state.pairing = Arc::new(PairingGuard::new(
+            false,
+            &[],
+            zeroclaw_config::pairing::PairingCodePolicy::default(),
+        ));
+        state.trust_forwarded_headers = true;
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", HeaderValue::from_static("127.0.0.1"));
+
+        let response = handle_sop_cancel(
+            State(state.clone()),
+            remote_peer(),
+            headers,
+            Path(("deploy".to_string(), run_id.clone())),
+            Bytes::new(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(run_status(&state, &run_id), Some(SopRunStatus::Running));
+    }
+
+    #[tokio::test]
+    async fn authoring_cancel_allows_direct_loopback_with_trust_and_no_forwarded_header() {
+        let (mut state, run_id) = authoring_state_with_running_run("unused");
+        state.pairing = Arc::new(PairingGuard::new(
+            false,
+            &[],
+            zeroclaw_config::pairing::PairingCodePolicy::default(),
+        ));
+        state.trust_forwarded_headers = true;
+
+        let response = handle_sop_cancel(
+            State(state.clone()),
+            loopback_peer(),
+            HeaderMap::new(),
+            Path(("deploy".to_string(), run_id.clone())),
+            Bytes::new(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        assert_eq!(
+            run_status(&state, &run_id),
+            Some(SopRunStatus::CancelRequested),
+        );
     }
 
     #[tokio::test]

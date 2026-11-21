@@ -1,6 +1,6 @@
 //! Response cache — avoid burning tokens on repeated prompts.
 
-use crate::sqlite_permissions::harden_sqlite_storage;
+use crate::sqlite_permissions::{check_sqlite_storage, prepare_sqlite_storage};
 use anyhow::Result;
 use chrono::{Duration, Local};
 use parking_lot::Mutex;
@@ -38,10 +38,12 @@ impl ResponseCache {
         max_entries: usize,
         hot_max_entries: usize,
     ) -> Result<Self> {
-        let db_path = workspace_dir.join("memory").join("response_cache.db");
-        harden_sqlite_storage(&db_path)?;
+        let db_path = prepare_sqlite_storage(workspace_dir, "response_cache.db")?;
 
-        let conn = Connection::open(&db_path)?;
+        let flags = rusqlite::OpenFlags::default();
+        #[cfg(unix)]
+        let flags = flags | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW;
+        let conn = Connection::open_with_flags(&db_path, flags)?;
 
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
@@ -62,7 +64,7 @@ impl ResponseCache {
             CREATE INDEX IF NOT EXISTS idx_rc_accessed ON response_cache(accessed_at);
             CREATE INDEX IF NOT EXISTS idx_rc_created ON response_cache(created_at);",
         )?;
-        harden_sqlite_storage(&db_path)?;
+        check_sqlite_storage(&db_path)?;
 
         Ok(Self {
             conn: Mutex::new(conn),
@@ -308,7 +310,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn response_cache_hardens_existing_storage_permissions() {
+    fn response_cache_rejects_permissive_storage_and_reopens_after_operator_repair() {
         use std::os::unix::fs::PermissionsExt;
 
         let tmp = TempDir::new().unwrap();
@@ -343,9 +345,28 @@ mod tests {
             }
         }
 
-        let _cache = ResponseCache::new(tmp.path(), 60, 1000).unwrap();
-
+        assert!(ResponseCache::new(tmp.path(), 60, 1000).is_err());
+        assert_eq!(mode(&db_path), 0o666);
+        for suffix in ["-wal", "-shm"] {
+            let sidecar = crate::sqlite_permissions::sqlite_sidecar_path(&db_path, suffix);
+            if sidecar.exists() {
+                assert_eq!(mode(&sidecar), 0o666);
+                std::fs::set_permissions(&sidecar, std::fs::Permissions::from_mode(0o600)).unwrap();
+            }
+        }
+        std::fs::set_permissions(&db_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let cache = ResponseCache::new(tmp.path(), 60, 1000).unwrap();
         assert_owner_only_sqlite_storage(&memory_dir, &db_path);
+        let response: String = cache
+            .conn
+            .lock()
+            .query_row(
+                "SELECT response FROM response_cache WHERE prompt_hash = 'seed'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(response, "private output");
     }
 
     #[test]

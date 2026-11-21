@@ -19,7 +19,7 @@ ingress and agent-side action.
 | Provider request | `agent::turn::tool_specs` and provider call | Native-tool providers receive structured specs; text-protocol providers receive prompt instructions unless strict parsing hides them. |
 | Tool-call parsing | `agent::turn::parse_response` and parser helpers | Native and text tool calls are normalized into parsed calls with provider ids when available. |
 | Preparation | `agent::turn::call_prep` | Hooks, delivery defaults, approval, prompt-required duplicate guards, and ordinary duplicate-call guards run before dispatch. |
-| Execution | `agent::tool_execution` | Calls run sequentially or in parallel according to policy, cancellation, and activation constraints. |
+| Execution | `agent::tool_execution` | Prepared calls run sequentially or in parallel according to policy, cancellation, and activation constraints. |
 | Result recording | `post_exec`, `results_collect`, and `history_append` | Results are ordered, logged, observed, optionally receipted, bounded, and appended back to provider history. |
 | Loop control | `run_tool_call_loop` | The model sees tool results and may continue until it returns final text, hits cancellation, or reaches the iteration cap. |
 
@@ -95,6 +95,14 @@ race activation. Delegate/subagent paths must thread the activated set they were
 granted; otherwise a delegated turn can advertise or attempt a tool that its
 executor cannot resolve.
 
+Parallel eligibility is evaluated after preparation because `before_tool_call`
+hooks can rewrite names and arguments. The policy therefore sees the calls the
+runtime will actually dispatch, not only the model's original request. A
+prepared batch containing `file_edit` plus another `file_edit` or `file_write`
+runs sequentially in model order to prevent stale read-modify-write results
+from overwriting a sibling mutation. One edit alongside non-mutating tools and
+two atomic full-file writes remain parallel-eligible.
+
 ## Approval and preparation
 
 Preparation happens before the executor runs a tool:
@@ -137,7 +145,8 @@ Parallel execution is allowed only when:
 - the runtime knob enables parallel tools;
 - the batch has more than one executable call;
 - no call in the batch requires approval;
-- the batch does not contain `tool_search`.
+- the batch does not contain `tool_search`; and
+- the batch does not combine `file_edit` with another `file_edit` or `file_write`.
 
 Otherwise calls run sequentially. Sequential dispatch checks cancellation
 before each call and stops dispatching the tail when cancelled. Parallel
@@ -149,6 +158,16 @@ The ordered result vector keeps one slot per original model call. Preparation
 fills slots for cancelled, denied, replaced, or deduplicated calls; execution
 fills the remaining slots. This preserves provider history ordering even when
 some calls never execute or when parallel calls finish out of order.
+
+### Cooperative execution context
+
+`Tool::execute_with_context(args, &ToolExecutionContext)` is the cancellation-aware Rust entrypoint. Its default implementation runs the existing `execute(args)` inside the context, so existing tool implementations remain compatible. The runtime supplies the current turn's optional cancellation token and preserves interrupted-result ownership. A cancelled context returns `ToolExecutionCancelled`, which runtime dispatch converts to its normal turn-cancellation outcome. A context without a token does not inherit another call's cancellation signal.
+
+A tool may override the context-aware method when it needs explicit execution inputs. Transparent wrappers forward that method while retaining their approval, path, rate-limit, audit, and locked-argument behavior. Legacy implementations can read `ToolExecutionContext::current()` while their future runs. Tools that spawn work must capture the context or derive a child token before spawning; Tokio task-local values do not automatically follow a new task. Sequential and parallel pipeline steps forward the same context to their children.
+
+Cancellation can drop the tool future promptly. Resources owned by that future need drop guards; work that outlives it must observe the captured token. The built-in shell retains its existing child and Unix process-group guards, and HTTP cancellation drops its local request future. Cancellation does not undo an HTTP action already received by a server, await asynchronous cleanup, or add cancellation messages to MCP, WASM, or remote-node protocols. Separately implemented shell-like tools do not acquire the built-in shell's process-tree guarantees from the context alone.
+
+In-turn parallel and agentic delegates derive child tokens from this context. Explicit background delegates keep their separate tool-owned cancellation token and remain cancellable through `cancel_task`.
 
 ## Results, receipts, and history
 

@@ -12,6 +12,8 @@ const PERSIST_CALLS: &[&str] = &[
     ".save().await",
     ".save_dirty()",
     ".save_dirty().await",
+    ".force_save()",
+    ".force_save().await",
     "set_prop_persistent",
     "set_secret_persistent",
 ];

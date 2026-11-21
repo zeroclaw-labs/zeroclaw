@@ -1044,6 +1044,7 @@ mod tests {
             run_id: "r1".into(),
             sop_name: "g".into(),
             initiating_agent: None,
+            memory_owner: None,
             trigger_event: SopEvent {
                 source: SopTriggerSource::Manual,
                 topic: None,
@@ -1063,6 +1064,7 @@ mod tests {
             revision: 0,
             revision_base: 0,
             decided_mode: None,
+            decisions: std::collections::BTreeMap::new(),
         }
     }
 

@@ -251,13 +251,52 @@ impl ZeroclawAttribution {
         }
     }
 
-    /// Fill any `key` absent on `self` from `other`. The flat-map shape
-    /// means composite groups move as a unit naturally (all three keys
-    /// merge independently, but the composite-prefix setter always
-    /// writes all three together, so the parent's set is consistent).
+    /// Fill absent fields from another contribution to the same span.
+    /// Span-scope inheritance handles composite groups separately.
     pub fn merge_from(&mut self, other: &Self) {
         for (k, v) in &other.fields {
             self.fields.entry(k.clone()).or_insert_with(|| v.clone());
+        }
+        if self.duration_ms.is_none() {
+            self.duration_ms = other.duration_ms;
+        }
+    }
+
+    /// Inherit outer-span fields without mixing composite groups across spans.
+    pub(crate) fn merge_scope_from(&mut self, other: &Self) {
+        // Freeze ownership before copying: the first key copied from a parent
+        // must not block the remaining keys of that same parent's group.
+        let owned_prefixes: Vec<_> = COMPOSITE_PREFIXES
+            .iter()
+            .copied()
+            .filter(|prefix| {
+                let owns_group = self.fields.keys().any(|key| {
+                    key == prefix
+                        || key.strip_suffix("_type") == Some(prefix)
+                        || key.strip_suffix("_alias") == Some(prefix)
+                });
+                if !owns_group {
+                    return false;
+                }
+                let type_key = type_field(prefix);
+                let matching_type_only = self.get(prefix).is_none()
+                    && self.get(&alias_field(prefix)).is_none()
+                    && self
+                        .get(&type_key)
+                        .is_some_and(|ty| other.get(&type_key) == Some(ty));
+                !matching_type_only
+            })
+            .collect();
+        for (key, value) in &other.fields {
+            let prefix = key
+                .strip_suffix("_type")
+                .or_else(|| key.strip_suffix("_alias"))
+                .unwrap_or(key);
+            if !owned_prefixes.contains(&prefix) {
+                self.fields
+                    .entry(key.clone())
+                    .or_insert_with(|| value.clone());
+            }
         }
         if self.duration_ms.is_none() {
             self.duration_ms = other.duration_ms;
@@ -624,6 +663,65 @@ mod tests {
         child.merge_from(&parent);
         assert_eq!(child.get("agent_alias"), Some("clamps"));
         assert_eq!(child.get("risk_profile"), Some("strict"));
+    }
+
+    #[test]
+    fn scope_merge_keeps_each_composite_group_with_its_nearest_source() {
+        for prefix in COMPOSITE_PREFIXES {
+            let keys = [prefix.to_string(), type_field(prefix), alias_field(prefix)];
+            let mut parent = ZeroclawAttribution::default();
+            parent.set_composite(prefix, "outer.parent");
+            parent.set("agent_alias", "parent-agent");
+            parent.duration_ms = Some(12);
+
+            for key in &keys {
+                let mut child = ZeroclawAttribution::default();
+                child.set(key, "inner");
+                child.merge_scope_from(&parent);
+                assert_eq!(child.get(key), Some("inner"));
+                for sibling in keys.iter().filter(|sibling| *sibling != key) {
+                    assert!(child.get(sibling).is_none(), "{prefix}: {:?}", child.fields);
+                }
+                assert_eq!(child.get("agent_alias"), Some("parent-agent"));
+                assert_eq!(child.duration_ms, Some(12));
+            }
+
+            let mut child = ZeroclawAttribution::default();
+            child.set_composite(prefix, "bare");
+            child.duration_ms = Some(7);
+            child.merge_scope_from(&parent);
+            assert_eq!(child.get(prefix), Some("bare"));
+            assert_eq!(child.get(&type_field(prefix)), Some("bare"));
+            assert!(child.get(&alias_field(prefix)).is_none());
+            assert_eq!(child.duration_ms, Some(7));
+
+            let mut inherited = ZeroclawAttribution::default();
+            inherited.merge_scope_from(&parent);
+            assert_eq!(inherited.fields, parent.fields);
+
+            let mut matching = ZeroclawAttribution::default();
+            matching.set(type_field(prefix), "outer");
+            matching.merge_scope_from(&parent);
+            assert_eq!(matching.fields, parent.fields);
+
+            let mut more_distant = ZeroclawAttribution::default();
+            more_distant.set_composite(prefix, "outer.distant");
+            matching.merge_scope_from(&more_distant);
+            assert_eq!(matching.fields, parent.fields);
+
+            let mut explicit = ZeroclawAttribution::default();
+            explicit.set_composite(prefix, "outer.child");
+            explicit.merge_scope_from(&parent);
+            assert_eq!(explicit.get(prefix), Some("outer.child"));
+            assert_eq!(explicit.get(&alias_field(prefix)), Some("child"));
+
+            let mut partial = ZeroclawAttribution::default();
+            partial.set(type_field(prefix), "outer");
+            partial.set(alias_field(prefix), "child");
+            partial.merge_scope_from(&parent);
+            assert!(partial.get(prefix).is_none());
+            assert_eq!(partial.get(&alias_field(prefix)), Some("child"));
+        }
     }
 
     #[test]

@@ -1,6 +1,8 @@
 //! Device management and pairing API handlers.
 
-use super::AppState;
+use super::{AppState, ConfigWriteGuard};
+use crate::dashboard_session::{DashboardAuth, DashboardCaller, SessionAuth, SessionRejection};
+use axum::Extension;
 use axum::{
     extract::{ConnectInfo, State},
     http::{HeaderMap, StatusCode},
@@ -13,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// Metadata about a paired device.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -229,8 +232,20 @@ impl DeviceRegistry {
     }
 
     pub fn revoke(&self, device_id: &str) -> Result<Option<String>, rusqlite::Error> {
-        let conn = self.open_db()?;
-        let deleted: Option<String> = conn
+        self.revoke_authorized(device_id, || Ok(()))?
+    }
+
+    fn revoke_authorized<R>(
+        &self,
+        device_id: &str,
+        authorize: impl FnOnce() -> Result<(), R>,
+    ) -> Result<Result<Option<String>, R>, rusqlite::Error> {
+        let mut conn = self.open_db()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        if let Err(refusal) = authorize() {
+            return Ok(Err(refusal));
+        }
+        let deleted: Option<String> = tx
             .query_row(
                 "DELETE FROM devices WHERE id = ?1 RETURNING token_hash",
                 rusqlite::params![device_id],
@@ -241,10 +256,13 @@ impl DeviceRegistry {
                 rusqlite::Error::QueryReturnedNoRows => Ok(None),
                 other => Err(other),
             })?;
+        // Release the database writer before taking the cache lock. Reconciliation
+        // takes the cache first and also writes this table.
+        tx.commit()?;
         if let Some(hash) = deleted.as_ref() {
             self.cache.lock().remove(hash);
         }
-        Ok(deleted)
+        Ok(Ok(deleted))
     }
 
     /// Delete every device row and clear the in-memory cache. Returns the
@@ -298,33 +316,6 @@ impl DeviceRegistry {
 
     pub fn device_count(&self) -> usize {
         self.cache.lock().len()
-    }
-}
-
-/// Store for pending pairing requests.
-#[derive(Debug, Default)]
-pub struct PairingStore {
-    pending: Mutex<Vec<PendingPairing>>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct PendingPairing {
-    code: String,
-    created_at: DateTime<Utc>,
-    expires_at: DateTime<Utc>,
-    client_ip: Option<String>,
-    attempts: u32,
-}
-
-impl PairingStore {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn pending_count(&self) -> usize {
-        let mut pending = self.pending.lock();
-        pending.retain(|p| p.expires_at > Utc::now());
-        pending.len()
     }
 }
 
@@ -442,13 +433,7 @@ pub async fn submit_pairing_enhanced(
                         .into_response();
                 }
             }
-            if let Err(e) = super::persist_pairing_tokens(
-                state.config.clone(),
-                &state.pairing,
-                state.config_write_lock.clone(),
-            )
-            .await
-            {
+            if let Err(e) = super::persist_pairing_tokens(&state).await {
                 ::zeroclaw_log::record!(
                     ERROR,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
@@ -536,45 +521,132 @@ pub async fn list_devices(State(state): State<AppState>, headers: HeaderMap) -> 
     .into_response()
 }
 
-/// DELETE /api/devices/{id} — revoke a paired device and its bearer token.
-pub async fn revoke_device(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    axum::extract::Path(device_id): axum::extract::Path<String>,
-) -> impl IntoResponse {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
+/// Delete `device_id` and invalidate its bearer token as one revocation.
+///
+/// An admitted config commit serializes this synchronous removal of both the
+/// durable device row and the live token with all other credential writes.
+pub(crate) fn revoke_device_credential<R>(
+    state: &AppState,
+    registry: &DeviceRegistry,
+    device_id: &str,
+    _commit: &ConfigWriteGuard,
+    authorize: impl FnOnce() -> Result<(), R>,
+) -> Result<Result<bool, rusqlite::Error>, R> {
+    match registry.revoke_authorized(device_id, authorize) {
+        Ok(Ok(Some(hash))) => {
+            state.pairing.revoke_token_hash(&hash);
+            Ok(Ok(true))
+        }
+        Ok(Ok(None)) => Ok(Ok(false)),
+        Ok(Err(refusal)) => Err(refusal),
+        Err(error) => Ok(Err(error)),
     }
+}
 
-    let Some(registry) = state.device_registry.as_ref() else {
-        return (
+/// The response when a revocation's config commit is refused before
+/// anything changed: the daemon generation is closing.
+pub(crate) fn revocation_not_admitted(
+    error: zeroclaw_runtime::live_config_authority::ConfigCommitError,
+) -> (StatusCode, String) {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        format!("Revocation refused without any change: {error}"),
+    )
+}
+
+/// Recheck the operator under the config writer before either device route
+/// removes a credential. Keep the verified cookie for a rotation's later mint.
+#[allow(clippy::result_large_err)]
+async fn revoke_operator_device(
+    state: &AppState,
+    headers: &HeaderMap,
+    device_id: &str,
+    dashboard: Option<&DashboardAuth>,
+) -> Result<(ConfigWriteGuard, Option<Arc<SessionAuth>>), axum::response::Response> {
+    require_auth(state, headers).map_err(IntoResponse::into_response)?;
+    let registry = state.device_registry.as_ref().ok_or_else(|| {
+        (
             StatusCode::SERVICE_UNAVAILABLE,
             "Device registry is disabled",
         )
-            .into_response();
+            .into_response()
+    })?;
+    let begin = || async {
+        state
+            .begin_config_commit()
+            .await
+            .map_err(|error| revocation_not_admitted(error).into_response())
     };
-
-    let token_hash = match registry.revoke(&device_id) {
-        Ok(Some(hash)) => hash,
-        Ok(None) => return (StatusCode::NOT_FOUND, "Device not found").into_response(),
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Device registry error: {e}"),
-            )
-                .into_response();
+    let mut commit = begin().await?;
+    let cookie = match crate::dashboard_session::current_caller() {
+        Some(DashboardCaller::Session(mut session)) if state.pairing.require_pairing() => {
+            let dashboard =
+                dashboard.ok_or_else(|| SessionRejection::Invalid.body().into_response())?;
+            match dashboard.operator_at_write(state, &session, &commit) {
+                Some(result) => result.map_err(IntoResponse::into_response)?,
+                None => {
+                    // Refresh a changed policy or a due credential without blocking
+                    // unrelated config writes on the identity provider.
+                    drop(commit);
+                    session = match dashboard.recheck(state, &session).await {
+                        DashboardCaller::Session(fresh) => fresh,
+                        DashboardCaller::Rejected(rejection) => {
+                            return Err(rejection.body().into_response());
+                        }
+                    };
+                    commit = begin().await?;
+                    dashboard
+                        .operator_at_write(state, &session, &commit)
+                        .unwrap_or_else(|| Err(SessionRejection::Expired.body()))
+                        .map_err(IntoResponse::into_response)?;
+                }
+            }
+            Some(session)
         }
+        _ => None,
     };
+    // Device registration and capability updates also write this database,
+    // independently of the config writer. Check again after that SQLite wait.
+    let revoked = revoke_device_credential(state, registry, device_id, &commit, || {
+        match (dashboard, cookie.as_deref()) {
+            (Some(auth), Some(session)) => auth
+                .operator_at_write(state, session, &commit)
+                .unwrap_or_else(|| Err(SessionRejection::Expired.body())),
+            _ => require_auth(state, headers),
+        }
+    })
+    .map_err(IntoResponse::into_response)?;
+    match revoked {
+        Ok(true) => Ok((commit, cookie)),
+        Ok(false) => Err((StatusCode::NOT_FOUND, "Device not found").into_response()),
+        Err(error) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Device registry error: {error}"),
+        )
+            .into_response()),
+    }
+}
 
-    state.pairing.revoke_token_hash(&token_hash);
-
-    if let Err(e) = super::persist_pairing_tokens(
-        state.config.clone(),
-        &state.pairing,
-        state.config_write_lock.clone(),
+/// DELETE /api/devices/{id} — revoke a paired device and its bearer token.
+pub async fn revoke_device(
+    State(state): State<AppState>,
+    dashboard: Option<Extension<Arc<DashboardAuth>>>,
+    headers: HeaderMap,
+    axum::extract::Path(device_id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    let (config_write_guard, _) = match revoke_operator_device(
+        &state,
+        &headers,
+        &device_id,
+        dashboard.as_ref().map(|Extension(auth)| auth.as_ref()),
     )
     .await
     {
+        Ok(revoked) => revoked,
+        Err(response) => return response,
+    };
+
+    if let Err(e) = super::persist_pairing_tokens_under(&state, config_write_guard).await {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("Token revoked in memory but config persist failed: {e}"),
@@ -645,54 +717,46 @@ pub async fn update_my_capabilities(
 
 pub async fn rotate_token(
     State(state): State<AppState>,
+    dashboard: Option<Extension<Arc<DashboardAuth>>>,
     headers: HeaderMap,
     axum::extract::Path(device_id): axum::extract::Path<String>,
 ) -> impl IntoResponse {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
-
-    let Some(registry) = state.device_registry.as_ref() else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Device registry is disabled",
-        )
-            .into_response();
-    };
-
-    let token_hash = match registry.revoke(&device_id) {
-        Ok(Some(hash)) => hash,
-        Ok(None) => return (StatusCode::NOT_FOUND, "Device not found").into_response(),
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Device registry error: {e}"),
-            )
-                .into_response();
-        }
-    };
-
-    state.pairing.revoke_token_hash(&token_hash);
+    let dashboard = dashboard.as_ref().map(|Extension(auth)| auth.as_ref());
+    let (config_write_guard, cookie) =
+        match revoke_operator_device(&state, &headers, &device_id, dashboard).await {
+            Ok(revoked) => revoked,
+            Err(response) => return response,
+        };
 
     // Same persist-fail caveat as `revoke_device`: device row + in-memory
     // token are already gone; surfacing the persist error tells the caller
     // a restart could resurrect the token.
-    if let Err(e) = super::persist_pairing_tokens(
-        state.config.clone(),
-        &state.pairing,
-        state.config_write_lock.clone(),
-    )
-    .await
+    let config_write_guard =
+        match super::persist_pairing_tokens_under(&state, config_write_guard).await {
+            Ok(guard) => guard,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Token revoked in memory but config persist failed: {e}"),
+                )
+                    .into_response();
+            }
+        };
+
+    // Time and cookie sign-out can advance during persistence even while
+    // policy publication is fenced. A native device may rotate its own bearer.
+    if let (Some(dashboard), Some(session)) = (dashboard, cookie)
+        && let Err(denied) = dashboard
+            .operator_at_write(&state, &session, &config_write_guard)
+            .unwrap_or_else(|| Err(SessionRejection::Expired.body()))
     {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Token revoked in memory but config persist failed: {e}"),
-        )
-            .into_response();
+        return denied.into_response();
     }
 
-    // Issue the new pairing code atomically against the slot. If another
-    // flow holds the slot, the revoke still stands — return 200 with
+    // Issue the new pairing code while the config commit is still held,
+    // so a revocation of this caller queued behind it cannot land between the
+    // check above and the code. The code is issued atomically against the
+    // slot. If another flow holds the slot, the revoke still stands — return 200 with
     // `pairing_code: null` and a message that tells the operator what
     // happened so they do not assume rotation failed.
     match state.pairing.generate_pairing_code_if_vacant(crate::live_pairing_code_policy(&state)) {
@@ -756,6 +820,41 @@ mod tests {
         (status, json)
     }
 
+    #[test]
+    fn device_revoke_checks_authority_while_holding_the_sqlite_writer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let registry = DeviceRegistry::new(tmp.path());
+        registry
+            .reconcile_from_token_hashes(&["synthetic-token-hash".into()])
+            .unwrap();
+        let id = registry.list().unwrap().pop().unwrap().id;
+        let competing_writer = registry.open_db().unwrap();
+        competing_writer
+            .busy_timeout(std::time::Duration::ZERO)
+            .unwrap();
+        for permitted in [false, true] {
+            let result = registry
+                .revoke_authorized(&id, || {
+                    let error = competing_writer
+                        .execute_batch("BEGIN IMMEDIATE")
+                        .unwrap_err();
+                    assert_eq!(
+                        error.sqlite_error_code(),
+                        Some(rusqlite::ErrorCode::DatabaseBusy)
+                    );
+                    permitted.then_some(()).ok_or("denied")
+                })
+                .unwrap();
+            if permitted {
+                assert_eq!(result.unwrap().as_deref(), Some("synthetic-token-hash"));
+            } else {
+                assert_eq!(result.unwrap_err(), "denied");
+            }
+            assert_eq!(registry.device_count(), usize::from(!permitted));
+            assert_eq!(registry.list().unwrap().len(), usize::from(!permitted));
+        }
+    }
+
     #[tokio::test]
     async fn submit_pairing_enhanced_rolls_back_in_process_token_when_registry_register_fails() {
         let state = unwriteable_registry_state();
@@ -808,10 +907,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let blocker = tmp.path().join("blocker");
         std::fs::write(&blocker, b"").expect("seed blocker file");
-        {
-            let mut cfg = state.config.write();
-            cfg.config_path = blocker.join("config.toml");
-        }
+        state.publish_test_config(|cfg| cfg.config_path = blocker.join("config.toml"));
 
         let code = state
             .pairing

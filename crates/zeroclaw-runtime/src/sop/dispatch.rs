@@ -531,15 +531,24 @@ fn remember_dispatch_start(
 
 // ── Core dispatch ───────────────────────────────────────────────
 
+/// What the decision model settled for one SOP's run: the execution mode it
+/// chose (if any) and its p(yes) for each conditional-part step.
+#[derive(Default)]
+struct RunDecision {
+    mode: Option<SopExecutionMode>,
+    parts: std::collections::BTreeMap<u32, f64>,
+}
+
 /// Consult the engine's decision model for each matched SOP that declares a
 /// `[decision]` table. Returns the names that should still start; declined
-/// SOPs are pushed to `results` as `Skipped`, and chosen modes land in
-/// `decided_modes`. SOPs without a `[decision]` table pass through untouched.
+/// SOPs are pushed to `results` as `Skipped`, and the chosen mode and part
+/// answers land in `decided`. SOPs without a `[decision]` table pass through
+/// untouched.
 async fn apply_decisions(
     engine: &Arc<Mutex<SopEngine>>,
     event: &SopEvent,
     matched_names: Vec<String>,
-    decided_modes: &mut HashMap<String, SopExecutionMode>,
+    decided: &mut HashMap<String, RunDecision>,
     results: &mut Vec<DispatchResult>,
 ) -> Vec<String> {
     let gated = match engine.lock() {
@@ -572,6 +581,7 @@ async fn apply_decisions(
                     "sop_name": sop.name,
                     "start": decision.start,
                     "mode": decision.mode.map(|m| m.to_string()),
+                    "parts": decision.parts,
                     "input_tokens": decision.input_tokens,
                 })
             ),
@@ -586,8 +596,14 @@ async fn apply_decisions(
                 reason: format!("decision gate declined: {}", decision.rationale),
             });
             declined.push(sop.name);
-        } else if let Some(mode) = decision.mode {
-            decided_modes.insert(sop.name, mode);
+        } else {
+            decided.insert(
+                sop.name,
+                RunDecision {
+                    mode: decision.mode,
+                    parts: decision.parts,
+                },
+            );
         }
     }
     matched_names
@@ -601,7 +617,7 @@ pub async fn dispatch_sop_event(
     audit: &SopAuditLogger,
     event: SopEvent,
 ) -> Vec<DispatchResult> {
-    dispatch_sop_event_filtered(engine, audit, event, None, None, None).await
+    dispatch_sop_event_filtered(engine, audit, event, None, None, None, None).await
 }
 
 /// Dispatch an incoming event to one named SOP, after normal trigger matching.
@@ -613,7 +629,7 @@ pub async fn dispatch_sop_event_to(
     event: SopEvent,
     target_sop: &str,
 ) -> Vec<DispatchResult> {
-    dispatch_sop_event_filtered(engine, audit, event, Some(target_sop), None, None).await
+    dispatch_sop_event_filtered(engine, audit, event, Some(target_sop), None, None, None).await
 }
 
 /// Dispatch to one named SOP with an active-run key shared by independent
@@ -632,6 +648,39 @@ pub async fn dispatch_sop_event_to_deduplicated(
         Some(target_sop),
         None,
         Some(dedup_key),
+        None,
+    )
+    .await
+}
+
+/// Keeps a caller's authority valid until a synchronous SOP effect finishes.
+/// Callbacks must return this guard rather than just checking and releasing it.
+pub(crate) trait SopEffectGuard {}
+impl<T> SopEffectGuard for T {}
+
+type SopAdmissionCheck<'a> =
+    dyn Fn(&super::Sop) -> Result<Box<dyn SopEffectGuard + 'a>, String> + Sync + 'a;
+
+/// RPC admission hook, borrowed only for this dispatch. It runs under the engine
+/// lock after decision-model waits, against the procedure that will actually
+/// start (including when a producer key would coalesce). No policy is stored on
+/// the engine or carried into running steps. Trusted non-RPC callers omit it.
+pub(crate) async fn dispatch_sop_event_to_authorized(
+    engine: &Arc<Mutex<SopEngine>>,
+    audit: &SopAuditLogger,
+    event: SopEvent,
+    target_sop: &str,
+    dedup_key: Option<&str>,
+    authorize: &SopAdmissionCheck<'_>,
+) -> Vec<DispatchResult> {
+    dispatch_sop_event_filtered(
+        engine,
+        audit,
+        event,
+        Some(target_sop),
+        None,
+        dedup_key,
+        Some(authorize),
     )
     .await
 }
@@ -652,6 +701,7 @@ async fn dispatch_sop_event_filtered(
     // Semantic key shared by fresh producers. Coalesces only while its run is
     // active; terminal retries remain possible.
     active_dedup: Option<&str>,
+    authorize: Option<&SopAdmissionCheck<'_>>,
 ) -> Vec<DispatchResult> {
     let safety = match engine.lock() {
         Ok(eng) => ContentSafety::from_sop_config(eng.config()),
@@ -754,15 +804,9 @@ async fn dispatch_sop_event_filtered(
     // this event should start them and in which mode. Awaited with no engine
     // lock held; a declined SOP is reported as Skipped and never reserves a slot.
     let mut results = Vec::new();
-    let mut decided_modes = HashMap::new();
-    let matched_names = apply_decisions(
-        engine,
-        &event,
-        matched_names,
-        &mut decided_modes,
-        &mut results,
-    )
-    .await;
+    let mut decided: HashMap<String, RunDecision> = HashMap::new();
+    let matched_names =
+        apply_decisions(engine, &event, matched_names, &mut decided, &mut results).await;
     if matched_names.is_empty() {
         return results;
     }
@@ -792,6 +836,21 @@ async fn dispatch_sop_event_filtered(
         // follows the same single-run or atomic AMQP-batch path.
         let mut candidate_names = Vec::with_capacity(matched_names.len());
         for sop_name in &matched_names {
+            if let Some(authorize) = authorize {
+                let authorization = eng
+                    .get_sop(sop_name)
+                    .ok_or_else(|| {
+                        crate::i18n::get_required_cli_string("sop-rpc-definition-unavailable")
+                    })
+                    .and_then(authorize);
+                if let Err(reason) = authorization {
+                    results.push(DispatchResult::Skipped {
+                        sop_name: sop_name.clone(),
+                        reason,
+                    });
+                    continue;
+                }
+            }
             if let Some(result) = coalesce_active_duplicate(&eng, sop_name, active_dedup) {
                 results.push(result);
             } else if let Some(result) =
@@ -1031,7 +1090,9 @@ async fn dispatch_sop_event_filtered(
             for sop_name in &admit_names {
                 match eng.reserve_run_slot(sop_name) {
                     Ok(mut reservation) => {
-                        reservation.set_decided_mode(decided_modes.get(sop_name).copied());
+                        let decision = decided.remove(sop_name).unwrap_or_default();
+                        reservation.set_decided_mode(decision.mode);
+                        reservation.set_decisions(decision.parts);
                         reservations.push(reservation);
                     }
                     Err(e) => {
@@ -1080,7 +1141,7 @@ async fn dispatch_sop_event_filtered(
             let mut remaining = reservations.into_iter();
             for reservation in remaining.by_ref() {
                 let sop_name = reservation.sop_name().to_string();
-                match eng.activate_reserved_run(reservation, event.clone(), None) {
+                match eng.activate_reserved_run(reservation, event.clone(), None, None) {
                     Ok(action) => activated.push((sop_name, action)),
                     Err(e) => {
                         activation_failure = Some((sop_name, e.to_string()));
@@ -1188,11 +1249,26 @@ async fn dispatch_sop_event_filtered(
                     }
                     SopAdmission::Admit => {}
                 }
-                match eng.start_run_with_mode(
-                    sop_name,
-                    event.clone(),
-                    decided_modes.get(sop_name).copied(),
-                ) {
+                let decision = decided.remove(sop_name).unwrap_or_default();
+                let start = if let Some(authorize) = authorize {
+                    eng.with_nonblocking_store(|eng| {
+                        let sop = eng.get_sop(sop_name).ok_or_else(|| {
+                            anyhow::Error::msg(crate::i18n::get_required_cli_string(
+                                "sop-rpc-definition-unavailable",
+                            ))
+                        })?;
+                        let _authority = authorize(sop).map_err(anyhow::Error::msg)?;
+                        eng.start_run_with_mode(
+                            sop_name,
+                            event.clone(),
+                            decision.mode,
+                            decision.parts,
+                        )
+                    })
+                } else {
+                    eng.start_run_with_mode(sop_name, event.clone(), decision.mode, decision.parts)
+                };
+                match start {
                     Ok(action) => {
                         let result =
                             record_started_run(&eng, sop_name, action, &mut pending_deterministic);
@@ -1551,6 +1627,7 @@ async fn dispatch_untrusted_fan_in_inner(
             .as_ref()
             .map(|(key, redelivered)| (key.as_str(), *redelivered)),
         active_dedup.as_deref(),
+        None,
     )
     .await;
     process_headless_results(&results);
@@ -3718,31 +3795,45 @@ mod tests {
         }
 
         impl Scripted {
-            fn answering(gate: f64, mode: &str, confidence: f64) -> Arc<Self> {
+            /// The answers to the gate (when given) and mode questions.
+            fn script(gate: Option<f64>, mode: &str, confidence: f64) -> Answers {
                 let modes = ["auto", "supervised", "step_by_step"];
                 let probabilities = modes
                     .iter()
                     .map(|m| ((*m).to_string(), if *m == mode { 0.9 } else { 0.05 }))
                     .collect();
-                let answers = BTreeMap::from([
-                    ("start_sop".to_string(), Answer::Noul { noul: gate }),
-                    (
-                        "execution_mode".to_string(),
-                        Answer::Choice {
-                            choice: mode.into(),
-                            probabilities,
-                            confidence,
-                        },
-                    ),
-                ]);
+                let mut answers = BTreeMap::from([(
+                    "execution_mode".to_string(),
+                    Answer::Choice {
+                        choice: mode.into(),
+                        probabilities,
+                        confidence,
+                    },
+                )]);
+                if let Some(gate) = gate {
+                    answers.insert("start_sop".to_string(), Answer::Noul { noul: gate });
+                }
+                Answers {
+                    model: None,
+                    answers,
+                    usage: None,
+                }
+            }
+
+            fn with(answers: Answers) -> Arc<Self> {
                 Arc::new(Self {
-                    answers: Some(Answers {
-                        model: None,
-                        answers,
-                        usage: None,
-                    }),
+                    answers: Some(answers),
                     calls: AtomicUsize::new(0),
                 })
+            }
+
+            fn answering(gate: f64, mode: &str, confidence: f64) -> Arc<Self> {
+                Self::with(Self::script(Some(gate), mode, confidence))
+            }
+
+            /// A confident answer for `mode` with no `start_sop` answer at all.
+            fn answering_mode_without_gate(mode: &str, confidence: f64) -> Arc<Self> {
+                Self::with(Self::script(None, mode, confidence))
             }
 
             fn down() -> Arc<Self> {
@@ -3783,6 +3874,7 @@ mod tests {
                 ],
                 mode_instructions: None,
                 min_confidence: 0.7,
+                part_threshold: 0.5,
             }
         }
 
@@ -3926,6 +4018,27 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn unusable_gate_answer_cannot_leave_a_run_less_supervised_than_fail_closed() {
+            let engine = engine_with(
+                vec![webhook_sop(
+                    "refunds",
+                    SopExecutionMode::Supervised,
+                    Some(spec()),
+                )],
+                Some(Scripted::answering_mode_without_gate("auto", 0.9)),
+            );
+            let results = dispatch_sop_event(&engine, &test_audit(), ticket("refund $12")).await;
+            assert_eq!(
+                started(&engine, &results),
+                vec![(
+                    "refunds".into(),
+                    "WaitApproval",
+                    Some(SopExecutionMode::StepByStep)
+                )]
+            );
+        }
+
+        #[tokio::test]
         async fn auto_decision_cannot_remove_a_step_confirmation() {
             let mut sop = webhook_sop("refunds", SopExecutionMode::Supervised, Some(spec()));
             sop.steps[0].requires_confirmation = true;
@@ -4002,6 +4115,112 @@ mod tests {
                 )]
             );
             assert_eq!(jev.calls.load(Ordering::SeqCst), 0);
+        }
+
+        /// A part SOP: no gate or modes, step 1 asks its own question.
+        fn part_sop() -> Sop {
+            let spec = SopDecisionSpec {
+                gate: None,
+                modes: vec![],
+                ..spec()
+            };
+            let mut sop = webhook_sop("review", SopExecutionMode::Auto, Some(spec));
+            sop.steps[0].decide = Some("Does this touch security?".into());
+            let mut compose = sop.steps[0].clone();
+            compose.number = 2;
+            compose.decide = None;
+            sop.steps.push(compose);
+            sop
+        }
+
+        fn active_run(engine: &Arc<Mutex<SopEngine>>) -> SopRun {
+            engine
+                .lock()
+                .unwrap()
+                .active_runs()
+                .values()
+                .next()
+                .cloned()
+                .expect("a run started")
+        }
+
+        #[tokio::test]
+        async fn one_model_call_decides_which_steps_run() {
+            let model = Arc::new(Scripted {
+                answers: Some(Answers {
+                    model: None,
+                    answers: BTreeMap::from([("part_1".to_string(), Answer::Noul { noul: 0.1 })]),
+                    usage: None,
+                }),
+                calls: AtomicUsize::new(0),
+            });
+            let engine = engine_with(vec![part_sop()], Some(model.clone()));
+            dispatch_sop_event(&engine, &test_audit(), ticket("typo fix")).await;
+            let run = active_run(&engine);
+            assert_eq!(run.decisions, BTreeMap::from([(1, 0.1)]));
+            assert_eq!(run.current_step, 2, "step 1 was answered no and skipped");
+            assert_eq!(run.step_results[0].status, SopStepStatus::Skipped);
+            assert_eq!(model.calls.load(Ordering::SeqCst), 1);
+        }
+
+        #[tokio::test]
+        async fn unusable_gate_answer_does_not_let_a_step_answer_skip_a_step() {
+            let mut sop = part_sop();
+            sop.decision = Some(spec());
+            let mut answers = Scripted::script(None, "auto", 0.9);
+            answers
+                .answers
+                .insert("part_1".to_string(), Answer::Noul { noul: 0.1 });
+            let engine = engine_with(vec![sop], Some(Scripted::with(answers)));
+            dispatch_sop_event(&engine, &test_audit(), ticket("typo fix")).await;
+            let run = active_run(&engine);
+            assert!(run.decisions.is_empty(), "{:?}", run.decisions);
+            assert_eq!(run.current_step, 1, "no usable answer: step 1 runs");
+            assert!(run.step_results.is_empty());
+            assert_eq!(run.decided_mode, Some(SopExecutionMode::StepByStep));
+        }
+
+        /// Dispatch a gated, moded SOP whose model says "no" to step 1 but whose
+        /// mode answer is unusable: step 1 must still run, under the strict mode.
+        async fn assert_unusable_mode_answer_does_not_skip_a_step(mut answers: Answers) {
+            let mut sop = part_sop();
+            sop.decision = Some(spec());
+            answers
+                .answers
+                .insert("start_sop".to_string(), Answer::Noul { noul: 0.95 });
+            answers
+                .answers
+                .insert("part_1".to_string(), Answer::Noul { noul: 0.1 });
+            let engine = engine_with(vec![sop], Some(Scripted::with(answers)));
+            dispatch_sop_event(&engine, &test_audit(), ticket("typo fix")).await;
+            let run = active_run(&engine);
+            assert!(run.decisions.is_empty(), "{:?}", run.decisions);
+            assert_eq!(run.current_step, 1, "no usable mode: step 1 runs");
+            assert!(run.step_results.is_empty());
+            assert_eq!(run.decided_mode, Some(SopExecutionMode::StepByStep));
+        }
+
+        #[tokio::test]
+        async fn low_confidence_mode_answer_does_not_let_a_step_answer_skip_a_step() {
+            assert_unusable_mode_answer_does_not_skip_a_step(Scripted::script(None, "auto", 0.5))
+                .await;
+        }
+
+        #[tokio::test]
+        async fn missing_mode_answer_does_not_let_a_step_answer_skip_a_step() {
+            let mut answers = Scripted::script(None, "auto", 0.9);
+            answers.answers.remove("execution_mode");
+            assert_unusable_mode_answer_does_not_skip_a_step(answers).await;
+        }
+
+        #[tokio::test]
+        async fn model_outage_runs_every_step() {
+            let engine = engine_with(vec![part_sop()], Some(Scripted::down()));
+            dispatch_sop_event(&engine, &test_audit(), ticket("typo fix")).await;
+            let run = active_run(&engine);
+            assert!(run.decisions.is_empty());
+            assert_eq!(run.current_step, 1, "no answer: the conditional step runs");
+            assert!(run.step_results.is_empty());
         }
 
         #[tokio::test]

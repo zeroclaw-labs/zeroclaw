@@ -12,6 +12,7 @@ use crate::agent::tool_receipts::ReceiptGenerator;
 use crate::approval::ApprovalManager;
 use crate::hooks::HookRunner;
 use crate::observability::Observer;
+use crate::security::SecurityPolicy;
 use crate::tools::ActivatedToolSet;
 use crate::tools::scoped::ScopedToolRegistry;
 
@@ -44,6 +45,10 @@ pub struct SettledAttemptSummary {
     pub output_tokens: Option<u64>,
     pub cost_usd: Option<f64>,
     pub accepted: bool,
+    /// Display-only estimate of the summary request's input tokens, set by
+    /// the caller when the provider omitted `input_tokens`. Rejected attempts
+    /// leave this `None`; accounting reads only `input_tokens`.
+    pub estimated_input_tokens: Option<u64>,
 }
 
 /// Append summaries for the billable subset of `attempts` as rejected
@@ -63,6 +68,7 @@ fn extend_rejected_summaries(out: &mut Vec<SettledAttemptSummary>, attempts: &[A
                 billable.usage,
             ),
             accepted: false,
+            estimated_input_tokens: None,
         });
     }
 }
@@ -80,11 +86,12 @@ impl ResolvedModelAccess<'_> {
         // (`prepare_messages_for_provider`): callers that want images in the
         // request normalize before calling, and the max-iteration graceful
         // summary does. As a fail-closed backstop for every other caller,
-        // loadable audio markers are replaced with a placeholder here, and so
-        // are image markers whose reference is not an inline `data:` URI, so
-        // no filesystem path or URL marker can reach a provider adapter
-        // through this seam. Both helpers borrow the input untouched when
-        // clean.
+        // loadable audio markers are replaced with a placeholder here, and
+        // image references that are not inline `data:` URIs are dropped the
+        // same way: a path or URL marker in a legacy body becomes a
+        // placeholder, while a declared carrier keeps its body verbatim and
+        // loses only the undeliverable attachments from its declared list.
+        // Both helpers borrow the input untouched when clean.
         let ChatRequest {
             messages,
             tools,
@@ -169,6 +176,11 @@ impl ResolvedModelAccess<'_> {
                         .and_then(|usage| usage.output_tokens),
                     cost_usd: accepted_cost_usd,
                     accepted: true,
+                    // The caller (max_iter) fills this from the summary
+                    // request's message history when the provider omitted
+                    // `input_tokens`, so the context meter keeps its numerator
+                    // after the final-summary event.
+                    estimated_input_tokens: None,
                 });
                 Ok(response)
             }
@@ -193,6 +205,12 @@ pub struct ResolvedAgentExecution<'a> {
     pub silent: bool,
     /// Approval policy + back-channel; `None` for paths that never prompt.
     pub approval: Option<&'a ApprovalManager>,
+    /// The agent's filesystem policy, applied by the no-vision image-marker
+    /// gate so a local marker counts as resolvable only when the agent's own
+    /// file tools could read it. `None` on configless (test) paths, where the
+    /// gate fails closed to a degrade. The gate lives in
+    /// `crate::agent::turn::vision_route::resolve_vision_provider`.
+    pub security: Option<&'a SecurityPolicy>,
     /// Vision-model routing config.
     pub multimodal_config: &'a MultimodalConfig,
     /// Full config, for resolving the configured `vision_model_provider`'s
@@ -221,6 +239,7 @@ pub struct ResolvedAgentExecution<'a> {
     pub parallel_tools: bool,
     /// Truncation limit for tool outputs.
     pub max_tool_result_chars: usize,
+    pub keep_tool_context_turns: usize,
     /// Capacity and proactive-trim budget resolved together for the selected
     /// route at the turn boundary.
     pub context_limits: ResolvedContextLimits,
@@ -244,6 +263,9 @@ pub struct ResolvedIo<'a> {
     pub observer: &'a dyn Observer,
     pub silent: bool,
     pub approval: Option<&'a ApprovalManager>,
+    /// Filesystem policy for the no-vision image-marker gate; `None` on
+    /// configless (test) paths. See [`ResolvedAgentExecution::security`].
+    pub security: Option<&'a SecurityPolicy>,
     pub multimodal_config: &'a MultimodalConfig,
     /// Full config for vision-route provider-alias resolution; `None` on
     /// configless (test) paths. See [`ResolvedAgentExecution::config`].
@@ -265,6 +287,7 @@ pub struct ResolvedRuntimeKnobs<'a> {
     pub strict_tool_parsing: bool,
     pub parallel_tools: bool,
     pub max_tool_result_chars: usize,
+    pub keep_tool_context_turns: usize,
     pub context_limits: ResolvedContextLimits,
     /// Single live limits authority; see [`ResolvedAgentExecution::context_limits_resolver`].
     pub context_limits_resolver: Option<ContextLimitsResolver>,
@@ -283,6 +306,7 @@ impl<'a> ResolvedAgentExecution<'a> {
             observer: io.observer,
             silent: io.silent,
             approval: io.approval,
+            security: io.security,
             multimodal_config: io.multimodal_config,
             config: io.config,
             max_tool_iterations: runtime.max_tool_iterations,
@@ -295,6 +319,7 @@ impl<'a> ResolvedAgentExecution<'a> {
             strict_tool_parsing: runtime.strict_tool_parsing,
             parallel_tools: runtime.parallel_tools,
             max_tool_result_chars: runtime.max_tool_result_chars,
+            keep_tool_context_turns: runtime.keep_tool_context_turns,
             context_limits: runtime.context_limits,
             context_limits_resolver: runtime.context_limits_resolver,
             receipt_generator: io.receipt_generator,

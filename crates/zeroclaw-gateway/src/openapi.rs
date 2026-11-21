@@ -109,6 +109,13 @@ pub fn build_spec() -> serde_json::Value {
             "TriggerSourceRegistry": schema_value::<zeroclaw_runtime::sop::TriggerSourceRegistry>(),
             "SlashOptionKindsResult": schema_value::<crate::api_skills::SlashOptionKindsResult>(),
             "StatusResponse": response_schema_value::<StatusResponse>(),
+            "InstalledPluginPackage": schema_value::<crate::api_plugins::InstalledPluginPackage>(),
+            "AvailablePluginPackage": schema_value::<crate::api_plugins::AvailablePluginPackage>(),
+            "PluginCatalogEntry": schema_value::<crate::api_plugins::PluginCatalogEntry>(),
+            "PluginCatalogIssueSource": schema_value::<crate::api_plugins::PluginCatalogIssueSource>(),
+            "PluginCatalogIssueCode": schema_value::<crate::api_plugins::PluginCatalogIssueCode>(),
+            "PluginCatalogIssue": schema_value::<crate::api_plugins::PluginCatalogIssue>(),
+            "PluginsResponse": schema_value::<crate::api_plugins::PluginsResponse>(),
         },
         "securitySchemes": {
             "bearerAuth": {
@@ -285,6 +292,22 @@ pub fn build_spec() -> serde_json::Value {
                 }
             }
         },
+        "/api/plugins": {
+            "get": {
+                "tags": ["plugins"],
+                "summary": "List plugin packages",
+                "description": "Returns a request-time package catalog derived from canonical plugin config, host-admitted installed manifests, and the cached registry. Installed and registry versions remain separate facts. The endpoint is available without WASM support; `wasm_plugins_available` identifies that build-time limitation.",
+                "responses": {
+                    "200": {
+                        "description": "The read-only plugin package catalog and source status.",
+                        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/PluginsResponse" } } }
+                    },
+                    "401": {
+                        "description": "A valid pairing-derived bearer token is required."
+                    }
+                }
+            }
+        },
         "/api/config": {
             "patch": {
                 "tags": ["config"],
@@ -363,7 +386,7 @@ pub fn build_spec() -> serde_json::Value {
             "post": {
                 "tags": ["config"],
                 "summary": "Apply on-disk schema migration in place",
-                "description": "Mirrors `zeroclaw config migrate`. Backs up the previous file as `config.toml.bak` before writing.",
+                "description": "Mirrors `zeroclaw config migrate`. Backs up the previous file as `config.toml.bak` before writing, and keeps the pre-upgrade original once per schema version as `config.toml.v<N>.backup`. Returns the migration notices.",
                 "responses": {
                     "200": {
                         "description": "Migration applied (or already at the current schema version).",
@@ -679,6 +702,7 @@ mod tests {
         assert!(paths.get("/api/version/upgrade").is_some());
         assert!(paths.get("/api/version/upgrade/status").is_some());
         assert!(paths.get("/api/skills/slash-option-kinds").is_some());
+        assert!(paths.get("/api/plugins").is_some());
         #[cfg(feature = "a2a")]
         assert!(paths.get("/a2a/{alias}").is_some());
     }
@@ -838,6 +862,28 @@ mod tests {
         }
     }
 
+    #[test]
+    fn spec_registers_plugin_catalog_schemas() {
+        let spec = build_spec();
+        let schemas = spec.pointer("/components/schemas").unwrap();
+        for schema in [
+            "InstalledPluginPackage",
+            "AvailablePluginPackage",
+            "PluginCatalogEntry",
+            "PluginCatalogIssue",
+            "PluginsResponse",
+        ] {
+            assert!(schemas.get(schema).is_some(), "missing schema {schema}");
+        }
+        assert_eq!(
+            spec.pointer(
+                "/paths/~1api~1plugins/get/responses/200/content/application~1json/schema/$ref"
+            )
+            .and_then(serde_json::Value::as_str),
+            Some("#/components/schemas/PluginsResponse")
+        );
+    }
+
     #[cfg(all(feature = "schema-export", feature = "a2a"))]
     #[test]
     fn spec_registers_a2a_task_schemas() {
@@ -924,6 +970,31 @@ mod tests {
         assert!(
             csp.contains("script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net"),
             "docs CSP must admit the Scalar CDN script: {csp}"
+        );
+    }
+
+    #[test]
+    fn docs_html_pins_scalar_with_sri() {
+        // include_str! is what handle_docs serves; assert the pin + SRI here so
+        // a regression cannot silently drop them without touching the handler.
+        let html = include_str!("openapi_docs.html");
+        assert!(
+            html.contains(
+                "cdn.jsdelivr.net/npm/@scalar/api-reference@1.76.3/dist/browser/standalone.js"
+            ),
+            "docs page must pin an exact Scalar version"
+        );
+        assert!(
+            html.contains(r#"integrity="sha384-H/jJ+XQ0S+5wKmVCrODlHKRKyDzdSBog4sUPc+AQTZddtU1FyQsiCrA47EUte2Fd""#),
+            "docs page must set Subresource Integrity on the Scalar script"
+        );
+        assert!(
+            html.contains(r#"crossorigin="anonymous""#),
+            "SRI requires crossorigin=anonymous"
+        );
+        assert!(
+            !html.contains(r#"src="https://cdn.jsdelivr.net/npm/@scalar/api-reference""#),
+            "unversioned Scalar CDN URL must not remain"
         );
     }
 

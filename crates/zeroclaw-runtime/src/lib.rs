@@ -10,13 +10,16 @@ pub mod cli_input;
 /// `cargo generate installers runtime-locales`. Generated, not hand-edited.
 mod generated_locales;
 pub mod identity;
+pub mod live_config_authority;
 pub mod migration;
 pub mod util;
 
 pub mod agent;
+pub mod agent_lifecycle;
 pub mod approval;
 pub mod browse;
 pub mod calendar;
+pub mod composition;
 pub mod control_plane;
 pub mod cost;
 pub mod cron;
@@ -38,6 +41,7 @@ pub mod process_stats;
 pub mod quickstart;
 pub mod rag;
 pub mod relay;
+pub mod relay_dashboard;
 pub mod restart;
 pub mod routines;
 pub mod rpc;
@@ -50,3 +54,7 @@ pub mod tools;
 pub mod trust;
 pub mod tunnel;
 pub mod verifiable_intent;
+
+pub use live_config_authority::{AgentExecutionCapability, LiveConfigAuthority};
+
+pub mod config_application;

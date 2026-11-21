@@ -78,6 +78,11 @@ tool-file-download-error-missing-dest-path = Missing 'dest_path' parameter
 tool-file-download-error-invalid-file-name = Invalid dest_path '{ $dest_path }': must end in a concrete file name
 tool-file-download-error-no-parent = Invalid dest_path '{ $dest_path }': has no parent directory
 tool-file-download-error-resolve-dir = Cannot resolve destination directory for '{ $dest_path }': { $err }
+tool-file-download-error-bad-scheme = file_download endpoint URL scheme '{ $scheme }' is not supported; only http:// and https:// are allowed
+tool-file-download-error-invalid-url = file_download endpoint URL is invalid: { $err }
+tool-file-download-error-private-host = file_download endpoint host '{ $host }' is loopback / private / link-local. To allow this host, add it (or "*") to { $config_key } in config.toml
+tool-file-download-error-metadata-endpoint = file_download endpoint host '{ $host }' resolved to cloud metadata or credential-delivery address { $ip }, which cannot be enabled by file_download.allowed_private_hosts
+tool-file-download-error-invalid-nat64-prefix = file_download config '{ $config_key }' contains malformed entry '{ $prefix }': fix or remove it, then retry (a network-specific NAT64 prefix must be an IPv6 CIDR with length 32, 40, 48, 56, 64, or 96)
 tool-file-download-error-client-build = Failed to build download client: { $err }
 tool-file-download-error-request = Download request failed: { $err }
 tool-file-download-error-status = Download endpoint returned status { $status }
@@ -172,6 +177,13 @@ tool-memory-store = Store a fact, preference, or note in long-term memory. Use c
 tool-microsoft365 = Microsoft 365 integration: manage Outlook mail, Teams messages, Calendar events, OneDrive files, and SharePoint search via Microsoft Graph API
 
 tool-model-routing-config = Manage default model settings, scenario-based provider/model routes, classification rules, and aliased agent profiles
+tool-model-routing-config-invalid-scenario = Invalid upsert_scenario arguments. Supply nonempty strings for: { $required }. Fix missing, non-string, or blank fields: { $invalid }.
+tool-model-routing-config-error-missing-risk-profile = agent `{$agent}` references missing risk profile `{$profile}`
+tool-model-routing-config-error-shared-risk-profile = risk profile `{$profile}` is shared by another agent; refusing an agent-scoped mutation
+tool-model-routing-config-error-risk-profile-collision = risk profile `{$profile}` already exists; refusing to overwrite it while isolating agent `{$agent}`
+tool-model-routing-config-error-missing-runtime-profile = agent `{$agent}` references missing runtime profile `{$profile}`
+tool-model-routing-config-error-shared-runtime-profile = runtime profile `{$profile}` is shared by another agent; refusing an agent-scoped mutation
+tool-model-routing-config-error-runtime-profile-collision = runtime profile `{$profile}` already exists; refusing to overwrite it while isolating agent `{$agent}`
 
 tool-notion = Interact with Notion: query databases, read/create/update pages, and search the workspace.
 
@@ -182,9 +194,17 @@ tool-proxy-config = Manage ZeroClaw proxy settings (scope: environment | zerocla
 
 tool-pushover = Send a Pushover notification to your device. Requires PUSHOVER_TOKEN and PUSHOVER_USER_KEY in .env file.
 
+tool-read-skill = Read the full source file for an available skill by name. Use this when its prompt entry says the instructions load on demand.
+
 tool-schedule = Manage scheduled shell-only tasks. Actions: create/add/once/list/get/cancel/remove/pause/resume. WARNING: This tool creates shell jobs whose output is only logged, NOT delivered to any channel. To send a scheduled message to Discord/Telegram/Slack/Matrix, use the cron_add tool with job_type='agent' and a delivery config like {"{"}"mode":"announce","channel":"discord","to":"<channel_id>"{"}"}.
 
 tool-sessions-history-header = Session '{ $session_id }': showing { $shown }/{ $total } messages
+tool-sessions-send = Deprecated legacy compatibility tool. Appends content to an existing Chat session's conversation history as an ordinary 'user' message. This does not notify or run the session and is not live message delivery. Use send_message_to_peer for agent-to-agent messaging.
+tool-sessions-send-param-session-id = The existing Chat session ID whose legacy history should be appended (for example, telegram__user123). Gateway dashboard sessions may be addressed by their dashboard ID or by gw_<id>.
+tool-sessions-send-param-message = Legacy content to append as an ordinary 'user' message; this does not notify or run the session.
+tool-sessions-send-output-appended = Legacy content appended to session '{ $session_id }' as an ordinary 'user' message. No notification, live delivery, or agent execution occurred. Use send_message_to_peer for agent-to-agent messaging.
+tool-sessions-send-output-appended-alias = Legacy content appended to session '{ $session_id }' (requested '{ $requested_id }') as an ordinary 'user' message. No notification, live delivery, or agent execution occurred. Use send_message_to_peer for agent-to-agent messaging.
+tool-sessions-send-error-append = Failed to append content to session history: { $error }
 tool-sessions-send-error-acp-unsupported = { $tool } does not support { $channel } sessions because durable transcript writes do not deliver messages to the live { $product } session.
 tool-sessions-current-channel = Channel: { $channel }
 
@@ -203,6 +223,7 @@ tool-browser-screenshot-error-sidecar-no-png-data = computer-use sidecar did not
 tool-browser-screenshot-error-sidecar-empty-png = computer-use sidecar returned an empty screenshot payload
 tool-browser-screenshot-error-sidecar-not-png = computer-use sidecar returned a non-PNG screenshot payload
 tool-browser-screenshot-error-sidecar-non-json-success = computer-use sidecar returned a non-JSON success response for a path-bearing screenshot; the requested file was not written
+tool-browser-screenshot-error-allocated-target-exists = Allocated screenshot target '{ $filename }' already exists; pass an explicit `path` instead of overwriting it
 
 tool-security-ops = Security operations tool for managed cybersecurity services. Actions: triage_alert (classify/prioritize alerts), run_playbook (execute incident response steps), parse_vulnerability (parse scan results), generate_report (create security posture reports), list_playbooks (list available playbooks), alert_stats (summarize alert metrics).
 
@@ -226,6 +247,14 @@ tool-web-search-tool = Search the web for information. Returns relevant search r
 tool-web-search-tool-error-duckduckgo-blocked = DuckDuckGo is rate-limiting this machine. Do not retry or rephrase the search; wait a few minutes, fetch known URLs directly with web_fetch, or configure SearXNG, Brave, or Tavily as the web_search provider.
 tool-web-search-tool-error-searxng-not-configured = SearXNG instance URL not configured. Set [web_search] searxng_instance_url in config.toml, or override it with the ZEROCLAW_web_search__searxng_instance_url environment variable.
 tool-web-search-tool-note-truncated-results = (further results omitted)
+tool-web-search-tool-error-anysearch-config-parse = Failed to parse config file { $path } for AnySearch API key ({ $error_code }{ $location })
+tool-web-search-tool-error-anysearch-config-parse-line = , line { $line }
+tool-web-search-tool-error-anysearch-config-read = Failed to read config file { $path } for AnySearch API key: { $error }
+tool-web-search-tool-error-anysearch-response-too-large = AnySearch response exceeds the { $limit } byte size limit
+tool-web-search-tool-error-anysearch-invalid-response = Invalid AnySearch API response
+tool-web-search-tool-error-anysearch-api = AnySearch returned error (code { $code }): { $message }
+tool-web-search-tool-anysearch-no-title = No title
+tool-web-search-tool-anysearch-no-error-details = no error details
 
 tool-workspace = Manage multi-client workspaces. Subcommands: list, switch, create, info, export. Each workspace provides isolated memory, audit, secrets, and tool restrictions.
 

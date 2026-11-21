@@ -8,7 +8,6 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use parking_lot::RwLock;
 use zeroclaw_api::channel::Channel;
 use zeroclaw_api::webhook::PluginWebhookRegistryLease;
 use zeroclaw_config::schema::Config;
@@ -47,6 +46,30 @@ struct BuiltChannelCandidate {
 #[cfg(feature = "plugins-wasm")]
 pub(crate) struct PluginActivationPlan {
     admitted: Vec<PluginInstanceScope>,
+    /// Mirror candidates, deliberately kept OUT of `admitted`.
+    ///
+    /// Everything that constructs a guest reads `admitted` through
+    /// [`Self::scopes`]. A mirror is not constructible yet: the endpoint would
+    /// still be stamped `plugin`, the sender policy would still resolve
+    /// `channel_external_peers("plugin", alias)`, and the config resolver would
+    /// still hand it its `plugins.entries` row instead of
+    /// `channels.<provides>.<alias>`. Admitting one into `admitted` would build
+    /// a channel that cannot act as the alias it mirrors, register it under a
+    /// `plugin.<alias>` routing key it does not own, and consume an
+    /// explicit-priority instance slot that an auto-discovered tool or skill
+    /// would otherwise get.
+    ///
+    /// So the decision is recorded and nothing consumes it. When the config
+    /// feed, endpoint type, peer policy and native precedence land, these move
+    /// into `admitted` and back under the single `max_active_instances`
+    /// ceiling.
+    ///
+    /// `allow(dead_code)`: having no production reader is the invariant, not an
+    /// oversight. The test accessor is the only consumer, and the day this
+    /// field is read outside `#[cfg(test)]` is the day a mirror can be
+    /// constructed — which is the review gate this attribute marks.
+    #[allow(dead_code)]
+    mirrors: Vec<PluginInstanceScope>,
 }
 
 #[cfg(feature = "plugins-wasm")]
@@ -82,48 +105,172 @@ impl PluginActivationPlan {
         if !config.plugins.enabled {
             return Ok(Self {
                 admitted: Vec::new(),
+                mirrors: Vec::new(),
             });
         }
 
-        let channel_packages: std::collections::HashSet<&str> = host
-            .channel_plugin_details()
-            .into_iter()
-            .map(|(manifest, _)| manifest.name.as_str())
-            .collect();
+        let channel_packages = channel_package_names(host);
         let mut candidates = Vec::new();
+        // Kept apart from `candidates` on purpose; see `Self::mirrors`.
+        let mut mirror_candidates: Vec<PluginInstanceScope> = Vec::new();
 
+        // The per-declaration rule is `decide_explicit_channel`, shared with
+        // `channel_binding_admission` so a report of this pass cannot drift
+        // from it. A declaration it refuses is skipped here; the reason is
+        // only reported by that query.
         for (binding, declaration) in &config.channels.plugin {
-            if !declaration.enabled || !has_enabled_owner(config, binding) {
-                continue;
-            }
-            let Some(manifest) = host.manifest(&declaration.package) else {
-                continue;
-            };
-            if !channel_packages.contains(manifest.name.as_str()) {
-                continue;
-            }
-            candidates.push(ActivationCandidate {
-                explicit: true,
-                scope: PluginInstanceScope::from_manifest(
-                    manifest,
-                    PluginCapability::Channel,
-                    binding,
-                    manifest.permissions.iter().copied(),
-                )?,
-            });
-        }
-
-        if config.plugins.auto_discover {
-            for (manifest, _) in host.tool_plugin_details() {
+            if let ExplicitChannelDecision::Candidate(scope) =
+                decide_explicit_channel(config, host, &channel_packages, binding, declaration)?
+            {
                 candidates.push(ActivationCandidate {
-                    explicit: false,
-                    scope: PluginInstanceScope::for_package_binding(
-                        manifest,
-                        PluginCapability::Tool,
-                        manifest.permissions.iter().copied(),
-                    )?,
+                    explicit: true,
+                    scope,
                 });
             }
+        }
+
+        // Mirror candidates. A channel package whose manifest declares
+        // `provides = "<id>"` is a drop-in for that compiled-in channel, so it
+        // activates once per configured and enabled `[channels.<id>.<alias>]`
+        // rather than from a single `[channels.plugin.<alias>]` declaration.
+        // Canonical channel config stays the one home for those settings.
+        //
+        // These count as explicit: the aliases are operator-named in canonical
+        // config, so they take ceiling priority over auto-discovery exactly as
+        // an explicit plugin channel declaration does.
+        //
+        // Native-wins is NOT decided here. Whether a compiled-in channel of the
+        // same id exists is a build-feature fact owned by the channel
+        // orchestrator, which drops a mirror that collides with a live native
+        // alias. Admission only decides which mirrors are eligible at all.
+        let mirror_claims = mirror_claim_counts(host);
+        let channels_view = serde_json::to_value(&config.channels).ok();
+        for (manifest, _) in host.channel_plugin_details() {
+            let Some(provides) = manifest.provides.as_deref() else {
+                continue;
+            };
+            // `provides` must name a channel type this build actually knows.
+            //
+            // This is diagnostic, not load-bearing: an unknown id has no
+            // canonical config section, so it would admit nothing regardless.
+            // The value is the log line — a typo otherwise looks exactly like
+            // a plugin whose aliases are simply unconfigured, which is the
+            // kind of silence that costs an operator an afternoon.
+            // `plugin` is in V3_CHANNEL_TYPES, but it is the plugin family's
+            // own namespace, not a compiled-in channel to mirror. Allowing it
+            // would let any admitted package enumerate
+            // `[channels.plugin.<alias>]` declarations that name a DIFFERENT
+            // package and claim those aliases, because this pass keys on the
+            // alias and never reads the declaration's `package` field the way
+            // the explicit pass above does. That is a route takeover, not a
+            // mirror, so the family is refused outright.
+            if provides == PLUGIN_CHANNEL_FAMILY {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "plugin": manifest.name,
+                            "provides": provides,
+                            "error_key": "plugin_mirror_reserved_channel_family",
+                        })),
+                    "A plugin may not mirror the reserved `plugin` channel family; refusing the mirror"
+                );
+                continue;
+            }
+            if !zeroclaw_config::schema::v2::V3_CHANNEL_TYPES.contains(&provides) {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "plugin": manifest.name,
+                            "provides": provides,
+                            "error_key": "plugin_mirror_unknown_channel_id",
+                        })),
+                    "Plugin mirrors a channel id this build does not define; refusing the mirror"
+                );
+                continue;
+            }
+            // Two packages claiming one id is ambiguous, and the host will not
+            // pick a mirror on the operator's behalf: both fail closed.
+            if mirror_claims.get(provides).copied().unwrap_or_default() > 1 {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "plugin": manifest.name,
+                            "provides": provides,
+                            "error_key": "plugin_mirror_ambiguous_provider",
+                        })),
+                    "More than one plugin mirrors this channel id; refusing every claimant"
+                );
+                continue;
+            }
+            // A mirror is fed the alias's canonical config, so without
+            // `config_read` it would run against an empty object and
+            // misbehave silently. Refuse it instead.
+            if !manifest
+                .permissions
+                .contains(&zeroclaw_plugins::PluginPermission::ConfigRead)
+            {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "plugin": manifest.name,
+                            "provides": provides,
+                            "error_key": "plugin_mirror_config_read_required",
+                        })),
+                    "Channel mirror requires config_read; refusing the mirror"
+                );
+                continue;
+            }
+            let Some(aliases) = channels_view
+                .as_ref()
+                .and_then(|channels| channels.get(provides))
+                .and_then(serde_json::Value::as_object)
+            else {
+                continue;
+            };
+            for (alias, entry) in aliases {
+                let enabled = entry
+                    .get("enabled")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
+                if !enabled {
+                    continue;
+                }
+                if !has_enabled_owner_ref(config, &format!("{provides}.{alias}")) {
+                    continue;
+                }
+                mirror_candidates.push(PluginInstanceScope::from_manifest(
+                    manifest,
+                    PluginCapability::Channel,
+                    alias,
+                    manifest.permissions.iter().copied(),
+                )?);
+            }
+        }
+
+        // The per-package rule for the default tool binding is
+        // `decide_tool_binding`, shared with `tool_instance_admission` so a
+        // report of this pass cannot drift from it. A package it refuses is
+        // skipped here; the reason is only reported by that query.
+        let tool_packages = tool_package_names(host);
+        for (manifest, _) in host.tool_plugin_details() {
+            if let ToolBindingDecision::Candidate(scope) =
+                decide_tool_binding(config, host, &tool_packages, &manifest.name)?
+            {
+                candidates.push(ActivationCandidate {
+                    explicit: false,
+                    scope,
+                });
+            }
+        }
+        if config.plugins.auto_discover {
             for (manifest, _) in host.skill_plugin_details() {
                 candidates.push(ActivationCandidate {
                     explicit: false,
@@ -148,12 +295,27 @@ impl PluginActivationPlan {
                 .then_with(|| left.scope.id().binding().cmp(right.scope.id().binding()))
         });
 
+        // Mirrors are ordered by the same stable key so the recorded decision
+        // is deterministic, and bounded by the same configured number so a
+        // large install cannot record an unbounded set. They are counted
+        // separately from `admitted` because nothing constructs them: charging
+        // them against the shared ceiling would let an inert mirror displace a
+        // tool or skill that does run.
+        mirror_candidates.sort_by(|left, right| {
+            left.id()
+                .package()
+                .cmp(right.id().package())
+                .then_with(|| left.id().binding().cmp(right.id().binding()))
+        });
+        mirror_candidates.truncate(config.plugins.max_active_instances);
+
         Ok(Self {
             admitted: candidates
                 .into_iter()
                 .take(config.plugins.max_active_instances)
                 .map(|candidate| candidate.scope)
                 .collect(),
+            mirrors: mirror_candidates,
         })
     }
 
@@ -197,6 +359,22 @@ impl PluginActivationPlan {
         self.find(package, capability, binding).cloned()
     }
 
+    /// Mirror decisions recorded by this plan.
+    ///
+    /// Intentionally has no production consumer: see [`Self::mirrors`].
+    #[cfg(test)]
+    fn mirror_identities(&self) -> Vec<(String, String)> {
+        self.mirrors
+            .iter()
+            .map(|scope| {
+                (
+                    scope.id().package().to_string(),
+                    scope.id().binding().to_string(),
+                )
+            })
+            .collect()
+    }
+
     /// Admitted scopes of one capability, in the plan's enumeration order.
     pub(crate) fn scopes(
         &self,
@@ -209,12 +387,445 @@ impl PluginActivationPlan {
     }
 }
 
+/// Whether one explicit `[channels.plugin.<alias>]` binding is an activation
+/// candidate, and if not, the first precondition the plan finds unmet, in the
+/// order the plan applies them.
+///
+/// The refusals are listed in that order. `PluginsDisabled` is the global
+/// switch, `Undeclared` means there is no declaration to judge, the next four
+/// are the plan's per-declaration checks, and `OverInstanceCeiling` is the
+/// shared ceiling, which only a whole plan can apply.
+#[cfg(feature = "plugins-wasm")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChannelBindingAdmission {
+    /// The plan admits the instance, so the channel loader will try to
+    /// construct it. Admission is not construction: the loader can still
+    /// refuse the instance, for example when its component does not load.
+    Admitted,
+    /// `plugins.enabled` is false, so the plan admits no plugin instance at
+    /// all.
+    PluginsDisabled,
+    /// No `[channels.plugin.<alias>]` declaration exists.
+    Undeclared,
+    /// The declaration sets `enabled = false`.
+    BindingDisabled,
+    /// No enabled agent lists `plugin.<alias>` among its channels, so the
+    /// instance would have nothing to deliver to.
+    NoEnabledOwner,
+    /// The declaration names a package the plugin host did not load: it is
+    /// not installed, or discovery refused it, for example on a failed
+    /// signature check.
+    PackageNotInstalled {
+        /// The package the declaration names.
+        package: String,
+    },
+    /// The named package is loaded but does not declare the `channel`
+    /// capability, so it cannot back a channel binding.
+    NotAChannelPackage {
+        /// The package the declaration names.
+        package: String,
+    },
+    /// Every precondition holds but `plugins.max_active_instances` leaves no
+    /// slot for it.
+    OverInstanceCeiling,
+}
+
+/// The activation plan's own verdict on each explicit channel binding in
+/// `aliases`, in that order.
+///
+/// Anything that reports whether a `[channels.plugin.<alias>]` instance will
+/// start, such as the CLI after binding one, asks this rather than restating
+/// the admission rules, so the report cannot drift from what the runtime does
+/// with the same config and installed packages. The per-declaration checks
+/// run through the helper the plan's explicit pass uses, in the same order.
+/// The ceiling verdict comes from building that plan and asking whether it
+/// admitted the instance. The plan is built at most once per call, so a
+/// report over every binding of one package, as `plugin info` prints, asks
+/// about them together and, when the plan can be built, costs one plan
+/// rather than one per binding.
+///
+/// Like the plan, this is guest-free: it reads canonical config and the
+/// manifests the host already admitted, never touches component bytes, and
+/// runs no guest code. That is also why `Admitted` promises admission and not
+/// a running channel.
+///
+/// The verdicts describe `config` as given. A running daemon keeps acting on
+/// the config it loaded until it restarts or reloads.
+///
+/// # Errors
+///
+/// Returns the plan's own error when the instance identity of a binding in
+/// `aliases` cannot be formed, for example from an alias containing control
+/// characters, and, when a binding meets every precondition, when the whole
+/// plan cannot be built. No binding gets a verdict then: the runtime starts
+/// no plugin instance in either case, because its own plan fails the same
+/// way.
+#[cfg(feature = "plugins-wasm")]
+pub fn channel_binding_admission(
+    config: &Config,
+    host: &PluginHost,
+    aliases: &[&str],
+) -> Result<Vec<ChannelBindingAdmission>, PluginError> {
+    if !config.plugins.enabled {
+        return Ok(vec![
+            ChannelBindingAdmission::PluginsDisabled;
+            aliases.len()
+        ]);
+    }
+    let channel_packages = channel_package_names(host);
+    let mut verdicts = Vec::with_capacity(aliases.len());
+    // The bindings that meet every per-declaration precondition, with their
+    // positions in `verdicts`. Only these need the plan.
+    let mut candidates = Vec::new();
+    for alias in aliases.iter().copied() {
+        let Some(declaration) = config.channels.plugin.get(alias) else {
+            verdicts.push(ChannelBindingAdmission::Undeclared);
+            continue;
+        };
+        match decide_explicit_channel(config, host, &channel_packages, alias, declaration)? {
+            ExplicitChannelDecision::Unmet(unmet) => verdicts.push(unmet),
+            ExplicitChannelDecision::Candidate(scope) => {
+                // Nothing but the ceiling removes an explicit candidate from
+                // the plan: it truncates the one sorted candidate sequence.
+                // So this is the candidate's verdict until the plan, built
+                // once below, shows it admitted.
+                candidates.push((verdicts.len(), scope));
+                verdicts.push(ChannelBindingAdmission::OverInstanceCeiling);
+            }
+        }
+    }
+    if candidates.is_empty() {
+        return Ok(verdicts);
+    }
+    let plan = PluginActivationPlan::build(config, host)?;
+    for (index, scope) in candidates {
+        let id = scope.id();
+        if plan.admits(id.package(), PluginCapability::Channel, id.binding()) {
+            verdicts[index] = ChannelBindingAdmission::Admitted;
+        }
+    }
+    Ok(verdicts)
+}
+
+/// One declaration's outcome in the plan's explicit pass.
+#[cfg(feature = "plugins-wasm")]
+enum ExplicitChannelDecision {
+    /// Every per-declaration precondition holds: the plan places this scope
+    /// among its explicit candidates, where the shared ceiling still applies.
+    Candidate(PluginInstanceScope),
+    /// The first per-declaration precondition that does not hold.
+    Unmet(ChannelBindingAdmission),
+}
+
+/// The explicit pass's rule for one `[channels.plugin.<alias>]` declaration.
+///
+/// This is the one statement of that rule: [`PluginActivationPlan::build`]
+/// keeps the candidates it yields and [`channel_binding_admission`] reports
+/// its refusals, so a change here changes both. A declaration is a candidate
+/// only when it is enabled, an enabled agent owns it, it names a package the
+/// host admitted, and that package declares the `channel` capability. The
+/// checks run in that order and stop at the first that fails, which is the
+/// order [`ChannelBindingAdmission`] lists them in.
+///
+/// `channel_packages` is [`channel_package_names`] of the same host, taken as
+/// an argument so the plan computes it once for all declarations.
+///
+/// # Errors
+///
+/// A declaration that passes every check but whose alias cannot name a plugin
+/// instance is an error rather than a refusal: it fails the plan as a whole.
+#[cfg(feature = "plugins-wasm")]
+fn decide_explicit_channel(
+    config: &Config,
+    host: &PluginHost,
+    channel_packages: &HashSet<&str>,
+    alias: &str,
+    declaration: &zeroclaw_config::schema::PluginChannelConfig,
+) -> Result<ExplicitChannelDecision, PluginError> {
+    if !declaration.enabled {
+        return Ok(ExplicitChannelDecision::Unmet(
+            ChannelBindingAdmission::BindingDisabled,
+        ));
+    }
+    if !has_enabled_owner(config, alias) {
+        return Ok(ExplicitChannelDecision::Unmet(
+            ChannelBindingAdmission::NoEnabledOwner,
+        ));
+    }
+    let Some(manifest) = host.manifest(&declaration.package) else {
+        return Ok(ExplicitChannelDecision::Unmet(
+            ChannelBindingAdmission::PackageNotInstalled {
+                package: declaration.package.clone(),
+            },
+        ));
+    };
+    if !channel_packages.contains(manifest.name.as_str()) {
+        return Ok(ExplicitChannelDecision::Unmet(
+            ChannelBindingAdmission::NotAChannelPackage {
+                package: declaration.package.clone(),
+            },
+        ));
+    }
+    Ok(ExplicitChannelDecision::Candidate(
+        PluginInstanceScope::from_manifest(
+            manifest,
+            PluginCapability::Channel,
+            alias,
+            manifest.permissions.iter().copied(),
+        )?,
+    ))
+}
+
+/// Names of the admitted packages an explicit channel binding may name: the
+/// ones the host lists as channel plugins.
+#[cfg(feature = "plugins-wasm")]
+fn channel_package_names(host: &PluginHost) -> HashSet<&str> {
+    host.channel_plugin_details()
+        .into_iter()
+        .map(|(manifest, _)| manifest.name.as_str())
+        .collect()
+}
+
+/// Whether one installed package's default tool binding is an activation
+/// candidate, and if not, the first precondition the plan finds unmet, in the
+/// order the plan applies them.
+///
+/// Only [`Self::Admitted`] is an activation decision, and it is the plan's
+/// own. `PluginsDisabled` is the global switch, the next three are the plan's
+/// per-package checks, and `CeilingReached` is the shared ceiling, which only
+/// a whole plan can apply.
+#[cfg(feature = "plugins-wasm")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ToolInstanceAdmission {
+    /// `plugins.enabled` is off, so no plugin instance activates.
+    PluginsDisabled,
+    /// `plugins.auto_discover` is off, so installed tool packages stay dormant.
+    AutoDiscoverDisabled,
+    /// The plugin host has no admitted package with this name.
+    PackageNotInstalled,
+    /// The package is installed but the host does not list it as a tool
+    /// plugin: it does not declare the tool capability.
+    PackageNotATool,
+    /// Candidates ordered ahead of this one took every instance slot.
+    CeilingReached {
+        /// The configured `plugins.max_active_instances`.
+        max_active_instances: usize,
+    },
+    /// The plan admits the package's tool instance. Admission is not
+    /// construction: the loader can still refuse the instance, for example
+    /// when its component does not load.
+    Admitted {
+        /// Name of the `[[plugins.entries]]` row that configures the instance.
+        instance_key: String,
+    },
+}
+
+/// The activation plan's own verdict on one installed package's default tool
+/// binding.
+///
+/// Anything that reports whether an installed tool package will activate,
+/// such as Quickstart after installing one, asks this rather than restating
+/// the admission rules. The per-package checks run through the helper the
+/// plan's tool pass uses, in the same order. The ceiling verdict comes from
+/// building that plan and asking whether it admitted this instance.
+///
+/// Like the plan, this is guest-free: it reads canonical config and the
+/// manifests the host already admitted, never touches component bytes, and
+/// runs no guest code.
+///
+/// The verdict describes `config` as given. A running daemon keeps acting on
+/// the config it loaded until it restarts or reloads.
+///
+/// # Errors
+///
+/// Returns the plan's own error when this package's instance identity cannot
+/// be formed, and, for a package that meets every precondition, when the
+/// whole plan cannot be built or the admitted instance's config key cannot be
+/// derived. The runtime starts no plugin instance in either plan failure,
+/// because its own plan fails the same way.
+#[cfg(feature = "plugins-wasm")]
+pub fn tool_instance_admission(
+    config: &Config,
+    host: &PluginHost,
+    package: &str,
+) -> Result<ToolInstanceAdmission, PluginError> {
+    if !config.plugins.enabled {
+        return Ok(ToolInstanceAdmission::PluginsDisabled);
+    }
+    let tool_packages = tool_package_names(host);
+    let scope = match decide_tool_binding(config, host, &tool_packages, package)? {
+        ToolBindingDecision::Candidate(scope) => scope,
+        ToolBindingDecision::Unmet(unmet) => return Ok(unmet),
+    };
+    // Nothing but the ceiling removes an auto-discovered candidate from the
+    // plan: it truncates the one sorted candidate sequence. So a candidate the
+    // plan does not admit is one the ceiling left out.
+    let plan = PluginActivationPlan::build(config, host)?;
+    if plan.admits(
+        scope.id().package(),
+        PluginCapability::Tool,
+        scope.id().binding(),
+    ) {
+        Ok(ToolInstanceAdmission::Admitted {
+            instance_key: scope.id().config_entry_key()?,
+        })
+    } else {
+        Ok(ToolInstanceAdmission::CeilingReached {
+            max_active_instances: config.plugins.max_active_instances,
+        })
+    }
+}
+
+/// One package's outcome in the plan's tool pass.
+#[cfg(feature = "plugins-wasm")]
+enum ToolBindingDecision {
+    /// Every per-package precondition holds: the plan places this scope among
+    /// its auto-discovered candidates, where the shared ceiling still applies.
+    Candidate(PluginInstanceScope),
+    /// The first per-package precondition that does not hold.
+    Unmet(ToolInstanceAdmission),
+}
+
+/// The tool pass's rule for one installed package's default tool binding.
+///
+/// This is the one statement of that rule: [`PluginActivationPlan::build`]
+/// keeps the candidates it yields and [`tool_instance_admission`] reports its
+/// refusals, so a change here changes both. A package is a candidate only when
+/// `plugins.auto_discover` is on, the host admitted the package, and the host
+/// lists it as a tool plugin. The checks run in that order and stop at the
+/// first that fails, which is the order [`ToolInstanceAdmission`] lists them
+/// in.
+///
+/// `tool_packages` is [`tool_package_names`] of the same host, taken as an
+/// argument so the plan computes it once for all packages.
+///
+/// # Errors
+///
+/// A package that passes every check but whose instance identity cannot be
+/// formed is an error rather than a refusal: it fails the plan as a whole.
+#[cfg(feature = "plugins-wasm")]
+fn decide_tool_binding(
+    config: &Config,
+    host: &PluginHost,
+    tool_packages: &HashSet<&str>,
+    package: &str,
+) -> Result<ToolBindingDecision, PluginError> {
+    if !config.plugins.auto_discover {
+        return Ok(ToolBindingDecision::Unmet(
+            ToolInstanceAdmission::AutoDiscoverDisabled,
+        ));
+    }
+    let Some(manifest) = host.manifest(package) else {
+        return Ok(ToolBindingDecision::Unmet(
+            ToolInstanceAdmission::PackageNotInstalled,
+        ));
+    };
+    if !tool_packages.contains(manifest.name.as_str()) {
+        return Ok(ToolBindingDecision::Unmet(
+            ToolInstanceAdmission::PackageNotATool,
+        ));
+    }
+    Ok(ToolBindingDecision::Candidate(tool_binding_scope(
+        manifest,
+    )?))
+}
+
+/// The scope the plan admits a package's default tool instance under: the
+/// package binding, holding every permission the manifest requests.
+#[cfg(feature = "plugins-wasm")]
+fn tool_binding_scope(
+    manifest: &zeroclaw_plugins::PluginManifest,
+) -> Result<PluginInstanceScope, PluginError> {
+    PluginInstanceScope::for_package_binding(
+        manifest,
+        PluginCapability::Tool,
+        manifest.permissions.iter().copied(),
+    )
+}
+
+/// The runtime's verdict on the configuration of one installed package's
+/// default tool instance.
+#[cfg(feature = "plugins-wasm")]
+#[derive(Debug)]
+pub enum ToolConfigVerdict {
+    /// The config resolver accepts the instance's configuration.
+    Accepted,
+    /// The manifest does not declare the tool capability, so the runtime
+    /// builds no tool instance of the package.
+    NotATool,
+    /// The config resolver refuses it, so the runtime skips the tool.
+    Refused {
+        /// Name of the `[[plugins.entries]]` row the configuration is read from.
+        instance_key: String,
+        /// The resolver's refusal, as the runtime records it when it skips
+        /// the tool.
+        error: PluginError,
+    },
+}
+
+/// Whether the runtime accepts the configuration of `manifest`'s default tool
+/// instance under `config`.
+///
+/// The runtime resolves a tool instance's configuration before it runs any
+/// guest code, and skips the tool when that fails. This runs the same
+/// resolution, [`crate::tools::resolve_instance_config`], under the scope the
+/// plan's tool pass admits. A report of whether a tool loads, such as
+/// `plugin info`, asks this so it gives the runtime's answer for the
+/// configuration as well as for the component.
+///
+/// Like [`tool_instance_admission`], this is guest-free and describes `config`
+/// as given. It does not consult `plugins.enabled`, `plugins.auto_discover` or
+/// the instance ceiling: those decide whether the instance is admitted, this
+/// decides whether an admitted instance's configuration is accepted.
+///
+/// # Errors
+///
+/// Returns the plan's own error when the instance identity cannot be formed.
+#[cfg(feature = "plugins-wasm")]
+pub fn tool_instance_config_verdict(
+    config: &Config,
+    manifest: &zeroclaw_plugins::PluginManifest,
+) -> Result<ToolConfigVerdict, PluginError> {
+    if !manifest.capabilities.contains(&PluginCapability::Tool) {
+        return Ok(ToolConfigVerdict::NotATool);
+    }
+    let scope = tool_binding_scope(manifest)?;
+    let instance_key = scope.id().config_entry_key()?;
+    let resolved =
+        crate::tools::resolve_instance_config(manifest, &scope, &instance_key, || config);
+    Ok(match resolved {
+        Ok(_) => ToolConfigVerdict::Accepted,
+        Err(error) => ToolConfigVerdict::Refused {
+            instance_key,
+            error,
+        },
+    })
+}
+
+/// Names of the admitted packages whose default tool binding the plan can
+/// admit: the ones the host lists as tool plugins.
+#[cfg(feature = "plugins-wasm")]
+fn tool_package_names(host: &PluginHost) -> HashSet<&str> {
+    host.tool_plugin_details()
+        .into_iter()
+        .map(|(manifest, _)| manifest.name.as_str())
+        .collect()
+}
+
 /// An explicit channel binding activates only when some enabled agent actually
 /// routes to it. Without an owner the listener would run with nothing to
 /// deliver to, so an orphaned declaration is inert rather than half-live.
 #[cfg(feature = "plugins-wasm")]
 fn has_enabled_owner(config: &Config, binding: &str) -> bool {
-    let channel_ref = format!("plugin.{binding}");
+    has_enabled_owner_ref(config, &format!("plugin.{binding}"))
+}
+
+/// The same ownership rule addressed by full composite channel reference.
+///
+/// A mirror is routed as `<provides>.<alias>`, not `plugin.<alias>`, so it
+/// asks this directly rather than through the `plugin.` shorthand above.
+#[cfg(feature = "plugins-wasm")]
+fn has_enabled_owner_ref(config: &Config, channel_ref: &str) -> bool {
     config.agents.values().any(|agent| {
         agent.enabled
             && agent
@@ -222,6 +833,30 @@ fn has_enabled_owner(config: &Config, binding: &str) -> bool {
                 .iter()
                 .any(|configured| configured.as_str() == channel_ref)
     })
+}
+
+/// The plugin family's own channel namespace: an explicit
+/// `[channels.plugin.<alias>]` binding runs as the channel `plugin.<alias>`.
+///
+/// `[channels.plugin.<alias>]` declarations are bound to a package by their
+/// `package` field, so this family is never a mirror target.
+#[cfg(feature = "plugins-wasm")]
+pub const PLUGIN_CHANNEL_FAMILY: &str = "plugin";
+
+/// How many installed channel packages claim each mirrored channel id.
+///
+/// Counted across every channel package before any admission decision, so an
+/// ambiguous id is refused for all claimants rather than resolved by install
+/// order.
+#[cfg(feature = "plugins-wasm")]
+fn mirror_claim_counts(host: &PluginHost) -> HashMap<String, usize> {
+    let mut claims: HashMap<String, usize> = HashMap::new();
+    for (manifest, _) in host.channel_plugin_details() {
+        if let Some(provides) = manifest.provides.as_deref() {
+            *claims.entry(provides.to_string()).or_default() += 1;
+        }
+    }
+    claims
 }
 
 #[cfg(feature = "plugins-wasm")]
@@ -281,7 +916,7 @@ fn plugin_sender_allowed(config: &Config, alias: &str, sender: &str) -> bool {
 #[cfg(feature = "plugins-wasm")]
 fn channel_sender_authorizer(
     config: Arc<Config>,
-    live_config: Option<Arc<RwLock<Config>>>,
+    live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
     alias: String,
 ) -> zeroclaw_plugins::wasm_channel::SenderAuthorizer {
     match live_config {
@@ -478,7 +1113,7 @@ async fn finalize_plugin_webhooks(
 /// must not stop the daemon from starting its remaining channels.
 pub async fn configured_plugin_channels(
     config: Arc<Config>,
-    live_config: Option<Arc<RwLock<Config>>>,
+    live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
 ) -> Vec<Arc<dyn Channel>> {
     Box::pin(configured_plugin_channels_with_webhooks(
         config,
@@ -492,7 +1127,7 @@ pub async fn configured_plugin_channels(
 /// claims into one daemon-generation registry.
 pub async fn configured_plugin_channels_with_webhooks(
     config: Arc<Config>,
-    live_config: Option<Arc<RwLock<Config>>>,
+    live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
     webhook_registry: Option<&PluginWebhookRegistryLease>,
 ) -> Vec<Arc<dyn Channel>> {
     #[cfg(not(feature = "plugins-wasm"))]
@@ -670,30 +1305,40 @@ mod tests {
         use zeroclaw_config::multi_agent::{PeerGroupConfig, PeerUsername};
         use zeroclaw_config::providers::ChannelRef;
 
-        let live = Arc::new(RwLock::new(Config::default()));
+        let live = zeroclaw_config::live::LiveConfig::new(Config::default());
         let authorizer = channel_sender_authorizer(
             Arc::new(Config::default()),
-            Some(Arc::clone(&live)),
+            Some(live.handle()),
             "operations".to_string(),
         );
         assert!(!authorizer("alice"), "empty peer groups deny by default");
 
-        live.write().peer_groups.insert(
-            "operators".to_string(),
-            PeerGroupConfig {
-                channel: ChannelRef::new("plugin.operations"),
-                external_peers: vec![PeerUsername::new("alice")],
-                ..PeerGroupConfig::default()
-            },
-        );
+        let publish = |mutating: &dyn Fn(&mut zeroclaw_config::schema::Config)| {
+            let mut next = live.snapshot();
+            mutating(&mut next);
+            let revision = live.next_revision().unwrap();
+            live.publish(revision, next).unwrap();
+        };
+        publish(&|config| {
+            config.peer_groups.insert(
+                "operators".to_string(),
+                PeerGroupConfig {
+                    channel: ChannelRef::new("plugin.operations"),
+                    external_peers: vec![PeerUsername::new("alice")],
+                    ..PeerGroupConfig::default()
+                },
+            );
+        });
         assert!(authorizer("alice"));
         assert!(!authorizer("Alice"), "plugin sender identity is exact");
 
-        live.write()
-            .peer_groups
-            .get_mut("operators")
-            .expect("operator peer group")
-            .external_peers = vec![PeerUsername::new("*")];
+        publish(&|config| {
+            config
+                .peer_groups
+                .get_mut("operators")
+                .expect("operator peer group")
+                .external_peers = vec![PeerUsername::new("*")];
+        });
         assert!(
             authorizer("anyone"),
             "wildcard uses native channel semantics"
@@ -710,8 +1355,8 @@ mod tests {
         use zeroclaw_config::providers::ChannelRef;
 
         let policy = |grants: &[&str], ignore: &[&str]| {
-            let live = Arc::new(RwLock::new(Config::default()));
-            live.write().peer_groups.insert(
+            let mut config = Config::default();
+            config.peer_groups.insert(
                 "operators".to_string(),
                 PeerGroupConfig {
                     channel: ChannelRef::new("plugin.operations"),
@@ -720,9 +1365,10 @@ mod tests {
                     ..PeerGroupConfig::default()
                 },
             );
+            let live = zeroclaw_config::live::LiveConfig::new(config);
             channel_sender_authorizer(
                 Arc::new(Config::default()),
-                Some(Arc::clone(&live)),
+                Some(live.handle()),
                 "operations".to_string(),
             )
         };
@@ -760,6 +1406,61 @@ mod tests {
         // Package admission intentionally does not compile the component. An
         // invalid payload here proves activation planning remains guest-free.
         std::fs::write(plugin_dir.join("plugin.wasm"), b"not a component").unwrap();
+    }
+
+    /// A channel package that mirrors a compiled-in channel id.
+    ///
+    /// `config_read` is spelled out per case because its absence is itself an
+    /// admission rule under test.
+    fn write_mirror_plugin(root: &Path, name: &str, provides: &str, config_read: bool) {
+        let plugin_dir = root.join(name);
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        let permissions = if config_read {
+            "permissions = [\"config_read\"]\n"
+        } else {
+            ""
+        };
+        // `config_read` is only valid alongside a config_schema, so a mirror
+        // that reads canonical config must declare one.
+        let schema = if config_read {
+            "config_schema = { type = \"object\", properties = {}, additionalProperties = false }\n"
+        } else {
+            ""
+        };
+        std::fs::write(
+            plugin_dir.join("manifest.toml"),
+            format!(
+                "name = \"{name}\"\nversion = \"0.1.0\"\nwasm_path = \"plugin.wasm\"\ncapabilities = [\"channel\"]\nprovides = \"{provides}\"\n{permissions}{schema}"
+            ),
+        )
+        .unwrap();
+        std::fs::write(plugin_dir.join("plugin.wasm"), b"not a component").unwrap();
+    }
+
+    /// Canonical config with one telegram alias and an agent routing to it.
+    fn mirror_config(plugins_dir: &Path, alias: &str, enabled: bool, owned: bool) -> Config {
+        let mut config = Config::default();
+        config.plugins.enabled = true;
+        config.plugins.auto_discover = false;
+        config.plugins.max_active_instances = 10;
+        config.plugins.plugins_dir = plugins_dir.display().to_string();
+        config.channels.telegram = HashMap::from([(
+            alias.to_string(),
+            zeroclaw_config::schema::TelegramConfig {
+                enabled,
+                ..zeroclaw_config::schema::TelegramConfig::default()
+            },
+        )]);
+        let agent = AliasedAgentConfig {
+            channels: if owned {
+                vec![ChannelRef::new(format!("telegram.{alias}"))]
+            } else {
+                Vec::new()
+            },
+            ..AliasedAgentConfig::default()
+        };
+        config.agents = HashMap::from([("operator".to_string(), agent)]);
+        config
     }
 
     fn write_skill_plugin(root: &Path, name: &str) {
@@ -879,6 +1580,209 @@ mod tests {
     }
 
     #[test]
+    fn a_mirror_admits_one_instance_per_configured_enabled_alias() {
+        // The whole point of `provides`: canonical channel config, not a
+        // second config home, decides how many instances exist.
+        let plugins = TempDir::new().unwrap();
+        write_mirror_plugin(plugins.path(), "tg-mirror", "telegram", true);
+        let mut config = mirror_config(plugins.path(), "main", true, true);
+        config.channels.telegram.insert(
+            "backup".to_string(),
+            zeroclaw_config::schema::TelegramConfig {
+                enabled: true,
+                ..zeroclaw_config::schema::TelegramConfig::default()
+            },
+        );
+        config
+            .agents
+            .get_mut("operator")
+            .unwrap()
+            .channels
+            .push(ChannelRef::new("telegram.backup"));
+        let host = plugin_host(&config).unwrap();
+
+        let plan = PluginActivationPlan::build(&config, &host).unwrap();
+
+        let mirrors = plan.mirror_identities();
+        assert!(
+            mirrors.contains(&("tg-mirror".to_string(), "main".to_string())),
+            "configured alias should be recorded, got {mirrors:?}"
+        );
+        assert!(
+            mirrors.contains(&("tg-mirror".to_string(), "backup".to_string())),
+            "second configured alias should get its own instance, got {mirrors:?}"
+        );
+        // The load-bearing half of this slice being inert: nothing that
+        // constructs a guest may see a mirror yet.
+        assert!(
+            plan.scopes(PluginCapability::Channel).next().is_none(),
+            "a mirror must not reach the construction feed"
+        );
+    }
+
+    #[test]
+    fn a_mirror_skips_disabled_and_unowned_aliases() {
+        // A disabled alias is not a channel, and an alias no enabled agent
+        // routes to has nothing to deliver to. Neither should start a guest.
+        for (enabled, owned) in [(false, true), (true, false)] {
+            let plugins = TempDir::new().unwrap();
+            write_mirror_plugin(plugins.path(), "tg-mirror", "telegram", true);
+            let config = mirror_config(plugins.path(), "main", enabled, owned);
+            let host = plugin_host(&config).unwrap();
+
+            let plan = PluginActivationPlan::build(&config, &host).unwrap();
+
+            assert!(
+                plan.mirror_identities().is_empty(),
+                "enabled={enabled} owned={owned} should record nothing, got {:?}",
+                plan.mirror_identities()
+            );
+        }
+    }
+
+    #[test]
+    fn a_mirror_without_config_read_is_refused() {
+        // A mirror is defined by being fed the alias's canonical config. With
+        // no grant to read it the instance would run blind, so it is refused
+        // rather than started against an empty object.
+        let plugins = TempDir::new().unwrap();
+        write_mirror_plugin(plugins.path(), "tg-mirror", "telegram", false);
+        let config = mirror_config(plugins.path(), "main", true, true);
+        let host = plugin_host(&config).unwrap();
+
+        let plan = PluginActivationPlan::build(&config, &host).unwrap();
+
+        assert!(
+            plan.mirror_identities().is_empty(),
+            "a mirror without config_read must not be recorded"
+        );
+    }
+
+    #[test]
+    fn a_package_cannot_mirror_the_plugin_family_to_claim_another_packages_route() {
+        // The route takeover this closes. `plugin` is a member of
+        // V3_CHANNEL_TYPES, so before the reserved-family refusal a package
+        // declaring provides = "plugin" enumerated every enabled
+        // `[channels.plugin.<alias>]` and claimed those aliases WITHOUT
+        // reading the declaration's `package` field. Since the endpoint is
+        // stamped `plugin.<alias>` for both, the later package by sort order
+        // won the channel map and inherited the legitimate package's route:
+        // its replies, its cron delivery, its sender policy.
+        let plugins = TempDir::new().unwrap();
+        write_executable_plugin(plugins.path(), "real", &["channel"]);
+        // Sorts after "real", which is what made it win the map.
+        write_mirror_plugin(plugins.path(), "zz-hijacker", "plugin", true);
+
+        let mut config = Config::default();
+        config.plugins.enabled = true;
+        config.plugins.auto_discover = false;
+        config.plugins.max_active_instances = 10;
+        config.plugins.plugins_dir = plugins.path().display().to_string();
+        config.channels.plugin = HashMap::from([(
+            "main".to_string(),
+            PluginChannelConfig {
+                package: "real".to_string(),
+                enabled: true,
+            },
+        )]);
+        config.agents = HashMap::from([(
+            "operator".to_string(),
+            AliasedAgentConfig {
+                channels: vec![ChannelRef::new("plugin.main")],
+                ..AliasedAgentConfig::default()
+            },
+        )]);
+        let host = plugin_host(&config).unwrap();
+
+        let plan = PluginActivationPlan::build(&config, &host).unwrap();
+
+        // Non-vacuous: the legitimate declaration still admits, so this test
+        // fails if mirror admission is simply broken rather than refused.
+        assert!(
+            plan.scope("real", PluginCapability::Channel, "main")
+                .is_some(),
+            "the package the operator bound to plugin.main must still be admitted"
+        );
+        assert!(
+            plan.scope("zz-hijacker", PluginCapability::Channel, "main")
+                .is_none(),
+            "a provides=\"plugin\" package must not be admitted at another package's alias"
+        );
+        assert!(
+            plan.mirror_identities().is_empty(),
+            "the reserved plugin family must record no mirror, got {:?}",
+            plan.mirror_identities()
+        );
+        // The routing key the orchestrator would publish must have exactly one
+        // claimant, which is the property the takeover violated.
+        let claimants: Vec<_> = plan
+            .scopes(PluginCapability::Channel)
+            .filter(|scope| scope.id().binding() == "main")
+            .map(|scope| scope.id().package().to_string())
+            .collect();
+        assert_eq!(
+            claimants,
+            vec!["real".to_string()],
+            "plugin.main must have exactly one claimant"
+        );
+    }
+
+    #[test]
+    fn two_packages_mirroring_one_id_both_fail_closed() {
+        // The host will not pick a mirror on the operator's behalf, and it
+        // must not resolve the tie by install order either: both are refused.
+        let plugins = TempDir::new().unwrap();
+        write_mirror_plugin(plugins.path(), "tg-mirror", "telegram", true);
+        write_mirror_plugin(plugins.path(), "tg-other", "telegram", true);
+        let config = mirror_config(plugins.path(), "main", true, true);
+        let host = plugin_host(&config).unwrap();
+
+        let plan = PluginActivationPlan::build(&config, &host).unwrap();
+
+        assert!(
+            plan.mirror_identities().is_empty(),
+            "ambiguous providers must fail closed, got {:?}",
+            plan.mirror_identities()
+        );
+    }
+
+    #[test]
+    fn mirrors_are_bounded_by_the_instance_ceiling() {
+        // Mirrors are explicit, so they take ceiling priority over
+        // auto-discovery — but they are not exempt from the ceiling itself.
+        let plugins = TempDir::new().unwrap();
+        write_mirror_plugin(plugins.path(), "tg-mirror", "telegram", true);
+        let mut config = mirror_config(plugins.path(), "main", true, true);
+        config.channels.telegram.insert(
+            "backup".to_string(),
+            zeroclaw_config::schema::TelegramConfig {
+                enabled: true,
+                ..zeroclaw_config::schema::TelegramConfig::default()
+            },
+        );
+        config
+            .agents
+            .get_mut("operator")
+            .unwrap()
+            .channels
+            .push(ChannelRef::new("telegram.backup"));
+        config.plugins.max_active_instances = 1;
+        let host = plugin_host(&config).unwrap();
+
+        let plan = PluginActivationPlan::build(&config, &host).unwrap();
+
+        assert_eq!(
+            plan.mirror_identities().len(),
+            1,
+            "the configured number bounds recorded mirrors"
+        );
+        assert!(
+            plan.scopes(PluginCapability::Channel).next().is_none(),
+            "bounded or not, a mirror must not reach construction"
+        );
+    }
+
+    #[test]
     fn explicit_channel_does_not_require_auto_discovery() {
         let (_plugins, mut config, host) = fixture();
         config.plugins.auto_discover = false;
@@ -968,6 +1872,236 @@ mod tests {
     }
 
     #[test]
+    fn tool_admission_reports_the_admitted_instance_key() {
+        let (_plugins, config, host) = fixture();
+        let plan = PluginActivationPlan::build(&config, &host).unwrap();
+        let expected = plan
+            .scope("zeta", PluginCapability::Tool, "zeta")
+            .expect("the fixture plan admits zeta's tool")
+            .id()
+            .config_entry_key()
+            .unwrap();
+
+        assert_eq!(
+            tool_instance_admission(&config, &host, "zeta").unwrap(),
+            ToolInstanceAdmission::Admitted {
+                instance_key: expected
+            }
+        );
+    }
+
+    #[test]
+    fn tool_admission_reports_a_disabled_plugin_system_before_any_other_gate() {
+        let (_plugins, mut config, host) = fixture();
+        config.plugins.enabled = false;
+        config.plugins.auto_discover = false;
+
+        // An admissible tool, a skill-only package and a missing package each
+        // fail a later gate too, but the first gate in order is the one named.
+        for package in ["zeta", "beta", "not-installed"] {
+            assert_eq!(
+                tool_instance_admission(&config, &host, package).unwrap(),
+                ToolInstanceAdmission::PluginsDisabled,
+                "{package}"
+            );
+        }
+    }
+
+    #[test]
+    fn tool_admission_reports_disabled_auto_discovery() {
+        let (_plugins, mut config, host) = fixture();
+        config.plugins.auto_discover = false;
+
+        for package in ["zeta", "not-installed"] {
+            assert_eq!(
+                tool_instance_admission(&config, &host, package).unwrap(),
+                ToolInstanceAdmission::AutoDiscoverDisabled,
+                "{package}"
+            );
+        }
+    }
+
+    #[test]
+    fn tool_admission_tells_a_missing_package_from_a_non_tool_package() {
+        let (_plugins, config, host) = fixture();
+
+        assert_eq!(
+            tool_instance_admission(&config, &host, "not-installed").unwrap(),
+            ToolInstanceAdmission::PackageNotInstalled
+        );
+        // `beta` is installed but ships only a skill.
+        assert_eq!(
+            tool_instance_admission(&config, &host, "beta").unwrap(),
+            ToolInstanceAdmission::PackageNotATool
+        );
+    }
+
+    #[test]
+    fn tool_admission_attributes_a_refused_tool_to_the_shared_ceiling() {
+        let (_plugins, mut config, host) = fixture();
+        // Plan order puts both explicit channels, alpha's tool and beta's skill
+        // into the four slots, which leaves zeta's tool past the ceiling.
+        config.plugins.max_active_instances = 4;
+
+        assert!(matches!(
+            tool_instance_admission(&config, &host, "alpha").unwrap(),
+            ToolInstanceAdmission::Admitted { .. }
+        ));
+        assert_eq!(
+            tool_instance_admission(&config, &host, "zeta").unwrap(),
+            ToolInstanceAdmission::CeilingReached {
+                max_active_instances: 4
+            }
+        );
+    }
+
+    #[test]
+    fn tool_admission_agrees_with_the_activation_plan_for_every_package() {
+        let (_plugins, mut config, host) = fixture();
+        let mut reached = std::collections::HashSet::new();
+
+        // Both switches off in turn, and a ceiling that admits every tool or
+        // truncates zeta's.
+        for (enabled, auto_discover, ceiling) in [
+            (true, true, 10),
+            (true, true, 4),
+            (true, false, 10),
+            (false, true, 10),
+        ] {
+            config.plugins.enabled = enabled;
+            config.plugins.auto_discover = auto_discover;
+            config.plugins.max_active_instances = ceiling;
+            let plan = PluginActivationPlan::build(&config, &host).unwrap();
+
+            for package in ["alpha", "beta", "not-installed", "zeta"] {
+                let verdict = tool_instance_admission(&config, &host, package).unwrap();
+                let planned = plan
+                    .scope(package, PluginCapability::Tool, package)
+                    .is_some();
+                assert_eq!(
+                    matches!(verdict, ToolInstanceAdmission::Admitted { .. }),
+                    planned,
+                    "enabled={enabled}, auto_discover={auto_discover}, max={ceiling}, \
+                     package {package}: the query said {verdict:?}"
+                );
+                reached.insert(std::mem::discriminant(&verdict));
+            }
+        }
+
+        // Not vacuous: the cases reach every verdict a package can get, so
+        // agreement is shown for each one.
+        assert_eq!(reached.len(), 6, "every verdict is reached");
+    }
+
+    /// The config verdict is the runtime's own: for each set of rows a tool
+    /// instance can meet, it gives the answer of the config resolver the
+    /// runtime constructs tools with, with the same message and the row it
+    /// read. Both run one function, so this pins that they keep doing so.
+    #[test]
+    fn tool_config_verdict_agrees_with_the_runtime_config_resolver() {
+        let plugins = TempDir::new().unwrap();
+        let write = |name: &str, capability: &str, extra: &str| {
+            let plugin_dir = plugins.path().join(name);
+            std::fs::create_dir_all(&plugin_dir).unwrap();
+            std::fs::write(
+                plugin_dir.join("manifest.toml"),
+                format!(
+                    "name = \"{name}\"\nversion = \"0.1.0\"\nwasm_path = \"plugin.wasm\"\ncapabilities = [\"{capability}\"]\n{extra}"
+                ),
+            )
+            .unwrap();
+            std::fs::write(plugin_dir.join("plugin.wasm"), b"not a component").unwrap();
+        };
+        write("schemaless", "tool", "permissions = []\n");
+        write(
+            "labelled",
+            "tool",
+            "permissions = [\"config_read\"]\n\
+             config_schema = { type = \"object\", additionalProperties = false, \
+             properties = { label = { type = \"string\" } } }\n",
+        );
+        write("relay", "channel", "permissions = []\n");
+        // `config_read` without a schema never reaches either path: package
+        // admission refuses it, so no host loads it.
+        write("readless", "tool", "permissions = [\"config_read\"]\n");
+        let host = Arc::new(PluginHost::from_plugins_dir(plugins.path()).unwrap());
+        assert!(host.manifest("readless").is_none());
+
+        let values = |pairs: &[(&str, &str)]| -> HashMap<String, String> {
+            pairs
+                .iter()
+                .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+                .collect()
+        };
+        /// The package, the `config` maps of the rows under its instance key
+        /// (none, one, or a duplicate pair), and whether the runtime accepts
+        /// them.
+        type Case = (&'static str, Vec<HashMap<String, String>>, bool);
+        let cases: [Case; 7] = [
+            // Values left on the row for a package without a schema.
+            ("schemaless", vec![values(&[("label", "masked")])], false),
+            ("schemaless", vec![HashMap::new()], true),
+            ("schemaless", Vec::new(), true),
+            ("labelled", vec![values(&[("label", "masked")])], true),
+            ("labelled", vec![values(&[("colour", "red")])], false),
+            ("labelled", Vec::new(), true),
+            ("labelled", vec![HashMap::new(), HashMap::new()], false),
+        ];
+        for (package, rows, accepted) in cases {
+            let manifest = host.manifest(package).unwrap();
+            let scope = tool_binding_scope(manifest).unwrap();
+            let key = scope.id().config_entry_key().unwrap();
+            let mut config = Config::default();
+            for row in &rows {
+                config
+                    .plugins
+                    .entries
+                    .push(zeroclaw_config::schema::PluginEntryConfig {
+                        name: key.clone(),
+                        config: row.clone(),
+                        ..zeroclaw_config::schema::PluginEntryConfig::default()
+                    });
+            }
+            let runtime = crate::tools::plugin_host_services(
+                Arc::clone(&host),
+                Arc::new(config.clone()),
+                None,
+            )
+            .resolve_config(&scope)
+            .map(drop);
+
+            match (
+                tool_instance_config_verdict(&config, manifest).unwrap(),
+                runtime,
+            ) {
+                (ToolConfigVerdict::Accepted, Ok(())) => {
+                    assert!(accepted, "{package} {rows:?}: both accept");
+                }
+                (
+                    ToolConfigVerdict::Refused {
+                        instance_key,
+                        error,
+                    },
+                    Err(runtime),
+                ) => {
+                    assert!(!accepted, "{package} {rows:?}: both refuse");
+                    assert_eq!(instance_key, key, "the refusal names the row it read");
+                    assert_eq!(error.to_string(), runtime.to_string());
+                }
+                (verdict, runtime) => {
+                    panic!("{package} {rows:?}: verdict {verdict:?}, runtime {runtime:?}")
+                }
+            }
+        }
+
+        let relay = host.manifest("relay").unwrap();
+        assert!(matches!(
+            tool_instance_config_verdict(&Config::default(), relay).unwrap(),
+            ToolConfigVerdict::NotATool
+        ));
+    }
+
+    #[test]
     fn disabled_plugin_system_admits_nothing() {
         let (_plugins, mut config, host) = fixture();
         config.plugins.enabled = false;
@@ -994,6 +2128,341 @@ mod tests {
                 .is_none(),
             "a configured alias must never fall back to the package binding"
         );
+    }
+
+    /// Declare `[channels.plugin.<alias>]` for `package`, routed to by the
+    /// fixture's operator agent when `owned`.
+    fn declare_binding(
+        config: &mut Config,
+        alias: &str,
+        package: &str,
+        enabled: bool,
+        owned: bool,
+    ) {
+        // Every field is named today; the base keeps this literal compiling
+        // when `PluginChannelConfig` gains one.
+        #[allow(clippy::needless_update)]
+        config.channels.plugin.insert(
+            alias.to_string(),
+            PluginChannelConfig {
+                package: package.to_string(),
+                enabled,
+                ..PluginChannelConfig::default()
+            },
+        );
+        if owned {
+            config
+                .agents
+                .get_mut("operator")
+                .unwrap()
+                .channels
+                .push(ChannelRef::new(format!("plugin.{alias}")));
+        }
+    }
+
+    /// The query for one binding, as `plugin bind` asks it.
+    fn admission(config: &Config, host: &PluginHost, alias: &str) -> ChannelBindingAdmission {
+        let mut verdicts = channel_binding_admission(config, host, &[alias]).unwrap();
+        assert_eq!(verdicts.len(), 1, "one verdict per alias asked");
+        verdicts.pop().unwrap()
+    }
+
+    #[test]
+    fn binding_admission_admits_an_enabled_owned_channel_binding() {
+        let (_plugins, config, host) = fixture();
+
+        assert_eq!(
+            admission(&config, &host, "ops"),
+            ChannelBindingAdmission::Admitted
+        );
+        let plan = PluginActivationPlan::build(&config, &host).unwrap();
+        assert!(
+            plan.admits("alpha", PluginCapability::Channel, "ops"),
+            "the plan the runtime builds must admit the same instance"
+        );
+    }
+
+    #[test]
+    fn binding_admission_reports_a_disabled_plugin_system_before_any_binding_rule() {
+        let (_plugins, mut config, host) = fixture();
+        config.plugins.enabled = false;
+        // A second unmet precondition on the same binding, so the order of
+        // the two is what this observes.
+        config.channels.plugin.get_mut("ops").unwrap().enabled = false;
+
+        for alias in ["ops", "backup", "absent"] {
+            assert_eq!(
+                admission(&config, &host, alias),
+                ChannelBindingAdmission::PluginsDisabled,
+                "alias {alias}"
+            );
+        }
+    }
+
+    #[test]
+    fn binding_admission_reports_an_alias_with_no_declaration_as_undeclared() {
+        let (_plugins, mut config, host) = fixture();
+        // An agent route alone does not declare a binding.
+        config
+            .agents
+            .get_mut("operator")
+            .unwrap()
+            .channels
+            .push(ChannelRef::new("plugin.absent"));
+
+        assert_eq!(
+            admission(&config, &host, "absent"),
+            ChannelBindingAdmission::Undeclared
+        );
+    }
+
+    #[test]
+    fn binding_admission_reports_a_disabled_binding_before_its_missing_owner() {
+        let (_plugins, mut config, host) = fixture();
+        config.channels.plugin.get_mut("ops").unwrap().enabled = false;
+        // The only agent is disabled too, so the owner check would also fail.
+        config.agents.get_mut("operator").unwrap().enabled = false;
+
+        assert_eq!(
+            admission(&config, &host, "ops"),
+            ChannelBindingAdmission::BindingDisabled
+        );
+    }
+
+    #[test]
+    fn binding_admission_reports_a_binding_no_enabled_agent_routes_to() {
+        let (_plugins, mut config, host) = fixture();
+        // Unrouted and naming a package that is not installed: ownership is
+        // checked first, so that is the precondition reported.
+        declare_binding(&mut config, "orphan", "not-installed", true, false);
+
+        assert_eq!(
+            admission(&config, &host, "orphan"),
+            ChannelBindingAdmission::NoEnabledOwner
+        );
+
+        // A route from a disabled agent does not own a binding either.
+        config.agents.get_mut("operator").unwrap().enabled = false;
+        assert_eq!(
+            admission(&config, &host, "ops"),
+            ChannelBindingAdmission::NoEnabledOwner
+        );
+    }
+
+    #[test]
+    fn binding_admission_names_the_uninstalled_package_a_binding_declares() {
+        let (_plugins, mut config, host) = fixture();
+        declare_binding(&mut config, "missing", "not-installed", true, true);
+
+        assert_eq!(
+            admission(&config, &host, "missing"),
+            ChannelBindingAdmission::PackageNotInstalled {
+                package: "not-installed".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn binding_admission_names_an_installed_package_without_the_channel_capability() {
+        let (_plugins, mut config, host) = fixture();
+        // `zeta` is an executable tool package; `beta` ships only skills.
+        declare_binding(&mut config, "toolonly", "zeta", true, true);
+        declare_binding(&mut config, "skillonly", "beta", true, true);
+
+        assert_eq!(
+            admission(&config, &host, "toolonly"),
+            ChannelBindingAdmission::NotAChannelPackage {
+                package: "zeta".to_string()
+            }
+        );
+        assert_eq!(
+            admission(&config, &host, "skillonly"),
+            ChannelBindingAdmission::NotAChannelPackage {
+                package: "beta".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn binding_admission_reports_a_valid_binding_the_instance_ceiling_leaves_out() {
+        // Explicit bindings sort by package, then alias, ahead of every
+        // auto-discovered candidate: `backup` takes the only slot and `ops`,
+        // which meets every other precondition, is truncated.
+        let (_plugins, mut config, host) = fixture();
+        config.plugins.max_active_instances = 1;
+
+        assert_eq!(
+            admission(&config, &host, "backup"),
+            ChannelBindingAdmission::Admitted
+        );
+        assert_eq!(
+            admission(&config, &host, "ops"),
+            ChannelBindingAdmission::OverInstanceCeiling
+        );
+
+        // A zero ceiling leaves no slot for any binding.
+        config.plugins.max_active_instances = 0;
+        for alias in ["backup", "ops"] {
+            assert_eq!(
+                admission(&config, &host, alias),
+                ChannelBindingAdmission::OverInstanceCeiling,
+                "alias {alias}"
+            );
+        }
+    }
+
+    #[test]
+    fn binding_admission_answers_the_bindings_of_one_report_together() {
+        let (_plugins, mut config, host) = fixture();
+        declare_binding(&mut config, "disabled", "alpha", false, true);
+        declare_binding(&mut config, "orphan", "alpha", true, false);
+        declare_binding(&mut config, "missing", "not-installed", true, true);
+        declare_binding(&mut config, "toolonly", "zeta", true, true);
+        // Valid, but sorts after `backup` and `ops` under a two-slot ceiling.
+        declare_binding(&mut config, "zulu", "alpha", true, true);
+        config.plugins.max_active_instances = 2;
+        // Out of alias order, with an undeclared alias among them: the
+        // verdicts come back in the order asked, one per alias.
+        let aliases = [
+            "zulu", "absent", "ops", "disabled", "missing", "orphan", "backup", "toolonly",
+        ];
+
+        let verdicts = channel_binding_admission(&config, &host, &aliases).unwrap();
+
+        assert_eq!(
+            verdicts,
+            vec![
+                ChannelBindingAdmission::OverInstanceCeiling,
+                ChannelBindingAdmission::Undeclared,
+                ChannelBindingAdmission::Admitted,
+                ChannelBindingAdmission::BindingDisabled,
+                ChannelBindingAdmission::PackageNotInstalled {
+                    package: "not-installed".to_string(),
+                },
+                ChannelBindingAdmission::NoEnabledOwner,
+                ChannelBindingAdmission::Admitted,
+                ChannelBindingAdmission::NotAChannelPackage {
+                    package: "zeta".to_string(),
+                },
+            ]
+        );
+        // The same answers as asking about each binding alone.
+        for (alias, verdict) in aliases.iter().zip(&verdicts) {
+            assert_eq!(&admission(&config, &host, alias), verdict, "alias {alias}");
+        }
+        assert!(
+            channel_binding_admission(&config, &host, &[])
+                .unwrap()
+                .is_empty()
+        );
+
+        // A disabled plugin system answers every binding without a plan.
+        config.plugins.enabled = false;
+        assert_eq!(
+            channel_binding_admission(&config, &host, &aliases).unwrap(),
+            vec![ChannelBindingAdmission::PluginsDisabled; aliases.len()]
+        );
+    }
+
+    #[test]
+    fn binding_admission_fails_the_whole_report_when_the_plan_would_fail() {
+        let (_plugins, mut config, host) = fixture();
+        // Owned, enabled and naming a channel package, so the explicit pass
+        // reaches identity formation, which refuses the control character.
+        declare_binding(&mut config, "bad\u{1}alias", "alpha", true, true);
+
+        assert!(
+            PluginActivationPlan::build(&config, &host).is_err(),
+            "premise: the runtime's own plan fails on this declaration"
+        );
+        // The report fails as a whole whether or not the bad binding is among
+        // the ones asked about: `ops` alone needs the plan for its ceiling
+        // verdict, and that plan fails.
+        assert!(channel_binding_admission(&config, &host, &["ops", "bad\u{1}alias"]).is_err());
+        assert!(channel_binding_admission(&config, &host, &["ops"]).is_err());
+        // A binding that fails a precondition before the plan is answered
+        // when nothing asked about with it needs the plan. Asked together
+        // with `backup`, which does, the report fails as a whole: the plan's
+        // failure is the one error, and it leaves no binding a verdict.
+        config.channels.plugin.get_mut("ops").unwrap().enabled = false;
+        assert_eq!(
+            channel_binding_admission(&config, &host, &["ops"]).unwrap(),
+            vec![ChannelBindingAdmission::BindingDisabled]
+        );
+        assert!(channel_binding_admission(&config, &host, &["backup", "ops"]).is_err());
+    }
+
+    #[test]
+    fn binding_admission_agrees_with_the_activation_plan_for_every_declared_alias() {
+        let (_plugins, mut config, host) = fixture();
+        declare_binding(&mut config, "disabled", "alpha", false, true);
+        declare_binding(&mut config, "orphan", "alpha", true, false);
+        declare_binding(&mut config, "missing", "not-installed", true, true);
+        declare_binding(&mut config, "toolonly", "zeta", true, true);
+        // Valid, but sorts after `backup` and `ops` under a two-slot ceiling.
+        declare_binding(&mut config, "zulu", "alpha", true, true);
+        config.plugins.max_active_instances = 2;
+
+        for plugins_enabled in [true, false] {
+            config.plugins.enabled = plugins_enabled;
+            let plan = PluginActivationPlan::build(&config, &host).unwrap();
+
+            let mut verdicts = std::collections::BTreeMap::new();
+            for (alias, declaration) in &config.channels.plugin {
+                let verdict = admission(&config, &host, alias);
+                let planned = plan
+                    .scope(&declaration.package, PluginCapability::Channel, alias)
+                    .is_some();
+                assert_eq!(
+                    verdict == ChannelBindingAdmission::Admitted,
+                    planned,
+                    "plugins.enabled={plugins_enabled}, alias {alias}: the query said {verdict:?}"
+                );
+                verdicts.insert(alias.clone(), verdict);
+            }
+
+            // Not vacuous: across both iterations the mixed config reaches
+            // every verdict a declared alias can get, so agreement is shown
+            // for each one.
+            let expected = if plugins_enabled {
+                std::collections::BTreeMap::from([
+                    ("backup".to_string(), ChannelBindingAdmission::Admitted),
+                    (
+                        "disabled".to_string(),
+                        ChannelBindingAdmission::BindingDisabled,
+                    ),
+                    (
+                        "missing".to_string(),
+                        ChannelBindingAdmission::PackageNotInstalled {
+                            package: "not-installed".to_string(),
+                        },
+                    ),
+                    ("ops".to_string(), ChannelBindingAdmission::Admitted),
+                    (
+                        "orphan".to_string(),
+                        ChannelBindingAdmission::NoEnabledOwner,
+                    ),
+                    (
+                        "toolonly".to_string(),
+                        ChannelBindingAdmission::NotAChannelPackage {
+                            package: "zeta".to_string(),
+                        },
+                    ),
+                    (
+                        "zulu".to_string(),
+                        ChannelBindingAdmission::OverInstanceCeiling,
+                    ),
+                ])
+            } else {
+                config
+                    .channels
+                    .plugin
+                    .keys()
+                    .map(|alias| (alias.clone(), ChannelBindingAdmission::PluginsDisabled))
+                    .collect()
+            };
+            assert_eq!(verdicts, expected, "plugins.enabled={plugins_enabled}");
+        }
     }
 
     /// The loader must survive a package whose component cannot be loaded:

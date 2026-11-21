@@ -1,3 +1,4 @@
+pub mod broadcast;
 pub mod log;
 pub mod multi;
 pub mod noop;
@@ -19,6 +20,7 @@ pub use self::log::LogObserver;
 pub use self::multi::MultiObserver;
 #[cfg(feature = "observability-otel")]
 use self::otel_config::OtelContentConfig;
+pub use broadcast::{BroadcastObserver, EventBuffer, EventBus};
 pub use noop::NoopObserver;
 #[cfg(feature = "observability-otel")]
 pub use otel::OtelObserver;
@@ -131,8 +133,8 @@ impl Drop for AgentTurnGuard<'_> {
     }
 }
 
-/// Process-wide broadcast hook installed by long-running subsystems (today: the
-/// gateway) so that events emitted by observers built in *other* subsystems —
+/// Process-wide broadcast hook installed by long-running subsystems (the
+/// daemon's [`EventBus`], or a standalone gateway's) so that events emitted by observers built in *other* subsystems —
 /// notably the agent loop's `process_message` — also fan out to the SSE
 /// broadcast channel. Without this, observers created per call site stay
 /// isolated and `/api/events` only sees the gateway's own direct emissions.

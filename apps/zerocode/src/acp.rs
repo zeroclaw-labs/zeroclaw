@@ -12,6 +12,11 @@ pub(crate) struct Acp {
 }
 
 impl Acp {
+    #[cfg(test)]
+    pub(crate) fn from_chat_for_test(inner: chat::Chat) -> Self {
+        Self { inner }
+    }
+
     pub(crate) fn new(rpc: Arc<RpcClient>) -> Self {
         Self {
             inner: chat::Chat::new(rpc, chat::PaneKind::Acp),
@@ -32,6 +37,11 @@ impl Acp {
 
     pub(crate) fn commit_reconnect_handoff(&mut self) {
         self.inner.commit_reconnect_handoff();
+    }
+
+    /// Reclaim only dispatched clipboard temporaries during a normal TUI exit.
+    pub(crate) fn cleanup_active_turn_on_shutdown(&mut self) {
+        self.inner.cleanup_active_turn_on_shutdown();
     }
 
     pub(crate) fn terminal_statuses(&self) -> Vec<(crate::turn_status::TurnStatus, String)> {
@@ -89,6 +99,7 @@ impl Acp {
         self.inner.add_agent_session(agent_alias).await;
     }
 
+    /// Close one tracked Code session while preserving its durable history.
     pub(crate) async fn close_session(&mut self, session_id: &str) -> bool {
         self.inner.close_session(session_id).await
     }
@@ -101,8 +112,51 @@ impl Acp {
         self.inner.tick_transport_events();
     }
 
-    pub(crate) fn draw(&mut self, frame: &mut ratatui::Frame, area: Rect) {
-        self.inner.draw(frame, area);
+    pub(crate) fn has_pending_transport_events(&self) -> bool {
+        self.inner.has_pending_transport_events()
+    }
+
+    pub(crate) fn draw_with_dock(
+        &mut self,
+        frame: &mut ratatui::Frame,
+        area: Rect,
+        queue_area: Option<Rect>,
+        plan_area: Option<Rect>,
+    ) {
+        self.inner
+            .draw_with_dock(frame, area, queue_area, plan_area);
+    }
+
+    pub(crate) fn draw_dock_overlay(&self, frame: &mut ratatui::Frame) {
+        self.inner.draw_dock_overlay(frame);
+    }
+
+    pub(crate) fn context_menu_open(&self) -> bool {
+        self.inner.context_menu_open()
+    }
+
+    pub(crate) async fn handle_queue_mouse(&mut self, mouse: MouseEvent, area: Rect) {
+        self.inner.handle_queue_mouse(mouse, area).await;
+    }
+
+    pub(crate) async fn handle_context_menu_mouse(&mut self, mouse: MouseEvent) -> bool {
+        self.inner.handle_context_menu_mouse(mouse).await
+    }
+
+    pub(crate) fn plan_visible(&self) -> bool {
+        self.inner.plan_visible()
+    }
+
+    pub(crate) fn current_session_id(&self) -> Option<&str> {
+        self.inner.current_session_id()
+    }
+
+    pub(crate) fn set_plan_visible(&mut self, visible: bool) {
+        self.inner.set_plan_visible(visible);
+    }
+
+    pub(crate) fn take_plan_toggle_request(&mut self) -> bool {
+        self.inner.take_plan_toggle_request()
     }
 
     pub(crate) async fn handle_key(
@@ -121,6 +175,10 @@ impl Acp {
         self.inner.claims_pane_navigation(key)
     }
 
+    pub(crate) fn claims_session_shortcut(&self, key: &KeyEvent) -> bool {
+        self.inner.claims_session_shortcut(key)
+    }
+
     pub(crate) fn clear_input(&mut self) {
         self.inner.clear_input();
     }
@@ -129,12 +187,20 @@ impl Acp {
         self.inner.in_browse_mode()
     }
 
-    pub(crate) fn wants_quit_chord(&self) -> bool {
-        self.inner.wants_quit_chord()
+    pub(crate) fn wants_quit_chord(&self, key: &KeyEvent) -> bool {
+        self.inner.wants_quit_chord(key)
+    }
+
+    pub(crate) fn copy_composer_selection(&self, key: &KeyEvent) -> bool {
+        self.inner.copy_composer_selection(key)
     }
 
     pub(crate) fn take_help_request(&mut self) -> bool {
         self.inner.take_help_request()
+    }
+
+    pub(crate) fn take_add_session_request(&mut self) -> bool {
+        self.inner.take_add_session_request()
     }
 
     pub(crate) fn exit_browse_mode(&mut self) {
@@ -149,7 +215,7 @@ impl Acp {
         self.inner.handle_paste(text);
     }
 
-    pub(crate) fn ctx_tokens(&self) -> (Option<u64>, Option<u64>, Option<u64>) {
+    pub(crate) fn ctx_tokens(&self) -> (Option<u64>, Option<String>, Option<u64>, Option<u64>) {
         self.inner.ctx_tokens()
     }
 
@@ -157,8 +223,16 @@ impl Acp {
         self.inner.selected_agent()
     }
 
+    pub(crate) fn focused_runtime_context(&self) -> Option<chat::FocusedRuntimeContext<'_>> {
+        self.inner.focused_runtime_context()
+    }
+
     pub(crate) fn current_cwd(&self) -> Option<&str> {
         self.inner.current_cwd()
+    }
+
+    pub(crate) fn info_message(&mut self) -> Option<&crate::widgets::InfoMessage> {
+        self.inner.info_message()
     }
 }
 

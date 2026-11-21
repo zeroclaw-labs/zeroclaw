@@ -123,6 +123,7 @@ pub fn derive_section_status(cfg: &zeroclaw_config::schema::Config) -> ConfigSta
         "fresh_install"
     };
     ConfigStatusResult {
+        application: None,
         needs_quickstart: !ready,
         reason: reason.to_string(),
         has_partial_state,
@@ -866,12 +867,55 @@ pub async fn handle_section_select(
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "default".to_string());
 
+    use zeroclaw_config::sections::Section;
+    if matches!(Section::from_key(&section), Some(Section::Agents)) {
+        let reservation = match state.agent_lifecycle.reserve_config_mutation(&key) {
+            Ok(reservation) => reservation,
+            Err(error) => {
+                return error_response(
+                    ConfigApiError::new(ConfigApiCode::ValidationFailed, error.to_string())
+                        .with_path(format!("agents.{key}")),
+                );
+            }
+        };
+        // persist_and_swap retains its save. Retain admission until that save
+        // and publication finish, even if the requesting handler is cancelled.
+        let task = zeroclaw_runtime::live_config_authority::spawn_agent_lifecycle_job(Box::pin(
+            async move {
+                let _reservation = reservation;
+                select_section(state, principal, section, key, alias).await
+            },
+        ));
+        return match task.await {
+            Ok(response) => response,
+            Err(error) => error_response(ConfigApiError::new(
+                ConfigApiCode::ValidationFailed,
+                format!("Agent creation completion failed: {error}"),
+            )),
+        };
+    }
+    select_section(state, principal, section, key, alias).await
+}
+
+async fn select_section(
+    state: AppState,
+    principal: crate::principal_gate::RequestPrincipal,
+    section: String,
+    key: String,
+    alias: String,
+) -> Response {
     // Held through the swap at the end of this handler so a concurrent
     // config writer can't land between this read and the save below.
-    let _cfg_guard = std::sync::Arc::clone(&state.config_write_lock)
-        .lock_owned()
-        .await;
-    let mut working = state.config.read().clone();
+    let _cfg_guard = match state.begin_config_commit().await {
+        Ok(commit) => commit,
+        Err(e) => {
+            return error_response(ConfigApiError::new(
+                ConfigApiCode::ReloadFailed,
+                format!("config commit refused without any change: {e}"),
+            ));
+        }
+    };
+    let mut working = _cfg_guard.current_config();
 
     use zeroclaw_config::sections::Section;
     let Some(section_enum) = Section::from_key(&section) else {
@@ -1139,11 +1183,12 @@ pub async fn handle_section_select(
     if created {
         writes = writes.with(fields_prefix.clone(), zeroclaw_api::grants::Verb::Create);
     }
-    let authorization = match crate::principal_gate::authorize_config_write(&principal, writes) {
-        Ok(authorization) => authorization,
-        Err(denied) => return denied.into_response(),
-    };
-    if let Err(e) = persist_and_swap(&state, &authorization, working, &_cfg_guard).await {
+    let authorization =
+        match crate::principal_gate::authorize_config_write(&principal, writes, &_cfg_guard) {
+            Ok(authorization) => authorization,
+            Err(denied) => return denied.into_response(),
+        };
+    if let Err(e) = persist_and_swap(&state, authorization, working, _cfg_guard).await {
         return e;
     }
 
@@ -1196,7 +1241,10 @@ mod tests {
     }
 
     fn assert_common_dev_template_contract(cfg: &zeroclaw_config::schema::Config) {
-        assert_eq!(cfg.schema_version, 3);
+        assert_eq!(
+            cfg.schema_version,
+            zeroclaw_config::migration::CURRENT_SCHEMA_VERSION
+        );
 
         let provider = cfg
             .providers
@@ -1470,12 +1518,56 @@ mod tests {
         zeroclaw_config::schema::Config::default()
     }
 
+    #[tokio::test]
+    async fn agent_section_creation_reserves_url_key_through_cleanup() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Default::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        config.save().await.unwrap();
+        let disk_before = std::fs::read(&config.config_path).unwrap();
+        let workspace = config.agent_workspace_dir("recreated");
+        let state = section_test_state(config);
+        let mut cleanup = state.agent_lifecycle.begin_delete("recreated").unwrap();
+        cleanup.commit_destructive_mutation();
+        let path = || {
+            axum::extract::Path(SectionItemPath {
+                section: "agents".into(),
+                key: "recreated".into(),
+            })
+        };
+        let body = || {
+            Some(axum::Json(SectionSelectBody {
+                alias: Some("other".into()),
+            }))
+        };
+        let response = handle_section_select(State(state.clone()), None, path(), body()).await;
+        assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+        assert!(!state.config.read().agents.contains_key("recreated"));
+        assert_eq!(
+            std::fs::read(&state.config.read().config_path).unwrap(),
+            disk_before
+        );
+        assert!(!workspace.exists());
+        drop(cleanup);
+        let response = handle_section_select(State(state.clone()), None, path(), body()).await;
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        assert!(state.config.read().agents.contains_key("recreated"));
+        assert!(!state.config.read().agents.contains_key("other"));
+        assert!(workspace.exists());
+    }
+
     fn section_test_state(config: zeroclaw_config::schema::Config) -> AppState {
         let memory: std::sync::Arc<dyn zeroclaw_api::memory_traits::Memory> =
             std::sync::Arc::new(zeroclaw_memory::NoneMemory::new("none"));
+        let state_authority = zeroclaw_runtime::LiveConfigAuthority::new(config);
         AppState {
-            config: std::sync::Arc::new(parking_lot::RwLock::new(config)),
-            config_write_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            config: state_authority.live_handle(),
+            config_authority: state_authority.clone(),
+            agent_lifecycle: state_authority.agent_lifecycle(),
             model_provider: std::sync::Arc::new(crate::UnconfiguredModelProvider),
             model: "test-model".to_string(),
             temperature: None,
@@ -1531,7 +1623,6 @@ mod tests {
                 8, 30, 600,
             )),
             device_registry: None,
-            pending_pairings: None,
             canvas_store: zeroclaw_runtime::tools::CanvasStore::new(),
             #[cfg(feature = "webauthn")]
             webauthn: None,
@@ -2082,7 +2173,10 @@ mod tests {
 
         let mut disk_cfg = state.config.read().clone();
         disk_cfg.memory.backend = "postgres".to_string();
-        disk_cfg.save().await.expect("write external memory drift");
+        disk_cfg
+            .force_save()
+            .await
+            .expect("write intentional external memory drift");
         let disk_before = tokio::fs::read(&config_path)
             .await
             .expect("read drifted memory config");
@@ -2143,7 +2237,10 @@ mod tests {
             .as_mut()
             .expect("tailscale defaults")
             .funnel = true;
-        disk_cfg.save().await.expect("write external tunnel drift");
+        disk_cfg
+            .force_save()
+            .await
+            .expect("write intentional external tunnel drift");
         let disk_before = tokio::fs::read(&config_path)
             .await
             .expect("read drifted tunnel config");

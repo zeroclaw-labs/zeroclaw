@@ -85,7 +85,8 @@ async fn handle_socket(socket: WebSocket, state: AppState, default_agent: Option
     let server = if let Some(store) = store {
         Arc::new(
             AcpServer::new_with_live_config_and_writer_and_store(
-                Arc::clone(&state.config),
+                state.config.clone(),
+                state.agent_lifecycle.clone(),
                 acp_config,
                 output_tx,
                 store,
@@ -97,7 +98,8 @@ async fn handle_socket(socket: WebSocket, state: AppState, default_agent: Option
     } else {
         Arc::new(
             AcpServer::new_with_live_config_and_writer(
-                Arc::clone(&state.config),
+                state.config.clone(),
+                state.agent_lifecycle.clone(),
                 acp_config,
                 output_tx,
             )
@@ -268,6 +270,8 @@ mod tests {
 
     #[tokio::test]
     async fn acp_ws_front_door_omitted_cwd_uses_agent_workspace() {
+        // `run_gateway` binds the process-global pricing config handle.
+        let _pricing_binding = crate::PRICING_BINDING_TEST_LOCK.lock().await;
         let tmp = tempfile::tempdir().unwrap();
         let install_root = tmp.path();
         let cfg = front_door_config(install_root);
@@ -284,10 +288,10 @@ mod tests {
 
         let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
         let (reload_tx, _reload_rx) = tokio::sync::watch::channel(false);
-        let reload_controls = zeroclaw_runtime::daemon::GatewayReloadControls {
-            shutdown_tx: shutdown_tx.clone(),
+        let reload_controls = zeroclaw_runtime::daemon::GatewayReloadControls::standalone(
+            shutdown_tx.clone(),
             reload_tx,
-        };
+        );
 
         let server = zeroclaw_spawn::spawn!(crate::run_gateway(
             "127.0.0.1",

@@ -222,6 +222,17 @@ interface channel {
     // Rust trait default value for any capability you do not implement.
 
     /// Return `true` if the channel is reachable and operational.
+    ///
+    /// While the channel listens, the host calls this on the running instance
+    /// between polls, about every 30 seconds, and reports the answer as the
+    /// channel's health in the gateway's `/health` snapshot. `zeroclaw channel
+    /// doctor` also calls it once on a freshly configured instance. Answer
+    /// from state the plugin already holds, such as whether its connection is
+    /// up or how its last exchange with the platform went. A network request
+    /// here repeats on every check and delays the next poll; to verify
+    /// credentials over the network, keep the last result and refresh it on
+    /// your own schedule. A trap or a missed call deadline discards the
+    /// instance, and the host rebuilds it with `configure`.
     /// Stub: return `true`.
     health-check: func() -> bool;
 

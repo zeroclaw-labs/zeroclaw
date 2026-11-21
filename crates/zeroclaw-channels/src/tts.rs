@@ -68,11 +68,7 @@ impl OpenAiTtsProvider {
     /// env grammar). Legacy `OPENAI_API_KEY` env-var fallback eradicated
     /// in V0.8.0.
     pub fn new(alias: &str, config: &TtsProviderConfig) -> Result<Self> {
-        let api_key = config
-            .api_key
-            .as_deref()
-            .map(str::trim)
-            .filter(|k| !k.is_empty())
+        let api_key = zeroclaw_config::setup::tts_api_key(config)
             .map(ToOwned::to_owned)
             .context(
                 "Missing OpenAI TTS API key: set `[tts_providers.openai.<alias>].api_key` (or via \
@@ -187,11 +183,7 @@ impl ElevenLabsTtsProvider {
     /// `[tts_providers.elevenlabs.<alias>].api_key`. Legacy
     /// `ELEVENLABS_API_KEY` env-var fallback eradicated in V0.8.0.
     pub fn new(alias: &str, config: &TtsProviderConfig) -> Result<Self> {
-        let api_key = config
-            .api_key
-            .as_deref()
-            .map(str::trim)
-            .filter(|k| !k.is_empty())
+        let api_key = zeroclaw_config::setup::tts_api_key(config)
             .map(ToOwned::to_owned)
             .context(
                 "Missing ElevenLabs API key: set `[tts_providers.elevenlabs.<alias>].api_key` (or \
@@ -318,11 +310,7 @@ impl GoogleTtsProvider {
     /// from `[tts_providers.google.<alias>].api_key`. Legacy
     /// `GOOGLE_TTS_API_KEY` env-var fallback eradicated in V0.8.0.
     pub fn new(alias: &str, config: &TtsProviderConfig) -> Result<Self> {
-        let api_key = config
-            .api_key
-            .as_deref()
-            .map(str::trim)
-            .filter(|k| !k.is_empty())
+        let api_key = zeroclaw_config::setup::tts_api_key(config)
             .map(ToOwned::to_owned)
             .context(
                 "Missing Google TTS API key: set `[tts_providers.google.<alias>].api_key` (or via \
@@ -1345,6 +1333,53 @@ impl ::zeroclaw_api::attribution::Attributable for PiperTtsProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cloud_tts_constructors_share_trimmed_key_requirements() {
+        for api_key in [None, Some(String::new()), Some(" \t\n ".to_string())] {
+            let config = TtsProviderConfig {
+                api_key,
+                ..Default::default()
+            };
+            assert!(
+                OpenAiTtsProvider::new("test", &config)
+                    .err()
+                    .unwrap()
+                    .to_string()
+                    .starts_with("Missing OpenAI TTS API key:")
+            );
+            assert!(
+                ElevenLabsTtsProvider::new("test", &config)
+                    .err()
+                    .unwrap()
+                    .to_string()
+                    .starts_with("Missing ElevenLabs API key:")
+            );
+            assert!(
+                GoogleTtsProvider::new("test", &config)
+                    .err()
+                    .unwrap()
+                    .to_string()
+                    .starts_with("Missing Google TTS API key:")
+            );
+        }
+        let config = TtsProviderConfig {
+            api_key: Some(" synthetic-tts-key \t".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            OpenAiTtsProvider::new("test", &config).unwrap().api_key,
+            "synthetic-tts-key"
+        );
+        assert_eq!(
+            ElevenLabsTtsProvider::new("test", &config).unwrap().api_key,
+            "synthetic-tts-key"
+        );
+        assert_eq!(
+            GoogleTtsProvider::new("test", &config).unwrap().api_key,
+            "synthetic-tts-key"
+        );
+    }
 
     #[cfg(unix)]
     fn write_edge_tts_fixture(path: &std::path::Path, script: String) {

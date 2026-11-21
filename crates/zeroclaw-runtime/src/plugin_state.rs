@@ -623,6 +623,7 @@ mod tests {
             wasm_path: Some("fixture.wasm".to_string()),
             wasm_sha256: None,
             capabilities: vec![PluginCapability::Channel],
+            provides: None,
             permissions: vec![PluginPermission::StateRead, PluginPermission::StateWrite],
             config_schema: None,
             signature: None,

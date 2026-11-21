@@ -717,6 +717,11 @@ pub struct ModelProviderRuntimeOptions {
     /// When `Some(false)`, strip assistant reasoning fields from outbound
     /// history replay. `None` honours provider default.
     pub replay_assistant_reasoning: Option<bool>,
+    /// Forward Anthropic extended thinking through OpenAI-compatible
+    /// providers: inject the runtime thinking params as an Anthropic-shaped
+    /// `thinking` request object and normalize gateway thinking responses
+    /// for replay. Propagated from `ModelProviderConfig::thinking_passthrough`.
+    pub thinking_passthrough: bool,
     /// Forward Anthropic prompt caching through OpenAI-compatible providers:
     /// inject `cache_control` breakpoints (system prompt; rolling last
     /// message) into request bodies and capture gateway-reported cache
@@ -760,8 +765,9 @@ pub struct ModelProviderRuntimeOptions {
     /// instead of silently reverting to defaults and re-trimming history a
     /// configured request had legitimately accepted.
     pub multimodal: zeroclaw_config::schema::MultimodalConfig,
-    /// How compatible chat-completions providers handle image markers in
-    /// native role=`tool` results.
+    /// How compatible chat-completions providers handle images a native
+    /// role=`tool` result declared in its `attachments` array; legacy tool
+    /// results (no array key) pass verbatim under both settings.
     pub tool_result_image_policy: zeroclaw_config::schema::ToolResultImagePolicy,
 }
 
@@ -783,6 +789,7 @@ impl Default for ModelProviderRuntimeOptions {
             merge_system_into_user: false,
             provider_extra: None,
             replay_assistant_reasoning: None,
+            thinking_passthrough: false,
             cache_passthrough: false,
             cache_ttl: None,
             native_tools: None,
@@ -851,6 +858,7 @@ pub fn model_provider_runtime_options_from_model_provider_entry(
         merge_system_into_user,
         provider_extra: entry.and_then(|e| e.provider_extra.clone()),
         replay_assistant_reasoning: entry.and_then(|e| e.replay_assistant_reasoning),
+        thinking_passthrough: entry.is_some_and(|e| e.thinking_passthrough),
         cache_passthrough: entry.is_some_and(|e| e.cache_passthrough),
         cache_ttl: entry.and_then(|e| e.cache_ttl),
         native_tools: entry.and_then(|e| e.native_tools),
@@ -2069,6 +2077,51 @@ pub fn create_routed_model_provider_with_options(
     .map(|(provider, _)| provider)
 }
 
+/// The route resolver a routed provider built from these arguments carries,
+/// derived from config alone.
+///
+/// For a caller that obtains its provider from somewhere other than
+/// [`create_routed_model_provider_with_options_and_resolver`] but still needs
+/// route-aware turn metadata and limits. It applies the same staged-entry
+/// filter, and a successfully built routed provider keeps every materialized
+/// route, so the two resolvers agree.
+#[must_use]
+pub fn model_route_resolver(
+    primary_name: &str,
+    model_routes: &[zeroclaw_config::schema::ModelRouteConfig],
+    default_model: &str,
+) -> Arc<router::ModelRouteResolver> {
+    let routes = materialized_model_routes(model_routes)
+        .map(|route| {
+            (
+                route.hint.clone(),
+                router::Route {
+                    provider_name: route.model_provider.clone(),
+                    model: route.model.clone(),
+                },
+            )
+        })
+        .collect();
+    Arc::new(router::ModelRouteResolver::new(
+        routes,
+        primary_name.to_string(),
+        default_model.to_string(),
+    ))
+}
+
+/// Routes whose three identity fields are all present. Config map editing
+/// creates a default route entry and fills its fields through separate
+/// writes; a staged entry is not yet a routing fact.
+fn materialized_model_routes(
+    model_routes: &[zeroclaw_config::schema::ModelRouteConfig],
+) -> impl Iterator<Item = &zeroclaw_config::schema::ModelRouteConfig> {
+    model_routes.iter().filter(|route| {
+        !route.hint.trim().is_empty()
+            && !route.model_provider.trim().is_empty()
+            && !route.model.trim().is_empty()
+    })
+}
+
 /// Build the routed provider together with the exact immutable route resolver
 /// it uses. Agent turn metadata can therefore resolve the serving profile and
 /// model without maintaining a second hint table.
@@ -2087,14 +2140,7 @@ pub fn create_routed_model_provider_with_options_and_resolver(
     // a routing fact: omit it from the materialized provider/resolver until all
     // three identity fields are present. `Config::validate` remains the
     // canonical persisted-config gate and still rejects incomplete routes.
-    let materialized_routes: Vec<_> = model_routes
-        .iter()
-        .filter(|route| {
-            !route.hint.trim().is_empty()
-                && !route.model_provider.trim().is_empty()
-                && !route.model.trim().is_empty()
-        })
-        .collect();
+    let materialized_routes: Vec<_> = materialized_model_routes(model_routes).collect();
 
     if materialized_routes.is_empty() {
         let provider = create_resilient_model_provider_from_ref_with_model_override(
@@ -2106,11 +2152,7 @@ pub fn create_routed_model_provider_with_options_and_resolver(
             options,
             Some(default_model),
         )?;
-        let resolver = Arc::new(router::ModelRouteResolver::new(
-            Vec::new(),
-            primary_name.to_string(),
-            default_model.to_string(),
-        ));
+        let resolver = model_route_resolver(primary_name, model_routes, default_model);
         return Ok((provider, resolver));
     }
 
@@ -3680,9 +3722,12 @@ mod tests {
 
         assert_eq!(route_options.provider_kind, None);
         assert_eq!(route_options.provider_api_url, None);
+        // A bare route clears the inherited alias-only state back to the type
+        // default (currently `relocate`), so assert against the default rather
+        // than a fixed variant.
         assert_eq!(
             route_options.tool_result_image_policy,
-            zeroclaw_config::schema::ToolResultImagePolicy::ImageUrl
+            zeroclaw_config::schema::ToolResultImagePolicy::default()
         );
     }
 
@@ -5110,6 +5155,53 @@ mod tests {
 
         assert!(!resolver.has_hint("staged"));
         assert!(resolver.has_hint("ready"));
+    }
+
+    #[test]
+    fn config_derived_route_resolver_matches_the_routed_provider_resolver() {
+        let config = config_with_openai_alias();
+        let reliability = zeroclaw_config::schema::ReliabilityConfig::default();
+        let routes = [
+            zeroclaw_config::schema::ModelRouteConfig {
+                hint: "staged".into(),
+                model_provider: String::new(),
+                model: String::new(),
+                api_key: None,
+            },
+            zeroclaw_config::schema::ModelRouteConfig {
+                hint: "fast".into(),
+                model_provider: "openai.alias".into(),
+                model: "gpt-4o-mini".into(),
+                api_key: None,
+            },
+        ];
+        for routes in [&routes[..], &[]] {
+            let (_, built) = create_routed_model_provider_with_options_and_resolver(
+                &config,
+                "openai.alias",
+                Some("fallback-key"),
+                None,
+                &reliability,
+                routes,
+                "gpt-4o",
+                &ModelProviderRuntimeOptions::default(),
+            )
+            .expect("routed provider builds");
+            let derived = model_route_resolver("openai.alias", routes, "gpt-4o");
+
+            for selector in ["hint:fast", "hint:staged", "hint:missing", "gpt-4o"] {
+                assert_eq!(
+                    built.resolve(selector),
+                    derived.resolve(selector),
+                    "resolvers disagree on {selector} with {} routes",
+                    routes.len()
+                );
+            }
+            assert_eq!(
+                built.configured_model_for_hint("fast"),
+                derived.configured_model_for_hint("fast")
+            );
+        }
     }
 
     #[test]

@@ -161,6 +161,14 @@ where
     TOOL_LOOP_RECEIPT_CONTEXT.scope(scope, fut).await
 }
 
+/// Scope for detached work (background delegation): the parent's generator so
+/// the child's tool results verify against the same key, and a FRESH collector,
+/// because the parent's per-turn collector belongs to a turn that ends before the
+/// detached task does. `None` stays `None` so receipts-off installs are unchanged.
+pub fn detached_scope(parent_generator: Option<ReceiptGenerator>) -> Option<ReceiptScope> {
+    parent_generator.map(ReceiptScope::with_generator)
+}
+
 /// Canonical system-prompt addendum that instructs the model to carry the
 /// `[receipt: ...]` field verbatim. Shared by every turn entrypoint so the
 /// instruction text never drifts between the channel orchestrator and the
@@ -324,5 +332,33 @@ mod tests {
         let r2 = receipt_gen2.generate("shell", &args, "out", 100);
         // Different keys → different receipts (probabilistically)
         assert_ne!(r1, r2);
+    }
+
+    #[test]
+    fn detached_scope_clones_the_generator_and_starts_a_fresh_collector() {
+        // Receipts-off installs stay off: no parent generator, no scope.
+        assert!(detached_scope(None).is_none());
+
+        let parent = ReceiptScope::with_generator(ReceiptGenerator::with_key(test_key()));
+        let detached = detached_scope(Some(parent.generator.clone()))
+            .expect("a parent generator yields a scope");
+        assert!(
+            !std::sync::Arc::ptr_eq(&detached.collector, &parent.collector),
+            "detached work gets a fresh collector, never the parent's per-turn collector"
+        );
+        assert!(
+            detached.collector.lock().unwrap().is_empty(),
+            "the fresh collector starts empty"
+        );
+        let args = test_args();
+        let receipt = detached.generator.generate_now("shell", &args, "output");
+        assert!(
+            receipt.starts_with("zc-receipt-"),
+            "the detached scope produces receipt-shaped output, got {receipt}"
+        );
+        assert!(
+            parent.generator.verify(&receipt, "shell", &args, "output"),
+            "the detached scope signs with the parent's key, so the parent verifies it"
+        );
     }
 }

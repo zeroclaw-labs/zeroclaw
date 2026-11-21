@@ -5,6 +5,7 @@
 use base64::Engine;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
+use zeroclaw_api::media::{MarkerKind, RenderedMarker};
 
 /// Per-file decoded size limit for embedded blobs (matches RPC attach / ACP).
 pub const MAX_EMBEDDED_FILE_BYTES: u64 = 10 * 1024 * 1024;
@@ -503,15 +504,17 @@ fn all_text_content(result: &serde_json::Value) -> Option<String> {
     (!text.is_empty()).then_some(text)
 }
 
-/// Format an MCP `tools/call` result for the model.
+/// Format an MCP `tools/call` result for the model, returning the model-facing
+/// JSON and the attachments the result declared.
 ///
 /// When `content` contains any `resource` blob or `type: "image"`/`"audio"`
-/// item, return the full result as JSON with only the binary payloads redacted:
-/// a resource `blob` becomes a Document/IMAGE `materialized` marker; a valid
+/// item, the full result is returned as JSON with only the binary payloads
+/// redacted: a resource `blob` becomes a `materialized` reference (a Document
+/// marker for non-image mimes, the saved path for image mimes); a valid
 /// `type: "image"` item is materialized under `{workspace}/uploads/` and
-/// rewritten to a text item carrying its `[IMAGE:<path>]` marker, with the item's
-/// `annotations`/`_meta` and other non-binary fields preserved; a `type: "audio"`
-/// item is redacted to a non-materializing `[audio attachment: <mime>]`
+/// rewritten to a text item carrying its saved path, with the item's
+/// `annotations`/`_meta` and other non-binary fields preserved; a `type:
+/// "audio"` item is redacted to a non-materializing `[audio attachment: <mime>]`
 /// placeholder (audio is not materialized in this slice). Raw base64 never
 /// survives — a malformed image/audio payload (empty or non-string `data`) is
 /// stripped just like a valid one. Every non-binary field (text, `resource_link`,
@@ -522,17 +525,25 @@ fn all_text_content(result: &serde_json::Value) -> Option<String> {
 /// as that text alone — see [`all_text_content`]. Results without binary content
 /// that cannot be compacted keep the existing pretty-printed JSON shape.
 ///
+/// Materialized images are declared in the returned attachment list (one
+/// `RenderedMarker` per written image file) instead of being written into the
+/// text as marker syntax: the caller attaches them to the `ToolResult`, so they
+/// ride the tool carrier grammar. A non-image resource blob keeps its Document
+/// marker in the text — that syntax is the channel delivery contract, and it
+/// was never image-promotable.
+///
 /// Crate-internal: the only caller is [`crate::mcp_tool::McpToolWrapper`]; the
 /// serialized `CallToolResult` from `McpRegistry::call_tool` remains the public
 /// surface.
 pub(crate) fn format_mcp_tool_result_for_model(
     mut result: serde_json::Value,
     workspace_dir: &Path,
-) -> Result<String, EmbeddedResourceError> {
+) -> Result<(String, Vec<RenderedMarker>), EmbeddedResourceError> {
     // An all-text result needs none of the machinery below: no content item can
     // hold binary data, and the envelope around the text is proven redundant.
+    // An all-text result has no binary item, so it can declare no attachment.
     if let Some(text) = all_text_content(&result) {
-        return Ok(text);
+        return Ok((text, Vec::new()));
     }
 
     // Preflight over an immutable borrow: count every binary item that WILL be
@@ -575,7 +586,8 @@ pub(crate) fn format_mcp_tool_result_for_model(
             })
         });
     if !has_binary {
-        return Ok(serde_json::to_string_pretty(&result).unwrap_or_else(|_| result.to_string()));
+        let text = serde_json::to_string_pretty(&result).unwrap_or_else(|_| result.to_string());
+        return Ok((text, Vec::new()));
     }
 
     // Which per-call bound was exceeded, if any. When set, every materializable
@@ -594,8 +606,10 @@ pub(crate) fn format_mcp_tool_result_for_model(
     // structuredContent, _meta, per-item annotations, isError, text, resource_link,
     // and unknown content types all survive; only base64 blob/data are removed.
     let Some(items) = result.get_mut("content").and_then(|c| c.as_array_mut()) else {
-        return Ok(serde_json::to_string_pretty(&result).unwrap_or_else(|_| result.to_string()));
+        let text = serde_json::to_string_pretty(&result).unwrap_or_else(|_| result.to_string());
+        return Ok((text, Vec::new()));
     };
+    let mut attachments: Vec<RenderedMarker> = Vec::new();
     for item in items.iter_mut() {
         let typ = item
             .get("type")
@@ -639,7 +653,26 @@ pub(crate) fn format_mcp_tool_result_for_model(
                         mime.as_deref(),
                         &blob,
                     ) {
-                        Ok(materialized) => materialized.marker,
+                        Ok(materialized) => {
+                            let abs_display = strip_windows_verbatim_prefix(
+                                &materialized.abs_path.to_string_lossy(),
+                            )
+                            .into_owned();
+                            if materialized.mime_type.starts_with("image/") {
+                                attachments.push(RenderedMarker {
+                                    target: abs_display.clone(),
+                                    kind: MarkerKind::Image,
+                                });
+                                // The image rides the attachment list; the
+                                // text references the plain path.
+                                abs_display
+                            } else {
+                                // Non-image resources keep their inline
+                                // Document marker: it is the channel delivery
+                                // contract and was never image-promotable.
+                                materialized.marker
+                            }
+                        }
                         Err(e) => format!("[attachment unavailable: {e}]"),
                     }
                 };
@@ -670,16 +703,30 @@ pub(crate) fn format_mcp_tool_result_for_model(
                     m.to_string()
                 } else if let Some(data) = data {
                     match materialize_mcp_image(workspace_dir, declared_mime.as_deref(), &data) {
-                        Ok(materialized) => materialized.marker,
+                        Ok(materialized) => {
+                            let abs_display = strip_windows_verbatim_prefix(
+                                &materialized.abs_path.to_string_lossy(),
+                            )
+                            .into_owned();
+                            attachments.push(RenderedMarker {
+                                target: abs_display.clone(),
+                                kind: MarkerKind::Image,
+                            });
+                            // The image rides the attachment list; the text
+                            // item carries the saved path, never marker
+                            // syntax.
+                            abs_display
+                        }
                         Err(e) => format!("[attachment unavailable: {e}]"),
                     }
                 } else {
                     "[attachment unavailable: malformed image item]".to_string()
                 };
-                // Convert in place to a text item carrying the marker so the
-                // multimodal pipeline (parse_image_markers) lifts [IMAGE:<path>]
-                // into a native provider image part. The preserved metadata
-                // (annotations, _meta) stays alongside it.
+                // Convert in place to a text item carrying the saved path so
+                // the model can still reference the file; the image itself is
+                // declared in the attachment list and reaches the provider as
+                // an image part through the tool carrier. The preserved
+                // metadata (annotations, _meta) stays alongside it.
                 obj.insert(
                     "type".to_string(),
                     serde_json::Value::String("text".to_string()),
@@ -715,7 +762,10 @@ pub(crate) fn format_mcp_tool_result_for_model(
         }
     }
 
-    Ok(serde_json::to_string_pretty(&result).unwrap_or_else(|_| result.to_string()))
+    Ok((
+        serde_json::to_string_pretty(&result).unwrap_or_else(|_| result.to_string()),
+        attachments,
+    ))
 }
 
 fn filename_from_uri(uri: Option<&str>) -> String {
@@ -789,6 +839,16 @@ mod tests {
     use super::*;
     use serde_json::json;
     use tempfile::tempdir;
+
+    /// The model-facing output is serialized JSON, so a path inside it carries
+    /// JSON escaping (Windows backslashes double). Compare against the escaped
+    /// form, not the raw path.
+    fn json_escaped(path: &str) -> String {
+        serde_json::to_string(path)
+            .unwrap()
+            .trim_matches('"')
+            .to_string()
+    }
 
     #[test]
     fn writes_blob_under_uploads_and_returns_document_marker() {
@@ -1005,7 +1065,7 @@ mod tests {
                 }
             ]
         });
-        let out = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
+        let (out, _) = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
         assert!(out.contains("Fetched original"));
         assert!(out.contains("[Document: report.pdf]"));
         assert!(
@@ -1034,8 +1094,17 @@ mod tests {
                 }
             }]
         });
-        let out = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
-        assert!(out.contains("[IMAGE:"));
+        let (out, attachments) = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
+        assert_eq!(
+            attachments.len(),
+            1,
+            "an image-mime resource blob must be declared as an attachment"
+        );
+        assert_eq!(attachments[0].kind, zeroclaw_api::media::MarkerKind::Image);
+        assert!(
+            out.contains(json_escaped(&attachments[0].target).as_str()),
+            "the materialized field must reference the saved path: {out}"
+        );
         assert!(!out.contains(&b64));
     }
 
@@ -1052,7 +1121,7 @@ mod tests {
                 }
             }]
         });
-        let out = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
+        let (out, _) = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
         assert!(out.contains("[attachment unavailable:"));
         assert!(out.to_lowercase().contains("base64"));
     }
@@ -1071,7 +1140,7 @@ mod tests {
                 }
             }]
         });
-        let out = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
+        let (out, _) = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
         assert!(out.contains("[attachment unavailable:"));
         assert!(out.contains("MB") || out.contains("limit"));
     }
@@ -1089,7 +1158,7 @@ mod tests {
                 }
             ]
         });
-        let out = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
+        let (out, _) = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
         assert!(out.contains("keep me"));
         assert!(out.contains("[attachment unavailable:"));
     }
@@ -1116,7 +1185,7 @@ mod tests {
                 }
             ]
         });
-        let out = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
+        let (out, _) = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
         assert!(out.contains("resource_link"));
         assert!(out.contains("The Spec"));
         assert!(out.contains("https://example.com/spec"));
@@ -1125,9 +1194,10 @@ mod tests {
 
     #[test]
     fn mcp_intake_image_item_yields_marker_not_base64() {
-        // A non-resource `image` block materializes and emits `[IMAGE:...]` as
-        // a text item, never its base64 data. The old MCP fields (mimeType,
-        // materialized) must NOT leak into the model-facing JSON.
+        // A non-resource `image` block materializes and is declared as an
+        // attachment carrying the saved path, never its base64 data. The old
+        // MCP fields (mimeType, materialized) must NOT leak into the
+        // model-facing JSON.
         let dir = tempdir().unwrap();
         let doc_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"doc");
         let img_b64 = base64::Engine::encode(
@@ -1151,13 +1221,31 @@ mod tests {
                 }
             ]
         });
-        let out = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
-        assert!(out.contains("[IMAGE:"), "missing IMAGE marker: {out}");
+        let (out, attachments) = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
+        assert!(
+            !out.contains("[IMAGE:"),
+            "marker syntax must not appear in the text: {out}"
+        );
+        assert_eq!(
+            attachments.len(),
+            1,
+            "the image item must be declared as exactly one attachment"
+        );
+        assert_eq!(attachments[0].kind, zeroclaw_api::media::MarkerKind::Image);
+        assert!(
+            attachments[0].target.contains("uploads"),
+            "attachment target must point at the materialized file: {:?}",
+            attachments[0].target
+        );
+        assert!(
+            out.contains(json_escaped(&attachments[0].target).as_str()),
+            "the text item must reference the saved path: {out}"
+        );
         assert!(
             !out.contains(&img_b64),
             "raw image base64 must not reach the model: {out}"
         );
-        // Image item must be replaced with a clean text marker, not leftover MCP fields.
+        // Image item must be replaced with a clean text item, not leftover MCP fields.
         assert!(
             out.contains(r#""type": "text""#),
             "image item should become text item: {out}"
@@ -1184,7 +1272,7 @@ mod tests {
                 }
             ]
         });
-        let out = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
+        let (out, _) = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
         // The error flag is preserved as structured data, not flattened to prose.
         assert!(out.contains("isError"));
         assert!(out.contains("boom"));
@@ -1212,7 +1300,7 @@ mod tests {
                 }
             ]
         });
-        let out = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
+        let (out, _) = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
         assert!(
             out.contains("structuredContent"),
             "structuredContent dropped: {out}"
@@ -1249,7 +1337,7 @@ mod tests {
             "structuredContent": { "id": 15, "name": "Upper Strength" },
             "isError": false,
         });
-        let out = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
+        let (out, _) = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
         assert_eq!(out, payload);
         assert!(!out.contains("structuredContent"), "envelope kept: {out}");
         assert!(!dir.path().join("uploads").exists());
@@ -1263,7 +1351,7 @@ mod tests {
             "structuredContent": { "records": [{ "id": 7, "value": 42 }] },
         });
 
-        let out = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
+        let (out, _) = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
 
         assert!(out.contains("Found one record"));
         assert!(
@@ -1284,7 +1372,7 @@ mod tests {
             }],
         });
 
-        let out = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
+        let (out, _) = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
 
         assert!(out.contains("For the assistant only"));
         assert!(out.contains("annotations"), "annotations dropped: {out}");
@@ -1304,7 +1392,7 @@ mod tests {
                 "traceId": "request-7",
             }),
         ] {
-            let out = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
+            let (out, _) = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
             assert!(out.starts_with('{'), "envelope dropped: {out}");
         }
     }
@@ -1318,7 +1406,7 @@ mod tests {
                 { "type": "text", "text": "b" },
             ]
         });
-        let out = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
+        let (out, _) = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
         assert_eq!(out, "a\nb");
     }
 
@@ -1326,14 +1414,15 @@ mod tests {
     fn mcp_intake_mixed_content_keeps_every_block() {
         // No-silent-loss rule: a text block beside an image, audio, resource_link
         // or unknown content type must NOT reduce the result to its text. The
-        // binary payload is still redacted, but the block itself survives.
+        // binary payload is still redacted, but the block itself survives. The
+        // image sibling additionally declares exactly one image attachment and
+        // its text item carries the saved path, never marker syntax.
         let dir = tempdir().unwrap();
         let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"\x89PNG");
+
+        // Non-materializing siblings: the block survives as text, nothing is
+        // declared.
         for (sibling, marker) in [
-            (
-                json!({ "type": "image", "data": b64, "mimeType": "image/png" }),
-                "[IMAGE:",
-            ),
             (
                 json!({ "type": "audio", "data": b64, "mimeType": "audio/wav" }),
                 "[audio attachment:",
@@ -1353,10 +1442,45 @@ mod tests {
                     sibling,
                 ]
             });
-            let out = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
+            let (out, attachments) = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
             assert!(out.contains("Screenshot captured"), "text lost: {out}");
             assert!(out.contains(marker), "{marker} block dropped: {out}");
+            assert!(
+                attachments.is_empty(),
+                "no sibling here declares an attachment"
+            );
         }
+
+        // The image sibling: the text block beside it survives, the image item
+        // becomes a path-bearing text item, and the saved file is declared as
+        // exactly one image attachment.
+        let result = json!({
+            "content": [
+                { "type": "text", "text": "Screenshot captured" },
+                { "type": "image", "data": b64, "mimeType": "image/png" },
+            ]
+        });
+        let (out, attachments) = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
+        assert!(out.contains("Screenshot captured"), "text lost: {out}");
+        assert_eq!(
+            attachments.len(),
+            1,
+            "the image item must be declared as exactly one attachment"
+        );
+        assert_eq!(attachments[0].kind, zeroclaw_api::media::MarkerKind::Image);
+        assert!(
+            attachments[0].target.contains("uploads"),
+            "attachment target must point at the materialized file: {:?}",
+            attachments[0].target
+        );
+        assert!(
+            out.contains(json_escaped(&attachments[0].target).as_str()),
+            "the image block must survive as a path-bearing text item: {out}"
+        );
+        assert!(
+            !out.contains("[IMAGE:"),
+            "marker syntax must not ride the text: {out}"
+        );
     }
 
     #[test]
@@ -1367,7 +1491,7 @@ mod tests {
             "_meta": { "trace": "abc123" },
             "content": [{ "type": "text", "text": "plain" }]
         });
-        let out = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
+        let (out, _) = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
         assert!(out.contains("abc123"), "_meta dropped: {out}");
         assert!(out.contains("plain"));
     }
@@ -1381,7 +1505,7 @@ mod tests {
             json!({ "content": [{ "type": "text", "text": "" }] }),
             json!({ "structuredContent": { "rows": 3 } }),
         ] {
-            let out = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
+            let (out, _) = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
             assert!(out.contains("{"), "not JSON: {out}");
         }
     }
@@ -1438,7 +1562,7 @@ mod tests {
                 }
             ]
         });
-        let out = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
+        let (out, _) = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
         assert!(out.contains("[Document: a.txt]"));
         assert!(out.contains("[Document: b.txt]"));
         assert!(dir.path().join("uploads").exists());
@@ -1467,7 +1591,7 @@ mod tests {
                 }
             ]
         });
-        let out = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
+        let (out, _) = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
         assert!(!dir.path().join("uploads").exists());
         assert!(out.contains("aggregate blob size exceeds limit"));
         assert!(!out.contains("[Document:"));
@@ -1491,7 +1615,7 @@ mod tests {
             .collect();
         let result = json!({ "content": items });
 
-        let out = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
+        let (out, _) = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
         assert!(
             !dir.path().join("uploads").exists(),
             "an over-count result must not write any file"
@@ -1518,7 +1642,7 @@ mod tests {
             ]
         });
 
-        let out = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
+        let (out, _) = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
         assert!(
             !out.contains("aggregate blob size exceeds limit"),
             "an exact-limit blob must not be rejected by the aggregate gate"
@@ -1547,7 +1671,7 @@ mod tests {
             ]
         });
 
-        let out = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
+        let (out, _) = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
         assert!(
             !dir.path().join("uploads").exists(),
             "a malformed all-padding blob must not be decoded or written"
@@ -1559,7 +1683,7 @@ mod tests {
     #[test]
     fn mcp_intake_image_only_without_resource_blobs() {
         // Result with only `type: "image"` items (no resource blobs) still
-        // materializes and emits IMAGE markers.
+        // materializes and declares image attachments.
         let dir = tempdir().unwrap();
         let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"img-data");
         let result = json!({
@@ -1567,14 +1691,19 @@ mod tests {
                 { "type": "image", "data": b64, "mimeType": "image/jpeg" }
             ]
         });
-        let out = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
-        assert!(out.contains("[IMAGE:"), "missing IMAGE marker: {out}");
+        let (out, attachments) = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
+        assert_eq!(attachments.len(), 1, "one image item -> one attachment");
         // A declared image/jpeg type names the file .jpg so the multimodal
         // loader — which prefers a path's extension over the bytes' magic —
         // reports image/jpeg to the provider.
         assert!(
-            out.contains(".jpg"),
-            "jpeg image should be stored with a .jpg extension: {out}"
+            attachments[0].target.ends_with(".jpg"),
+            "jpeg image should be stored with a .jpg extension: {:?}",
+            attachments[0].target
+        );
+        assert!(
+            out.contains(json_escaped(&attachments[0].target).as_str()),
+            "the text item must reference the saved path: {out}"
         );
         assert!(dir.path().join("uploads").exists());
     }
@@ -1590,11 +1719,16 @@ mod tests {
         let result = json!({
             "content": [ { "type": "image", "data": b64 } ]
         });
-        let out = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
-        assert!(out.contains("[IMAGE:"), "missing IMAGE marker: {out}");
+        let (out, attachments) = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
+        assert_eq!(attachments.len(), 1);
         assert!(
-            out.contains(".jpg") && !out.contains(".png"),
-            "sniffed JPEG should be stored as .jpg, not .png: {out}"
+            attachments[0].target.ends_with(".jpg"),
+            "sniffed JPEG should be stored as .jpg, not .png: {:?}",
+            attachments[0].target
+        );
+        assert!(
+            out.contains(json_escaped(&attachments[0].target).as_str()),
+            "the text item must reference the saved path: {out}"
         );
     }
 
@@ -1610,7 +1744,7 @@ mod tests {
                 { "type": "audio", "data": b64, "mimeType": "audio/wav" }
             ]
         });
-        let out = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
+        let (out, _) = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
         assert!(
             out.contains("[audio attachment: audio/wav]"),
             "missing audio placeholder: {out}"
@@ -1636,7 +1770,7 @@ mod tests {
                 { "type": "text", "text": "survivor" }
             ]
         });
-        let out = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
+        let (out, _) = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
         assert!(out.contains("[attachment unavailable:"));
         assert!(out.contains("survivor"));
     }
@@ -1652,7 +1786,7 @@ mod tests {
                 { "type": "image", "data": b64, "mimeType": "image/png" }
             ]
         });
-        let out = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
+        let (out, _) = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
         assert!(out.contains("[attachment unavailable:"));
     }
 
@@ -1666,7 +1800,7 @@ mod tests {
             .map(|_| json!({ "type": "image", "data": b64, "mimeType": "image/png" }))
             .collect();
         let result = json!({ "content": items });
-        let out = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
+        let (out, _) = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
         assert!(
             out.contains("too many embedded blobs"),
             "expected item-budget marker: {out}"
@@ -1699,7 +1833,7 @@ mod tests {
                 { "type": "image", "data": img, "mimeType": "image/png" }
             ]
         });
-        let out = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
+        let (out, _) = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
         assert!(
             out.contains("aggregate blob size exceeds limit"),
             "expected byte-budget marker: {out}"
@@ -1733,9 +1867,10 @@ mod tests {
                 { "type": "image", "data": "", "mimeType": "image/png" }
             ]
         });
-        let out = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
-        assert!(
-            out.contains("[IMAGE:"),
+        let (out, attachments) = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
+        assert_eq!(
+            attachments.len(),
+            1,
             "valid image should materialize: {out}"
         );
         assert!(
@@ -1754,9 +1889,9 @@ mod tests {
 
     #[test]
     fn mcp_intake_image_conversion_preserves_annotations_and_meta() {
-        // Converting an image item to its text marker must keep the item's
-        // non-binary metadata (annotations, _meta) while dropping only the binary
-        // `data` and superseded `mimeType`.
+        // Converting an image item to its text-path form must keep the item's
+        // non-binary metadata (annotations, _meta) while dropping only the
+        // binary `data` and superseded `mimeType`.
         let dir = tempdir().unwrap();
         let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"img");
         let result = json!({
@@ -1770,8 +1905,8 @@ mod tests {
                 }
             ]
         });
-        let out = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
-        assert!(out.contains("[IMAGE:"), "missing IMAGE marker: {out}");
+        let (out, attachments) = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
+        assert_eq!(attachments.len(), 1, "missing image attachment: {out}");
         assert!(
             out.contains(r#""type": "text""#),
             "image should convert to a text item: {out}"
@@ -1833,14 +1968,16 @@ mod tests {
         let result = json!({
             "content": [ { "type": "image", "data": b64, "mimeType": "IMAGE/JPEG" } ]
         });
-        let out = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
-        assert!(
-            out.contains("[IMAGE:"),
+        let (out, attachments) = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
+        assert_eq!(
+            attachments.len(),
+            1,
             "uppercase mime should still be an image: {out}"
         );
         assert!(
-            out.contains(".jpg") && !out.contains(".bin"),
-            "IMAGE/JPEG should normalize to .jpg: {out}"
+            attachments[0].target.ends_with(".jpg"),
+            "IMAGE/JPEG should normalize to .jpg: {:?}",
+            attachments[0].target
         );
     }
 
@@ -1853,14 +1990,16 @@ mod tests {
         let result = json!({
             "content": [ { "type": "image", "data": b64, "mimeType": "image/png; charset=binary" } ]
         });
-        let out = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
-        assert!(
-            out.contains("[IMAGE:"),
+        let (out, attachments) = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
+        assert_eq!(
+            attachments.len(),
+            1,
             "parameterized mime should still be an image: {out}"
         );
         assert!(
-            out.contains(".png") && !out.contains(".bin"),
-            "parameterized image/png should resolve to .png: {out}"
+            attachments[0].target.ends_with(".png"),
+            "parameterized image/png should resolve to .png: {:?}",
+            attachments[0].target
         );
     }
 
@@ -1874,14 +2013,16 @@ mod tests {
         let result = json!({
             "content": [ { "type": "image", "data": b64, "mimeType": "image/bmp" } ]
         });
-        let out = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
-        assert!(
-            out.contains("[IMAGE:"),
+        let (out, attachments) = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
+        assert_eq!(
+            attachments.len(),
+            1,
             "sniffed PNG should be an image: {out}"
         );
         assert!(
-            out.contains(".png") && !out.contains(".bin"),
-            "untabled declaration should fall back to sniffed .png: {out}"
+            attachments[0].target.ends_with(".png"),
+            "untabled declaration should fall back to sniffed .png: {:?}",
+            attachments[0].target
         );
     }
 
@@ -1897,7 +2038,7 @@ mod tests {
         let result = json!({
             "content": [ { "type": "image", "data": b64, "mimeType": "image/bmp" } ]
         });
-        let out = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
+        let (out, _) = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
         assert!(
             out.contains("[attachment unavailable:"),
             "unsupported unidentifiable image should degrade: {out}"

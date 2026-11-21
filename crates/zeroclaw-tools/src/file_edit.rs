@@ -64,7 +64,7 @@ impl Tool for FileEditTool {
         // A successful edit on an ephemeral runtime rewrites a file that never
         // reaches the host and is lost at session end; warn loudly
         if !self.persistent_writes && result.success {
-            result.output = with_ephemeral_workspace_warning(&result.output).into();
+            result.output.map_text(with_ephemeral_workspace_warning);
         }
         Ok(result)
     }
@@ -201,6 +201,19 @@ impl FileEditTool {
                     "Refusing to edit through symlink: {}",
                     resolved_target.display()
                 )),
+            });
+        }
+
+        // Editing reads existing content, including when only a match diagnostic
+        // is returned. A write-only grant must not expose that content.
+        if !self.security.is_resolved_path_readable(&resolved_target) {
+            return Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(
+                    self.security
+                        .resolved_path_violation_message(&resolved_target),
+                ),
             });
         }
 
