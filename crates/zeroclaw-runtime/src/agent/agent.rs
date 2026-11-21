@@ -13,7 +13,6 @@ use crate::security::ingress::{IngressPolicy, steering_policy};
 use crate::sop::{SopAuditLogger, SopEngine};
 use crate::tools::{self, Tool};
 use anyhow::{Context, Result};
-use chrono::{Datelike, Timelike};
 use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::path::Path;
@@ -1559,17 +1558,10 @@ impl Agent {
 
     /// Prefixes a user message with the current date/time in the labeled
     /// shape both embedded Agent turn paths store in history, including the
-    /// streamed path used by RPC and ACP. Other runtime owners format their
-    /// own user-message envelopes independently.
+    /// streamed path used by RPC and ACP. `prompt::timestamp_user_message`
+    /// owns that shape.
     fn enrich_user_message(&self, user_message: &str) -> String {
-        let now = self.current_turn_datetime();
-        let (year, month, day) = (now.year(), now.month(), now.day());
-        let (hour, minute, second) = (now.hour(), now.minute(), now.second());
-        let tz = now.format("%Z");
-        let date_str =
-            format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02} {tz}");
-
-        format!("[CURRENT DATE & TIME: {date_str}]\n\n{user_message}")
+        crate::agent::prompt::timestamp_user_message(&self.current_turn_datetime(), user_message)
     }
 
     pub fn set_channel_name(&mut self, name: String) {
