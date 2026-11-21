@@ -260,8 +260,20 @@ pub(crate) async fn delete_discord_message(
 }
 
 pub(crate) fn encode_emoji_for_discord(emoji: &str) -> String {
-    if emoji.contains(':') {
-        return emoji.to_string();
+    let trimmed = emoji.trim();
+    let unwrapped = trimmed
+        .strip_prefix("<a:")
+        .or_else(|| trimmed.strip_prefix("<:"))
+        .and_then(|s| s.strip_suffix('>'))
+        .unwrap_or(trimmed);
+
+    if let Some((name, id)) = unwrapped.split_once(':')
+        && !name.is_empty()
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && !id.is_empty()
+        && id.chars().all(|c| c.is_ascii_digit())
+    {
+        return format!("{name}:{id}");
     }
 
     let mut encoded = String::new();

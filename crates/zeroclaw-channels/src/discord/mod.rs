@@ -6888,6 +6888,24 @@ mod tests {
     }
 
     #[test]
+    fn encode_emoji_custom_guild_emoji_with_markup() {
+        let encoded = encode_emoji_for_discord("<:custom_emoji:123456789>");
+        assert_eq!(encoded, "custom_emoji:123456789");
+        let animated = encode_emoji_for_discord("<a:party_blob:987654321>");
+        assert_eq!(animated, "party_blob:987654321");
+    }
+
+    #[test]
+    fn encode_emoji_rejects_path_traversal_and_percent_encodes() {
+        let malicious = ":x/../../#";
+        let encoded = encode_emoji_for_discord(malicious);
+        assert_eq!(encoded, "%3A%78%2F%2E%2E%2F%2E%2E%2F%23");
+        assert!(!encoded.contains('/'));
+        assert!(!encoded.contains('#'));
+        assert!(!encoded.contains('?'));
+    }
+
+    #[test]
     fn encode_emoji_simple_ascii_char() {
         let encoded = encode_emoji_for_discord("A");
         assert_eq!(encoded, "%41");
