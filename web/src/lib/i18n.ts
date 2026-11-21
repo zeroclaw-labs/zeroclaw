@@ -1654,6 +1654,8 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.approval_always': 'Always approve',
     'agent.approval_always_hint': 'Approve this tool automatically for the rest of this session',
     'agent.stop': 'Stop',
+    'agent.turn_stopped': 'Turn stopped',
+    'agent.stop_confirm': 'Stop the current turn?',
 
     // Agent drawer / card
     'agent.detail_aria_prefix': 'Agent',
