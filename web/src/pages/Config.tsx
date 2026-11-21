@@ -1,3 +1,6 @@
+import CredentialPermissions from "@/components/sections/CredentialPermissions";
+import HttpCredentials from "@/components/sections/HttpCredentials";
+import PluginTlsCredentials from "../components/sections/PluginTlsCredentials";
 // Schema-driven config editor (#6175). Curated section explorer
 // but lands on a per-section overview: pick a section in the sidebar, see
 // what's currently configured under it, click an item to edit, click +Add
@@ -227,6 +230,54 @@ export default function Config() {
 
   const mainContent = (() => {
     if (!activeSection) return null;
+
+    if (activeSection.key === "secrets") {
+      return (
+        <SectionTabs
+          tabs={[
+            { key: "settings", label: t("plugin_tls.settings"), render: () => (
+                <FieldForm
+                  key={reloadKey}
+                  prefix="secrets"
+                  title={activeSection.label}
+                  onSaved={fetchDrift}
+                  drift={drifted}
+                />
+              ) },
+            {
+              key: "plugin-tls-credentials",
+              label: t("plugin_tls.title"),
+              render: () => <PluginTlsCredentials />,
+            },
+            {
+              key: "user-password-credentials",
+              label: t("http_credentials.user_password"),
+              render: () => <HttpCredentials key="user_password" kind="user_password" />,
+            },
+            {
+              key: "api-key-credentials",
+              label: t("http_credentials.api_key"),
+              render: () => <HttpCredentials key="api_key" kind="api_key" />,
+            },
+            {
+              key: "ssh-key-credentials",
+              label: t("http_credentials.ssh_keys"),
+              render: () => <HttpCredentials key="ssh_key" kind="ssh_key" />,
+            },
+            {
+              key: "totp-credentials",
+              label: t("http_credentials.totp"),
+              render: () => <HttpCredentials key="totp" kind="totp" />,
+            },
+            {
+              key: "credential-permissions",
+              label: t("http_credentials.permissions"),
+              render: () => <CredentialPermissions />,
+            },
+          ]}
+        />
+      );
+    }
 
     if (!activeSection.has_picker) {
       return (

@@ -260,13 +260,40 @@ pub enum Question {
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum Answer {
     Noul {
+        #[serde(deserialize_with = "deserialize_probability")]
         noul: f64,
     },
     Choice {
         choice: String,
+        #[serde(deserialize_with = "deserialize_probabilities")]
         probabilities: BTreeMap<String, f64>,
+        #[serde(deserialize_with = "deserialize_probability")]
         confidence: f64,
     },
+}
+
+// Tagged enum deserialization buffers values through Serde. Decode JSON
+// numbers explicitly so arbitrary-precision buffering also accepts f64 fields.
+fn deserialize_probability<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<f64, D::Error> {
+    Value::deserialize(deserializer)?
+        .as_f64()
+        .ok_or_else(|| serde::de::Error::custom("expected a numeric probability"))
+}
+
+fn deserialize_probabilities<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<BTreeMap<String, f64>, D::Error> {
+    BTreeMap::<String, Value>::deserialize(deserializer)?
+        .into_iter()
+        .map(|(key, value)| {
+            value
+                .as_f64()
+                .map(|number| (key, number))
+                .ok_or_else(|| serde::de::Error::custom("expected a numeric probability"))
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -686,6 +713,22 @@ fn validate_choice(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tagged_probability_answers_accept_numbers_and_reject_strings() {
+        let answer: Answer = serde_json::from_str(r#"{"type":"noul","noul":0.7}"#).unwrap();
+        assert_eq!(answer, Answer::Noul { noul: 0.7 });
+        let answer: Answer = serde_json::from_str(
+            r#"{"type":"choice","choice":"auto","probabilities":{"auto":0.8,"supervised":0.2},"confidence":0.95}"#,
+        ).unwrap();
+        assert!(matches!(answer, Answer::Choice { confidence, .. } if confidence == 0.95));
+        for invalid in [
+            r#"{"type":"noul","noul":"0.7"}"#,
+            r#"{"type":"choice","choice":"auto","probabilities":{"auto":"0.8"},"confidence":0.95}"#,
+        ] {
+            assert!(serde_json::from_str::<Answer>(invalid).is_err());
+        }
+    }
 
     fn spec() -> SopDecisionSpec {
         SopDecisionSpec {
