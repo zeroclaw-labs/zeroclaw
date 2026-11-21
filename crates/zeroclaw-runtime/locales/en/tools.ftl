@@ -258,6 +258,7 @@ tool-weather = Get current weather conditions and forecast for any location worl
 
 tool-a2a-discover = List available remote A2A peer agents and their advertised capabilities. Call with no peer to list all configured peers, or a specific peer to fetch its Agent Card (name, description, skills). Use before a2a_send to find the right peer and agent for a task.
 tool-a2a-discover-desc-peer = Peer name to fetch the Agent Card for. Omit to list all configured peers.
+tool-a2a-discover-desc-agent = Optional published agent alias to inspect within the peer catalog. Omit to discover all colleague profiles.
 tool-a2a-discover-desc-filter-tags = Optional tags to filter peers by (e.g. ["production"]).
 tool-a2a-send = Delegate a task to a remote A2A peer agent and wait for the result. Returns a Task with a task_id, state, and artifacts (the peer's reply, fenced as untrusted-external). If the state is non-terminal (working/input-required), poll with a2a_get_task or cancel with a2a_cancel. The message is sent as-is. This is an Act operation that requires approval by default (not in auto_approve) unless the operator explicitly opts in via risk_profiles.<name>.auto_approve.
 tool-a2a-send-desc-peer = Configured peer name to send the task to.

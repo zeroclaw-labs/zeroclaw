@@ -18,7 +18,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
-use futures_util::stream::TryStreamExt;
+use futures_util::stream::{StreamExt, TryStreamExt};
 use parking_lot::Mutex;
 use serde_json::{Value, json};
 
@@ -1357,6 +1357,88 @@ impl A2aHttpClient {
             .map_err(|e| anyhow::Error::msg(format!("a2a client: {e}")))
     }
 
+    /// Expand only native catalogs. Routes come from the current catalog and
+    /// must remain on the configured origin; no credentials are sent to cards.
+    async fn get_profiles(
+        &self,
+        peer: &str,
+        catalog: &AgentCard,
+        requested: Option<&str>,
+    ) -> anyhow::Result<Vec<(String, String, anyhow::Result<AgentCard>)>> {
+        let base = parse_peer_url(&self.resolve_peer(peer)?.base_url)?;
+        let prefix = format!("{}/a2a/", base.path().trim_end_matches('/'));
+        let mut routes = std::collections::BTreeMap::new();
+        for interface in &catalog.supported_interfaces {
+            if !interface.protocol_binding.eq_ignore_ascii_case("jsonrpc") {
+                continue;
+            }
+            let url = parse_peer_url(&interface.url)?;
+            if url_origin(&url) != url_origin(&base)
+                || url.query().is_some()
+                || url.fragment().is_some()
+            {
+                anyhow::bail!(
+                    "a2a discovery: catalog interface must remain on its configured origin"
+                );
+            }
+            let alias = url
+                .path()
+                .strip_prefix(&prefix)
+                .filter(|alias| {
+                    !alias.is_empty()
+                        && alias.len() <= 63
+                        && alias
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+                })
+                .ok_or_else(|| anyhow::Error::msg("a2a discovery: invalid native catalog alias"))?;
+            routes.insert(
+                alias.to_string(),
+                format!(
+                    "{}/.well-known/agent-card.json",
+                    url.as_str().trim_end_matches('/')
+                ),
+            );
+        }
+        if routes.len() > 128 {
+            anyhow::bail!("a2a discovery: catalog exceeds the 128-profile request bound");
+        }
+        if let Some(alias) = requested {
+            let url = routes.remove(alias).ok_or_else(|| {
+                anyhow::Error::msg(
+                    "a2a discovery: requested agent is not published in this catalog",
+                )
+            })?;
+            routes.clear();
+            routes.insert(alias.to_string(), url);
+        }
+        let mut profiles =
+            futures_util::stream::iter(routes.into_iter().map(|(alias, url)| async move {
+                let result = async {
+                    let parsed = parse_peer_url(&url)?;
+                    let resolved = self.guard_host(&parsed).await?;
+                    let http = self.pinned_client(&parsed, resolved)?;
+                    let card = self
+                        .try_card_url(&http, &url)
+                        .await
+                        .map_err(|error| anyhow::Error::msg(format!("a2a discovery: {error}")))?;
+                    if card.name != alias {
+                        anyhow::bail!(
+                            "a2a discovery: profile name does not match its catalog alias"
+                        );
+                    }
+                    Ok(card)
+                }
+                .await;
+                (alias, url, result)
+            }))
+            .buffer_unordered(4)
+            .collect::<Vec<_>>()
+            .await;
+        profiles.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(profiles)
+    }
+
     /// Fetch a peer's Agent Card, spec-first with a ZeroClaw-inbound fallback.
     ///
     /// Tries the spec §14.3 well-known root path `/.well-known/agent-card.json`
@@ -1881,6 +1963,7 @@ impl Tool for A2aDiscoverTool {
             "type": "object",
             "properties": {
                 "peer": { "type": "string", "description": crate::i18n::get_required_tool_string("tool-a2a-discover-desc-peer") },
+                "agent": { "type": "string", "description": crate::i18n::get_required_tool_string("tool-a2a-discover-desc-agent") },
                 "filter_tags": { "type": "array", "items": { "type": "string" }, "description": crate::i18n::get_required_tool_string("tool-a2a-discover-desc-filter-tags") }
             }
         })
@@ -1910,7 +1993,52 @@ impl Tool for A2aDiscoverTool {
             .unwrap_or_default();
         match args.get("peer").and_then(|v| v.as_str()) {
             Some(peer) => {
-                let card = self.client.get_card(peer).await?;
+                let mut card = self.client.get_card(peer).await?;
+                let requested = args.get("agent").and_then(Value::as_str);
+                let is_catalog = card
+                    .supported_interfaces
+                    .iter()
+                    .any(|interface| interface.protocol_binding.eq_ignore_ascii_case("catalog"));
+                let mut agents = Vec::new();
+                let mut profile_errors = Vec::new();
+                if is_catalog {
+                    for (alias, url, profile) in
+                        self.client.get_profiles(peer, &card, requested).await?
+                    {
+                        match profile {
+                            Ok(profile) => {
+                                agents.push(discovered_profile(&alias, &url, &profile));
+                                if requested.is_some() {
+                                    card = profile;
+                                }
+                            }
+                            Err(error) => {
+                                if requested.is_some() {
+                                    return Err(error);
+                                }
+                                profile_errors.push(json!({
+                                    "alias": fence_remote_error_text(&alias),
+                                    "card_url": fence_remote_error_text(&url),
+                                    "error": fence_remote_error_text(&error.to_string())
+                                }));
+                            }
+                        }
+                    }
+                } else if requested.is_some_and(|alias| alias != card.name) {
+                    anyhow::bail!(
+                        "a2a discovery: requested agent does not match the single-agent card"
+                    );
+                }
+                if is_catalog && requested.is_none() {
+                    // The catalog's aggregate skills repeat the profile skills.
+                    // Return one projection so a fleet fits the tool-result budget.
+                    return Ok(ToolResult::ok(ToolOutput::json(json!({
+                        "peer": peer,
+                        "agents": agents,
+                        "complete": profile_errors.is_empty(),
+                        "profile_errors": profile_errors
+                    }))));
+                }
                 // Peer card text (name/description/skills/version/interfaces)
                 // is attacker-authored by construction and shown to the model
                 // so it can choose a delegate — a cross-agent prompt-injection
@@ -1955,7 +2083,7 @@ impl Tool for A2aDiscoverTool {
                         })
                     })
                     .collect();
-                Ok(ToolResult::ok(ToolOutput::json(json!({
+                let mut output = json!({
                     "peer": peer,
                     "name": fenced_name,
                     "description": fenced_desc,
@@ -1963,9 +2091,18 @@ impl Tool for A2aDiscoverTool {
                     "capabilities": card.capabilities,
                     "supported_interfaces": fenced_interfaces,
                     "skills": fenced_skills,
-                }))))
+                });
+                if is_catalog {
+                    output["agents"] = json!(agents);
+                    output["profile_errors"] = json!(profile_errors);
+                    output["complete"] = json!(profile_errors.is_empty());
+                }
+                Ok(ToolResult::ok(ToolOutput::json(output)))
             }
             None => {
+                if args.get("agent").is_some() {
+                    anyhow::bail!("a2a discovery: inspecting an agent requires a peer");
+                }
                 let config = self.client.config.read();
                 let peers: Vec<_> = config
                     .a2a
@@ -1985,6 +2122,27 @@ impl Tool for A2aDiscoverTool {
 }
 
 const A2A_SEND_KEY: &str = "tool-a2a-send";
+fn discovered_profile(alias: &str, card_url: &str, card: &AgentCard) -> Value {
+    let fence = |text: &str| {
+        format!(
+            "<a2a-card trust=\"untrusted-external\">{}</a2a-card>",
+            escape_fence_body(text)
+        )
+    };
+    json!({
+        "alias": fence(alias),
+        "name": fence(&card.name),
+        "description": fence(&card.description),
+        "card_url": fence(card_url),
+        "skills": card.skills.iter().map(|skill| json!({
+            "id": fence(&skill.id),
+            "name": fence(&skill.name),
+            "description": fence(&skill.description),
+            "tags": skill.tags.iter().map(|tag| fence(tag)).collect::<Vec<_>>()
+        })).collect::<Vec<_>>()
+    })
+}
+
 static A2A_SEND_DESC: OnceLock<String> = OnceLock::new();
 
 #[async_trait]
@@ -4159,6 +4317,168 @@ mod tests {
             .expect(1..)
             .mount(server)
             .await;
+    }
+
+    fn directory_card(server: &MockServer, aliases: &[&str]) -> Value {
+        let mut interfaces = vec![json!({
+            "url": format!("{}/.well-known/agents-card.json", server.uri()),
+            "protocolBinding": "catalog", "protocolVersion": "1.0"
+        })];
+        interfaces.extend(aliases.iter().map(|alias| {
+            json!({
+                "url": format!("{}/a2a/{alias}", server.uri()),
+                "protocolBinding": "JSONRPC", "protocolVersion": "1.0"
+            })
+        }));
+        json!({"name":"Catalog", "description":"Colleagues", "version":"1.0",
+            "supportedInterfaces": interfaces, "capabilities": {},
+            "defaultInputModes":[], "defaultOutputModes":[], "skills":[]})
+    }
+
+    fn directory_tool(server: &MockServer) -> A2aDiscoverTool {
+        let config = LiveConfig::new(test_config(server)).handle();
+        let client =
+            Arc::new(A2aHttpClient::new(config, 10, None, false, test_route_cache()).unwrap());
+        A2aDiscoverTool::new(client, Arc::new(SecurityPolicy::default()))
+    }
+
+    async fn mount_directory_profile(server: &MockServer, alias: &str) {
+        let mut card = directory_card(server, &[]);
+        card["name"] = json!(alias);
+        card["description"] = json!(format!(
+            "{alias}. Organization: example/{alias}. Purpose: Support {alias}."
+        ));
+        Mock::given(method("GET"))
+            .and(path(format!("/a2a/{alias}/.well-known/agent-card.json")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(card))
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    #[serial(a2a)]
+    async fn directory_discovery_lists_unique_sorted_profiles_and_inspects_one() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/.well-known/agents-card.json"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(directory_card(&server, &["qa", "engineering", "qa"])),
+            )
+            .mount(&server)
+            .await;
+        for alias in ["engineering", "qa"] {
+            mount_directory_profile(&server, alias).await;
+        }
+        let tool = directory_tool(&server);
+        let result = tool.execute(json!({"peer":"local"})).await.unwrap();
+        let data = result.output.data().unwrap();
+        assert_eq!(data["complete"], true);
+        assert_eq!(data["agents"].as_array().unwrap().len(), 2);
+        assert!(
+            data["agents"][0]["alias"]
+                .as_str()
+                .unwrap()
+                .contains("engineering")
+        );
+        assert!(
+            data["agents"][0]["description"]
+                .as_str()
+                .unwrap()
+                .contains("example/engineering")
+        );
+        let result = tool
+            .execute(json!({"peer":"local", "agent":"qa"}))
+            .await
+            .unwrap();
+        let data = result.output.data().unwrap();
+        assert!(data["name"].as_str().unwrap().contains("qa"));
+        assert_eq!(data["agents"].as_array().unwrap().len(), 1);
+        assert!(
+            tool.execute(json!({"peer":"local", "agent":"unpublished"}))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    #[serial(a2a)]
+    async fn directory_discovery_reports_partial_failure_and_reads_fresh_profiles() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/.well-known/agents-card.json"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(directory_card(&server, &["engineering", "missing"])),
+            )
+            .mount(&server)
+            .await;
+        mount_directory_profile(&server, "engineering").await;
+        let tool = directory_tool(&server);
+        let result = tool.execute(json!({"peer":"local"})).await.unwrap();
+        let data = result.output.data().unwrap();
+        assert_eq!(data["complete"], false);
+        assert_eq!(data["agents"].as_array().unwrap().len(), 1);
+        assert_eq!(data["profile_errors"].as_array().unwrap().len(), 1);
+        assert!(
+            tool.execute(json!({"peer":"local", "agent":"missing"}))
+                .await
+                .is_err()
+        );
+        server.reset().await;
+        Mock::given(method("GET"))
+            .and(path("/.well-known/agents-card.json"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(directory_card(&server, &["new_agent"])),
+            )
+            .mount(&server)
+            .await;
+        mount_directory_profile(&server, "new_agent").await;
+        let result = tool.execute(json!({"peer":"local"})).await.unwrap();
+        let data = result.output.data().unwrap();
+        assert_eq!(data["complete"], true);
+        assert_eq!(data["agents"].as_array().unwrap().len(), 1);
+        assert!(
+            data["agents"][0]["alias"]
+                .as_str()
+                .unwrap()
+                .contains("new_agent")
+        );
+    }
+
+    #[tokio::test]
+    #[serial(a2a)]
+    async fn directory_discovery_rejects_foreign_origins_and_name_mismatch() {
+        let server = MockServer::start().await;
+        let mut card = directory_card(&server, &["engineering"]);
+        card["supportedInterfaces"][1]["url"] = json!("http://invalid.example/a2a/engineering");
+        Mock::given(method("GET"))
+            .and(path("/.well-known/agents-card.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(card))
+            .mount(&server)
+            .await;
+        let tool = directory_tool(&server);
+        assert!(tool.execute(json!({"peer":"local"})).await.is_err());
+        server.reset().await;
+        Mock::given(method("GET"))
+            .and(path("/.well-known/agents-card.json"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(directory_card(&server, &["engineering"])),
+            )
+            .mount(&server)
+            .await;
+        let mut wrong = directory_card(&server, &[]);
+        wrong["name"] = json!("another_agent");
+        Mock::given(method("GET"))
+            .and(path("/a2a/engineering/.well-known/agent-card.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(wrong))
+            .mount(&server)
+            .await;
+        assert!(
+            tool.execute(json!({"peer":"local", "agent":"engineering"}))
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

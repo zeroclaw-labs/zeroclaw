@@ -474,6 +474,47 @@ the JSONRPC method names, and the enum and Part shapes all moved to v1 together.
 
 ## Use cases
 
+### Discover colleagues in the same instance
+
+Point an A2A client peer at the local gateway, explicitly allow its loopback
+host, and publish the agents that should be discoverable:
+
+```toml
+[a2a.server]
+enabled = true
+public_base_url = "http://127.0.0.1:42617"
+
+[a2a.client]
+enabled = true
+allowed_private_hosts = ["127.0.0.1"]
+card_cache_ttl_secs = 0
+
+[[a2a.client.peers]]
+name = "self"
+base_url = "http://127.0.0.1:42617"
+```
+
+`a2a_discover(peer="self")` expands the native catalog into an `agents` list
+of individual public profiles, ordered by alias. Duplicate aliases appear once.
+Each profile contains its alias, public description, advertised skills, and card
+URL. `a2a_discover(peer="self", agent="researcher")` inspects one published
+alias. Unknown aliases and failed individual lookups return errors. A partial
+catalog read returns `complete: false` with explicit `profile_errors`, rather
+than claiming the missing agents do not exist. Expansion is bounded to 128
+aliases and four concurrent profile reads. Standard single-agent cards retain
+their existing result shape.
+
+When an identity's `history.origin_story` contains `Name:`, `Organization:`,
+and `Purpose:` lines, those canonical fields supply the public description.
+Other identities retain the existing bio/name fallback. Skills still come only
+from attached bundles narrowed by `exposed_skills`.
+
+Discovery is read-only and does not choose a delivery channel. Agents can find
+colleagues here and then communicate through independently configured chat
+routes. Publishing still exposes the cards on the gateway listener and enables
+the authenticated A2A task endpoint described above. A loopback client address
+does not make a publicly bound gateway private.
+
 A few concrete reasons to wire deployments together.
 
 A research deployment hands literature search to a specialist data deployment.
