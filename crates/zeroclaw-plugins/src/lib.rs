@@ -19,6 +19,8 @@ mod component_state;
 mod component_websocket;
 pub mod config;
 pub mod egress;
+#[cfg(feature = "plugins-wasmtime")]
+mod egress_report;
 pub mod endpoint;
 pub mod error;
 pub mod event;

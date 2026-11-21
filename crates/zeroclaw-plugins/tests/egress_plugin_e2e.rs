@@ -13,6 +13,8 @@
 
 #![cfg(feature = "plugins-wasm-cranelift")]
 
+#[path = "support/egress_records.rs"]
+mod egress_records;
 mod support;
 
 use std::io::{Read, Write};
@@ -448,5 +450,35 @@ async fn ip_grants_are_exact_at_the_live_boundary() {
     )
     .await;
     assert_denied_by_policy(&report, "hop1");
+    assert_eq!(server.hits(), 0, "got: {report}");
+}
+
+/// The refusal record the socket and WebSocket adapters now share: `wasi:http`
+/// reports through the same recorder, under its own transport name.
+#[tokio::test]
+async fn a_refused_request_is_recorded_under_the_http_transport() {
+    egress_records::start();
+    let server = TestServer::start(OK_RESPONSE);
+    let report = probe(
+        &server.url("/"),
+        false,
+        Some(policy(&["records.example.com"], &[])),
+    )
+    .await;
+    assert_denied_by_policy(&report, "hop1");
+
+    let records = egress_records::matching(|record| {
+        record["transport"] == "http"
+            && record["remedy"]
+                .as_str()
+                .is_some_and(|remedy| remedy.contains("records.example.com"))
+    });
+    assert_eq!(
+        records.len(),
+        1,
+        "one refused request, one record: {records:?}"
+    );
+    assert_eq!(records[0]["error_key"], "plugin_egress_denied");
+    assert_eq!(records[0]["host"], "127.0.0.1");
     assert_eq!(server.hits(), 0, "got: {report}");
 }
