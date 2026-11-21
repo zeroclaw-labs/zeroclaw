@@ -3,7 +3,7 @@
 //! and return it appended to the accumulated display text, or bail.
 
 use super::StreamDelta;
-use super::execution::SettledAttemptSummary;
+use super::execution::{ModelQueryControl, ModelQueryInterruption, SettledAttemptSummary};
 use super::knobs::{LoopKnobs, MaxIterationBehavior};
 use super::outcome::ToolLoopCancelled;
 use anyhow::Result;
@@ -65,6 +65,41 @@ async fn emit_summary_attempt_usage(
                 .await;
         }
     }
+}
+
+/// Preserve only an instrumented Goal admission refusal; an enclosing loop
+/// still owns its own tool-phase check. Any inner negative evidence wins.
+fn preserve_goal_summary_spend_refusal(error: &anyhow::Error, timed_out: bool) -> bool {
+    use zeroclaw_goal::accounting::{GoalAccountingFailure, GoalOrdinarySpendRefusal};
+
+    if timed_out
+        || !crate::agent::cost::goal_operation_accounting_is_scoped()
+        || zeroclaw_api::turn_stop::turn_stop(error)
+            .is_none_or(|stop| stop.code != TurnStopCode::BudgetExhausted)
+        || error.downcast_ref::<GoalAccountingFailure>().is_some()
+        || error
+            .chain()
+            .any(|cause| cause.is::<GoalAccountingFailure>())
+    {
+        return false;
+    }
+    let mut checked_clean = false;
+    if let Some(refusal) = error.downcast_ref::<GoalOrdinarySpendRefusal>() {
+        if !refusal.clean_tool_phase() {
+            return false;
+        }
+        checked_clean = true;
+    }
+    for refusal in error
+        .chain()
+        .filter_map(|cause| cause.downcast_ref::<GoalOrdinarySpendRefusal>())
+    {
+        if !refusal.clean_tool_phase() {
+            return false;
+        }
+        checked_clean = true;
+    }
+    checked_clean
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -176,7 +211,7 @@ pub(crate) async fn finish_after_max_iterations(
 
     enum SummaryCall {
         Cancelled,
-        TimedOut(u64),
+        TimedOut,
         Done(Result<zeroclaw_providers::ChatResponse>),
     }
     // Collect the summary call's settled attempts so they can be projected
@@ -184,10 +219,36 @@ pub(crate) async fn finish_after_max_iterations(
     // final-summary billed work. Declared outside the call block so the
     // match arms below can read it after the future completes.
     let mut summary_attempts = Vec::new();
+    let step_secs = pacing
+        .step_timeout_secs
+        .filter(|secs| *secs > 0)
+        .unwrap_or(0);
+    let step_deadline = (step_secs > 0)
+        .then(|| tokio::time::Instant::now().checked_add(Duration::from_secs(step_secs)))
+        .flatten();
+    let foreground = crate::goal_accounting::GoalForegroundContext::current();
+    let control = ModelQueryControl {
+        deadline: step_deadline,
+        cancellation_token,
+        foreground_token: None,
+    }
+    .with_foreground(foreground.as_ref());
+    let summary_timeout_stop = || {
+        let detail = if step_deadline.is_some() && control.deadline == step_deadline {
+            format!("Final summary LLM call timed out after {step_secs}s (step_timeout_secs)")
+        } else {
+            "Final summary LLM call timed out at the Goal foreground deadline".to_owned()
+        };
+        TurnStop::close_out(TurnStopCode::MaxIterations, detail)
+    };
+    let interrupted_call = |interruption| match interruption {
+        ModelQueryInterruption::Cancelled => SummaryCall::Cancelled,
+        ModelQueryInterruption::TimedOut => SummaryCall::TimedOut,
+    };
     let summary_call = {
         // Preparation and hooks belong to the same timeout/cancellation scope
         // as dispatch; only a successful summary persists the prompt.
-        let summary_future = async {
+        let preparation = async {
             // Exclude the synthetic prompt so trailing tool-result images
             // remain in the latest run and receive normal image validation.
             let mut messages = super::vision_route::prepare_messages_for_iteration(
@@ -359,60 +420,53 @@ pub(crate) async fn finish_after_max_iterations(
                 }
                 break;
             }
-            let summary_request = zeroclaw_providers::ChatRequest {
-                messages: &messages,
-                tools: None, // No tools — force a text response
-                thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
-                    .try_with(Clone::clone)
-                    .ok()
-                    .flatten(),
-            };
-            let access = crate::agent::turn::execution::ResolvedModelAccess {
-                model_provider,
-                provider_name,
-                model: &selected_model,
-                dispatch_model: if selected_model == model {
-                    dispatch_model
-                } else {
-                    &selected_model
-                },
-                temperature,
-            };
-            // Route the graceful-summary call through the metered provider seam. This
-            // was the one tool-loop provider call that skipped the budget check and
-            // recorded no cost; through the seam it now fails closed when the turn's
-            // budget is exhausted and its token usage is charged like any in-loop
-            // call. Metering is a no-op when the turn is unscoped.
-            access
-                .run_model_query(summary_request, &mut summary_attempts)
-                .await
+            Ok::<_, anyhow::Error>((messages, selected_model))
         };
-        match pacing.step_timeout_secs {
-            Some(step_secs) if step_secs > 0 => {
-                let step_timeout = Duration::from_secs(step_secs);
-                if let Some(token) = cancellation_token {
-                    tokio::select! {
-                        () = token.cancelled() => SummaryCall::Cancelled,
-                        result = tokio::time::timeout(step_timeout, summary_future) => match result {
-                            Ok(inner) => SummaryCall::Done(inner),
-                            Err(_) => SummaryCall::TimedOut(step_secs),
-                        },
-                    }
-                } else {
-                    match tokio::time::timeout(step_timeout, summary_future).await {
-                        Ok(inner) => SummaryCall::Done(inner),
-                        Err(_) => SummaryCall::TimedOut(step_secs),
-                    }
-                }
-            }
-            _ => {
-                if let Some(token) = cancellation_token {
-                    tokio::select! {
-                        () = token.cancelled() => SummaryCall::Cancelled,
-                        result = summary_future => SummaryCall::Done(result),
-                    }
-                } else {
-                    SummaryCall::Done(summary_future.await)
+        let prepared = tokio::select! {
+            biased;
+            interruption = control.interrupted() => Err(interrupted_call(interruption)),
+            result = preparation => result.map_err(|error| SummaryCall::Done(Err(error))),
+        };
+        match prepared {
+            Err(result) => result,
+            Ok((messages, selected_model)) => {
+                let summary_request = zeroclaw_providers::ChatRequest {
+                    messages: &messages,
+                    tools: None, // No tools — force a text response
+                    thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
+                        .try_with(Clone::clone)
+                        .ok()
+                        .flatten(),
+                };
+                let access = crate::agent::turn::execution::ResolvedModelAccess {
+                    model_provider,
+                    provider_name,
+                    model: &selected_model,
+                    dispatch_model: if selected_model == model {
+                        dispatch_model
+                    } else {
+                        &selected_model
+                    },
+                    temperature,
+                };
+                // The provider race is inside the accounting scope. Goal
+                // settlement is awaited even after timeout or cancellation;
+                // ordinary turns retain their existing interruption behavior.
+                match access
+                    .run_model_query_controlled(summary_request, &mut summary_attempts, control)
+                    .await
+                {
+                    // Only a bare interruption is control flow. An interruption
+                    // with a settlement error must reach both failure consumers.
+                    Err(error) => match error
+                        .chain()
+                        .next()
+                        .and_then(|cause| cause.downcast_ref::<ModelQueryInterruption>())
+                    {
+                        Some(interruption) => interrupted_call(*interruption),
+                        None => SummaryCall::Done(Err(error)),
+                    },
+                    Ok(response) => SummaryCall::Done(Ok(response)),
                 }
             }
         }
@@ -420,16 +474,28 @@ pub(crate) async fn finish_after_max_iterations(
 
     let resp = match summary_call {
         SummaryCall::Cancelled => {
+            emit_summary_attempt_usage(event_tx, &summary_attempts).await;
             return Err(ToolLoopCancelled.into());
         }
-        SummaryCall::TimedOut(step_secs) => {
-            return Err(TurnStop::close_out(
-                TurnStopCode::MaxIterations,
-                format!("Final summary LLM call timed out after {step_secs}s (step_timeout_secs)"),
-            )
-            .into());
+        SummaryCall::TimedOut => {
+            emit_summary_attempt_usage(event_tx, &summary_attempts).await;
+            return Err(summary_timeout_stop().into());
         }
         SummaryCall::Done(Err(e)) => {
+            let timed_out = e.chain().any(|cause| {
+                matches!(
+                    cause.downcast_ref::<ModelQueryInterruption>(),
+                    Some(ModelQueryInterruption::TimedOut)
+                )
+            });
+            let accounting = e
+                .downcast_ref::<zeroclaw_goal::accounting::GoalAccountingFailure>()
+                .or_else(|| {
+                    e.chain().find_map(|cause| {
+                        cause.downcast_ref::<zeroclaw_goal::accounting::GoalAccountingFailure>()
+                    })
+                })
+                .map(|failure| (failure.accounting_state(), failure.has_pending_operation()));
             ::zeroclaw_log::record!(
                 ERROR,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
@@ -445,12 +511,30 @@ pub(crate) async fn finish_after_max_iterations(
                 "final summary LLM call failed after iteration exhaustion; bailing"
             );
             emit_summary_attempt_usage(event_tx, &summary_attempts).await;
+            // A refused Goal summary made no provider call. Keep its decisive
+            // native budget cause rather than replacing it with the cap tag.
+            if preserve_goal_summary_spend_refusal(&e, timed_out) {
+                return Err(e.context(exhaustion));
+            }
             // The provider error stays the source; the stop rides alongside
             // it so the exit is typed without losing what actually failed.
-            return Err(zeroclaw_api::turn_stop::tag(
-                e.context(exhaustion),
-                limit.stop(),
-            ));
+            let stop = if timed_out {
+                summary_timeout_stop()
+            } else {
+                limit.stop()
+            };
+            let tagged = zeroclaw_api::turn_stop::tag(
+                crate::agent::cost::with_goal_diagnostic_context(e, &exhaustion),
+                stop,
+            );
+            return Err(if let Some((state, pending)) = accounting {
+                zeroclaw_goal::accounting::GoalAccountingFailure::with_operation_source(
+                    state, pending, tagged,
+                )
+                .into()
+            } else {
+                tagged
+            });
         }
         SummaryCall::Done(Ok(resp)) => {
             // When the provider omitted `input_tokens` on the accepted
@@ -706,6 +790,975 @@ mod graceful_summary_metering_tests {
         run_summary_with_events(provider, String::new(), None, None).await
     }
 
+    struct BlockingSummaryProvider {
+        entered: Arc<tokio::sync::Notify>,
+    }
+    #[async_trait]
+    impl ModelProvider for BlockingSummaryProvider {
+        async fn chat_with_system(
+            &self,
+            _: Option<&str>,
+            _: &str,
+            _: &str,
+            _: Option<f64>,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("unused")
+        }
+        async fn chat(
+            &self,
+            _: ChatRequest<'_>,
+            _: &str,
+            _: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            self.entered.notify_one();
+            std::future::pending().await
+        }
+    }
+    impl Attributable for BlockingSummaryProvider {
+        fn role(&self) -> Role {
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+        }
+        fn alias(&self) -> &str {
+            "blocking-summary"
+        }
+    }
+
+    struct BlockingSummaryAccounting {
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+        settlements: Arc<AtomicUsize>,
+    }
+    #[async_trait]
+    impl zeroclaw_goal::accounting::GoalOperationAccounting for BlockingSummaryAccounting {
+        fn admission_guard(&self) -> anyhow::Result<zeroclaw_goal::accounting::GoalOperationGuard> {
+            Ok(zeroclaw_goal::accounting::GoalOperationGuard::new(()))
+        }
+
+        async fn begin_dispatch(&self) -> anyhow::Result<zeroclaw_goal::task::GoalDispatchStart> {
+            Ok(zeroclaw_goal::task::GoalDispatchStart::new(
+                Arc::new(tokio::sync::Mutex::new(())).lock_owned().await,
+            ))
+        }
+
+        async fn release_unstarted(&self) -> anyhow::Result<()> {
+            anyhow::bail!("summary must settle after entering dispatch")
+        }
+
+        async fn admit(
+            &self,
+            _: zeroclaw_goal::accounting::GoalOperationRequest,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn settle(
+            &self,
+            settlement: zeroclaw_goal::accounting::GoalOperationSettlement,
+        ) -> anyhow::Result<()> {
+            assert_eq!(
+                settlement.accounting_state,
+                zeroclaw_goal::GoalAccountingState::OutcomeUnknown
+            );
+            self.settlements.fetch_add(1, Ordering::SeqCst);
+            self.entered.notify_one();
+            self.release.notified().await;
+            Err(zeroclaw_goal::accounting::GoalAccountingFailure::settled(
+                zeroclaw_goal::GoalAccountingState::OutcomeUnknown,
+                &["summary settlement".into()],
+            )
+            .into())
+        }
+        async fn pricing_complete(&self) -> anyhow::Result<bool> {
+            Ok(true)
+        }
+    }
+
+    async fn run_controlled_goal_summary(
+        provider: &dyn ModelProvider,
+        token: &tokio_util::sync::CancellationToken,
+        step_timeout: Option<u64>,
+    ) -> anyhow::Result<String> {
+        let mut history = vec![ChatMessage::user("do the work")];
+        let pacing = PacingConfig {
+            step_timeout_secs: step_timeout,
+            ..PacingConfig::default()
+        };
+        finish_after_max_iterations(
+            &mut None,
+            provider,
+            &mut history,
+            "custom",
+            "test-model",
+            "test-model",
+            None,
+            &pacing,
+            Some(token),
+            CompletionLimit::LocalIterations(2),
+            String::new(),
+            "goal-summary",
+            &LoopKnobs::default(),
+            None,
+            None,
+            None,
+            None,
+            &MultimodalConfig::default(),
+            None,
+            None,
+            None,
+            None,
+            |_, _| ResolvedContextLimits::legacy_fallback(0),
+            &mut false,
+            None,
+            &crate::observability::NoopObserver,
+            None,
+        )
+        .await
+    }
+
+    async fn assert_goal_summary_drain(step_timeout: Option<u64>) {
+        use zeroclaw_goal::accounting::GOAL_OPERATION_ACCOUNTING;
+        let directory = tempfile::TempDir::new().unwrap();
+        let handle = crate::control_plane::ControlPlaneHandle::open(directory.path()).unwrap();
+        let identity =
+            zeroclaw_goal::GoalExecutionScope::new("goal-summary", "session-summary", 1).unwrap();
+        let token = tokio_util::sync::CancellationToken::new();
+        let root = crate::goal_accounting::GoalForegroundContext::new_root(
+            identity,
+            handle,
+            token.clone(),
+            tokio::time::Instant::now() + std::time::Duration::from_secs(30),
+        );
+        let provider_entered = Arc::new(tokio::sync::Notify::new());
+        let settlement_entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let settlements = Arc::new(AtomicUsize::new(0));
+        let provider = BlockingSummaryProvider {
+            entered: provider_entered.clone(),
+        };
+        let accountant: Arc<dyn zeroclaw_goal::accounting::GoalOperationAccounting> =
+            Arc::new(BlockingSummaryAccounting {
+                entered: settlement_entered.clone(),
+                release: release.clone(),
+                settlements: settlements.clone(),
+            });
+        let future = GOAL_OPERATION_ACCOUNTING.scope(
+            Some(accountant),
+            root.scope(run_controlled_goal_summary(&provider, &token, step_timeout)),
+        );
+        let mut future = Box::pin(future);
+        tokio::select! {
+            () = provider_entered.notified() => {},
+            result = &mut future => panic!("summary returned before provider admission: {}", result.is_ok()),
+        }
+        if step_timeout.is_none() {
+            token.cancel();
+        }
+        tokio::select! {
+            () = settlement_entered.notified() => {},
+            result = &mut future => panic!("summary returned before settlement: {}", result.is_ok()),
+        }
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(future.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        release.notify_one();
+        let error = future.await.unwrap_err();
+        assert_eq!(settlements.load(Ordering::SeqCst), 1);
+        let failure = error
+            .downcast_ref::<zeroclaw_goal::accounting::GoalAccountingFailure>()
+            .unwrap();
+        assert_eq!(
+            failure.accounting_state(),
+            zeroclaw_goal::GoalAccountingState::OutcomeUnknown
+        );
+        assert!(!failure.has_pending_operation());
+        let stop = zeroclaw_api::turn_stop::turn_stop(&error).unwrap();
+        assert_eq!(
+            stop.code,
+            zeroclaw_api::turn_stop::TurnStopCode::MaxIterations
+        );
+        if step_timeout.is_some() {
+            assert!(
+                stop.to_string()
+                    .contains("Final summary LLM call timed out")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn goal_summary_cancellation_awaits_query_settlement() {
+        assert_goal_summary_drain(None).await;
+    }
+
+    #[tokio::test]
+    async fn goal_summary_step_timeout_awaits_query_settlement() {
+        assert_goal_summary_drain(Some(1)).await;
+    }
+
+    struct InterruptedSummaryProvider {
+        calls: Arc<AtomicUsize>,
+        cancel_on_second: Option<tokio_util::sync::CancellationToken>,
+    }
+
+    #[async_trait]
+    impl ModelProvider for InterruptedSummaryProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("unused")
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Ok(ChatResponse {
+                    text: None,
+                    tool_calls: Vec::new(),
+                    usage: Some(TokenUsage {
+                        input_tokens: Some(80),
+                        output_tokens: Some(5),
+                        cached_input_tokens: None,
+                        cache_creation_input_tokens: None,
+                    }),
+                    reasoning_content: None,
+                });
+            }
+            if let Some(token) = &self.cancel_on_second {
+                token.cancel();
+            }
+            std::future::pending().await
+        }
+    }
+
+    impl Attributable for InterruptedSummaryProvider {
+        fn role(&self) -> Role {
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+        }
+
+        fn alias(&self) -> &str {
+            "interrupted-summary-provider"
+        }
+    }
+
+    #[derive(Default)]
+    struct SummaryAccounting {
+        admissions: AtomicUsize,
+        releases: AtomicUsize,
+        cancel_on_admit: Option<tokio_util::sync::CancellationToken>,
+        fail_settlement: bool,
+        settlements: parking_lot::Mutex<Vec<zeroclaw_goal::accounting::GoalOperationSettlement>>,
+    }
+
+    #[async_trait]
+    impl zeroclaw_goal::accounting::GoalOperationAccounting for SummaryAccounting {
+        fn admission_guard(&self) -> anyhow::Result<zeroclaw_goal::accounting::GoalOperationGuard> {
+            Ok(zeroclaw_goal::accounting::GoalOperationGuard::new(()))
+        }
+        async fn begin_dispatch(&self) -> anyhow::Result<zeroclaw_goal::task::GoalDispatchStart> {
+            Ok(zeroclaw_goal::task::GoalDispatchStart::new(
+                std::sync::Arc::new(tokio::sync::Mutex::new(()))
+                    .lock_owned()
+                    .await,
+            ))
+        }
+        async fn admit(
+            &self,
+            _request: zeroclaw_goal::accounting::GoalOperationRequest,
+        ) -> anyhow::Result<()> {
+            self.admissions.fetch_add(1, Ordering::SeqCst);
+            if let Some(token) = &self.cancel_on_admit {
+                token.cancel();
+            }
+            Ok(())
+        }
+
+        async fn settle(
+            &self,
+            settlement: zeroclaw_goal::accounting::GoalOperationSettlement,
+        ) -> anyhow::Result<()> {
+            self.settlements.lock().push(settlement);
+            if self.fail_settlement {
+                anyhow::bail!("fixture settlement failed");
+            }
+            Ok(())
+        }
+
+        async fn release_unstarted(&self) -> anyhow::Result<()> {
+            self.releases.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn pricing_complete(&self) -> anyhow::Result<bool> {
+            Ok(true)
+        }
+    }
+
+    async fn run_controlled_summary(
+        provider: &dyn ModelProvider,
+        cancellation_token: Option<&tokio_util::sync::CancellationToken>,
+        event_tx: Option<&Sender<TurnEvent>>,
+    ) -> anyhow::Result<String> {
+        run_controlled_summary_with_hooks(provider, cancellation_token, event_tx, None).await
+    }
+
+    async fn run_controlled_summary_with_hooks(
+        provider: &dyn ModelProvider,
+        cancellation_token: Option<&tokio_util::sync::CancellationToken>,
+        event_tx: Option<&Sender<TurnEvent>>,
+        hooks: Option<&crate::hooks::HookRunner>,
+    ) -> anyhow::Result<String> {
+        let mut history = vec![ChatMessage::user("do the work")];
+        let pacing = PacingConfig {
+            step_timeout_secs: Some(1),
+            ..PacingConfig::default()
+        };
+        finish_after_max_iterations(
+            &mut None,
+            provider,
+            &mut history,
+            "reliable",
+            "test-model",
+            "test-model",
+            None,
+            &pacing,
+            cancellation_token,
+            CompletionLimit::LocalIterations(2),
+            String::new(),
+            "trace-interrupted-summary",
+            &LoopKnobs::default(),
+            event_tx,
+            None,
+            None,
+            None,
+            &MultimodalConfig::default(),
+            None,
+            hooks,
+            None,
+            None,
+            |_, _| ResolvedContextLimits::legacy_fallback(0),
+            &mut false,
+            None,
+            &crate::observability::NoopObserver,
+            None,
+        )
+        .await
+    }
+
+    struct SummaryPreparationHook {
+        calls: Arc<AtomicUsize>,
+        pending: bool,
+        cancel: Option<tokio_util::sync::CancellationToken>,
+    }
+
+    #[async_trait]
+    impl crate::hooks::HookHandler for SummaryPreparationHook {
+        fn name(&self) -> &str {
+            "summary-preparation"
+        }
+
+        async fn before_llm_call(
+            &self,
+            _messages: &mut Vec<ChatMessage>,
+            _model: &mut String,
+        ) -> crate::hooks::HookResult<()> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if let Some(token) = &self.cancel {
+                token.cancel();
+            }
+            if self.pending {
+                std::future::pending().await
+            } else {
+                crate::hooks::HookResult::Continue(())
+            }
+        }
+    }
+
+    async fn assert_interrupted_summary_preparation_does_not_admit(cancel: bool) {
+        let token = tokio_util::sync::CancellationToken::new();
+        let provider_calls = Arc::new(AtomicUsize::new(0));
+        let provider = CountingUsageProvider {
+            calls: Arc::clone(&provider_calls),
+        };
+        let hook_calls = Arc::new(AtomicUsize::new(0));
+        let mut hooks = crate::hooks::HookRunner::new();
+        hooks.register(Box::new(SummaryPreparationHook {
+            calls: Arc::clone(&hook_calls),
+            pending: true,
+            cancel: cancel.then(|| token.clone()),
+        }));
+        let accountant = Arc::new(SummaryAccounting::default());
+        let accounting: Arc<dyn zeroclaw_goal::accounting::GoalOperationAccounting> =
+            accountant.clone();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            zeroclaw_goal::accounting::GOAL_OPERATION_ACCOUNTING.scope(
+                Some(accounting),
+                run_controlled_summary_with_hooks(
+                    &provider,
+                    cancel.then_some(&token),
+                    None,
+                    Some(&hooks),
+                ),
+            ),
+        )
+        .await
+        .expect("summary preparation must not remain stuck");
+        let error = result.expect_err("interrupted preparation must stop the summary");
+        if cancel {
+            assert!(error.downcast_ref::<super::ToolLoopCancelled>().is_some());
+        } else {
+            assert_eq!(
+                zeroclaw_api::turn_stop::turn_stop(&error).unwrap().code,
+                zeroclaw_api::turn_stop::TurnStopCode::MaxIterations
+            );
+            assert!(error.to_string().contains("step_timeout_secs"));
+        }
+        assert_eq!(hook_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(accountant.admissions.load(Ordering::SeqCst), 0);
+        assert_eq!(accountant.releases.load(Ordering::SeqCst), 0);
+        assert!(accountant.settlements.lock().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn graceful_summary_preparation_timeout_does_not_admit_goal() {
+        assert_interrupted_summary_preparation_does_not_admit(false).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn graceful_summary_preparation_cancellation_does_not_admit_goal() {
+        assert_interrupted_summary_preparation_does_not_admit(true).await;
+    }
+
+    #[tokio::test]
+    async fn graceful_summary_preparation_completed_admits_goal() {
+        let provider_calls = Arc::new(AtomicUsize::new(0));
+        let provider = CountingUsageProvider {
+            calls: Arc::clone(&provider_calls),
+        };
+        let hook_calls = Arc::new(AtomicUsize::new(0));
+        let mut hooks = crate::hooks::HookRunner::new();
+        hooks.register(Box::new(SummaryPreparationHook {
+            calls: Arc::clone(&hook_calls),
+            pending: false,
+            cancel: None,
+        }));
+        let accountant = Arc::new(SummaryAccounting::default());
+        let accounting: Arc<dyn zeroclaw_goal::accounting::GoalOperationAccounting> =
+            accountant.clone();
+        let result = zeroclaw_goal::accounting::GOAL_OPERATION_ACCOUNTING
+            .scope(
+                Some(accounting),
+                run_controlled_summary_with_hooks(&provider, None, None, Some(&hooks)),
+            )
+            .await
+            .expect("completed preparation must allow the summary");
+        assert!(result.contains("wrap-up summary"));
+        assert_eq!(hook_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(accountant.admissions.load(Ordering::SeqCst), 1);
+        assert_eq!(accountant.releases.load(Ordering::SeqCst), 0);
+        assert_eq!(accountant.settlements.lock().len(), 1);
+    }
+
+    async fn assert_interrupted_summary_settles(cancel: bool) {
+        let token = tokio_util::sync::CancellationToken::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = zeroclaw_providers::reliable::ReliableModelProvider::new(
+            "reliable",
+            vec![(
+                "primary".to_string(),
+                Box::new(InterruptedSummaryProvider {
+                    calls: Arc::clone(&calls),
+                    cancel_on_second: cancel.then(|| token.clone()),
+                }),
+            )],
+            1,
+            50,
+        );
+        let accountant = Arc::new(SummaryAccounting::default());
+        let accounting: Arc<dyn zeroclaw_goal::accounting::GoalOperationAccounting> =
+            accountant.clone();
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(16);
+        let result = zeroclaw_goal::accounting::GOAL_OPERATION_ACCOUNTING
+            .scope(
+                Some(accounting),
+                run_controlled_summary(&provider, cancel.then_some(&token), Some(&event_tx)),
+            )
+            .await;
+        assert!(result.is_err(), "interruption must stop the summary");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(accountant.admissions.load(Ordering::SeqCst), 1);
+        assert_eq!(accountant.releases.load(Ordering::SeqCst), 0);
+        let settlements = accountant.settlements.lock();
+        assert_eq!(settlements.len(), 1, "the admitted operation must settle");
+        assert_eq!(
+            settlements[0].accounting_state,
+            zeroclaw_goal::task::GoalAccountingState::OutcomeUnknown
+        );
+        assert_eq!(settlements[0].events.len(), 1);
+        assert_eq!(settlements[0].events[0].usage.input_tokens, Some(80));
+        assert_eq!(settlements[0].events[0].usage.output_tokens, Some(5));
+        drop(settlements);
+        let mut usage_events = 0;
+        while let Ok(event) = event_rx.try_recv() {
+            if let TurnEvent::Usage {
+                input_tokens: Some(80),
+                output_tokens: Some(5),
+                accepted: false,
+                ..
+            } = event
+            {
+                usage_events += 1;
+            }
+        }
+        assert_eq!(
+            usage_events, 1,
+            "known usage must reach the event sink once"
+        );
+    }
+
+    #[tokio::test]
+    async fn graceful_summary_cancellation_settles_prior_attempt_usage() {
+        assert_interrupted_summary_settles(true).await;
+    }
+
+    #[tokio::test]
+    async fn graceful_summary_timeout_settles_prior_attempt_usage() {
+        assert_interrupted_summary_settles(false).await;
+    }
+
+    async fn assert_ordinary_interrupted_summary_is_not_settled(cancel: bool) {
+        let directory = tempfile::TempDir::new().unwrap();
+        let tracker = Arc::new(
+            crate::cost::CostTracker::new(
+                CostConfig {
+                    enabled: true,
+                    ..CostConfig::default()
+                },
+                directory.path(),
+            )
+            .unwrap(),
+        );
+        let pricing = Arc::new(HashMap::from([(
+            "primary".to_owned(),
+            HashMap::from([
+                ("test-model.input".to_owned(), 1.0),
+                ("test-model.output".to_owned(), 2.0),
+            ]),
+        )]));
+        let context = ToolLoopCostTrackingContext::new(Arc::clone(&tracker), pricing);
+        let turn_usage = Arc::clone(&context.turn_usage);
+        let token = tokio_util::sync::CancellationToken::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = zeroclaw_providers::reliable::ReliableModelProvider::new(
+            "reliable",
+            vec![(
+                "primary".to_owned(),
+                Box::new(InterruptedSummaryProvider {
+                    calls: Arc::clone(&calls),
+                    cancel_on_second: cancel.then(|| token.clone()),
+                }),
+            )],
+            1,
+            50,
+        );
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(16);
+        let result = TOOL_LOOP_COST_TRACKING_CONTEXT
+            .scope(
+                Some(context),
+                run_controlled_summary(&provider, cancel.then_some(&token), Some(&event_tx)),
+            )
+            .await;
+        assert!(result.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        let usage = *turn_usage.lock();
+        assert_eq!((usage.input_tokens, usage.output_tokens), (0, 0));
+        assert_eq!(
+            tracker
+                .get_summary_in_bounds(None, None)
+                .unwrap()
+                .request_count,
+            0
+        );
+        while let Ok(event) = event_rx.try_recv() {
+            assert!(!matches!(event, TurnEvent::Usage { .. }));
+        }
+    }
+
+    #[tokio::test]
+    async fn graceful_summary_ordinary_cancel_does_not_settle_interrupted_attempts() {
+        assert_ordinary_interrupted_summary_is_not_settled(true).await;
+    }
+
+    #[tokio::test]
+    async fn graceful_summary_ordinary_timeout_does_not_settle_interrupted_attempts() {
+        assert_ordinary_interrupted_summary_is_not_settled(false).await;
+    }
+
+    struct FailingSummaryProvider;
+
+    #[async_trait]
+    impl ModelProvider for FailingSummaryProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("upstream exploded: detail-7")
+        }
+    }
+
+    impl Attributable for FailingSummaryProvider {
+        fn role(&self) -> Role {
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+        }
+
+        fn alias(&self) -> &str {
+            "failing-summary-provider"
+        }
+    }
+
+    #[tokio::test]
+    async fn graceful_summary_ordinary_failure_keeps_limit_as_display() {
+        let error = run_summary(&FailingSummaryProvider).await.unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            CompletionLimit::LocalIterations(2).explanation()
+        );
+        assert_eq!(
+            format!("{error:#}")
+                .matches("upstream exploded: detail-7")
+                .count(),
+            1
+        );
+        assert_eq!(
+            zeroclaw_api::turn_stop::turn_stop(&error).unwrap().code,
+            zeroclaw_api::turn_stop::TurnStopCode::MaxIterations
+        );
+    }
+
+    #[tokio::test]
+    async fn graceful_summary_goal_plain_failure_keeps_limit_as_display() {
+        let accountant = Arc::new(SummaryAccounting::default());
+        let accounting: Arc<dyn zeroclaw_goal::accounting::GoalOperationAccounting> =
+            accountant.clone();
+        let error = zeroclaw_goal::accounting::GOAL_OPERATION_ACCOUNTING
+            .scope(Some(accounting), run_summary(&FailingSummaryProvider))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            CompletionLimit::LocalIterations(2).explanation()
+        );
+        assert_eq!(
+            format!("{error:#}")
+                .matches("upstream exploded: detail-7")
+                .count(),
+            1
+        );
+        assert_eq!(accountant.settlements.lock().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn graceful_summary_cancellation_during_admission_releases_without_dispatch() {
+        let token = tokio_util::sync::CancellationToken::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = CountingUsageProvider {
+            calls: Arc::clone(&calls),
+        };
+        let accountant = Arc::new(SummaryAccounting {
+            cancel_on_admit: Some(token.clone()),
+            ..SummaryAccounting::default()
+        });
+        let accounting: Arc<dyn zeroclaw_goal::accounting::GoalOperationAccounting> =
+            accountant.clone();
+        let error = zeroclaw_goal::accounting::GOAL_OPERATION_ACCOUNTING
+            .scope(
+                Some(accounting),
+                run_controlled_summary(&provider, Some(&token), None),
+            )
+            .await
+            .expect_err("cancellation must stop the summary");
+        assert!(error.downcast_ref::<super::ToolLoopCancelled>().is_some());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(accountant.admissions.load(Ordering::SeqCst), 1);
+        assert_eq!(accountant.releases.load(Ordering::SeqCst), 1);
+        assert!(accountant.settlements.lock().is_empty());
+    }
+
+    async fn assert_real_goal_interruption_settles(cancel: bool) {
+        use zeroclaw_api::task::{TaskKind, TaskRecord, TaskStatus};
+        use zeroclaw_goal::accounting::GoalOperationAccountingFactory;
+        use zeroclaw_goal::{
+            GoalAccountingState, GoalExecutionScope, GoalTaskRecord, GoalTaskRegistry,
+            GoalTransitionResult,
+        };
+
+        let store = Arc::new(crate::control_plane::SqliteTaskStore::new_in_memory().unwrap());
+        let scope = GoalExecutionScope::new("summary-goal", "summary-session", 1).unwrap();
+        let task = TaskRecord {
+            id: scope.task_id().to_owned(),
+            kind: TaskKind::Goal,
+            agent: "main".to_owned(),
+            status: TaskStatus::Running,
+            owner_pid: 1,
+            owner_boot_id: "test-boot".to_owned(),
+            heartbeat_at: None,
+            depth: 0,
+            parent_id: None,
+            originator_route: None,
+            originator_chain: Vec::new(),
+            delivered: false,
+            idem_key: None,
+            principal_id: Some("test-principal".to_owned()),
+            session_id: Some(scope.session_id().to_owned()),
+            execution_epoch: 1,
+            started_at: "2026-01-01T00:00:00Z".to_owned(),
+            finished_at: None,
+        };
+        let goal = GoalTaskRecord {
+            task_id: task.id.clone(),
+            objective: "finish the work".to_owned(),
+            ..GoalTaskRecord::default()
+        };
+        assert_eq!(
+            store
+                .create_or_replace_session_goal(task, goal)
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+        let directory = tempfile::TempDir::new().unwrap();
+        let tracker = Arc::new(
+            crate::cost::CostTracker::new(
+                CostConfig {
+                    enabled: false,
+                    ..CostConfig::default()
+                },
+                directory.path(),
+            )
+            .unwrap(),
+        );
+        let pricing = Arc::new(HashMap::from([(
+            "primary".to_owned(),
+            HashMap::from([
+                ("test-model.input".to_owned(), 1.0),
+                ("test-model.output".to_owned(), 2.0),
+            ]),
+        )]));
+        let pricer = Arc::new(crate::goal_accounting::ModelProviderGoalUsagePricer::new(
+            Arc::clone(&pricing),
+        ));
+        let factory = crate::goal_accounting::RuntimeGoalOperationAccountingFactory::new(
+            store.clone(),
+            Arc::clone(&tracker),
+            "main",
+            pricer,
+        )
+        .unwrap();
+        let accountant = factory.for_scope(scope.clone());
+        let context = ToolLoopCostTrackingContext::new(Arc::clone(&tracker), pricing);
+        let token = tokio_util::sync::CancellationToken::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = zeroclaw_providers::reliable::ReliableModelProvider::new(
+            "reliable",
+            vec![(
+                "primary".to_owned(),
+                Box::new(InterruptedSummaryProvider {
+                    calls: Arc::clone(&calls),
+                    cancel_on_second: cancel.then(|| token.clone()),
+                }),
+            )],
+            1,
+            50,
+        );
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(16);
+        let error = zeroclaw_goal::accounting::GOAL_OPERATION_ACCOUNTING
+            .scope(
+                Some(Arc::clone(&accountant)),
+                TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
+                    Some(context),
+                    run_controlled_summary(&provider, cancel.then_some(&token), Some(&event_tx)),
+                ),
+            )
+            .await
+            .expect_err("the in-flight summary was cancelled");
+        let accounting_failure = error
+            .downcast_ref::<zeroclaw_goal::accounting::GoalAccountingFailure>()
+            .expect("interruption with unknown usage must retain its accounting failure");
+        assert_eq!(
+            accounting_failure.accounting_state(),
+            GoalAccountingState::OutcomeUnknown
+        );
+        if cancel {
+            assert!(error.chain().any(|cause| matches!(
+                cause.downcast_ref::<super::ModelQueryInterruption>(),
+                Some(super::ModelQueryInterruption::Cancelled)
+            )));
+        } else {
+            assert!(
+                zeroclaw_api::turn_stop::turn_stop(&error)
+                    .expect("timed out summary retains its typed stop")
+                    .to_string()
+                    .contains("Final summary LLM call timed out")
+            );
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            tracker
+                .get_strict_usage_totals_for_task_with_pricing(scope.task_id())
+                .unwrap()
+                .0,
+            85,
+            "the rejected attempt is written once to the canonical ledger"
+        );
+        let goal = store.get_goal_task(scope.task_id()).await.unwrap().unwrap();
+        assert_eq!(goal.accounting_state, GoalAccountingState::OutcomeUnknown);
+        assert!(goal.pending_call_id.is_none());
+        assert!(goal.pending_call_epoch.is_none());
+        assert!(
+            accountant
+                .admit(zeroclaw_goal::accounting::GoalOperationRequest::new(
+                    "primary",
+                    "test-model",
+                ))
+                .await
+                .is_err(),
+            "unknown accounting must fence a successor call"
+        );
+        let mut usage_events = 0;
+        while let Ok(event) = event_rx.try_recv() {
+            if let TurnEvent::Usage {
+                input_tokens: Some(80),
+                output_tokens: Some(5),
+                accepted: false,
+                ..
+            } = event
+            {
+                usage_events += 1;
+            }
+        }
+        assert_eq!(usage_events, 1);
+    }
+
+    #[tokio::test]
+    async fn graceful_summary_cancel_settles_real_goal_ledger_and_fence() {
+        assert_real_goal_interruption_settles(true).await;
+    }
+
+    #[tokio::test]
+    async fn graceful_summary_timeout_settles_real_goal_ledger_and_fence() {
+        assert_real_goal_interruption_settles(false).await;
+    }
+
+    #[tokio::test]
+    async fn graceful_summary_settlement_failure_preserves_usage_and_error() {
+        let token = tokio_util::sync::CancellationToken::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = zeroclaw_providers::reliable::ReliableModelProvider::new(
+            "reliable",
+            vec![(
+                "primary".to_owned(),
+                Box::new(InterruptedSummaryProvider {
+                    calls: Arc::clone(&calls),
+                    cancel_on_second: Some(token.clone()),
+                }),
+            )],
+            1,
+            50,
+        );
+        let accountant = Arc::new(SummaryAccounting {
+            fail_settlement: true,
+            ..SummaryAccounting::default()
+        });
+        let accounting: Arc<dyn zeroclaw_goal::accounting::GoalOperationAccounting> =
+            accountant.clone();
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(16);
+        let error = zeroclaw_goal::accounting::GOAL_OPERATION_ACCOUNTING
+            .scope(
+                Some(accounting),
+                run_controlled_summary(&provider, Some(&token), Some(&event_tx)),
+            )
+            .await
+            .expect_err("settlement failure must reach the caller");
+        let chain = format!("{error:#}");
+        assert!(chain.contains("fixture settlement failed"));
+        assert!(chain.contains("model query cancelled"));
+        assert!(error.to_string().contains("fixture settlement failed"));
+        assert!(error.to_string().contains("model query cancelled"));
+        assert_eq!(
+            error
+                .to_string()
+                .matches("fixture settlement failed")
+                .count(),
+            1
+        );
+        assert_eq!(
+            error.to_string().matches("model query cancelled").count(),
+            1
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(accountant.settlements.lock().len(), 1);
+        let mut usage_events = 0;
+        while let Ok(event) = event_rx.try_recv() {
+            if let TurnEvent::Usage {
+                input_tokens: Some(80),
+                output_tokens: Some(5),
+                accepted: false,
+                ..
+            } = event
+            {
+                usage_events += 1;
+            }
+        }
+        assert_eq!(usage_events, 1);
+    }
+
+    #[tokio::test]
+    async fn graceful_summary_success_with_settlement_failure_still_projects_usage() {
+        let provider = CountingUsageProvider {
+            calls: Arc::new(AtomicUsize::new(0)),
+        };
+        let accounting: Arc<dyn zeroclaw_goal::accounting::GoalOperationAccounting> =
+            Arc::new(SummaryAccounting {
+                fail_settlement: true,
+                ..SummaryAccounting::default()
+            });
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(16);
+        let error = zeroclaw_goal::accounting::GOAL_OPERATION_ACCOUNTING
+            .scope(
+                Some(accounting),
+                run_controlled_summary(&provider, None, Some(&event_tx)),
+            )
+            .await
+            .expect_err("failed settlement must still fail the summary");
+        assert!(format!("{error:#}").contains("fixture settlement failed"));
+        let mut usage_events = 0;
+        while let Ok(event) = event_rx.try_recv() {
+            if let TurnEvent::Usage {
+                input_tokens: Some(100),
+                output_tokens: Some(20),
+                accepted: true,
+                ..
+            } = event
+            {
+                usage_events += 1;
+            }
+        }
+        assert_eq!(usage_events, 1);
+    }
+
     // The graceful summary now routes through the metered provider seam: under a
     // cost-tracking scope its token usage is recorded (before this change the
     // summary recorded nothing).
@@ -892,6 +1945,470 @@ mod graceful_summary_metering_tests {
         fn alias(&self) -> &str {
             "semantic-empty-summary-provider"
         }
+    }
+
+    struct FailingSummaryAccounting;
+    #[async_trait]
+    impl zeroclaw_goal::accounting::GoalOperationAccounting for FailingSummaryAccounting {
+        fn admission_guard(&self) -> anyhow::Result<zeroclaw_goal::accounting::GoalOperationGuard> {
+            Ok(zeroclaw_goal::accounting::GoalOperationGuard::new(()))
+        }
+
+        async fn begin_dispatch(&self) -> anyhow::Result<zeroclaw_goal::task::GoalDispatchStart> {
+            Ok(zeroclaw_goal::task::GoalDispatchStart::new(
+                Arc::new(tokio::sync::Mutex::new(())).lock_owned().await,
+            ))
+        }
+
+        async fn release_unstarted(&self) -> anyhow::Result<()> {
+            anyhow::bail!("fixture unexpectedly released an unstarted operation")
+        }
+
+        async fn admit(
+            &self,
+            _: zeroclaw_goal::accounting::GoalOperationRequest,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn settle(
+            &self,
+            _: zeroclaw_goal::accounting::GoalOperationSettlement,
+        ) -> anyhow::Result<()> {
+            Err(zeroclaw_goal::accounting::GoalAccountingFailure::settled(
+                zeroclaw_goal::GoalAccountingState::OutcomeUnknown,
+                &["summary secondary detail".into()],
+            )
+            .into())
+        }
+        async fn pricing_complete(&self) -> anyhow::Result<bool> {
+            Ok(true)
+        }
+    }
+
+    struct RefusedSummaryAccounting {
+        admits: Arc<AtomicUsize>,
+        settlements: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl zeroclaw_goal::accounting::GoalOperationAccounting for RefusedSummaryAccounting {
+        fn admission_guard(&self) -> anyhow::Result<zeroclaw_goal::accounting::GoalOperationGuard> {
+            anyhow::bail!("refusal must precede accounting admission")
+        }
+
+        async fn begin_dispatch(&self) -> anyhow::Result<zeroclaw_goal::task::GoalDispatchStart> {
+            anyhow::bail!("refusal must precede provider dispatch")
+        }
+
+        async fn release_unstarted(&self) -> anyhow::Result<()> {
+            anyhow::bail!("fixture unexpectedly released an unstarted operation")
+        }
+
+        async fn admit(
+            &self,
+            _: zeroclaw_goal::accounting::GoalOperationRequest,
+        ) -> anyhow::Result<()> {
+            self.admits.fetch_add(1, Ordering::SeqCst);
+            anyhow::bail!("refused summary unexpectedly reached admission")
+        }
+
+        async fn settle(
+            &self,
+            _: zeroclaw_goal::accounting::GoalOperationSettlement,
+        ) -> anyhow::Result<()> {
+            self.settlements.fetch_add(1, Ordering::SeqCst);
+            anyhow::bail!("refused summary unexpectedly reached settlement")
+        }
+
+        async fn pricing_complete(&self) -> anyhow::Result<bool> {
+            anyhow::bail!("refused summary unexpectedly queried pricing completeness")
+        }
+    }
+
+    #[tokio::test]
+    async fn graceful_summary_preserves_only_goal_checked_admission_budget_stop() {
+        use zeroclaw_api::turn_stop::{TurnStopCode, turn_stop};
+        use zeroclaw_goal::accounting::{GOAL_OPERATION_ACCOUNTING, GoalOrdinarySpendRefusal};
+
+        for goal_scoped in [false, true] {
+            let directory = tempfile::TempDir::new().unwrap();
+            let tracker = Arc::new(
+                crate::cost::CostTracker::new(
+                    CostConfig {
+                        enabled: true,
+                        daily_limit_usd: 1.0,
+                        monthly_limit_usd: 100.0,
+                        ..Default::default()
+                    },
+                    directory.path(),
+                )
+                .unwrap(),
+            );
+            tracker
+                .record_usage(crate::cost::types::TokenUsage::new(
+                    "seed", 1_000_000, 0, 0, 2.0, 0.0, 0.0,
+                ))
+                .unwrap();
+            let ledger_path = directory.path().join("state/costs.jsonl");
+            let before = std::fs::read(&ledger_path).unwrap();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let provider = CountingUsageProvider {
+                calls: Arc::clone(&calls),
+            };
+            let admits = Arc::new(AtomicUsize::new(0));
+            let settlements = Arc::new(AtomicUsize::new(0));
+            let accountant: Arc<dyn zeroclaw_goal::accounting::GoalOperationAccounting> =
+                Arc::new(RefusedSummaryAccounting {
+                    admits: Arc::clone(&admits),
+                    settlements: Arc::clone(&settlements),
+                });
+            let context = ToolLoopCostTrackingContext::new(tracker, Arc::new(HashMap::new()));
+            let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(8);
+            let error = GOAL_OPERATION_ACCOUNTING
+                .scope(
+                    goal_scoped.then_some(accountant),
+                    TOOL_LOOP_COST_TRACKING_CONTEXT.scope(Some(context), async {
+                        run_summary_with_events(
+                            &provider,
+                            "completed prefix".into(),
+                            Some(&event_tx),
+                            None,
+                        )
+                        .await
+                        .unwrap_err()
+                    }),
+                )
+                .await;
+
+            assert_eq!(
+                turn_stop(&error).unwrap().code,
+                if goal_scoped {
+                    TurnStopCode::BudgetExhausted
+                } else {
+                    TurnStopCode::MaxIterations
+                }
+            );
+            let marker = error
+                .chain()
+                .find_map(|cause| cause.downcast_ref::<GoalOrdinarySpendRefusal>());
+            assert_eq!(marker.is_some(), goal_scoped);
+            assert!(marker.is_none_or(GoalOrdinarySpendRefusal::clean_tool_phase));
+            assert!(format!("{error:#}").contains("Agent exceeded maximum tool iterations (2)"));
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            assert_eq!(admits.load(Ordering::SeqCst), 0);
+            assert_eq!(settlements.load(Ordering::SeqCst), 0);
+            assert!(event_rx.try_recv().is_err());
+            assert_eq!(std::fs::read(ledger_path).unwrap(), before);
+        }
+    }
+
+    #[derive(Debug)]
+    struct ForeignSummarySource(anyhow::Error);
+
+    impl std::fmt::Display for ForeignSummarySource {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("foreign summary source")
+        }
+    }
+
+    impl std::error::Error for ForeignSummarySource {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            Some(self.0.as_ref())
+        }
+    }
+
+    #[tokio::test]
+    async fn graceful_summary_refusal_checks_all_native_phase_accounting_and_timeout_evidence() {
+        use zeroclaw_api::turn_stop::{TurnStop, TurnStopCode, tag};
+        use zeroclaw_goal::accounting::{
+            GOAL_OPERATION_ACCOUNTING, GoalAccountingFailure, GoalOrdinarySpendRefusal,
+        };
+
+        let checked = || {
+            anyhow::Error::new(GoalOrdinarySpendRefusal::new(
+                TurnStop::fatal(TurnStopCode::BudgetExhausted, "ordinary budget exhausted").into(),
+                true,
+            ))
+        };
+        assert!(!super::preserve_goal_summary_spend_refusal(
+            &checked(),
+            false
+        ));
+        let accountant: Arc<dyn zeroclaw_goal::accounting::GoalOperationAccounting> =
+            Arc::new(FailingSummaryAccounting);
+        GOAL_OPERATION_ACCOUNTING
+            .scope(Some(accountant), async {
+                let positive =
+                    anyhow::Error::new(ForeignSummarySource(checked())).context("summary context");
+                assert!(super::preserve_goal_summary_spend_refusal(&positive, false));
+                assert!(!super::preserve_goal_summary_spend_refusal(&positive, true));
+                let negative = GoalOrdinarySpendRefusal::new(
+                    TurnStop::fatal(TurnStopCode::BudgetExhausted, "ordinary budget exhausted")
+                        .into(),
+                    false,
+                );
+                let nested = anyhow::Error::new(GoalOrdinarySpendRefusal::new(
+                    anyhow::Error::new(ForeignSummarySource(anyhow::Error::new(negative))),
+                    true,
+                ));
+                assert!(!super::preserve_goal_summary_spend_refusal(&nested, false));
+                let accounting = anyhow::Error::new(ForeignSummarySource(
+                    GoalAccountingFailure::with_operation_source(
+                        zeroclaw_goal::GoalAccountingState::Missing,
+                        true,
+                        checked(),
+                    )
+                    .into(),
+                ));
+                assert!(!super::preserve_goal_summary_spend_refusal(
+                    &accounting,
+                    false
+                ));
+                let context_accounting = checked().context(GoalAccountingFailure::incomplete(
+                    zeroclaw_goal::GoalAccountingState::Invalid,
+                    false,
+                ));
+                assert!(!super::preserve_goal_summary_spend_refusal(
+                    &context_accounting,
+                    false
+                ));
+                for code in [
+                    TurnStopCode::TurnTimeout,
+                    TurnStopCode::StepTimeout,
+                    TurnStopCode::MaxIterations,
+                    TurnStopCode::Cancelled,
+                ] {
+                    let terminal = tag(
+                        checked(),
+                        TurnStop::close_out(code, "decisive terminal stop"),
+                    );
+                    assert!(!super::preserve_goal_summary_spend_refusal(
+                        &terminal, false
+                    ));
+                }
+                for error in [
+                    anyhow::Error::new(TurnStop::fatal(
+                        TurnStopCode::BudgetExhausted,
+                        "ordinary budget exhausted",
+                    )),
+                    anyhow::Error::msg("ordinary budget exhausted"),
+                ] {
+                    assert!(!super::preserve_goal_summary_spend_refusal(&error, false));
+                }
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn graceful_summary_bridges_accounting_metadata_through_stop_wrapper() {
+        let provider = SemanticEmptySummaryProvider;
+        let accountant: Arc<dyn zeroclaw_goal::accounting::GoalOperationAccounting> =
+            Arc::new(FailingSummaryAccounting);
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(8);
+        let error = zeroclaw_goal::accounting::GOAL_OPERATION_ACCOUNTING
+            .scope(Some(accountant), async {
+                run_summary_with_events(&provider, "earlier output".into(), Some(&event_tx), None)
+                    .await
+                    .unwrap_err()
+            })
+            .await;
+        let marker = error
+            .downcast_ref::<zeroclaw_goal::accounting::GoalAccountingFailure>()
+            .unwrap();
+        assert_eq!(
+            marker.accounting_state(),
+            zeroclaw_goal::GoalAccountingState::OutcomeUnknown
+        );
+        assert!(!marker.has_pending_operation());
+        let stop = zeroclaw_api::turn_stop::turn_stop(&error).unwrap();
+        assert_eq!(
+            stop.code,
+            zeroclaw_api::turn_stop::TurnStopCode::MaxIterations
+        );
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.is::<SemanticEmptyTerminalCompletion>())
+        );
+        let text = format!("{error:#}");
+        assert_eq!(text.matches("summary secondary detail").count(), 1);
+        let mut usage = Vec::new();
+        while let Ok(event) = event_rx.try_recv() {
+            if let TurnEvent::Usage {
+                input_tokens,
+                output_tokens,
+                accepted,
+                ..
+            } = event
+            {
+                usage.push((input_tokens, output_tokens, accepted));
+            }
+        }
+        assert_eq!(usage, vec![(Some(100), Some(20), false)]);
+    }
+
+    struct ExhaustedSummaryProvider(Arc<AtomicUsize>);
+
+    #[async_trait]
+    impl ModelProvider for ExhaustedSummaryProvider {
+        async fn chat_with_system(
+            &self,
+            _: Option<&str>,
+            _: &str,
+            _: &str,
+            _: Option<f64>,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("unused")
+        }
+
+        async fn chat(
+            &self,
+            _: ChatRequest<'_>,
+            _: &str,
+            _: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(ChatResponse {
+                text: None,
+                tool_calls: Vec::new(),
+                usage: Some(TokenUsage {
+                    input_tokens: Some(80),
+                    output_tokens: Some(5),
+                    cached_input_tokens: None,
+                    cache_creation_input_tokens: None,
+                }),
+                reasoning_content: None,
+            })
+        }
+    }
+
+    impl Attributable for ExhaustedSummaryProvider {
+        fn role(&self) -> Role {
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+        }
+        fn alias(&self) -> &str {
+            "exhausted-summary-provider"
+        }
+    }
+
+    #[tokio::test]
+    async fn graceful_summary_preserves_exhausted_provider_error_and_rejected_usage() {
+        use zeroclaw_api::turn_stop::{TurnStopClass, TurnStopCode};
+        use zeroclaw_providers::ReliableRejectedCompletionUsage;
+        use zeroclaw_providers::reliable::ReliableModelProvider;
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = ReliableModelProvider::new(
+            "reliable",
+            vec![(
+                "primary".into(),
+                Box::new(ExhaustedSummaryProvider(calls.clone())) as Box<dyn ModelProvider>,
+            )],
+            0,
+            1,
+        );
+        let accountant: Arc<dyn zeroclaw_goal::accounting::GoalOperationAccounting> =
+            Arc::new(FailingSummaryAccounting);
+        let mut history = vec![
+            ChatMessage::user("do the work"),
+            ChatMessage::assistant("earlier output"),
+        ];
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(8);
+        let (delta_tx, mut delta_rx) = tokio::sync::mpsc::channel(8);
+        let error = zeroclaw_goal::accounting::GOAL_OPERATION_ACCOUNTING
+            .scope(Some(accountant), async {
+                finish_after_max_iterations(
+                    &mut None,
+                    &provider,
+                    &mut history,
+                    "reliable",
+                    "test-model",
+                    "test-model",
+                    None,
+                    &PacingConfig::default(),
+                    None,
+                    CompletionLimit::LocalIterations(2),
+                    "earlier output".into(),
+                    "trace-req-test",
+                    &LoopKnobs::default(),
+                    Some(&event_tx),
+                    Some(&delta_tx),
+                    None,
+                    None,
+                    &MultimodalConfig::default(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    |_, _| ResolvedContextLimits::legacy_fallback(0),
+                    &mut false,
+                    None,
+                    &crate::observability::NoopObserver,
+                    None,
+                )
+                .await
+                .unwrap_err()
+            })
+            .await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.is::<ReliableRejectedCompletionUsage>())
+        );
+        let marker = error
+            .downcast_ref::<zeroclaw_goal::accounting::GoalAccountingFailure>()
+            .unwrap();
+        assert_eq!(
+            marker.accounting_state(),
+            zeroclaw_goal::GoalAccountingState::OutcomeUnknown
+        );
+        assert!(!marker.has_pending_operation());
+        let stop = zeroclaw_api::turn_stop::turn_stop(&error).unwrap();
+        assert_eq!(
+            (stop.class, stop.code),
+            (TurnStopClass::CloseOut, TurnStopCode::MaxIterations)
+        );
+        assert_eq!(
+            format!("{error:#}")
+                .matches("summary secondary detail")
+                .count(),
+            1
+        );
+        assert_eq!(history.len(), 2);
+        assert_eq!(
+            (&*history[0].role, &*history[0].content),
+            ("user", "do the work")
+        );
+        assert_eq!(
+            (&*history[1].role, &*history[1].content),
+            ("assistant", "earlier output")
+        );
+        assert!(delta_rx.try_recv().is_err());
+        let mut usage = Vec::new();
+        while let Ok(event) = event_rx.try_recv() {
+            if let TurnEvent::Usage {
+                input_tokens,
+                output_tokens,
+                provider_ref,
+                model,
+                accepted,
+                ..
+            } = event
+            {
+                usage.push((input_tokens, output_tokens, provider_ref, model, accepted));
+            }
+        }
+        assert_eq!(
+            usage,
+            vec![(
+                Some(80),
+                Some(5),
+                "primary".into(),
+                "test-model".into(),
+                false
+            )]
+        );
     }
 
     #[tokio::test]

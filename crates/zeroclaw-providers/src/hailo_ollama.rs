@@ -193,6 +193,13 @@ struct MessageCandidate {
     content: String,
 }
 
+// The wire worker observes the response; the joined caller owns accounting.
+#[derive(Default)]
+struct HailoWireObservation {
+    reported: Option<crate::dispatch::AttemptUsageOutcome>,
+    completed_rejection: bool,
+}
+
 /// Native Hailo-Ollama provider.
 ///
 /// The provider owns Hailo-specific URL validation, transport policy, message
@@ -990,6 +997,7 @@ impl HailoOllamaModelProvider {
         messages: &[Message],
         model: &str,
         temperature: Option<f64>,
+        usage_observation: Option<&mut HailoWireObservation>,
     ) -> anyhow::Result<ApiChatResponse> {
         let request = self.build_request(messages.to_vec(), model, temperature);
         ::zeroclaw_log::record!(
@@ -1019,6 +1027,13 @@ impl HailoOllamaModelProvider {
         let body = response.bytes().await?;
 
         if !status.is_success() {
+            if let Some(observation) = usage_observation {
+                observation.reported = serde_json::from_slice(&body)
+                    .ok()
+                    .as_ref()
+                    .and_then(ApiChatResponse::rejected_string_usage);
+                observation.completed_rejection = true;
+            }
             let raw = String::from_utf8_lossy(&body);
             let sanitized = self.sanitize_response_body(&raw);
             ::zeroclaw_log::record!(
@@ -1041,7 +1056,24 @@ impl HailoOllamaModelProvider {
             );
         }
 
-        let parsed: ApiChatResponse = serde_json::from_slice(&body).map_err(|error| {
+        let parsed = serde_json::from_slice::<ApiChatResponse>(&body);
+        if let Some(observation) = usage_observation {
+            observation.reported = match &parsed {
+                Ok(response) => Some(crate::dispatch::accounting::classify_usage(Some(
+                    TokenUsage {
+                        input_tokens: response.prompt_eval_count,
+                        output_tokens: response.eval_count,
+                        cached_input_tokens: None,
+                        cache_creation_input_tokens: None,
+                    },
+                ))),
+                Err(_) => serde_json::from_slice(&body)
+                    .ok()
+                    .as_ref()
+                    .and_then(ApiChatResponse::rejected_string_usage),
+            };
+        }
+        let parsed = parsed.map_err(|error| {
             let raw = String::from_utf8_lossy(&body);
             let sanitized = self.sanitize_response_body(&raw);
             ::zeroclaw_log::record!(
@@ -1152,11 +1184,18 @@ impl HailoOllamaModelProvider {
         let provider = self.clone();
         let model = model.to_string();
         let worker_gate = gate.clone();
+        let capture_usage = crate::dispatch::accounting::string_usage_observation_enabled();
         let worker = zeroclaw_spawn::spawn!(async move {
             let _permit = permit;
             let mut in_flight = InFlightGuard::new(worker_gate);
+            let mut observation = HailoWireObservation::default();
             let result = provider
-                .send_request_inner(&messages, &model, temperature)
+                .send_request_inner(
+                    &messages,
+                    &model,
+                    temperature,
+                    capture_usage.then_some(&mut observation),
+                )
                 .await;
             if let Err(error) = &result
                 && let Some(reason) = Self::quarantine_reason(error)
@@ -1165,12 +1204,18 @@ impl HailoOllamaModelProvider {
             } else {
                 in_flight.disarm();
             }
-            result
+            (result, observation)
         });
 
-        let result = worker
+        let (result, observation) = worker
             .await
             .map_err(|error| self.request_worker_failure(&gate, &error))?;
+        if let Some(reported) = observation.reported {
+            crate::dispatch::accounting::observe_string_outcome(reported);
+        }
+        if observation.completed_rejection {
+            crate::dispatch::accounting::finish_current_string_attempt_after_completed_response();
+        }
         result.map_err(|error| self.redact_transport_error(error))
     }
 
@@ -1373,6 +1418,114 @@ impl Attributable for HailoOllamaModelProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn goal_string_usage_preserves_hailo_request_and_text() {
+        use axum::{Json, Router, routing::post};
+        use std::sync::Mutex;
+        let captured = Arc::new(Mutex::new(None));
+        let capture = Arc::clone(&captured);
+        let app = Router::new().route("/api/chat", post(move |Json(body): Json<serde_json::Value>| {
+            let capture = Arc::clone(&capture);
+            async move {
+                let input = if body["messages"][0]["content"].as_str().is_some_and(|text| text.contains("malformed")) {
+                    serde_json::json!(-1)
+                } else {
+                    serde_json::json!(8)
+                };
+                let rejects = body["messages"][0]["content"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("billed rejection"));
+                *capture.lock().unwrap() = Some(body);
+                if rejects {
+                    (axum::http::StatusCode::TOO_MANY_REQUESTS, Json(serde_json::json!({
+                        "error":"fixture rejection","prompt_eval_count":input,"eval_count":3
+                    })))
+                } else {
+                    (axum::http::StatusCode::OK, Json(serde_json::json!({"message":{"role":"assistant","content":"ok"},"done":true,"prompt_eval_count":input,"eval_count":3})))
+                }
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let server = scopeguard::guard(server, |server| server.abort());
+        let provider =
+            HailoOllamaModelProvider::new("edge", Some(&url), 90, 5, OllamaTuning::default())
+                .unwrap();
+        let dispatch = crate::dispatch::ProviderDispatch::new(Arc::new(provider));
+        let scope = crate::dispatch::AccountedChatScope::new_with_string_usage();
+        let text = scope
+            .scope(dispatch.chat_with_system(Some("system"), "hello", "edge-model", Some(0.4)))
+            .await
+            .unwrap();
+        let report = scope.take();
+        assert_eq!(text, "ok");
+        assert!(
+            matches!(report.attempts()[0].outcome(), crate::dispatch::AttemptUsageOutcome::Complete(usage)
+            if usage.input_tokens == Some(8) && usage.output_tokens == Some(3))
+        );
+        let body = captured.lock().unwrap().take().unwrap();
+        assert_eq!(body["model"], "edge-model");
+        // Preserve Hailo's existing native-prompt folding, not the generic
+        // Ollama wire shape: its backend receives one user-anchored message.
+        assert_eq!(body["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(body["messages"][0]["role"], "user");
+        assert_eq!(
+            body["messages"][0]["content"],
+            "Instructions: system Request: hello"
+        );
+        assert_eq!(body["options"]["temperature"], 0.4);
+
+        let scope = crate::dispatch::AccountedChatScope::new_with_string_usage();
+        let error = scope
+            .scope(dispatch.chat_with_system(
+                Some("system"),
+                "billed rejection",
+                "edge-model",
+                None,
+            ))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("fixture rejection"), "{error:#}");
+        let report = scope.take();
+        let [attempt] = report.attempts() else {
+            panic!("expected exactly one wire request");
+        };
+        assert!(matches!(
+            attempt.outcome(),
+            crate::dispatch::AttemptUsageOutcome::Complete(usage)
+                if (usage.input_tokens, usage.output_tokens) == (Some(8), Some(3))
+        ));
+        assert_eq!(report.rejected_attempts().len(), 1);
+        assert!(report.accepted_route().is_none());
+
+        let scope = crate::dispatch::AccountedChatScope::new_with_string_usage();
+        assert!(
+            scope
+                .scope(dispatch.chat_with_system(
+                    Some("system"),
+                    "malformed",
+                    "edge-model",
+                    Some(0.4)
+                ))
+                .await
+                .is_err()
+        );
+        let report = scope.take();
+        assert!(report.accepted_route().is_none());
+        assert!(matches!(
+            report.attempts()[0].outcome(),
+            crate::dispatch::AttemptUsageOutcome::Invalid {
+                observed: usage, reason: crate::dispatch::InvalidUsageReason::MalformedUsage,
+            } if usage.input_tokens.is_none() && usage.output_tokens == Some(3)
+        ));
+        let server = scopeguard::ScopeGuard::into_inner(server);
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
+    }
 
     #[test]
     fn constructor_normalizes_request_and_gate_url_identity() {
