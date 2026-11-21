@@ -68,8 +68,19 @@ const DEFAULT_DISPATCH_RATE_PER_MIN: u32 = 30;
 /// that a mutually recursive pair of plugins cannot spin.
 const MAX_PLUGIN_WAKE_DEPTH: u32 = 2;
 
-const WAKE_SETTLEMENT_RETRY_DELAY: Duration = Duration::from_millis(25);
-const WAKE_SETTLEMENT_MAX_RETRY_DELAY: Duration = Duration::from_secs(5);
+/// First delay before retrying a durable task-store write (registration or
+/// settlement); doubles per consecutive failure up to
+/// [`WAKE_STORE_MAX_RETRY_DELAY`].
+const WAKE_STORE_RETRY_DELAY: Duration = Duration::from_millis(25);
+const WAKE_STORE_MAX_RETRY_DELAY: Duration = Duration::from_secs(5);
+
+/// Backoff before the next attempt after `failures` consecutive store failures.
+fn wake_store_retry_delay(failures: u32) -> Duration {
+    let multiplier = 1_u32 << failures.saturating_sub(1).min(8);
+    WAKE_STORE_RETRY_DELAY
+        .saturating_mul(multiplier)
+        .min(WAKE_STORE_MAX_RETRY_DELAY)
+}
 
 /// One coalesced wake that has not started yet.
 ///
@@ -653,12 +664,17 @@ impl AgentWakeBackend for RuntimeAgentWakeBackend {
                 settle_wake_task(&task_store, &plan.task, &result).await;
 
                 // Drain wakes that coalesced while this turn ran until one is
-                // ready to run. A follow-up that cannot run (grant revoked,
-                // target disabled, re-admission or registration failed) is
-                // skipped, never the slot: wakes that coalesced while it was
-                // being prepared stay pending and are drained next. The slot is
+                // ready to run. A follow-up the operator no longer permits
+                // (grant revoked, target disabled or removed, re-admission
+                // refused) is cancelled, never the slot: wakes that coalesced
+                // while it was being prepared stay pending and are drained
+                // next. A follow-up whose durable registration fails is not
+                // cancelled: its caller was already told the wake was accepted,
+                // so it goes back to `pending` and is retried after a backoff,
+                // re-passing every live check above first. The slot is
                 // released only here, under the lock, when nothing is pending,
                 // so no accepted wake is dropped with it.
+                let mut registration_failures = 0_u32;
                 plan = 'drain: loop {
                     let next = {
                         let mut slots = coordinator.slots.lock();
@@ -806,20 +822,41 @@ impl AgentWakeBackend for RuntimeAgentWakeBackend {
                     {
                         Ok(task) => task,
                         Err(error) => {
-                            ::zeroclaw_log::record!(
-                                WARN,
-                                ::zeroclaw_log::Event::new(
-                                    module_path!(),
-                                    ::zeroclaw_log::Action::Reject
-                                )
-                                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                                .with_attrs(::serde_json::json!({
-                                    "plugin": package,
-                                    "agent": spawn_canonical,
-                                    "error": format!("{error:#}"),
-                                })),
-                                "coalesced plugin wake registration failed"
-                            );
+                            registration_failures = registration_failures.saturating_add(1);
+                            if registration_failures == 1 || registration_failures.is_power_of_two()
+                            {
+                                ::zeroclaw_log::record!(
+                                    WARN,
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Reject
+                                    )
+                                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                    .with_attrs(
+                                        ::serde_json::json!({
+                                            "plugin": package,
+                                            "agent": spawn_canonical,
+                                            "attempt": registration_failures,
+                                            "error": format!("{error:#}"),
+                                        })
+                                    ),
+                                    "coalesced plugin wake registration failed; will retry"
+                                );
+                            }
+                            // Release any generation lease before waiting so
+                            // the retry cannot hold up a reload.
+                            drop(admission);
+                            // Requeue under the lock. A newer wake that
+                            // coalesced meanwhile already replaced this one,
+                            // exactly as it would have had this one still been
+                            // pending, and shares its reservation.
+                            if let Some(WakeSlotState::Running { pending }) =
+                                coordinator.slots.lock().get_mut(&spawn_key)
+                                && pending.is_none()
+                            {
+                                *pending = Some(Box::new(next));
+                            }
+                            tokio::time::sleep(wake_store_retry_delay(registration_failures)).await;
                             continue 'drain;
                         }
                     };
@@ -984,11 +1021,7 @@ async fn settle_wake_task(
             }
         }
 
-        let multiplier = 1_u32 << failures.saturating_sub(1).min(8);
-        let delay = WAKE_SETTLEMENT_RETRY_DELAY
-            .saturating_mul(multiplier)
-            .min(WAKE_SETTLEMENT_MAX_RETRY_DELAY);
-        tokio::time::sleep(delay).await;
+        tokio::time::sleep(wake_store_retry_delay(failures)).await;
     }
 }
 
@@ -2561,7 +2594,10 @@ mod tests {
 
     /// The worker's own follow-up registration can fail too. A wake that
     /// coalesced while that registration was in flight must still run after
-    /// it: the worker keeps draining instead of releasing the slot.
+    /// it: the worker keeps draining instead of releasing the slot. The newer
+    /// wake supersedes the failed one in `pending`, exactly as coalescing
+    /// would have had the failed one still been waiting there, so it runs in
+    /// that one's place rather than in addition to it.
     #[tokio::test]
     async fn wake_coalesced_during_a_failed_followup_registration_still_runs() {
         use axum::{Json, Router, extract::State, routing::post};
@@ -2681,12 +2717,238 @@ mod tests {
         assert_eq!(
             tasks.len(),
             2,
-            "the first turn and the third wake run; the failed follow-up registered \
-             nothing: {principals:?}"
+            "the first turn and the third wake run; the third superseded the \
+             second while its registration failed: {principals:?}"
         );
         assert!(principals.contains(&Some("sender-1")));
         assert!(principals.contains(&Some("sender-3")));
         assert_eq!(*request_count.lock(), 2);
+        server.abort();
+    }
+
+    /// Mock OpenAI-compatible provider whose every chat request signals
+    /// `entered` and then waits for `release`. Returns the server handle, its
+    /// address and the request counter.
+    async fn gated_mock_provider(
+        entered: &Arc<tokio::sync::Notify>,
+        release: &Arc<tokio::sync::Notify>,
+    ) -> (
+        tokio::task::JoinHandle<()>,
+        std::net::SocketAddr,
+        Arc<Mutex<u32>>,
+    ) {
+        use axum::{Json, Router, extract::State, routing::post};
+
+        #[derive(Clone)]
+        struct RequestState {
+            count: Arc<Mutex<u32>>,
+            entered: Arc<tokio::sync::Notify>,
+            release: Arc<tokio::sync::Notify>,
+        }
+        async fn capture_chat(
+            State(state): State<RequestState>,
+            Json(_body): Json<serde_json::Value>,
+        ) -> Json<serde_json::Value> {
+            *state.count.lock() += 1;
+            state.entered.notify_one();
+            state.release.notified().await;
+            Json(serde_json::json!({
+                "choices": [{"message": {"content": "ok"}}]
+            }))
+        }
+
+        let count = Arc::new(Mutex::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("mock provider listener should bind");
+        let addr = listener.local_addr().expect("mock provider addr");
+        let app = Router::new()
+            .route("/v1/chat/completions", post(capture_chat))
+            .with_state(RequestState {
+                count: Arc::clone(&count),
+                entered: Arc::clone(entered),
+                release: Arc::clone(release),
+            });
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("mock provider server should run");
+        });
+        (server, addr, count)
+    }
+
+    /// `base_config` pointed at a mock provider, granting `recipient`.
+    fn mock_provider_config(dir: &Path, addr: std::net::SocketAddr) -> Config {
+        let mut config = base_config(dir);
+        config.providers.models.ollama.insert(
+            "default".to_string(),
+            OllamaModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("mock-model".to_string()),
+                    uri: Some(format!("http://{addr}")),
+                    timeout_secs: Some(10),
+                    ..ModelProviderConfig::default()
+                },
+                ..OllamaModelProviderConfig::default()
+            },
+        );
+        config.plugins.entries = vec![entry(&instance_key(), &["recipient"], None)];
+        config
+    }
+
+    /// A wake that coalesced onto a running turn was reported as accepted, so
+    /// a transient failure registering its follow-up must not lose it. With
+    /// no later wake to carry the slot, the worker must requeue the accepted
+    /// wake, retry its registration, and run it exactly once.
+    #[tokio::test]
+    async fn accepted_wake_survives_a_transient_followup_registration_failure() {
+        let provider_entered = Arc::new(tokio::sync::Notify::new());
+        let provider_release = Arc::new(tokio::sync::Notify::new());
+        let (server, mock_addr, request_count) =
+            gated_mock_provider(&provider_entered, &provider_release).await;
+
+        let workspace = tempfile::TempDir::new().expect("temp data dir");
+        let config = mock_provider_config(workspace.path(), mock_addr);
+
+        // Registration 1 is the first turn; 2 is the follow-up's first attempt
+        // and fails once. Every later registration succeeds.
+        let registry_entered = Arc::new(tokio::sync::Notify::new());
+        let registry_release = Arc::new(tokio::sync::Notify::new());
+        let (control_plane, store) =
+            gated_control_plane(workspace.path(), 2, &registry_entered, &registry_release);
+        let coordinator = Arc::new(SharedWakeCoordinator::new());
+        let backend = RuntimeAgentWakeBackend::for_tests(
+            Arc::new(config),
+            None,
+            None,
+            Some(control_plane),
+            Arc::clone(&coordinator),
+        );
+
+        assert_eq!(
+            backend
+                .wake(&scope(), Some("sender-1"), "recipient", "first")
+                .await,
+            Ok(())
+        );
+        tokio::time::timeout(Duration::from_secs(10), provider_entered.notified())
+            .await
+            .expect("first turn reaches mock provider");
+        assert_eq!(
+            backend
+                .wake(&scope(), Some("sender-2"), "recipient", "second")
+                .await,
+            Ok(()),
+            "the second wake is accepted onto the running turn"
+        );
+
+        // The first turn ends; the follow-up's registration fails once. No
+        // later wake arrives to keep the slot busy.
+        provider_release.notify_one();
+        tokio::time::timeout(Duration::from_secs(10), registry_entered.notified())
+            .await
+            .expect("the worker reaches the follow-up registration");
+        registry_release.notify_one();
+
+        // The accepted wake must still reach the provider after the retry.
+        tokio::time::timeout(Duration::from_secs(10), provider_entered.notified())
+            .await
+            .expect("the accepted wake's turn must run after a transient failure");
+        provider_release.notify_one();
+
+        await_slots_released(&coordinator).await;
+        let tasks = tasks_for(store.as_ref(), "recipient").await;
+        let principals: Vec<_> = tasks
+            .iter()
+            .map(|task| task.principal_id.as_deref())
+            .collect();
+        assert_eq!(
+            tasks.len(),
+            2,
+            "the first turn and the accepted wake each register once: {principals:?}"
+        );
+        assert!(principals.contains(&Some("sender-1")));
+        assert!(principals.contains(&Some("sender-2")));
+        for task in &tasks {
+            let snapshot = await_terminal(store.as_ref(), &task.id).await;
+            assert_eq!(snapshot.task.status, TaskStatus::Completed);
+        }
+
+        // Exactly once: nothing else runs after the slot is released.
+        tokio::time::sleep(WAKE_STORE_RETRY_DELAY * 4).await;
+        assert_eq!(*request_count.lock(), 2);
+        assert_eq!(tasks_for(store.as_ref(), "recipient").await.len(), 2);
+        server.abort();
+    }
+
+    /// A requeued wake is re-judged on live config before each retry. If the
+    /// operator revokes the target while the failed registration is in
+    /// flight, the retry must cancel the wake rather than run it.
+    #[tokio::test]
+    async fn requeued_wake_rechecks_a_grant_revoked_before_its_retry() {
+        let provider_entered = Arc::new(tokio::sync::Notify::new());
+        let provider_release = Arc::new(tokio::sync::Notify::new());
+        let (server, mock_addr, request_count) =
+            gated_mock_provider(&provider_entered, &provider_release).await;
+
+        let workspace = tempfile::TempDir::new().expect("temp data dir");
+        let key = instance_key();
+        let live = zeroclaw_config::live::LiveConfig::new(mock_provider_config(
+            workspace.path(),
+            mock_addr,
+        ));
+
+        let registry_entered = Arc::new(tokio::sync::Notify::new());
+        let registry_release = Arc::new(tokio::sync::Notify::new());
+        let (control_plane, store) =
+            gated_control_plane(workspace.path(), 2, &registry_entered, &registry_release);
+        let coordinator = Arc::new(SharedWakeCoordinator::new());
+        let backend = RuntimeAgentWakeBackend::for_tests(
+            Arc::new(base_config(workspace.path())),
+            Some(live.handle()),
+            None,
+            Some(control_plane),
+            Arc::clone(&coordinator),
+        );
+
+        assert_eq!(
+            backend
+                .wake(&scope(), Some("sender-1"), "recipient", "first")
+                .await,
+            Ok(())
+        );
+        tokio::time::timeout(Duration::from_secs(10), provider_entered.notified())
+            .await
+            .expect("first turn reaches mock provider");
+        assert_eq!(
+            backend
+                .wake(&scope(), Some("sender-2"), "recipient", "second")
+                .await,
+            Ok(())
+        );
+
+        provider_release.notify_one();
+        tokio::time::timeout(Duration::from_secs(10), registry_entered.notified())
+            .await
+            .expect("the worker reaches the follow-up registration");
+
+        // The operator revokes the target before the registration fails.
+        let mut revoked = live.snapshot();
+        revoked.plugins.entries = vec![entry(&key, &[], None)];
+        let revision = live.next_revision().expect("revision available");
+        live.publish(revision, revoked)
+            .expect("publication accepted");
+        registry_release.notify_one();
+
+        await_slots_released(&coordinator).await;
+        let tasks = tasks_for(store.as_ref(), "recipient").await;
+        assert_eq!(
+            tasks.len(),
+            1,
+            "a wake revoked before its retry registers nothing: {tasks:?}"
+        );
+        assert_eq!(tasks[0].principal_id.as_deref(), Some("sender-1"));
+        assert_eq!(*request_count.lock(), 1, "the revoked wake never runs");
         server.abort();
     }
 

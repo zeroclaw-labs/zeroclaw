@@ -506,8 +506,14 @@ Every call passes five host-owned checks before spawning a turn:
    edit made while it waited applies), then coalesces or claims the pair
    itself, so a failed claim never drops a wake that already returned success. The follow-up
    re-checks live grants and target availability before running; a follow-up
-   that cannot run is skipped and the next pending wake is drained, rather than
-   releasing the pair with accepted wakes still queued.
+   the operator no longer permits (target revoked, disabled or removed, or
+   re-admission refused) is cancelled and the next pending wake is drained,
+   rather than releasing the pair with accepted wakes still queued. A follow-up
+   whose durable `TaskRecord` registration fails transiently is not dropped: it
+   returns to the pending slot (unless a newer wake has already replaced it)
+   and is retried with capped exponential backoff, re-checking the live grant
+   and target before each attempt, so an accepted wake runs exactly once or is
+   cancelled by an operator edit.
    Idle pairs also spend from the per-instance continuous token bucket, admit
    against `AgentExecutionCapability`, record a durable `TaskRecord`, and run
    under `InternalPrincipal::PluginTool`.
