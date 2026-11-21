@@ -203,9 +203,14 @@ jobs:
           # tags build amd64+arm64 (the Dockerfile cross-compiles to arm64 on the
           # native amd64 builder), Containerfile tags stay amd64-only.
           platforms: ${{ matrix.platforms }}
+          # Only dist-broad carries a release-profile override (thin LTO, to fit
+          # the arm64 runner memory); tags without it keep the Dockerfile's
+          # fat-LTO defaults, and an empty line is ignored by build-push-action.
           build-args: |
             ZEROCLAW_CARGO_FLAGS=${{ matrix.flags }}
             ZEROCLAW_BUILD_ID=${{ steps.srcsha.outputs.sha }}
+            ${{ matrix.lto && format('ZEROCLAW_RELEASE_LTO={0}', matrix.lto) || '' }}
+            ${{ matrix.codegen_units && format('ZEROCLAW_RELEASE_CODEGEN_UNITS={0}', matrix.codegen_units) || '' }}
           # The floating tag moves only on a tag push, the release call, or a
           # dispatch with `floating` set; an empty line adds no tag.
           tags: |
