@@ -82,9 +82,10 @@ let configPutCalls: ConfigPutRequest[] = [];
 let missingSessions = new Set<string>();
 let deleteFailures = new Set<string>();
 let configPutHandler: ((request: ConfigPutRequest) => Promise<Response>) | null = null;
-// Config entries the mocked `/api/config/list` returns; the model picker
-// derives its choices from `providers.models.<family>.<alias>.model` paths.
-let configListEntries: Array<{ path: string }> = [];
+// Canonical model-provider references returned by the alias-source resolver.
+// The picker consumes these exact refs and does not reconstruct them from
+// dotted configuration paths.
+let modelProviderRefs: string[] = [];
 // The element whose node mock last received `focus()`. Read it through
 // `focusedNode()` so TypeScript doesn't narrow it after a reset.
 let lastFocused: { type: unknown; props: Record<string, unknown> } | null = null;
@@ -113,7 +114,10 @@ globalThis.fetch = async (input, init) => {
     if (configPutHandler) return configPutHandler(request);
     body = { path: request.path, value: request.value };
   } else if (url.includes('/api/config/prop')) body = { path: '', value: '<unset>' };
-  else if (url.includes('/api/config/list')) body = { entries: configListEntries };
+  else if (url.includes('/api/config/resolve-alias-source')) {
+    const source = new URL(url, 'http://localhost').searchParams.get('source');
+    body = { source, values: source === 'model_providers' ? modelProviderRefs : [] };
+  }
   else if (url.endsWith('/api/sessions')) {
     // `sessionsResponder` lets a test control when each listing resolves, so
     // out-of-order list responses can be reproduced deterministically.
@@ -393,7 +397,7 @@ beforeEach(() => {
   missingSessions = new Set();
   deleteFailures = new Set();
   configPutHandler = null;
-  configListEntries = [];
+  modelProviderRefs = [];
   lastFocused = null;
   documentListeners.clear();
   delete fakeDocument.activeElement;
@@ -2132,10 +2136,7 @@ function modelButtonIn(renderer: ReactTestRenderer): ReactTestInstance | undefin
 }
 
 test('Escape closes the model menu and returns focus to its button', async () => {
-  configListEntries = [
-    { path: 'providers.models.openai.fast.model' },
-    { path: 'providers.models.openai.smart.model' },
-  ];
+  modelProviderRefs = ['openai.fast', 'openai.smart'];
   const runtime = new FakeSessionRuntime();
   const mounted = await mountChat(runtime, true);
   await openSocket(runtime, 0);
@@ -2195,10 +2196,7 @@ test('Escape closes the model menu and returns focus to its button', async () =>
 });
 
 test('Escape in the composer closes the command hint, not the model menu', async () => {
-  configListEntries = [
-    { path: 'providers.models.openai.fast.model' },
-    { path: 'providers.models.openai.smart.model' },
-  ];
+  modelProviderRefs = ['openai.fast', 'openai.smart'];
   const runtime = new FakeSessionRuntime();
   const mounted = await mountChat(runtime, true);
   await openSocket(runtime, 0);

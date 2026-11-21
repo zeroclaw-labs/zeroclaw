@@ -20,7 +20,7 @@ pub struct ScheduleTool {
 
 impl ScheduleTool {
     /// `config` is a shared snapshot: every constructor site in
-    /// `all_tools_with_runtime` wraps the same `Arc`, so building the tool
+    /// `build_native_registry` wraps the same `Arc`, so building the tool
     /// registry costs one full `Config` copy per build instead of one per
     /// `root_config`-derived tool.
     pub fn new_with_runtime(

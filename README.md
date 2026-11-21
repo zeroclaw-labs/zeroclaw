@@ -87,12 +87,12 @@ Full walkthrough: [Quick start](docs/book/src/getting-started/quickstart.md) —
 
 One TOML file at `~/.zeroclaw/config.toml`. Pointers:
 
-- [Provider configuration](docs/book/src/providers/configuration.md) — the universal `[providers.models.<type>.<alias>]` schema
+- [Provider configuration](docs/book/src/providers/configuration.md) — reusable `[providers.connections.<key>]` connections and `[providers.models.<key>]` models
 - [Channels overview](docs/book/src/channels/overview.md) — per-channel `[channels.<type>.<alias>]` blocks
 - [Security overview](docs/book/src/security/overview.md) — autonomy, sandboxing, tool receipts
 - [Full config reference](https://docs.zeroclaw.com/master/en/reference/config.html) — generated from the live schema; every key documented
 
-A V3 config has at minimum four section headers (`<type>.<alias>` shaped) — a provider entry, an agent that references it, and a risk profile the agent gates against. A hand-written file should also start with `schema_version = 4`, the current schema version. See [Provider Configuration → Minimal working example](docs/book/src/providers/configuration.md#minimal-working-example) for the canonical four-section form with inline type/alias commentary.
+A V5 config separates the provider connection from each logical model. An agent references a model by its exact configured key and uses a risk profile for its permissions. A hand-written file should start with `schema_version = 5`. Existing V4 configurations migrate through `zeroclaw config migrate`; V4 was released with ZeroClaw 0.9.0 and remains frozen. See [Provider Configuration → Minimal working example](docs/book/src/providers/configuration.md#minimal-working-example) for the current layout.
 
 For standard OpenAI Codex subscription auth, Quickstart can write the provider
 entry for you:

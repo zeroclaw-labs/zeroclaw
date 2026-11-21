@@ -27,8 +27,6 @@ pub mod util;
 pub mod acp_channel;
 pub mod cli;
 pub mod link_enricher;
-pub mod transcription;
-pub mod tts;
 pub mod voice;
 
 // Feature-gated channels
@@ -106,3 +104,16 @@ pub mod whatsapp;
 pub mod whatsapp_storage;
 #[cfg(feature = "whatsapp-web")]
 pub mod whatsapp_web;
+
+#[cfg(test)]
+fn transcription_fixture(
+    section: &zeroclaw_config::schema::TranscriptionConfig,
+) -> Option<std::sync::Arc<zeroclaw_providers::transcription::TranscriptionManager>> {
+    if !section.enabled {
+        return None;
+    }
+    let config = zeroclaw_config::schema::Config::from_transcription_input(section);
+    zeroclaw_providers::transcription::build_transcription_manager(&config, "")
+        .ok()
+        .map(std::sync::Arc::new)
+}

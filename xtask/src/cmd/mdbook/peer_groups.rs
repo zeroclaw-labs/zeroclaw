@@ -1034,7 +1034,7 @@ fn validate_env_var_path(path: &str) -> anyhow::Result<()> {
     // won't appear in `prop_fields()` — validating the section is the correct
     // check.
     let under_section = Config::map_key_sections().into_iter().any(|s| {
-        path.strip_prefix(s.path)
+        path.strip_prefix(s.path.as_str())
             .and_then(|rest| rest.strip_prefix('.'))
             .is_some_and(|rest| !rest.is_empty())
     });

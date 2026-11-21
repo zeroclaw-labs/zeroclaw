@@ -1134,11 +1134,12 @@ pub struct TelegramChannel {
     /// Override for local Bot API servers or testing.
     api_base: String,
     transcription: Option<zeroclaw_config::schema::TranscriptionConfig>,
-    transcription_manager: Option<std::sync::Arc<super::transcription::TranscriptionManager>>,
+    transcription_manager:
+        Option<std::sync::Arc<zeroclaw_providers::transcription::TranscriptionManager>>,
     voice_transcriptions: Mutex<std::collections::HashMap<String, String>>,
     workspace_dir: Option<std::path::PathBuf>,
     ack_reactions: bool,
-    tts_manager: Option<Arc<super::tts::TtsManager>>,
+    tts_manager: Option<Arc<zeroclaw_providers::tts::TtsManager>>,
     voice_chats: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     /// Resolves voice peers from canonical config at call-time.
     /// See AGENTS.md "ABSOLUTE RULE — SINGLE SOURCE OF TRUTH" — no cache.
@@ -1458,17 +1459,20 @@ impl TelegramChannel {
     }
 
     fn configured_model_provider(config: &Config, provider_ref: &str) -> bool {
-        provider_ref
-            .split_once('.')
-            .filter(|(family, alias)| !family.is_empty() && !alias.is_empty())
-            .is_some_and(|(family, alias)| config.providers.models.find(family, alias).is_some())
+        config
+            .providers
+            .models
+            .canonical_model(&zeroclaw_config::provider_registry::ModelRef::from(
+                provider_ref,
+            ))
+            .is_some_and(|model| model.capability() == zeroclaw_api::capability::Capability::Chat)
     }
 
     /// Mirror of the text resolver's match rule (`apply_model_ref`): a
-    /// `/model <hint>` argument matches a route by model identifier or by
-    /// hint, ASCII case-insensitively, first match wins.
+    /// `/model <hint>` matches an exact model reference or an ASCII
+    /// case-insensitive hint; first match wins.
     fn model_picker_route_matches_argument(hint: &str, model: &str, argument: &str) -> bool {
-        model.eq_ignore_ascii_case(argument) || hint.eq_ignore_ascii_case(argument)
+        model == argument || hint.eq_ignore_ascii_case(argument)
     }
 
     /// Classify why `selected` cannot be offered, or `None` when selecting
@@ -1480,14 +1484,14 @@ impl TelegramChannel {
     ) -> Option<ModelPickerExclusion> {
         if !Self::is_safe_model_picker_field(&selected.hint)
             || !Self::is_safe_model_picker_field(&selected.model_provider)
-            || !Self::is_safe_model_picker_field(&selected.model)
+            || (!selected.model.is_empty() && !Self::is_safe_model_picker_field(&selected.model))
         {
             return Some(ModelPickerExclusion::UnsafeField);
         }
         let is_selected_route = |route: &zeroclaw_config::schema::ModelRouteConfig| {
             route.hint == selected.hint
-                && route.model_provider == selected.model_provider
-                && route.model == selected.model
+                && route.model_ref == selected.model_provider
+                && route.effective_model(config) == selected.model
         };
         if !Self::configured_model_provider(config, &selected.model_provider)
             || !config.model_routes.iter().any(&is_selected_route)
@@ -1503,14 +1507,22 @@ impl TelegramChannel {
             .model_routes
             .iter()
             .find(|route| {
-                Self::model_picker_route_matches_argument(&route.hint, &route.model, &selected.hint)
+                Self::model_picker_route_matches_argument(
+                    &route.hint,
+                    &route.model_ref,
+                    &selected.hint,
+                )
             })
             .filter(|route| !is_selected_route(route))
             .map(|route| route.hint.clone());
         let shadowing_runtime = runtime_routes
             .iter()
             .find(|route| {
-                Self::model_picker_route_matches_argument(&route.hint, &route.model, &selected.hint)
+                Self::model_picker_route_matches_argument(
+                    &route.hint,
+                    &route.model_provider,
+                    &selected.hint,
+                )
             })
             .filter(|route| *route != selected)
             .map(|route| route.hint.clone());
@@ -1607,14 +1619,7 @@ impl TelegramChannel {
         }
 
         let current_provider = owner.model_provider.as_str();
-        let (current_family, current_alias) = current_provider.split_once('.')?;
-        let current_model = config
-            .providers
-            .models
-            .find(current_family, current_alias)?
-            .model
-            .clone()
-            .unwrap_or_default();
+        let current_model = config.resolve_model_id(current_provider)?;
 
         let mut categories: Vec<ModelPickerCategory> = Vec::new();
         // Presented (provider, model) targets and the hint each is shown
@@ -3359,14 +3364,12 @@ impl TelegramChannel {
 
     /// Configure voice transcription from a `[transcription]` snapshot.
     ///
-    /// Compatibility and test path. The daemon routes every channel through
-    /// `with_transcription_manager` with a manager built from live
-    /// config and the owning agent's resolved provider; this path can only see
-    /// the legacy section, so it binds a lone registered provider and
-    /// otherwise leaves the choice unbound (see
-    /// `transcription::manager_from_snapshot`).
-    pub fn with_transcription(self, config: zeroclaw_config::schema::TranscriptionConfig) -> Self {
-        let manager = super::transcription::manager_from_snapshot(&config);
+    /// Test fixture only: project historical input before constructing the
+    /// canonical manager. Production injects a manager built from the live
+    /// configuration and the owning agent's exact model reference.
+    #[cfg(test)]
+    fn with_transcription(self, config: zeroclaw_config::schema::TranscriptionConfig) -> Self {
+        let manager = crate::transcription_fixture(&config);
         self.with_transcription_manager(config, manager)
     }
 
@@ -3376,7 +3379,7 @@ impl TelegramChannel {
     pub(crate) fn with_transcription_manager(
         mut self,
         config: zeroclaw_config::schema::TranscriptionConfig,
-        manager: Option<std::sync::Arc<super::transcription::TranscriptionManager>>,
+        manager: Option<std::sync::Arc<zeroclaw_providers::transcription::TranscriptionManager>>,
     ) -> Self {
         if let Some(manager) = manager {
             self.transcription_manager = Some(manager);
@@ -3386,9 +3389,9 @@ impl TelegramChannel {
     }
 
     pub fn with_tts(mut self, config: &zeroclaw_config::schema::Config) -> Self {
-        if config.tts.enabled {
+        if zeroclaw_providers::tts::is_enabled(config) {
             let owner = config.agent_for_channel(&format!("telegram.{}", self.alias));
-            match super::tts::TtsManager::from_config_for_agent(config, owner) {
+            match zeroclaw_providers::tts::TtsManager::from_config_for_agent(config, owner) {
                 Ok(m) => self.tts_manager = Some(Arc::new(m)),
                 Err(e) => ::zeroclaw_log::record!(
                     WARN,
@@ -4363,7 +4366,7 @@ impl TelegramChannel {
         chat_id: &str,
         thread_id: Option<&str>,
         text: &str,
-        tts_manager: &crate::tts::TtsManager,
+        tts_manager: &zeroclaw_providers::tts::TtsManager,
     ) -> anyhow::Result<()> {
         let audio_bytes = tts_manager.synthesize_opus(text).await?;
         let audio_len = audio_bytes.len();
@@ -11969,9 +11972,7 @@ mod tests {
     async fn finalize_multi_message_suppress_voice_skips_tts_but_delivers_text() {
         use wiremock::matchers::method;
         use wiremock::{Mock, MockServer, ResponseTemplate};
-        use zeroclaw_config::schema::{
-            AliasedAgentConfig, Config, OpenAITtsProviderConfig, TtsProviderConfig,
-        };
+        use zeroclaw_config::schema::{AliasedAgentConfig, Config};
 
         let mock_server = MockServer::start().await;
         // Catch-all for every POST: Bot API (sendMessage/sendVoice) and the
@@ -11997,17 +11998,10 @@ mod tests {
                 ..AliasedAgentConfig::default()
             },
         );
-        config.providers.tts.openai.insert(
-            "default".to_string(),
-            OpenAITtsProviderConfig {
-                base: TtsProviderConfig {
-                    api_key: Some("k".to_string()),
-                    uri: Some(format!("{}/v1/audio/speech", mock_server.uri())),
-                    voice: Some("alloy".to_string()),
-                    ..TtsProviderConfig::default()
-                },
-            },
-        );
+        config.providers = serde_json::from_value(serde_json::json!({
+            "connections": {"speech.openai": {"kind": "openai", "uri": format!("{}/v1", mock_server.uri()), "auth": {"mode": "api_key", "api_key": "k"}}},
+            "models": {"openai.default": {"capability": "tts", "provider": "speech.openai", "model": "tts-1", "options": {"voice": "alloy"}}}
+        })).unwrap();
 
         // Recipient "123" is voice-capable, so a non-suppressed finalize WOULD
         // queue TTS — that is what makes the suppress assertion meaningful.
@@ -12091,9 +12085,7 @@ mod tests {
     async fn multi_message_voice_only_peer_gets_voice_without_narration_or_final_text() {
         use wiremock::matchers::method;
         use wiremock::{Mock, MockServer, ResponseTemplate};
-        use zeroclaw_config::schema::{
-            AliasedAgentConfig, Config, OpenAITtsProviderConfig, TtsProviderConfig,
-        };
+        use zeroclaw_config::schema::{AliasedAgentConfig, Config};
 
         let mock_server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -12115,17 +12107,10 @@ mod tests {
                 ..AliasedAgentConfig::default()
             },
         );
-        config.providers.tts.openai.insert(
-            "default".to_string(),
-            OpenAITtsProviderConfig {
-                base: TtsProviderConfig {
-                    api_key: Some("k".to_string()),
-                    uri: Some(format!("{}/v1/audio/speech", mock_server.uri())),
-                    voice: Some("alloy".to_string()),
-                    ..TtsProviderConfig::default()
-                },
-            },
-        );
+        config.providers = serde_json::from_value(serde_json::json!({
+            "connections": {"speech.openai": {"kind": "openai", "uri": format!("{}/v1", mock_server.uri()), "auth": {"mode": "api_key", "api_key": "k"}}},
+            "models": {"openai.default": {"capability": "tts", "provider": "speech.openai", "model": "tts-1", "options": {"voice": "alloy"}}}
+        })).unwrap();
 
         // "123" is a voice-only peer.
         let ch = multi_message_test_channel("telegram_test_alias", 0)
@@ -13541,30 +13526,30 @@ mod tests {
                 ..Default::default()
             },
         );
+        for (reference, model) in [
+            ("openai.primary", "gpt-current"),
+            ("openai.reasoning", "gpt-reasoning"),
+            ("openai.fast", "gpt-fast"),
+            ("anthropic.team", "claude-sonnet"),
+        ] {
+            zeroclaw_config::migration::bind_test_route_model(&mut config, reference, model, None);
+        }
         config.model_routes = vec![
             zeroclaw_config::schema::ModelRouteConfig {
                 hint: "current".to_string(),
-                model_provider: "openai.primary".to_string(),
-                model: "gpt-current".to_string(),
-                api_key: None,
+                model_ref: "openai.primary".to_string(),
             },
             zeroclaw_config::schema::ModelRouteConfig {
                 hint: "reasoning".to_string(),
-                model_provider: "openai.primary".to_string(),
-                model: "gpt-reasoning".to_string(),
-                api_key: None,
+                model_ref: "openai.reasoning".to_string(),
             },
             zeroclaw_config::schema::ModelRouteConfig {
                 hint: "fast".to_string(),
-                model_provider: "openai.fast".to_string(),
-                model: "gpt-fast".to_string(),
-                api_key: None,
+                model_ref: "openai.fast".to_string(),
             },
             zeroclaw_config::schema::ModelRouteConfig {
                 hint: "sonnet".to_string(),
-                model_provider: "anthropic.team".to_string(),
-                model: "claude-sonnet".to_string(),
-                api_key: None,
+                model_ref: "anthropic.team".to_string(),
             },
         ];
         config
@@ -13577,8 +13562,8 @@ mod tests {
                 .iter()
                 .map(|route| ModelPickerOption {
                     hint: route.hint.clone(),
-                    model_provider: route.model_provider.clone(),
-                    model: route.model.clone(),
+                    model_provider: route.model_ref.clone(),
+                    model: route.effective_model(config),
                 })
                 .collect(),
         )
@@ -13592,8 +13577,8 @@ mod tests {
             .iter()
             .map(|route| zeroclaw_api::channel::ChannelModelPickerRoute {
                 hint: route.hint.clone(),
-                model_provider: route.model_provider.clone(),
-                model: route.model.clone(),
+                model_provider: route.model_ref.clone(),
+                model: route.effective_model(config),
             })
             .collect()
     }
@@ -13609,13 +13594,15 @@ mod tests {
         assert_eq!(context.owner_agent_alias, "assistant");
         assert_eq!(context.current.model_provider, "openai.primary");
         assert_eq!(context.current.model, "gpt-current");
-        assert_eq!(context.categories.len(), 3);
+        assert_eq!(context.categories.len(), 4);
         assert_eq!(context.categories[0].provider_ref, "openai.primary");
-        assert_eq!(context.categories[0].options.len(), 2);
-        assert_eq!(context.categories[1].provider_ref, "openai.fast");
+        assert_eq!(context.categories[0].options.len(), 1);
+        assert_eq!(context.categories[1].provider_ref, "openai.reasoning");
         assert_eq!(context.categories[1].options.len(), 1);
-        assert_eq!(context.categories[2].provider_ref, "anthropic.team");
+        assert_eq!(context.categories[2].provider_ref, "openai.fast");
         assert_eq!(context.categories[2].options.len(), 1);
+        assert_eq!(context.categories[3].provider_ref, "anthropic.team");
+        assert_eq!(context.categories[3].options.len(), 1);
     }
 
     #[test]
@@ -13624,47 +13611,33 @@ mod tests {
         config.model_routes.extend([
             zeroclaw_config::schema::ModelRouteConfig {
                 hint: "duplicate".to_string(),
-                model_provider: "openai.primary".to_string(),
-                model: "gpt-current".to_string(),
-                api_key: None,
+                model_ref: "openai.primary".to_string(),
             },
             zeroclaw_config::schema::ModelRouteConfig {
                 hint: "missing".to_string(),
-                model_provider: "openai.not-configured".to_string(),
-                model: "ghost".to_string(),
-                api_key: None,
+                model_ref: "openai.not-configured".to_string(),
             },
             zeroclaw_config::schema::ModelRouteConfig {
                 hint: "unsafe\nroute".to_string(),
-                model_provider: "openai.fast".to_string(),
-                model: "unsafe".to_string(),
-                api_key: None,
+                model_ref: "openai.fast".to_string(),
             },
             // Regression: flag-shaped hints must not cross the `/model
             // --user|--agent` scope boundary via the picker.
             zeroclaw_config::schema::ModelRouteConfig {
                 hint: "--user fast".to_string(),
-                model_provider: "openai.fast".to_string(),
-                model: "gpt-flag-user".to_string(),
-                api_key: None,
+                model_ref: "openai.fast".to_string(),
             },
             zeroclaw_config::schema::ModelRouteConfig {
                 hint: "--agent fast".to_string(),
-                model_provider: "openai.fast".to_string(),
-                model: "gpt-flag-agent".to_string(),
-                api_key: None,
+                model_ref: "openai.fast".to_string(),
             },
             zeroclaw_config::schema::ModelRouteConfig {
                 hint: "--flag".to_string(),
-                model_provider: "openai.fast".to_string(),
-                model: "gpt-flag-generic".to_string(),
-                api_key: None,
+                model_ref: "openai.fast".to_string(),
             },
             zeroclaw_config::schema::ModelRouteConfig {
                 hint: "current".to_string(),
-                model_provider: "anthropic.team".to_string(),
-                model: "claude-conflicting".to_string(),
-                api_key: None,
+                model_ref: "anthropic.team".to_string(),
             },
         ]);
 
@@ -13678,7 +13651,7 @@ mod tests {
             .flat_map(|category| category.options.iter())
             .collect::<Vec<_>>();
 
-        assert_eq!(context.categories.len(), 3);
+        assert_eq!(context.categories.len(), 4);
         assert_eq!(options.len(), 4);
         assert!(options.iter().all(|option| option.model != "ghost"));
         assert!(options.iter().all(|option| option.hint != "duplicate"));
@@ -13718,37 +13691,27 @@ mod tests {
             // different target: unreachable through its own hint.
             zeroclaw_config::schema::ModelRouteConfig {
                 hint: "FAST".to_string(),
-                model_provider: "anthropic.team".to_string(),
-                model: "claude-fast".to_string(),
-                api_key: None,
+                model_ref: "anthropic.team".to_string(),
             },
-            // Hint equal to an earlier route's model identifier: the text
+            // Hint equal to an earlier route's exact model ref: the text
             // resolver would pick the `sonnet` route first.
             zeroclaw_config::schema::ModelRouteConfig {
-                hint: "claude-sonnet".to_string(),
-                model_provider: "openai.fast".to_string(),
-                model: "gpt-alias-collision".to_string(),
-                api_key: None,
+                hint: "anthropic.team".to_string(),
+                model_ref: "openai.fast".to_string(),
             },
             // Same target as `reasoning` under a second hint: still
             // reachable, presented once.
             zeroclaw_config::schema::ModelRouteConfig {
                 hint: "think".to_string(),
-                model_provider: "openai.primary".to_string(),
-                model: "gpt-reasoning".to_string(),
-                api_key: None,
+                model_ref: "openai.reasoning".to_string(),
             },
             zeroclaw_config::schema::ModelRouteConfig {
                 hint: "ghost".to_string(),
-                model_provider: "openai.not-configured".to_string(),
-                model: "gpt-ghost".to_string(),
-                api_key: None,
+                model_ref: "openai.not-configured".to_string(),
             },
             zeroclaw_config::schema::ModelRouteConfig {
                 hint: "bad\thint".to_string(),
-                model_provider: "openai.fast".to_string(),
-                model: "gpt-bad".to_string(),
-                api_key: None,
+                model_ref: "openai.fast".to_string(),
             },
         ]);
         let runtime_routes = model_picker_runtime_routes(&config);
@@ -13766,15 +13729,14 @@ mod tests {
                 .model_routes
                 .iter()
                 .find(|route| {
-                    route.model.eq_ignore_ascii_case(&option.hint)
-                        || route.hint.eq_ignore_ascii_case(&option.hint)
+                    route.model_ref == option.hint || route.hint.eq_ignore_ascii_case(&option.hint)
                 })
                 .expect("displayed route must resolve through the text command");
             assert_eq!(
                 (
                     first_match.hint.as_str(),
-                    first_match.model_provider.as_str(),
-                    first_match.model.as_str(),
+                    first_match.model_ref.as_str(),
+                    first_match.effective_model(&config).as_str(),
                 ),
                 (
                     option.hint.as_str(),
@@ -13817,7 +13779,7 @@ mod tests {
             })
         );
         assert_eq!(
-            exclusion("claude-sonnet"),
+            exclusion("anthropic.team"),
             Some(ModelPickerExclusion::ShadowedByRoute {
                 shadowing_hint: "sonnet".to_string(),
             })
@@ -13924,23 +13886,34 @@ mod tests {
             .model_routes
             .push(zeroclaw_config::schema::ModelRouteConfig {
                 hint: "also-fast".into(),
-                model_provider: "openai.fast".into(),
-                model: "gpt-fast".into(),
-                api_key: None,
+                model_ref: "openai.fast".into(),
             });
         assert!(TelegramChannel::model_picker_route_available(
             &config,
             runtime_routes.as_ref(),
             &option,
         ));
-        config.model_routes[2].model = "gpt-fast-v2".to_string();
+        zeroclaw_config::migration::bind_test_route_model(
+            &mut config,
+            "openai.fast",
+            "gpt-fast-v2",
+            None,
+        );
         assert!(!TelegramChannel::model_picker_route_available(
             &config,
             runtime_routes.as_ref(),
             &option,
         ));
-        config.model_routes[2].model = "gpt-fast".to_string();
-        config.providers.models.openai.remove("fast");
+        zeroclaw_config::migration::bind_test_route_model(
+            &mut config,
+            "openai.fast",
+            "gpt-fast",
+            None,
+        );
+        config
+            .providers
+            .models
+            .retain_canonical_models(|reference, _| reference.as_str() != "openai.fast");
         assert!(!TelegramChannel::model_picker_route_available(
             &config,
             runtime_routes.as_ref(),
@@ -13991,14 +13964,12 @@ mod tests {
             "--agent fast",
             "fast --user",
         ];
-        for (index, hint) in non_canonical.iter().enumerate() {
+        for hint in &non_canonical {
             config
                 .model_routes
                 .push(zeroclaw_config::schema::ModelRouteConfig {
                     hint: (*hint).to_string(),
-                    model_provider: "openai.fast".to_string(),
-                    model: format!("gpt-non-canonical-{index}"),
-                    api_key: None,
+                    model_ref: "openai.fast".to_string(),
                 });
         }
 
@@ -14162,7 +14133,7 @@ mod tests {
         assert!(markup.contains("✓ anthropic.team"));
         assert!(!markup.contains("gpt-5.6"));
         let pending = channel.pending_model_pickers.lock().await;
-        assert_eq!(pending.len(), 4);
+        assert_eq!(pending.len(), 5, "four model categories plus cancel");
         assert!(pending.values().all(|state| {
             state.requesting_user_id == "123"
                 && state.reply_target == "-10042:9"
@@ -14232,7 +14203,7 @@ mod tests {
         let requests = server.received_requests().await.unwrap();
         assert_eq!(requests.len(), 2);
         let pending = channel.pending_model_pickers.lock().await;
-        assert_eq!(pending.len(), 4);
+        assert_eq!(pending.len(), 5, "four model categories plus cancel");
         assert!(pending.values().all(|state| {
             state.requesting_user_id == "123"
                 && state.reply_target == "-10042:9"
@@ -19385,13 +19356,24 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let tc = zeroclaw_config::schema::TranscriptionConfig {
-            enabled: true,
-            api_key: Some("test_key".to_string()),
-            api_url: format!("{}/transcribe", mock_server.uri()),
-            max_duration_secs: 120,
+        let mut canonical = zeroclaw_config::schema::Config {
+            providers: serde_json::from_value(serde_json::json!({
+                "connections": {"speech.test": {"kind": "local_whisper", "uri": format!("{}/transcribe", mock_server.uri())}},
+                "models": {"asr.test": {"capability": "asr", "provider": "speech.test", "model": "whisper-1"}}
+            })).unwrap(),
             ..Default::default()
         };
+        canonical.transcription.enabled = true;
+        canonical.agents.insert(
+            "telegram-agent".into(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                transcription_provider: "asr.test".into(),
+                ..Default::default()
+            },
+        );
+        let manager =
+            zeroclaw_providers::transcription::build_transcription_manager(&canonical, "asr.test")
+                .unwrap();
         let mention_only = false;
         let ch = TelegramChannel::new(
             "token".into(),
@@ -19400,7 +19382,7 @@ mod tests {
             mention_only,
         )
         .with_mock_api_base(mock_server.uri())
-        .with_transcription(tc);
+        .with_transcription_manager(Default::default(), Some(Arc::new(manager)));
         let update = serde_json::json!({
             "message": {
                 "message_id": 4,
@@ -21328,8 +21310,12 @@ mod tests {
             api_key: Some(api_key),
             ..Default::default()
         };
-        let manager = crate::transcription::TranscriptionManager::new(&config)
-            .expect("TranscriptionManager::new should succeed with valid GROQ_API_KEY");
+        let manager =
+            zeroclaw_providers::transcription::TranscriptionManager::from_config_for_agent(
+                &Config::from_transcription_input(&config),
+                None,
+            )
+            .expect("TranscriptionManager::from_config_for_agent should succeed with valid GROQ_API_KEY");
         let transcript: String = manager
             .transcribe(&audio_data, "hello.mp3")
             .await

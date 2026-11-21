@@ -849,13 +849,6 @@ fn required_field_sections_can_be_completed_across_cli_processes() {
             ],
         ),
         (
-            "transcription.local_whisper",
-            &[(
-                "transcription.local_whisper.url",
-                "http://127.0.0.1:8080/v1/transcribe",
-            )],
-        ),
-        (
             "tunnel.openvpn",
             &[("tunnel.openvpn.config_file", "/tmp/zeroclaw-test.ovpn")],
         ),

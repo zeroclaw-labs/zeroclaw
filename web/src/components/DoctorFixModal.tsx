@@ -3,6 +3,7 @@ import { Link } from 'react-router-dom';
 import { ExternalLink, X } from 'lucide-react';
 import { Button } from '@/components/ui';
 import FieldForm from '@/components/sections/FieldForm';
+import ProviderRegistryEditor from '@/components/sections/ProviderRegistryEditor';
 import {
   useFocusTrap,
   FOCUSABLE_SELECTOR_FORM,
@@ -12,9 +13,7 @@ import { t } from '@/lib/i18n';
 export interface DoctorFixModalProps {
   /** Whether the modal is mounted/visible. */
   open: boolean;
-  /** Dotted config entity prefix to edit, e.g. `providers.models.openai.ss`
-   *  or `channels.discord.gnosis`. FieldForm fetches and renders every field
-   *  under this prefix and owns its own Save. */
+  /** Config entity prefix, or `providers.registry` for atomic registry editing. */
   prefix: string;
   /** Human-friendly entity name shown in the header (e.g. `openai.ss`). */
   entity: string;
@@ -110,7 +109,11 @@ export default function DoctorFixModal({
 
         {/* Body — the entity's editable fields. FieldForm owns its own Save. */}
         <div className="px-6 py-4 max-h-[60vh] overflow-y-auto">
-          <FieldForm prefix={prefix} drift={[]} onSaved={() => undefined} inlineSaveBar />
+          {prefix === 'providers.registry' ? (
+            <ProviderRegistryEditor onSaved={() => undefined} />
+          ) : (
+            <FieldForm prefix={prefix} drift={[]} onSaved={() => undefined} inlineSaveBar />
+          )}
         </div>
 
         {/* Footer — escape hatch to the full config page + close. */}

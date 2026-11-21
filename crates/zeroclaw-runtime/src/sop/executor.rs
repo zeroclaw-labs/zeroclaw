@@ -758,10 +758,7 @@ async fn headless_step_memory(
     let Some(owner) = owner else {
         return Ok(None);
     };
-    let api_key = config
-        .resolved_model_provider_for_agent(agent_alias)
-        .and_then(|(_, _, cfg)| cfg.api_key.clone());
-    crate::agent::turn::step_agent_memory(config, agent_alias, api_key.as_deref(), Some(owner))
+    crate::agent::turn::step_agent_memory(config, agent_alias, Some(owner))
         .await
         .map(Some)
 }
@@ -1135,11 +1132,8 @@ async fn drive_headless_run(
                             // (child-agent spawning) inherits the same boundary,
                             // so the child cannot regain tools this step denies,
                             // including the SOP control surface the step turn
-                            // always drops. Boxed innermost. The turn future is
-                            // large, and in a debug build composing it inline
-                            // with both scope wrappers overflows the worker stack
-                            // while the value is still being built on it, before
-                            // `Box::pin` can move it to the heap.
+                            // always drops. The runner owns its heap boundary
+                            // before either task-local scope is composed.
                             let task_scope = scope.clone();
                             let overrides = crate::agent::loop_::AgentRunOverrides {
                                 security: Some(Arc::new(policy)),
@@ -1160,22 +1154,15 @@ async fn drive_headless_run(
                             };
                             #[cfg(test)]
                             record_step_turn_memory(&run_id, step.number, &overrides);
-                            let turn = Box::pin(crate::agent::run(
-                                effective_config.clone(),
-                                &agent_alias,
-                                Some(context),
-                                None,
-                                None,
-                                effective_config
-                                    .model_provider_for_agent(&agent_alias)
-                                    .and_then(|e| e.temperature),
-                                vec![],
-                                false,
-                                Some(session_path),
-                                None,
-                                zeroclaw_api::ingress::TurnOrigin::Daemon,
+                            let mut request = crate::agent::AgentRunRequest::new(&agent_alias);
+                            request.message = Some(context);
+                            request.session_state_file = Some(session_path);
+                            request.origin = zeroclaw_api::ingress::TurnOrigin::Daemon;
+                            let turn = crate::agent::run_with_request(
+                                Arc::new(effective_config.clone()),
+                                request,
                                 overrides,
-                            ));
+                            );
                             // Canonical run attribution for every provider and
                             // tool event the step turn emits, so a run-filtered
                             // log query (and an OTLP collector) sees what the
@@ -2008,7 +1995,7 @@ mod tests {
         };
         let tmp = tempfile::tempdir().unwrap();
         let memory: Arc<dyn zeroclaw_memory::Memory> =
-            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path()).unwrap());
         let logger = SopAuditLogger::new(memory);
 
         let run_id = "run-canonical-attribution-0001";

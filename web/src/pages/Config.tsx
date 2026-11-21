@@ -33,9 +33,7 @@ import {
   type PickerItem,
   type SectionInfo,
 } from "../lib/api";
-import FieldForm, {
-  clearFieldFormCatalogCaches,
-} from "../components/sections/FieldForm";
+import FieldForm from "../components/sections/FieldForm";
 import PersonalityEditor from "../components/sections/PersonalityEditor";
 import SkillsBundleEditor from "../components/sections/SkillsBundleEditor";
 import BindChannelForm from "../components/sections/BindChannelForm";
@@ -54,6 +52,7 @@ import CostRatesEditor, {
 } from "../components/sections/CostRatesEditor";
 import { Badge, Button, Card, PageHeader } from "@/components/ui";
 import { t } from "@/lib/i18n";
+import ProviderRegistryEditor from '../components/sections/ProviderRegistryEditor';
 
 // Display order for the curated sidebar groups. Each `SectionInfo.group`
 // from the gateway lands in one of these buckets (anything else falls
@@ -92,7 +91,11 @@ export default function Config() {
     section: sectionParam,
     type: typeParam,
     alias: aliasParam,
-  } = useParams<{ section?: string; type?: string; alias?: string }>();
+  } = useParams<{
+    section?: string;
+    type?: string;
+    alias?: string;
+  }>();
   const location = useLocation();
   const navigate = useNavigate();
   const lockedSection = location.pathname.startsWith("/setup/")
@@ -158,13 +161,6 @@ export default function Config() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sectionParam, sections]);
 
-  // Bust FieldForm's per-provider model catalog cache on section change so a
-  // model alias just added under e.g. `providers.models.anthropic` shows up
-  // the next time the user opens an agent form, without a hard refresh.
-  useEffect(() => {
-    clearFieldFormCatalogCaches();
-  }, [sectionParam, typeParam, aliasParam]);
-
   const activeSection = useMemo(
     () => sections.find((s) => s.key === activeKey) ?? null,
     [sections, activeKey],
@@ -224,9 +220,14 @@ export default function Config() {
   // or a flat alias list — no hardcoded section keys on the client.
   const needsAliasTier = activeSection?.shape === "typed_family_map";
   const isOneTierAliasSection = activeSection?.shape === "one_tier_alias_map";
+  const isCostRatesSection = activeSection?.shape === "cost_rates";
 
   const mainContent = (() => {
     if (!activeSection) return null;
+
+    if (activeSection.key === 'providers.registry') {
+      return <ProviderRegistryEditor onSaved={fetchDrift} />;
+    }
 
     if (!activeSection.has_picker) {
       return (
@@ -241,6 +242,31 @@ export default function Config() {
       );
     }
 
+    // Cost-only provider sections retain the familiar category entry point,
+    // but never expose the retired provider alias editor. The selected type
+    // is the provider family used by the canonical cost-rate map.
+    if (isCostRatesSection && typeParam) {
+      const category = activeSection.cost_category as CostRatesCategory;
+      return (
+        <div className="flex flex-col gap-3 flex-1 min-h-0">
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={() => navigate(`/config/${encodeURIComponent(activeSection.key)}`)}
+            className="self-start"
+          >
+            <ArrowLeft className="h-4 w-4" />
+            {t("config.back_to")}{activeSection.label}
+          </Button>
+          <CostRatesEditor
+            category={category}
+            providerType={typeParam}
+            onSaved={fetchDrift}
+          />
+        </div>
+      );
+    }
+
     // /config/:section/:type/:alias — field form
     if (typeParam && aliasParam) {
       const fieldsPrefix = needsAliasTier
@@ -249,14 +275,15 @@ export default function Config() {
           : `${activeSection.key}.${typeParam}.${aliasParam}`
         : typeParam;
 
-      // Pre-scoped operator-bind tab on a pairing channel's own page, so you
-      // can authorize a user (no /bind message) right where you configured it.
-      const channelExtraTabs: SectionTabSpec[] = [];
+      // Extra tabs alongside the wire-driven field tabs for this alias page.
+      // Channels get a pre-scoped operator-bind tab (authorize a user right
+      // where you configured the channel, no /bind message).
+      const aliasExtraTabs: SectionTabSpec[] = [];
       if (
         activeSection.key === "channels" &&
         ["telegram", "wechat", "line"].includes(typeParam)
       ) {
-        channelExtraTabs.push({
+        aliasExtraTabs.push({
           key: "bind",
           label: "Bind identity",
           render: () => (
@@ -269,6 +296,7 @@ export default function Config() {
           ),
         });
       }
+
 
       return (
         <div className="flex flex-col gap-3 flex-1 min-h-0">
@@ -289,7 +317,7 @@ export default function Config() {
             onSaved={fetchDrift}
             drift={drifted}
             extraTabs={
-              channelExtraTabs.length > 0 ? channelExtraTabs : undefined
+              aliasExtraTabs.length > 0 ? aliasExtraTabs : undefined
             }
           />
         </div>
@@ -475,7 +503,7 @@ export default function Config() {
       <SectionOverview
         section={activeSection}
         onPickType={(typeKey) => {
-          if (needsAliasTier) {
+          if (needsAliasTier || isCostRatesSection) {
             goToType(activeSection.key, typeKey);
           } else {
             void (async () => {

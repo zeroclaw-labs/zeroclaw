@@ -8,9 +8,9 @@ Use this page when a change touches `model_routes`, session or in-turn model sel
 
 | Concern | Current owner | Contract |
 | --- | --- | --- |
-| Provider profiles and fallback graph | `zeroclaw-config` provider schema and validation | A dotted `<family>.<alias>` identifies the endpoint, credentials, optional primary model, capabilities, and ordered fallback declarations for one profile. |
-| Provider construction | `zeroclaw-providers` factory functions | Materialize each profile with its own settings, flatten configured fallback entries in order, and compose routing around reliability. |
-| Hint-based selection | `RouterModelProvider` | Resolve `hint:<name>` to a configured provider target and route model. The primary target is pinned to the active/default model. A non-primary target is pinned when its profile configures a model; otherwise its reliable entry remains unpinned and receives the route model. |
+| Provider profiles and fallback graph | `zeroclaw-config` provider schema and validation | An exact model key identifies a capability model; its `provider` points to a reusable connection, and `[providers.fallback]` stores ordered exact-key edges. |
+| Provider construction | `zeroclaw-providers` factory functions | `zeroclaw-providers::model::build_model` derives the selected model, tuning, connection and identity from config; runtime adds its tool dispatcher. Reuse the immutable registry during one build, while materializing each fallback candidate with its complete model settings before composing routing around reliability. |
+| Hint-based selection | `RouterModelProvider` | Resolve `hint:<name>` to a configured exact model target. The target key is authoritative; route metadata cannot replace its model options or connection policy. |
 | Effort-based selection | Resolved runtime profile plus agent/channel turn entrypoints | Deterministically classify an opted-in turn, select one of two existing route hints, preserve explicit model choices, and constrain eligible provider attempts for the turn. |
 | Retry and failover | `ReliableModelProvider` | Classify failures, retry with bounded backoff, honor rate-limit cooldowns, and advance through the materialized entries. |
 | Provider stream termination | Concrete providers and `zeroclaw-providers/src/stream_guard.rs` | Translate each provider protocol's completion semantics into `StreamEvent::Final` or a truncation error. |
@@ -23,14 +23,14 @@ Use this page when a change touches `model_routes`, session or in-turn model sel
 
 The runtime starts with an active provider reference and model from the selected agent, a session override, or an in-turn `model_switch`. Provider construction then composes two wrappers:
 
-1. The factory builds a `ReliableModelProvider` for the active provider profile. An effective primary model comes from an explicit construction override or the profile's configured `model`. When one exists, it and the profile's `fallback_models` become pinned entries. Without one, the profile contributes one unpinned entry and its `fallback_models` are not materialized. Recursively referenced `fallback` profiles are still walked. Each referenced profile keeps its own credentials, endpoint, headers, model, and capability overrides.
+1. The factory builds a `ReliableModelProvider` for the active exact-key model. The selected model and every `[providers.fallback]` target are resolved from complete model definitions. The immutable connection registry is reused during this construction transaction, while each candidate gets a fresh adapter with its own model options, metadata, and pin.
 2. When `model_routes` are configured, the factory builds a separate reliable provider for the primary route and each unique route target, then wraps them in `RouterModelProvider`.
 3. A recognized `hint:<name>` selects its configured target before the call enters that target's reliability policy. A normal model value uses the default route. An unknown hint logs a warning, stays in the default reliability domain, and preserves the literal `hint:<name>` as the requested model. A pinned default entry still serves its pin; an unpinned default entry forwards the literal value and the provider may reject it before normal fallback or error handling continues.
 
 There are two current construction constraints:
 
-- Route pinning is conditional. The primary target is pinned to the active/default model passed into provider construction, including when a recognized hint points back to the active primary profile; that hint's `model_routes[].model` value does not override the primary pin. A non-primary target with a configured profile model is pinned to that model, so its route model does not override the profile model either. A non-primary target without a configured model is valid and remains unpinned; the route model reaches that provider, and that profile's `fallback_models` are not materialized even though its referenced fallback profiles are still walked. Keep each route model aligned with the target pin when one exists, and account for the unpinned behavior when the target profile omits `model`.
-- Route targets are deduplicated by `model_provider`. If a route supplies `api_key`, the first matching route credential takes precedence when the shared target is constructed. Prefer credentials on the provider profile when several hints share one target.
+- Route selection is exact-key based. A recognized hint selects its configured `model_ref`; the route does not duplicate or override connection credentials, upstream model IDs, or model options. A fallback or model switch resolves a new exact key and rematerializes its complete policy, so construction never inherits the primary model's options by accident.
+- Each route target is built from its own canonical model definition. The immutable connection registry may be reused during one build transaction, but the model-aware adapter and all model-specific options are resolved afresh for every target.
 
 This ordering matters: routing chooses a reliability domain; it does not bypass reliability. An external routing service such as OpenRouter can still perform server-side selection behind one ZeroClaw profile, but it is optional and does not replace ZeroClaw's first-party route and fallback contracts.
 
@@ -44,19 +44,19 @@ The operator-facing schema and examples live in [Provider configuration](../prov
 
 For a production alias, the factory flattens the configured graph depth-first. The effective order is:
 
-1. The profile's effective primary model, or one unpinned entry when no effective primary model exists.
-2. That profile's `fallback_models`, in order, only when an effective primary model exists.
-3. Each `fallback` profile, in order, including that profile's own primary or unpinned entry, eligible fallback models, and nested fallback profiles.
+1. The selected exact-key model reference.
+2. Each target in `[providers.fallback]` for that reference, in depth-first order.
+3. Every target is resolved from its complete model definition; only the immutable connection registry is reused within the construction transaction.
 
 For each materialized entry, `ReliableModelProvider` attempts the request up to `provider_retries + 1` times. A retryable error normally stays on the entry and applies bounded backoff. A retryable rate limit places that provider profile on an in-memory cooldown and advances when another entry exists. Most non-retryable errors advance immediately; context-window errors have method-specific handling and can return early for runtime recovery. A successful response ends the walk; if every entry fails, the wrapper returns an aggregated error with the attempt failures.
 
-Materialization order and effective execution order can differ after a rate limit. A profile's primary and `fallback_models` entries share one cooldown key, so a `429` on the primary can cause the remaining same-profile models to be skipped while the cooldown is active.
+Materialization order and effective execution order can differ after a rate limit. Each exact-key candidate has its own materialized model identity and policy. Cooldown state is attached to the admitted candidate domain, so a model switch or fallback cannot accidentally reuse the primary model's options.
 
-The global `reliability.api_keys` pool is not a working failover mechanism today. The wrapper selects and logs an alternate key after a retryable rate limit, but the `ModelProvider` trait cannot apply that key to the constructed provider, so the retry still uses the original credential. [Issue #9190](https://github.com/zeroclaw-labs/zeroclaw/issues/9190) tracks the repair. Use distinct fallback profiles or an external routing service when credential-level failover is required.
+The global `reliability.api_keys` pool is not a working failover mechanism today. The wrapper selects and logs an alternate key after a retryable rate limit, but the `ModelProvider` trait cannot apply that key to the constructed provider, so the retry still uses the original credential. [Issue #9190](https://github.com/zeroclaw-labs/zeroclaw/issues/9190) tracks the repair. Use distinct exact-key fallback models or an external routing service when credential-level failover is required.
 
 Empty completions receive the same bounded retry treatment instead of immediately becoming a blank assistant turn.
 
-Invalid fallback declarations have two different boundaries. Dangling references, cycles, over-depth edges, blank model IDs, and duplicate primary models are reported and pruned as described in [Provider configuration](../providers/configuration.md#misconfiguration). A fallback profile that resolves but cannot supply its required credential or cannot be constructed fails provider initialization rather than silently changing the route.
+Invalid fallback declarations have two boundaries. Dangling references, cycles, and over-depth edges are reported and pruned as described in [Provider configuration](../providers/configuration.md#fallback-on-failure). A target that resolves but cannot supply its required credential or cannot be constructed fails provider initialization rather than silently changing the route.
 
 ## Streaming and replay boundary
 
@@ -92,8 +92,8 @@ Content refusal and safeguard fallback is also a separate proposed contract from
 For provider-routing changes, answer these before reviewer sign-off:
 
 - Does the change affect agent dispatch, hint selection, reliability fallback, or an external router? Name exactly one owner for each decision.
-- If a hint targets any provider profile, does its model handling match the target construction? Compare the primary target with the active/default pin. For a non-primary target with a configured model, compare the route model with that pin. If the profile omits `model`, confirm that the route model should flow through and that the profile's `fallback_models` will not be materialized.
-- Does every fallback profile retain its own endpoint, credentials, model, headers, and capability overrides?
+- If a hint targets a model reference, does construction preserve that exact key and rematerialize its full model policy?
+- Does every fallback target retain its own connection, credentials, model, headers, presets, options, and capability overrides?
 - What is retryable, what advances immediately, and what error is returned after exhaustion?
 - Can a request be replayed after any output that a user or immutable consumer already observed?
 - What exact signal does each provider parser accept as completion? Does EOF before that signal fail as truncated?
@@ -111,3 +111,73 @@ For provider-routing changes, answer these before reviewer sign-off:
 - Provider stream completion guard: `crates/zeroclaw-providers/src/stream_guard.rs`
 - Runtime stream replay and partial-output handling: `crates/zeroclaw-runtime/src/agent/turn/provider_call.rs`, `crates/zeroclaw-runtime/src/agent/turn/stream_consume.rs`
 - Operator guides: [Provider configuration](../providers/configuration.md), [Routing](../providers/routing.md), [Streaming](../providers/streaming.md)
+
+### Named selections and capacity
+
+`ModelIdentity` contains an exact `ModelRef` and the effective upstream model
+ID. It has no family/profile/model-alias decomposition. Capacity, billing,
+route selection, and refresh dependencies retain each candidate's exact key;
+two keys sharing a connection or upstream ID remain distinct selections.
+Reliable dispatch resolves every fallback target's full definition and policy.
+Accepted-call reports carry the construction selection on ordinary and streamed
+calls. Capacity is resolved from the admitted Config generation at consumption.
+
+All configured consumers construct through `zeroclaw_providers::model`.
+`zeroclaw-config` converts historical profiles, speech bindings and embedding
+bindings at configuration deserialization, before returning `Config`. Loaded
+configuration contains canonical connections and models; historical input tables
+are empty. Registry getters, Quickstart, validation, exports, and runtime consumers
+never project those tables. Explicit bare-family/URL CLI invocations may construct
+an ephemeral registry from the already admitted model and connection.
+Exact model keys always win; dots inside a key never imply profile ancestry.
+A same-family CLI input inherits the admitted agent model and its connection
+policy; an explicit URL replaces the connection URI for that construction.
+An explicit upstream model argument changes only the primary model ID. Hint
+routes and fallback targets still materialize their own complete definitions.
+Unknown dotted references and wrong-capability targets fail construction.
+
+CLI and tool writes use the shared registry editor with typed keys. The editor
+validates and replaces canonical definitions only. Historical provider tables are
+retired during loading and structural disk migration, including files already
+stamped V4. Environment-input normalization translates restore records to their
+canonical field identities, preserving pre-override credentials and bindings on
+save.
+Embedding construction is prepared before the live config commit; disabling
+embeddings installs the empty implementation instead of retaining an old one.
+Speech managers accept the full admitted Config and register exact capability
+model keys; section-only historical adapters are test fixtures.
+
+### Configuration and invocation sampling
+
+Registry resolvers provide borrowed model selections and effective options.
+Model construction returns an encapsulated `BuiltModel` binding; its model
+reference and upstream ID derive from `ModelIdentity`. `build_model` assembles routing and reliability, while `build_raw_provider` and `build_reliable_provider` preserve consumers that own their routing or make a single raw call. Their `ProviderOverrides` argument carries only genuine invocation overrides; consumers do not independently copy credentials or rebuild model-option overlays. Runtime alone adds the tool dispatcher. The model-option overlay destructures all model fields exhaustively, requiring an explicit inheritance decision when the schema grows.
+
+Initial Agent construction accepts model overrides before building its provider, so an explicit model does not require a configured default. Session refresh builds a sealed `PreparedModelUpdate` from one admitted configuration generation and installs that generation together with the complete runtime binding. Refresh dependency checks traverse the canonical fallback graph and routed selections on demand, using both old and new configurations for changed or removed models. Shared construction inputs (provider retries, backoff and key pool; runtime reasoning defaults; credential-store encryption; and multimodal policy) rebuild all live RPC bindings through the same transaction before a config write is acknowledged. Existing turns keep their admitted generation until completion. No parallel dependency registry is retained. An equivalent in-turn model switch is a successful no-op; returning from a classified hint to the primary selection still resets the selector. Model-dependent tools resolve through the Agent's admitted configuration cell; independent live security policy keeps its own authority.
+
+Configured Agent callers use `AgentBuildContext` for invocation and transport capabilities. The runner accepts an `AgentRunRequest` and an admitted `Arc<Config>`; its heap boundary is established before callers compose task-local scopes, and polling remains in the caller task. Compatibility overloads delegate to these entries. Delegate registration supplies the canonical configuration plus execution capabilities through `DelegateBuildContext`; it does not reconstruct parallel provider, agent, runtime, risk or skill maps. Delegated capacity comes from the same target generation as its provider and sampling.
+
+Agent-scoped refresh excludes sessions owned by other agents before acquiring their update guards. Provider and shared scopes remain conservative until the installed active selection is read under the guard, because an in-turn switch can differ from session overrides. Channel reload uses the canonical configuration filename rather than reconstructing `config.toml` from provider options.
+
+Model-routing mutations acquire the shared config write gate without waiting, then probe a privately hydrated candidate before saving it. A busy gate produces a retryable result: a running RPC turn already holds its session guard, and a config writer can hold the gate while waiting for that turn. Construction errors and permanent request failures reject the candidate; transient request failures permit saving with an explicit deferred outcome. Uncredentialed hosted profiles without an explicit endpoint or external authentication return an explicit skipped outcome. Catalog and pricing construction also use `build_nonblocking`; async listing remains on the normal async path. Live pricing stores results under each opted-in exact model key. Historical
+profiles project their selected/default row and each nested entry independently;
+pricing never fabricates a vendor-prefix fallback rate.
+
+After an in-turn switch, refresh derives the active selection from the installed Agent identity and admitted configuration. Changing only a session's model or temperature preserves that active provider. Configured model defaults are resolved again during rebuilding. A switched model ID that differs from its admitted selection's default remains pinned; an equivalent switch is a no-op and continues to inherit default edits. Existing explicit session model overrides retain their own provenance. A new explicit provider selection in a `session/configure` request takes precedence over the active in-turn selection.
+
+Long-lived channel tool registries resolve model configuration through an immutable turn-admission scope keyed by the owning agent. Concurrent turns retain separate scopes. Nested turns add their own admission while borrowed parent tools retain their parent's generation; spawned pipeline and bounded-delegate workers explicitly inherit this context. The scope carries existing admitted Config Arcs and does not publish or cache live configuration.
+
+Invocation temperature and thinking adjustment travel separately from configured defaults. `zeroclaw-api::model_provider::CallSampling` is a configuration-independent explicit call input: `Explicit(None)` omits temperature, `Explicit(Some(value))` overrides it, and a per-selection resolver opts into configured defaults. The existing scalar trait methods always retain their omit/override meaning. Configured consumers use the corresponding `*_with_sampling` methods; no ambient task-local policy changes scalar calls. `Temperature::for_call` captures the admitted configuration Arc for the lifetime of a call or stream, and turn iterations share one admitted generation. Reliable retains each candidate's construction reference, including its exact model key, and resolves sampling at the attempt boundary. Router, model-pin, vision and dispatch wrappers preserve this explicit input.
+
+Per-call native tool-round policy travels alongside sampling through the combined chat and stream methods. Composite providers forward both controls; a physical attempt resolves its own sampling without losing the selected tool-round policy. Effort routes retain exact model keys for construction, capacity, and the
+attempt allowlist. Scoped configuration retains only admitted chat models and
+fallback edges between admitted keys; it never expands a permission by a dotted
+prefix or by a shared connection. Classifier calls, visual fallback and model switches observe that same boundary.
+
+Kernel-only CLI chat, channel classification and consolidation, skill reflection, delegation, direct vision calls, and graceful summaries use their own selected route and admitted configuration. A separately configured classifier with no temperature leaves sampling unset rather than inheriting the main agent's value. A derived entrance temperature never becomes an invocation override. Explicit invocation overrides continue across retry and fallback candidates and model switches. Reverting the integration restores the previous sampling behavior; no persisted config migration is involved.
+
+SOP `llm.generate` holds a resolver over the canonical live-config handle rather than a provider or sampling snapshot. Each call reads one published Config, resolves the default agent's current selection, and constructs through `build_model`. The adapter uses `build_nonblocking` for construction and passes sampling from that same generation explicitly. This shared construction adapter also protects async Agent, channel, tool, gateway boot, doctor catalog and raw vision-route callers from synchronous OAuth exchanges that use a blocking HTTP client. Published updates to model identity, endpoint, credentials, and model options apply on the next SOP call without recreating the engine. Invalid selections fail the call rather than reusing the previous provider. Reverting this integration restores construction-time SOP settings; no persisted config migration is involved.
+
+Hailo-Ollama materializes the selected model's context window through the common construction-option overlay for its existing local input budget. Rebuilding a binding rematerializes this projection; Config remains canonical and the window is not sent as a wire `num_ctx` override.
+
+Deterministic response-cache keys include the full selected reference and a SHA-256 digest of the canonical model-provider configuration and shared construction options, resolved at use time. Entries with the same wire model ID but different tuning, and updates to the same entry, cannot reuse an earlier result. Connection credentials are never stored as plaintext in the cache key. Changes anywhere in model-provider configuration or shared request defaults conservatively start a new cache namespace. Reverting these fixes restores the earlier vision sampling, fallback capacity, Hailo budgeting and cache reuse behavior; no persisted configuration migration is required.

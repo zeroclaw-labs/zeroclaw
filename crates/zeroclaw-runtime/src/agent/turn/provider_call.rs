@@ -36,6 +36,45 @@ pub(crate) struct ProviderCallOutcome {
     pub(crate) image_recovery_succeeded: bool,
 }
 
+/// Route/request data selected for one provider attempt. Keeping this as one
+/// value prevents the streaming and non-streaming branches from growing a
+/// parallel list of loosely related arguments whenever a route policy gains a
+/// new field.
+struct ProviderCallInput<'a> {
+    active_model_provider: &'a dyn ModelProvider,
+    active_model_provider_name: &'a str,
+    active_model: &'a str,
+    active_dispatch_model: &'a str,
+    original_request: ChatRequest<'a>,
+    image_recovery_messages: Option<&'a [ChatMessage]>,
+    should_consume_provider_stream: bool,
+    policy: zeroclaw_api::model_provider::ToolRoundPolicy,
+    iteration: usize,
+    guard_tools: Option<&'a [ToolSpec]>,
+}
+
+fn normalize_recovery(
+    result: Result<ChatResponse>,
+    ctx: &TurnCtx<'_>,
+    config: Option<&zeroclaw_config::schema::Config>,
+    scope: &zeroclaw_providers::dispatch::AccountedChatScope,
+) -> Result<ChatResponse> {
+    let route = scope.accepted_route();
+    let policy = config
+        .zip(route.as_ref())
+        .map(|(config, route)| {
+            config.model_text_extraction(route.selection_ref().unwrap_or(route.provider_ref()))
+        })
+        .unwrap_or(zeroclaw_api::TextExtraction {
+            reasoning: Some(ctx.extract_text_reasoning),
+            tool_calls: !ctx.text_tool_calls_disabled,
+        });
+    result.map(|mut response| {
+        zeroclaw_providers::response::normalize_response(&mut response, policy);
+        response
+    })
+}
+
 fn is_image_recovery_candidate_error(error: &anyhow::Error) -> bool {
     !zeroclaw_providers::reliable::is_context_window_exceeded(error)
         && error.chain().any(|cause| {
@@ -301,6 +340,7 @@ pub(crate) fn announce_budget_warning(
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn call_provider(
     ctx: &TurnCtx<'_>,
+    config: Option<&zeroclaw_config::schema::Config>,
     active_model_provider: &dyn ModelProvider,
     active_model_provider_name: &str,
     active_model: &str,
@@ -312,6 +352,60 @@ pub(crate) async fn call_provider(
     iteration: usize,
     guard_tools: Option<&[ToolSpec]>,
 ) -> Result<ProviderCallOutcome> {
+    let resolver = match config {
+        Some(config) => {
+            let config = std::sync::Arc::new(config.clone());
+            std::sync::Arc::new(move |model: &str| config.model_text_extraction(model))
+                as std::sync::Arc<dyn Fn(&str) -> zeroclaw_api::TextExtraction + Send + Sync>
+        }
+        None => {
+            let policy = zeroclaw_api::TextExtraction {
+                reasoning: Some(ctx.extract_text_reasoning),
+                tool_calls: !ctx.text_tool_calls_disabled,
+            };
+            std::sync::Arc::new(move |_: &str| policy)
+                as std::sync::Arc<dyn Fn(&str) -> zeroclaw_api::TextExtraction + Send + Sync>
+        }
+    };
+    zeroclaw_api::scope_text_extraction(
+        Some(resolver),
+        call_provider_inner(
+            ctx,
+            config,
+            ProviderCallInput {
+                active_model_provider,
+                active_model_provider_name,
+                active_model,
+                active_dispatch_model,
+                original_request,
+                image_recovery_messages,
+                should_consume_provider_stream,
+                policy,
+                iteration,
+                guard_tools,
+            },
+        ),
+    )
+    .await
+}
+
+async fn call_provider_inner(
+    ctx: &TurnCtx<'_>,
+    config: Option<&zeroclaw_config::schema::Config>,
+    input: ProviderCallInput<'_>,
+) -> Result<ProviderCallOutcome> {
+    let ProviderCallInput {
+        active_model_provider,
+        active_model_provider_name,
+        active_model,
+        active_dispatch_model,
+        original_request,
+        image_recovery_messages,
+        should_consume_provider_stream,
+        policy,
+        iteration,
+        guard_tools,
+    } = input;
     let mut streamed_live_deltas = false;
     let mut streamed_protocol_suppressed = false;
     let mut streamed_visible_text = String::new();
@@ -330,11 +424,13 @@ pub(crate) async fn call_provider(
                         active_model_provider,
                         original_request,
                         active_dispatch_model,
-                        ctx.temperature,
+                        ctx.temperature.clone(),
                         ctx.cancellation_token,
                         ctx.on_delta,
                         ctx.event_tx,
-                        ctx.strict_tool_parsing,
+                        ctx.text_tool_calls_disabled,
+                        ctx.extract_text_reasoning,
+                        config,
                         ctx.draft_reasoning,
                         policy,
                         guard_tools,
@@ -503,10 +599,10 @@ pub(crate) async fn call_provider(
                                         match streamed_refusal {
                                             Some(refusal) => {
                                                 dispatcher
-                                                    .chat_after_stream_refusal_with_tool_round_policy(
+                                                    .chat_after_stream_refusal_with_sampling_and_tool_round_policy(
                                                         request,
                                                         active_dispatch_model,
-                                                        ctx.temperature,
+                                                        ctx.temperature.clone(),
                                                         refusal,
                                                         policy,
                                                     )
@@ -514,10 +610,10 @@ pub(crate) async fn call_provider(
                                             }
                                             None => {
                                                 dispatcher
-                                                    .chat_with_tool_round_policy(
+                                                    .chat_with_sampling_and_tool_round_policy(
                                                         request,
                                                         active_dispatch_model,
-                                                        ctx.temperature,
+                                                        ctx.temperature.clone(),
                                                         policy,
                                                     )
                                                     .await
@@ -550,6 +646,7 @@ pub(crate) async fn call_provider(
                                     recovery.await
                                 };
                                 let result = if recover_images {
+                                    let recovery_result = normalize_recovery(recovery_result, ctx, config, &scope);
                                     match recovery_result {
                                         Ok(response)
                                             if !response.is_semantically_empty_terminal() =>
@@ -595,10 +692,10 @@ pub(crate) async fn call_provider(
                 .scope(Box::pin(with_exact_dispatch_route(
                     active_model_provider_name.to_string(),
                     active_model.to_string(),
-                    dispatcher.chat_with_tool_round_policy(
+                    dispatcher.chat_with_sampling_and_tool_round_policy(
                         original_request,
                         active_dispatch_model,
-                        ctx.temperature,
+                        ctx.temperature.clone(),
                         policy,
                     ),
                 )))
@@ -616,7 +713,7 @@ pub(crate) async fn call_provider(
                             scope.scope(with_exact_dispatch_route(
                                 active_model_provider_name.to_string(),
                                 active_model.to_string(),
-                                dispatcher.chat_with_tool_round_policy(
+                                dispatcher.chat_with_sampling_and_tool_round_policy(
                                     ChatRequest {
                                         messages: image_recovery_messages
                                             .unwrap_or(prepared_messages),
@@ -624,13 +721,13 @@ pub(crate) async fn call_provider(
                                         thinking: original_request.thinking,
                                     },
                                     active_dispatch_model,
-                                    ctx.temperature,
+                                    ctx.temperature.clone(),
                                     policy,
                                 ),
                             )),
                         )
                         .await;
-                        match recovery {
+                        match normalize_recovery(recovery, ctx, config, &scope) {
                             Ok(response) if !response.is_semantically_empty_terminal() => {
                                 image_recovery_succeeded = true;
                                 Ok(response)
@@ -758,7 +855,7 @@ mod payload_capture_tests {
                 model_context_window_source:
                     zeroclaw_config::schema::ModelContextWindowSource::Configured,
             },
-            temperature: None,
+            temperature: None.into(),
             approval: None,
             channel_name: "test",
             channel_reply_target: None,
@@ -768,7 +865,8 @@ mod payload_capture_tests {
             hooks: None,
             dedup_exempt_tools: &[],
             pacing,
-            strict_tool_parsing: false,
+            text_tool_calls_disabled: false,
+            extract_text_reasoning: true,
             channel: None,
             draft_reasoning,
             agent_alias: None,
@@ -1237,7 +1335,7 @@ mod streaming_fallback_tests {
             provider_name: "test-provider",
             model: "test-model",
             context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0),
-            temperature: Some(0.0),
+            temperature: Some(0.0).into(),
             approval: None,
             channel_name: "test",
             channel_reply_target: None,
@@ -1247,7 +1345,8 @@ mod streaming_fallback_tests {
             hooks: None,
             dedup_exempt_tools: &[],
             pacing,
-            strict_tool_parsing: false,
+            text_tool_calls_disabled: false,
+            extract_text_reasoning: true,
             channel: None,
             draft_reasoning: StreamReasoningMode::Status,
             turn_id: "test-turn",
@@ -1325,6 +1424,7 @@ mod streaming_fallback_tests {
             let recovery = [ChatMessage::user("image omitted")];
             let call = call_provider(
                 &ctx,
+                None,
                 &provider,
                 "test-provider",
                 "test-model",
@@ -1378,6 +1478,7 @@ mod streaming_fallback_tests {
             Duration::from_secs(11),
             call_provider(
                 &ctx,
+                None,
                 &provider,
                 "test-provider",
                 "test-model",
@@ -1922,7 +2023,7 @@ mod streaming_fallback_tests {
             provider_name: "test-provider",
             model: "test-model",
             context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0),
-            temperature: Some(0.0),
+            temperature: Some(0.0).into(),
             approval: None,
             channel_name: "test",
             channel_reply_target: None,
@@ -1932,7 +2033,8 @@ mod streaming_fallback_tests {
             hooks: None,
             dedup_exempt_tools: &[],
             pacing: &pacing,
-            strict_tool_parsing: false,
+            text_tool_calls_disabled: false,
+            extract_text_reasoning: true,
             channel: None,
             draft_reasoning: StreamReasoningMode::Status,
             turn_id: "test-turn",
@@ -1949,6 +2051,7 @@ mod streaming_fallback_tests {
                     Some(cost_context),
                     call_provider(
                         &ctx,
+                        None,
                         &provider,
                         "test-provider",
                         "test-model",
@@ -2038,7 +2141,7 @@ mod streaming_fallback_tests {
             provider_name: "test-provider",
             model: "test-model",
             context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0),
-            temperature: Some(0.0),
+            temperature: Some(0.0).into(),
             approval: None,
             channel_name: "test",
             channel_reply_target: None,
@@ -2048,7 +2151,8 @@ mod streaming_fallback_tests {
             hooks: None,
             dedup_exempt_tools: &[],
             pacing: &pacing,
-            strict_tool_parsing: false,
+            text_tool_calls_disabled: false,
+            extract_text_reasoning: true,
             channel: None,
             draft_reasoning: StreamReasoningMode::Status,
             turn_id: "test-turn",
@@ -2060,6 +2164,7 @@ mod streaming_fallback_tests {
 
         let outcome = call_provider(
             &ctx,
+            None,
             &provider,
             "test-provider",
             "test-model",
@@ -2101,7 +2206,7 @@ mod streaming_fallback_tests {
             provider_name: "test-provider",
             model: "test-model",
             context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0),
-            temperature: Some(0.0),
+            temperature: Some(0.0).into(),
             approval: None,
             channel_name: "test",
             channel_reply_target: None,
@@ -2111,7 +2216,8 @@ mod streaming_fallback_tests {
             hooks: None,
             dedup_exempt_tools: &[],
             pacing: &pacing,
-            strict_tool_parsing: false,
+            text_tool_calls_disabled: false,
+            extract_text_reasoning: true,
             channel: None,
             draft_reasoning: StreamReasoningMode::Status,
             turn_id: "test-turn",
@@ -2123,6 +2229,7 @@ mod streaming_fallback_tests {
 
         let error = call_provider(
             &ctx,
+            None,
             &provider,
             "test-provider",
             "test-model",
@@ -2245,7 +2352,7 @@ mod streaming_fallback_tests {
                 provider_name: "test-provider",
                 model: "test-model",
                 context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0),
-                temperature: Some(0.0),
+                temperature: Some(0.0).into(),
                 approval: None,
                 channel_name: "test",
                 channel_reply_target: None,
@@ -2255,7 +2362,8 @@ mod streaming_fallback_tests {
                 hooks: None,
                 dedup_exempt_tools: &[],
                 pacing: &pacing,
-                strict_tool_parsing: false,
+                text_tool_calls_disabled: false,
+                extract_text_reasoning: true,
                 channel: None,
                 draft_reasoning: StreamReasoningMode::Status,
                 turn_id: "test-turn",
@@ -2267,6 +2375,7 @@ mod streaming_fallback_tests {
 
             let outcome = call_provider(
                 &ctx,
+                None,
                 &provider,
                 "test-provider",
                 "test-model",
@@ -2305,6 +2414,81 @@ mod streaming_fallback_tests {
             assert_eq!(outcome.attempts.len(), 2);
             server.abort();
         }
+    }
+
+    #[tokio::test]
+    async fn image_recovery_uses_the_fallback_models_extraction_policy() {
+        use axum::{Json, response::IntoResponse};
+        let app = Router::new().route("/chat/completions", post(|Json(body): Json<serde_json::Value>| async move {
+            let has_image = body["messages"].as_array().unwrap().iter().any(|message|
+                message["content"].as_array().is_some_and(|parts|
+                    parts.iter().any(|part| part["type"] == "image_url")));
+            if has_image {
+                return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":{"message":"image request rejected"}}))).into_response();
+            }
+            if body["model"] == "primary-model" {
+                return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error":{"message":"primary unavailable"}}))).into_response();
+            }
+            Json(serde_json::json!({"choices":[{"message":{"content":"<think>literal text</think>"}}]})).into_response()
+        }));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server =
+            zeroclaw_spawn::spawn!(async move { axum::serve(listener, app).await.unwrap() });
+        let config = serde_json::from_value(serde_json::json!({
+            "reliability":{"provider_retries":0,"provider_backoff_ms":1},
+            "providers":{
+                "connections":{"gateway":{"kind":"custom","uri":format!("http://{addr}")}},
+                "models":{
+                    "primary":{"capability":"chat","provider":"gateway","model":"primary-model","options":{"extract_text_reasoning":true}},
+                    "backup":{"capability":"chat","provider":"gateway","model":"backup-model","options":{"extract_text_reasoning":false}}
+                },
+            }
+        })).unwrap();
+        let original = [ChatMessage::user(
+            "inspect [IMAGE:data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC]",
+        )];
+        let recovery = [ChatMessage::user("inspect")];
+        let observer = NoopObserver;
+        let pacing = PacingConfig::default();
+        let mut ctx = recovery_test_ctx(&observer, &pacing);
+        ctx.extract_text_reasoning = true;
+        for streaming in [false, true] {
+            let provider = zeroclaw_providers::model::build_reliable_provider(
+                &config,
+                "backup",
+                Default::default(),
+            )
+            .unwrap()
+            .provider;
+            let outcome = call_provider(
+                &ctx,
+                Some(&config),
+                provider.as_ref(),
+                "backup",
+                "backup-model",
+                "backup-model",
+                ChatRequest::new(&original),
+                Some(&recovery),
+                streaming,
+                ToolRoundPolicy::Batch,
+                0,
+                None,
+            )
+            .await
+            .unwrap();
+            assert!(
+                outcome.image_recovery_succeeded,
+                "streaming={streaming}, result={:?}",
+                outcome.chat_result
+            );
+            assert_eq!(
+                outcome.chat_result.unwrap().text.as_deref(),
+                Some("<think>literal text</think>"),
+                "streaming={streaming}"
+            );
+        }
+        server.abort();
     }
 
     #[tokio::test]
@@ -2360,17 +2544,19 @@ mod streaming_fallback_tests {
             "inspect [IMAGE:data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC]",
         )];
         let recovery = [ChatMessage::user("inspect")];
-        let provider = zeroclaw_providers::create_resilient_model_provider_with_options(
-            "custom",
-            None,
-            Some(&format!("http://{addr}")),
-            &zeroclaw_config::schema::ReliabilityConfig {
-                provider_retries: 0,
-                provider_backoff_ms: 1,
-                ..Default::default()
-            },
-            &zeroclaw_providers::ModelProviderRuntimeOptions::default(),
+        let config = serde_json::from_value(serde_json::json!({
+            "reliability": {"provider_retries": 0, "provider_backoff_ms": 1},
+            "providers": {
+                "connections": {"recovery": {"kind": "custom", "uri": format!("http://{addr}")}},
+                "models": {"recovery": {"capability": "chat", "provider": "recovery", "model": "test-model"}}
+            }
+        })).expect("canonical recovery configuration");
+        let provider = zeroclaw_providers::model::build_reliable_provider(
+            &config,
+            "recovery",
+            Default::default(),
         )
+        .map(|resolved| resolved.provider)
         .expect("construct production factory and reliability wrappers");
         let provider = zeroclaw_providers::router::RouterModelProvider::new(
             "test-router",
@@ -2398,6 +2584,7 @@ mod streaming_fallback_tests {
 
         let outcome = call_provider(
             &ctx,
+            None,
             &provider,
             "test-provider",
             "test-model",
@@ -2465,7 +2652,7 @@ mod streaming_fallback_tests {
             provider_name: "requested-provider",
             model: "requested-model",
             context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0),
-            temperature: Some(0.0),
+            temperature: Some(0.0).into(),
             approval: None,
             channel_name: "test",
             channel_reply_target: None,
@@ -2475,7 +2662,8 @@ mod streaming_fallback_tests {
             hooks: None,
             dedup_exempt_tools: &[],
             pacing: &pacing,
-            strict_tool_parsing: false,
+            text_tool_calls_disabled: false,
+            extract_text_reasoning: true,
             channel: None,
             draft_reasoning: StreamReasoningMode::Status,
             turn_id: "test-turn",
@@ -2488,6 +2676,7 @@ mod streaming_fallback_tests {
         let (outcome, notice) = zeroclaw_providers::scope_safeguard_fallback(async {
             let outcome = call_provider(
                 &ctx,
+                None,
                 &provider,
                 "requested-provider",
                 "requested-model",
@@ -2578,7 +2767,7 @@ mod streaming_fallback_tests {
             provider_name: "test-provider",
             model: "test-model",
             context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0),
-            temperature: Some(0.0),
+            temperature: Some(0.0).into(),
             approval: None,
             channel_name: "test",
             channel_reply_target: None,
@@ -2588,7 +2777,8 @@ mod streaming_fallback_tests {
             hooks: None,
             dedup_exempt_tools: &[],
             pacing: &pacing,
-            strict_tool_parsing: false,
+            text_tool_calls_disabled: false,
+            extract_text_reasoning: true,
             channel: None,
             draft_reasoning: StreamReasoningMode::Status,
             turn_id: "test-turn",
@@ -2600,6 +2790,7 @@ mod streaming_fallback_tests {
 
         let error = call_provider(
             &ctx,
+            None,
             &provider,
             "test-provider",
             "test-model",
@@ -2657,7 +2848,7 @@ mod streaming_fallback_tests {
             provider_name: "requested-provider",
             model: "requested-model",
             context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0),
-            temperature: Some(0.0),
+            temperature: Some(0.0).into(),
             approval: None,
             channel_name: "test",
             channel_reply_target: None,
@@ -2667,7 +2858,8 @@ mod streaming_fallback_tests {
             hooks: None,
             dedup_exempt_tools: &[],
             pacing: &pacing,
-            strict_tool_parsing: false,
+            text_tool_calls_disabled: false,
+            extract_text_reasoning: true,
             channel: None,
             draft_reasoning: StreamReasoningMode::Status,
             turn_id: "test-turn",
@@ -2679,6 +2871,7 @@ mod streaming_fallback_tests {
 
         let outcome = call_provider(
             &ctx,
+            None,
             &provider,
             "requested-provider",
             "requested-model",
@@ -2737,7 +2930,7 @@ mod streaming_fallback_tests {
             provider_name: "requested-provider",
             model: "requested-model",
             context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0),
-            temperature: Some(0.0),
+            temperature: Some(0.0).into(),
             approval: None,
             channel_name: "test",
             channel_reply_target: None,
@@ -2747,7 +2940,8 @@ mod streaming_fallback_tests {
             hooks: None,
             dedup_exempt_tools: &[],
             pacing: &pacing,
-            strict_tool_parsing: false,
+            text_tool_calls_disabled: false,
+            extract_text_reasoning: true,
             channel: None,
             draft_reasoning: StreamReasoningMode::Status,
             turn_id: "test-turn",
@@ -2759,6 +2953,7 @@ mod streaming_fallback_tests {
 
         let outcome = call_provider(
             &ctx,
+            None,
             &provider,
             "requested-provider",
             "requested-model",
@@ -2896,6 +3091,7 @@ mod streaming_fallback_tests {
                 let recovery = [ChatMessage::user("inspect")];
                 let outcome = call_provider(
                     &ctx,
+                    None,
                     &provider,
                     "test-provider",
                     "test-model",
@@ -3098,6 +3294,7 @@ mod streaming_fallback_tests {
 
         let call = call_provider(
             &ctx,
+            None,
             &provider,
             "test-provider",
             "test-model",
@@ -3157,6 +3354,7 @@ mod streaming_fallback_tests {
 
         let outcome = call_provider(
             &ctx,
+            None,
             &provider,
             "test-provider",
             "test-model",
@@ -3211,6 +3409,7 @@ mod streaming_fallback_tests {
 
             let outcome = call_provider(
                 &ctx,
+                None,
                 &provider,
                 "test-provider",
                 "test-model",
@@ -3332,6 +3531,7 @@ mod streaming_fallback_tests {
             let recovery = [ChatMessage::user("inspect")];
             let outcome = call_provider(
                 &ctx,
+                None,
                 &provider,
                 "context-overflow",
                 "test-model",
@@ -3390,6 +3590,7 @@ mod streaming_fallback_tests {
 
             let outcome = call_provider(
                 &ctx,
+                None,
                 &provider,
                 "test-provider",
                 "test-model",
@@ -3528,7 +3729,7 @@ mod streaming_fallback_tests {
             provider_name: "router-test",
             model: "test-model",
             context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0),
-            temperature: Some(0.0),
+            temperature: Some(0.0).into(),
             approval: None,
             channel_name: "test",
             channel_reply_target: None,
@@ -3538,7 +3739,8 @@ mod streaming_fallback_tests {
             hooks: None,
             dedup_exempt_tools: &[],
             pacing: &pacing,
-            strict_tool_parsing: false,
+            text_tool_calls_disabled: false,
+            extract_text_reasoning: true,
             channel: None,
             draft_reasoning: StreamReasoningMode::Status,
             turn_id: "test-turn",
@@ -3555,6 +3757,7 @@ mod streaming_fallback_tests {
                     Some(cost_context),
                     call_provider(
                         &ctx,
+                        None,
                         &provider,
                         "router-test",
                         "test-model",
@@ -3642,7 +3845,7 @@ mod streaming_fallback_tests {
             provider_name: "router-test",
             model: "test-model",
             context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0),
-            temperature: Some(0.0),
+            temperature: Some(0.0).into(),
             approval: None,
             channel_name: "test",
             channel_reply_target: None,
@@ -3652,7 +3855,8 @@ mod streaming_fallback_tests {
             hooks: None,
             dedup_exempt_tools: &[],
             pacing: &pacing,
-            strict_tool_parsing: false,
+            text_tool_calls_disabled: false,
+            extract_text_reasoning: true,
             channel: None,
             draft_reasoning: StreamReasoningMode::Status,
             turn_id: "test-turn",
@@ -3669,6 +3873,7 @@ mod streaming_fallback_tests {
                     Some(cost_context),
                     call_provider(
                         &ctx,
+                        None,
                         &provider,
                         "router-test",
                         "test-model",
@@ -3909,7 +4114,7 @@ mod streaming_fallback_tests {
             provider_name: "router-test",
             model: "test-model",
             context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0),
-            temperature: Some(0.0),
+            temperature: Some(0.0).into(),
             approval: None,
             channel_name: "test",
             channel_reply_target: None,
@@ -3919,7 +4124,8 @@ mod streaming_fallback_tests {
             hooks: None,
             dedup_exempt_tools: &[],
             pacing: &pacing,
-            strict_tool_parsing: false,
+            text_tool_calls_disabled: false,
+            extract_text_reasoning: true,
             channel: None,
             draft_reasoning: StreamReasoningMode::Status,
             turn_id: "test-turn",
@@ -3936,6 +4142,7 @@ mod streaming_fallback_tests {
                     Some(cost_context),
                     call_provider(
                         &ctx,
+                        None,
                         &provider,
                         "router-test",
                         "test-model",
@@ -3994,7 +4201,7 @@ mod streaming_fallback_tests {
             provider_name: "router-test",
             model: "test-model",
             context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0),
-            temperature: Some(0.0),
+            temperature: Some(0.0).into(),
             approval: None,
             channel_name: "test",
             channel_reply_target: None,
@@ -4004,7 +4211,8 @@ mod streaming_fallback_tests {
             hooks: None,
             dedup_exempt_tools: &[],
             pacing: &pacing,
-            strict_tool_parsing: false,
+            text_tool_calls_disabled: false,
+            extract_text_reasoning: true,
             channel: None,
             draft_reasoning: StreamReasoningMode::Status,
             turn_id: "test-turn",
@@ -4021,6 +4229,7 @@ mod streaming_fallback_tests {
                     Some(cost_context),
                     call_provider(
                         &ctx,
+                        None,
                         &provider,
                         "router-test",
                         "test-model",

@@ -68,7 +68,7 @@ pub async fn run_case(trace: &LlmTrace) -> anyhow::Result<RunRecord> {
         backend: "none".into(),
         ..MemoryConfig::default()
     };
-    let memory: Arc<dyn Memory> = Arc::from(create_memory(&mem_cfg, tmp.path(), None)?);
+    let memory: Arc<dyn Memory> = Arc::from(create_memory(&mem_cfg, tmp.path())?);
 
     let observer = Arc::new(RecordingObserver::new());
     let replay = TraceLlmProvider::from_trace(trace);

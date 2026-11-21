@@ -173,6 +173,16 @@ tool-memory-store = Store a fact, preference, or note in long-term memory. Use c
 tool-microsoft365 = Microsoft 365 integration: manage Outlook mail, Teams messages, Calendar events, OneDrive files, and SharePoint search via Microsoft Graph API
 
 tool-model-routing-config = Manage default model settings, scenario-based provider/model routes, classification rules, and aliased agent profiles
+tool-model-switch = Request a runtime model switch using an exact configured model reference. Use 'get' to see the pending switch, 'list_model_providers' to see configured model references and available provider kinds, 'list_models' to query upstream model IDs through a configured model's connection, or 'set' with a model reference such as 'chat.fast'. The switch is runtime/session state and does not write config.
+tool-model-switch-param-action = Action to perform: get pending switch state, set an exact model switch, list configured model references and provider kinds, or query upstream model IDs through a configured model's connection
+tool-model-switch-param-model-provider = Exact configured model reference (for example, 'chat.fast'). Required for 'set' and 'list_models' actions.
+tool-model-switch-param-model = Optional provider-local model override. Usually omit this when the model reference already selects a model.
+tool-model-routing-config-write-busy = Another configuration update is in progress. Retry this change after it finishes.
+tool-model-routing-config-reverted = Reverted to '{$model}'.
+tool-model-routing-config-removed-new-alias = Removed the newly created alias.
+tool-model-routing-config-error-no-update = set_default requires at least one of: model_provider, model, temperature
+tool-model-routing-config-error-invalid-reference = model_provider `{$model_provider}` must use `<type>.<alias>` or `<type>.<alias>.<model>` form
+tool-model-routing-config-error-nested-reference-update = a `<type>.<alias>.<model>` model_provider requires `model` or `temperature` to set on that model entry
 tool-model-routing-config-invalid-scenario = Invalid upsert_scenario arguments. Supply nonempty strings for: { $required }. Fix missing, non-string, or blank fields: { $invalid }.
 tool-model-routing-config-error-missing-risk-profile = agent `{$agent}` references missing risk profile `{$profile}`
 tool-model-routing-config-error-shared-risk-profile = risk profile `{$profile}` is shared by another agent; refusing an agent-scoped mutation
@@ -254,6 +264,10 @@ tool-web-search-tool-anysearch-no-error-details = no error details
 
 tool-workspace = Manage multi-client workspaces. Subcommands: list, switch, create, info, export. Each workspace provides isolated memory, audit, secrets, and tool restrictions.
 
+tool-llm-task-agent-missing = Unknown model_provider agent: { $agent }
+tool-llm-task-provider-invalid = Invalid model_provider reference: { $provider }
+tool-llm-task-model-missing = No model configured for model_provider: { $provider }
+
 tool-weather = Get current weather conditions and forecast for any location worldwide. Supports city names (in any language or script), IATA airport codes (e.g. 'LAX'), GPS coordinates (e.g. '51.5,-0.1'), postal/zip codes, and domain-based geolocation. Returns temperature, feels-like, humidity, wind speed/direction, precipitation, visibility, pressure, UV index, and cloud cover. Optional 0-3 day forecast with hourly breakdown. Units default to metric (°C, km/h, mm) but can be set to imperial (°F, mph, inches) per request. No API key required.
 
 tool-a2a-discover = List available remote A2A peer agents and their advertised capabilities. Call with no peer to list all configured peers, or a specific peer to fetch its Agent Card (name, description, skills). Use before a2a_send to find the right peer and agent for a task.
@@ -274,3 +288,9 @@ tool-a2a-cancel = Cancel an in-flight A2A task on a peer. Returns the updated Ta
 tool-a2a-cancel-desc-peer = Configured peer name hosting the task.
 tool-a2a-cancel-desc-task-id = The task id to cancel.
 tool-a2a-cancel-desc-agent = Optional agent alias or tenant that created the task (from a2a_send). Helps route the cancel to the correct interface when discovery is re-run (the cached route is used first).
+tool-model-routing-config-error-no-active-model = No active agent model is configured
+tool-model-routing-config-error-provider-clear = model_provider cannot be cleared
+tool-model-routing-config-error-no-active-agent = No active agent is configured to bind this model
+tool-model-routing-config-error-missing-reference = Model reference does not exist
+tool-model-routing-config-error-not-chat = Model reference must select a chat model
+tool-model-routing-config-error-temperature-range = temperature must be between 0 and 2
