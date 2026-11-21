@@ -66,7 +66,17 @@ impl EscalateToHumanTool {
     /// nobody". Channels whose `send` is a no-op (`supports_outbound_send()`
     /// is false) are skipped rather than counted as delivered — otherwise an
     /// alert-channel list made solely of back-channels would look successful.
-    async fn send_alerts(&self, text: &str) -> Vec<String> {
+    ///
+    /// `already_sent` is the channel that has just received the escalation
+    /// directly, if any. It is skipped by pointer identity rather than by name:
+    /// one channel is commonly reachable under both a bare type key
+    /// (`discord`) and a dotted alias (`discord.default`), so comparing names
+    /// would still deliver the message twice into the same room.
+    async fn send_alerts(
+        &self,
+        text: &str,
+        already_sent: Option<&Arc<dyn Channel>>,
+    ) -> Vec<String> {
         // Collect Arc clones while holding the lock, then drop the guard before awaiting.
         let targets: Vec<(String, Arc<dyn Channel>)> = {
             let channels = self.channel_map.read();
@@ -97,6 +107,9 @@ impl EscalateToHumanTool {
                             .with_attrs(::serde_json::json!({"name": name})),
                             "escalate_to_human: alert channel cannot deliver outbound messages"
                         );
+                        return None;
+                    }
+                    if already_sent.is_some_and(|origin| Arc::ptr_eq(origin, ch)) {
                         return None;
                     }
                     Some((name.clone(), Arc::clone(ch)))
@@ -133,6 +146,9 @@ impl Tool for EscalateToHumanTool {
          Sends a structured message to the active channel. High/critical urgency \
          also notifies any channels listed in `[escalation] alert_channels`, which \
          additionally serve as a fallback when the active channel cannot deliver. \
+         The active channel is never alerted twice, and the result reports \
+         `alerted_to` so you can see which alert channels actually accepted it — \
+         an empty list means only the active channel was reached. \
          Optionally blocks to wait for a human response."
     }
 
@@ -301,7 +317,9 @@ impl Tool for EscalateToHumanTool {
             let delivered = if self.alert_channels.is_empty() {
                 Vec::new()
             } else {
-                self.send_alerts(&text).await
+                // Nothing was delivered on the origin channel here, so there is
+                // no prior send to deduplicate against.
+                self.send_alerts(&text, None).await
             };
 
             if delivered.is_empty() {
@@ -369,22 +387,82 @@ impl Tool for EscalateToHumanTool {
             });
         }
 
-        // Send the escalation message
+        // Send the escalation message. A failure here is not the end of the
+        // call: a congested or refusing origin is precisely when the configured
+        // alert targets earn their keep, so the fan-out below still runs.
         let msg = SendMessage::new(&text, "");
-        if let Err(e) = channel.send(&msg).await {
-            return Ok(ToolResult {
-                success: false,
-                output: ToolOutput::default(),
-                error: Some(format!(
-                    "Failed to send escalation to channel '{channel_name}': {e}"
-                )),
-            });
-        }
+        let origin_error = match channel.send(&msg).await {
+            Ok(()) => None,
+            Err(e) => Some(format!("{e}")),
+        };
 
-        // Notify alert channels for high/critical urgency (non-blocking, best-effort).
-        // The undeliverable-origin path above returns early, so this cannot double-send.
-        if (urgency == "high" || urgency == "critical") && !self.alert_channels.is_empty() {
-            let _ = self.send_alerts(&text).await;
+        // Notify alert channels for high/critical urgency. Best-effort, but not
+        // silent: the model is told which channels took it, so it cannot claim
+        // an alert reached anyone when every configured channel refused.
+        let alert_requested =
+            (urgency == "high" || urgency == "critical") && !self.alert_channels.is_empty();
+        let alerted_to = if alert_requested {
+            // Exclude the origin only once it has actually accepted the
+            // message. An origin that failed holds nothing to duplicate, and
+            // skipping it there would drop the one target still worth trying.
+            let already_delivered = origin_error.is_none().then_some(&channel);
+            self.send_alerts(&text, already_delivered).await
+        } else {
+            Vec::new()
+        };
+
+        if let Some(origin_error) = origin_error {
+            // The origin did not take it. Succeed only if an alert channel did,
+            // and say plainly which one, so the model never reads this as the
+            // human having seen it on the channel it was talking to.
+            if alerted_to.is_empty() {
+                let remedy = if alert_requested {
+                    " The configured `[escalation] alert_channels` could not deliver it either."
+                } else {
+                    ""
+                };
+                return Ok(ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some(format!(
+                        "Failed to send escalation to channel '{channel_name}': \
+                         {origin_error}.{remedy}"
+                    )),
+                });
+            }
+
+            if wait_for_response {
+                return Ok(ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some(format!(
+                        "Channel '{channel_name}' could not take the escalation \
+                         ({origin_error}), so it was routed to \
+                         `[escalation] alert_channels` ({}) instead. Those channels \
+                         cannot return a reply to this turn, so `wait_for_response` \
+                         is unsupported here. Retry with `wait_for_response: false`.",
+                        alerted_to.join(", ")
+                    )),
+                });
+            }
+
+            return Ok(ToolResult {
+                success: true,
+                output: json!({
+                    "status": "escalated_via_alert_channels",
+                    "urgency": urgency,
+                    "channel": channel_name,
+                    "alerted_to": alerted_to,
+                    "origin_error": origin_error,
+                    "note": format!(
+                        "Channel '{channel_name}' could not take the escalation; \
+                         it was delivered to the configured alert channels instead."
+                    ),
+                })
+                .to_string()
+                .into(),
+                error: None,
+            });
         }
 
         if wait_for_response {
@@ -419,16 +497,26 @@ impl Tool for EscalateToHumanTool {
                 }),
             }
         } else {
-            // Non-blocking: return confirmation
+            // Non-blocking: return confirmation. When extra alerting was asked
+            // for, say what actually happened to it — an empty list after a
+            // high/critical escalation means only the origin channel saw this.
+            let mut payload = json!({
+                "status": "escalated",
+                "urgency": urgency,
+                "channel": channel_name,
+            });
+            if alert_requested {
+                payload["alerted_to"] = json!(alerted_to);
+                if alerted_to.is_empty() {
+                    payload["alert_note"] = json!(
+                        "No configured `[escalation] alert_channels` accepted this alert; \
+                         only the origin channel received it."
+                    );
+                }
+            }
             Ok(ToolResult {
                 success: true,
-                output: json!({
-                    "status": "escalated",
-                    "urgency": urgency,
-                    "channel": channel_name,
-                })
-                .to_string()
-                .into(),
+                output: payload.to_string().into(),
                 error: None,
             })
         }
@@ -1142,5 +1230,302 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&result.output).unwrap();
         assert_eq!(parsed["status"], "escalated");
         assert_eq!(parsed["urgency"], "high");
+    }
+
+    #[tokio::test]
+    async fn high_urgency_does_not_alert_the_origin_channel_twice() {
+        // One channel, reachable under both a bare type key and a dotted
+        // alias — the common shape when a type has a single configured
+        // instance. Excluding by name alone would still double-send here.
+        let origin = Arc::new(SilentChannel::new("webhook"));
+        let sent = Arc::clone(&origin.sent);
+        let shared: Arc<dyn Channel> = origin;
+        let tool = make_tool_with_channels_and_alerts(
+            vec![
+                ("webhook", Arc::clone(&shared)),
+                ("webhook.default", Arc::clone(&shared)),
+            ],
+            vec!["webhook"],
+        );
+
+        let result = tool
+            .execute(json!({
+                "summary": "Disk is full",
+                "urgency": "critical",
+                "channel": "webhook.default",
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "error: {:?}", result.error);
+        assert_eq!(
+            sent.read().len(),
+            1,
+            "the origin channel must receive the escalation exactly once, not again via the alert fan-out",
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(
+            parsed["alerted_to"],
+            json!([]),
+            "the origin channel must not be counted as an alert target",
+        );
+    }
+
+    #[tokio::test]
+    async fn alert_fan_out_reports_which_channels_took_it() {
+        let origin = Arc::new(SilentChannel::new("origin"));
+        let pager = Arc::new(SilentChannel::new("pager"));
+        let pager_sent = Arc::clone(&pager.sent);
+        let tool = make_tool_with_channels_and_alerts(
+            vec![
+                ("origin", Arc::clone(&origin) as Arc<dyn Channel>),
+                ("pager", Arc::clone(&pager) as Arc<dyn Channel>),
+            ],
+            vec!["pager"],
+        );
+
+        let result = tool
+            .execute(json!({
+                "summary": "Database unreachable",
+                "urgency": "critical",
+                "channel": "origin",
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "error: {:?}", result.error);
+        assert_eq!(
+            pager_sent.read().len(),
+            1,
+            "the alert channel must be notified"
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(parsed["alerted_to"], json!(["pager"]));
+        assert!(
+            parsed.get("alert_note").is_none(),
+            "no note is warranted when an alert channel accepted the message",
+        );
+    }
+
+    #[tokio::test]
+    async fn alerts_that_reached_nobody_are_reported_not_hidden() {
+        // The alert channel is configured but absent from the channel map, so
+        // nothing accepts the alert. The escalation still succeeded on the
+        // origin channel, so this stays a success — but the model must be able
+        // to tell that its high-urgency alerting reached no one.
+        let tool = make_tool_with_channels_and_alerts(
+            vec![(
+                "origin",
+                Arc::new(SilentChannel::new("origin")) as Arc<dyn Channel>,
+            )],
+            vec!["pager-that-is-not-configured"],
+        );
+
+        let result = tool
+            .execute(json!({
+                "summary": "Certificate expires today",
+                "urgency": "high",
+                "channel": "origin",
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "error: {:?}", result.error);
+        let parsed: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(parsed["alerted_to"], json!([]));
+        assert!(
+            parsed["alert_note"]
+                .as_str()
+                .is_some_and(|n| n.contains("alert_channels")),
+            "an alert that reached nobody must say so, got: {parsed}",
+        );
+    }
+
+    #[tokio::test]
+    async fn medium_urgency_does_not_report_alert_fields() {
+        let tool = make_tool_with_channels_and_alerts(
+            vec![(
+                "origin",
+                Arc::new(SilentChannel::new("origin")) as Arc<dyn Channel>,
+            )],
+            vec!["pager"],
+        );
+
+        let result = tool
+            .execute(json!({
+                "summary": "Routine notice",
+                "urgency": "medium",
+                "channel": "origin",
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "error: {:?}", result.error);
+        let parsed: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+        assert!(
+            parsed.get("alerted_to").is_none() && parsed.get("alert_note").is_none(),
+            "alert reporting belongs only to urgencies that actually fan out, got: {parsed}",
+        );
+    }
+
+    /// An outbound-capable channel whose `send` always fails — the shape a
+    /// paced origin takes once its per-recipient queue is full.
+    struct CongestedChannel {
+        channel_name: String,
+        attempts: Arc<RwLock<usize>>,
+    }
+
+    impl CongestedChannel {
+        fn new(name: &str) -> Self {
+            Self {
+                channel_name: name.to_string(),
+                attempts: Arc::new(RwLock::new(0)),
+            }
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for CongestedChannel {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Channel(
+                ::zeroclaw_api::attribution::ChannelKind::Webhook,
+            )
+        }
+        fn alias(&self) -> &str {
+            "test"
+        }
+    }
+
+    #[async_trait]
+    impl Channel for CongestedChannel {
+        fn name(&self) -> &str {
+            &self.channel_name
+        }
+
+        async fn send(&self, _message: &SendMessage) -> anyhow::Result<()> {
+            *self.attempts.write() += 1;
+            anyhow::bail!(
+                "paced channel queue full for this recipient (max 16): \
+                 outbound message dropped without being sent"
+            )
+        }
+
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            tokio::time::sleep(std::time::Duration::from_secs(600)).await;
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn congested_origin_still_reaches_a_healthy_alert_channel() {
+        // The regression this pairs with: once a full paced queue reports an
+        // error instead of a bare success, an early return here would have
+        // skipped the fan-out entirely and notified nobody.
+        let origin = Arc::new(CongestedChannel::new("origin"));
+        let attempts = Arc::clone(&origin.attempts);
+        let pager = Arc::new(SilentChannel::new("pager"));
+        let pager_sent = Arc::clone(&pager.sent);
+        let tool = make_tool_with_channels_and_alerts(
+            vec![
+                ("origin", Arc::clone(&origin) as Arc<dyn Channel>),
+                ("pager", Arc::clone(&pager) as Arc<dyn Channel>),
+            ],
+            vec!["pager"],
+        );
+
+        let result = tool
+            .execute(json!({
+                "summary": "Disk is full",
+                "urgency": "critical",
+                "channel": "origin",
+            }))
+            .await
+            .unwrap();
+
+        assert!(
+            result.success,
+            "an alert channel took it, so the escalation succeeded: {:?}",
+            result.error,
+        );
+        assert_eq!(*attempts.read(), 1, "the origin must still be tried first");
+        assert_eq!(
+            pager_sent.read().len(),
+            1,
+            "a congested origin must not suppress the configured alert fan-out",
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(parsed["status"], "escalated_via_alert_channels");
+        assert_eq!(parsed["alerted_to"], json!(["pager"]));
+        assert!(
+            parsed["origin_error"]
+                .as_str()
+                .is_some_and(|e| e.contains("queue full")),
+            "the origin failure must be reported, not hidden: {parsed}",
+        );
+    }
+
+    #[tokio::test]
+    async fn congested_origin_with_no_reachable_alert_fails_honestly() {
+        let origin = Arc::new(CongestedChannel::new("origin"));
+        let tool = make_tool_with_channels_and_alerts(
+            vec![("origin", Arc::clone(&origin) as Arc<dyn Channel>)],
+            vec!["pager-that-is-not-configured"],
+        );
+
+        let result = tool
+            .execute(json!({
+                "summary": "Disk is full",
+                "urgency": "critical",
+                "channel": "origin",
+            }))
+            .await
+            .unwrap();
+
+        assert!(
+            !result.success,
+            "nobody received this, so it must not report success",
+        );
+        let err = result.error.unwrap_or_default();
+        assert!(
+            err.contains("queue full") && err.contains("alert_channels"),
+            "the error must name both the origin failure and the failed fallback, got: {err}",
+        );
+    }
+
+    #[tokio::test]
+    async fn congested_origin_blocks_wait_for_response_even_when_alerted() {
+        let origin = Arc::new(CongestedChannel::new("origin"));
+        let pager = Arc::new(SilentChannel::new("pager"));
+        let tool = make_tool_with_channels_and_alerts(
+            vec![
+                ("origin", Arc::clone(&origin) as Arc<dyn Channel>),
+                ("pager", Arc::clone(&pager) as Arc<dyn Channel>),
+            ],
+            vec!["pager"],
+        );
+
+        let result = tool
+            .execute(json!({
+                "summary": "Disk is full",
+                "urgency": "critical",
+                "channel": "origin",
+                "wait_for_response": true,
+            }))
+            .await
+            .unwrap();
+
+        assert!(
+            !result.success,
+            "an alert channel cannot carry a reply back to this turn",
+        );
+        assert!(
+            result
+                .error
+                .unwrap_or_default()
+                .contains("wait_for_response"),
+            "the model must be told which argument to drop",
+        );
     }
 }
