@@ -15,8 +15,8 @@ use crate::error::PluginError;
 use crate::host::AdmittedComponent;
 use crate::instance::PluginInstanceScope;
 use crate::services::{
-    ConfigLookupError, PluginHostServices, PluginStateError, PluginStateKey, PluginStateValue,
-    SecretLookupError,
+    AgentWakeError, ConfigLookupError, PluginHostServices, PluginStateError, PluginStateKey,
+    PluginStateValue, SecretLookupError,
 };
 use crate::wasi_http::PluginEgressHooks;
 use crate::{PluginCapability, PluginPermission};
@@ -109,6 +109,7 @@ pub(crate) struct PluginStoreSpec {
     inbound: InboundQueue,
     http: bool,
     egress: Option<EgressHostService>,
+    caller_alias: Option<String>,
 }
 
 impl PluginStoreSpec {
@@ -126,7 +127,20 @@ impl PluginStoreSpec {
             inbound: InboundQueue::default(),
             http: false,
             egress: None,
+            caller_alias: None,
         }
+    }
+
+    /// Attach the host-owned alias of the agent whose turn runs this tool.
+    ///
+    /// The alias travels with the store rather than with the guest's arguments,
+    /// so a dispatch cannot claim to be a different agent than the one the host
+    /// admitted the call for. `None` (the default) means the store dispatches
+    /// without a caller identity, as the metadata probes do.
+    #[must_use]
+    pub(crate) fn with_caller_alias(mut self, caller_alias: Option<String>) -> Self {
+        self.caller_alias = caller_alias;
+        self
     }
 
     /// Attach HTTP only when this scope was granted `HttpClient`.
@@ -223,6 +237,9 @@ pub struct PluginState {
     limits: StoreLimits,
     fuel_per_call: u64,
     call_timeout: Duration,
+    /// The host-owned alias of the agent whose turn owns this store, if any.
+    /// Forwarded to the wake backend as the dispatch's caller identity.
+    caller_alias: Option<String>,
 }
 
 /// The outbound-HTTP half of a store: wasmtime's per-store context paired with
@@ -301,6 +318,7 @@ impl PluginState {
                 .build(),
             fuel_per_call: spec.limits.call_fuel,
             call_timeout: spec.limits.call_timeout,
+            caller_alias: spec.caller_alias,
         }
     }
 
@@ -571,6 +589,89 @@ impl PluginState {
         state.delete(&scope, &key, expected_revision).await
     }
 
+    /// Enqueue one asynchronous wake turn through the runtime's wake backend.
+    ///
+    /// This is the host half of the tool world's `dispatch` import. Every
+    /// check here is on state the guest cannot influence: the frame phase, the
+    /// frame's remaining host-call budget, the store's own admitted grants, and
+    /// the store's host-owned caller alias. Only the target and prompt cross
+    /// from the guest, and both are shape-validated before they do.
+    ///
+    /// The order matters. An exhausted frame or an unauthorized frame reports
+    /// [`AgentWakeError::Unavailable`] before any grant is inspected, matching
+    /// `state_get`, so a store that is not serving a tool call cannot report
+    /// access facts about itself. Validation runs after the grant check so an
+    /// ungranted instance learns nothing about the request grammar.
+    ///
+    /// # Errors
+    ///
+    /// - [`AgentWakeError::Unavailable`] outside a `ToolExecute` tool frame, or
+    ///   when the frame's host-call budget is spent.
+    /// - [`AgentWakeError::AccessDenied`] without the `agent_dispatch` grant.
+    /// - [`AgentWakeError::InvalidRequest`] for a target or prompt the host
+    ///   refuses by shape (see [`Self::valid_wake_target`] and
+    ///   [`Self::valid_wake_prompt`]).
+    /// - Whatever the runtime's backend reports, unchanged. A host path with no
+    ///   wake service wired fails closed with [`AgentWakeError::Unavailable`].
+    pub(crate) async fn wake_agent(
+        &mut self,
+        target_agent: String,
+        prompt: String,
+    ) -> Result<(), AgentWakeError> {
+        if !self.charge_host_call() || !self.instance_services_enabled() {
+            return Err(AgentWakeError::Unavailable);
+        }
+        if !matches!(
+            (self.call_config.phase(), self.scope.id().capability()),
+            (Some(PluginCallPhase::ToolExecute), PluginCapability::Tool)
+        ) {
+            return Err(AgentWakeError::Unavailable);
+        }
+        if !self.scope.grants().allows(PluginPermission::AgentDispatch) {
+            return Err(AgentWakeError::AccessDenied);
+        }
+        if !Self::valid_wake_target(&target_agent) || !Self::valid_wake_prompt(&prompt) {
+            return Err(AgentWakeError::InvalidRequest);
+        }
+        let scope = self.scope.clone();
+        let caller = self.caller_alias.as_deref();
+        self.services
+            .wake()
+            .wake(&scope, caller, &target_agent, &prompt)
+            .await
+    }
+
+    /// Whether `target` is a well-formed agent alias for one wake turn.
+    ///
+    /// The grammar is the one `[plugins.entries].dispatch_agents` validates
+    /// against, minus the `*` wildcard: an exact alias, 1 to 64 bytes of ASCII
+    /// alphanumerics, `_`, and `-`. Padding is rejected rather than trimmed, so
+    /// `" alpha"` and `"alpha "` are refused instead of silently collapsing to a
+    /// different agent than the guest wrote.
+    pub(crate) fn valid_wake_target(target: &str) -> bool {
+        !target.is_empty()
+            && target.trim() == target
+            && target.len() <= 64
+            && target
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    }
+
+    /// Whether `prompt` is a notification the host will deliver.
+    ///
+    /// At most 1024 bytes, not blank, and free of control characters except
+    /// newline and tab. The prompt reaches an agent transcript and possibly a
+    /// terminal, so an escape sequence, carriage return, or NUL is refused
+    /// rather than sanitized: a plugin that wants those bytes is asking for
+    /// something this channel does not do.
+    pub(crate) fn valid_wake_prompt(prompt: &str) -> bool {
+        !prompt.trim().is_empty()
+            && prompt.len() <= 1024
+            && !prompt
+                .bytes()
+                .any(|byte| (byte < 0x20 && !matches!(byte, b'\n' | b'\t')) || byte == 0x7f)
+    }
+
     /// Whether this state was built with outbound HTTP attached.
     pub(crate) fn http_enabled(&self) -> bool {
         self.http.is_some()
@@ -641,6 +742,7 @@ pub(crate) struct OptionalImports {
     pub(crate) http: bool,
     pub(crate) sockets: bool,
     pub(crate) websocket: bool,
+    pub(crate) dispatch: bool,
 }
 
 impl OptionalImports {
@@ -650,6 +752,7 @@ impl OptionalImports {
             http: state.http_enabled(),
             sockets: state.permission_enabled(PluginPermission::SocketClient),
             websocket: state.permission_enabled(PluginPermission::WebSocketClient),
+            dispatch: state.permission_enabled(PluginPermission::AgentDispatch),
         }
     }
 }
@@ -673,6 +776,12 @@ pub(crate) fn ensure_imports_coherent(
         PluginPermission::WebSocketClient,
         "zeroclaw:plugin/websocket",
         imports.websocket,
+    )?;
+    ensure_permission_coherent(
+        store,
+        PluginPermission::AgentDispatch,
+        "zeroclaw:plugin/dispatch",
+        imports.dispatch,
     )
 }
 
@@ -1819,6 +1928,7 @@ mod tests {
                     http: false,
                     sockets: true,
                     websocket: false,
+                    dispatch: false,
                 }
             )
             .is_err(),
@@ -1827,6 +1937,243 @@ mod tests {
         assert!(
             plain.data().egress_service().is_none(),
             "a store built without an egress authority has no reach"
+        );
+    }
+
+    #[test]
+    fn dispatch_import_follows_the_admitted_grant() {
+        let granted = new_store(spec([PluginPermission::AgentDispatch], 0));
+        let imports = OptionalImports::for_store(granted.data());
+        assert!(
+            imports.dispatch,
+            "an agent_dispatch grant must link the dispatch import"
+        );
+        assert!(ensure_imports_coherent(&granted, imports).is_ok());
+
+        let plain = new_store(spec([], 0));
+        assert!(
+            !OptionalImports::for_store(plain.data()).dispatch,
+            "no grant must leave the dispatch import unlinked"
+        );
+        assert!(
+            !OptionalImports::for_store(plain.data()).sockets,
+            "a dispatch grant must not widen any other optional import"
+        );
+    }
+
+    #[test]
+    fn dispatch_coherence_rejects_a_store_linker_mismatch() {
+        let granted = new_store(spec([PluginPermission::AgentDispatch], 0));
+        assert!(
+            ensure_imports_coherent(
+                &granted,
+                OptionalImports {
+                    dispatch: false,
+                    ..OptionalImports::for_store(granted.data())
+                }
+            )
+            .is_err(),
+            "a granted store must not be paired with a linker missing dispatch"
+        );
+
+        let plain = new_store(spec([], 0));
+        let error = ensure_imports_coherent(
+            &plain,
+            OptionalImports {
+                dispatch: true,
+                ..OptionalImports::for_store(plain.data())
+            },
+        )
+        .expect_err("an ungranted store must never be linked with dispatch");
+        assert!(
+            error.to_string().contains("zeroclaw:plugin/dispatch"),
+            "the refusal must name the import: {error}"
+        );
+    }
+
+    /// Durable identity for the wake tests: a tool instance granted
+    /// `agent_dispatch`, and a recording backend behind the store's services.
+    fn wake_state(
+        binding: &str,
+        grants: impl IntoIterator<Item = PluginPermission>,
+        caller_alias: Option<&str>,
+    ) -> (PluginState, crate::services::RecordingWake) {
+        let (wake, recorder) = crate::services::RecordingWake::service();
+        let services = crate::services::test_host_services_with_wake(wake);
+        let spec = PluginStoreSpec::new(scope(binding, grants), services, test_limits(1_000))
+            .with_caller_alias(caller_alias.map(ToOwned::to_owned));
+        (PluginState::new(spec), recorder)
+    }
+
+    #[tokio::test]
+    async fn wake_agent_is_unavailable_outside_a_tool_execute_frame() {
+        for phase in [PluginCallPhase::Standard, PluginCallPhase::ChannelService] {
+            let (mut state, recorder) = wake_state("main", [PluginPermission::AgentDispatch], None);
+            state.start_call(phase);
+            assert_eq!(
+                state
+                    .wake_agent("alpha".to_string(), "go".to_string())
+                    .await,
+                Err(AgentWakeError::Unavailable),
+                "a {phase:?} frame must not dispatch a wake"
+            );
+            state.finish_call();
+            assert!(
+                recorder.recorded().is_empty(),
+                "an unavailable frame must not reach the backend"
+            );
+        }
+
+        // No frame at all: the store is inactive.
+        let (mut inactive, recorder) = wake_state("main", [PluginPermission::AgentDispatch], None);
+        assert_eq!(
+            inactive
+                .wake_agent("alpha".to_string(), "go".to_string())
+                .await,
+            Err(AgentWakeError::Unavailable),
+            "an inactive store must not dispatch a wake"
+        );
+        assert!(recorder.recorded().is_empty());
+    }
+
+    #[tokio::test]
+    async fn wake_agent_is_unavailable_once_the_host_call_budget_is_spent() {
+        let (mut state, recorder) = wake_state("main", [PluginPermission::AgentDispatch], None);
+        state.start_call(PluginCallPhase::ToolExecute);
+        state.host_calls_remaining = 0;
+
+        assert_eq!(
+            state
+                .wake_agent("alpha".to_string(), "go".to_string())
+                .await,
+            Err(AgentWakeError::Unavailable),
+            "an exhausted frame budget must be unavailable, not a validation error"
+        );
+        assert!(recorder.recorded().is_empty());
+        state.finish_call();
+    }
+
+    #[tokio::test]
+    async fn wake_agent_denies_a_tool_frame_without_the_grant() {
+        let (mut state, recorder) = wake_state("main", [], None);
+        state.start_call(PluginCallPhase::ToolExecute);
+
+        assert_eq!(
+            state
+                .wake_agent("alpha".to_string(), "go".to_string())
+                .await,
+            Err(AgentWakeError::AccessDenied),
+            "an ungranted tool frame must be refused, not served"
+        );
+        assert!(recorder.recorded().is_empty());
+        state.finish_call();
+    }
+
+    #[tokio::test]
+    async fn wake_agent_rejects_invalid_targets() {
+        for target in [
+            "".to_string(),
+            " alpha".to_string(),
+            "alpha ".to_string(),
+            "a".repeat(65),
+            "alpha.beta".to_string(),
+            "alpha/beta".to_string(),
+            "alpha\nbeta".to_string(),
+            "alphä".to_string(),
+        ] {
+            let (mut state, recorder) = wake_state("main", [PluginPermission::AgentDispatch], None);
+            state.start_call(PluginCallPhase::ToolExecute);
+            assert_eq!(
+                state.wake_agent(target.clone(), "go".to_string()).await,
+                Err(AgentWakeError::InvalidRequest),
+                "{target:?} must be rejected before reaching the backend"
+            );
+            state.finish_call();
+            assert!(recorder.recorded().is_empty());
+        }
+
+        // The accepted shape, at the length ceiling.
+        let (mut state, recorder) = wake_state("main", [PluginPermission::AgentDispatch], None);
+        state.start_call(PluginCallPhase::ToolExecute);
+        let target = "a".repeat(64);
+        assert_eq!(
+            state.wake_agent(target, "go".to_string()).await,
+            Ok(()),
+            "a 64-byte alphanumeric target is the longest accepted alias"
+        );
+        state.finish_call();
+        assert_eq!(recorder.recorded().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn wake_agent_rejects_invalid_prompts() {
+        for prompt in [
+            String::new(),
+            "   ".to_string(),
+            "\n\t ".to_string(),
+            "p".repeat(1025),
+            "bell\u{7}".to_string(),
+            "cr\r".to_string(),
+            "escape\u{1b}[2J".to_string(),
+            "delete\u{7f}".to_string(),
+        ] {
+            let (mut state, recorder) = wake_state("main", [PluginPermission::AgentDispatch], None);
+            state.start_call(PluginCallPhase::ToolExecute);
+            assert_eq!(
+                state.wake_agent("alpha".to_string(), prompt.clone()).await,
+                Err(AgentWakeError::InvalidRequest),
+                "{prompt:?} must be rejected before reaching the backend"
+            );
+            state.finish_call();
+            assert!(recorder.recorded().is_empty());
+        }
+
+        // Newlines and tabs are the two permitted control characters, and 1024
+        // bytes is the ceiling.
+        let (mut state, recorder) = wake_state("main", [PluginPermission::AgentDispatch], None);
+        state.start_call(PluginCallPhase::ToolExecute);
+        let mut prompt = String::from("line one\nline two\t");
+        prompt.push_str(&"p".repeat(1024 - prompt.len()));
+        assert_eq!(prompt.len(), 1024);
+        assert_eq!(
+            state.wake_agent("alpha".to_string(), prompt.clone()).await,
+            Ok(())
+        );
+        state.finish_call();
+        assert_eq!(
+            recorder.recorded(),
+            vec![crate::services::RecordedWake {
+                caller_alias: None,
+                target_agent: "alpha".to_string(),
+                prompt,
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn wake_agent_forwards_the_host_owned_caller_alias() {
+        let (mut state, recorder) = wake_state(
+            "redaction-primary",
+            [PluginPermission::AgentDispatch],
+            Some("redaction-primary"),
+        );
+        state.start_call(PluginCallPhase::ToolExecute);
+
+        assert_eq!(
+            state
+                .wake_agent("alpha-1_b".to_string(), "review the diff".to_string())
+                .await,
+            Ok(())
+        );
+        state.finish_call();
+        assert_eq!(
+            recorder.recorded(),
+            vec![crate::services::RecordedWake {
+                caller_alias: Some("redaction-primary".to_string()),
+                target_agent: "alpha-1_b".to_string(),
+                prompt: "review the diff".to_string(),
+            }],
+            "the store must forward its own alias, never a guest-supplied one"
         );
     }
 

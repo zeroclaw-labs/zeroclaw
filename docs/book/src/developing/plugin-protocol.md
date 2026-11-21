@@ -335,8 +335,8 @@ bundle (`validate_manifest_shape` in `host.rs`).
 `crates/zeroclaw-plugins/src/lib.rs`. Read the enum for the canonical set.
 
 Be aware of the gap between declared and enforced: in the component host today
-`config_read`, `http_client`, `state_read`, and `state_write` have behavioral
-effect. Requesting
+`config_read`, `http_client`, `socket_client`, `websocket_client`, `state_read`,
+`state_write`, and `agent_dispatch` have behavioral effect. Requesting
 `config_read` requires a `config_schema`, and declaring that schema without the
 permission is also rejected. Before a tool or channel component is used, the
 host resolves its effective grant, materializes the plugin's operator values to
@@ -362,7 +362,12 @@ address class for an already-granted destination and never grants one (see
 [Plugins](../plugins/index.md) for the operator side). The state permissions
 independently gate the `state.get` and `state.put`/`delete` imports for tool
 and channel service frames. Package, capability, and binding come only from the
-admitted host scope; a guest supplies no namespace. The remaining variants
+admitted host scope; a guest supplies no namespace. `agent_dispatch` gates the
+tool world's `dispatch` import (`plugins-wit-v0-dispatch`): requesting it alone
+grants no targets, and every `dispatch.wake` call requires the operator's live
+`plugins.entries.<key>.dispatch_agents` allowlist (default empty; `"*"` permits
+any enabled agent) plus the per-instance `dispatch_rate_per_min` ceiling
+(default `30`). The remaining variants
 (`file_read`, `file_write`, `memory_read`, `memory_write`) are accepted by the
 manifest schema but are not yet wired to a host import: declaring them grants
 nothing on its own. They reserve the names for the host functions that will
@@ -385,9 +390,10 @@ imports `logging` (host) and exports `plugin-info` plus its primary interface:
 `memory-plugin` exports `memory`. Tool also imports `secrets` and `state`;
 channel imports `config`, `secrets`, `state`, and `inbound`. Tool and channel
 additionally import `sockets` and `websocket` behind their own features
-(`plugins-wit-v0-sockets`, `plugins-wit-v0-websocket`); the host links each only
-for an instance holding the matching grant, so a component that imports one
-without the grant fails to instantiate. The required
+(`plugins-wit-v0-sockets`, `plugins-wit-v0-websocket`), and `tool-plugin`
+additionally imports `dispatch` behind `plugins-wit-v0-dispatch`; the host
+links each only for an instance holding the matching grant, so a component that
+imports one without the grant fails to instantiate. The required
 (no-default) exports for each
 world are listed in the world's doc comment in its `.wit` file.
 
@@ -454,9 +460,72 @@ plus exactly the host imports its grants and adapter opt-ins jointly enable.
 ZeroClaw-owned imports share a fixed safety budget per host-dispatched service
 frame. The canonical ceiling is `MAX_HOST_CALLS_PER_FRAME` in
 `crates/zeroclaw-plugins/src/component.rs`. On exhaustion, logging becomes a
-no-op, inbound polling reports empty, and public-config or secret reads return
-`unavailable`. A new frame resets the budget. This ceiling is fixed host policy,
-not duplicated operator configuration.
+no-op, inbound polling reports empty, and public-config, secret, state, or
+dispatch calls return `unavailable`. A new frame resets the budget. This
+ceiling is fixed host policy, not duplicated operator configuration.
+
+### `dispatch`
+
+`wit/v0/dispatch.wit` is imported by the `tool-plugin` world behind the
+`plugins-wit-v0-dispatch` feature and linked only when the instance holds
+`agent_dispatch`. It lets a tool enqueue an asynchronous, non-blocking wake
+turn for a configured agent alias:
+
+```wit
+wake: func(target-agent: string, prompt: string) -> result<_, dispatch-error>;
+```
+
+Every call passes five host-owned checks before spawning a turn:
+
+1. **Frame and budget:** only `ToolExecute` frames with remaining host-call
+   budget may call `wake`; static metadata exports and exhausted frames return
+   `unavailable`.
+2. **Prompt and target grammar:** `target-agent` must be a non-empty,
+   unpadded 1–64 byte ASCII `[A-Za-z0-9_-]` alias; `prompt` must be non-empty,
+   at most 1024 UTF-8 bytes, and free of ASCII control characters other than
+   `\n` and `\t`. Violations return `invalid-request`.
+3. **Hop-depth ceiling:** woken turns (and detached child tasks they spawn,
+   such as peer-agent messages or background delegations) carry a task-local hop
+   depth capped at `MAX_PLUGIN_WAKE_DEPTH` (`2`), refusing deeper wake chains
+   with `access-denied`.
+4. **Live operator grant:** the runtime reads `plugins.entries.<key>.dispatch_agents`
+   and `dispatch_rate_per_min` from live config on every call (default empty
+   target list and `30` wakes/min; `"*"` allows any enabled agent). Targets
+   outside the grant return `access-denied`; disabled or missing agents return
+   `unknown-agent`. A grant that names an agent follows that agent when it is
+   renamed and is removed when the agent is deleted; a `"*"` grant is left as
+   it is.
+5. **Coalescing and rate limit:** wakes for an `(instance, target)` pair already
+   running a plugin wake turn coalesce into at most one pending follow-up turn
+   (retaining the latest prompt and caller attribution). The first pending
+   wake reserves one token before returning success; later overwrites share
+   that reservation. An exhausted bucket returns `rate-limited` immediately.
+   A wake is accepted onto a pair only once a worker owns it: a wake that
+   arrives while another wake is still being admitted and registered waits for
+   that claim to settle, re-resolves the live grant and target (so an operator
+   edit made while it waited applies), then coalesces or claims the pair
+   itself, so a failed claim never drops a wake that already returned success. The follow-up
+   re-checks live grants and target availability before running; a follow-up
+   that cannot run is skipped and the next pending wake is drained, rather than
+   releasing the pair with accepted wakes still queued.
+   Idle pairs also spend from the per-instance continuous token bucket, admit
+   against `AgentExecutionCapability`, record a durable `TaskRecord`, and run
+   under `InternalPrincipal::PluginTool`.
+
+**Woken turns keep the caller's headless SOP step scope.** A wake issued from
+inside a headless SOP step carries that step's tool scope into the woken turn,
+as `send_message_to_peer`, `delegate` and `spawn_subagent` do, so the target
+cannot call tools the step excludes. Each wake carries its own caller's scope,
+including a coalesced follow-up.
+
+**Restricted principals do not receive dispatch-capable tools.** A wake carries
+the caller's identity into the target turn as attribution, but not the caller's
+live agent and tool selectors. A tool instance holding `agent_dispatch`
+therefore reports `requires_unrestricted_principal`, like `send_message_to_peer`.
+Non-admin RPC sessions and other restricted principal postures withhold it even
+when their tool selectors name it. Plugins without `agent_dispatch` are not
+affected. This restriction stays in place until `dispatch.wake` can enforce the
+caller's live authority in the target turn.
 
 ### `inbound`
 

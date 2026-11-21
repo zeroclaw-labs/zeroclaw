@@ -8,6 +8,8 @@ pub mod component;
 #[cfg(feature = "plugins-wasmtime")]
 mod component_config;
 #[cfg(feature = "plugins-wasmtime")]
+mod component_dispatch;
+#[cfg(feature = "plugins-wasmtime")]
 mod component_logging;
 #[cfg(feature = "plugins-wasmtime")]
 mod component_secrets;
@@ -162,6 +164,8 @@ pub enum PluginPermission {
     StateRead,
     /// Can write this exact plugin instance's encrypted durable state
     StateWrite,
+    /// Can enqueue asynchronous wakeups for operator-granted agent aliases.
+    AgentDispatch,
 }
 
 /// Information about a loaded plugin.
@@ -175,4 +179,34 @@ pub struct PluginInfo {
     /// Resolved path to the WASM file. `None` for skill-only plugins.
     pub wasm_path: Option<PathBuf>,
     pub loaded: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn agent_dispatch_permission_round_trips_as_snake_case() {
+        let parsed: PluginPermission =
+            serde_json::from_str("\"agent_dispatch\"").expect("agent_dispatch is a permission");
+        assert_eq!(parsed, PluginPermission::AgentDispatch);
+        assert_eq!(
+            serde_json::to_string(&PluginPermission::AgentDispatch).expect("permission serializes"),
+            "\"agent_dispatch\""
+        );
+    }
+
+    #[test]
+    fn manifest_accepts_agent_dispatch_permission() {
+        let manifest: PluginManifest = toml::from_str(
+            r#"
+            name = "waker"
+            version = "0.1.0"
+            capabilities = ["tool"]
+            permissions = ["agent_dispatch"]
+            "#,
+        )
+        .expect("manifest with agent_dispatch parses");
+        assert_eq!(manifest.permissions, vec![PluginPermission::AgentDispatch]);
+    }
 }

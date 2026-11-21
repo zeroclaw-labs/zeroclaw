@@ -23523,6 +23523,7 @@ type = "string"
             egress_hosts: hosts.iter().map(|h| (*h).to_string()).collect(),
             egress_allow_private: Vec::new(),
             tls_profiles: Vec::new(),
+            ..Default::default()
         }
     }
 
@@ -23642,6 +23643,7 @@ type = "string"
             egress_hosts: vec!["api.example.com".to_string()],
             egress_allow_private: Vec::new(),
             tls_profiles: Vec::new(),
+            ..Default::default()
         }];
 
         let lines = egress_grant_gap_lines(&config, &manifest).expect("gap lines must build");
@@ -24038,6 +24040,7 @@ type = "string"
             egress_hosts: vec![" api.example.com ".to_string(), String::new()],
             egress_allow_private: Vec::new(),
             tls_profiles: Vec::new(),
+            ..Default::default()
         }];
         assert!(
             !runtime_accepts_row(&config, &instance_key),
@@ -24100,6 +24103,7 @@ type = "string"
             egress_hosts: vec!["api.example.com".to_string(), "10.0.0.5".to_string()],
             egress_allow_private: vec!["10.0.0.5".to_string()],
             tls_profiles: Vec::new(),
+            ..Default::default()
         }];
 
         let install = existing_egress_grant_lines(&config, "weather-tool", &instance_key, &[]);
@@ -24156,6 +24160,7 @@ type = "string"
             egress_hosts: vec!["api.example.com".to_string()],
             egress_allow_private: Vec::new(),
             tls_profiles: Vec::new(),
+            ..Default::default()
         }];
         config.security.nat64_prefixes = vec!["2001:db8::/97".to_string()];
         assert!(
@@ -24225,6 +24230,7 @@ type = "string"
             egress_hosts: vec!["api.example.com".to_string()],
             egress_allow_private: vec!["other.example.com".to_string()],
             tls_profiles: Vec::new(),
+            ..Default::default()
         }];
         assert!(
             !runtime_accepts_row(&config, &instance_key),
@@ -24279,6 +24285,7 @@ type = "string"
             egress_hosts: vec!["*.com".to_string()],
             egress_allow_private: Vec::new(),
             tls_profiles: Vec::new(),
+            ..Default::default()
         }];
         assert!(
             !runtime_accepts_row(&config, &instance_key),
@@ -24574,6 +24581,7 @@ type = "string"
             P::MemoryWrite,
             P::StateRead,
             P::StateWrite,
+            P::AgentDispatch,
         ] {
             let uses_declaration = match permission {
                 P::HttpClient | P::WebSocketClient | P::SocketClient => true,
@@ -24583,7 +24591,8 @@ type = "string"
                 | P::MemoryRead
                 | P::MemoryWrite
                 | P::StateRead
-                | P::StateWrite => false,
+                | P::StateWrite
+                | P::AgentDispatch => false,
             };
             let name = serde_json::to_value(permission).expect("a permission serializes");
             let (manifest, rows) = rows_for(&[name.as_str().expect("a permission is a string")]);
@@ -24929,6 +24938,7 @@ type = "string"
             egress_hosts: vec!["api.example.com".to_string()],
             egress_allow_private: Vec::new(),
             tls_profiles: Vec::new(),
+            ..Default::default()
         };
         // The tool row and the `operations` row keep a grant; `support` has no
         // row at all.
@@ -25508,6 +25518,7 @@ hosts = ["irc.example.net"]
                     client_certificate_secret: None,
                     client_private_key_secret: None,
                 }],
+                ..Default::default()
             });
         config.mark_dirty(&format!("plugins.entries.{operations_key}"));
         // `support`: a binding with no row.
@@ -25603,6 +25614,7 @@ hosts = ["irc.example.net"]
                 egress_hosts: Vec::new(),
                 egress_allow_private: Vec::new(),
                 tls_profiles: Vec::new(),
+                ..Default::default()
             });
         config.mark_dirty(&format!("plugins.entries.{key}"));
         Box::pin(config.save_dirty())
@@ -25857,6 +25869,7 @@ hosts = ["irc.example.net"]
             egress_hosts: hosts.iter().map(|host| (*host).to_string()).collect(),
             egress_allow_private: Vec::new(),
             tls_profiles: Vec::new(),
+            ..Default::default()
         };
         config.plugins.entries = vec![
             row(&tool_key, &["tool.example.net"]),
@@ -27441,6 +27454,7 @@ hosts = ["api.example.com", "api2.example.com"]
             egress_hosts: hosts.iter().map(|h| (*h).to_string()).collect(),
             egress_allow_private: Vec::new(),
             tls_profiles: Vec::new(),
+            ..Default::default()
         };
 
         let dir_a = tempfile::tempdir().expect("profile a");
@@ -28247,6 +28261,7 @@ hosts = ["api.example.com", "api2.example.com"]
             egress_hosts: Vec::new(),
             egress_allow_private: Vec::new(),
             tls_profiles: Vec::new(),
+            ..Default::default()
         }];
 
         let channel_rows = updated_channel_rows(&config, "chat-bridge", &manifest);
@@ -29593,6 +29608,7 @@ type = "integer"
             egress_hosts: vec!["api.example.com".to_string()],
             egress_allow_private: Vec::new(),
             tls_profiles: Vec::new(),
+            ..Default::default()
         }];
 
         let rows = instance_rows(&config, manifest).expect("the package's rows still derive");

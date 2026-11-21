@@ -77,6 +77,14 @@ pub enum InternalPrincipal {
     /// A daemon-driven task (heartbeat pipeline, SOP step driver). `task`
     /// is a runtime-owned identifier, never model-authored text.
     Daemon { task: String },
+    /// A plugin tool that woke the agent. `package` is the installed
+    /// plugin package name as resolved by the runtime's plugin registry —
+    /// never a name taken from tool arguments. `sender_alias` is the agent
+    /// alias the plugin attributes the wake to, if it attributes one.
+    PluginTool {
+        package: String,
+        sender_alias: Option<String>,
+    },
 }
 
 /// Trust class resolved for the turn's sender. Minimal for phase 1; peer-group
@@ -233,6 +241,19 @@ impl IngressContext {
         Self::from_parts(
             TurnOrigin::Daemon,
             Some(InternalPrincipal::Daemon { task: task.into() }),
+        )
+    }
+
+    /// Envelope for a turn a plugin tool woke the agent with, stamped with
+    /// the plugin package and an optional attributed sender alias.
+    #[must_use]
+    pub fn plugin_tool(package: impl Into<String>, sender_alias: Option<String>) -> Self {
+        Self::from_parts(
+            TurnOrigin::AgentDirect,
+            Some(InternalPrincipal::PluginTool {
+                package: package.into(),
+                sender_alias,
+            }),
         )
     }
 }
@@ -392,6 +413,43 @@ mod tests {
         let ctx: IngressContext = serde_json::from_value(legacy).unwrap();
         assert_eq!(ctx.origin, TurnOrigin::Cron);
         assert!(ctx.internal_principal.is_none());
+    }
+
+    #[test]
+    fn plugin_tool_constructor_stamps_origin_and_principal() {
+        let ctx = IngressContext::plugin_tool("crossbar", Some("alpha".to_string()));
+        assert_eq!(ctx.origin, TurnOrigin::AgentDirect);
+        assert_eq!(ctx.source_class, SourceClass::Internal);
+        assert_eq!(ctx.trust, TrustClass::Trusted);
+        assert_eq!(
+            ctx.internal_principal,
+            Some(InternalPrincipal::PluginTool {
+                package: "crossbar".to_string(),
+                sender_alias: Some("alpha".to_string()),
+            })
+        );
+
+        // Serde round-trip for both the aliased and the anonymous plugin sender.
+        let cases = [
+            (
+                IngressContext::plugin_tool("crossbar", Some("alpha".to_string())),
+                serde_json::json!({
+                    "plugin_tool": {"package": "crossbar", "sender_alias": "alpha"}
+                }),
+            ),
+            (
+                IngressContext::plugin_tool("crossbar", None),
+                serde_json::json!({
+                    "plugin_tool": {"package": "crossbar", "sender_alias": null}
+                }),
+            ),
+        ];
+        for (ctx, expected_principal) in cases {
+            let v = serde_json::to_value(&ctx).unwrap();
+            assert_eq!(v["internal_principal"], expected_principal);
+            let back: IngressContext = serde_json::from_value(v).unwrap();
+            assert_eq!(back, ctx);
+        }
     }
 
     #[test]

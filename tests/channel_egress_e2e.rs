@@ -203,6 +203,7 @@ fn entry_row(
             .map(|h| (*h).to_string())
             .collect(),
         tls_profiles: Vec::new(),
+        ..Default::default()
     }
 }
 

@@ -3,6 +3,8 @@
 
 #![forbid(unsafe_code)]
 
+use std::future::Future;
+
 /// Private re-export root for macro expansion. External crates must not
 /// reach through here — it exists solely so `spawn!` can expand without
 /// callers needing `tokio`, `tracing`, or `zeroclaw_log` as direct
@@ -15,10 +17,111 @@ pub mod __private {
     pub use ::zeroclaw_log;
 }
 
+tokio::task_local! {
+    static ACTIVE_PLUGIN_WAKE_DEPTH: u32;
+}
+
+/// Plugin wake-dispatch hops already taken by the current execution lineage.
+///
+/// Returns `0` for root turns and unrelated tasks. Because [`spawn!`] captures
+/// and restores this task-local across every detached Tokio task it creates,
+/// child work launched from inside a woken turn (such as `send_message_to_peer`
+/// recipient turns or background delegations) inherits the parent's hop depth
+/// rather than resetting to a root wake.
+#[must_use]
+pub fn current_plugin_wake_depth() -> u32 {
+    ACTIVE_PLUGIN_WAKE_DEPTH
+        .try_with(|depth| *depth)
+        .unwrap_or(0)
+}
+
+/// Run `future` with `depth` installed as the active plugin wake-dispatch depth.
+///
+/// Passing `0` installs an explicit zero scope, masking any enclosing depth.
+/// Returns the `TaskLocalFuture` directly rather than an `async fn` so large
+/// turn futures are not copied onto an extra coroutine frame in debug builds.
+pub fn scope_plugin_wake_depth<F: Future>(
+    depth: u32,
+    future: F,
+) -> tokio::task::futures::TaskLocalFuture<u32, F> {
+    ACTIVE_PLUGIN_WAKE_DEPTH.scope(depth, future)
+}
+
 /// Stable event name for spawn-lifecycle records emitted by [`spawn!`].
 /// Exposed so dashboards / queries can match on a single string instead
 /// of recomputing it.
 pub const TASK_EVENT_NAME: &str = "runtime.task.spawn";
+
+/// Emit one lifecycle record at a runtime-selected level.
+///
+/// `record!` needs the level as a literal identifier, so each supported level
+/// gets its own arm. Lives in a function so [`spawn!`] call sites stay small.
+macro_rules! record_at {
+    ($level:expr, $event:expr, $msg:expr) => {{
+        let level: ::tracing::Level = $level;
+        if level == ::tracing::Level::TRACE {
+            ::zeroclaw_log::record!(TRACE, $event, $msg);
+        } else if level == ::tracing::Level::DEBUG {
+            ::zeroclaw_log::record!(DEBUG, $event, $msg);
+        } else if level == ::tracing::Level::WARN {
+            ::zeroclaw_log::record!(WARN, $event, $msg);
+        } else if level == ::tracing::Level::ERROR {
+            ::zeroclaw_log::record!(ERROR, $event, $msg);
+        } else {
+            ::zeroclaw_log::record!(INFO, $event, $msg);
+        }
+    }};
+}
+
+/// Record the `Spawn` lifecycle event for [`spawn!`] in a single non-generic
+/// function so macro call sites do not duplicate `serde_json::json!` and
+/// `tracing::event!` expansion code across hundreds of spawns.
+#[doc(hidden)]
+pub fn record_task_spawn(
+    level: tracing::Level,
+    module: &'static str,
+    file: &'static str,
+    line: u32,
+) {
+    record_at!(
+        level,
+        ::zeroclaw_log::Event::new(TASK_EVENT_NAME, ::zeroclaw_log::Action::Spawn).with_attrs(
+            ::serde_json::json!({
+                "task_site": format!("{file}:{line}"),
+                "task_module": module,
+                "_file": file,
+                "_line": line,
+            })
+        ),
+        "task spawned"
+    );
+}
+
+/// Record the `Complete` lifecycle event for [`spawn!`] in a single
+/// non-generic function.
+#[doc(hidden)]
+pub fn record_task_complete(
+    level: tracing::Level,
+    module: &'static str,
+    file: &'static str,
+    line: u32,
+    started_at: tokio::time::Instant,
+) {
+    let elapsed_ms = started_at.elapsed().as_millis() as u64;
+    record_at!(
+        level,
+        ::zeroclaw_log::Event::new(TASK_EVENT_NAME, ::zeroclaw_log::Action::Complete)
+            .with_outcome(::zeroclaw_log::EventOutcome::Success)
+            .with_duration(elapsed_ms)
+            .with_attrs(::serde_json::json!({
+                "task_site": format!("{file}:{line}"),
+                "task_module": module,
+                "_file": file,
+                "_line": line,
+            })),
+        "task complete"
+    );
+}
 
 /// Spawn a task that inherits the caller's span, recording its spawn and
 /// its completion at INFO.
@@ -42,47 +145,36 @@ macro_rules! spawn {
         // Spawn-time record — fires synchronously on the caller's
         // thread, attributed to whatever span the caller currently has
         // entered.
-        $crate::__private::zeroclaw_log::record!(
-            $level,
-            $crate::__private::zeroclaw_log::Event::new(
-                $crate::TASK_EVENT_NAME,
-                $crate::__private::zeroclaw_log::Action::Spawn,
-            )
-            .with_attrs($crate::__private::serde_json::json!({
-                "task_site": format!("{}:{}", __ZC_TASK_FILE, __ZC_TASK_LINE),
-                "task_module": __ZC_TASK_MODULE,
-            })),
-            "task spawned"
+        $crate::record_task_spawn(
+            $crate::__private::tracing::Level::$level,
+            __ZC_TASK_MODULE,
+            __ZC_TASK_FILE,
+            __ZC_TASK_LINE,
         );
 
         // Wrap the user's future so we can stamp a Complete record when
-        // it resolves. The wrapper is itself `.in_current_span()`d, so
-        // the completion record inherits the same attribution context
-        // the caller had at spawn time.
+        // it resolves, and carry any active plugin wake-dispatch hop depth
+        // into the detached task so spawned child turns cannot reset it.
+        // The wrapper is itself `.in_current_span()`d, so the completion
+        // record inherits the same attribution context the caller had at
+        // spawn time.
+        let __zc_inherited_wake_depth = $crate::current_plugin_wake_depth();
         let __zc_task_started_at = $crate::__private::tokio::time::Instant::now();
-        let __zc_task_future = async move {
-            let __zc_task_output = { $body }.await;
-            let __zc_task_elapsed_ms = __zc_task_started_at.elapsed().as_millis() as u64;
-            $crate::__private::zeroclaw_log::record!(
-                $level,
-                $crate::__private::zeroclaw_log::Event::new(
-                    $crate::TASK_EVENT_NAME,
-                    $crate::__private::zeroclaw_log::Action::Complete,
-                )
-                .with_outcome($crate::__private::zeroclaw_log::EventOutcome::Success)
-                .with_duration(__zc_task_elapsed_ms)
-                .with_attrs($crate::__private::serde_json::json!({
-                    "task_site": format!("{}:{}", __ZC_TASK_FILE, __ZC_TASK_LINE),
-                    "task_module": __ZC_TASK_MODULE,
-                })),
-                "task complete"
-            );
-            __zc_task_output
-        };
+        let __zc_task_future =
+            $crate::scope_plugin_wake_depth(__zc_inherited_wake_depth, async move {
+                let __zc_task_output = { $body }.await;
+                $crate::record_task_complete(
+                    $crate::__private::tracing::Level::$level,
+                    __ZC_TASK_MODULE,
+                    __ZC_TASK_FILE,
+                    __ZC_TASK_LINE,
+                    __zc_task_started_at,
+                );
+                __zc_task_output
+            });
 
         #[allow(clippy::disallowed_methods)]
-        let __zc_spawn_handle =
-            $crate::__private::tokio::spawn(__zc_task_future.in_current_span());
+        let __zc_spawn_handle = $crate::__private::tokio::spawn(__zc_task_future.in_current_span());
         __zc_spawn_handle
     }};
     ($body:expr) => {
@@ -224,5 +316,67 @@ mod tests {
             "spawned task lost caller's span; captured stacks: {:?}",
             *events
         );
+    }
+
+    #[tokio::test]
+    async fn spawn_propagates_plugin_wake_depth_and_explicit_zero_masks_parent() {
+        assert_eq!(crate::current_plugin_wake_depth(), 0);
+
+        crate::scope_plugin_wake_depth(2, async {
+            assert_eq!(crate::current_plugin_wake_depth(), 2);
+
+            let inherited = crate::spawn!(async {
+                tokio::task::yield_now().await;
+                crate::current_plugin_wake_depth()
+            })
+            .await
+            .unwrap();
+            assert_eq!(inherited, 2);
+
+            let masked = crate::scope_plugin_wake_depth(0, async {
+                crate::spawn!(async { crate::current_plugin_wake_depth() })
+                    .await
+                    .unwrap()
+            })
+            .await;
+            assert_eq!(masked, 0);
+        })
+        .await;
+
+        assert_eq!(crate::current_plugin_wake_depth(), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn spawn_lifecycle_events_preserve_caller_file_and_line() {
+        let _hook_lock = zeroclaw_log::__private_test_hook_lock();
+        let mut rx = zeroclaw_log::subscribe_or_install();
+        let subscriber = Registry::default().with(zeroclaw_log::LogCaptureLayer);
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let expected_file = file!();
+        let (expected_line, handle) = (line!(), crate::spawn!(async { 7_u8 }));
+        assert_eq!(handle.await.unwrap(), 7);
+
+        let mut matched = Vec::new();
+        while let Ok(parsed) = rx.try_recv() {
+            if parsed["attributes"]["task_site"] == format!("{expected_file}:{expected_line}") {
+                matched.push(parsed);
+            }
+        }
+        assert_eq!(
+            matched.len(),
+            2,
+            "expected Spawn and Complete events for call site"
+        );
+        for event in &matched {
+            assert_eq!(
+                event["attributes"]["_file"], expected_file,
+                "_file must point to the spawn! call site, not the helper: {event}"
+            );
+            assert_eq!(
+                event["attributes"]["_line"], expected_line,
+                "_line must point to the spawn! call site, not the helper: {event}"
+            );
+        }
     }
 }
