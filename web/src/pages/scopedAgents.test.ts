@@ -22,7 +22,8 @@ class FakeWebSocket {
     FakeWebSocket.instances.push(this);
   }
 
-  send(): void {}
+  sent: string[] = [];
+  send(data: string): void { this.sent.push(data); }
 
   close(): void {
     if (this.readyState === 3) return;
@@ -236,4 +237,27 @@ test("a failed agents page load shows the error with Retry, not an empty list", 
     marked(r, "data-available-agent").map((n) => n.props["data-available-agent"]),
     ["support"],
   );
+});
+
+
+test("the first scoped voice submission starts a conversation and preserves operator-only uploads", async () => {
+  setOidcSession(scoped);
+  agentsBody = { agents: [{ alias: "support", enabled: true }] };
+  const { default: Voice } = await import("../components/BrowserVoiceControls.tsx");
+  const r = await render("/agent/support", createElement(AgentChat), "/agent/:alias");
+  assert.equal(FakeWebSocket.instances.length, 0);
+  assert.equal(r.root.findAll((n) => n.type === "input" && n.props.type === "file").length, 0);
+  await act(async () => { r.root.findByType(Voice).props.onTranscript("Synthetic voice request"); });
+  await act(async () => { r.root.findByType(Voice).props.onSilence(); });
+  await settle();
+  assert.equal(FakeWebSocket.instances.length, 1);
+  const socket = FakeWebSocket.instances[0]!;
+  await act(async () => {
+    socket.readyState = FakeWebSocket.OPEN;
+    socket.onopen?.();
+    socket.onmessage?.({ data: JSON.stringify({ type: "session_start", session_id: "synthetic-session" }) });
+  });
+  assert.deepEqual(socket.sent.map((data) => JSON.parse(data)).filter((frame) => frame.type === "message"), [
+    { type: "message", content: "Synthetic voice request" },
+  ]);
 });
