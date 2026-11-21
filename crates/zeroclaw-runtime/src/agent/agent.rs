@@ -1406,6 +1406,7 @@ impl AgentBuilder {
                 crate::agent::memory_inject::MemoryInjectConfig::from_memory_config(
                     &zeroclaw_config::schema::MemoryConfig::default(),
                     crate::agent::memory_inject::DEFAULT_RECALL_LIMIT,
+                    &[],
                 )
             }),
             config,
@@ -3620,6 +3621,7 @@ impl Agent {
                 crate::agent::memory_inject::MemoryInjectConfig::from_memory_config(
                     &config.memory,
                     config.effective_memory_recall_limit(agent_alias),
+                    &config.security.nat64_prefixes,
                 ),
             )
             .prompt_builder(SystemPromptBuilder::with_defaults())
@@ -4654,7 +4656,7 @@ impl Agent {
                             query: user_message.to_string(),
                             sessions: vec![self.memory_session_id.clone()],
                             suppress: false,
-                            cfg: self.memory_inject_cfg,
+                            cfg: self.memory_inject_cfg.clone(),
                         }),
                         ingress: zeroclaw_api::ingress::IngressContext::agent_direct(),
                         agent_alias: agent_alias_for_loop.as_deref(),
@@ -5320,7 +5322,7 @@ impl Agent {
                                 query: user_message.to_string(),
                                 sessions: vec![self.memory_session_id.clone()],
                                 suppress: false,
-                                cfg: self.memory_inject_cfg,
+                                cfg: self.memory_inject_cfg.clone(),
                             }),
                             ingress: zeroclaw_api::ingress::IngressContext::agent_direct(),
                             agent_alias: agent_alias_for_loop.as_deref(),

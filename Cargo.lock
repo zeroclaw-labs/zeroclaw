@@ -14364,6 +14364,7 @@ dependencies = [
  "uuid",
  "zeroclaw-api",
  "zeroclaw-config",
+ "zeroclaw-infra",
  "zeroclaw-log",
  "zeroclaw-providers",
  "zeroclaw-spawn",

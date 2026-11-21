@@ -13058,7 +13058,10 @@ pub struct MemoryConfig {
     /// Minimum candidate count to trigger the advanced rerank strategy.
     #[serde(default = "default_rerank_threshold")]
     pub rerank_threshold: usize,
-    /// Advanced rerank strategy. Valid: "none", "mmr".
+    /// Advanced rerank strategy. Valid: "none", "mmr", "external".
+    /// `"external"` orders the candidate pool with the endpoint in
+    /// `[memory.external_rerank]`, and keeps the local order whenever that
+    /// endpoint fails.
     #[serde(default = "default_rerank_strategy")]
     pub rerank_strategy: String,
     /// MMR relevance-vs-diversity weight, where 1.0 means relevance-only.
@@ -13141,6 +13144,12 @@ pub struct MemoryConfig {
     #[serde(default)]
     #[nested]
     pub types: MemoryTypesConfig,
+
+    /// Rerank endpoint for `rerank_strategy = "external"`
+    /// (`[memory.external_rerank]` section).
+    #[serde(default)]
+    #[nested]
+    pub external_rerank: MemoryExternalRerankConfig,
     // Backend-specific config fields (sqlite_open_timeout_secs, qdrant.*,
     // postgres.*) live on `[storage.<backend>.<alias>]`. The `backend` field
     // carries a dotted alias reference and the runtime looks up the typed
@@ -13160,6 +13169,71 @@ pub struct MemoryTypesConfig {
     /// Assign a first-class MemoryKind to new consolidation writes.
     #[serde(default)]
     pub enabled: bool,
+}
+
+/// Rerank endpoint for the memory recall stage (`[memory.external_rerank]`
+/// section), used when `rerank_enabled = true` and
+/// `rerank_strategy = "external"`.
+///
+/// The recall query and the text of each candidate memory are sent to this
+/// endpoint. Point it at a service you trust with that content, such as a
+/// local llama.cpp server started with `--reranking`. When the endpoint times
+/// out, errors or answers in an unexpected shape, recall keeps the order it
+/// would have used without it.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "memory.external_rerank"]
+pub struct MemoryExternalRerankConfig {
+    /// Base URL of the rerank service, such as `http://127.0.0.1:8098`; the
+    /// request goes to `/v1/rerank` under it. A URL whose path already ends in
+    /// `/rerank` is used as given. Required with the external strategy.
+    #[serde(default)]
+    pub endpoint: String,
+    /// Model name passed through in the request. Empty omits it.
+    #[serde(default)]
+    pub model: String,
+    /// Request timeout in milliseconds (1..=60000). On expiry recall keeps
+    /// its local order.
+    #[serde(default = "default_external_rerank_timeout_ms")]
+    pub timeout_ms: u64,
+    /// Most candidates sent per turn (1..=256), taken from the head of the
+    /// prepared pool after the relevance floor. The pool itself stays bounded
+    /// by the recall limit times `candidate_multiplier`.
+    #[serde(default = "default_external_rerank_max_candidates")]
+    pub max_candidates: usize,
+    /// Allow an endpoint on a private, loopback or local host (`127.0.0.1`,
+    /// `192.168.x.x`, `localhost`, a `.local` name), such as a reranker on
+    /// this machine or the home network. Off by default: memory text then goes
+    /// only to globally routable addresses. Cloud metadata addresses are
+    /// refused either way, including through a configured
+    /// `security.nat64_prefixes` translation.
+    #[serde(default)]
+    pub allow_private_endpoint: bool,
+}
+
+impl Default for MemoryExternalRerankConfig {
+    fn default() -> Self {
+        Self {
+            endpoint: String::new(),
+            model: String::new(),
+            timeout_ms: default_external_rerank_timeout_ms(),
+            max_candidates: default_external_rerank_max_candidates(),
+            allow_private_endpoint: false,
+        }
+    }
+}
+
+/// Upper bound for `memory.external_rerank.timeout_ms`.
+pub const MAX_EXTERNAL_RERANK_TIMEOUT_MS: u64 = 60_000;
+/// Upper bound for `memory.external_rerank.max_candidates`.
+pub const MAX_EXTERNAL_RERANK_CANDIDATES: usize = 256;
+
+fn default_external_rerank_timeout_ms() -> u64 {
+    1_500
+}
+
+fn default_external_rerank_max_candidates() -> usize {
+    16
 }
 
 /// Memory policy configuration (`[memory.policy]` section).
@@ -13279,6 +13353,78 @@ fn validate_memory_rerank_config(memory: &MemoryConfig) -> Result<()> {
         }
     }
 
+    if memory
+        .rerank_strategy
+        .trim()
+        .eq_ignore_ascii_case("external")
+    {
+        validate_external_rerank_config(&memory.external_rerank)?;
+    }
+
+    Ok(())
+}
+
+fn validate_external_rerank_config(external: &MemoryExternalRerankConfig) -> Result<()> {
+    let endpoint = external.endpoint.trim();
+    if endpoint.is_empty() {
+        anyhow::bail!(
+            "memory.external_rerank.endpoint is required when memory.rerank_strategy = \"external\""
+        );
+    }
+    let parsed = url::Url::parse(endpoint).map_err(|error| {
+        anyhow::Error::msg(format!(
+            "memory.external_rerank.endpoint is not a valid URL ({error}): {endpoint}"
+        ))
+    })?;
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+        anyhow::bail!(
+            "memory.external_rerank.endpoint must be an http or https URL with a host (got {endpoint})"
+        );
+    }
+    let host = match parsed.host() {
+        Some(url::Host::Ipv4(ip)) => {
+            validate_external_rerank_ip(ip.into(), endpoint)?;
+            ip.to_string()
+        }
+        Some(url::Host::Ipv6(ip)) => {
+            validate_external_rerank_ip(ip.into(), endpoint)?;
+            ip.to_string()
+        }
+        Some(url::Host::Domain(domain)) => domain.to_string(),
+        None => String::new(),
+    };
+    if zeroclaw_infra::net_guard::is_private_or_local_host(&host)
+        && !external.allow_private_endpoint
+    {
+        anyhow::bail!(
+            "memory.external_rerank.endpoint {endpoint} is a private or local host; set \
+             memory.external_rerank.allow_private_endpoint = true to send memory text to it"
+        );
+    }
+    if !(1..=MAX_EXTERNAL_RERANK_TIMEOUT_MS).contains(&external.timeout_ms) {
+        anyhow::bail!(
+            "memory.external_rerank.timeout_ms must be in 1..={MAX_EXTERNAL_RERANK_TIMEOUT_MS} (got {})",
+            external.timeout_ms
+        );
+    }
+    if !(1..=MAX_EXTERNAL_RERANK_CANDIDATES).contains(&external.max_candidates) {
+        anyhow::bail!(
+            "memory.external_rerank.max_candidates must be in 1..={MAX_EXTERNAL_RERANK_CANDIDATES} (got {})",
+            external.max_candidates
+        );
+    }
+    Ok(())
+}
+
+/// Cloud metadata addresses, and the link-local range that holds them, are
+/// never a rerank endpoint, whatever `allow_private_endpoint` says.
+fn validate_external_rerank_ip(ip: std::net::IpAddr, endpoint: &str) -> Result<()> {
+    if zeroclaw_infra::net_guard::is_cloud_metadata_ip(ip) {
+        anyhow::bail!(
+            "memory.external_rerank.endpoint {endpoint} is a cloud metadata or link-local \
+             address, which is never allowed"
+        );
+    }
     Ok(())
 }
 fn default_namespace() -> String {
@@ -13325,22 +13471,6 @@ pub fn validate_memory_semantics(
         inert.push((
             "memory.fts_early_return_score",
             "the staged retrieval pipeline is not wired into the recall path yet",
-        ));
-    }
-
-    // The proposed rerank stage was never landed, so these knobs remain inert.
-    // `DefaultMemoryStrategy::new` logs the same fact at agent start; this
-    // config-time copy reaches `config validate` and dashboard callers too.
-    if memory.rerank_enabled {
-        inert.push((
-            "memory.rerank_enabled",
-            "the rerank stage is not yet implemented",
-        ));
-    }
-    if memory.rerank_threshold != default_rerank_threshold() {
-        inert.push((
-            "memory.rerank_threshold",
-            "the rerank stage is not yet implemented",
         ));
     }
 
@@ -13638,6 +13768,7 @@ impl Default for MemoryConfig {
             audit_retention_days: default_audit_retention_days(),
             policy: MemoryPolicyConfig::default(),
             types: MemoryTypesConfig::default(),
+            external_rerank: MemoryExternalRerankConfig::default(),
         }
     }
 }
@@ -30491,6 +30622,170 @@ mod tests {
             .validate()
             .expect_err("out-of-range MMR lambda must fail validation");
         assert!(err.to_string().contains("memory.mmr_lambda"));
+    }
+
+    #[::core::prelude::v1::test]
+    fn memory_external_rerank_defaults_are_off_and_bounded() {
+        let cfg: super::MemoryConfig = serde_json::from_str("{}").unwrap();
+        assert!(cfg.external_rerank.endpoint.is_empty());
+        assert!(cfg.external_rerank.model.is_empty());
+        assert_eq!(cfg.external_rerank.timeout_ms, 1_500);
+        assert_eq!(cfg.external_rerank.max_candidates, 16);
+        assert!(!cfg.external_rerank.allow_private_endpoint);
+
+        let def = super::MemoryConfig::default();
+        assert_eq!(
+            def.external_rerank.timeout_ms,
+            cfg.external_rerank.timeout_ms
+        );
+        assert_eq!(
+            def.external_rerank.max_candidates,
+            cfg.external_rerank.max_candidates
+        );
+        super::Config::default()
+            .validate()
+            .expect("the default config validates");
+    }
+
+    #[::core::prelude::v1::test]
+    fn memory_external_rerank_section_parses_from_toml() {
+        let cfg: super::MemoryConfig = toml::from_str(
+            r#"
+rerank_enabled = true
+rerank_strategy = "external"
+
+[external_rerank]
+endpoint = "http://127.0.0.1:8098"
+model = "bge-reranker-v2-m3"
+timeout_ms = 900
+max_candidates = 12
+allow_private_endpoint = true
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.external_rerank.endpoint, "http://127.0.0.1:8098");
+        assert_eq!(cfg.external_rerank.model, "bge-reranker-v2-m3");
+        assert_eq!(cfg.external_rerank.timeout_ms, 900);
+        assert_eq!(cfg.external_rerank.max_candidates, 12);
+        assert!(cfg.external_rerank.allow_private_endpoint);
+    }
+
+    #[::core::prelude::v1::test]
+    fn config_validate_guards_the_external_rerank_endpoint_host() {
+        let external = |endpoint: &str, allow_private: bool| {
+            let mut config = super::Config::default();
+            config.memory.rerank_enabled = true;
+            config.memory.rerank_strategy = "external".into();
+            config.memory.external_rerank.endpoint = endpoint.into();
+            config.memory.external_rerank.allow_private_endpoint = allow_private;
+            config.validate()
+        };
+
+        // A metadata or link-local literal is refused before any client is
+        // built, with or without the private opt-in.
+        for endpoint in [
+            "http://169.254.169.254/",
+            "http://169.254.169.254:8080/latest",
+            "http://169.254.10.20:8091",
+            "http://[fd00:ec2::254]/",
+            "http://100.100.100.200/",
+        ] {
+            for allow_private in [false, true] {
+                let err = external(endpoint, allow_private)
+                    .expect_err("a metadata endpoint must fail validation");
+                assert!(
+                    err.to_string().contains("never allowed"),
+                    "{endpoint} (allow_private {allow_private}): {err}"
+                );
+            }
+        }
+
+        // Private, loopback and local hosts need the opt-in.
+        for endpoint in [
+            "http://127.0.0.1:8098",
+            "http://[::1]:8098",
+            "http://localhost:8098",
+            "http://192.168.5.65:8091",
+            "http://reranker.local:8091",
+        ] {
+            let err = external(endpoint, false).expect_err("a private endpoint needs the opt-in");
+            assert!(
+                err.to_string()
+                    .contains("memory.external_rerank.allow_private_endpoint"),
+                "{endpoint}: {err}"
+            );
+            external(endpoint, true).expect("the opt-in admits a private endpoint");
+        }
+
+        external("https://rerank.example.com", false).expect("a public endpoint needs no opt-in");
+    }
+
+    #[::core::prelude::v1::test]
+    fn config_validate_checks_the_external_rerank_endpoint_and_bounds() {
+        let external = |endpoint: &str, timeout_ms: u64, max_candidates: usize| {
+            let mut config = super::Config::default();
+            config.memory.rerank_enabled = true;
+            config.memory.rerank_strategy = " External ".into();
+            config.memory.external_rerank.endpoint = endpoint.into();
+            config.memory.external_rerank.timeout_ms = timeout_ms;
+            config.memory.external_rerank.max_candidates = max_candidates;
+            config.memory.external_rerank.allow_private_endpoint = true;
+            config.validate()
+        };
+
+        external("http://127.0.0.1:8098", 1_500, 16).expect("a local endpoint validates");
+        external("https://rerank.example.com/v1/rerank", 1, 256).expect("bounds are inclusive");
+
+        for (endpoint, timeout_ms, max_candidates, field) in [
+            ("", 1_500, 16, "memory.external_rerank.endpoint"),
+            ("not a url", 1_500, 16, "memory.external_rerank.endpoint"),
+            (
+                "ftp://127.0.0.1/x",
+                1_500,
+                16,
+                "memory.external_rerank.endpoint",
+            ),
+            (
+                "http://127.0.0.1:8098",
+                0,
+                16,
+                "memory.external_rerank.timeout_ms",
+            ),
+            (
+                "http://127.0.0.1:8098",
+                super::MAX_EXTERNAL_RERANK_TIMEOUT_MS + 1,
+                16,
+                "memory.external_rerank.timeout_ms",
+            ),
+            (
+                "http://127.0.0.1:8098",
+                1_500,
+                0,
+                "memory.external_rerank.max_candidates",
+            ),
+            (
+                "http://127.0.0.1:8098",
+                1_500,
+                super::MAX_EXTERNAL_RERANK_CANDIDATES + 1,
+                "memory.external_rerank.max_candidates",
+            ),
+        ] {
+            let err = external(endpoint, timeout_ms, max_candidates)
+                .expect_err("invalid external rerank settings must fail validation");
+            assert!(
+                err.to_string().contains(field),
+                "expected {field}, got {err}"
+            );
+        }
+
+        // Another strategy leaves the section unchecked, so an empty
+        // endpoint does not stop a config that never uses it.
+        let mut config = super::Config::default();
+        config.memory.rerank_strategy = "mmr".into();
+        config.memory.external_rerank.timeout_ms = 0;
+        config
+            .validate()
+            .expect("unused external settings are not checked");
     }
 
     #[::core::prelude::v1::test]
@@ -54360,38 +54655,32 @@ group_policy = "all"
         );
     }
 
+    /// The rerank stage is wired into memory injection, so its knobs are live
+    /// and must not be reported as having no effect.
     #[test]
-    async fn validate_memory_semantics_warns_for_rerank_enabled() {
+    async fn validate_memory_semantics_does_not_report_live_rerank_knobs() {
         let mut config = Config::default();
         config.memory.rerank_enabled = true;
-
-        let warnings = warnings_with_code(&config, INERT_MEMORY_KNOB_WARNING);
-        assert_eq!(warnings.len(), 1);
-        assert_eq!(warnings[0].path, "memory.rerank_enabled");
-        assert!(
-            warnings[0].message.contains("currently has no effect"),
-            "warning should state the knob has no effect: {}",
-            warnings[0].message
-        );
-    }
-
-    #[test]
-    async fn validate_memory_semantics_warns_for_non_default_rerank_threshold() {
-        let mut config = Config::default();
         config.memory.rerank_threshold = 10;
+        config.memory.rerank_strategy = "external".into();
+        config.memory.external_rerank.endpoint = "http://127.0.0.1:8098".into();
 
-        assert_eq!(inert_knob_paths(&config), vec!["memory.rerank_threshold"]);
+        assert!(
+            inert_knob_paths(&config).is_empty(),
+            "{:?}",
+            inert_knob_paths(&config)
+        );
     }
 
     #[test]
     async fn validate_memory_semantics_reports_each_set_knob() {
         let mut config = Config::default();
-        config.memory.rerank_enabled = true;
-        config.memory.rerank_threshold = 10;
+        config.memory.retrieval_stages = vec!["fts".into()];
+        config.memory.fts_early_return_score = 0.5;
 
         assert_eq!(
             inert_knob_paths(&config),
-            vec!["memory.rerank_enabled", "memory.rerank_threshold"]
+            vec!["memory.retrieval_stages", "memory.fts_early_return_score"]
         );
     }
 
