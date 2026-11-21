@@ -873,6 +873,17 @@ impl WhatsAppChannel {
 /// The marker kinds the Cloud API backend extracts from outgoing text.
 const LOCATION_MARKER_KIND: &[&str] = &["LOCATION"];
 
+/// The text left after taking `[LOCATION:...]` markers out of `message`, and
+/// those markers. With inline attachments off, no marker is taken and the
+/// content is sent as written.
+fn location_markers_for(message: &SendMessage) -> (String, Vec<(String, String)>) {
+    if message.inline_attachments {
+        crate::util::parse_attachment_markers_of_kinds(&message.content, LOCATION_MARKER_KIND)
+    } else {
+        (message.content.clone(), Vec::new())
+    }
+}
+
 fn text_message_body(to: &str, content: &str) -> serde_json::Value {
     serde_json::json!({
         "messaging_product": "whatsapp",
@@ -935,8 +946,7 @@ impl Channel for WhatsAppChannel {
 
         // Native location pins ([LOCATION:...]) are the only marker kind this
         // backend can deliver; markers of any other kind stay in the text.
-        let (text, location_markers) =
-            crate::util::parse_attachment_markers_of_kinds(&message.content, LOCATION_MARKER_KIND);
+        let (text, location_markers) = location_markers_for(message);
 
         if location_markers.is_empty() {
             // No pins: send the content untouched (extraction trims the text).
@@ -1091,7 +1101,10 @@ impl Channel for WhatsAppChannel {
             &self.alias,
             recipient,
             self.approval_timeout_secs,
-            || async { self.send(&SendMessage::new(text, recipient)).await },
+            || async {
+                self.send(&crate::util::approval_prompt_message(text, recipient))
+                    .await
+            },
         )
         .await?;
         Ok(Some(attributed))
@@ -1457,6 +1470,33 @@ mod tests {
         });
 
         assert!(ch.parse_webhook_payload(&payload).is_empty());
+    }
+
+    #[test]
+    fn location_markers_for_respects_inline_attachments() {
+        let content = "Meet [LOCATION:40.7128,-74.0060,Liberty Island] here";
+        let message = SendMessage::new(content, "+1555");
+
+        let (text, markers) = location_markers_for(&message);
+        assert_eq!(text, "Meet  here");
+        assert_eq!(
+            markers,
+            vec![(
+                "LOCATION".to_string(),
+                "40.7128,-74.0060,Liberty Island".to_string()
+            )]
+        );
+
+        for content in [content, "[LOCATION:999,999]"] {
+            let message = SendMessage::new(content, "+1555").with_inline_attachments(false);
+            let (text, markers) = location_markers_for(&message);
+            assert_eq!(text, content);
+            assert!(markers.is_empty(), "{content}");
+            assert_eq!(
+                text_message_body("1555", &message.content)["text"]["body"],
+                content
+            );
+        }
     }
 
     #[test]

@@ -259,10 +259,14 @@ mod approval {
 
     /// Build the outbound `SendMessage` for an approval prompt: the rendered
     /// prompt text to the requesting recipient, with voice synthesis
-    /// suppressed. Kept as a small, pure helper so tests can assert its shape
-    /// (recipient, voice suppression) without standing up a live client.
+    /// suppressed and inline attachments off, so a file marker in the tool's
+    /// arguments is shown to the operator rather than uploaded. Kept as a
+    /// small, pure helper so tests can assert its shape (recipient, voice
+    /// suppression) without standing up a live client.
     pub(super) fn build_prompt_message(prompt: String, recipient: &str) -> SendMessage {
-        SendMessage::new(prompt, recipient).suppress_voice()
+        SendMessage::new(prompt, recipient)
+            .suppress_voice()
+            .with_inline_attachments(false)
     }
 
     /// Try to parse an approval reply. Returns `Some((token, response))` if the
@@ -3632,11 +3636,24 @@ mod outbound {
         })
     }
 
+    /// The text to send for `message` and the markers to deliver from it.
+    /// With inline attachments off, the content is sent as written and no
+    /// marker is taken from it.
+    pub(super) fn outbound_text_and_markers(
+        message: &SendMessage,
+    ) -> (String, Vec<markers::Marker>) {
+        if message.inline_attachments {
+            markers::parse(&message.content)
+        } else {
+            (message.content.clone(), Vec::new())
+        }
+    }
+
     pub(super) async fn send(outbox: &Outbox<'_>, message: &SendMessage) -> Result<OwnedEventId> {
         let room =
             resolve_joined_room(outbox.client, outbox.alias_cache, &message.recipient).await?;
 
-        let (text, ms) = markers::parse(&message.content);
+        let (text, ms) = outbound_text_and_markers(message);
 
         // Build the thread anchor used by both attachment uploads and the
         // text reply, so attachments live in the same thread instead of
@@ -4910,6 +4927,11 @@ impl Channel for MatrixChannel {
         Ok(())
     }
 
+    /// Outbound attachments are uploaded to the room, in the reply's thread.
+    fn supports_outbound_attachments(&self) -> bool {
+        true
+    }
+
     fn supports_draft_updates(&self) -> bool {
         // The orchestrator's streaming pipeline is gated on this returning
         // true. Partial, SingleMessage, and MultiMessage all need streaming
@@ -5830,6 +5852,63 @@ mod tests {
                 Some(1),
                 "the TTS endpoint must be asked to synthesize exactly once"
             );
+        }
+
+        /// With inline attachments off, a marker naming a real workspace file
+        /// reaches the room as literal text and nothing is uploaded.
+        #[tokio::test]
+        async fn a_message_without_inline_attachments_sends_its_marker_as_text() {
+            let room_id = owned_room_id!("!room:server");
+            let homeserver = homeserver_with_room(room_id.as_str()).await;
+            mount_room_members(&homeserver, room_id.as_str(), &["@alice:server"]).await;
+
+            Mock::given(method("PUT"))
+                .and(path_regex(
+                    r"^/_matrix/client/(v3|r0)/rooms/.*/send/m\.room\.message/.*$",
+                ))
+                .and(body_partial_json(serde_json::json!({
+                    "msgtype": "m.text",
+                    "body": "see [image:a.png]"
+                })))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "event_id": "$text:server"
+                })))
+                .expect(1)
+                .mount(&homeserver)
+                .await;
+            Mock::given(method("POST"))
+                .and(path_regex(r"^.*/upload$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "content_uri": "mxc://server/image"
+                })))
+                .expect(0)
+                .mount(&homeserver)
+                .await;
+
+            let state_dir = TempDir::new().expect("temp state dir");
+            let workspace = TempDir::new().expect("temp workspace");
+            std::fs::write(workspace.path().join("a.png"), b"\x89PNG\r\n\x1a\n")
+                .expect("write workspace image");
+            let channel = channel_for(&homeserver, Config::default(), Vec::new(), &state_dir)
+                .await
+                .with_workspace_dir(workspace.path().to_path_buf());
+
+            let client = channel.ensure_client().await.expect("matrix client");
+            client
+                .sync_once(SyncSettings::default())
+                .await
+                .expect("mock sync populates the joined room");
+
+            channel
+                .send(
+                    &SendMessage::new("see [image:a.png]", room_id.as_str())
+                        .with_inline_attachments(false),
+                )
+                .await
+                .expect("text is delivered");
+
+            // Mock `.expect` assertions verify on drop: one text event with
+            // the marker in its body and no media upload.
         }
 
         /// The event wrapper was always encrypted by `send_raw`; the audio was
@@ -8084,6 +8163,27 @@ mod tests {
                 "the approval prompt must suppress voice synthesis"
             );
             assert!(!message.force_voice);
+            assert!(
+                !message.inline_attachments,
+                "the approval prompt must not upload files named in its text"
+            );
+        }
+
+        #[test]
+        fn approval_prompt_keeps_file_markers_from_arguments_as_text() {
+            let prompt = crate::util::build_approve_deny_approval_prompt(
+                &generate_token_default(),
+                "send_via",
+                "body: see [image:a.png]",
+                None,
+            );
+
+            let message = build_prompt_message(prompt.clone(), "!room:example.invalid");
+            let (text, markers) = super::super::outbound::outbound_text_and_markers(&message);
+
+            assert_eq!(text, prompt);
+            assert!(text.contains("[image:a.png]"));
+            assert!(markers.is_empty());
         }
 
         #[test]
@@ -11714,6 +11814,47 @@ mod tests {
                 ..enabled_cfg()
             });
             assert!(resolver().is_some_and(|manager| manager.is_ok()));
+        }
+    }
+
+    mod outbound_inline_attachments {
+        //! Which markers `outbound::send` takes from a message's text, by its
+        //! `inline_attachments` flag.
+
+        use super::super::markers::MarkerKind;
+        use super::super::outbound::outbound_text_and_markers;
+        use zeroclaw_api::channel::SendMessage;
+        use zeroclaw_api::media::MediaAttachment;
+
+        const CONTENT: &str = "hi [image:a.png] [file:https://x/y.pdf]";
+
+        #[test]
+        fn default_message_takes_markers_from_text() {
+            let (text, markers) = outbound_text_and_markers(&SendMessage::new(CONTENT, "!r:s"));
+
+            assert_eq!(text, "hi");
+            assert_eq!(markers.len(), 2);
+            assert_eq!(markers[0].kind, MarkerKind::Image);
+            assert_eq!(markers[0].target, "a.png");
+            assert_eq!(markers[1].kind, MarkerKind::File);
+        }
+
+        #[test]
+        fn without_inline_attachments_text_is_sent_as_written() {
+            let message = SendMessage::new(CONTENT, "!r:s")
+                .with_attachments(vec![MediaAttachment {
+                    file_name: "explicit.txt".to_string(),
+                    data: b"bytes".to_vec(),
+                    mime_type: Some("text/plain".to_string()),
+                    marker: None,
+                }])
+                .with_inline_attachments(false);
+
+            let (text, markers) = outbound_text_and_markers(&message);
+
+            assert_eq!(text, CONTENT);
+            assert!(markers.is_empty());
+            assert_eq!(message.attachments.len(), 1);
         }
     }
 

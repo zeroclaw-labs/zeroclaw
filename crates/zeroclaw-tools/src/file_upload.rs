@@ -22,7 +22,7 @@ impl FileUploadTool {
     /// (catches binary files with wrong or missing extensions), then falls
     /// back to a filename-extension table for text formats and types `infer`
     /// does not cover, then finally to `application/octet-stream`.
-    fn detect_mime(bytes: &[u8], file_name: &str) -> &'static str {
+    pub(crate) fn detect_mime(bytes: &[u8], file_name: &str) -> &'static str {
         if let Some(kind) = infer::get(bytes) {
             return kind.mime_type();
         }

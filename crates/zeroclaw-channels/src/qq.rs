@@ -198,6 +198,16 @@ fn parse_qq_attachment_markers(content: &str) -> (String, Vec<QQMediaAttachment>
     (cleaned.trim().to_string(), attachments)
 }
 
+/// The text and media markers to send for `message`. With inline attachments
+/// off, the content is sent as written and no marker is taken from it.
+fn qq_outbound_parts(message: &SendMessage) -> (String, Vec<QQMediaAttachment>) {
+    if message.inline_attachments {
+        parse_qq_attachment_markers(&message.content)
+    } else {
+        (message.content.clone(), Vec::new())
+    }
+}
+
 /// Infer attachment type marker from content_type or filename.
 fn infer_attachment_marker(content_type: &str, filename: &str) -> &'static str {
     let ct = content_type.to_ascii_lowercase();
@@ -1340,7 +1350,7 @@ impl Channel for QQChannel {
     }
 
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
-        let (cleaned_text, attachments) = parse_qq_attachment_markers(&message.content);
+        let (cleaned_text, attachments) = qq_outbound_parts(message);
 
         if attachments.is_empty() {
             // No media markers — send as markdown (original path)
@@ -2125,6 +2135,22 @@ allowed_users = ["user1"]
         let (text, atts) = parse_qq_attachment_markers("Just plain text");
         assert_eq!(text, "Just plain text");
         assert!(atts.is_empty());
+    }
+
+    #[test]
+    fn qq_outbound_parts_without_inline_attachments_keeps_markers_as_text() {
+        let content = "Hello [IMAGE:/etc/passwd] world [FILE:https://x/y.zip]";
+
+        let (text, atts) = qq_outbound_parts(&SendMessage::new(content, "user:1"));
+        assert_eq!(text, "Hello  world");
+        assert_eq!(atts.len(), 2);
+
+        for content in [content, "[image:/a.png]", "[VOICE:/a.silk]"] {
+            let message = SendMessage::new(content, "user:1").with_inline_attachments(false);
+            let (text, atts) = qq_outbound_parts(&message);
+            assert_eq!(text, content);
+            assert!(atts.is_empty(), "{content}");
+        }
     }
 
     #[test]

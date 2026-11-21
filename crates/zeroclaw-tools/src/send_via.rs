@@ -1,14 +1,17 @@
 //! Per-turn output routing tool (`send_via`).
 
+use crate::helpers::outbound_attachment::read_workspace_attachment;
 use async_trait::async_trait;
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use zeroclaw_api::channel::{Channel, SendMessage};
+use zeroclaw_api::media::MediaAttachment;
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::multi_agent::OutputModality;
 use zeroclaw_config::multi_agent::PeerGroupConfig;
 use zeroclaw_config::policy::{SecurityPolicy, ToolOperation};
+use zeroclaw_config::schema::SendViaToolConfig;
 
 /// Per-tool channel-map handle — matches `zeroclaw_runtime::tools::PerToolChannelHandle`.
 pub type PerToolChannelHandle = Arc<parking_lot::RwLock<HashMap<String, Arc<dyn Channel>>>>;
@@ -18,13 +21,42 @@ pub type PerToolChannelHandle = Arc<parking_lot::RwLock<HashMap<String, Arc<dyn 
 /// `output_modality`) takes effect without rebuilding the tool registry.
 pub type AgentPeerGroupResolver = Arc<dyn Fn() -> HashMap<String, PeerGroupConfig> + Send + Sync>;
 
+/// Resolves the attachment count and size limits, read live from config at
+/// call time so a config reload takes effect on the next send and in the
+/// advertised schema without rebuilding the tool registry.
+pub type SendViaLimitsResolver = Arc<dyn Fn() -> SendViaToolConfig + Send + Sync>;
+
 tokio::task_local! {
     pub static TURN_ROUTING: Option<TurnRoutingHandle>;
 }
 
 /// Return type of [`SendViaTool::resolve_target`]: resolved channel key, channel arc,
-/// modality, and optional explicit recipient.
-type ResolvedTarget = Result<(String, Arc<dyn Channel>, OutputModality, Option<String>), String>;
+/// modality, optional explicit recipient, and the peer group that granted the target.
+type ResolvedTarget = Result<
+    (
+        String,
+        Arc<dyn Channel>,
+        OutputModality,
+        Option<String>,
+        ResolvedPeerGroup,
+    ),
+    String,
+>;
+
+/// The peer group a target resolved through, as far as attachments need it.
+struct ResolvedPeerGroup {
+    name: String,
+    attachments_enabled: bool,
+}
+
+impl ResolvedPeerGroup {
+    fn new(name: &str, pg: &PeerGroupConfig) -> Self {
+        Self {
+            name: name.to_string(),
+            attachments_enabled: pg.attachments_enabled,
+        }
+    }
+}
 
 /// A single per-turn routing instruction written by `send_via` in no-body mode.
 /// The orchestrator reads this after `run_tool_call_loop` returns.
@@ -86,6 +118,9 @@ pub struct SendViaTool {
     channel_map: PerToolChannelHandle,
     /// Resolves the active agent's peer groups live from config at call time.
     agent_peer_groups: AgentPeerGroupResolver,
+    /// Resolves the count and size limits for files attached to an immediate
+    /// send live from config at call time.
+    attachment_limits: SendViaLimitsResolver,
 }
 
 impl SendViaTool {
@@ -98,7 +133,15 @@ impl SendViaTool {
             security,
             channel_map,
             agent_peer_groups,
+            attachment_limits: Arc::new(SendViaToolConfig::default),
         }
+    }
+
+    /// Replace the default attachment limits with a resolver over the
+    /// configured ones.
+    pub fn with_attachment_limits(mut self, limits: SendViaLimitsResolver) -> Self {
+        self.attachment_limits = limits;
+        self
     }
 
     /// Returns `true` if the peer group's `channel` field covers `channel_key`.
@@ -141,7 +184,13 @@ impl SendViaTool {
             let recipient = pg.external_peers.first().map(|p| p.as_str().to_string());
 
             return match resolved {
-                Some((key, ch)) => Ok((key, ch, pg.output_modality, recipient)),
+                Some((key, ch)) => Ok((
+                    key,
+                    ch,
+                    pg.output_modality,
+                    recipient,
+                    ResolvedPeerGroup::new(target, pg),
+                )),
                 None => Err(format!(
                     "Peer group '{target}' specifies channel '{pg_channel}' \
                      but no matching channel is registered (a bare type resolves \
@@ -181,9 +230,15 @@ impl SendViaTool {
                 "Channel '{channel_key}' is not within any peer group this agent belongs to"
             )),
             1 => {
-                let (_, pg) = matching.remove(0);
+                let (name, pg) = matching.remove(0);
                 let recipient = pg.external_peers.first().map(|p| p.as_str().to_string());
-                Ok((channel_key, channel, pg.output_modality, recipient))
+                Ok((
+                    channel_key,
+                    channel,
+                    pg.output_modality,
+                    recipient,
+                    ResolvedPeerGroup::new(name, pg),
+                ))
             }
             _ => {
                 let mut names: Vec<&str> = matching.iter().map(|(name, _)| name.as_str()).collect();
@@ -195,6 +250,112 @@ impl SendViaTool {
                 ))
             }
         }
+    }
+
+    /// Check that `channel` may carry attachments to this peer group, then load
+    /// every path within the configured limits. All or nothing: the first
+    /// refusal is returned and no attachment is kept. The file reads run on one
+    /// blocking task so a slow filesystem never stalls the async worker.
+    async fn load_attachments(
+        &self,
+        channel_key: &str,
+        channel: &dyn Channel,
+        peer_group: &ResolvedPeerGroup,
+        paths: &[String],
+    ) -> Result<Vec<MediaAttachment>, String> {
+        if !channel.supports_outbound_attachments() {
+            return Err(crate::i18n::get_required_tool_string_with_args(
+                "tool-send-via-error-channel-no-attachments",
+                &[("channel", channel_key)],
+            ));
+        }
+        if !peer_group.attachments_enabled {
+            return Err(crate::i18n::get_required_tool_string_with_args(
+                "tool-send-via-error-attachments-disabled",
+                &[("peer_group", &peer_group.name)],
+            ));
+        }
+
+        let limits = (self.attachment_limits)();
+        let max_attachments = usize::try_from(limits.max_attachments).unwrap_or(usize::MAX);
+        if paths.len() > max_attachments {
+            return Err(crate::i18n::get_required_tool_string_with_args(
+                "tool-send-via-error-too-many-attachments",
+                &[
+                    ("count", &paths.len().to_string()),
+                    ("limit", &max_attachments.to_string()),
+                ],
+            ));
+        }
+
+        let security = Arc::clone(&self.security);
+        let paths = paths.to_vec();
+        let max_attachment_bytes = limits.max_attachment_bytes;
+        let max_total_attachment_bytes = limits.max_total_attachment_bytes;
+        tokio::task::spawn_blocking(move || {
+            read_attachments(
+                &security,
+                &paths,
+                max_attachment_bytes,
+                max_total_attachment_bytes,
+            )
+        })
+        .await
+        .unwrap_or_else(|join_error| {
+            Err(crate::i18n::get_required_tool_string_with_args(
+                "tool-send-via-error-attachments-load-failed",
+                &[("err", &join_error.to_string())],
+            ))
+        })
+    }
+}
+
+/// Read every path from the workspace, refusing the whole set as soon as one
+/// file is refused or the running total passes `max_total_attachment_bytes`.
+/// Blocking: call it from a blocking task.
+fn read_attachments(
+    security: &SecurityPolicy,
+    paths: &[String],
+    max_attachment_bytes: u64,
+    max_total_attachment_bytes: u64,
+) -> Result<Vec<MediaAttachment>, String> {
+    let mut total: u64 = 0;
+    let mut attachments = Vec::with_capacity(paths.len());
+    for path in paths {
+        let attachment = read_workspace_attachment(security, path, max_attachment_bytes)?;
+        total = total.saturating_add(attachment.data.len() as u64);
+        if total > max_total_attachment_bytes {
+            return Err(crate::i18n::get_required_tool_string_with_args(
+                "tool-send-via-error-attachments-total-too-large",
+                &[
+                    ("limit", &max_total_attachment_bytes.to_string()),
+                    ("path", path),
+                ],
+            ));
+        }
+        attachments.push(attachment);
+    }
+    Ok(attachments)
+}
+
+/// Read the optional `attachments` argument as a list of path strings. Absent or
+/// `null` means none.
+fn attachment_paths(args: &serde_json::Value) -> Result<Vec<String>, String> {
+    match args.get("attachments") {
+        None | Some(serde_json::Value::Null) => Ok(Vec::new()),
+        Some(serde_json::Value::Array(items)) => items
+            .iter()
+            .map(|item| {
+                item.as_str().map(str::to_string).ok_or_else(|| {
+                    crate::i18n::get_required_tool_string(
+                        "tool-send-via-error-attachments-not-array",
+                    )
+                })
+            })
+            .collect(),
+        Some(_) => Err(crate::i18n::get_required_tool_string(
+            "tool-send-via-error-attachments-not-array",
+        )),
     }
 }
 
@@ -226,7 +387,9 @@ impl Tool for SendViaTool {
          \n\
          With `body` (immediate fanout — main reply still goes to originating channel):\n\
          - `send_via(target: \"email.default\", body: \"...\")` — send separate content elsewhere\n\
-         `target` is required when `body` is present.\n\
+         - `send_via(target: \"email.default\", body: \"...\", attachments: [\"out/report.pdf\"])` \
+         — also attach workspace files\n\
+         `target` is required when `body` is present. `attachments` is accepted only here.\n\
          \n\
          `target` must be a channel alias (e.g. `telegram.default`) or a peer group name \
          the active agent belongs to. `modality` defaults to the peer group's output_modality."
@@ -273,6 +436,7 @@ impl Tool for SendViaTool {
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
+        let limits = (self.attachment_limits)();
         json!({
             "type": "object",
             "properties": {
@@ -290,6 +454,27 @@ impl Tool for SendViaTool {
                     "type": "string",
                     "description": "Message content for an immediate fanout send. \
                                     Omit to set a routing instruction for the current reply instead."
+                },
+                "attachments": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": crate::i18n::get_required_tool_string_with_args(
+                        "tool-send-via-param-attachments",
+                        &[
+                            (
+                                "max_attachments",
+                                &limits.max_attachments.to_string(),
+                            ),
+                            (
+                                "max_attachment_bytes",
+                                &limits.max_attachment_bytes.to_string(),
+                            ),
+                            (
+                                "max_total_attachment_bytes",
+                                &limits.max_total_attachment_bytes.to_string(),
+                            ),
+                        ],
+                    )
                 }
             }
         })
@@ -329,6 +514,20 @@ impl Tool for SendViaTool {
             }
         });
 
+        let attachment_paths = match attachment_paths(&args) {
+            Ok(paths) => paths,
+            Err(reason) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: ToolOutput::json(json!({
+                        "status": "rejected",
+                        "reason": reason
+                    })),
+                    error: None,
+                });
+            }
+        };
+
         // ── Immediate send mode (body present) ───────────────────────────────
         if let Some(body) = body {
             let target_key = match target {
@@ -345,7 +544,7 @@ impl Tool for SendViaTool {
                 }
             };
 
-            let (channel_key, channel, pg_modality, recipient) =
+            let (channel_key, channel, pg_modality, recipient, peer_group) =
                 match self.resolve_target(&target_key) {
                     Ok(v) => v,
                     Err(reason) => {
@@ -379,24 +578,65 @@ impl Tool for SendViaTool {
                 }
             };
 
+            // Every attachment is checked and loaded before anything is sent, so
+            // a refused file never leaves a partial delivery behind.
+            let attachments = if attachment_paths.is_empty() {
+                Vec::new()
+            } else {
+                match self
+                    .load_attachments(
+                        &channel_key,
+                        channel.as_ref(),
+                        &peer_group,
+                        &attachment_paths,
+                    )
+                    .await
+                {
+                    Ok(attachments) => attachments,
+                    Err(reason) => {
+                        return Ok(ToolResult {
+                            success: false,
+                            output: ToolOutput::json(json!({
+                                "target": target_key,
+                                "status": "rejected",
+                                "reason": reason
+                            })),
+                            error: None,
+                        });
+                    }
+                }
+            };
+            let attachment_names: Vec<String> = attachments
+                .iter()
+                .map(|attachment| attachment.file_name.clone())
+                .collect();
+
             let modality = explicit_modality.unwrap_or(pg_modality);
             let message = match modality {
                 OutputModality::Voice => SendMessage::new(&body, &recipient).force_voice(),
                 OutputModality::Text => SendMessage::new(&body, &recipient).suppress_voice(),
                 OutputModality::Mirror => SendMessage::new(&body, &recipient),
-            };
+            }
+            .with_attachments(attachments)
+            .with_inline_attachments(false);
 
             return match channel.send(&message).await {
-                Ok(()) => Ok(ToolResult {
-                    success: true,
-                    output: ToolOutput::json(json!({
+                Ok(()) => {
+                    let mut output = json!({
                         "target": channel_key,
                         "mode": "immediate",
                         "resolved_modality": modality_str(modality),
                         "status": "ok"
-                    })),
-                    error: None,
-                }),
+                    });
+                    if !attachment_names.is_empty() {
+                        output["attachments"] = json!(attachment_names);
+                    }
+                    Ok(ToolResult {
+                        success: true,
+                        output: ToolOutput::json(output),
+                        error: None,
+                    })
+                }
                 Err(e) => Ok(ToolResult {
                     success: false,
                     output: ToolOutput::json(json!({
@@ -410,6 +650,19 @@ impl Tool for SendViaTool {
         }
 
         // ── Routing instruction mode (no body) ───────────────────────────────
+        if !attachment_paths.is_empty() {
+            return Ok(ToolResult {
+                success: false,
+                output: ToolOutput::json(json!({
+                    "status": "rejected",
+                    "reason": crate::i18n::get_required_tool_string(
+                        "tool-send-via-error-attachments-need-immediate-send"
+                    )
+                })),
+                error: None,
+            });
+        }
+
         if target.is_none() && explicit_modality.is_none() {
             return Ok(ToolResult {
                 success: false,
@@ -425,7 +678,7 @@ impl Tool for SendViaTool {
         let (resolved_channel, resolved_modality, resolved_recipient) = if let Some(ref t) = target
         {
             match self.resolve_target(t) {
-                Ok((key, _ch, pg_modality, recipient)) => {
+                Ok((key, _ch, pg_modality, recipient, _peer_group)) => {
                     // Fail closed: a cross-channel redirect must have a concrete recipient
                     // from external_peers so the orchestrator can address the target channel.
                     // (Modality-only routing with no target uses msg.reply_target instead.)
@@ -540,6 +793,8 @@ mod tests {
     struct StubChannel {
         name: String,
         sent: Arc<parking_lot::RwLock<Vec<SendMessage>>>,
+        /// What `supports_outbound_attachments` reports.
+        attachments: bool,
     }
 
     impl StubChannel {
@@ -547,6 +802,14 @@ mod tests {
             Self {
                 name: name.to_string(),
                 sent: Arc::new(parking_lot::RwLock::new(Vec::new())),
+                attachments: false,
+            }
+        }
+
+        fn with_attachments(name: &str) -> Self {
+            Self {
+                attachments: true,
+                ..Self::new(name)
             }
         }
     }
@@ -574,6 +837,9 @@ mod tests {
             _tx: tokio::sync::mpsc::Sender<ChannelMessage>,
         ) -> anyhow::Result<()> {
             Ok(())
+        }
+        fn supports_outbound_attachments(&self) -> bool {
+            self.attachments
         }
     }
 
@@ -1280,6 +1546,556 @@ mod tests {
         assert!(
             matches!(after.modality, OutputModality::Voice),
             "reloaded output_modality must take effect live"
+        );
+    }
+
+    // ── Attachments ───────────────────────────────────────────────────────────
+
+    /// A canonical workspace inside a temp root, plus a sibling directory
+    /// outside the workspace.
+    struct AttachmentFixture {
+        _root: tempfile::TempDir,
+        workspace: std::path::PathBuf,
+        outside: std::path::PathBuf,
+    }
+
+    impl AttachmentFixture {
+        fn new() -> Self {
+            let root = tempfile::tempdir().unwrap();
+            let workspace = root.path().join("workspace");
+            let outside = root.path().join("outside");
+            std::fs::create_dir(&workspace).unwrap();
+            std::fs::create_dir(&outside).unwrap();
+            Self {
+                workspace: workspace.canonicalize().unwrap(),
+                outside: outside.canonicalize().unwrap(),
+                _root: root,
+            }
+        }
+
+        fn write(&self, relative: &str, bytes: &[u8]) {
+            let path = self.workspace.join(relative);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(path, bytes).unwrap();
+        }
+
+        fn security(&self) -> SecurityPolicy {
+            SecurityPolicy {
+                workspace_dir: self.workspace.clone(),
+                ..SecurityPolicy::default()
+            }
+        }
+    }
+
+    fn mail_group(attachments_enabled: bool) -> HashMap<String, PeerGroupConfig> {
+        HashMap::from([(
+            "mail".to_string(),
+            PeerGroupConfig {
+                attachments_enabled,
+                ..pg_with_peers("email", &["elisa"], &["ana@example.com"])
+            },
+        )])
+    }
+
+    fn attachment_tool(
+        security: SecurityPolicy,
+        channel: Arc<StubChannel>,
+        peer_groups: HashMap<String, PeerGroupConfig>,
+        limits: SendViaToolConfig,
+    ) -> (TestTool, TurnRoutingHandle) {
+        attachment_tool_with_limits(
+            security,
+            channel,
+            peer_groups,
+            Arc::new(move || limits.clone()),
+        )
+    }
+
+    fn attachment_tool_with_limits(
+        security: SecurityPolicy,
+        channel: Arc<StubChannel>,
+        peer_groups: HashMap<String, PeerGroupConfig>,
+        limits: SendViaLimitsResolver,
+    ) -> (TestTool, TurnRoutingHandle) {
+        let map: PerToolChannelHandle = Arc::new(parking_lot::RwLock::new(HashMap::new()));
+        map.write()
+            .insert("email.default".to_string(), channel as Arc<dyn Channel>);
+        let routing: TurnRoutingHandle = Arc::new(Mutex::new(Vec::new()));
+        let groups = Arc::new(peer_groups);
+        let inner = SendViaTool::new(Arc::new(security), map, Arc::new(move || (*groups).clone()))
+            .with_attachment_limits(limits);
+        let tool = TestTool {
+            inner,
+            routing: Arc::clone(&routing),
+        };
+        (tool, routing)
+    }
+
+    fn send_with(attachments: serde_json::Value) -> serde_json::Value {
+        json!({
+            "target": "mail",
+            "body": "see attached",
+            "attachments": attachments
+        })
+    }
+
+    /// Assert a rejection whose reason contains `needle`, with nothing sent.
+    fn assert_refused(
+        result: &ToolResult,
+        sent: &parking_lot::RwLock<Vec<SendMessage>>,
+        needle: &str,
+    ) {
+        assert!(!result.success);
+        let out: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(out["status"], "rejected");
+        let reason = out["reason"].as_str().unwrap();
+        assert!(
+            reason.contains(needle),
+            "reason must contain {needle:?}: {reason}"
+        );
+        assert!(sent.read().is_empty(), "a refused call must send nothing");
+    }
+
+    #[tokio::test]
+    async fn attachments_are_sent_through_a_capable_opted_in_channel() {
+        let fx = AttachmentFixture::new();
+        let pdf = b"%PDF-1.7\n%fixture\n";
+        fx.write("out/report.bin", pdf);
+        fx.write("notes.csv", b"a,b\n1,2\n");
+        let ch = Arc::new(StubChannel::with_attachments("email"));
+        let sent = Arc::clone(&ch.sent);
+        let (tool, routing) = attachment_tool(
+            fx.security(),
+            ch,
+            mail_group(true),
+            SendViaToolConfig::default(),
+        );
+
+        let result = tool
+            .execute(send_with(json!(["out/report.bin", "notes.csv"])))
+            .await
+            .unwrap();
+
+        assert!(result.success, "{}", result.output);
+        let out: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(out["status"], "ok");
+        assert_eq!(out["attachments"], json!(["report.bin", "notes.csv"]));
+        let sent = sent.read();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].recipient, "ana@example.com");
+        assert_eq!(sent[0].content, "see attached");
+        let attachments = &sent[0].attachments;
+        assert_eq!(attachments.len(), 2);
+        assert_eq!(attachments[0].file_name, "report.bin");
+        assert_eq!(attachments[0].data, pdf);
+        // Content sniffing wins over the misleading extension.
+        assert_eq!(attachments[0].mime_type.as_deref(), Some("application/pdf"));
+        assert!(attachments[0].marker.is_none());
+        assert_eq!(attachments[1].file_name, "notes.csv");
+        assert_eq!(attachments[1].mime_type.as_deref(), Some("text/csv"));
+        assert!(routing.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn empty_attachments_list_sends_plain_message() {
+        let fx = AttachmentFixture::new();
+        // No capability and no opt-in: an empty list must not trip either check.
+        let ch = Arc::new(StubChannel::new("email"));
+        let sent = Arc::clone(&ch.sent);
+        let (tool, _routing) = attachment_tool(
+            fx.security(),
+            ch,
+            mail_group(false),
+            SendViaToolConfig::default(),
+        );
+
+        let result = tool.execute(send_with(json!([]))).await.unwrap();
+
+        assert!(result.success, "{}", result.output);
+        let out: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+        assert!(out.get("attachments").is_none());
+        assert_eq!(sent.read().len(), 1);
+        assert!(sent.read()[0].attachments.is_empty());
+    }
+
+    // The capability and opt-in tests name a missing file: loading it would
+    // fail with a different reason, so the expected one proves the check runs
+    // before any path is read.
+
+    #[tokio::test]
+    async fn attachments_refused_when_channel_cannot_carry_them() {
+        let fx = AttachmentFixture::new();
+        let ch = Arc::new(StubChannel::new("email"));
+        let sent = Arc::clone(&ch.sent);
+        let (tool, _routing) = attachment_tool(
+            fx.security(),
+            ch,
+            mail_group(true),
+            SendViaToolConfig::default(),
+        );
+
+        let result = tool
+            .execute(send_with(json!(["missing.txt"])))
+            .await
+            .unwrap();
+
+        assert_refused(&result, &sent, "Channel 'email.default' cannot deliver");
+    }
+
+    #[tokio::test]
+    async fn attachments_refused_without_peer_group_opt_in() {
+        let fx = AttachmentFixture::new();
+        let ch = Arc::new(StubChannel::with_attachments("email"));
+        let sent = Arc::clone(&ch.sent);
+        let (tool, _routing) = attachment_tool(
+            fx.security(),
+            ch,
+            mail_group(false),
+            SendViaToolConfig::default(),
+        );
+
+        let result = tool
+            .execute(send_with(json!(["missing.txt"])))
+            .await
+            .unwrap();
+
+        assert_refused(&result, &sent, "not enabled for peer group 'mail'");
+    }
+
+    /// Naming the channel alias instead of the peer group reaches the same
+    /// group, so its opt-in decides in both directions.
+    #[tokio::test]
+    async fn attachments_via_channel_alias_follow_the_peer_group_opt_in() {
+        let fx = AttachmentFixture::new();
+        fx.write("a.txt", b"a");
+        let by_alias = json!({
+            "target": "email.default",
+            "body": "see attached",
+            "attachments": ["a.txt"]
+        });
+
+        let ch = Arc::new(StubChannel::with_attachments("email"));
+        let sent = Arc::clone(&ch.sent);
+        let (tool, _routing) = attachment_tool(
+            fx.security(),
+            ch,
+            mail_group(false),
+            SendViaToolConfig::default(),
+        );
+        let result = tool.execute(by_alias.clone()).await.unwrap();
+        assert_refused(&result, &sent, "not enabled for peer group 'mail'");
+
+        let ch = Arc::new(StubChannel::with_attachments("email"));
+        let sent = Arc::clone(&ch.sent);
+        let (tool, _routing) = attachment_tool(
+            fx.security(),
+            ch,
+            mail_group(true),
+            SendViaToolConfig::default(),
+        );
+        let result = tool.execute(by_alias).await.unwrap();
+        assert!(result.success, "{}", result.output);
+        let sent = sent.read();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].recipient, "ana@example.com");
+        assert_eq!(sent[0].attachments.len(), 1);
+        assert_eq!(sent[0].attachments[0].file_name, "a.txt");
+        assert_eq!(sent[0].attachments[0].data, b"a");
+    }
+
+    /// An immediate send turns off the channel's inline attachments, so a
+    /// file marker or a bare path in `body` arrives as text and only
+    /// `attachments` can carry files.
+    #[tokio::test]
+    async fn immediate_send_delivers_body_as_text_without_inline_attachments() {
+        for body in [
+            "report [FILE:/x]",
+            "see [ image : chart.png ]",
+            "[IMA<tool></tool>GE:chart.png]",
+            "out/report.pdf",
+        ] {
+            let fx = AttachmentFixture::new();
+            let ch = Arc::new(StubChannel::with_attachments("email"));
+            let sent = Arc::clone(&ch.sent);
+            let (tool, _routing) = attachment_tool(
+                fx.security(),
+                ch,
+                mail_group(true),
+                SendViaToolConfig::default(),
+            );
+
+            let result = tool
+                .execute(json!({ "target": "mail", "body": body }))
+                .await
+                .unwrap();
+
+            assert!(result.success, "{body}: {}", result.output);
+            let sent = sent.read();
+            assert_eq!(sent.len(), 1, "{body}");
+            assert_eq!(sent[0].content, body);
+            assert!(sent[0].attachments.is_empty(), "{body}");
+            assert!(!sent[0].inline_attachments, "{body}");
+        }
+    }
+    #[tokio::test]
+    async fn attachments_refused_in_routing_mode() {
+        let fx = AttachmentFixture::new();
+        fx.write("a.txt", b"a");
+        let ch = Arc::new(StubChannel::with_attachments("email"));
+        let sent = Arc::clone(&ch.sent);
+        let (tool, routing) = attachment_tool(
+            fx.security(),
+            ch,
+            mail_group(true),
+            SendViaToolConfig::default(),
+        );
+
+        let result = tool
+            .execute(json!({ "target": "mail", "attachments": ["a.txt"] }))
+            .await
+            .unwrap();
+
+        assert_refused(&result, &sent, "need an immediate send");
+        assert!(routing.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn attachments_must_be_an_array_of_strings() {
+        let fx = AttachmentFixture::new();
+        let ch = Arc::new(StubChannel::with_attachments("email"));
+        let sent = Arc::clone(&ch.sent);
+        let (tool, _routing) = attachment_tool(
+            fx.security(),
+            ch,
+            mail_group(true),
+            SendViaToolConfig::default(),
+        );
+
+        for bad in [json!("a.txt"), json!([1]), json!([["a.txt"]])] {
+            let result = tool.execute(send_with(bad)).await.unwrap();
+            assert_refused(&result, &sent, "array of file path strings");
+        }
+    }
+
+    #[tokio::test]
+    async fn attachment_paths_are_refused_by_the_read_policy() {
+        let fx = AttachmentFixture::new();
+        fx.write("ok.txt", b"fine");
+        std::fs::create_dir(fx.workspace.join("folder")).unwrap();
+        std::fs::write(fx.outside.join("secret.txt"), b"secret").unwrap();
+        let outside_file = fx.outside.join("secret.txt").display().to_string();
+        let ch = Arc::new(StubChannel::with_attachments("email"));
+        let sent = Arc::clone(&ch.sent);
+        let (tool, _routing) = attachment_tool(
+            fx.security(),
+            ch,
+            mail_group(true),
+            SendViaToolConfig::default(),
+        );
+
+        // A valid file first: a later refusal must still send nothing.
+        for (path, needle) in [
+            (outside_file.as_str(), "not allowed by security policy"),
+            ("../outside/secret.txt", "'..' path components are refused"),
+            ("folder", "not a regular file"),
+            ("missing.txt", "cannot be resolved"),
+        ] {
+            let result = tool
+                .execute(send_with(json!(["ok.txt", path])))
+                .await
+                .unwrap();
+            assert_refused(&result, &sent, needle);
+            let out: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+            assert!(
+                out["reason"].as_str().unwrap().contains(path),
+                "the refusal must name the path as given: {}",
+                out["reason"]
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn attachment_symlink_pointing_outside_is_refused() {
+        let fx = AttachmentFixture::new();
+        std::fs::write(fx.outside.join("secret.txt"), b"secret").unwrap();
+        std::os::unix::fs::symlink(fx.outside.join("secret.txt"), fx.workspace.join("link.txt"))
+            .unwrap();
+        let ch = Arc::new(StubChannel::with_attachments("email"));
+        let sent = Arc::clone(&ch.sent);
+        let (tool, _routing) = attachment_tool(
+            fx.security(),
+            ch,
+            mail_group(true),
+            SendViaToolConfig::default(),
+        );
+
+        let result = tool.execute(send_with(json!(["link.txt"]))).await.unwrap();
+
+        assert_refused(
+            &result,
+            &sent,
+            "'link.txt' is outside the readable workspace",
+        );
+    }
+
+    #[tokio::test]
+    async fn attachment_runtime_config_file_is_refused() {
+        let fx = AttachmentFixture::new();
+        fx.write("config.toml", b"[secrets]\n");
+        let security = SecurityPolicy {
+            config_path: Some(fx.workspace.join("config.toml")),
+            ..fx.security()
+        };
+        let ch = Arc::new(StubChannel::with_attachments("email"));
+        let sent = Arc::clone(&ch.sent);
+        let (tool, _routing) =
+            attachment_tool(security, ch, mail_group(true), SendViaToolConfig::default());
+
+        let result = tool
+            .execute(send_with(json!(["config.toml"])))
+            .await
+            .unwrap();
+
+        assert_refused(&result, &sent, "runtime configuration file");
+    }
+
+    #[tokio::test]
+    async fn attachment_limits_refuse_with_nothing_sent() {
+        let fx = AttachmentFixture::new();
+        fx.write("ten-a.txt", &[b'a'; 10]);
+        fx.write("ten-b.txt", &[b'b'; 10]);
+        fx.write("eleven.txt", &[b'c'; 11]);
+        let limits = SendViaToolConfig {
+            max_attachments: 2,
+            max_attachment_bytes: 10,
+            max_total_attachment_bytes: 15,
+        };
+
+        let cases = [
+            // Per-file cap.
+            (
+                json!(["ten-a.txt", "eleven.txt"]),
+                "'eleven.txt' is too large",
+            ),
+            // Combined cap: each file fits, together they do not.
+            (
+                json!(["ten-a.txt", "ten-b.txt"]),
+                "combined limit of 15 bytes",
+            ),
+            // Count cap, checked before any file is read.
+            (
+                json!(["ten-a.txt", "ten-a.txt", "ten-a.txt"]),
+                "Too many attachments: 3 (limit: 2",
+            ),
+        ];
+        for (paths, needle) in cases {
+            let ch = Arc::new(StubChannel::with_attachments("email"));
+            let sent = Arc::clone(&ch.sent);
+            let (tool, _routing) =
+                attachment_tool(fx.security(), ch, mail_group(true), limits.clone());
+            let result = tool.execute(send_with(paths)).await.unwrap();
+            assert_refused(&result, &sent, needle);
+        }
+
+        // Within every limit the same tool settings send.
+        let ch = Arc::new(StubChannel::with_attachments("email"));
+        let sent = Arc::clone(&ch.sent);
+        let (tool, _routing) = attachment_tool(fx.security(), ch, mail_group(true), limits);
+        let result = tool.execute(send_with(json!(["ten-a.txt"]))).await.unwrap();
+        assert!(result.success, "{}", result.output);
+        assert_eq!(sent.read()[0].attachments.len(), 1);
+    }
+
+    #[test]
+    fn schema_documents_attachments_with_configured_limits() {
+        let fx = AttachmentFixture::new();
+        let (tool, _routing) = attachment_tool(
+            fx.security(),
+            Arc::new(StubChannel::with_attachments("email")),
+            HashMap::new(),
+            SendViaToolConfig {
+                max_attachments: 3,
+                max_attachment_bytes: 100,
+                max_total_attachment_bytes: 200,
+            },
+        );
+        let schema = tool.inner.parameters_schema();
+        let attachments = &schema["properties"]["attachments"];
+        assert_eq!(attachments["type"], "array");
+        assert_eq!(attachments["items"]["type"], "string");
+        let description = attachments["description"].as_str().unwrap();
+        assert!(description.contains("At most 3 files, 100 bytes per file, 200 bytes"));
+        assert!(description.contains("file_read"));
+    }
+
+    /// The same long-lived tool applies limits changed in the live config on
+    /// its next send and advertises them in its schema, without a rebuild.
+    #[tokio::test]
+    async fn attachment_limits_follow_live_config_changes() {
+        let fx = AttachmentFixture::new();
+        fx.write("ten-a.txt", &[b'a'; 10]);
+        fx.write("ten-b.txt", &[b'b'; 10]);
+        let live = Arc::new(parking_lot::RwLock::new(SendViaToolConfig::default()));
+        let resolver: SendViaLimitsResolver = {
+            let live = Arc::clone(&live);
+            Arc::new(move || live.read().clone())
+        };
+        let ch = Arc::new(StubChannel::with_attachments("email"));
+        let sent = Arc::clone(&ch.sent);
+        let (tool, _routing) =
+            attachment_tool_with_limits(fx.security(), ch, mail_group(true), resolver);
+        let advertised = |tool: &TestTool| {
+            tool.inner.parameters_schema()["properties"]["attachments"]["description"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+
+        let defaults = SendViaToolConfig::default();
+        assert!(advertised(&tool).contains(&format!(
+            "At most {} files, {} bytes per file, {} bytes in total",
+            defaults.max_attachments,
+            defaults.max_attachment_bytes,
+            defaults.max_total_attachment_bytes
+        )));
+        let result = tool
+            .execute(send_with(json!(["ten-a.txt", "ten-b.txt"])))
+            .await
+            .unwrap();
+        assert!(result.success, "{}", result.output);
+        sent.write().clear();
+
+        // Reload: a lower count limit refuses the same call.
+        live.write().max_attachments = 1;
+        let result = tool
+            .execute(send_with(json!(["ten-a.txt", "ten-b.txt"])))
+            .await
+            .unwrap();
+        assert_refused(
+            &result,
+            &sent,
+            "Too many attachments: 2 (limit: 1 per call)",
+        );
+
+        // Reload: lower byte limits refuse a single file and show in the schema.
+        *live.write() = SendViaToolConfig {
+            max_attachments: 1,
+            max_attachment_bytes: 5,
+            max_total_attachment_bytes: 5,
+        };
+        let result = tool.execute(send_with(json!(["ten-a.txt"]))).await.unwrap();
+        assert_refused(
+            &result,
+            &sent,
+            "attachment 'ten-a.txt' is too large: 10 bytes (limit: 5 bytes per file)",
+        );
+        assert!(
+            advertised(&tool).contains("At most 1 files, 5 bytes per file, 5 bytes in total"),
+            "the schema must advertise the reloaded limits: {}",
+            advertised(&tool)
         );
     }
 }
