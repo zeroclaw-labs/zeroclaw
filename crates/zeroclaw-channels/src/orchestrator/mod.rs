@@ -30625,6 +30625,7 @@ BTC is currently around $65,000 based on latest tool output."#
         cfg.channels.telegram.insert(
             "telegram_test_alias".to_string(),
             TelegramConfig {
+                owner_chat_id: None,
                 bot_token: "fake-token".into(),
                 multi_message_delay_ms: 0,
                 ..TelegramConfig::default()
@@ -30822,6 +30823,7 @@ BTC is currently around $65,000 based on latest tool output."#
         cfg.channels.telegram.insert(
             "telegram_test_alias".to_string(),
             TelegramConfig {
+                owner_chat_id: None,
                 bot_token: "fake-token".into(),
                 multi_message_delay_ms: 0,
                 ..TelegramConfig::default()
@@ -31020,6 +31022,7 @@ BTC is currently around $65,000 based on latest tool output."#
         cfg.channels.telegram.insert(
             "telegram_test_alias".to_string(),
             TelegramConfig {
+                owner_chat_id: None,
                 bot_token: "fake-token".into(),
                 multi_message_delay_ms: 0,
                 ..TelegramConfig::default()
@@ -31218,6 +31221,7 @@ BTC is currently around $65,000 based on latest tool output."#
         cfg.channels.telegram.insert(
             "telegram_test_alias".to_string(),
             TelegramConfig {
+                owner_chat_id: None,
                 bot_token: "fake-token".into(),
                 multi_message_delay_ms: 0,
                 ..TelegramConfig::default()
@@ -31794,6 +31798,7 @@ BTC is currently around $65,000 based on latest tool output."#
         cfg.channels.telegram.insert(
             "telegram_test_alias".to_string(),
             TelegramConfig {
+                owner_chat_id: None,
                 bot_token: "fake-token".into(),
                 multi_message_delay_ms: 0,
                 ..TelegramConfig::default()
@@ -53749,6 +53754,7 @@ This is an example JSON object for profile settings."#;
         config.channels.telegram.insert(
             "default".to_string(),
             zeroclaw_config::schema::TelegramConfig {
+                owner_chat_id: None,
                 enabled: true,
                 bot_token: "test-token".to_string(),
                 api_base_url: zeroclaw_config::schema::TELEGRAM_OFFICIAL_API_BASE_URL.to_string(),
@@ -53782,6 +53788,7 @@ This is an example JSON object for profile settings."#;
         config.channels.telegram.insert(
             alias.to_string(),
             zeroclaw_config::schema::TelegramConfig {
+                owner_chat_id: None,
                 enabled: true,
                 bot_token: "test-token".to_string(),
                 api_base_url: zeroclaw_config::schema::TELEGRAM_OFFICIAL_API_BASE_URL.to_string(),
