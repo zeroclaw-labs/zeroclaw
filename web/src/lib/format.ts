@@ -2,6 +2,9 @@ import { t } from '@/lib/i18n';
 
 export function formatUsd(value: number | null): string {
   if (value === null) return '—';
+  // Nothing spent (a free local model, say) is $0.00; "<$0.01" is for spend
+  // too small to show in cents.
+  if (value <= 0) return '$0.00';
   if (value < 0.01) return '<$0.01';
   return `$${value.toFixed(2)}`;
 }
