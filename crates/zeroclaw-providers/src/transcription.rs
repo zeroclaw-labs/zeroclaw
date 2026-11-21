@@ -1987,7 +1987,7 @@ mod tests {
         let mut config = zeroclaw_config::schema::Config::default();
         config.transcription.enabled = true;
         config.providers.transcription = typed.clone();
-        let _ = TranscriptionManager::from_config_for_agent(&config, None);
+        assert!(TranscriptionManager::from_config_for_agent(&config, None).is_ok());
         assert_events(
             "config manager",
             std::iter::from_fn(|| rx.try_recv().ok()).collect(),

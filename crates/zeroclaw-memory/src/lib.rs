@@ -1114,6 +1114,7 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use tempfile::TempDir;
+    use zeroclaw_api::embedding::EmbeddingProvider;
     use zeroclaw_config::schema::Config;
     use zeroclaw_config::schema::EmbeddingRouteConfig;
 
@@ -1516,13 +1517,12 @@ mod tests {
         profile.api_key = Some("chat-key".into());
         zeroclaw_config::migration::normalize_test_input(&mut config);
 
+        let expected_identity = build_embedder_from_config(&config).unwrap().identity();
         drop(create_memory_from_config(&config).unwrap());
         let reopened = SqliteMemory::new("test", tmp.path()).unwrap();
         assert_eq!(embedded_rows(&reopened), 1);
         let identity = reopened.stored_embedding_identity().unwrap().unwrap();
-        assert_ne!(identity.provider, "openai");
-        assert_eq!(identity.model, "text-embedding-3-small");
-        assert_eq!(identity.dimensions, 4);
+        assert_eq!(identity, expected_identity);
     }
 
     #[tokio::test]
