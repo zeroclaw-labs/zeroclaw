@@ -21,24 +21,33 @@ struct Destination {
     let agent: String
 
     init(_ address: String, _ agent: String) throws {
-        guard let parts = URLComponents(string: address), let origin = parts.url,
+        guard let parts = URLComponents(string: address),
               parts.scheme == "http" || parts.scheme == "https",
               ["127.0.0.1", "localhost", "[::1]"].contains(parts.host?.lowercased() ?? ""),
               parts.user == nil, parts.password == nil, parts.query == nil, parts.fragment == nil,
               parts.path.isEmpty || parts.path == "/", identifier(agent) else {
             throw Failure("Expected a loopback dashboard origin and an agent alias.")
         }
-        self.origin = origin
+        var canonical = parts
+        canonical.path = ""
+        canonical.host = parts.host?.lowercased()
+        if (parts.scheme == "http" && parts.port == 80) || (parts.scheme == "https" && parts.port == 443) {
+            canonical.port = nil
+        }
+        guard let normalized = canonical.url else { throw Failure("Invalid dashboard origin.") }
+        self.origin = normalized
         self.agent = agent
     }
 
     func link(_ session: String?) throws -> URL {
         var parts = URLComponents(url: origin, resolvingAgainstBaseURL: false)
         parts?.path = "/agent/" + agent
+        var query = [URLQueryItem(name: "notify", value: "1")]
         if let session {
             guard identifier(session) else { throw Failure("Invalid conversation identifier.") }
-            parts?.queryItems = [URLQueryItem(name: "session", value: session)]
+            query.append(URLQueryItem(name: "session", value: session))
         }
+        parts?.queryItems = query
         guard let url = parts?.url else { throw Failure("Invalid dashboard address.") }
         return url
     }

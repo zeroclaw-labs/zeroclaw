@@ -33,6 +33,7 @@ class FakeWebSocket {
 
 const fakeWindow = Object.assign(new EventTarget(), {
   location: { protocol: "https:", host: "zc.example", hostname: "zc.example", port: "", pathname: "/", search: "" },
+  focus: () => {},
   setTimeout: (fn: () => void, ms: number) => setTimeout(fn, ms),
   clearTimeout: (id: ReturnType<typeof setTimeout>) => clearTimeout(id),
 });
@@ -136,6 +137,29 @@ test("an unavailable linked conversation opens the agent's ordinary chat", async
   sessionList = async () => Response.json({ sessions: [] });
   const r = await render("/agent/support?session=unavailable", createElement(ChatWorkspace, { initialAlias: "support" }), "/agent/:alias");
   assert.notEqual(r.root.findByType(AgentProvider).props.initialSessionId, "unavailable");
+});
+
+test("a second notification window delegates to the open workspace", {
+  skip: typeof navigator === "undefined" || !navigator.locks || typeof BroadcastChannel === "undefined",
+}, async () => {
+  sessionList = async () => Response.json({ sessions: [{
+    session_id: "active", session_key: "gw_active", agent_alias: "support", channel_id: null,
+  }] });
+  const first = await render("/agent/support", createElement(ChatWorkspace, { initialAlias: "support" }), "/agent/:alias");
+  let second: ReactTestRenderer | undefined;
+  try {
+    await act(async () => {
+      second = create(createElement(MemoryRouter, { initialEntries: ["/agent/support?notify=1&session=gw_active"] },
+        createElement(ChatWorkspace, { initialAlias: "support" })));
+    });
+    await settle();
+    assert.ok(second);
+    assert.equal(second.root.findAllByType(AgentProvider).length, 0);
+    assert.match(text(second.root), /existing ZeroClaw window/);
+    assert.ok(first.root.findAllByType(AgentProvider).some((pane) => pane.props.initialSessionId === "active"));
+  } finally {
+    await act(async () => { second?.unmount(); });
+  }
 });
 
 test("the agents page lists only the agents this account may use", async () => {

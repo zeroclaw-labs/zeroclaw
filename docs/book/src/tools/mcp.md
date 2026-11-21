@@ -44,6 +44,9 @@ in the default browser. An optional conversation ID selects a saved gateway
 conversation attributed to that agent, including when another tab already has
 the same agent open. If the dashboard cannot verify the conversation from its
 session list, the link opens the agent’s usual chat.
+If another browser tab is already running the chat workspace, a notification
+tab asks it to open the conversation. Browsers with Web Locks and Broadcast
+Channel support can reuse its live connections.
 
 From the repository root, build the app using the Xcode Command Line Tools.
 Open it once to request notification permission.

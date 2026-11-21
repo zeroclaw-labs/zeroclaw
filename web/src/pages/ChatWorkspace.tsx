@@ -5,6 +5,8 @@ import { AgentChatInner, type AgentChatStatus } from '@/pages/AgentChat';
 import { ChatTabBar, type TabIndicator, type WorkspaceLayout } from '@/components/ChatTabBar';
 import { basePath } from '@/lib/basePath';
 import { getSessions } from '@/lib/api';
+import { t } from '@/lib/i18n';
+import { useNotificationWindow } from './useNotificationWindow';
 import {
   applySessionChange,
   loadPersisted,
@@ -50,6 +52,7 @@ export interface ChatWorkspaceProps {
  */
 export default function ChatWorkspace({ initialAlias, allowedAliases }: ChatWorkspaceProps) {
   const location = useLocation();
+  const notificationWindow = useNotificationWindow(initialAlias);
   const requested = linkedSession(location.search);
   const [resolved, setResolved] = useState<{ alias: string; routeKey: string; requested?: string; session?: string }>();
   useEffect(() => {
@@ -68,7 +71,8 @@ export default function ChatWorkspace({ initialAlias, allowedAliases }: ChatWork
   const route = requested ? resolved : { alias: initialAlias, routeKey: location.key, requested: undefined, session: undefined };
   // Keep mounted panes and sockets during an in-app navigation. A cold link
   // waits for the session inventory before it can mount a pane with that ID.
-  if (!route || (allowedAliases && !allowedAliases.has(route.alias))) return null;
+  if (notificationWindow === 'forwarded') return <p role="status" className="p-4">{t('agent.notification_opened_elsewhere')}</p>;
+  if (notificationWindow === 'waiting' || !route || (allowedAliases && !allowedAliases.has(route.alias))) return null;
   const waiting = route.routeKey !== location.key || route.alias !== initialAlias || route.requested !== requested;
   return <Workspace initialAlias={route.alias} allowedAliases={allowedAliases}
     session={route.session} routeKey={route.routeKey} waiting={waiting} />;
