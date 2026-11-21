@@ -9,7 +9,7 @@
 //! them to build requests and deserialize peer responses. Router/server-only
 //! types stay gateway-local.
 //!
-//! This follows the established precedent of [`crate::jsonrpc`]: a
+//! This follows the established precedent of `zeroclaw-api`'s `jsonrpc`: a
 //! dependency-light, pure-Serde wire-model source shared across crates
 //! without cross-crate coupling. No `a2a-rs`/protobuf footprint.
 //!
@@ -1209,7 +1209,7 @@ mod tests {
     /// tests fail — preventing silent protocol drift without a live peer.
     #[test]
     fn fixture_send_message_request_round_trips() {
-        let raw = include_str!("../tests/fixtures/send_message_request.json");
+        let raw = include_str!("../../tests/fixtures/send_message_request.json");
         let parsed: serde_json::Value = serde_json::from_str(raw).unwrap();
         // The request envelope must parse as a JsonRpcRequest.
         let req: JsonRpcRequest = serde_json::from_str(raw).unwrap();
@@ -1231,7 +1231,7 @@ mod tests {
 
     #[test]
     fn fixture_send_message_response_task_branch() {
-        let raw = include_str!("../tests/fixtures/send_message_response_task.json");
+        let raw = include_str!("../../tests/fixtures/send_message_response_task.json");
         let resp: JsonRpcResponse<SendMessageResponse> = serde_json::from_str(raw).unwrap();
         let payload = rpc_result(resp, None).unwrap();
         match payload {
@@ -1251,7 +1251,7 @@ mod tests {
 
     #[test]
     fn fixture_send_message_response_message_branch() {
-        let raw = include_str!("../tests/fixtures/send_message_response_message.json");
+        let raw = include_str!("../../tests/fixtures/send_message_response_message.json");
         let resp: JsonRpcResponse<SendMessageResponse> = serde_json::from_str(raw).unwrap();
         let payload = rpc_result(resp, None).unwrap();
         match payload {
