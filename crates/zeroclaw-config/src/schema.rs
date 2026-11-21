@@ -7532,10 +7532,14 @@ pub struct CostConfig {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "cost.enforcement"]
 pub struct CostEnforcementConfig {
-    /// Enforcement mode: "warn", "block", or "route_down".
+    /// What happens when a shared daily or monthly limit is exceeded:
+    /// "warn" (default) logs a warning and lets the request through, and
+    /// "block" refuses it. "route_down" does not substitute a model yet and
+    /// refuses like "block", as does any other value. A delegated agent's
+    /// per-hop cost ceiling refuses in every mode.
     #[serde(default = "default_cost_enforcement_mode")]
     pub mode: String,
-    /// Model hint to route to when budget is exceeded (used with "route_down" mode).
+    /// Model hint for "route_down" mode, which does not substitute it yet.
     #[serde(default)]
     pub route_down_model: Option<String>,
     /// Reserve this percentage of budget for critical operations.

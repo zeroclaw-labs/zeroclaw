@@ -1397,6 +1397,10 @@ tags = ["auto-generated"]
         let cost_config = zeroclaw_config::schema::CostConfig {
             enabled: true,
             daily_limit_usd: 0.001, // very low limit
+            enforcement: zeroclaw_config::schema::CostEnforcementConfig {
+                mode: "block".into(),
+                ..zeroclaw_config::schema::CostEnforcementConfig::default()
+            },
             ..zeroclaw_config::schema::CostConfig::default()
         };
         let tracker = Arc::new(CostTracker::new(cost_config, cost_dir.path()).unwrap());

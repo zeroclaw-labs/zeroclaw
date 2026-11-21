@@ -485,20 +485,8 @@ impl CostTracker {
         // derived tracker can only be stricter than the base tracker,
         // never looser. Own entry first, then ancestors nearest first, so
         // the nearest violated ceiling wins and names its agent.
-        if let BudgetScope::Agent { own, inherited } = &self.budget_scope {
-            for entry in std::iter::once(own).chain(inherited.iter()) {
-                let agent_daily = storage.get_daily_cost_for_agent(&entry.alias);
-                let descendants_usd = entry.descendants_usd_for(day);
-                let projected = agent_daily + descendants_usd + estimated_cost_usd;
-                if projected > entry.daily_ceiling_usd {
-                    return Ok(BudgetCheck::Exceeded {
-                        current_usd: agent_daily + descendants_usd,
-                        limit_usd: entry.daily_ceiling_usd,
-                        period: UsagePeriod::Day,
-                        agent_alias: Some(entry.alias.clone()),
-                    });
-                }
-            }
+        if let Some(exceeded) = self.exceeded_agent_ceiling(&storage, day, estimated_cost_usd) {
+            return Ok(exceeded);
         }
 
         // Check monthly limit
@@ -534,6 +522,66 @@ impl CostTracker {
         }
 
         Ok(BudgetCheck::Allowed)
+    }
+
+    /// The per-hop and per-agent daily ceilings alone, without the shared
+    /// daily and monthly limits that [`Self::check_budget`] checks first.
+    /// `Exceeded` names the ceiling the current spend already breaks;
+    /// `Allowed` when none does, and always for a tracker that carries no
+    /// ceiling (the process-global one and [`Self::derived_shared`]). The
+    /// runtime asks this when `[cost.enforcement] mode` lets an exceeded
+    /// shared limit through: `check_budget` returns at the first limit it
+    /// finds exceeded, so a delegation's own ceiling would otherwise go
+    /// unchecked behind an exceeded shared limit.
+    pub fn check_ceilings(&self) -> Result<BudgetCheck> {
+        let (enabled, _) = self.mode();
+        if !enabled {
+            return Ok(BudgetCheck::Allowed);
+        }
+        let mut storage = self.lock_storage();
+        let (daily_cost, _) = storage.get_aggregated_costs_at_period(ReportingPeriod::current())?;
+        let day = storage.reporting_period().day;
+        if let BudgetScope::SharedCapped { daily_ceiling_usd } = &self.budget_scope
+            && daily_cost > *daily_ceiling_usd
+        {
+            return Ok(BudgetCheck::Exceeded {
+                current_usd: daily_cost,
+                limit_usd: *daily_ceiling_usd,
+                period: UsagePeriod::Day,
+                agent_alias: None,
+            });
+        }
+        Ok(self
+            .exceeded_agent_ceiling(&storage, day, 0.0)
+            .unwrap_or(BudgetCheck::Allowed))
+    }
+
+    /// The nearest per-agent daily ceiling that `estimated_cost_usd` on top
+    /// of today's spend would break, for a tracker derived for an agent:
+    /// the agent's own entry first, then its delegation ancestors nearest
+    /// first. `None` when no ceiling binds or the scope is not per-agent.
+    fn exceeded_agent_ceiling(
+        &self,
+        storage: &CostStorage,
+        day: NaiveDate,
+        estimated_cost_usd: f64,
+    ) -> Option<BudgetCheck> {
+        let BudgetScope::Agent { own, inherited } = &self.budget_scope else {
+            return None;
+        };
+        std::iter::once(own)
+            .chain(inherited.iter())
+            .find_map(|entry| {
+                let agent_daily = storage.get_daily_cost_for_agent(&entry.alias);
+                let descendants_usd = entry.descendants_usd_for(day);
+                let projected = agent_daily + descendants_usd + estimated_cost_usd;
+                (projected > entry.daily_ceiling_usd).then(|| BudgetCheck::Exceeded {
+                    current_usd: agent_daily + descendants_usd,
+                    limit_usd: entry.daily_ceiling_usd,
+                    period: UsagePeriod::Day,
+                    agent_alias: Some(entry.alias.clone()),
+                })
+            })
     }
 
     /// Record a usage event without per-agent attribution.
@@ -2690,6 +2738,121 @@ mod tests {
             (derived.get_daily_cost(day).unwrap() - daily).abs() < f64::EPSILON,
             "both trackers must read the same ledger file"
         );
+    }
+
+    #[test]
+    fn check_ceilings_reads_only_the_ceilings_behind_an_exceeded_shared_limit() {
+        // $6 of agent spend against $1 shared limits: `check_budget` always
+        // reports the shared limit first, so only `check_ceilings` can say
+        // whether a per-agent or per-hop ceiling binds as well.
+        let tmp = TempDir::new().unwrap();
+        let base = CostTracker::new(
+            CostConfig {
+                enabled: true,
+                track_per_agent: true,
+                daily_limit_usd: 1.0,
+                monthly_limit_usd: 1.0,
+                ..Default::default()
+            },
+            tmp.path(),
+        )
+        .unwrap();
+        base.record_usage_with_agent(
+            TokenUsage::new("test/model", 6_000_000, 0, 0, 1.0, 1.0, 0.0),
+            Some("target"),
+        )
+        .unwrap();
+        let shared_first = |tracker: &CostTracker| {
+            matches!(
+                tracker.check_budget(0.0).unwrap(),
+                BudgetCheck::Exceeded {
+                    agent_alias: None,
+                    period: UsagePeriod::Day,
+                    ..
+                }
+            )
+        };
+
+        // No ceiling to bind on the global tracker or its shared derivation.
+        assert!(shared_first(&base));
+        assert!(matches!(
+            base.check_ceilings().unwrap(),
+            BudgetCheck::Allowed
+        ));
+        assert!(matches!(
+            base.derived_shared().check_ceilings().unwrap(),
+            BudgetCheck::Allowed
+        ));
+
+        // A per-agent ceiling above the agent's spend holds; one below it
+        // binds and names the agent.
+        let roomy = base.derived_for_agent("target", 10.0);
+        assert!(shared_first(&roomy));
+        assert!(matches!(
+            roomy.check_ceilings().unwrap(),
+            BudgetCheck::Allowed
+        ));
+        let tight = base.derived_for_agent("target", 5.0);
+        assert!(shared_first(&tight));
+        match tight.check_ceilings().unwrap() {
+            BudgetCheck::Exceeded {
+                current_usd,
+                limit_usd,
+                period: UsagePeriod::Day,
+                agent_alias: Some(alias),
+            } => {
+                assert_eq!(alias, "target");
+                assert!((current_usd - 6.0).abs() < 1e-9, "{current_usd}");
+                assert!((limit_usd - 5.0).abs() < 1e-9, "{limit_usd}");
+            }
+            other => panic!("expected the agent ceiling, got {other:?}"),
+        }
+
+        // A delegation ancestor's ceiling binds through the chain.
+        let parent = base.derived_for_agent("parent", 0.5);
+        let child =
+            base.derived_for_agent_in_chain("child", 100.0, parent.subtree_chain_for_children());
+        child
+            .record_usage_with_agent(
+                TokenUsage::new("test/model", 1_000_000, 0, 0, 1.0, 1.0, 0.0),
+                Some("child"),
+            )
+            .unwrap();
+        assert!(shared_first(&child));
+        assert!(
+            matches!(
+                child.check_ceilings().unwrap(),
+                BudgetCheck::Exceeded { agent_alias: Some(ref alias), .. } if alias == "parent"
+            ),
+            "the parent's ceiling covers what it delegated"
+        );
+
+        // Without per-agent totals the per-hop ceiling caps the shared
+        // daily total: $7 breaks a $5 cap and holds under a $10 one.
+        match base.derived_shared_capped(5.0).check_ceilings().unwrap() {
+            BudgetCheck::Exceeded {
+                limit_usd,
+                agent_alias: None,
+                ..
+            } => assert!((limit_usd - 5.0).abs() < 1e-9, "{limit_usd}"),
+            other => panic!("expected the shared cap, got {other:?}"),
+        }
+        assert!(matches!(
+            base.derived_shared_capped(10.0).check_ceilings().unwrap(),
+            BudgetCheck::Allowed
+        ));
+
+        // A tracker derived while cost tracking is off checks nothing, even
+        // with the ceiling `tight` was refused by above.
+        let mut disabled = base.config();
+        disabled.enabled = false;
+        base.update_config(disabled);
+        assert!(matches!(
+            base.derived_for_agent("target", 5.0)
+                .check_ceilings()
+                .unwrap(),
+            BudgetCheck::Allowed
+        ));
     }
 
     #[test]

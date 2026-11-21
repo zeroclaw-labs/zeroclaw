@@ -209,15 +209,152 @@ fn step_timeout_stop(step_secs: u64) -> TurnStop {
     )
 }
 
-/// Budget enforcement — block if limit exceeded (no-op when not scoped).
+/// `[cost.enforcement] mode`, as the budget gate reads it when a limit is
+/// exceeded. Only `warn` relaxes anything; every other value stops the
+/// turn, so a cost control never loosens on a value it cannot honor.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ExceededBudgetMode {
+    /// Record a warn-level event and let the call through.
+    Warn,
+    /// Stop the turn.
+    Block,
+    /// Documented as substituting `route_down_model`, which the turn loop
+    /// cannot do yet: stops the turn as `Block` does and records that.
+    RouteDown,
+    /// Any other value: stops the turn as `Block` does and records that.
+    Unrecognised,
+}
+
+impl ExceededBudgetMode {
+    fn from_config(mode: &str) -> Self {
+        match mode {
+            "warn" => Self::Warn,
+            "block" => Self::Block,
+            "route_down" => Self::RouteDown,
+            _ => Self::Unrecognised,
+        }
+    }
+}
+
+/// One exceeded limit, as a [`BudgetCheck::Exceeded`] names it.
+#[derive(Clone)]
+struct ExceededLimit {
+    current_usd: f64,
+    limit_usd: f64,
+    period: UsagePeriod,
+    agent_alias: Option<String>,
+}
+
+impl ExceededLimit {
+    fn from_check(check: BudgetCheck) -> Option<Self> {
+        match check {
+            BudgetCheck::Exceeded {
+                current_usd,
+                limit_usd,
+                period,
+                agent_alias,
+            } => Some(Self {
+                current_usd,
+                limit_usd,
+                period,
+                agent_alias,
+            }),
+            BudgetCheck::Allowed | BudgetCheck::Warning { .. } => None,
+        }
+    }
+}
+
+/// The per-agent or per-hop ceiling that still binds behind an exceeded
+/// shared limit, which `warn` lets through; `None` when no ceiling binds.
+/// The shared check returns before it reads a delegation's own ceiling, so
+/// the ceilings are asked on their own. When that check fails, no ceiling
+/// is proven clear and the shared limit itself binds.
+fn ceiling_behind_shared_limit(shared: &ExceededLimit) -> Option<ExceededLimit> {
+    match crate::agent::cost::check_tool_loop_ceilings() {
+        Some(Ok(check)) => ExceededLimit::from_check(check),
+        Some(Err(error)) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_category(::zeroclaw_log::EventCategory::Provider)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "current_usd": shared.current_usd,
+                        "limit_usd": shared.limit_usd,
+                        "error": format!("{error:#}"),
+                    })),
+                "cost ceiling check failed; the exceeded shared limit is enforced \
+                 despite cost.enforcement.mode warn"
+            );
+            Some(shared.clone())
+        }
+        None => Some(shared.clone()),
+    }
+}
+
+/// Budget enforcement (no-op when not scoped). An exceeded shared daily or
+/// monthly limit follows `[cost.enforcement] mode`, read live from the
+/// scoped tracker: `warn` records a warn-level event and lets the call
+/// through, `block` stops the turn. A per-agent or per-hop ceiling stops
+/// the turn in every mode. `route_down` and unrecognised values stop the
+/// turn as `block` does, with a record saying why.
 pub(crate) fn enforce_tool_loop_budget() -> Result<()> {
-    if let Some(BudgetCheck::Exceeded {
-        current_usd,
-        limit_usd,
-        period,
-        agent_alias,
-    }) = check_tool_loop_budget()
-    {
+    if let Some(exceeded) = check_tool_loop_budget().and_then(ExceededLimit::from_check) {
+        let configured_mode = crate::agent::cost::tool_loop_enforcement_mode().unwrap_or_default();
+        let mode = ExceededBudgetMode::from_config(&configured_mode);
+        let stop = match mode {
+            ExceededBudgetMode::Warn if exceeded.agent_alias.is_none() => {
+                let Some(ceiling) = ceiling_behind_shared_limit(&exceeded) else {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_category(::zeroclaw_log::EventCategory::Provider)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                            .with_attrs(::serde_json::json!({
+                                "current_usd": exceeded.current_usd,
+                                "limit_usd": exceeded.limit_usd,
+                                "period": format!("{:?}", exceeded.period),
+                                "enforcement_mode": configured_mode,
+                            })),
+                        "cost limit exceeded; the call proceeds because \
+                         cost.enforcement.mode is warn"
+                    );
+                    return Ok(());
+                };
+                ceiling
+            }
+            ExceededBudgetMode::Warn
+            | ExceededBudgetMode::Block
+            | ExceededBudgetMode::RouteDown
+            | ExceededBudgetMode::Unrecognised => exceeded,
+        };
+        let ExceededLimit {
+            current_usd,
+            limit_usd,
+            period,
+            agent_alias,
+        } = stop;
+        if matches!(
+            mode,
+            ExceededBudgetMode::RouteDown | ExceededBudgetMode::Unrecognised
+        ) {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_category(::zeroclaw_log::EventCategory::Provider)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "current_usd": current_usd,
+                        "limit_usd": limit_usd,
+                        "period": format!("{period:?}"),
+                        "enforcement_mode": configured_mode,
+                        "enforced_as": "block",
+                    })),
+                "cost.enforcement.mode is not one the budget gate can apply \
+                 (route_down has no model substitution yet; the only other values \
+                 are warn and block), so the exceeded limit is enforced as block"
+            );
+        }
         ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
@@ -228,6 +365,7 @@ pub(crate) fn enforce_tool_loop_budget() -> Result<()> {
                     "limit_usd": limit_usd,
                     "period": format!("{period:?}"),
                     "agent_alias": agent_alias,
+                    "enforcement_mode": configured_mode,
                 })),
             "tool-call loop budget exceeded"
         );
@@ -4080,6 +4218,204 @@ mod tests {
                 .expect("stop must survive the anyhow hop")
                 .code,
             TurnStopCode::StepTimeout
+        );
+    }
+
+    /// [`tracker_with_spend`] with `[cost.enforcement] mode` set to `mode`
+    /// through the live config handle a reload writes.
+    fn tracker_with_mode(
+        tmp: &tempfile::TempDir,
+        spent_usd: f64,
+        mode: &str,
+    ) -> std::sync::Arc<crate::cost::CostTracker> {
+        let tracker = tracker_with_spend(tmp, spent_usd);
+        set_mode(&tracker, mode);
+        tracker
+    }
+
+    fn set_mode(tracker: &crate::cost::CostTracker, mode: &str) {
+        let mut config = tracker.config();
+        config.enforcement.mode = mode.to_string();
+        tracker.update_config(config);
+    }
+
+    /// Run the budget gate once in a cost scope for `tracker`.
+    fn gate(tracker: std::sync::Arc<crate::cost::CostTracker>) -> Result<()> {
+        use crate::agent::cost::{TOOL_LOOP_COST_TRACKING_CONTEXT, ToolLoopCostTrackingContext};
+        let ctx = ToolLoopCostTrackingContext::new(
+            tracker,
+            std::sync::Arc::new(crate::agent::cost::ModelProviderPricing::new()),
+        );
+        TOOL_LOOP_COST_TRACKING_CONTEXT.sync_scope(Some(ctx), enforce_tool_loop_budget)
+    }
+
+    /// [`gate`], also returning every log frame emitted meanwhile whose
+    /// `current_usd` is `spent_usd`. Each test uses its own spend, so frames
+    /// from tests running concurrently are left out.
+    fn gate_with_records(
+        tracker: std::sync::Arc<crate::cost::CostTracker>,
+        spent_usd: f64,
+    ) -> (Result<()>, Vec<serde_json::Value>) {
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let (tx, mut rx) = tokio::sync::broadcast::channel(256);
+        zeroclaw_log::set_broadcast_hook(tx);
+        let result = gate(tracker);
+        zeroclaw_log::clear_broadcast_hook();
+        let mut frames = Vec::new();
+        loop {
+            match rx.try_recv() {
+                Ok(frame) => {
+                    if frame["attributes"]["current_usd"]
+                        .as_f64()
+                        .is_some_and(|usd| (usd - spent_usd).abs() < 1e-9)
+                    {
+                        frames.push(frame);
+                    }
+                }
+                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => continue,
+                Err(_) => break,
+            }
+        }
+        (result, frames)
+    }
+
+    fn frame_with_message<'a>(
+        frames: &'a [serde_json::Value],
+        needle: &str,
+    ) -> Option<&'a serde_json::Value> {
+        frames.iter().find(|frame| {
+            frame["message"]
+                .as_str()
+                .is_some_and(|message| message.contains(needle))
+        })
+    }
+
+    fn assert_budget_stop(result: Result<()>, expected: &str) {
+        let err = result.expect_err("the exceeded limit must stop the turn");
+        assert_eq!(
+            turn_stop(&err).expect("a typed stop").code,
+            TurnStopCode::BudgetExhausted
+        );
+        assert!(err.to_string().contains(expected), "unexpected stop: {err}");
+    }
+
+    const WARN_NOTE: &str = "the call proceeds because cost.enforcement.mode is warn";
+    const FALLBACK_NOTE: &str = "so the exceeded limit is enforced as block";
+    const REJECT: &str = "tool-call loop budget exceeded";
+
+    #[test]
+    fn the_default_warn_mode_lets_an_exceeded_shared_limit_through_and_records_it() {
+        // No mode set: the default is `warn`.
+        let tmp = tempfile::tempdir().unwrap();
+        let (result, frames) = gate_with_records(tracker_with_spend(&tmp, 10.25), 10.25);
+        assert!(result.is_ok(), "warn must not stop the turn: {result:?}");
+        let note = frame_with_message(&frames, WARN_NOTE).unwrap_or_else(|| {
+            panic!(
+                "no warn record (capture layer active: {}): {frames:?}",
+                zeroclaw_log::__private_test_capture_layer_active()
+            )
+        });
+        assert_eq!(note["severity_text"], "WARN");
+        assert_eq!(note["attributes"]["enforcement_mode"], "warn");
+        assert!((note["attributes"]["limit_usd"].as_f64().unwrap() - 10.0).abs() < 1e-9);
+        assert!(
+            frame_with_message(&frames, REJECT).is_none(),
+            "a call let through is not a refusal: {frames:?}"
+        );
+    }
+
+    #[test]
+    fn block_mode_stops_an_exceeded_shared_limit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (result, frames) = gate_with_records(tracker_with_mode(&tmp, 12.5, "block"), 12.5);
+        assert_budget_stop(result, "Budget exceeded: $12.5000 of $10.00 Day limit");
+        let reject = frame_with_message(&frames, REJECT).unwrap_or_else(|| {
+            panic!(
+                "no refusal record (capture layer active: {}): {frames:?}",
+                zeroclaw_log::__private_test_capture_layer_active()
+            )
+        });
+        assert_eq!(reject["attributes"]["enforcement_mode"], "block");
+        assert!(frame_with_message(&frames, WARN_NOTE).is_none());
+        assert!(frame_with_message(&frames, FALLBACK_NOTE).is_none());
+    }
+
+    #[test]
+    fn route_down_mode_stops_like_block_and_records_that_it_did() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (result, frames) =
+            gate_with_records(tracker_with_mode(&tmp, 10.75, "route_down"), 10.75);
+        assert_budget_stop(result, "Budget exceeded: $10.7500 of $10.00 Day limit");
+        let note = frame_with_message(&frames, FALLBACK_NOTE).unwrap_or_else(|| {
+            panic!(
+                "route_down must say it was enforced as block (capture layer active: {}): \
+                 {frames:?}",
+                zeroclaw_log::__private_test_capture_layer_active()
+            )
+        });
+        assert_eq!(note["severity_text"], "WARN");
+        assert_eq!(note["attributes"]["enforcement_mode"], "route_down");
+        assert_eq!(note["attributes"]["enforced_as"], "block");
+        assert!(frame_with_message(&frames, REJECT).is_some());
+        assert!(frame_with_message(&frames, WARN_NOTE).is_none());
+    }
+
+    #[test]
+    fn an_unrecognised_mode_stops_like_block_and_records_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (result, frames) = gate_with_records(tracker_with_mode(&tmp, 11.25, "Warn"), 11.25);
+        assert_budget_stop(result, "Budget exceeded: $11.2500 of $10.00 Day limit");
+        let note = frame_with_message(&frames, FALLBACK_NOTE).unwrap_or_else(|| {
+            panic!(
+                "an unrecognised mode must say it was enforced as block (capture layer \
+                 active: {}): {frames:?}",
+                zeroclaw_log::__private_test_capture_layer_active()
+            )
+        });
+        assert_eq!(note["attributes"]["enforcement_mode"], "Warn");
+        assert!(frame_with_message(&frames, WARN_NOTE).is_none());
+    }
+
+    #[test]
+    fn the_mode_is_read_from_the_live_config_at_each_check() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tracker = tracker_with_mode(&tmp, 11.5, "warn");
+        assert!(gate(std::sync::Arc::clone(&tracker)).is_ok());
+        set_mode(&tracker, "block");
+        assert_budget_stop(gate(std::sync::Arc::clone(&tracker)), "Budget exceeded");
+        set_mode(&tracker, "warn");
+        assert!(gate(tracker).is_ok());
+    }
+
+    #[test]
+    fn warn_mode_still_stops_a_delegated_agent_at_its_own_ceiling() {
+        // $10.5 shared plus $6 of the child's own: the $10 shared limit is
+        // exceeded, which `warn` lets through, so only the ceiling decides.
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tracker_with_spend(&tmp, 10.5);
+        base.record_usage_with_agent(
+            crate::cost::types::TokenUsage::new("test/model", 1_000_000, 0, 0, 6.0, 0.0, 0.0),
+            Some("child"),
+        )
+        .unwrap();
+        assert_budget_stop(
+            gate(std::sync::Arc::new(base.derived_for_agent("child", 5.0))),
+            "Budget exceeded for agent `child`: $6.0000 of $5.00 Day daily ceiling",
+        );
+        assert!(gate(std::sync::Arc::new(base.derived_for_agent("child", 50.0))).is_ok());
+        // Without per-agent totals the per-hop ceiling caps the shared total.
+        assert_budget_stop(
+            gate(std::sync::Arc::new(base.derived_shared_capped(5.0))),
+            "Budget exceeded: $16.5000 of $5.00 Day limit",
+        );
+        assert!(gate(std::sync::Arc::new(base.derived_shared_capped(50.0))).is_ok());
+        // `block` stops at the shared limit whatever the ceiling.
+        set_mode(&base, "block");
+        assert_budget_stop(
+            gate(std::sync::Arc::new(base.derived_for_agent("child", 50.0))),
+            "Budget exceeded: $16.5000 of $10.00 Day limit",
         );
     }
 
