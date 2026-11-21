@@ -387,16 +387,26 @@ async fn lease(
     let fingerprint = serde_json::to_vec(&(host, effective))?;
     let key = format!("{:x}", Sha256::digest(fingerprint));
     let path = dir.join(&key[..24]);
-    let entry = pool.lock().await.entry(path.clone()).or_default().clone();
+    let entry = lease_entry(pool, &path, open(&path, options, host)).await?;
+    Ok((path, entry))
+}
+
+async fn lease_entry(
+    pool: &Pool,
+    path: &Path,
+    connect: impl std::future::Future<Output = Result<OwnedMaster>>,
+) -> Result<Arc<Mutex<Entry>>> {
+    let entry = pool
+        .lock()
+        .await
+        .entry(path.to_path_buf())
+        .or_default()
+        .clone();
     let mut state = entry.lock().await;
     ensure!(!state.failed, "failed connection");
     if state.master.is_none() {
         state.failed = true;
-        state.master = Some(
-            open(&path, options, host)
-                .await
-                .context("tool-native-ssh-connection")?,
-        );
+        state.master = Some(connect.await.context("tool-native-ssh-connection")?);
         state.failed = false;
     }
     ensure!(
@@ -410,7 +420,7 @@ async fn lease(
     );
     state.leases += 1;
     drop(state);
-    Ok((path, entry))
+    Ok(entry)
 }
 
 async fn serve(id: &str) -> Result<()> {
@@ -690,6 +700,58 @@ mod tests {
                 std::future::pending::<()>().await;
                 drop(master);
             });
+    }
+
+    #[tokio::test]
+    async fn concurrent_leases_share_one_failed_connection_attempt() {
+        use std::{
+            cell::Cell,
+            future::{Future, poll_fn},
+            task::Poll,
+        };
+
+        let pool = Pool::default();
+        let path = std::path::Path::new("fixture-control-socket");
+        let attempts = Cell::new(0);
+        let (release, wait_for_release) = tokio::sync::oneshot::channel();
+        let mut first = std::pin::pin!(super::lease_entry(&pool, path, async {
+            attempts.set(attempts.get() + 1);
+            wait_for_release.await.unwrap();
+            anyhow::bail!("fixture connection failed")
+        }));
+        let mut second = std::pin::pin!(super::lease_entry(&pool, path, async {
+            attempts.set(attempts.get() + 1);
+            anyhow::bail!("unexpected second connection attempt")
+        }));
+
+        poll_fn(|cx| {
+            assert!(first.as_mut().poll(cx).is_pending());
+            assert_eq!(attempts.get(), 1);
+            assert!(second.as_mut().poll(cx).is_pending());
+            assert_eq!(attempts.get(), 1);
+            Poll::Ready(())
+        })
+        .await;
+        release.send(()).unwrap();
+
+        let (first, second) = tokio::join!(first, second);
+        assert_eq!(
+            first.err().expect("first attempt must fail").to_string(),
+            "tool-native-ssh-connection"
+        );
+        assert_eq!(
+            second
+                .err()
+                .expect("cached failure must be returned")
+                .to_string(),
+            "failed connection"
+        );
+        assert_eq!(attempts.get(), 1);
+        let entry = pool.lock().await.get(path).unwrap().clone();
+        let state = entry.lock().await;
+        assert!(state.failed);
+        assert!(state.master.is_none());
+        assert_eq!(state.leases, 0);
     }
 
     #[tokio::test]
