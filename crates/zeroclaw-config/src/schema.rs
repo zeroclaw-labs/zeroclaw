@@ -18054,11 +18054,8 @@ pub struct MSTeamsConfig {
     pub mention_only: Option<bool>,
     /// When true, a newer Teams message from the same sender in the same
     /// conversation cancels the in-flight request and starts a fresh
-    /// response with preserved history.
-    ///
-    /// Applied channel-wide: enabling it on any `msteams` alias turns it on
-    /// for all Teams conversations. (Per-alias scoping is a shared channel
-    /// limitation tracked separately.)
+    /// response with preserved history. Resolved per alias: only messages
+    /// arriving through an alias that enables it are interrupted.
     #[tab(Behavior)]
     #[serde(default)]
     pub interrupt_on_new_message: bool,

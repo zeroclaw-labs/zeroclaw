@@ -663,6 +663,12 @@ fn interrupt_on_new_message_enabled(
             .mattermost
             .get(alias)
             .is_some_and(|config| config.interrupt_on_new_message),
+        "msteams" => ctx
+            .prompt_config
+            .channels
+            .msteams
+            .get(alias)
+            .is_some_and(|config| config.interrupt_on_new_message),
         "matrix" => ctx
             .prompt_config
             .channels
@@ -54564,6 +54570,46 @@ This is an example JSON object for profile settings."#;
         );
         let cfg = interrupt_on_new_message_config(&channels);
         assert!(cfg.enabled_for_channel("msteams"));
+    }
+
+    #[test]
+    fn msteams_interrupt_policy_is_resolved_per_alias() {
+        let mut channels = zeroclaw_config::schema::ChannelsConfig::default();
+        channels.msteams.insert(
+            "work".to_string(),
+            zeroclaw_config::schema::MSTeamsConfig {
+                interrupt_on_new_message: true,
+                ..Default::default()
+            },
+        );
+        channels.msteams.insert(
+            "secondary".to_string(),
+            zeroclaw_config::schema::MSTeamsConfig::default(),
+        );
+        let mut ctx = (*router_test_ctx()).clone();
+        ctx.prompt_config = Arc::new(zeroclaw_config::schema::Config {
+            channels: channels.clone(),
+            ..Default::default()
+        });
+        ctx.interrupt_on_new_message = interrupt_on_new_message_config(&channels);
+
+        let teams_message = |alias: &str| zeroclaw_api::channel::ChannelMessage {
+            channel: "msteams".into(),
+            channel_alias: Some(alias.to_string()),
+            ..Default::default()
+        };
+        assert!(interrupt_on_new_message_enabled(
+            &ctx,
+            &teams_message("work")
+        ));
+        assert!(!interrupt_on_new_message_enabled(
+            &ctx,
+            &teams_message("secondary")
+        ));
+        assert!(!interrupt_on_new_message_enabled(
+            &ctx,
+            &teams_message("unconfigured")
+        ));
     }
 
     #[test]

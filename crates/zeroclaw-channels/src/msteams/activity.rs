@@ -50,9 +50,9 @@ pub struct ChannelAccount {
     pub id: String,
     #[serde(default)]
     pub name: Option<String>,
-    /// Entra object id of the user, when Teams provides it. Stable
-    /// across conversations (unlike the `29:` channel-scoped id), so
-    /// peer-group allowlists match on it.
+    /// Entra object id of the user, when Teams provides it. Stable across
+    /// bots and conversations, unlike the `29:` id, which Teams issues per
+    /// bot and user, so peer-group allowlists match on it.
     #[serde(default)]
     pub aad_object_id: Option<String>,
 }

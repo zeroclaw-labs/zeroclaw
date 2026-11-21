@@ -459,19 +459,22 @@ derive, `#[secret]` on the secret field):
 | `path` | String | `"/api/messages"` | webhook route |
 | `allow_dms` | bool | `true` | whether the bot responds in personal (1:1) chats at all; when `false`, inbound personal-chat activities are dropped |
 | `mention_only` | `Option<bool>` | `None` (= true in groups) | group/channel gating only; personal chats are exempt by definition (gated by `allow_dms` instead). Named `mention_only` to match the existing telegram/mattermost convention. |
-| `interrupt_on_new_message` | bool | `false` | when `true`, a newer message from the same sender in the same conversation cancels the in-flight agent run and starts a fresh response (history preserved); default queues instead. Feeds the orchestrator's `InterruptOnNewMessageConfig`. **Applied channel-wide:** it is on for every `msteams` alias if any alias enables it, the same rule every channel uses. Per-alias resolution is deferred (§9). |
+| `interrupt_on_new_message` | bool | `false` | when `true`, a newer message from the same sender in the same conversation cancels the in-flight agent run and starts a fresh response (history preserved); default queues instead. Resolved per alias by the orchestrator's `interrupt_on_new_message_enabled`, which reads the `[channels.msteams.<alias>]` the message arrived through, the same as Telegram, Slack and the other channels with this setting. |
 | `proxy_url` | `Option<String>` | `None` | per-channel proxy for every outbound call: Connector sends, the JWKS fetch and the Entra token request (§"Proxy coverage"). Falls back to the global `[proxy]` settings when unset. |
 
 The remaining fields, `excluded_tools`, `reply_min_interval_secs` and
 `reply_queue_depth_max`, are the standard per-channel tool filter and
 `PacedChannel` settings, with the same meaning and defaults as on every other
-channel.
+channel. The per-channel `excluded_tools` list is currently not applied on any
+channel; [#11989](https://github.com/zeroclaw-labs/zeroclaw/issues/11989)
+tracks that, and
+[#11990](https://github.com/zeroclaw-labs/zeroclaw/pull/11990) connects it.
+Whichever of #11990 and this channel lands second adds the `msteams` entry to
+that lookup.
 
 Multiple aliases (`[channels.msteams.<alias>]`) follow the standard
 HashMap pattern; each alias runs its own listener, so aliases must use
-distinct ports. One documented exception to per-alias resolution:
-`interrupt_on_new_message` is applied channel-wide (see the field note
-above).
+distinct ports.
 
 ## 6. Wiring checklist (mirror of the `mattermost` touchpoints)
 
@@ -569,7 +572,5 @@ in a team channel, confirm replies and threading.
 - Reactions, message delete (`redact_message`)
 - Graph API enrichment (member lookup for allowlist UPN resolution —
   OpenClaw's `resolve-allowlist.ts` equivalent)
-- Per-alias `interrupt_on_new_message` resolution (today any alias that
-  enables it turns it on channel-wide)
 - Code-fence reopening when outbound chunking has to hard-cut inside a
   fenced block that is itself larger than the per-message budget

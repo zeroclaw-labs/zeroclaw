@@ -26,8 +26,10 @@ messaging.
 
 Allowlist entries match the sender's **Entra (Azure AD) object ID** (stable
 across chats, visible under **Microsoft Entra ID → Users → (user) → Object
-ID**) or the raw Teams channel-scoped `29:…` ID carried on each message.
-Matching is case-insensitive.
+ID**) or the raw Teams `29:…` user ID carried on each message, which Teams
+issues per bot and user. Matching is case-insensitive. A sender is judged on
+both IDs together, so an `ignore` entry for either one blocks it even when a
+wildcard or an explicit grant matches the other.
 
 ## Quickstart
 
@@ -89,8 +91,9 @@ channels = ["msteams.default"]
 ```
 
 Find a user's Object ID under **Microsoft Entra ID → Users → (user) → Object
-ID**. The channel also accepts the Teams-scoped `29:…` id, but that value is
-less stable across conversations.
+ID**. The channel also accepts the `29:…` user ID, but Teams issues that
+value per bot, so it stops matching if the bot is re-registered under a new
+app ID.
 
 A hand-edited file needs a reload/restart before the daemon picks up the new
 blocks.
@@ -203,8 +206,8 @@ question again. Turning `interrupt_on_new_message` on avoids this: the
 follow-up cancels the in-flight turn and only the newer question is answered.
 The cost is that any message sent during a slow turn discards it.
 
-`interrupt_on_new_message` applies to the whole channel: enabling it on any
-`msteams` alias turns it on for all Teams conversations.
+`interrupt_on_new_message` is resolved per alias: it applies only to messages
+that arrive through an `msteams` alias that enables it.
 
 ## Why there is no gray bubble
 

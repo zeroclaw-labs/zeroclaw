@@ -851,18 +851,21 @@ async fn process_activity(
         return StatusCode::OK;
     }
 
-    // Sender allowlist: match the stable Entra object id when Teams
-    // provides it, else the channel-scoped `29:` id. Empty list denies
-    // everyone, `"*"` allows everyone (shared allowlist semantics).
+    // Sender allowlist: one account arrives under two ids, its Entra object id
+    // (when Teams provides it) and the bot-scoped `29:` id. They are judged
+    // together so an `ignore` on either id wins over a grant reached through
+    // the other. Empty list denies everyone, `"*"` allows everyone (shared
+    // allowlist semantics).
     let peers = (state.peer_resolver)();
-    let candidates = [from.aad_object_id.as_deref(), Some(from.id.as_str())];
-    let allowed = candidates.into_iter().flatten().any(|candidate| {
-        crate::allowlist::is_user_allowed(
-            &peers,
-            candidate,
-            crate::allowlist::Match::CaseInsensitive,
-        )
-    });
+    let identities: Vec<&str> = [from.aad_object_id.as_deref(), Some(from.id.as_str())]
+        .into_iter()
+        .flatten()
+        .collect();
+    let allowed = crate::allowlist::is_identity_allowed(
+        &peers,
+        &identities,
+        crate::allowlist::Match::CaseInsensitive,
+    );
     if !allowed {
         ::zeroclaw_log::record!(
             WARN,
@@ -1612,6 +1615,32 @@ mod tests {
             200
         );
         assert!(rx.recv().await.is_some());
+    }
+
+    /// One sender arrives under its Entra object id and its `29:` id. An
+    /// `ignore` on either id must win over a grant that only reaches the other.
+    #[tokio::test]
+    async fn an_ignored_id_is_not_admitted_through_the_senders_other_id() {
+        const AAD: &str = "00000000-0000-0000-0000-00000000feed";
+        const TEAMS: &str = "29:user-x";
+        for peers in [
+            vec!["*".to_string(), format!("!{AAD}")],
+            vec!["*".to_string(), format!("!{TEAMS}")],
+            vec![TEAMS.to_string(), format!("!{AAD}")],
+            vec![AAD.to_string(), format!("!{TEAMS}")],
+        ] {
+            let auth_server = MockServer::start().await;
+            mock_jwks(&auth_server).await;
+            let ch = channel_with(test_config(), peers.clone(), &auth_server);
+            let (url, mut rx) = spawn_listener(&ch).await;
+
+            let token = mint_service_token();
+            assert_eq!(
+                post_activity(&url, &token, &personal_activity("hi")).await,
+                200
+            );
+            assert!(rx.try_recv().is_err(), "admitted with peers {peers:?}");
+        }
     }
 
     #[tokio::test]
