@@ -39,6 +39,11 @@ const CHANNEL_COMPILE_SPECS: &[ChannelCompileSpec] = &[
         compiled: cfg!(feature = "channel-mattermost"),
     },
     ChannelCompileSpec {
+        schema_name: Some("Zulip"),
+        type_keys: &["zulip"],
+        compiled: cfg!(feature = "channel-zulip"),
+    },
+    ChannelCompileSpec {
         schema_name: Some("iMessage"),
         type_keys: &["imessage"],
         compiled: cfg!(feature = "channel-imessage"),
