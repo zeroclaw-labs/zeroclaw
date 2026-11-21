@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use std::path::PathBuf;
+use zeroclaw_api::embedding::EmbeddingProvider;
 use zeroclaw_api::model_provider::{ChatMessage, ChatRequest, ModelProvider};
 use zeroclaw_config::schema::SkillCreationConfig;
-use zeroclaw_memory::embeddings::EmbeddingProvider;
 use zeroclaw_memory::vector::cosine_similarity;
 
 use super::document::SkillDocument;
@@ -657,7 +657,8 @@ pub fn extract_tool_calls_from_history(
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use zeroclaw_memory::embeddings::{EmbeddingProvider, NoopEmbedding};
+    use zeroclaw_api::embedding::EmbeddingProvider;
+    use zeroclaw_providers::embedding::NoopEmbedding;
 
     fn set_test_modified_time(path: &std::path::Path, ordinal: u64) {
         const TEST_MTIME_BASE_SECS: u64 = 1_000_000_000;

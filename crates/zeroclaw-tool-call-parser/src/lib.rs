@@ -2,7 +2,16 @@
 
 use regex::Regex;
 use std::{collections::HashSet, sync::LazyLock};
+
 pub use zeroclaw_api::model_provider::strip_think_tags;
+
+pub mod protocol_detect;
+pub mod stream_guard;
+
+pub use stream_guard::{
+    ProtocolSuppressionDiagnostic, StreamTerminalMarkerStripper, StreamTextGuard,
+    StreamThinkTagStripper,
+};
 
 /// A single parsed tool call extracted from LLM output.
 #[derive(Debug, Clone)]
@@ -37,8 +46,8 @@ fn parse_arguments_value(raw: Option<&serde_json::Value>) -> serde_json::Value {
 /// stripped from final response text. This is the single source of truth for
 /// the marker vocabulary, shared by the non-streaming
 /// [`strip_trailing_terminal_markers`] helper and the streaming state machine
-/// (`zeroclaw-runtime`'s `StreamTerminalMarkerStripper`) so a vocabulary or
-/// matching-rule change cannot drift one path.
+/// (`StreamTerminalMarkerStripper`) so a vocabulary or matching-rule change
+/// cannot drift one path.
 ///
 /// Order matters: longer spellings must precede shorter ones so a suffix check
 /// matches the most specific marker first.
@@ -2093,8 +2102,12 @@ pub fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
     // these tags can interfere with `<tool_call>` extraction and must be
     // removed first.
     let cleaned = strip_think_tags(response);
-    let response = cleaned.as_str();
+    parse_tool_calls_from_text(&cleaned)
+}
 
+/// Parse tool-call envelopes without removing textual reasoning. Callers that
+/// own model-specific reasoning policy sanitize the text before this boundary.
+pub fn parse_tool_calls_from_text(response: &str) -> (String, Vec<ParsedToolCall>) {
     let mut text_parts = Vec::new();
     let mut calls = Vec::new();
     let mut remaining = response;
@@ -3477,6 +3490,16 @@ mod tests {
         let (text, calls) = parse_tool_calls(response);
         assert_eq!(text, "Just a normal response with no tools.");
         assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn parse_tool_calls_from_text_preserves_reasoning_when_caller_keeps_it() {
+        let response = "<think>reasoning</think>Answer\n<tool_call>{\"name\":\"shell\",\"arguments\":{}}</tool_call>";
+        let (text, calls) = parse_tool_calls_from_text(response);
+        assert!(text.contains("<think>reasoning</think>Answer"));
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
+        assert!(!parse_tool_calls(response).0.contains("<think>"));
     }
 
     #[test]
