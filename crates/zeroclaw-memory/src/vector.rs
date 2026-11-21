@@ -53,6 +53,24 @@ pub fn bytes_to_vec(bytes: &[u8]) -> Vec<f32> {
         .collect()
 }
 
+/// Serialize an f32 vector into the textual `vector` literal accepted by
+/// pgvector (`[v1,v2,...]`), which is the bind form used when writing the
+/// `embedding` column directly. Non-finite components are coerced to `0.0`
+/// so a degenerate embedding cannot make PostgreSQL reject the row.
+pub fn vec_to_pgvector(v: &[f32]) -> String {
+    let mut s = String::with_capacity(v.len() * 8 + 2);
+    s.push('[');
+    for (i, f) in v.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        let safe = if f.is_finite() { *f } else { 0.0 };
+        s.push_str(&safe.to_string());
+    }
+    s.push(']');
+    s
+}
+
 /// A scored result for hybrid merging
 #[derive(Debug, Clone)]
 pub struct ScoredResult {
@@ -418,5 +436,14 @@ mod tests {
         let merged = hybrid_merge(&[("only".into(), 0.8)], &[], 0.7, 0.3, 10);
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].id, "only");
+    }
+
+    #[test]
+    fn vec_to_pgvector_formats_and_guards() {
+        assert_eq!(vec_to_pgvector(&[1.0, 2.5, -0.5]), "[1,2.5,-0.5]");
+        assert_eq!(vec_to_pgvector(&[]), "[]");
+        // Non-finite components must not reach PostgreSQL as NaN/Infinity.
+        let s = vec_to_pgvector(&[f32::NAN, f32::INFINITY, 0.25]);
+        assert_eq!(s, "[0,0,0.25]");
     }
 }
