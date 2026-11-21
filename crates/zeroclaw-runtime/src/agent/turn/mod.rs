@@ -72,9 +72,7 @@ pub(crate) use provider_call::{
     enforce_tool_loop_budget,
 };
 pub use redact::scrub_credentials;
-pub(crate) use results_collect::{
-    CollectedResults, check_identical_output_abort, collect_tool_results,
-};
+pub(crate) use results_collect::{check_identical_output_abort, collect_tool_results};
 pub use steering::{
     SteeringAdmission, SteeringAdmit, SteeringInput, SteeringPosture, drain_steering_messages,
 };
@@ -1636,8 +1634,13 @@ pub(crate) fn run_tool_call_loop_with_initial_ingress<'a>(
     subject: InitialIngressSubject<'a>,
     reported_usage: Option<ReportedRequestUsage>,
     repetition_guard: Option<&'a std::sync::Mutex<repetition::RepetitionGuard>>,
-) -> impl std::future::Future<Output = Result<String>> + 'a {
-    run_tool_call_loop_impl(p, Some(subject), reported_usage, repetition_guard)
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String>> + Send + 'a>> {
+    Box::pin(run_tool_call_loop_impl(
+        p,
+        Some(subject),
+        reported_usage,
+        repetition_guard,
+    ))
 }
 
 /// Non-streamed Agent turns own the guard without steering ingress.
@@ -1645,14 +1648,27 @@ pub(crate) fn run_tool_call_loop_with_initial_ingress<'a>(
 pub(crate) fn run_tool_call_loop_with_guard<'a>(
     p: ToolLoop<'a>,
     repetition_guard: Option<&'a std::sync::Mutex<repetition::RepetitionGuard>>,
-) -> impl std::future::Future<Output = Result<String>> + 'a {
-    run_tool_call_loop_impl(p, None, None, repetition_guard)
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String>> + Send + 'a>> {
+    Box::pin(run_tool_call_loop_impl(p, None, None, repetition_guard))
+}
+
+/// Recovery evidence owned by one logical turn, including model switches.
+/// Contains only hashed completed-dispatch evidence, never tool arguments.
+#[derive(Default)]
+pub struct ToolLoopRecovery(std::sync::Mutex<repetition::RepetitionGuard>);
+
+/// Run a channel turn with the same result-aware recovery used by Agent APIs.
+pub fn run_tool_call_loop_with_recovery<'a>(
+    p: ToolLoop<'a>,
+    recovery: &'a ToolLoopRecovery,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String>> + Send + 'a>> {
+    run_tool_call_loop_with_guard(p, Some(&recovery.0))
 }
 
 pub fn run_tool_call_loop(
     p: ToolLoop<'_>,
-) -> impl std::future::Future<Output = Result<String>> + '_ {
-    run_tool_call_loop_impl(p, None, None, None)
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String>> + Send + '_>> {
+    Box::pin(run_tool_call_loop_impl(p, None, None, None))
 }
 
 async fn run_tool_call_loop_impl<'a>(
@@ -3619,31 +3635,15 @@ async fn run_tool_call_loop_impl<'a>(
             repetition::RepetitionDisposition::default()
         };
 
-        record_executed_outcomes(
-            &ctx,
+        post_exec::store_executed_outcomes(
             &executed_completed_indices,
             &executed_completed_calls,
-            &executed_completed_stream_calls,
             executed_completed_outcomes
                 .into_iter()
-                .map(|completed| completed.outcome)
-                .collect(),
+                .map(|completed| completed.outcome),
             &mut ordered_results,
-            iteration,
-        )
-        .await;
+        );
         if cancelled_mid_batch {
-            // Completed calls already received their after hook; every other
-            // executable context of the batch was interrupted before
-            // post-execution handling and gets exactly one abandonment.
-            call_prep::abandon_unexecuted_prepared_contexts(
-                &ctx,
-                iteration,
-                &executable_indices,
-                &executable_calls,
-                &executed_completed_indices,
-            )
-            .await;
             for (idx, call) in tool_calls.iter().enumerate() {
                 if ordered_results[idx].is_none() {
                     ordered_results[idx] = Some((
@@ -3663,6 +3663,68 @@ async fn run_tool_call_loop_impl<'a>(
                     ));
                 }
             }
+        }
+
+        let collected = collect_tool_results(
+            &ordered_results,
+            &tool_calls,
+            turn_state.history,
+            &mut loop_detector,
+            &loop_ignore_tools,
+            max_tool_result_chars,
+            collected_receipts,
+            active_model,
+            iteration,
+            turn_id,
+        )
+        .and_then(|collected| {
+            if !cancelled_mid_batch && repetition_guard.is_none() {
+                check_identical_output_abort(
+                    &collected.detection_relevant_output,
+                    loop_started_at,
+                    pacing,
+                    &mut consecutive_identical_outputs,
+                    &mut last_tool_output_hash,
+                    active_model,
+                    iteration,
+                    turn_id,
+                )?;
+            }
+            Ok(collected)
+        });
+
+        if let Ok(collected) = &collected {
+            turn_state.append_tool_round(
+                assistant_history_content,
+                &native_tool_calls,
+                &collected.individual_results,
+                &collected.tool_results,
+                use_native_tools,
+            );
+        }
+
+        // Record executed calls even when a detector stops the turn.
+        record_executed_outcomes(
+            &ctx,
+            &executed_completed_indices,
+            &executed_completed_calls,
+            &executed_completed_stream_calls,
+            &ordered_results,
+            iteration,
+        )
+        .await;
+        if cancelled_mid_batch {
+            // Completed calls already received their after hook; every other
+            // executable context of the batch was interrupted before
+            // post-execution handling and gets exactly one abandonment.
+            call_prep::abandon_unexecuted_prepared_contexts(
+                &ctx,
+                iteration,
+                &executable_indices,
+                &executable_calls,
+                &executed_completed_indices,
+            )
+            .await;
             // Close pending cards only for executable calls whose terminal
             // ToolResult was never emitted by the executor. A parallel call that
             // completed before the cancellation already emitted its real result;
@@ -3689,50 +3751,12 @@ async fn run_tool_call_loop_impl<'a>(
                     events::emit_tool_result(tx, &call_id, &call.name, &interrupted).await;
                 }
             }
-        }
-
-        let CollectedResults {
-            individual_results,
-            tool_results,
-            detection_relevant_output,
-        } = collect_tool_results(
-            ordered_results,
-            &tool_calls,
-            turn_state.history,
-            &mut loop_detector,
-            &loop_ignore_tools,
-            max_tool_result_chars,
-            collected_receipts,
-            active_model,
-            iteration,
-            turn_id,
-        )?;
-
-        if !cancelled_mid_batch && repetition_guard.is_none() {
-            check_identical_output_abort(
-                &detection_relevant_output,
-                loop_started_at,
-                pacing,
-                &mut consecutive_identical_outputs,
-                &mut last_tool_output_hash,
-                active_model,
-                iteration,
-                turn_id,
-            )?;
-        }
-
-        turn_state.append_tool_round(
-            assistant_history_content,
-            &native_tool_calls,
-            &individual_results,
-            &tool_results,
-            use_native_tools,
-        );
-
-        if cancelled_mid_batch {
+            collected?;
             return Err(ToolLoopCancelled.into());
         }
+        collected?;
 
+        let mut closeout_reply = None;
         if let Some(key) = repetition_disposition.message_key {
             if cancellation_token
                 .as_ref()
@@ -3753,11 +3777,10 @@ async fn run_tool_call_loop_impl<'a>(
             }
             accumulated_display_text.push_str(&visible_reason);
             if repetition_disposition.close {
-                turn_state.push_dual(ChatMessage::assistant(reason));
-                *history_has_trim_breadcrumb = turn_state.crumb_present;
-                return Ok(accumulated_display_text);
+                closeout_reply = Some(reason);
+            } else {
+                turn_state.push_dual(ChatMessage::system(reason));
             }
-            turn_state.push_dual(ChatMessage::system(reason));
         }
 
         let queued_sop_actions = crate::sop::executor::drain_live_actions(&live_sop_queue);
@@ -3816,6 +3839,14 @@ async fn run_tool_call_loop_impl<'a>(
             ))
             .await?;
             turn_state.mark_all_synced();
+        }
+
+        if repetition_disposition.close {
+            if let Some(reply) = closeout_reply {
+                turn_state.push_dual(ChatMessage::assistant(reply));
+            }
+            *history_has_trim_breadcrumb = turn_state.crumb_present;
+            return Ok(accumulated_display_text);
         }
 
         pending_reported_usage = reported_input_tokens.map(|reported| ReportedRequestUsage {
@@ -11909,6 +11940,152 @@ mod tool_lifecycle_abandonment_tests {
             ],
             "every executable context of the interrupted batch gets exactly one abandonment; none reaches after"
         );
+    }
+
+    #[tokio::test]
+    async fn cancelled_batch_detector_break_still_abandons_contexts_and_closes_cards() {
+        let observer = NoopObserver;
+        let pacing = zeroclaw_config::schema::PacingConfig {
+            loop_detection_max_repeats: 1,
+            ..Default::default()
+        };
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let runner = lifecycle_runner(Arc::clone(&events), Vec::new());
+        let token = CancellationToken::new();
+        let response = |last: bool| ChatResponse {
+            text: None,
+            tool_calls: {
+                let mut calls = vec![tool_call(
+                    if last { "echo-3" } else { "echo-prior" },
+                    "echo_tool",
+                    serde_json::json!({"n": 1}),
+                )];
+                if last {
+                    calls.push(tool_call(
+                        "interrupted",
+                        "interrupt_tool",
+                        serde_json::json!({"n": 2}),
+                    ));
+                    calls.push(tool_call(
+                        "pending",
+                        "echo_second",
+                        serde_json::json!({"n": 3}),
+                    ));
+                }
+                calls
+            },
+            usage: None,
+            reasoning_content: None,
+        };
+        let provider = ScriptedProvider {
+            responses: Mutex::new(vec![response(false), response(false), response(true)]),
+        };
+        let tools_registry = registry_with(vec![
+            Box::new(EchoTool {
+                name: "echo_tool".into(),
+            }),
+            Box::new(InterruptingTool {
+                name: "interrupt_tool".into(),
+                token: token.clone(),
+            }),
+            Box::new(EchoTool {
+                name: "echo_second".into(),
+            }),
+        ]);
+        let mut history = vec![ChatMessage::user("repeat then cancel")];
+        let turn_id = "cancelled-detector-break";
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(128);
+        let mut crumb_present = false;
+        let mut injected_preamble = None;
+        let error = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
+            capability_binding: None,
+            exec: ResolvedAgentExecution {
+                model_access: ResolvedModelAccess {
+                    model_provider: &provider,
+                    provider_name: "scripted",
+                    model: "scripted-model",
+                    dispatch_model: "scripted-model",
+                    temperature: Some(0.0),
+                },
+                tools_registry: &tools_registry,
+                observer: &observer,
+                silent: true,
+                approval: None,
+                multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
+                max_tool_iterations: 4,
+                hooks: Some(&runner),
+                excluded_tools: &[],
+                dedup_exempt_tools: &[],
+                activated_tools: None,
+                model_switch_callback: None,
+                pacing: &pacing,
+                strict_tool_parsing: false,
+                parallel_tools: false,
+                max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
+                context_limits: zeroclaw_config::schema::ResolvedContextLimits {
+                    context_token_budget: 0,
+                    ..zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0)
+                },
+                context_limits_resolver: None,
+                receipt_generator: None,
+                knobs: &LoopKnobs::default(),
+                security: None,
+            },
+            history: &mut history,
+            history_has_trim_breadcrumb: &mut crumb_present,
+            injected_memory_preamble: &mut injected_preamble,
+            channel_name: "cli",
+            channel_reply_target: None,
+            cancellation_token: Some(token),
+            on_delta: None,
+            shared_budget: None,
+            channel: None,
+            collected_receipts: None,
+            event_tx: Some(event_tx),
+            steering: None,
+            new_messages_out: None,
+            image_cache: None,
+            memory: None,
+            ingress: IngressContext::sub_turn(),
+            agent_alias: None,
+            turn_id,
+            served_route_sink: None,
+        })
+        .await
+        .expect_err("the detector must stop the cancelled batch");
+
+        assert!(
+            error.to_string().contains("loop detector"),
+            "must exercise Break: {error:#}"
+        );
+        let recorded = events.lock().unwrap();
+        for tool in ["interrupt_tool", "echo_second"] {
+            assert_eq!(
+                recorded
+                    .iter()
+                    .filter(|entry| entry.starts_with(&format!("abandoned:{tool}:")))
+                    .count(),
+                1
+            );
+            assert!(
+                !recorded
+                    .iter()
+                    .any(|entry| entry.starts_with(&format!("after:{tool}:")))
+            );
+        }
+        let mut terminal = std::collections::HashMap::new();
+        while let Ok(event) = event_rx.try_recv() {
+            if let TurnEvent::ToolResult { id, .. } = event {
+                *terminal.entry(id).or_insert(0usize) += 1;
+            }
+        }
+        for id in ["echo-3", "interrupted", "pending"] {
+            assert_eq!(terminal.get(id), Some(&1), "one terminal result for {id}");
+        }
     }
 
     /// Tool that never completes on its own: the containing wrapper decides

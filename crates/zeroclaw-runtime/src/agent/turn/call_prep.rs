@@ -515,7 +515,7 @@ mod tests {
     use super::{PreparedToolCalls, prepare_tool_calls};
     use crate::agent::tool_execution::ToolExecutionOutcome;
     use crate::agent::turn::context::TurnCtx;
-    use crate::agent::turn::post_exec::record_executed_outcomes;
+    use crate::agent::turn::post_exec::{record_executed_outcomes, store_executed_outcomes};
     use crate::agent::turn::{DraftEvent, StreamDelta};
     use crate::observability::NoopObserver;
     use crate::skills::SkillTool;
@@ -644,11 +644,9 @@ mod tests {
         .await
         .expect("preparation should accept the test call");
 
-        record_executed_outcomes(
-            &ctx,
+        store_executed_outcomes(
             &prepared.executable_indices,
             &prepared.executable_calls,
-            &prepared.stream_calls,
             vec![ToolExecutionOutcome {
                 output: "ok".to_string(),
                 attachments: Vec::new(),
@@ -659,6 +657,13 @@ mod tests {
                 receipt: None,
             }],
             &mut prepared.ordered_results,
+        );
+        record_executed_outcomes(
+            &ctx,
+            &prepared.executable_indices,
+            &prepared.executable_calls,
+            &prepared.stream_calls,
+            &prepared.ordered_results,
             0,
         )
         .await;
@@ -901,11 +906,9 @@ mod tests {
         assert!(duplicate.output.contains("duplicate"));
 
         // The surviving call completes normally through the after hook.
-        record_executed_outcomes(
-            &ctx,
+        store_executed_outcomes(
             &prepared.executable_indices,
             &prepared.executable_calls,
-            &prepared.stream_calls,
             vec![ToolExecutionOutcome {
                 output: "ok".to_string(),
                 attachments: Vec::new(),
@@ -916,6 +919,13 @@ mod tests {
                 receipt: None,
             }],
             &mut prepared.ordered_results,
+        );
+        record_executed_outcomes(
+            &ctx,
+            &prepared.executable_indices,
+            &prepared.executable_calls,
+            &prepared.stream_calls,
+            &prepared.ordered_results,
             0,
         )
         .await;
