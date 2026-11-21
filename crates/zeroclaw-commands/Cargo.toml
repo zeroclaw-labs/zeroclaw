@@ -9,4 +9,5 @@ homepage.workspace = true
 publish = true
 
 [dependencies]
+zeroclaw-api.workspace = true
 serde = { version = "1.0", default-features = false, features = ["derive"] }

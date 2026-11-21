@@ -1888,8 +1888,11 @@ rpc_type! {
 rpc_type! {
     /// Turn-wide usage totals on `TurnComplete`, the RPC counterpart of the
     /// gateway chat socket's `done` frame. Totals and `usage_by_provider`
-    /// include every billable attempt; the `last_*` fields and context
-    /// limits describe the accepted call that served the turn.
+    /// include recorded usage for billable attempts and may be incomplete.
+    /// The `model` and `last_*` fields describe the accepted attempt; an
+    /// unknown model can be labelled `(unattributed)`. Context limits follow
+    /// the route used to dispatch that call, which can differ from the
+    /// provider-reported model after server-side fallback.
     #[derive(Default, PartialEq)]
     pub struct TurnUsageTotals {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1908,10 +1911,10 @@ rpc_type! {
         pub model: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub last_input_tokens: Option<u64>,
-        /// Proactive-trim budget of the serving route.
+        /// Proactive-trim budget of the route used for the accepted call.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub max_context_tokens: Option<u64>,
-        /// Configured context window of the serving model.
+        /// Configured context window of the route used for the accepted call.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub model_context_window: Option<u64>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]

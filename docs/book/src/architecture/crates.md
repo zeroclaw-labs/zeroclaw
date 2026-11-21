@@ -19,6 +19,12 @@ Notable submodules:
 - `service/`: systemd / launchctl / Windows Service integration
 - `rpc/`: the RPC layer for zerocode
 
+### `zeroclaw-goal`
+
+Transport-neutral Goal Mode control, execution, and accounting contracts. It
+depends on `zeroclaw-api`, `zeroclaw-commands`, and `zeroclaw-config`, not on
+the runtime. Runtime hosts provide the durable store and pricing integration.
+
 ### `zeroclaw-config`
 
 TOML schema and its validation. Handles:

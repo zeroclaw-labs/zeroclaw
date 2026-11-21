@@ -4710,7 +4710,7 @@
         "type": "string"
       },
       "TurnUsageTotals": {
-        "description": "Turn-wide usage totals on `TurnComplete`, the RPC counterpart of the\ngateway chat socket's `done` frame. Totals and `usage_by_provider`\ninclude every billable attempt; the `last_*` fields and context\nlimits describe the accepted call that served the turn.",
+        "description": "Turn-wide usage totals on `TurnComplete`, the RPC counterpart of the\ngateway chat socket's `done` frame. Totals and `usage_by_provider`\ninclude recorded usage for billable attempts and may be incomplete.\nThe `model` and `last_*` fields describe the accepted attempt; an\nunknown model can be labelled `(unattributed)`. Context limits follow\nthe route used to dispatch that call, which can differ from the\nprovider-reported model after server-side fallback.",
         "properties": {
           "cost_usd": {
             "description": "Sum of `usage_by_provider[*].cost_usd`; absent when the sum is\nnot positive (an unpriced turn).",
@@ -4737,7 +4737,7 @@
             ]
           },
           "max_context_tokens": {
-            "description": "Proactive-trim budget of the serving route.",
+            "description": "Proactive-trim budget of the route used for the accepted call.",
             "format": "uint64",
             "minimum": 0,
             "type": [
@@ -4752,7 +4752,7 @@
             ]
           },
           "model_context_window": {
-            "description": "Configured context window of the serving model.",
+            "description": "Configured context window of the route used for the accepted call.",
             "format": "uint64",
             "minimum": 0,
             "type": [

@@ -155,6 +155,22 @@ token-bearing response to `<workspace>/state/costs.jsonl`, one JSON object
 per line. The ledger is read on startup so the dashboard's current-month
 per-agent rollup survives restarts.
 
+When actual provider-route attribution is available, a `CostRecord` can also
+carry `provider_ref`. Older rows may omit it and deserialize without it; the
+field does not change the ledger's existing ownership or pricing rules.
+
+Goal accounting requires every non-empty ledger line to be readable. It
+accepts blank lines and complete JSON records concatenated on one line, but an
+unreadable fragment anywhere in the shared ledger makes Goal usage uncertain,
+even when it cannot be attributed to the current Goal. The Goal fails closed
+instead of admitting another model call with an unreliable budget.
+
+Before repairing a damaged ledger, stop its writers and preserve an unchanged
+copy for investigation. Restore or reconcile the missing records only from
+evidence that establishes their completeness. Removing an unreadable fragment
+or restoring an older, incomplete backup does not make the missing usage zero
+or prove that a subsequent Goal's accounting is complete.
+
 Each `TokenUsage` record carries two pricing-provenance fields:
 
 - `unpriced_tokens`: the input, cached-input, or output token subset whose
@@ -163,6 +179,11 @@ Each `TokenUsage` record carries two pricing-provenance fields:
   whose `0.0` cached-input rate fell back to the standard input rate.
 - `pricing_available`: compatibility summary of that provenance. New records
   set it to `false` when `unpriced_tokens > 0`.
+
+An `(unattributed)` lower-bound row stays unpriced even if a rate is configured
+under that name, unless it identifies an actual model with that literal name.
+Goal Mode retains such a lower bound and stops before another Goal-owned model
+call when the operation's accounting is incomplete.
 
 Ledger rows written before these fields existed deserialize with
 `pricing_available = true` and `unpriced_tokens = 0`. Zero spend on a legacy
