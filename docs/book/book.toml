@@ -22,6 +22,7 @@ additional-css = ["theme/pc-themes.css", "theme/custom.css"]
 
 [output.html.redirect]
 "/contributing/multi-agent-setup.html" = "../agents/multi-agent-setup.html"
+"/getting-started/zerocode.html" = "../zerocode/overview.html"
 
 [output.html.search]
 enable = true

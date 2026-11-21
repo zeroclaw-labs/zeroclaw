@@ -12,9 +12,7 @@ Repository convention:
 1. Keep runnable workflow entry files at `.github/workflows/` root.
 2. Keep cross-tooling/local CI scripts under `dev/` or `scripts/ci/` when used outside Actions.
 
-Workflow behavior documentation in this directory:
-
-- `.github/workflows/master-branch-flow.md`
+Workflow behavior is documented in `docs/book/src/maintainers/ci-and-actions.md`.
 
 ## Bespoke CI gate provenance
 
