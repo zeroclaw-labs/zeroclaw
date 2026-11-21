@@ -36,6 +36,7 @@ import {
 import FieldForm, {
   clearFieldFormCatalogCaches,
 } from "../components/sections/FieldForm";
+import BrowserVoiceSettings from "../components/BrowserVoiceSettings";
 import PersonalityEditor from "../components/sections/PersonalityEditor";
 import SkillsBundleEditor from "../components/sections/SkillsBundleEditor";
 import BindChannelForm from "../components/sections/BindChannelForm";
@@ -54,6 +55,7 @@ import CostRatesEditor, {
 } from "../components/sections/CostRatesEditor";
 import { Badge, Button, Card, PageHeader } from "@/components/ui";
 import { t } from "@/lib/i18n";
+import { useLocaleContext } from "@/App";
 
 // Display order for the curated sidebar groups. Each `SectionInfo.group`
 // from the gateway lands in one of these buckets (anything else falls
@@ -82,6 +84,8 @@ const GROUP_ORDER = [
 // (single canonical source). The dashboard preserves response order for
 // the Foundation group instead of carrying its own copy of the list.
 
+const VOICE_SECTION = "voice-and-audio";
+
 export default function Config() {
   // URL params drive the view. No internal mode state for picker/form —
   // the address bar is the source of truth.
@@ -98,7 +102,25 @@ export default function Config() {
   const lockedSection = location.pathname.startsWith("/setup/")
     ? sectionParam
     : undefined;
-  const [sections, setSections] = useState<SectionInfo[]>([]);
+  const setup = location.pathname.startsWith("/setup/");
+  const [schemaSections, setSchemaSections] = useState<SectionInfo[]>([]);
+  useLocaleContext();
+  const voiceLabel = t("voice.settings");
+  const voiceHelp = t("voice.help_intro");
+  const sections = useMemo<SectionInfo[]>(() => setup ? schemaSections : [
+    ...schemaSections,
+    {
+      key: VOICE_SECTION,
+      label: voiceLabel,
+      help: voiceHelp,
+      group: "Other",
+      has_picker: false,
+      completed: false,
+      ready: true,
+      is_quickstart: false,
+      cost_category: "",
+    },
+  ], [schemaSections, setup, voiceLabel, voiceHelp]);
   const [activeKey, setActiveKey] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -123,11 +145,11 @@ export default function Config() {
     getSections()
       .then((resp) => {
         if (cancelled) return;
-        setSections(resp.sections);
-        const initialKey =
-          sectionParam && resp.sections.find((s) => s.key === sectionParam)
-            ? sectionParam
-            : (resp.sections[0]?.key ?? null);
+        setSchemaSections(resp.sections);
+        const initialKey = sectionParam && (
+          (!setup && sectionParam === VOICE_SECTION) ||
+          resp.sections.some((section) => section.key === sectionParam)
+        ) ? sectionParam : (resp.sections[0]?.key ?? null);
         setActiveKey(initialKey);
       })
       .catch((e) => {
@@ -227,6 +249,7 @@ export default function Config() {
 
   const mainContent = (() => {
     if (!activeSection) return null;
+    if (activeSection.key === VOICE_SECTION) return <BrowserVoiceSettings />;
 
     if (!activeSection.has_picker) {
       return (
@@ -686,7 +709,7 @@ export default function Config() {
                   ))}
                 </span>
               }
-              actions={
+              actions={activeSection.key !== VOICE_SECTION && (
                 <>
                   <Button
                     variant="ghost"
@@ -706,7 +729,7 @@ export default function Config() {
                     }}
                   />
                 </>
-              }
+              )}
             />
 
             <div className="flex-1 min-h-0 flex flex-col">{mainContent}</div>

@@ -111,8 +111,10 @@ export function persistedToUiMessages(
   local?: boolean;
   toolCall?: { name: string; args?: unknown; output?: string };
   timestamp: Date;
+  fromHistory: true;
 }> {
   return rows.map((m) => ({
+    fromHistory: true as const,
     id: m.id,
     role: m.role,
     content: m.content,

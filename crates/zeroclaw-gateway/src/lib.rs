@@ -1094,7 +1094,10 @@ impl ServeTasks {
         let cancelled = self.0.cancelled.clone();
         // No lock is held here: spawning can drop the task at once (a runtime
         // that has shut down does), and that only updates the count.
-        zeroclaw_spawn::spawn!(async move {
+        // Every connection and HTTP/2 stream is one of these tasks, so their
+        // lifecycle is recorded at DEBUG: at INFO it would fill the runtime
+        // trace with routine traffic.
+        zeroclaw_spawn::spawn!(level = DEBUG, async move {
             // Moves the whole task in. Naming only `task.future` below would
             // capture just that field, and `_done` would take the task off the
             // count as soon as `spawn` returned.
@@ -2439,7 +2442,10 @@ pub async fn run_gateway_with_plugin_webhooks(
 
     // Device registry and pairing store (only when pairing is required)
     let device_registry = if config.gateway.require_pairing {
-        let registry = Arc::new(api_pairing::DeviceRegistry::new(&config.data_dir));
+        let registry = Arc::new(
+            api_pairing::DeviceRegistry::new(&config.data_dir)
+                .context("Initialize paired-device registry")?,
+        );
         // Reconcile the registry against the canonical paired-token set so that
         // tokens paired via the legacy `/pair` route (and any other historical
         // orphans) become visible and revocable in the management UI. The token
@@ -2766,6 +2772,8 @@ pub async fn run_gateway_with_plugin_webhooks(
             post(api_pairing::submit_pairing_enhanced).layer(no_relayed_pairing.clone()),
         )
         .route("/api/devices", get(api_pairing::list_devices))
+        .route("/api/devices/{id}/voice", get(api_pairing::get_device_voice_preferences).put(api_pairing::put_device_voice_preferences))
+        .route("/api/devices/me/voice", get(api_pairing::get_my_voice_preferences).put(api_pairing::put_my_voice_preferences))
         .route(
             "/api/devices/me/capabilities",
             post(api_pairing::update_my_capabilities),
@@ -6306,7 +6314,8 @@ mod tests {
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         };
-        let registry = with_registry.then(|| Arc::new(api_pairing::DeviceRegistry::new(&data_dir)));
+        let registry =
+            with_registry.then(|| Arc::new(api_pairing::DeviceRegistry::new(&data_dir).unwrap()));
         let state_authority = zeroclaw_runtime::LiveConfigAuthority::new(config);
         AppState {
             config: state_authority.live_handle(),
@@ -7955,6 +7964,66 @@ path = "{trigger_path}"
             Arc::strong_count(&owned),
             1,
             "a stream task outlived its gateway's retirement"
+        );
+    }
+
+    /// Each connection, and each stream hyper hands to the executor, is a task
+    /// of the set. Their spawn and completion are recorded at DEBUG, so the
+    /// runtime trace, recorded at INFO by default, does not get a pair of
+    /// records for every connection.
+    #[test]
+    fn serve_tasks_record_their_lifecycle_below_info() {
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut receiver = zeroclaw_log::subscribe_or_install();
+        let test_case = "serve-tasks-lifecycle-level";
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(::zeroclaw_log::scope!(test_case: test_case, => async {
+            let tasks = ServeTasks::default();
+            tasks.spawn(async {});
+            hyper::rt::Executor::execute(&tasks, async {});
+            tasks.idle().await;
+        }));
+        drop(runtime);
+
+        let mut records = Vec::new();
+        loop {
+            let event = match receiver.try_recv() {
+                Ok(event) => event,
+                // Other tests log into the same capture; a lagged receiver
+                // has only dropped older events, so keep reading.
+                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => continue,
+                Err(_) => break,
+            };
+            if event
+                .pointer("/attributes/test_case")
+                .and_then(|v| v.as_str())
+                == Some(test_case)
+                && event.pointer("/attributes/task_site").is_some()
+            {
+                records.push(format!(
+                    "{} {}",
+                    event["severity_text"].as_str().unwrap_or_default(),
+                    event["message"].as_str().unwrap_or_default()
+                ));
+            }
+        }
+        zeroclaw_log::clear_broadcast_hook();
+
+        records.sort();
+        assert_eq!(
+            records,
+            [
+                "DEBUG task complete",
+                "DEBUG task complete",
+                "DEBUG task spawned",
+                "DEBUG task spawned",
+            ],
+            "a connection's or stream's task lifecycle must stay out of the INFO trace"
         );
     }
 
