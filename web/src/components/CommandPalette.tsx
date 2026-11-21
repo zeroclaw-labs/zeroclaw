@@ -334,7 +334,6 @@ export default function CommandPalette({ open, onClose }: CommandPaletteProps) {
       className="fixed inset-0 z-[200] flex items-start justify-center px-4 pt-[12vh] animate-fade-in"
       onKeyDown={onKeyDown}
     >
-      {/* Backdrop */}
       <button
         type="button"
         aria-label={t('nav.cmdk.close')}
@@ -343,7 +342,6 @@ export default function CommandPalette({ open, onClose }: CommandPaletteProps) {
         tabIndex={-1}
       />
 
-      {/* Dialog */}
       <div
         ref={dialogRef}
         role="dialog"
@@ -351,7 +349,6 @@ export default function CommandPalette({ open, onClose }: CommandPaletteProps) {
         aria-label={t('nav.cmdk.title')}
         className="relative w-full max-w-xl overflow-hidden rounded-[var(--radius-lg)] border border-pc-border bg-pc-surface shadow-[var(--pc-shadow-md)]"
       >
-        {/* Search input */}
         <div className="flex items-center gap-2.5 border-b border-pc-border px-3.5">
           <Search className="h-4 w-4 shrink-0 text-pc-text-muted" aria-hidden="true" />
           <input
@@ -372,7 +369,6 @@ export default function CommandPalette({ open, onClose }: CommandPaletteProps) {
           )}
         </div>
 
-        {/* Results */}
         <div
           ref={listRef}
           role="listbox"
@@ -436,7 +432,6 @@ export default function CommandPalette({ open, onClose }: CommandPaletteProps) {
           )}
         </div>
 
-        {/* Footer hint */}
         <div className="flex items-center gap-3 border-t border-pc-border px-3.5 py-2 text-[11px] text-pc-text-faint">
           <span className="flex items-center gap-1">
             <kbd className="rounded-[var(--radius-sm)] border border-pc-border bg-pc-elevated px-1.5 py-0.5 font-mono">↑</kbd>

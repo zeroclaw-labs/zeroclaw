@@ -251,7 +251,7 @@ export function AgentChatInner({
     saveDraftRef.current(value);
   }, [writeInput]);
   const [showModelDropdown, setShowModelDropdown] = useState(false);
-  // Slash-command autocomplete popover (#7137). Shown while the input begins
+  // Slash-command autocomplete popover. Shown while the input begins
   // with a single '/' and the token still matches at least one command.
   const [showCommandHint, setShowCommandHint] = useState(false);
   const [copiedId, setCopiedId] = useState<string | null>(null);
@@ -306,7 +306,7 @@ export function AgentChatInner({
 
   // Scroll to bottom on new messages / streaming.
   // Note: WebSocket lifecycle, hydration, and tool_call/tool_result handling
-  // moved to AgentContext (PR #6101). Tool activity is filtered at render
+  // moved to AgentContext. Tool activity is filtered at render
   // time below using `showToolActivity`, not at the message-handler layer.
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -344,7 +344,7 @@ export function AgentChatInner({
   }, [modelMenuOpen]);
 
   /**
-   * Slash-command dispatcher (#7137). Returns true when `trimmed` was handled
+   * Slash-command dispatcher. Returns true when `trimmed` was handled
    * as a command (and therefore must NOT be sent to the model as a prompt).
    * Commands drive existing session primitives — clear/reset and model switch —
    * and surface their feedback as local info messages, never to the gateway.
@@ -365,7 +365,7 @@ export function AgentChatInner({
 
       // Was an alias for /clear, which deleted the conversation. Now that an
       // agent can hold several, "new" means what it says: start another one and
-      // leave this one on the gateway (issue #7543).
+      // leave this one on the gateway.
       case 'new':
         if (!startNewSession()) {
           addLocalMessage(t('agent.sessions_unavailable'));
@@ -412,7 +412,7 @@ export function AgentChatInner({
           return true;
         }
         // switchModel silently no-ops while another switch is in flight, which
-        // looks like the command was ignored. Surface that state explicitly. #7137
+        // looks like the command was ignored. Surface that state explicitly.
         if (modelLoading) {
           addLocalMessage(t('agent.cmd_model_busy'));
           return true;
@@ -445,12 +445,12 @@ export function AgentChatInner({
     // Slash commands are dispatched BEFORE the connectivity check so purely
     // local commands like /help still work during transient disconnects.
     // Network-dependent commands (/clear, /model) self-recover via their own
-    // reconnect paths inside the context. #7137
+    // reconnect paths inside the context.
     if (command) {
       runCommand(trimmed);
     } else {
       if (!canSend) return;
-      // `//` is the documented escape for a literal leading slash (#7223);
+      // `//` is the documented escape for a literal leading slash;
       // strip one `/` so `//foo` is sent to the agent as `/foo`.
       sendMessage(trimmed.startsWith('//') ? trimmed.slice(1) : trimmed);
     }
@@ -672,7 +672,7 @@ export function AgentChatInner({
   };
 
   return (
-    /* translate="no" / notranslate (#7057): browser auto-translation (e.g.
+    /* translate="no" / notranslate: browser auto-translation (e.g.
        Chrome → Google Translate) rewrites text nodes into <font> wrappers.
        React reconciliation then trips "Failed to execute 'removeChild' on
        'Node'" and unmounts the view. The crash repro surface spans every
@@ -790,7 +790,6 @@ export function AgentChatInner({
         </div>
       </div>
 
-      {/* Connection status bar */}
       {error && (
         <div className="px-4 py-2 border-b border-status-error/20 bg-status-error/10 text-status-error flex items-center gap-2 text-sm animate-fade-in">
           <AlertCircle className="h-4 w-4 shrink-0" />
@@ -810,7 +809,6 @@ export function AgentChatInner({
         </div>
       )}
 
-      {/* Chat toolbar */}
       {messages.length > 0 && (
         <div className="flex flex-wrap items-center justify-end gap-2 px-4 py-2 border-b border-pc-border bg-pc-surface">
           <Button
@@ -857,7 +855,6 @@ export function AgentChatInner({
         </div>
       )}
 
-      {/* Messages area. */}
       <div
         className={`flex-1 overflow-y-auto p-4 ${compact ? 'space-y-1.5' : 'space-y-4'}`}
       >
@@ -928,14 +925,13 @@ export function AgentChatInner({
         <div ref={messagesEndRef} />
       </div>
 
-      {/* Tool approval banner — supervised-mode consent prompt (#6522). */}
+      {/* Tool approval banner — supervised-mode consent prompt. */}
       {pendingApproval && (
         <ApprovalBanner pending={pendingApproval} onRespond={respondToApproval} />
       )}
 
-      {/* Input area */}
       <div className="border-t border-pc-border bg-pc-surface p-4">
-        {/* Slash-command autocomplete popover (#7137) */}
+        {/* Slash-command autocomplete popover */}
         {showCommandHint && matchedCommands.length > 0 && (
           <div className="relative max-w-4xl mx-auto">
             <div
@@ -1073,7 +1069,7 @@ export function AgentChatInner({
 // typing into the input does not re-render every existing message (and
 // re-run ReactMarkdown on each one). Keep the prop surface small and pass
 // `isCopied` rather than the parent's full copiedId so only the affected
-// row re-renders when the copy indicator flips. See #5125.
+// row re-renders when the copy indicator flips.
 interface MessageItemProps {
   msg: ChatMessage;
   idx: number;

@@ -26,7 +26,7 @@ function rowLabel(row: SessionRow): string {
 }
 
 /**
- * Conversation switcher for one agent (issue #7543).
+ * Conversation switcher for one agent.
  *
  * The gateway keys history by session id, so a single agent can hold any number
  * of independent conversations; this exposes them — new, switch, rename,

@@ -137,7 +137,7 @@ export function uiMessagesToPersisted(
   return messages
     // Skip messages flagged `ephemeral: true` (web slash-command output like
     // /help, /model banners, unknown-command notices). They are throwaway UI
-    // feedback and must not be re-hydrated as fake assistant replies on reload. #7137
+    // feedback and must not be re-hydrated as fake assistant replies on reload.
     .filter((m) => !m.ephemeral)
     .map((m) => ({
       id: m.id,

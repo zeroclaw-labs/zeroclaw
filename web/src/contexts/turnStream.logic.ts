@@ -35,7 +35,7 @@ export type TurnStreamFrame =
   | { type: 'chunk_reset' }
   // `hasName` mirrors the handler's `if (!msg.name) break` guard: a nameless
   // observability telemetry frame is not a real tool call and must not flip
-  // `hadToolCall` (issue #7151).
+  // `hadToolCall`.
   | { type: 'tool_call'; hasName: boolean }
   | { type: 'done' | 'message'; full_response?: string; content?: string }
   // Every terminal/non-completion boundary resets the same canonical state.
@@ -45,7 +45,7 @@ export type TurnStreamFrame =
 /** What the handler should do with the finished turn. `commit` renders an
  *  assistant bubble (possibly empty content when reasoning is present);
  *  `diagnostic` renders the one-off no-output notice; `skip` renders nothing
- *  (the tool cards are already the visible record — #6702). */
+ *  (the tool cards are already the visible record). */
 export type CompletionOutcome =
   | { kind: 'commit'; content: string; thinking?: string }
   | { kind: 'diagnostic' }
@@ -61,7 +61,7 @@ export function classifyCompletion(
   // frame `content`, then whatever was streamed live.
   const raw = frame.full_response ?? frame.content ?? state.pendingContent;
   // Trim so whitespace-only content (models that emit "\n\n" alongside
-  // tool_calls) does not create a blank bubble (#6702).
+  // tool_calls) does not create a blank bubble.
   const content = raw.trim();
   const thinking =
     state.capturedThinking || state.pendingThinking || undefined;
@@ -73,7 +73,7 @@ export function classifyCompletion(
   }
   if (!state.hadToolCall) {
     // Nothing at all on a clean completion — surface a diagnostic so the turn
-    // does not disappear. Mirrors zerocode's zc-turn-no-output (#8779).
+    // does not disappear. Mirrors zerocode's zc-turn-no-output.
     return { kind: 'diagnostic' };
   }
   // Empty content but tools ran: their cards are the record, render nothing.

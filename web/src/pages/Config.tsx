@@ -1,11 +1,12 @@
-// Schema-driven config editor (#6175). Curated section explorer
-// but lands on a per-section overview: pick a section in the sidebar, see
-// what's currently configured under it, click an item to edit, click +Add
-// to instantiate a new entry. Sections with root-level controls can also
-// compose a filtered FieldForm beside the picker.
+// Schema-driven config editor. Bare /config opens the section navigator, with
+// an empty-state detail pane on wider screens; selecting a section or entry
+// opens its settings. Pick a section in the sidebar, see what's currently
+// configured under it, click an item to edit, click +Add to instantiate a new
+// entry. Sections with root-level controls can also compose a filtered
+// FieldForm beside the picker.
 //
 // URL structure:
-//   /config/:section             — section overview plus root settings when any
+//   /config/:section             — the selected section's view
 //   /config/:section/:type       — alias list for a provider/channel type
 //   /config/:section/:type/:alias — field form for a specific alias
 //
@@ -59,8 +60,7 @@ import { useLocaleContext } from "@/App";
 
 // Display order for the curated sidebar groups. Each `SectionInfo.group`
 // from the gateway lands in one of these buckets (anything else falls
-// into "Other"). Schema-attribute-driven grouping replaces this in v3 /
-// #5947.
+// into "Other").
 //
 // Foundation leads — Workspace / Providers / Channels / Memory /
 // Hardware / Tunnel are the most-edited sections, surfaced first inside
@@ -649,9 +649,6 @@ export default function Config() {
           <div className="flex h-full items-center justify-center">
             <div className="text-center max-w-sm">
               <Sparkles className="h-8 w-8 mx-auto mb-3 text-pc-text-faint" />
-              {/* i18n: reuse existing keys if present; otherwise these are
-                  the proposed new keys cfg.empty.title / cfg.empty.body
-                  (reported back to the owner of i18n.ts). */}
               <p className="text-sm font-medium text-pc-text-secondary">
                 {t("config.empty_title")}
               </p>
@@ -920,7 +917,6 @@ function AliasListView({
             />
           ))}
 
-          {/* Inline new alias row */}
           <div className="flex flex-col gap-1 px-4 py-3">
             <div className="flex items-center gap-2">
               <input

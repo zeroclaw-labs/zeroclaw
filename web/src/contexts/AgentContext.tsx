@@ -79,7 +79,7 @@ export interface ChatMessage {
    * Locally-generated info/system message produced by web slash-command
    * handlers (`/help`, `/model`, unknown-command notices). Excluded from
    * persistence so command output does not pollute localStorage and reappear
-   * as fake assistant replies on reload. See #7137.
+   * as fake assistant replies on reload.
    */
   ephemeral?: boolean;
   /** User-visible lifecycle notice, rendered distinctly from agent output. */
@@ -116,7 +116,7 @@ export interface AgentContextValue {
   refreshModels: () => void;
   deleteMessage: (id: string) => void;
   clearAllMessages: () => void;
-  /** Conversation currently on screen for this agent (issue #7543). */
+  /** Conversation currently on screen for this agent. */
   sessionId: string;
   /**
    * True once the active conversation's transcript has loaded. Sending before
@@ -144,18 +144,17 @@ export interface AgentContextValue {
    * Append a locally-generated info/system message to the transcript without
    * sending anything to the gateway. Used by web slash-command handlers
    * (`/help`, `/model`, unknown-command notices) to surface feedback inline.
-   * See #7137.
    */
   addLocalMessage: (content: string) => void;
   abortSession: () => Promise<void>;
   /**
    * Pending supervised-mode tool-approval prompt, or null. Populated when the
    * gateway emits an `approval_request` frame; cleared once the user responds
-   * or a fresh `approval_request` arrives. See #6522.
+   * or a fresh `approval_request` arrives.
    */
   pendingApproval: PendingApproval | null;
   respondToApproval: (decision: ApprovalDecision) => void;
-  // Context window tracking (from "done" WS frames). See #7311.
+  // Context window tracking (from "done" WS frames).
   contextMaxTokens: number | null;
   contextModelWindow: number | null;
   contextInputTokens: number | null;
@@ -280,7 +279,7 @@ export function AgentProvider({
 }: AgentProviderProps) {
   // The conversation this provider is showing. State, not a ref: switching it
   // is what re-runs hydration and rebuilds the socket, which is how one agent
-  // serves several independent conversations (issue #7543).
+  // serves several independent conversations.
   const [sessionId, setSessionId] = useState(
     () => initialSessionId ?? getActiveSessionId(agentAlias),
   );
@@ -338,7 +337,7 @@ export function AgentProvider({
   // loads it again.
   const hydrationFailedRef = useRef<string | null>(null);
   const [pendingApproval, setPendingApproval] = useState<PendingApproval | null>(null);
-  // Context window tracking (from "done" WS frames). See #7311.
+  // Context window tracking (from "done" WS frames).
   const [contextLimits, setContextLimits] = useState(EMPTY_CONTEXT_LIMITS);
   // Count and provenance move together, including batched socket frames.
   const [contextInput, setContextInput] = useState(EMPTY_CONTEXT_INPUT);
@@ -599,7 +598,7 @@ export function AgentProvider({
         } else if (outcome?.kind === 'diagnostic') {
           // Clean completion with nothing at all — surface a one-off notice so
           // the turn does not disappear. Mirrors zerocode's zc-turn-no-output
-          // fallback (#8779). `skip` (empty + tool calls ran) renders nothing.
+          // fallback. `skip` (empty + tool calls ran) renders nothing.
           localMessageMutationVersionRef.current += 1;
           setMessages((prev) => [
             ...prev,
@@ -628,7 +627,7 @@ export function AgentProvider({
           type: 'tool_call',
           hasName: Boolean(msg.name),
         });
-        // Defense in depth (issue #7151): the chat WebSocket shares a broadcast
+        // Defense in depth: the chat WebSocket shares a broadcast
         // bus with observability telemetry, whose `tool_call` frames have a
         // different shape (`tool`/`duration_ms`/`success`) and carry no `name`.
         // Such a frame would otherwise produce a permanent "unknown" tool card
@@ -668,7 +667,7 @@ export function AgentProvider({
       }
 
       case 'tool_result': {
-        // Defense in depth (issue #7151): mirrors the `tool_call` guard
+        // Defense in depth: mirrors the `tool_call` guard
         // above. Observability `tool_result`-shaped telemetry would otherwise
         // overwrite the most recent pending tool card with an empty output.
         if (!msg.name) {
@@ -1055,8 +1054,7 @@ export function AgentProvider({
         // Agent-scoped status: `/api/status?agent=<alias>` runs the same
         // `resolved_model_provider_for_agent` logic the gateway uses to build
         // the Agent, so the fallback `status.model` is correct for THIS agent
-        // rather than the install-wide default. (Ported from
-        // zeroclaw-labs/zeroclaw#7191.)
+        // rather than the install-wide default.
         const status = await getStatus(agentAlias);
         if (cancelled) return;
 
@@ -1191,7 +1189,7 @@ export function AgentProvider({
     // that actually succeeded). Splitting the budget keeps the spinner bounded
     // against a hung request *and* a reconnect that never opens, without the
     // false positive. The `=== model` identity check stops a fired watchdog
-    // from clobbering a newer switch. (Ported from zeroclaw-labs/zeroclaw#7191.)
+    // from clobbering a newer switch.
     const armWatchdog = () => {
       if (switchTimeoutRef.current) clearTimeout(switchTimeoutRef.current);
       switchTimeoutRef.current = setTimeout(() => {
@@ -1360,7 +1358,7 @@ export function AgentProvider({
     // life of the connection, and the gateway persists each turn to the
     // session backend. Clearing only React state leaves both intact, so the
     // next turn still carries prior context and a reload/reconnect repopulates
-    // the old transcript (issue #7126). To genuinely reset context we must:
+    // the old transcript. To genuinely reset context we must:
     //   1. delete the persisted backend session history, and
     //   2. tear down + reconnect the socket so the gateway builds a fresh
     //      Agent that seeds from the now-empty backend.
@@ -1591,7 +1589,7 @@ export function AgentProvider({
     },
     pendingApproval,
     respondToApproval,
-    // Context window tracking (from "done" WS frames). See #7311.
+    // Context window tracking (from "done" WS frames).
     contextMaxTokens: contextLimits.maxTokens,
     contextModelWindow: contextLimits.modelWindow,
     contextInputTokens: contextInput.inputTokens,

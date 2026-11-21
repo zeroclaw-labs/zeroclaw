@@ -79,7 +79,6 @@ export default function AgentCard({ agent, onSelect, selected = false }: AgentCa
         .filter(Boolean)
         .join(' ')}
     >
-      {/* Identity */}
       <div className="h-8 w-8 rounded-[var(--radius-md)] flex-shrink-0 flex items-center justify-center bg-pc-accent/10">
         <Bot className="h-4 w-4 text-pc-accent" />
       </div>

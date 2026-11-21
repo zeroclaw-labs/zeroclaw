@@ -1,4 +1,4 @@
-// Master navigator for the Config master-detail layout (#6175 follow-up).
+// Master navigator for the Config master-detail layout.
 //
 // A single ~300px column that replaces the old section-list → overview →
 // alias-list drill-down. It shows, top to bottom:
@@ -381,7 +381,6 @@ export default function SectionNavigator({
 
   return (
     <aside className={`w-full md:w-[300px] flex-shrink-0 border-r border-pc-border flex flex-col min-h-0 ${className}`}>
-      {/* Search box */}
       <div className="p-3 border-b border-pc-border">
         <div className="relative">
           <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-pc-text-faint pointer-events-none" />

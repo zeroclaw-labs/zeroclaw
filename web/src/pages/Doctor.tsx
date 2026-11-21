@@ -231,14 +231,12 @@ export default function Doctor() {
         }
       />
 
-      {/* Error */}
       {error && (
         <Card className="text-sm border-status-error/25 bg-status-error/10 text-status-error">
           {error}
         </Card>
       )}
 
-      {/* Loading state */}
       {loading && (
         <Card className="flex flex-col items-center justify-center py-16">
           <Loader2 className="h-8 w-8 animate-spin text-pc-accent mb-4" />
@@ -247,7 +245,6 @@ export default function Doctor() {
         </Card>
       )}
 
-      {/* Results */}
       {results && !loading && (
         <>
           {/* Summary bar — the counts double as severity filters. Click a
@@ -276,7 +273,6 @@ export default function Doctor() {
               onToggle={() => toggleSeverity('error')}
             />
 
-            {/* Overall indicator */}
             <div className="ml-auto">
               {errorCount > 0 ? (
                 <Badge tone="error">{t('doctor.issues_found')}</Badge>
@@ -295,7 +291,6 @@ export default function Doctor() {
             </Card>
           )}
 
-          {/* Grouped results */}
           {Object.entries(grouped)
             .sort(([a], [b]) => a.localeCompare(b))
             .map(([category, items]) => (
@@ -361,7 +356,6 @@ export default function Doctor() {
         onClose={() => setFixTarget(null)}
       />
 
-      {/* Empty state */}
       {!results && !loading && !error && (
         <Card className="flex flex-col items-center justify-center py-16">
           <div className="h-16 w-16 rounded-[var(--radius-lg)] flex items-center justify-center mb-4 bg-pc-elevated border border-pc-border">

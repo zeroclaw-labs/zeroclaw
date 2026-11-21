@@ -6,8 +6,6 @@ import { t } from "../../lib/i18n";
 import type { SignInMethods, SignOutNotice } from "../../hooks/useAuth";
 import { RelayNotice } from "./RelayNotice";
 
-// Pairing dialog: the sign-in screen when no sign-in providers are configured,
-// unchanged from before dashboard sign-in existed.
 export function PairingDialog({
   onPair,
   children,
@@ -22,23 +20,20 @@ export function PairingDialog({
   const [displayCode, setDisplayCode] = useState<string | null>(null);
   const [codeLoading, setCodeLoading] = useState(true);
   const [generating, setGenerating] = useState(false);
-  // True once minting from the browser is impossible (remote/non-loopback origin,
-  // a 403, or pairing disabled) — collapse to the copy-able CLI command instead.
+  // Set when Generate gets a 403 or no code back; switches the localhost form to
+  // the copy-able CLI command.
   const [showCliFallback, setShowCliFallback] = useState(false);
 
-  // The admin mint endpoint is localhost-only, so a self-serve "Generate" button
-  // can only work when the dashboard itself is served from loopback. Remote /
-  // Docker origins must use the CLI on the gateway host instead.
+  // Offer Generate on localhost only, since the mint endpoint is localhost-only.
+  // A 403 switches the form to the CLI command.
   const isLocalhost = ["localhost", "127.0.0.1", "::1", "[::1]"].includes(
     window.location.hostname,
   );
-  // The browser knows the gateway's real host:port (it is talking to it), so it
-  // can show the exact recovery command — including the alternate port that made
-  // the config-default `get-paircode` miss the running instance (#5266).
   const gatewayPort = window.location.port;
   const cliRecoveryCommand = `zeroclaw gateway get-paircode --new${gatewayPort ? ` --port ${gatewayPort}` : ""}`;
 
-  // Fetch the current pairing code (public endpoint works in Docker too)
+  // Load pairing status and prefill any code the gateway returns. The current
+  // public `/pair/code` endpoint never includes the code (see getAdminPairCode).
   useEffect(() => {
     let cancelled = false;
     getAdminPairCode()
@@ -72,10 +67,10 @@ export function PairingDialog({
     }
   };
 
-  // Mint a fresh code on demand against the localhost-only admin endpoint. This
-  // is the in-band escape from the #5266 dead end: an already-paired gateway
-  // prints no code at startup, so without this the dashboard's 6-digit prompt
-  // has no code to enter and no obvious way forward.
+  // Request a fresh code on demand from the localhost-only admin endpoint. An
+  // already-paired gateway prints no code at startup, which leaves the pairing
+  // prompt with no code to enter. When the endpoint refuses (403), show the
+  // CLI command instead.
   const handleGenerate = async () => {
     setGenerating(true);
     setError("");
@@ -90,7 +85,8 @@ export function PairingDialog({
       }
     } catch (err: unknown) {
       if (err instanceof PairCodeForbiddenError) {
-        // Non-loopback origin: the browser can't mint; show the CLI command.
+        // 403: the endpoint wants a loopback peer and the admin token, which
+        // this request does not carry; show the CLI command.
         setShowCliFallback(true);
       } else {
         setError(
@@ -114,8 +110,9 @@ export function PairingDialog({
     >
       {children}
 
-      {/* Already paired, no code minted at startup (#5266): offer a self-serve
-          mint on localhost, or the equivalent CLI command everywhere else. */}
+      {/* Shown while no code is displayed. Localhost offers Generate, whose
+          403 reveals the CLI command; other origins see the CLI command at
+          once. */}
       {!codeLoading && !displayCode && (
         <div
           className="mb-6 p-4 rounded-2xl border text-center text-sm"
@@ -193,8 +190,8 @@ export function PairingDialog({
       )}
 
       <form onSubmit={handleSubmit}>
-        {/* Pairing codes are case-sensitive alphanumeric by default
-            (#6613). Mobile keyboards auto-capitalise and autocorrect free
+        {/* Pairing codes are case-sensitive alphanumeric by default.
+            Mobile keyboards auto-capitalise and autocorrect free
             text, which silently corrupts a typed or pasted code, so both
             are turned off here. */}
         <input
@@ -244,7 +241,6 @@ function SignInFrame({ status, children }: { status: ReactNode; children: ReactN
       className="min-h-screen flex items-center justify-center"
       style={{ background: "var(--pc-bg-base)" }}
     >
-      {/* Ambient glow */}
       <div className="relative surface-panel p-8 w-full max-w-md animate-fade-in-scale">
         <div className="text-center mb-8">
           <img

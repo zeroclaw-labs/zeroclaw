@@ -248,7 +248,6 @@ export function ChatTabBar({
             </div>
           )}
         </div>
-      {/* Layout toggle */}
       <div className="flex items-center px-2 border-l border-pc-border">
         <Button
           variant="ghost"

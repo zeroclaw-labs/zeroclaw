@@ -560,7 +560,6 @@ export default function Cron() {
 
   return (
     <div className="flex flex-col h-full p-6 gap-6 overflow-hidden">
-      {/* Header */}
       <PageHeader
         title={t('cron.scheduled_tasks')}
         actions={
@@ -570,7 +569,6 @@ export default function Cron() {
         }
       />
 
-      {/* Catch-up toggle */}
       {settings && (
         <Card className="px-4 py-3 flex items-center justify-between">
           <div>
@@ -620,7 +618,6 @@ export default function Cron() {
               </div>
             )}
             <div className="space-y-4">
-              {/* Job Type Selector */}
               <div>
                 <label className="block text-[11px] font-medium mb-1.5 uppercase tracking-wider text-pc-text-faint">
                   {t('cron.job_type')}
@@ -714,7 +711,6 @@ export default function Cron() {
                 <input type="text" value={formTimezone} onChange={(e) => setFormTimezone(e.target.value)} placeholder={t('cron.timezone_placeholder')} className="rounded-[var(--radius-md)] border border-pc-border bg-pc-input text-pc-text placeholder:text-pc-text-faint transition-colors focus:outline-none focus:border-pc-border-strong focus:ring-2 focus:ring-[var(--pc-focus)]/30 w-full px-3 py-2.5 text-sm font-mono" />
               </div>
 
-              {/* Conditional fields based on job type */}
               {formJobType === 'shell' ? (
                 <div>
                   <label className="block text-[11px] font-medium mb-1.5 uppercase tracking-wider text-pc-text-faint">
@@ -840,7 +836,6 @@ export default function Cron() {
                 </>
               )}
 
-              {/* Uses memory toggle */}
               <div>
                 <label className="flex items-center gap-2 text-sm cursor-pointer">
                   <input
@@ -1005,7 +1000,6 @@ export default function Cron() {
         </div>
       )}
 
-      {/* Jobs Table */}
       {jobs.length === 0 ? (
         <Card className="p-10 text-center">
           <Clock className="h-10 w-10 mx-auto mb-3 text-pc-text-faint" />

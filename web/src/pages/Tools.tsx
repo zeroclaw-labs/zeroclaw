@@ -303,7 +303,6 @@ export default function Tools() {
         }
       />
 
-      {/* Agent Tools Grid */}
       <section>
         <button
           onClick={() => setAgentSectionOpen((v) => !v)}
@@ -381,7 +380,6 @@ export default function Tools() {
         </div>
       </section>
 
-      {/* CLI Tools Section */}
       {filteredCli.length > 0 && (
         <section>
           <button

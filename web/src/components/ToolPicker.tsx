@@ -236,7 +236,6 @@ export default function ToolPicker({
 
   return (
     <div className="space-y-2">
-      {/* Selected chips */}
       <div className="flex flex-wrap gap-1.5" aria-label={t('tool_picker.selected_tools')}>
         {value.length === 0 ? (
           <span className="text-xs text-pc-text-faint py-0.5">
@@ -277,7 +276,6 @@ export default function ToolPicker({
         )}
       </div>
 
-      {/* Search box */}
       <div className="relative">
         <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-pc-text-faint pointer-events-none" />
         <input
@@ -349,7 +347,6 @@ export default function ToolPicker({
         />
       )}
 
-      {/* Catalog list */}
       {loading ? (
         <div className="flex items-center gap-2 px-3 py-4 text-xs text-pc-text-muted">
           <div

@@ -199,9 +199,6 @@ function rendererFor(
       return entry.enum_variants && entry.enum_variants.length > 0
         ? "select"
         : "text";
-    // Schema-driven alias reference (zeroclaw-labs/zeroclaw#7594). Dormant
-    // until the backend declares `PropKind::AliasRef`; until then no entry has
-    // this kind, so the per-section alias maps in FieldRow resolve refs.
     case "alias-ref":
       return "alias-ref";
     default:
@@ -231,7 +228,7 @@ const LABEL_ACRONYMS = new Set([
 // Humanize the schema-provided dotted path's LAST segment into a Title-ish
 // label (de-kebab/de-snake, capitalize words, upper-case known acronyms).
 // Purely a presentation transform of the schema's own path — no hardcoded field
-// names — so the config renderer stays schema-driven (#6175). The dotted path
+// names — so the config renderer stays schema-driven. The dotted path
 // itself remains visible as a secondary line for unambiguous identification.
 function humanizeFieldLabel(path: string): string {
   return leafLabel(path)
@@ -642,11 +639,12 @@ function loadAgentOptions(): Promise<AgentOptionsResponse> {
   return agentOptionsPromise;
 }
 
-// Generic alias-source resolution with in-flight de-dupe, keyed by the wire
-// `alias_source` value. Backs the schema-driven `kind === 'alias-ref'` picker
-// from zeroclaw-labs/zeroclaw#7594. Dormant on backends that predate that PR
-// (they never emit `alias_source`, so loadAliasSource is never called); when
-// the backend does declare it, this resolves the live values generically with
+// Generic alias-source resolution with in-flight de-dupe, keyed by the
+// namespace `aliasRefSource` returns (the wire `alias_source`, else one derived
+// from a recognized type_hint). Backs the schema-driven `kind === 'alias-ref'`
+// picker.
+// Backends that predate `PropKind::AliasRef` never send that kind, so this is
+// never called there; otherwise it resolves the live values generically with
 // no per-path special-casing, superseding the per-section maps below.
 const aliasSourcePromises: Record<string, Promise<string[]> | undefined> = {};
 function loadAliasSource(source: string): Promise<string[]> {
@@ -1373,7 +1371,7 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
     // Count of fields whose draft value differs from the saved display value.
     // Drives the unsaved-changes counter in the sticky save bar. Must be
     // declared above the conditional render so hook count stays stable
-    // across the loading / loaded transition (React error #310).
+    // across the loading / loaded transition (React minified error 310).
     const unsavedCount = useMemo(() => {
       let n = 0;
       for (const e of actionableEntries) {
@@ -1895,8 +1893,8 @@ function FieldRow({
     value,
     // Suppress the "required when empty" hint when: the badge marks the field
     // optional/choice (keeps badge + hint from contradicting), OR it's an
-    // empty-able reference type that the badge does NOT mark required (the #8
-    // residual: a *Ref with no badge). A ref that IS badged "required" (e.g.
+    // empty-able reference type that the badge does NOT mark required (a *Ref
+    // with no badge). A ref that IS badged "required" (e.g.
     // model_provider) still gets its hint.
     (requirement != null && requirement.tone !== "required") ||
       (requirement?.tone !== "required" && isReferenceField(entry.type_hint)),
@@ -2045,13 +2043,14 @@ function FieldRow({
     };
   }, [agentNeedsOptions]);
 
-  // Generic alias-reference picker (zeroclaw-labs/zeroclaw#7594). Any field the
-  // schema types as `PropKind::AliasRef` carries `alias_source`; resolve its
-  // values from the live config with no per-path special-casing. Dormant on
-  // backends that predate #7594 — they never set `kind === 'alias-ref'`, so
-  // `aliasSource` is undefined and the effect is a no-op, leaving the maps
-  // above to resolve refs. When the backend does declare it, the
-  // `renderer === 'alias-ref'` branch takes precedence over those maps.
+  // Generic alias-reference picker. A field the schema types as
+  // `PropKind::AliasRef` arrives as `kind === 'alias-ref'` and renders through
+  // the `renderer === 'alias-ref'` branch, which takes precedence over the maps
+  // above. `aliasRefSource` names its namespace from `alias_source` or a
+  // recognized `<Type>Ref` type_hint, and the effect below loads its values
+  // from the live config with no per-path special-casing. With no namespace
+  // (an older backend that never sends the kind, or an unrecognized type_hint)
+  // `aliasSource` is null and the effect is a no-op.
   const aliasSource = aliasRefSource(entry);
   const [aliasValues, setAliasValues] = useState<string[] | null>(null);
   useEffect(() => {
@@ -2200,15 +2199,15 @@ function FieldRow({
             ]}
           />
         ) : renderer === "alias-ref" ? (
-          // Schema-driven alias-ref picker (zeroclaw-labs/zeroclaw#7594): a
-          // themed, click-to-open ComboBox of the live values (resolved from
-          // `entry.alias_source`, with an agent-options fallback — see
-          // `aliasRefOptions`). Uses the same primitive as the model-field picker
-          // so it matches the rest of the page instead of a browser-styled native
-          // <select>. `openOnFocus` makes clicking the field open the list, since
-          // the configured aliases ARE the expected input. Free text is still
-          // accepted verbatim (and validated on save) so an existing or
-          // not-yet-created alias is never dropped. Precedes the per-section maps.
+          // Schema-driven alias-ref picker: a themed, click-to-open ComboBox of
+          // the live values (resolved through `aliasRefSource`, with an
+          // agent-options fallback — see `aliasRefOptions`). Uses the same
+          // primitive as the model-field picker so it matches the rest of the
+          // page instead of a browser-styled native <select>. `openOnFocus`
+          // makes clicking the field open the list, since the configured
+          // aliases ARE the expected input. Free text is still accepted
+          // verbatim (and validated on save) so an existing or not-yet-created
+          // alias is never dropped. Precedes the per-section maps.
           aliasRefResolving ? (
             <input
               id={entry.path}
@@ -2663,9 +2662,6 @@ interface ObjectArrayEditorProps {
 // Per-row form editor for `Vec<T>` of structs (e.g. `mcp.servers`).
 // Parses the JSON-array value, renders one row per element with per-property
 // inputs derived from the JSON Schema, and serializes back to JSON on save.
-// Schema v3 / #5947 will migrate the load-bearing Vecs to `HashMap<String, T>`
-// keyed tables; this editor is the bridge so the dashboard doesn't have to
-// wait on that to surface MCP servers / peripheral boards / etc.
 function ObjectArrayEditor({
   inputId,
   value,

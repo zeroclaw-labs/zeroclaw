@@ -412,7 +412,7 @@ export async function getAdminPairCode(): Promise<{
   }>;
 }
 
-/** Thrown when the localhost-only mint endpoint rejects a non-loopback caller. */
+/** Thrown when the localhost-only mint endpoint answers 403. */
 export class PairCodeForbiddenError extends Error {
   constructor() {
     super('forbidden');
@@ -423,14 +423,14 @@ export class PairCodeForbiddenError extends Error {
 /**
  * Mint a fresh pairing code on demand against the localhost-only
  * `POST /admin/paircode/new` endpoint (the "add another client" path — it does
- * not revoke existing tokens). This is the in-band recovery for #5266: an
- * already-paired gateway never mints a code on restart, so a new browser/device
- * (e.g. on an alternate port) would otherwise face the pairing prompt with no
- * code anywhere.
+ * not revoke existing tokens). It exists because an already-paired gateway
+ * never mints a code on restart, so a new browser/device (e.g. on an alternate
+ * port) would otherwise face the pairing prompt with no code anywhere.
  *
- * The endpoint is restricted to loopback peers, so a remote/Docker dashboard
- * gets a 403 — surfaced as {@link PairCodeForbiddenError} so the caller can fall
- * back to showing the equivalent CLI command instead of a raw error.
+ * The endpoint answers 403 unless the request comes from a loopback peer and
+ * carries the gateway admin token, which this request does not send. The 403
+ * is surfaced as {@link PairCodeForbiddenError} so the caller can fall back to
+ * showing the equivalent CLI command instead of a raw error.
  */
 export async function generatePairCode(): Promise<{
   pairing_code: string | null;
@@ -565,7 +565,7 @@ export function getTuis(): Promise<TuiEntry[]> {
 }
 
 // ---------------------------------------------------------------------------
-// Config — per-property CRUD (issue #6175). Whole-file getConfig/putConfig
+// Config — per-property CRUD. Whole-file getConfig/putConfig
 // removed; the gateway no longer exposes those endpoints.
 // ---------------------------------------------------------------------------
 
@@ -614,9 +614,9 @@ export interface ListResponseEntry {
   enum_variants?: string[];
   /**
    * Alias namespace for `kind === 'alias-ref'` fields (drives the resolved
-   * picker). Emitted by the schema-driven `PropKind::AliasRef` backend from
-   * zeroclaw-labs/zeroclaw#7594; absent on backends that predate it, in which
-   * case FieldForm falls back to its per-section alias maps.
+   * picker). Optional on the wire: when it is absent, FieldForm derives the
+   * namespace from a recognized `<Type>Ref` type_hint, and falls back to its
+   * per-section alias maps when neither names one.
    */
   alias_source?: string;
   section?: string;
@@ -923,9 +923,9 @@ export interface SkillFrontmatter {
   version?: string | null;
   category?: string | null;
   /** Free-form skill tags. The `slash` tag opts the skill into Discord slash
-   *  commands (zeroclaw-labs/zeroclaw#7490); `open-skills` is loader-managed. */
+   *  commands; `open-skills` is loader-managed. */
   tags?: string[];
-  /** Typed slash-command options (zeroclaw-labs/zeroclaw#8021). Only meaningful
+  /** Typed slash-command options. Only meaningful
    *  with the `slash` tag; edited by the bespoke editor in SkillsBundleEditor.
    *  Omitted by the backend when empty. */
   slash_options?: SkillSlashOption[];
@@ -1350,7 +1350,7 @@ export function descriptionForPath(
     : null;
 }
 
-// ── Templates + map-key creation (issue #6175) ───────────────────────
+// ── Templates + map-key creation ─────────────────────────────────────
 
 /**
  * One addable shape — a HashMap<String, T> (Map) or Vec<T> (List) section
@@ -1647,11 +1647,12 @@ export interface ResolveAliasSourceResponse {
 }
 
 /**
- * Resolve the live alias values for a schema-declared `alias_source`
- * namespace. Backs the generic `kind === 'alias-ref'` picker introduced by
- * zeroclaw-labs/zeroclaw#7594. The endpoint only exists on backends that
- * declare `PropKind::AliasRef`; callers must gate on `entry.alias_source`
- * being present so this is never hit on older daemons.
+ * Resolve the live alias values for an alias namespace (`model_providers`,
+ * `risk_profiles`, ...). Backs the generic `kind === 'alias-ref'` picker and
+ * the chat model picker. The endpoint only exists on backends that declare
+ * `PropKind::AliasRef`: FieldForm only calls it for alias-ref fields whose
+ * namespace it can name, and the model picker falls back to a config scan
+ * when the call fails.
  */
 export function resolveAliasSource(
   source: string,

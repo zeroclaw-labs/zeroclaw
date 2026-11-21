@@ -111,7 +111,6 @@ export default function Integrations() {
         actions={<Badge tone="neutral">{integrations.length}</Badge>}
       />
 
-      {/* Category Filter Tabs */}
       <div className="flex flex-wrap gap-2">
         {categories.map((cat) => {
           const active = activeCategory === cat;
@@ -133,7 +132,6 @@ export default function Integrations() {
         })}
       </div>
 
-      {/* Grouped Integration Cards */}
       {Object.keys(grouped).length === 0 ? (
         <Card className="p-10 text-center">
           <Puzzle className="h-10 w-10 mx-auto mb-3 text-pc-text-faint" />

@@ -119,7 +119,6 @@ function ThemePreviewCard({
           </div>
         </div>
       </div>
-      {/* Label */}
       <div className="flex items-center gap-1 px-0.5">
         {active && <Check size={10} className="text-pc-accent" />}
         <span
@@ -222,7 +221,6 @@ export function SettingsModal({ open, onClose }: Props) {
         className="relative flex flex-col w-full max-w-2xl mx-4 max-h-[90vh] rounded-[var(--radius-xl)] border border-pc-border bg-pc-base shadow-[var(--pc-shadow-md)] animate-fade-in"
         onClick={(e) => e.stopPropagation()}
       >
-        {/* Header */}
         <div className="flex-shrink-0 flex items-center justify-between px-6 py-4 border-b border-pc-border">
           <div className="flex items-center gap-2.5">
             <Settings size={18} className="text-pc-accent-light" />
@@ -238,9 +236,7 @@ export function SettingsModal({ open, onClose }: Props) {
           </button>
         </div>
 
-        {/* Body */}
         <div className="flex-1 min-h-0 px-6 py-4 overflow-y-auto">
-          {/* Tabs */}
           <div className="flex gap-2 mb-4">
             {tabs.map(tTab => (
               <button
@@ -259,12 +255,10 @@ export function SettingsModal({ open, onClose }: Props) {
             ))}
           </div>
 
-          {/* Appearance Tab */}
           {tab === 'appearance' && (
             <>
               <SectionTitle>{t('settings.appearance')}</SectionTitle>
 
-              {/* Theme Mode */}
               <div className="mb-3">
                 <div className="text-xs mb-2 text-pc-text-secondary">{t('theme.mode')}</div>
                 <div className="flex gap-1.5">
@@ -301,7 +295,6 @@ export function SettingsModal({ open, onClose }: Props) {
                 </div>
               </div>
 
-              {/* Accent Color */}
               <div className="mb-4">
                 <div className="text-xs mb-2 text-pc-text-secondary">{t('theme.accent')}</div>
                 {/* flex-wrap so swatches never overflow the modal on a phone; each
@@ -334,7 +327,6 @@ export function SettingsModal({ open, onClose }: Props) {
             </>
           )}
 
-          {/* Themes Tab */}
           {tab === 'themes' && (
             <>
               <SectionTitle>{t('settings.dark_themes')}</SectionTitle>
@@ -361,7 +353,6 @@ export function SettingsModal({ open, onClose }: Props) {
                 ))}
               </div>
 
-              {/* Active theme info */}
               <div className="rounded-[var(--radius-lg)] border border-pc-border bg-pc-surface p-3 mt-2">
                 <div className="flex items-center gap-2">
                   <Palette size={14} className="text-pc-accent" />
@@ -376,12 +367,10 @@ export function SettingsModal({ open, onClose }: Props) {
             </>
           )}
 
-          {/* Typography Tab */}
           {tab === 'typography' && (
             <>
               <SectionTitle>{t('settings.typography')}</SectionTitle>
 
-              {/* UI Font */}
               <div className="mb-4">
                 <div className="flex items-center gap-2 text-xs mb-2 text-pc-text-secondary">
                   <Type size={14} />
@@ -406,7 +395,6 @@ export function SettingsModal({ open, onClose }: Props) {
                 </div>
               </div>
 
-              {/* Mono Font */}
               <div className="mb-4">
                 <div className="flex items-center gap-2 text-xs mb-2 text-pc-text-secondary">
                   <CaseSensitive size={14} />
@@ -431,7 +419,6 @@ export function SettingsModal({ open, onClose }: Props) {
                 </div>
               </div>
 
-              {/* UI Font Size */}
               <div className="mb-4">
                 <div className="text-xs mb-2 text-pc-text-secondary">{t('settings.fontSize')}</div>
                 <div className="flex gap-1.5 flex-wrap">
@@ -452,7 +439,6 @@ export function SettingsModal({ open, onClose }: Props) {
                 </div>
               </div>
 
-              {/* Mono Font Size */}
               <div className="mb-4">
                 <div className="text-xs mb-2 text-pc-text-secondary">{t('settings.fontMonoSize')}</div>
                 <div className="flex gap-1.5 flex-wrap">
@@ -473,7 +459,6 @@ export function SettingsModal({ open, onClose }: Props) {
                 </div>
               </div>
 
-              {/* Preview */}
               <div className="rounded-[var(--radius-lg)] border border-pc-border bg-pc-surface p-3">
                 <div className="text-[11px] uppercase tracking-wide mb-2 text-pc-text-faint">
                   {t('settings.preview')}

@@ -1,7 +1,7 @@
 import { t } from '@/lib/i18n';
 
 /**
- * Web chat slash commands (#7137).
+ * Web chat slash commands.
  *
  * The gateway web chat input treats a leading `/` as a command rather than a
  * raw prompt. Commands drive existing frontend/session primitives (clear/reset,

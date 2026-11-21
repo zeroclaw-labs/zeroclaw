@@ -530,7 +530,7 @@ test("lost access re-checks the session", async () => {
  * Signing in again ends the session the browser held. A request sent under it
  * comes back 401 `session_invalid` once the browser holds `renewed`: after this
  * tab adopted it (`announced`, as the re-auth window reports), or without this
- * tab hearing of it (a full-page sign-in in another tab, #12108). A second
+ * tab hearing of it (a full-page sign-in in another tab). A second
  * send of the request succeeds.
  */
 async function staleRequestAfterRenewal(
