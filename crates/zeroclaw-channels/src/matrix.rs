@@ -243,6 +243,371 @@ mod approval {
     use rand::{Rng, RngExt};
     use zeroclaw_api::channel::{ChannelApprovalResponse, SendMessage};
 
+    use std::collections::{HashMap, VecDeque};
+    use std::sync::Arc;
+
+    use crate::util::PendingApprovalResolution;
+
+    // A bounded race buffer, not an audit log. Recently settled or cancelled
+    // prompts still own their protocol replies, but ordinary unknown text does not.
+    pub(super) const RETIRED_TOKEN_CAP: usize = 64;
+
+    pub(super) struct Pending {
+        pub sender: tokio::sync::oneshot::Sender<ChannelApprovalResponse>,
+        pub destination: String,
+        pub registration: Arc<()>,
+        pub message_id: Option<String>,
+    }
+
+    #[derive(Default)]
+    pub(super) struct State {
+        pub pending: HashMap<String, Pending>,
+        retired: VecDeque<String>,
+    }
+
+    impl State {
+        pub(super) fn register(
+            &mut self,
+            sender: tokio::sync::oneshot::Sender<ChannelApprovalResponse>,
+            destination: String,
+            registration: Arc<()>,
+            mut generate: impl FnMut() -> String,
+        ) -> anyhow::Result<String> {
+            for _ in 0..16 {
+                let token = generate();
+                if self.pending.contains_key(&token) || self.retired.contains(&token) {
+                    continue;
+                }
+                self.pending.insert(
+                    token.clone(),
+                    Pending {
+                        sender,
+                        destination,
+                        registration,
+                        message_id: None,
+                    },
+                );
+                return Ok(token);
+            }
+            anyhow::bail!("matrix: approval token collision")
+        }
+
+        fn remember_retired(&mut self, token: String) {
+            if self.retired.len() == RETIRED_TOKEN_CAP {
+                self.retired.pop_front();
+            }
+            self.retired.push_back(token);
+        }
+
+        pub(super) fn bind(
+            &mut self,
+            token: &str,
+            registration: &Arc<()>,
+            event_id: String,
+        ) -> bool {
+            let Some(pending) = self.pending.get_mut(token) else {
+                return false;
+            };
+            if !Arc::ptr_eq(&pending.registration, registration) {
+                return false;
+            }
+            pending.message_id = Some(event_id);
+            true
+        }
+
+        fn retire(&mut self, token: &str, registration: &Arc<()>) {
+            if self
+                .pending
+                .get(token)
+                .is_some_and(|pending| Arc::ptr_eq(&pending.registration, registration))
+            {
+                self.pending.remove(token);
+                self.remember_retired(token.to_string());
+            }
+        }
+
+        pub(super) fn resolve(
+            &mut self,
+            token: &str,
+            response: ChannelApprovalResponse,
+            responder_allowed: bool,
+            destination: &str,
+        ) -> PendingApprovalResolution {
+            let Some(pending) = self.pending.get(token) else {
+                return PendingApprovalResolution::NotFound;
+            };
+            if !responder_allowed || destination.is_empty() || pending.destination != destination {
+                return PendingApprovalResolution::Rejected;
+            }
+            let Some(pending) = self.pending.remove(token) else {
+                return PendingApprovalResolution::NotFound;
+            };
+            self.remember_retired(token.to_string());
+            if pending.sender.send(response).is_ok() {
+                PendingApprovalResolution::Resolved
+            } else {
+                PendingApprovalResolution::ReceiverClosed
+            }
+        }
+
+        pub(super) fn resolve_reply(
+            &mut self,
+            token: &str,
+            response: ChannelApprovalResponse,
+            responder_allowed: bool,
+            destination: &str,
+        ) -> bool {
+            if self.retired.iter().any(|retired| retired == token) {
+                return true;
+            }
+            self.resolve(token, response, responder_allowed, destination)
+                .suppresses_message()
+        }
+
+        pub(super) fn resolve_reaction(
+            &mut self,
+            event_id: &str,
+            response: ChannelApprovalResponse,
+            responder_allowed: bool,
+            destination: &str,
+        ) -> PendingApprovalResolution {
+            let Some(token) = self.pending.iter().find_map(|(token, pending)| {
+                (pending.message_id.as_deref() == Some(event_id)).then(|| token.clone())
+            }) else {
+                return PendingApprovalResolution::NotFound;
+            };
+            self.resolve(&token, response, responder_allowed, destination)
+        }
+    }
+
+    pub(super) struct Guard {
+        state: Arc<tokio::sync::Mutex<State>>,
+        token: Option<String>,
+        registration: Arc<()>,
+    }
+
+    impl Guard {
+        pub(super) fn new(
+            state: Arc<tokio::sync::Mutex<State>>,
+            token: String,
+            registration: Arc<()>,
+        ) -> Self {
+            Self {
+                state,
+                token: Some(token),
+                registration,
+            }
+        }
+
+        pub(super) fn disarm(&mut self) {
+            self.token = None;
+        }
+
+        pub(super) async fn remove(&mut self) {
+            let Some(token) = self.token.as_deref() else {
+                return;
+            };
+            self.state.lock().await.retire(token, &self.registration);
+            self.disarm();
+        }
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            let Some(token) = self.token.take() else {
+                return;
+            };
+            let state = Arc::clone(&self.state);
+            let registration = Arc::clone(&self.registration);
+            if let Ok(mut state) = state.try_lock() {
+                state.retire(&token, &registration);
+                return;
+            }
+            zeroclaw_spawn::spawn!(async move {
+                state.lock().await.retire(&token, &registration);
+            });
+        }
+    }
+
+    pub(super) const APPROVAL_EMOJI_APPROVE: &str = "✅";
+    pub(super) const APPROVAL_EMOJI_ALWAYS: &str = "🔁";
+    pub(super) const APPROVAL_EMOJI_DENY: &str = "❌";
+
+    pub(super) fn approval_response_for_emoji(emoji: &str) -> Option<ChannelApprovalResponse> {
+        match emoji {
+            "✅" | "✅\u{fe0f}" => Some(ChannelApprovalResponse::Approve),
+            "🔁" | "🔁\u{fe0f}" => Some(ChannelApprovalResponse::AlwaysApprove),
+            "❌" | "❌\u{fe0f}" => Some(ChannelApprovalResponse::Deny),
+            _ => None,
+        }
+    }
+
+    pub(super) fn build_approval_prompt(
+        token: &str,
+        request: &zeroclaw_api::channel::ChannelApprovalRequest,
+        bot_user_id: Option<&matrix_sdk::ruma::UserId>,
+        typed_instructions: bool,
+    ) -> String {
+        if bot_user_id.is_none() {
+            return crate::util::build_approve_deny_approval_prompt(
+                token,
+                &request.tool_name,
+                &request.arguments_summary,
+                request.position_counter(),
+            );
+        }
+        let header = crate::util::build_approval_prompt_header(
+            token,
+            &request.tool_name,
+            &request.arguments_summary,
+            request.position_counter(),
+        );
+        let react =
+            zeroclaw_runtime::i18n::get_required_cli_string("channel-approval-react-instruction");
+        if !typed_instructions {
+            return format!("{header}\n\n{react}");
+        }
+        let reply = crate::util::build_approve_deny_reply_instruction(token);
+        format!("{header}\n\n{react}\n{reply}")
+    }
+
+    pub(super) struct ReactionPolicy<'a> {
+        pub pending: &'a tokio::sync::Mutex<State>,
+        pub bot_user_id: Option<&'a matrix_sdk::ruma::UserId>,
+        pub peers: &'a [String],
+        pub allowed_rooms: &'a [String],
+    }
+
+    pub(super) async fn try_resolve_reaction(
+        policy: ReactionPolicy<'_>,
+        sender: &matrix_sdk::ruma::UserId,
+        event_id: &matrix_sdk::ruma::EventId,
+        key: &str,
+        room_id: &str,
+    ) -> bool {
+        use crate::util::PendingApprovalResolution;
+        let Some(response) = approval_response_for_emoji(key) else {
+            return false;
+        };
+        let reason = if policy.bot_user_id.is_none() {
+            Some("unknown_bot_identity")
+        } else if policy.bot_user_id == Some(sender) {
+            return false;
+        } else if !super::allowlist::user_allowed(policy.peers, sender.as_str()) {
+            Some("sender_not_allowed")
+        } else if !super::allowlist::room_allowed_static(policy.allowed_rooms, room_id) {
+            Some("room_not_allowed")
+        } else {
+            None
+        };
+        let outcome = policy.pending.lock().await.resolve_reaction(
+            event_id.as_str(),
+            response,
+            reason.is_none(),
+            room_id,
+        );
+        match outcome {
+            PendingApprovalResolution::Rejected if reason == Some("unknown_bot_identity") => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "room_id": bounded_log_value(room_id),
+                            "event_id": bounded_log_value(event_id.as_str()),
+                            "reason": "unknown_bot_identity"
+                        })),
+                    "matrix: refusing to decide an approval without a trustworthy bot identity"
+                );
+            }
+            PendingApprovalResolution::Rejected => {
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "sender": bounded_log_value(sender.as_str()),
+                            "room_id": bounded_log_value(room_id),
+                            "event_id": bounded_log_value(event_id.as_str()),
+                            "reason": reason.unwrap_or("destination_mismatch")
+                        })),
+                    "matrix: rejected approval reaction"
+                );
+            }
+            PendingApprovalResolution::ReceiverClosed => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "sender": bounded_log_value(sender.as_str()),
+                            "room_id": bounded_log_value(room_id),
+                            "event_id": bounded_log_value(event_id.as_str())
+                        })),
+                    "matrix: approval reaction receiver closed"
+                );
+            }
+            PendingApprovalResolution::NotFound | PendingApprovalResolution::Resolved => {}
+        }
+        outcome == PendingApprovalResolution::Resolved
+    }
+
+    pub(super) fn bounded_log_value(value: &str) -> String {
+        value.chars().take(256).collect()
+    }
+
+    pub(super) async fn catch_up_reactions(
+        room: &matrix_sdk::Room,
+        event_id: &matrix_sdk::ruma::OwnedEventId,
+        pending: &tokio::sync::Mutex<crate::matrix::approval::State>,
+        peers: &(dyn Fn() -> Vec<String> + Send + Sync),
+        allowed_rooms: &[String],
+    ) -> anyhow::Result<()> {
+        use matrix_sdk::{
+            room::{IncludeRelations, RelationsOptions},
+            ruma::{api::Direction, events::relation::RelationType},
+        };
+        let mut options = RelationsOptions {
+            dir: Direction::Backward,
+            include_relations: IncludeRelations::RelationsOfType(RelationType::Annotation),
+            ..Default::default()
+        };
+        loop {
+            let relations = room.relations(event_id.clone(), options.clone()).await?;
+            for event in relations.chunk {
+                if let Ok(matrix_sdk::ruma::events::AnySyncTimelineEvent::MessageLike(
+                    matrix_sdk::ruma::events::AnySyncMessageLikeEvent::Reaction(
+                        matrix_sdk::ruma::events::SyncMessageLikeEvent::Original(event),
+                    ),
+                )) = event.raw().deserialize()
+                    && try_resolve_reaction(
+                        ReactionPolicy {
+                            pending,
+                            bot_user_id: room.client().user_id(),
+                            peers: &peers(),
+                            allowed_rooms,
+                        },
+                        &event.sender,
+                        &event.content.relates_to.event_id,
+                        &event.content.relates_to.key,
+                        room.room_id().as_str(),
+                    )
+                    .await
+                {
+                    return Ok(());
+                }
+            }
+            // The SDK exposes the continuation for this direction as next_batch_token.
+            let Some(next) = relations.next_batch_token else {
+                return Ok(());
+            };
+            if options.from.as_ref() == Some(&next) {
+                anyhow::bail!("matrix: repeated approval relations pagination token");
+            }
+            options.from = Some(next);
+        }
+    }
+
     pub(super) const TOKEN_LEN: usize = 8;
     const TOKEN_ALPHABET: &[u8] = b"ABCDEFGHJKMNPQRSTUVWXYZ23456789";
 
@@ -2087,7 +2452,7 @@ mod client {
 // ─── inbound ───────────────────────────────────────────────────────────────
 mod inbound {
     use std::{
-        collections::{HashMap, HashSet},
+        collections::HashSet,
         sync::{
             Arc,
             atomic::{AtomicBool, Ordering},
@@ -2103,7 +2468,7 @@ mod inbound {
             OwnedEventId, OwnedUserId,
             events::{
                 AnySyncTimelineEvent,
-                reaction::ReactionEventContent,
+                reaction::{OriginalSyncReactionEvent, ReactionEventContent},
                 relation::Annotation,
                 room::{
                     encrypted::OriginalSyncRoomEncryptedEvent,
@@ -2134,7 +2499,7 @@ mod inbound {
         pub transcription: Option<super::TranscriptionResolver>,
         pub workspace_dir: Option<Arc<std::path::PathBuf>>,
         pub tx: mpsc::Sender<ChannelMessage>,
-        pub pending_approvals: Arc<TokioMutex<HashMap<String, crate::util::PendingApproval>>>,
+        pub pending_approvals: Arc<TokioMutex<crate::matrix::approval::State>>,
         pub threads_seen: Arc<TokioRwLock<HashSet<OwnedEventId>>>,
         pub bot_user_id: OwnedUserId,
         pub bot_display_name: Arc<TokioRwLock<Option<String>>>,
@@ -2151,6 +2516,7 @@ mod inbound {
         client: &Client,
         ctx: &HandlerCtx,
     ) -> (
+        matrix_sdk::event_handler::EventHandlerDropGuard,
         matrix_sdk::event_handler::EventHandlerDropGuard,
         matrix_sdk::event_handler::EventHandlerDropGuard,
     ) {
@@ -2190,11 +2556,38 @@ mod inbound {
             });
         let encrypted_guard = client.event_handler_drop_guard(encrypted_handler);
 
-        (message_guard, encrypted_guard)
+        // SDK 0.19 dispatches decrypted timeline events by their inner event
+        // type, so this receives m.reaction in both encrypted and plain rooms.
+        let reaction_ctx = ctx.clone();
+        let reaction_handler =
+            client.add_event_handler(move |ev: OriginalSyncReactionEvent, room: Room| {
+                let ctx = reaction_ctx.clone();
+                async move {
+                    if room.state() != RoomState::Joined {
+                        return;
+                    }
+                    approval::try_resolve_reaction(
+                        approval::ReactionPolicy {
+                            pending: &ctx.pending_approvals,
+                            bot_user_id: room.client().user_id(),
+                            peers: &(ctx.peer_resolver)(),
+                            allowed_rooms: &ctx.config.allowed_rooms,
+                        },
+                        &ev.sender,
+                        &ev.content.relates_to.event_id,
+                        &ev.content.relates_to.key,
+                        room.room_id().as_str(),
+                    )
+                    .await;
+                }
+            });
+        let reaction_guard = client.event_handler_drop_guard(reaction_handler);
+
+        (message_guard, encrypted_guard, reaction_guard)
     }
 
     pub(super) async fn run_sync_loop(client: Client, ctx: HandlerCtx) -> anyhow::Result<()> {
-        let (_message_handler_guard, _encrypted_handler_guard) =
+        let (_message_handler_guard, _encrypted_handler_guard, _reaction_handler_guard) =
             register_event_handlers(&client, &ctx);
 
         ::zeroclaw_log::record!(
@@ -2297,15 +2690,12 @@ mod inbound {
         let room_allowed = allowlist::room_allowed_static(&ctx.config.allowed_rooms, room_id);
 
         if let Some((token, response)) = approval::parse_reply(&body)
-            && crate::util::resolve_pending_approval(
-                &ctx.pending_approvals,
+            && ctx.pending_approvals.lock().await.resolve_reply(
                 &token,
                 response,
                 sender_allowed && room_allowed,
                 room_id,
             )
-            .await
-            .suppresses_message()
         {
             return Ok(());
         }
@@ -3710,6 +4100,41 @@ mod outbound {
         Ok(event_id)
     }
 
+    /// Fires `failed` at the first reaction that cannot be placed, so the
+    /// caller can react without waiting for the remaining sends.
+    pub(super) async fn seed_approval_reactions(
+        room: &Room,
+        event_id: &OwnedEventId,
+        failed: tokio::sync::oneshot::Sender<()>,
+    ) {
+        let mut failed = Some(failed);
+        for emoji in [
+            super::approval::APPROVAL_EMOJI_APPROVE,
+            super::approval::APPROVAL_EMOJI_ALWAYS,
+            super::approval::APPROVAL_EMOJI_DENY,
+        ] {
+            let content =
+                ReactionEventContent::new(Annotation::new(event_id.clone(), emoji.to_string()));
+            if let Err(e) = room.send(content).await {
+                if let Some(failed) = failed.take() {
+                    let _ = failed.send(());
+                }
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "error": super::approval::bounded_log_value(&e.to_string()),
+                            "emoji": emoji,
+                            "room_id": super::approval::bounded_log_value(room.room_id().as_str()),
+                            "event_id": super::approval::bounded_log_value(event_id.as_str())
+                        })),
+                    "matrix: failed to seed approval reaction"
+                );
+            }
+        }
+    }
+
     /// Best-effort: apply 🚫 / ⚠️ reactions to the bot's just-sent message
     /// based on which kinds of marker failures occurred. Reaction send
     /// failures are logged but never propagated — the primary message
@@ -4310,7 +4735,7 @@ pub struct MatrixChannel {
     /// Resolved from live config on every send, never cached.
     voice_peers: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
     client: tokio::sync::OnceCell<Client>,
-    pending_approvals: Arc<TokioMutex<HashMap<String, crate::util::PendingApproval>>>,
+    pending_approvals: Arc<TokioMutex<crate::matrix::approval::State>>,
     streaming_state: Arc<TokioRwLock<streaming::State>>,
     threads_seen: Arc<TokioRwLock<HashSet<OwnedEventId>>>,
     alias_cache: Arc<TokioRwLock<HashMap<String, OwnedRoomId>>>,
@@ -4326,6 +4751,98 @@ pub struct MatrixChannel {
 }
 
 impl MatrixChannel {
+    /// Seeds the approval reactions and catches up on any already sent. When
+    /// a reaction cannot be placed, sends the typed commands the prompt left
+    /// out without waiting for the catch-up.
+    async fn prepare_approval_reactions(
+        &self,
+        client: &Client,
+        room_id: &OwnedRoomId,
+        event_id: &OwnedEventId,
+        still_live: bool,
+        recipient: &str,
+        token: &str,
+    ) {
+        let attrs = || {
+            ::serde_json::json!({
+                "room_id": approval::bounded_log_value(room_id.as_str()),
+                "event_id": approval::bounded_log_value(event_id.as_str())
+            })
+        };
+        if !still_live || client.user_id().is_none() {
+            return;
+        }
+        if let Some(room) = client.get_room(room_id) {
+            let (failed_tx, failed_rx) = oneshot::channel();
+            let fallback = async {
+                if failed_rx.await.is_ok() {
+                    self.send_hidden_typed_commands(client, recipient, token)
+                        .await;
+                }
+            };
+            tokio::join!(
+                outbound::seed_approval_reactions(&room, event_id, failed_tx),
+                fallback,
+                async {
+                    if let Err(error) = approval::catch_up_reactions(
+                        &room,
+                        event_id,
+                        &self.pending_approvals,
+                        &*self.peer_resolver,
+                        &self.config.allowed_rooms,
+                    )
+                    .await
+                    {
+                        let mut fields = attrs();
+                        fields["error"] = approval::bounded_log_value(&error.to_string()).into();
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(fields),
+                            "matrix: failed to catch up approval reactions"
+                        );
+                    }
+                }
+            );
+        } else {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(attrs()),
+                "matrix: approval room missing; skipping reactions"
+            );
+            self.send_hidden_typed_commands(client, recipient, token)
+                .await;
+        }
+    }
+
+    /// Sends the typed approval commands when `approval_typed_instructions`
+    /// left them out of the prompt. Failure is logged; the prompt stands.
+    async fn send_hidden_typed_commands(&self, client: &Client, recipient: &str, token: &str) {
+        if self.config.approval_typed_instructions {
+            return;
+        }
+        let reply = crate::util::build_approve_deny_reply_instruction(token);
+        let message = approval::build_prompt_message(reply, recipient);
+        if let Err(error) = outbound::send(&self.outbox(client), &message).await {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "error": approval::bounded_log_value(&error.to_string()),
+                        "recipient": approval::bounded_log_value(recipient)
+                    })),
+                "matrix: failed to send typed approval commands"
+            );
+        }
+    }
+
     /// Validate config and prepare the channel. The SDK Client is built lazily
     /// on first `listen()` or `send()` call.
     pub fn new(
@@ -4360,7 +4877,7 @@ impl MatrixChannel {
             tts: None,
             voice_peers: Arc::new(Vec::new),
             client: tokio::sync::OnceCell::new(),
-            pending_approvals: Arc::new(TokioMutex::new(HashMap::new())),
+            pending_approvals: Arc::new(TokioMutex::new(crate::matrix::approval::State::default())),
             streaming_state: Arc::new(TokioRwLock::new(streaming_state)),
             threads_seen: Arc::new(TokioRwLock::new(HashSet::new())),
             alias_cache: Arc::new(TokioRwLock::new(HashMap::new())),
@@ -5471,39 +5988,71 @@ impl Channel for MatrixChannel {
         request: &ChannelApprovalRequest,
     ) -> Result<Option<zeroclaw_api::channel::AttributedApprovalResponse>> {
         let client = self.ensure_client().await?;
-        let destination = client::resolve_room(client, &self.alias_cache, recipient)
-            .await?
-            .to_string();
-        let token = approval::generate_token_default();
-        let prompt = crate::util::build_approve_deny_approval_prompt(
-            &token,
-            &request.tool_name,
-            &request.arguments_summary,
-            request.position_counter(),
-        );
-
+        let room_id = client::resolve_room(client, &self.alias_cache, recipient).await?;
+        let destination = room_id.to_string();
         let (tx, rx) = oneshot::channel();
-        self.pending_approvals.lock().await.insert(
-            token.clone(),
-            crate::util::PendingApproval {
-                sender: tx,
-                destination,
-                tool_name: request.tool_name.clone(),
-            },
-        );
-        let mut guard = crate::util::PendingApprovalGuard::new(
+        let registration = Arc::new(());
+        let token = self.pending_approvals.lock().await.register(
+            tx,
+            destination,
+            Arc::clone(&registration),
+            approval::generate_token_default,
+        )?;
+        let mut guard = approval::Guard::new(
             Arc::clone(&self.pending_approvals),
             token.clone(),
+            Arc::clone(&registration),
+        );
+        let prompt = approval::build_approval_prompt(
+            &token,
+            request,
+            client.user_id(),
+            self.config.approval_typed_instructions,
         );
 
         let send_msg = approval::build_prompt_message(prompt, recipient);
-        if let Err(e) = self.send(&send_msg).await {
-            guard.remove().await;
-            return Err(e);
+        let event_id = match outbound::send(&self.outbox(client), &send_msg).await {
+            Ok(event_id) => event_id,
+            Err(e) => {
+                guard.remove().await;
+                return Err(e);
+            }
+        };
+        let still_live =
+            self.pending_approvals
+                .lock()
+                .await
+                .bind(&token, &registration, event_id.to_string());
+        if !still_live {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                    .with_attrs(::serde_json::json!({
+                        "room_id": approval::bounded_log_value(room_id.as_str()),
+                        "event_id": approval::bounded_log_value(event_id.as_str())
+                    })),
+                "matrix: approval resolved before prompt binding; skipping reactions"
+            );
         }
+        // Catch-up and seeding must not delay a typed answer or stretch the
+        // timeout. Dropping the request cancels both alongside the decision wait.
+        let seed = async {
+            self.prepare_approval_reactions(
+                client, &room_id, &event_id, still_live, recipient, &token,
+            )
+            .await;
+            std::future::pending().await
+        };
 
         let timeout = Duration::from_secs(self.config.approval_timeout_secs.max(1));
-        let result = tokio::time::timeout(timeout, rx).await;
+        let result = tokio::time::timeout(timeout, async {
+            tokio::select! {
+                decision = rx => decision,
+                never = seed => never,
+            }
+        })
+        .await;
         // Only the first arm is an operator decision; the other two are the
         // runtime denying because nobody replied, and must say so.
         match result {
@@ -6868,7 +7417,7 @@ mod tests {
     // event parsing → media download/save → attach_media → transcript
     // insertion, with only the homeserver and STT provider mocked at HTTP.
     mod inbound_route {
-        use std::collections::{HashMap, HashSet};
+        use std::collections::HashSet;
         use std::sync::Arc;
         use std::sync::atomic::AtomicBool;
         use std::time::Duration;
@@ -6951,7 +7500,9 @@ mod tests {
                 transcription,
                 workspace_dir: Some(Arc::new(workspace.to_path_buf())),
                 tx,
-                pending_approvals: Arc::new(TokioMutex::new(HashMap::new())),
+                pending_approvals: Arc::new(TokioMutex::new(
+                    crate::matrix::approval::State::default(),
+                )),
                 threads_seen: Arc::new(TokioRwLock::new(HashSet::new())),
                 bot_user_id: user_id!("@bot:localhost").to_owned(),
                 bot_display_name: Arc::new(TokioRwLock::new(None)),
@@ -7698,6 +8249,186 @@ mod tests {
             assert_stt_received_the_wav(&stt.received_requests().await.unwrap(), &wav);
         }
         #[tokio::test]
+        async fn sync_ingress_reaction_winner_consumes_late_replies_but_preserves_unknown_chat() {
+            let matrix = MatrixMockServer::new().await;
+            let client = matrix.client_builder().build().await;
+            matrix.sync_joined_room(&client, test_room()).await;
+            let workspace = tempfile::tempdir().unwrap();
+            let (tx, mut messages) = mpsc::channel(4);
+            let mut ctx = handler_ctx_with_resolver(None, workspace.path(), tx);
+            ctx.peer_resolver = Arc::new(|| vec!["@operator:localhost".to_string()]);
+            let (sender, receiver) = oneshot::channel();
+            ctx.pending_approvals.lock().await.pending.insert(
+                "APPROVAL".to_string(),
+                crate::matrix::approval::Pending {
+                    sender,
+                    destination: test_room().to_string(),
+
+                    registration: std::sync::Arc::new(()),
+                    message_id: Some("$prompt:localhost".to_string()),
+                },
+            );
+            let _guards = register_event_handlers(&client, &ctx);
+            for (id, sender, key) in [
+                (
+                    "$bot-seed:localhost",
+                    client.user_id().unwrap().as_str(),
+                    "✅",
+                ),
+                ("$other:localhost", "@operator:localhost", "👍"),
+                ("$unauthorized:localhost", "@intruder:localhost", "✅"),
+            ] {
+                let event = serde_json::json!({
+                    "type":"m.reaction", "event_id":id, "sender":sender, "origin_server_ts":1,
+                    "content":{"m.relates_to":{"rel_type":"m.annotation","event_id":"$prompt:localhost","key":key}}
+                });
+                matrix
+                    .sync_room(
+                        &client,
+                        JoinedRoomBuilder::new(test_room())
+                            .add_timeline_event(timeline_raw(&event)),
+                    )
+                    .await;
+                assert_eq!(ctx.pending_approvals.lock().await.pending.len(), 1);
+            }
+            let event = serde_json::json!({
+                "type":"m.reaction", "event_id":"$decision:localhost", "sender":"@operator:localhost", "origin_server_ts":2,
+                "content":{"m.relates_to":{"rel_type":"m.annotation","event_id":"$prompt:localhost","key":"❌️"}}
+            });
+            matrix
+                .sync_room(
+                    &client,
+                    JoinedRoomBuilder::new(test_room()).add_timeline_event(timeline_raw(&event)),
+                )
+                .await;
+            assert_eq!(receiver.await.unwrap(), ChannelApprovalResponse::Deny);
+            assert!(ctx.pending_approvals.lock().await.pending.is_empty());
+            assert!(messages.try_recv().is_err());
+
+            // A competing typed answer to the settled prompt remains protocol
+            // traffic. An unknown token-shaped message is still ordinary chat.
+            for (id, sender, body) in [
+                (
+                    "$late-answer:localhost",
+                    "@operator:localhost",
+                    "APPROVAL always",
+                ),
+                (
+                    "$late-unauthorized:localhost",
+                    "@intruder:localhost",
+                    "APPROVAL approve",
+                ),
+            ] {
+                let event = serde_json::json!({
+                    "type":"m.room.message", "event_id":id, "sender":sender, "origin_server_ts":3,
+                    "content":{"msgtype":"m.text","body":body}
+                });
+                matrix
+                    .sync_room(
+                        &client,
+                        JoinedRoomBuilder::new(test_room())
+                            .add_timeline_event(timeline_raw(&event)),
+                    )
+                    .await;
+            }
+            assert!(
+                tokio::time::timeout(Duration::from_millis(200), messages.recv())
+                    .await
+                    .is_err(),
+                "a typed loser after a reaction must not dispatch a model turn"
+            );
+            let unknown = serde_json::json!({
+                "type":"m.room.message", "event_id":"$unknown-token:localhost", "sender":"@operator:localhost", "origin_server_ts":4,
+                "content":{"msgtype":"m.text","body":"UNKNOWN1 approve"}
+            });
+            matrix
+                .sync_room(
+                    &client,
+                    JoinedRoomBuilder::new(test_room()).add_timeline_event(timeline_raw(&unknown)),
+                )
+                .await;
+            assert_eq!(
+                recv_forwarded(&mut messages).await.content,
+                "UNKNOWN1 approve"
+            );
+        }
+
+        #[tokio::test]
+        async fn sync_ingress_consumes_late_replies_after_timeout_or_cancellation_in_any_room() {
+            let matrix = MatrixMockServer::new().await;
+            let client = matrix.client_builder().build().await;
+            let other_room = room_id!("!other:localhost");
+            matrix.sync_joined_room(&client, test_room()).await;
+            matrix.sync_joined_room(&client, other_room).await;
+            let workspace = tempfile::tempdir().unwrap();
+            let (tx, mut messages) = mpsc::channel(4);
+            let mut ctx = handler_ctx_with_resolver(None, workspace.path(), tx);
+            ctx.peer_resolver = Arc::new(|| vec!["@operator:localhost".to_string()]);
+            let mut guards = Vec::new();
+            for token in ["TIMEOUT1", "CANCEL01"] {
+                let (sender, _receiver) = oneshot::channel();
+                let registration = Arc::new(());
+                ctx.pending_approvals.lock().await.pending.insert(
+                    token.to_string(),
+                    crate::matrix::approval::Pending {
+                        sender,
+                        destination: test_room().to_string(),
+                        registration: Arc::clone(&registration),
+                        message_id: Some(format!("${token}:localhost")),
+                    },
+                );
+                guards.push(crate::matrix::approval::Guard::new(
+                    Arc::clone(&ctx.pending_approvals),
+                    token.to_string(),
+                    registration,
+                ));
+            }
+            // The timeout arm calls `remove`; a dropped request runs `Drop`.
+            let cancelled = guards.pop().unwrap();
+            let mut timed_out = guards.pop().unwrap();
+            timed_out.remove().await;
+            drop(cancelled);
+            assert!(ctx.pending_approvals.lock().await.pending.is_empty());
+
+            let _handlers = register_event_handlers(&client, &ctx);
+            for (id, room, body) in [
+                ("$late-timeout:localhost", test_room(), "TIMEOUT1 always"),
+                ("$late-cancel:localhost", test_room(), "CANCEL01 approve"),
+                ("$late-other-room:localhost", other_room, "TIMEOUT1 deny"),
+            ] {
+                let event = serde_json::json!({
+                    "type":"m.room.message", "event_id":id, "sender":"@operator:localhost",
+                    "origin_server_ts":1, "content":{"msgtype":"m.text","body":body}
+                });
+                matrix
+                    .sync_room(
+                        &client,
+                        JoinedRoomBuilder::new(room).add_timeline_event(timeline_raw(&event)),
+                    )
+                    .await;
+            }
+            assert!(
+                tokio::time::timeout(Duration::from_millis(200), messages.recv())
+                    .await
+                    .is_err(),
+                "a late reply to a retired approval must not dispatch a model turn"
+            );
+            // The other room still dispatches ordinary chat, so the silence
+            // above comes from retired-token consumption, not room admission.
+            let chat = serde_json::json!({
+                "type":"m.room.message", "event_id":"$chat:localhost", "sender":"@operator:localhost",
+                "origin_server_ts":2, "content":{"msgtype":"m.text","body":"hello"}
+            });
+            matrix
+                .sync_room(
+                    &client,
+                    JoinedRoomBuilder::new(other_room).add_timeline_event(timeline_raw(&chat)),
+                )
+                .await;
+            assert_eq!(recv_forwarded(&mut messages).await.content, "hello");
+        }
+
+        #[tokio::test]
         async fn sync_ingress_suppresses_rejected_approval_replies_and_delivers_authorized_one() {
             let matrix = MatrixMockServer::new().await;
             let client = matrix.client_builder().build().await;
@@ -7713,7 +8444,9 @@ mod tests {
                 transcription: None,
                 workspace_dir: None,
                 tx,
-                pending_approvals: Arc::new(TokioMutex::new(HashMap::new())),
+                pending_approvals: Arc::new(TokioMutex::new(
+                    crate::matrix::approval::State::default(),
+                )),
                 threads_seen: Arc::new(TokioRwLock::new(HashSet::new())),
                 bot_user_id: user_id!("@bot:localhost").to_owned(),
                 bot_display_name: Arc::new(TokioRwLock::new(None)),
@@ -7725,28 +8458,31 @@ mod tests {
             let (unauthorized_tx, _unauthorized_rx) = oneshot::channel();
             {
                 let mut approvals = ctx.pending_approvals.lock().await;
-                approvals.insert(
+                approvals.pending.insert(
                     "AUTH0001".into(),
-                    crate::util::PendingApproval {
+                    crate::matrix::approval::Pending {
+                        registration: std::sync::Arc::new(()),
+                        message_id: None,
                         sender: approved_tx,
                         destination: test_room().to_string(),
-                        tool_name: "tool".to_string(),
                     },
                 );
-                approvals.insert(
+                approvals.pending.insert(
                     "WRONG001".into(),
-                    crate::util::PendingApproval {
+                    crate::matrix::approval::Pending {
+                        registration: std::sync::Arc::new(()),
+                        message_id: None,
                         sender: wrong_tx,
                         destination: "!other:localhost".into(),
-                        tool_name: "tool".to_string(),
                     },
                 );
-                approvals.insert(
+                approvals.pending.insert(
                     "OTHER001".into(),
-                    crate::util::PendingApproval {
+                    crate::matrix::approval::Pending {
+                        registration: std::sync::Arc::new(()),
+                        message_id: None,
                         sender: unauthorized_tx,
                         destination: test_room().to_string(),
-                        tool_name: "tool".to_string(),
                     },
                 );
             }
@@ -7797,8 +8533,8 @@ mod tests {
                 "approval-shaped events must not reach agent dispatch"
             );
             let approvals = ctx.pending_approvals.lock().await;
-            assert!(approvals.contains_key("WRONG001"));
-            assert!(approvals.contains_key("OTHER001"));
+            assert!(approvals.pending.contains_key("WRONG001"));
+            assert!(approvals.pending.contains_key("OTHER001"));
         }
     }
 
@@ -7899,16 +8635,860 @@ mod tests {
         use std::collections::HashSet;
         use zeroclaw_api::channel::ChannelApprovalResponse;
 
+        async fn try_resolve_reaction(
+            pending: &tokio::sync::Mutex<crate::matrix::approval::State>,
+            event: &matrix_sdk::ruma::events::reaction::OriginalSyncReactionEvent,
+            bot_user_id: Option<&matrix_sdk::ruma::UserId>,
+            peers: &[String],
+            allowed_rooms: &[String],
+            room_id: &str,
+        ) -> bool {
+            super::super::approval::try_resolve_reaction(
+                super::super::approval::ReactionPolicy {
+                    pending,
+                    bot_user_id,
+                    peers,
+                    allowed_rooms,
+                },
+                &event.sender,
+                &event.content.relates_to.event_id,
+                &event.content.relates_to.key,
+                room_id,
+            )
+            .await
+        }
+
+        fn reaction(
+            sender: &str,
+            target: &str,
+            key: &str,
+        ) -> matrix_sdk::ruma::events::reaction::OriginalSyncReactionEvent {
+            serde_json::from_value(serde_json::json!({
+                "type": "m.reaction", "event_id": "$reaction:example.invalid",
+                "sender": sender, "origin_server_ts": 1,
+                "content": {"m.relates_to": {"rel_type": "m.annotation", "event_id": target, "key": key}}
+            })).unwrap()
+        }
+
+        #[test]
+        fn approval_emoji_mapping_is_exact() {
+            use super::super::approval::approval_response_for_emoji;
+            for (key, response) in [
+                ("✅", ChannelApprovalResponse::Approve),
+                ("✅\u{fe0f}", ChannelApprovalResponse::Approve),
+                ("🔁", ChannelApprovalResponse::AlwaysApprove),
+                ("🔁\u{fe0f}", ChannelApprovalResponse::AlwaysApprove),
+                ("❌", ChannelApprovalResponse::Deny),
+                ("❌\u{fe0f}", ChannelApprovalResponse::Deny),
+            ] {
+                assert_eq!(approval_response_for_emoji(key), Some(response));
+            }
+            for key in [
+                "",
+                "always",
+                "👍",
+                "✔",
+                "☑️",
+                "❎",
+                " ✅",
+                "✅✅",
+                "✅\u{fe0e}",
+                "🔂",
+                "🔄",
+                "🔁🔁",
+                "❌\u{fe0f}\u{fe0f}",
+            ] {
+                assert_eq!(approval_response_for_emoji(key), None, "{key:?}");
+            }
+        }
+
+        #[tokio::test]
+        async fn approval_reactions_require_identity_authorization_room_and_live_binding() {
+            use matrix_sdk::ruma::user_id;
+            let bot = user_id!("@bot:example.invalid");
+            let operator = "@operator:example.invalid";
+            let room = "!origin:example.invalid";
+            let peers = vec![operator.to_string(), bot.to_string()];
+            let rooms = vec![room.to_string(), "!other:example.invalid".to_string()];
+            for (key, expected) in [
+                ("✅", ChannelApprovalResponse::Approve),
+                ("🔁", ChannelApprovalResponse::AlwaysApprove),
+                ("❌️", ChannelApprovalResponse::Deny),
+            ] {
+                let pending = tokio::sync::Mutex::new(crate::matrix::approval::State::default());
+                let (tx, mut rx) = tokio::sync::oneshot::channel();
+                pending.lock().await.pending.insert(
+                    "APPROVAL".to_string(),
+                    crate::matrix::approval::Pending {
+                        sender: tx,
+                        destination: room.to_string(),
+
+                        registration: std::sync::Arc::new(()),
+                        message_id: Some("$prompt:example.invalid".to_string()),
+                    },
+                );
+                for (sender, identity, destination, target, emoji) in [
+                    (
+                        bot.as_str(),
+                        Some(bot),
+                        room,
+                        "$prompt:example.invalid",
+                        key,
+                    ),
+                    (operator, None, room, "$prompt:example.invalid", key),
+                    (
+                        "@intruder:example.invalid",
+                        Some(bot),
+                        room,
+                        "$prompt:example.invalid",
+                        key,
+                    ),
+                    (
+                        operator,
+                        Some(bot),
+                        "!other:example.invalid",
+                        "$prompt:example.invalid",
+                        key,
+                    ),
+                    (operator, Some(bot), room, "$unbound:example.invalid", key),
+                    (operator, Some(bot), room, "$prompt:example.invalid", "👍"),
+                ] {
+                    assert!(
+                        !try_resolve_reaction(
+                            &pending,
+                            &reaction(sender, target, emoji),
+                            identity,
+                            &peers,
+                            &rooms,
+                            destination
+                        )
+                        .await
+                    );
+                    assert!(matches!(
+                        rx.try_recv(),
+                        Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+                    ));
+                    assert_eq!(pending.lock().await.pending.len(), 1);
+                }
+                let event = reaction(operator, "$prompt:example.invalid", key);
+                assert!(
+                    try_resolve_reaction(&pending, &event, Some(bot), &peers, &rooms, room).await
+                );
+                assert_eq!(rx.await.unwrap(), expected);
+                assert!(pending.lock().await.pending.is_empty());
+                assert!(
+                    !try_resolve_reaction(&pending, &event, Some(bot), &peers, &rooms, room).await
+                );
+                assert_eq!(
+                    pending.lock().await.resolve(
+                        "APPROVAL",
+                        ChannelApprovalResponse::AlwaysApprove,
+                        true,
+                        room
+                    ),
+                    crate::util::PendingApprovalResolution::NotFound
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn approval_reaction_rejects_prompt_in_excluded_room() {
+            let room = "!origin:example.invalid";
+            let pending = tokio::sync::Mutex::new(crate::matrix::approval::State::default());
+            let (sender, mut receiver) = tokio::sync::oneshot::channel();
+            pending.lock().await.pending.insert(
+                "APPROVAL".into(),
+                crate::matrix::approval::Pending {
+                    sender,
+                    destination: room.into(),
+                    registration: std::sync::Arc::new(()),
+                    message_id: Some("$prompt:example.invalid".into()),
+                },
+            );
+            assert!(
+                !try_resolve_reaction(
+                    &pending,
+                    &reaction("@operator:example.invalid", "$prompt:example.invalid", "✅"),
+                    Some(matrix_sdk::ruma::user_id!("@bot:example.invalid")),
+                    &["@operator:example.invalid".into()],
+                    &["!allowed:example.invalid".into()],
+                    room,
+                )
+                .await
+            );
+            assert!(matches!(
+                receiver.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ));
+            assert_eq!(pending.lock().await.pending.len(), 1);
+        }
+
+        fn approval_request() -> zeroclaw_api::channel::ChannelApprovalRequest {
+            zeroclaw_api::channel::ChannelApprovalRequest {
+                tool_name: "shell".into(),
+                arguments_summary: "pwd".into(),
+                raw_arguments: None,
+                position: None,
+            }
+        }
+
+        fn mock_approval_channel(
+            matrix: &matrix_sdk::test_utils::mocks::MatrixMockServer,
+            client: matrix_sdk::Client,
+        ) -> (tempfile::TempDir, super::super::MatrixChannel) {
+            let workspace = tempfile::tempdir().unwrap();
+            let channel = super::super::MatrixChannel::new(
+                zeroclaw_config::schema::MatrixConfig {
+                    homeserver: matrix.server().uri(),
+                    access_token: Some("test-token".into()),
+                    approval_timeout_secs: 1,
+                    ack_reactions: Some(false),
+                    ..Default::default()
+                },
+                "test",
+                std::sync::Arc::new(|| vec!["@operator:localhost".into()]),
+                workspace.path().to_path_buf(),
+            )
+            .unwrap();
+            channel.client.set(client).unwrap();
+            (workspace, channel)
+        }
+
+        async fn preexisting_reaction(sender: &str, expected: ChannelApprovalResponse) {
+            use matrix_sdk::{ruma::room_id, test_utils::mocks::MatrixMockServer};
+            use std::time::Duration;
+            use wiremock::{
+                Mock, ResponseTemplate,
+                matchers::{method, path_regex, query_param, query_param_is_missing},
+            };
+            use zeroclaw_api::channel::{ApprovalSource, Channel};
+            let matrix = MatrixMockServer::new().await;
+            let client = matrix.client_builder().build().await;
+            matrix.mock_room_state_encryption().plain().mount().await;
+            let room = matrix
+                .sync_joined_room(&client, room_id!("!room:localhost"))
+                .await;
+            Mock::given(method("PUT"))
+                .and(path_regex("/send/m.room.message/"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({"event_id":"$prompt:localhost"}))
+                        .set_delay(Duration::from_millis(100)),
+                )
+                .expect(1)
+                .mount(matrix.server())
+                .await;
+            Mock::given(method("PUT"))
+                .and(path_regex("/send/m.reaction/"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({"event_id":"$seed:localhost"}))
+                        .set_delay(Duration::from_secs(30)),
+                )
+                .mount(matrix.server())
+                .await;
+            // Pagination must not hide the early operator tap on the next page.
+            Mock::given(method("GET"))
+                .and(path_regex("/relations/"))
+                .and(query_param_is_missing("from"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "chunk":[], "next_batch":"early-tap"
+                })))
+                .expect(1)
+                .mount(matrix.server())
+                .await;
+            let early = serde_json::json!({
+                "type":"m.reaction", "event_id":"$early:localhost", "sender":sender,
+                "origin_server_ts":1, "room_id":"!room:localhost",
+                "content":{"m.relates_to":{"rel_type":"m.annotation", "event_id":"$prompt:localhost", "key":"✅"}}
+            });
+            Mock::given(method("GET"))
+                .and(path_regex("/relations/"))
+                .and(query_param("from", "early-tap"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({"chunk":[early]})),
+                )
+                .expect(1)
+                .mount(matrix.server())
+                .await;
+            let (_workspace, channel) = mock_approval_channel(&matrix, client.clone());
+            let request = approval_request();
+            let (result, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+                tokio::join!(
+                    channel.request_approval_attributed(room.room_id().as_str(), &request),
+                    async {
+                        loop {
+                            if !channel.pending_approvals.lock().await.pending.is_empty() {
+                                break;
+                            }
+                            tokio::task::yield_now().await;
+                        }
+                        assert!(
+                            channel
+                                .pending_approvals
+                                .lock()
+                                .await
+                                .pending
+                                .values()
+                                .all(|entry| entry.message_id.is_none())
+                        );
+                        assert!(
+                            !try_resolve_reaction(
+                                &channel.pending_approvals,
+                                &reaction(sender, "$prompt:localhost", "✅"),
+                                client.user_id(),
+                                &(channel.peer_resolver)(),
+                                &[],
+                                room.room_id().as_str(),
+                            )
+                            .await
+                        );
+                    }
+                )
+            })
+            .await
+            .unwrap();
+            let result = result.unwrap().unwrap();
+            assert_eq!(result.response, expected);
+            assert_eq!(
+                result.source,
+                if expected == ChannelApprovalResponse::Approve {
+                    ApprovalSource::Operator
+                } else {
+                    ApprovalSource::TimedOut
+                }
+            );
+            assert!(channel.pending_approvals.lock().await.pending.is_empty());
+        }
+
+        #[tokio::test]
+        async fn preexisting_operator_reaction_resolves_after_prompt_binding() {
+            preexisting_reaction("@operator:localhost", ChannelApprovalResponse::Approve).await;
+        }
+
+        #[tokio::test]
+        async fn preexisting_unauthorized_reaction_does_not_resolve() {
+            preexisting_reaction("@intruder:localhost", ChannelApprovalResponse::Deny).await;
+        }
+
+        #[tokio::test]
+        async fn cancelling_real_approval_during_stalled_seed_retires_binding() {
+            use matrix_sdk::{ruma::room_id, test_utils::mocks::MatrixMockServer};
+            use std::time::Duration;
+            use wiremock::{
+                Mock, ResponseTemplate,
+                matchers::{method, path_regex},
+            };
+            use zeroclaw_api::channel::Channel;
+            let matrix = MatrixMockServer::new().await;
+            let client = matrix.client_builder().build().await;
+            matrix.mock_room_state_encryption().plain().mount().await;
+            let room = matrix
+                .sync_joined_room(&client, room_id!("!room:localhost"))
+                .await;
+            Mock::given(method("PUT"))
+                .and(path_regex("/send/m.room.message/"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({"event_id":"$prompt:localhost"})),
+                )
+                .mount(matrix.server())
+                .await;
+            Mock::given(method("PUT"))
+                .and(path_regex("/send/m.reaction/"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({"event_id":"$seed:localhost"}))
+                        .set_delay(Duration::from_secs(30)),
+                )
+                .mount(matrix.server())
+                .await;
+            let (_workspace, channel) = mock_approval_channel(&matrix, client);
+            let request = approval_request();
+            let mut approval =
+                Box::pin(channel.request_approval_attributed(room.room_id().as_str(), &request));
+            tokio::time::timeout(Duration::from_secs(5), async {
+                tokio::select! {
+                    result = &mut approval => panic!("approval ended before cancellation: {result:?}"),
+                    () = async {
+                        loop {
+                            if matrix.server().received_requests().await.unwrap().iter()
+                                .any(|req| req.url.path().contains("/send/m.reaction/")) { break; }
+                            tokio::time::sleep(Duration::from_millis(5)).await;
+                        }
+                    } => {}
+                }
+            }).await.unwrap();
+            // Force Drop onto the deferred cleanup path by holding the map lock.
+            let pending = channel.pending_approvals.lock().await;
+            assert_eq!(pending.pending.len(), 1);
+            let token = pending.pending.keys().next().unwrap().clone();
+            assert_eq!(
+                pending
+                    .pending
+                    .values()
+                    .next()
+                    .unwrap()
+                    .message_id
+                    .as_deref(),
+                Some("$prompt:localhost")
+            );
+            drop(approval);
+            drop(pending);
+            tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    if channel.pending_approvals.lock().await.pending.is_empty() {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(channel.pending_approvals.lock().await.resolve_reply(
+                &token,
+                ChannelApprovalResponse::Approve,
+                true,
+                room.room_id().as_str()
+            ));
+        }
+
+        #[test]
+        fn reaction_prompt_shows_typed_commands_unless_disabled() {
+            use super::super::approval::build_approval_prompt;
+            let bot = matrix_sdk::ruma::user_id!("@bot:example.invalid");
+            let react = zeroclaw_runtime::i18n::get_required_cli_string(
+                "channel-approval-react-instruction",
+            );
+            let typed = crate::util::build_approve_deny_reply_instruction("APPROVAL");
+            for word in ["approve", "deny", "always"] {
+                assert!(typed.contains(&format!("APPROVAL {word}")), "{typed:?}");
+            }
+
+            let prompt = build_approval_prompt("APPROVAL", &approval_request(), Some(bot), true);
+            assert!(
+                prompt.starts_with("APPROVAL REQUIRED [APPROVAL]\n"),
+                "{prompt:?}"
+            );
+            assert!(
+                prompt.ends_with(&format!("\n\n{react}\n{typed}")),
+                "{prompt:?}"
+            );
+
+            let prompt = build_approval_prompt("APPROVAL", &approval_request(), Some(bot), false);
+            assert!(prompt.ends_with(&format!("\n\n{react}")), "{prompt:?}");
+            assert!(!prompt.contains("APPROVAL approve"), "{prompt:?}");
+
+            for typed_instructions in [true, false] {
+                assert_eq!(
+                    build_approval_prompt(
+                        "APPROVAL",
+                        &approval_request(),
+                        None,
+                        typed_instructions
+                    ),
+                    crate::util::build_approve_deny_approval_prompt(
+                        "APPROVAL", "shell", "pwd", None
+                    )
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn unknown_bot_identity_omits_react_instruction_seed_and_decision() {
+            use matrix_sdk::{
+                ruma::{event_id, room_id},
+                test_utils::mocks::MatrixMockServer,
+            };
+            let matrix = MatrixMockServer::new().await;
+            let client = matrix.client_builder().unlogged().build().await;
+            assert!(client.user_id().is_none());
+            let prompt = super::super::approval::build_approval_prompt(
+                "APPROVAL",
+                &approval_request(),
+                client.user_id(),
+                false,
+            );
+            assert!(
+                !prompt.contains(&zeroclaw_runtime::i18n::get_required_cli_string(
+                    "channel-approval-react-instruction"
+                ))
+            );
+            let (_workspace, channel) = mock_approval_channel(&matrix, client.clone());
+            let (sender, mut receiver) = tokio::sync::oneshot::channel();
+            channel.pending_approvals.lock().await.pending.insert(
+                "APPROVAL".into(),
+                crate::matrix::approval::Pending {
+                    sender,
+                    destination: "!room:localhost".into(),
+                    registration: std::sync::Arc::new(()),
+                    message_id: Some("$prompt:localhost".into()),
+                },
+            );
+            channel
+                .prepare_approval_reactions(
+                    &client,
+                    &room_id!("!room:localhost").to_owned(),
+                    &event_id!("$prompt:localhost").to_owned(),
+                    true,
+                    "!room:localhost",
+                    "APPROVAL",
+                )
+                .await;
+            assert!(
+                !try_resolve_reaction(
+                    &channel.pending_approvals,
+                    &reaction("@operator:localhost", "$prompt:localhost", "✅"),
+                    client.user_id(),
+                    &(channel.peer_resolver)(),
+                    &[],
+                    "!room:localhost"
+                )
+                .await
+            );
+            assert!(matches!(
+                receiver.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ));
+            assert_eq!(channel.pending_approvals.lock().await.pending.len(), 1);
+            assert!(
+                matrix
+                    .server()
+                    .received_requests()
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+
+        #[tokio::test]
+        async fn stalled_reaction_seeding_delays_neither_a_typed_answer_nor_the_timeout() {
+            use matrix_sdk::ruma::room_id;
+            use matrix_sdk::test_utils::mocks::MatrixMockServer;
+            use std::{sync::Arc, time::Duration};
+            use wiremock::matchers::{method, path_regex};
+            use wiremock::{Mock, ResponseTemplate};
+            use zeroclaw_api::channel::{ApprovalSource, Channel, ChannelApprovalRequest};
+            use zeroclaw_config::schema::MatrixConfig;
+            for answer in [true, false] {
+                let matrix = MatrixMockServer::new().await;
+                let client = matrix.client_builder().build().await;
+                matrix.mock_room_state_encryption().plain().mount().await;
+                let room = matrix
+                    .sync_joined_room(&client, room_id!("!room:localhost"))
+                    .await;
+                Mock::given(method("PUT"))
+                    .and(path_regex("/send/m.room.message/"))
+                    .respond_with(
+                        ResponseTemplate::new(200)
+                            .set_body_json(serde_json::json!({"event_id":"$prompt:localhost"})),
+                    )
+                    .mount(matrix.server())
+                    .await;
+                Mock::given(method("PUT"))
+                    .and(path_regex("/send/m.reaction/"))
+                    .respond_with(
+                        ResponseTemplate::new(200)
+                            .set_body_json(serde_json::json!({"event_id":"$seed:localhost"}))
+                            .set_delay(Duration::from_secs(30)),
+                    )
+                    .mount(matrix.server())
+                    .await;
+                Mock::given(method("GET"))
+                    .and(path_regex("/relations/"))
+                    .respond_with(
+                        ResponseTemplate::new(200)
+                            .set_body_json(serde_json::json!({"chunk": []}))
+                            .set_delay(Duration::from_secs(30)),
+                    )
+                    .mount(matrix.server())
+                    .await;
+                let workspace = tempfile::tempdir().unwrap();
+                let channel = super::super::MatrixChannel::new(
+                    MatrixConfig {
+                        homeserver: matrix.server().uri(),
+                        access_token: Some("test-token".to_string()),
+                        approval_timeout_secs: if answer { 10 } else { 1 },
+                        ack_reactions: Some(false),
+                        ..MatrixConfig::default()
+                    },
+                    "test",
+                    Arc::new(|| vec!["@operator:localhost".to_string()]),
+                    workspace.path().to_path_buf(),
+                )
+                .unwrap();
+                channel.client.set(client).unwrap();
+                let request = ChannelApprovalRequest {
+                    tool_name: "shell".to_string(),
+                    arguments_summary: "pwd".to_string(),
+                    raw_arguments: None,
+                    position: None,
+                };
+                let (result, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+                    tokio::join!(
+                        channel.request_approval_attributed(room.room_id().as_str(), &request),
+                        async {
+                            if !answer {
+                                return;
+                            }
+                            let token = loop {
+                                let bound = channel
+                                    .pending_approvals
+                                    .lock()
+                                    .await
+                                    .pending
+                                    .iter()
+                                    .find_map(|(token, approval)| {
+                                        approval.message_id.as_ref().map(|_| token.clone())
+                                    });
+                                if let Some(token) = bound {
+                                    break token;
+                                }
+                                tokio::time::sleep(Duration::from_millis(5)).await;
+                            };
+                            assert_eq!(
+                                channel.pending_approvals.lock().await.resolve(
+                                    &token,
+                                    ChannelApprovalResponse::Deny,
+                                    true,
+                                    room.room_id().as_str()
+                                ),
+                                crate::util::PendingApprovalResolution::Resolved
+                            );
+                        }
+                    )
+                })
+                .await
+                .expect("a stalled reaction seed must not hold the approval open");
+                let decided = result.unwrap().unwrap();
+                assert_eq!(decided.response, ChannelApprovalResponse::Deny);
+                if !answer {
+                    assert_eq!(decided.source, ApprovalSource::TimedOut);
+                }
+                assert!(channel.pending_approvals.lock().await.pending.is_empty());
+            }
+        }
+
+        #[tokio::test]
+        async fn failed_reaction_seeding_keeps_typed_approval_available() {
+            failed_reaction_seeding(true, Stall::Nothing).await;
+        }
+
+        #[tokio::test]
+        async fn failed_reaction_seeding_sends_the_hidden_typed_commands() {
+            failed_reaction_seeding(false, Stall::Nothing).await;
+        }
+
+        #[tokio::test]
+        async fn stalled_reaction_catch_up_does_not_delay_the_typed_commands() {
+            failed_reaction_seeding(false, Stall::CatchUp).await;
+        }
+
+        #[tokio::test]
+        async fn stalled_later_reaction_does_not_delay_the_typed_commands() {
+            failed_reaction_seeding(false, Stall::LaterReactions).await;
+        }
+
+        /// A homeserver request that outlives the approval timeout.
+        #[derive(Clone, Copy, PartialEq)]
+        enum Stall {
+            Nothing,
+            /// The catch-up's relations request.
+            CatchUp,
+            /// Every reaction after the first, rejected one.
+            LaterReactions,
+        }
+
+        /// Reaction sends fail. With the typed commands in the prompt there is
+        /// nothing more to send; without them they follow in a second message
+        /// as soon as one reaction fails, even while other homeserver requests
+        /// are still waiting. Either way a typed reply resolves the approval.
+        async fn failed_reaction_seeding(typed_instructions: bool, stall: Stall) {
+            use matrix_sdk::ruma::room_id;
+            use matrix_sdk::test_utils::mocks::MatrixMockServer;
+            use std::{sync::Arc, time::Duration};
+            use wiremock::matchers::{method, path_regex};
+            use wiremock::{Mock, ResponseTemplate};
+            use zeroclaw_api::channel::{Channel, ChannelApprovalRequest};
+            use zeroclaw_config::schema::MatrixConfig;
+            let matrix = MatrixMockServer::new().await;
+            let client = matrix.client_builder().build().await;
+            matrix.mock_room_state_encryption().plain().mount().await;
+            let room = matrix
+                .sync_joined_room(&client, room_id!("!room:localhost"))
+                .await;
+            Mock::given(method("PUT"))
+                .and(path_regex("/send/m.room.message/"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({"event_id":"$prompt:localhost"})),
+                )
+                .expect(if typed_instructions { 1 } else { 2 })
+                .mount(matrix.server())
+                .await;
+            if stall == Stall::CatchUp {
+                Mock::given(method("GET"))
+                    .and(path_regex("/relations/"))
+                    .respond_with(
+                        ResponseTemplate::new(200)
+                            .set_body_json(serde_json::json!({"chunk": []}))
+                            .set_delay(Duration::from_secs(30)),
+                    )
+                    .mount(matrix.server())
+                    .await;
+            }
+            let rejected = if stall == Stall::LaterReactions { 1 } else { 3 };
+            Mock::given(method("PUT"))
+                .and(path_regex("/send/m.reaction/"))
+                .respond_with(ResponseTemplate::new(403).set_body_json(
+                    serde_json::json!({"errcode":"M_FORBIDDEN","error":"forbidden"}),
+                ))
+                .up_to_n_times(rejected)
+                .expect(rejected)
+                .mount(matrix.server())
+                .await;
+            if stall == Stall::LaterReactions {
+                Mock::given(method("PUT"))
+                    .and(path_regex("/send/m.reaction/"))
+                    .respond_with(
+                        ResponseTemplate::new(200)
+                            .set_body_json(serde_json::json!({"event_id":"$seed:localhost"}))
+                            .set_delay(Duration::from_secs(30)),
+                    )
+                    .mount(matrix.server())
+                    .await;
+            }
+            let workspace = tempfile::tempdir().unwrap();
+            let channel = super::super::MatrixChannel::new(
+                MatrixConfig {
+                    homeserver: matrix.server().uri(),
+                    access_token: Some("test-token".to_string()),
+                    approval_timeout_secs: 10,
+                    approval_typed_instructions: typed_instructions,
+                    ack_reactions: Some(false),
+                    ..MatrixConfig::default()
+                },
+                "test",
+                Arc::new(|| vec!["@operator:localhost".to_string()]),
+                workspace.path().to_path_buf(),
+            )
+            .unwrap();
+            channel.client.set(client).unwrap();
+            let request = ChannelApprovalRequest {
+                tool_name: "shell".to_string(),
+                arguments_summary: "pwd".to_string(),
+                raw_arguments: None,
+                position: None,
+            };
+            let expected_messages = if typed_instructions { 1 } else { 2 };
+            let (result, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+                tokio::join!(
+                    channel.request_approval_attributed(room.room_id().as_str(), &request),
+                    async {
+                        loop {
+                            let requests = matrix.server().received_requests().await.unwrap();
+                            let sent = |kind: &str| {
+                                requests
+                                    .iter()
+                                    .filter(|req| req.url.path().contains(kind))
+                                    .count()
+                            };
+                            if sent("/send/m.reaction/") >= rejected as usize
+                                && sent("/send/m.room.message/") == expected_messages
+                            {
+                                break;
+                            }
+                            tokio::time::sleep(Duration::from_millis(5)).await;
+                        }
+                        if typed_instructions {
+                            // Give a wrongly sent follow-up time to reach the
+                            // server before the answer cancels seeding.
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                        }
+                        let token = {
+                            let pending = channel.pending_approvals.lock().await;
+                            let (token, approval) = pending.pending.iter().next().unwrap();
+                            assert_eq!(approval.message_id.as_deref(), Some("$prompt:localhost"));
+                            token.clone()
+                        };
+                        let (token, response) = parse_reply(&format!("{token} always")).unwrap();
+                        assert_eq!(
+                            channel.pending_approvals.lock().await.resolve(
+                                &token,
+                                response,
+                                true,
+                                room.room_id().as_str()
+                            ),
+                            crate::util::PendingApprovalResolution::Resolved
+                        );
+                    }
+                )
+            })
+            .await
+            .unwrap();
+            assert_eq!(
+                result.unwrap().unwrap().response,
+                ChannelApprovalResponse::AlwaysApprove
+            );
+            assert!(channel.pending_approvals.lock().await.pending.is_empty());
+            let requests = matrix.server().received_requests().await.unwrap();
+            let messages: Vec<String> = requests
+                .iter()
+                .filter(|req| req.url.path().contains("/send/m.room.message/"))
+                .map(|req| {
+                    req.body_json::<serde_json::Value>().unwrap()["body"]
+                        .as_str()
+                        .unwrap()
+                        .to_string()
+                })
+                .collect();
+            assert_eq!(messages.len(), expected_messages, "{messages:?}");
+            let token = messages[0]
+                .strip_prefix("APPROVAL REQUIRED [")
+                .and_then(|rest| rest.split(']').next())
+                .unwrap();
+            let typed = crate::util::build_approve_deny_reply_instruction(token);
+            assert!(
+                messages[0].contains(&zeroclaw_runtime::i18n::get_required_cli_string(
+                    "channel-approval-react-instruction"
+                ))
+            );
+            assert_eq!(
+                messages[0].contains(&typed),
+                typed_instructions,
+                "{messages:?}"
+            );
+            if !typed_instructions {
+                assert_eq!(messages[1], typed);
+            }
+            let annotations: Vec<serde_json::Value> = requests
+                .iter()
+                .filter(|req| req.url.path().contains("/send/m.reaction/"))
+                .map(|req| req.body_json::<serde_json::Value>().unwrap()["m.relates_to"].clone())
+                .collect();
+            assert!(
+                (rejected as usize..=3).contains(&annotations.len()),
+                "{annotations:?}"
+            );
+            for (annotation, key) in annotations.iter().zip(["✅", "🔁", "❌"]) {
+                assert_eq!(
+                    annotation,
+                    &serde_json::json!({"rel_type":"m.annotation","event_id":"$prompt:localhost","key":key})
+                );
+            }
+        }
+
         #[tokio::test]
         async fn pending_approval_requires_allowed_user_and_origin_room() {
-            let pending = tokio::sync::Mutex::new(std::collections::HashMap::new());
+            let pending = tokio::sync::Mutex::new(crate::matrix::approval::State::default());
             let (tx, rx) = tokio::sync::oneshot::channel();
-            pending.lock().await.insert(
+            pending.lock().await.pending.insert(
                 "APPROVAL".to_string(),
-                crate::util::PendingApproval {
+                crate::matrix::approval::Pending {
+                    registration: std::sync::Arc::new(()),
+                    message_id: None,
                     sender: tx,
                     destination: "!origin:example.invalid".to_string(),
-                    tool_name: "tool".to_string(),
                 },
             );
 
@@ -7918,8 +9498,7 @@ mod tests {
                 ChannelApprovalResponse::AlwaysApprove,
             ] {
                 assert_eq!(
-                    crate::util::resolve_pending_approval(
-                        &pending,
+                    pending.lock().await.resolve(
                         "APPROVAL",
                         response,
                         super::super::allowlist::user_allowed(
@@ -7927,16 +9506,14 @@ mod tests {
                             "@other:example.invalid",
                         ),
                         "!origin:example.invalid",
-                    )
-                    .await,
+                    ),
                     crate::util::PendingApprovalResolution::Rejected,
                 );
-                assert!(pending.lock().await.contains_key("APPROVAL"));
+                assert!(pending.lock().await.pending.contains_key("APPROVAL"));
             }
 
             assert_eq!(
-                crate::util::resolve_pending_approval(
-                    &pending,
+                pending.lock().await.resolve(
                     "APPROVAL",
                     ChannelApprovalResponse::Approve,
                     super::super::allowlist::user_allowed(
@@ -7944,15 +9521,13 @@ mod tests {
                         "@operator:example.invalid",
                     ),
                     "!other:example.invalid",
-                )
-                .await,
+                ),
                 crate::util::PendingApprovalResolution::Rejected,
             );
-            assert!(pending.lock().await.contains_key("APPROVAL"));
+            assert!(pending.lock().await.pending.contains_key("APPROVAL"));
 
             assert_eq!(
-                crate::util::resolve_pending_approval(
-                    &pending,
+                pending.lock().await.resolve(
                     "APPROVAL",
                     ChannelApprovalResponse::AlwaysApprove,
                     super::super::allowlist::user_allowed(
@@ -7960,24 +9535,23 @@ mod tests {
                         "@operator:example.invalid",
                     ),
                     "!origin:example.invalid",
-                )
-                .await,
+                ),
                 crate::util::PendingApprovalResolution::Resolved,
             );
             assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::AlwaysApprove);
 
             let (approve_tx, approve_rx) = tokio::sync::oneshot::channel();
-            pending.lock().await.insert(
+            pending.lock().await.pending.insert(
                 "APPROVE2".to_string(),
-                crate::util::PendingApproval {
+                crate::matrix::approval::Pending {
+                    registration: std::sync::Arc::new(()),
+                    message_id: None,
                     sender: approve_tx,
                     destination: "!origin:example.invalid".to_string(),
-                    tool_name: "tool".to_string(),
                 },
             );
             assert_eq!(
-                crate::util::resolve_pending_approval(
-                    &pending,
+                pending.lock().await.resolve(
                     "APPROVE2",
                     ChannelApprovalResponse::Approve,
                     super::super::allowlist::user_allowed(
@@ -7985,11 +9559,238 @@ mod tests {
                         "@operator:example.invalid",
                     ),
                     "!origin:example.invalid",
-                )
-                .await,
+                ),
                 crate::util::PendingApprovalResolution::Resolved,
             );
             assert_eq!(approve_rx.await.unwrap(), ChannelApprovalResponse::Approve);
+        }
+
+        #[tokio::test]
+        async fn prompt_binding_resolves_only_its_registered_event() {
+            use super::super::approval::State;
+            use crate::util::PendingApprovalResolution;
+            use std::sync::Arc;
+            let mut state = State::default();
+            let registration = Arc::new(());
+            let (sender, receiver) = tokio::sync::oneshot::channel();
+            let token = state
+                .register(
+                    sender,
+                    "!room:example.invalid".into(),
+                    Arc::clone(&registration),
+                    || "APPROVAL".into(),
+                )
+                .unwrap();
+            assert!(Arc::ptr_eq(
+                &state.pending[&token].registration,
+                &registration
+            ));
+            assert!(!state.bind(&token, &Arc::new(()), "$wrong:example.invalid".into()));
+            assert!(state.bind(&token, &registration, "$prompt:example.invalid".into()));
+            assert_eq!(
+                state.resolve_reaction(
+                    "$other:example.invalid",
+                    ChannelApprovalResponse::Approve,
+                    true,
+                    "!room:example.invalid"
+                ),
+                PendingApprovalResolution::NotFound
+            );
+            assert_eq!(
+                state.resolve_reaction(
+                    "$prompt:example.invalid",
+                    ChannelApprovalResponse::Approve,
+                    true,
+                    "!room:example.invalid"
+                ),
+                PendingApprovalResolution::Resolved
+            );
+            assert_eq!(receiver.await.unwrap(), ChannelApprovalResponse::Approve);
+        }
+
+        #[tokio::test]
+        async fn stale_registration_guard_preserves_reused_token() {
+            use super::super::approval::{Guard, RETIRED_TOKEN_CAP, State};
+            use std::sync::Arc;
+            for contended in [false, true] {
+                let state = Arc::new(tokio::sync::Mutex::new(State::default()));
+                let original = Arc::new(());
+                let (sender, receiver) = tokio::sync::oneshot::channel();
+                let token = state
+                    .lock()
+                    .await
+                    .register(
+                        sender,
+                        "!room:example.invalid".into(),
+                        Arc::clone(&original),
+                        || "APPROVAL".into(),
+                    )
+                    .unwrap();
+                let mut guard =
+                    Guard::new(Arc::clone(&state), token.clone(), Arc::clone(&original));
+                assert!(state.lock().await.resolve_reply(
+                    &token,
+                    ChannelApprovalResponse::Approve,
+                    true,
+                    "!room:example.invalid"
+                ));
+                assert_eq!(receiver.await.unwrap(), ChannelApprovalResponse::Approve);
+                // Let this token age out of the bounded race buffer, then reuse
+                // it while its original cancellation guard is still alive.
+                for index in 0..RETIRED_TOKEN_CAP {
+                    let (sender, _receiver) = tokio::sync::oneshot::channel();
+                    let mut entries = state.lock().await;
+                    let next = entries
+                        .register(sender, "!room:example.invalid".into(), Arc::new(()), || {
+                            format!("T{index:07}")
+                        })
+                        .unwrap();
+                    assert!(entries.resolve_reply(
+                        &next,
+                        ChannelApprovalResponse::Deny,
+                        true,
+                        "!room:example.invalid"
+                    ));
+                }
+                let replacement = Arc::new(());
+                let (sender, mut receiver) = tokio::sync::oneshot::channel();
+                assert_eq!(
+                    state
+                        .lock()
+                        .await
+                        .register(
+                            sender,
+                            "!room:example.invalid".into(),
+                            Arc::clone(&replacement),
+                            || token.clone()
+                        )
+                        .unwrap(),
+                    token
+                );
+                if contended {
+                    let entries = state.lock().await;
+                    drop(guard);
+                    drop(entries);
+                    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                        while Arc::strong_count(&original) != 1 {
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await
+                    .unwrap();
+                } else {
+                    guard.remove().await;
+                    drop(guard);
+                }
+                let mut entries = state.lock().await;
+                assert!(Arc::ptr_eq(
+                    &entries.pending[&token].registration,
+                    &replacement
+                ));
+                assert!(!entries.bind(&token, &original, "$stale:example.invalid".into()));
+                assert!(entries.bind(&token, &replacement, "$replacement:example.invalid".into()));
+                assert!(matches!(
+                    receiver.try_recv(),
+                    Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+                ));
+                assert!(entries.resolve_reply(
+                    &token,
+                    ChannelApprovalResponse::Deny,
+                    true,
+                    "!room:example.invalid"
+                ));
+                assert_eq!(receiver.await.unwrap(), ChannelApprovalResponse::Deny);
+            }
+        }
+
+        #[tokio::test]
+        async fn registration_excludes_live_and_recent_tokens_with_bounded_retention() {
+            use super::super::approval::{RETIRED_TOKEN_CAP, State};
+            use std::sync::Arc;
+            let mut state = State::default();
+            let (sender, receiver) = tokio::sync::oneshot::channel();
+            state
+                .register(sender, "!room:example.invalid".into(), Arc::new(()), || {
+                    "RETIRED1".into()
+                })
+                .unwrap();
+            assert!(state.resolve_reply(
+                "RETIRED1",
+                ChannelApprovalResponse::Approve,
+                true,
+                "!room:example.invalid"
+            ));
+            assert_eq!(receiver.await.unwrap(), ChannelApprovalResponse::Approve);
+            let (sender, _receiver) = tokio::sync::oneshot::channel();
+            state
+                .register(sender, "!room:example.invalid".into(), Arc::new(()), || {
+                    "LIVE0001".into()
+                })
+                .unwrap();
+            let (sender, _receiver) = tokio::sync::oneshot::channel();
+            let mut tokens = ["RETIRED1", "LIVE0001", "FRESH001"].into_iter();
+            assert_eq!(
+                state
+                    .register(sender, "!room:example.invalid".into(), Arc::new(()), || {
+                        tokens.next().unwrap().into()
+                    })
+                    .unwrap(),
+                "FRESH001"
+            );
+            let (sender, mut receiver) = tokio::sync::oneshot::channel();
+            let mut attempts = 0;
+            assert!(
+                state
+                    .register(sender, "!room:example.invalid".into(), Arc::new(()), || {
+                        attempts += 1;
+                        "LIVE0001".into()
+                    })
+                    .is_err()
+            );
+            assert_eq!(attempts, 16);
+            assert!(matches!(
+                receiver.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+            ));
+            assert_eq!(state.pending.len(), 2);
+            for index in 0..RETIRED_TOKEN_CAP {
+                let (sender, receiver) = tokio::sync::oneshot::channel();
+                drop(receiver);
+                let token = state
+                    .register(sender, "!room:example.invalid".into(), Arc::new(()), || {
+                        format!("T{index:07}")
+                    })
+                    .unwrap();
+                assert_eq!(
+                    state.resolve(
+                        &token,
+                        ChannelApprovalResponse::Deny,
+                        true,
+                        "!room:example.invalid"
+                    ),
+                    crate::util::PendingApprovalResolution::ReceiverClosed
+                );
+            }
+            assert!(!state.resolve_reply(
+                "RETIRED1",
+                ChannelApprovalResponse::Approve,
+                true,
+                "!room:example.invalid"
+            ));
+            for index in 0..RETIRED_TOKEN_CAP {
+                assert!(state.resolve_reply(
+                    &format!("T{index:07}"),
+                    ChannelApprovalResponse::Approve,
+                    true,
+                    "!room:example.invalid"
+                ));
+            }
+            assert!(!state.resolve_reply(
+                "UNKNOWN1",
+                ChannelApprovalResponse::Approve,
+                true,
+                "!room:example.invalid"
+            ));
         }
 
         #[test]
@@ -10485,6 +12286,7 @@ mod tests {
                 recovery_key: None,
                 password: password.map(String::from),
                 approval_timeout_secs: 300,
+                approval_typed_instructions: true,
                 reply_in_thread: true,
                 ack_reactions: Some(true),
                 excluded_tools: vec![],
