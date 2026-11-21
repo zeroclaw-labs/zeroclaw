@@ -145,6 +145,22 @@ impl FileReadTool {
             });
         }
 
+        // Second-stage glob check: restrict to configured patterns
+        // (e.g. only SKILL.md + references/*.md inside skill bundles).
+        // Returns `success: false` without charging an extra budget slot,
+        // leaving the outer `RateLimitedTool` / `PathGuardedTool` wrappers
+        // to enforce the per-sender rate limit.
+        if !self.security.is_file_read_pattern_allowed(&resolved_path) {
+            return Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(crate::i18n::get_required_cli_string_with_args(
+                    "tool-file-read-error-pattern-not-allowed",
+                    &[("path", path)],
+                )),
+            });
+        }
+
         // Check file size AFTER canonicalization to prevent TOCTOU symlink bypass
         match tokio::fs::metadata(&resolved_path).await {
             Ok(meta) => {
@@ -816,6 +832,42 @@ mod tests {
 
         assert!(!result.success);
         assert!(result.error.as_ref().unwrap().contains("escapes workspace"));
+
+        let _ = tokio::fs::remove_dir_all(&root).await;
+    }
+
+    #[tokio::test]
+    async fn file_read_pattern_denial_renders_localized_message() {
+        let root = std::env::temp_dir().join("zeroclaw_test_file_read_pattern_denial");
+        let workspace = root.join("workspace");
+        let file = workspace.join("skills").join("foo").join("notes.txt");
+
+        let _ = tokio::fs::remove_dir_all(&root).await;
+        tokio::fs::create_dir_all(file.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&file, "secret").await.unwrap();
+
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: workspace.clone(),
+            file_read_allowed_patterns: vec!["**/SKILL.md".into()],
+            ..SecurityPolicy::default()
+        });
+        let tool = FileReadTool::new(security);
+
+        let result = tool
+            .execute(json!({"path": file.to_string_lossy().to_string()}))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        let error = result.error.unwrap_or_default();
+        assert!(
+            !error.contains("tool-file-read-error-pattern-not-allowed") && !error.contains('{'),
+            "missing Fluent key fell back to a raw placeholder: {error}"
+        );
+        assert!(error.contains("file_read allowed patterns"));
 
         let _ = tokio::fs::remove_dir_all(&root).await;
     }
