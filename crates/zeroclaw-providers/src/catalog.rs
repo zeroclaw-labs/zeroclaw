@@ -72,6 +72,7 @@ pub fn catalog_source_for(family: &str) -> Option<(Option<&'static str>, Option<
         // Atlas Cloud exposes a no-auth OpenAI-compatible `/models` endpoint.
         // `list_models_for_family` handles that path before using this tuple.
         "atlascloud" => (None, None),
+        "opper" => (Some("opper"), None),
         "synthetic" => (Some("synthetic"), None),
         "opencode" => (Some("opencode"), None),
         "atomic_chat" => (Some("atomic-chat"), None),
@@ -499,6 +500,20 @@ mod tests {
     fn atlascloud_family_uses_provider_catalog_source() {
         let (md, or) = catalog_source_for("atlascloud").expect("atlascloud is canonical");
         assert_eq!(md, None);
+        assert_eq!(or, None);
+    }
+
+    #[test]
+    fn opper_family_uses_models_dev_catalog_source() {
+        use crate::factory::CompatFamilySpec;
+        use zeroclaw_config::schema::OpperModelProviderConfig;
+
+        let (md, or) = catalog_source_for("opper").expect("opper is canonical");
+        assert_eq!(md, Some("opper"));
+        assert_eq!(
+            md,
+            <OpperModelProviderConfig as CompatFamilySpec>::MODELS_DEV_KEY
+        );
         assert_eq!(or, None);
     }
 
