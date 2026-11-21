@@ -26,15 +26,16 @@ pub use crate::skills::frontmatter::SkillFrontmatter;
 pub(crate) fn safeguard_fallback_wire(
     notice: &zeroclaw_providers::SafeguardFallbackNotice,
 ) -> SafeguardFallbackWire {
-    use zeroclaw_providers::SafeguardFallbackKind as K;
+    use crate::agent::turn_accounting::{SafeguardFallbackDisplay, SafeguardFallbackKindLabel};
+    let display = SafeguardFallbackDisplay::from_notice_ref(notice);
     SafeguardFallbackWire {
-        fallback_kind: match notice.kind {
-            K::ServerSide => SafeguardFallbackKindWire::Server,
-            K::ClientSide => SafeguardFallbackKindWire::Client,
-            K::ClientAndServer => SafeguardFallbackKindWire::ClientServer,
+        fallback_kind: match display.fallback_kind {
+            SafeguardFallbackKindLabel::Server => SafeguardFallbackKindWire::Server,
+            SafeguardFallbackKindLabel::Client => SafeguardFallbackKindWire::Client,
+            SafeguardFallbackKindLabel::ClientServer => SafeguardFallbackKindWire::ClientServer,
         },
-        requested_model: notice.requested_model.clone(),
-        served_model: notice.served_model.clone(),
+        requested_model: display.requested_model,
+        served_model: display.served_model,
     }
 }
 
