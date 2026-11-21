@@ -56,7 +56,7 @@ pub use outcome::{
 };
 pub(crate) use outcome::{SteeringPending, StreamCancelledAfterOutput};
 pub(crate) use outcome::{
-    current_model_switch_state, model_switch_provider_allowed,
+    current_model_switch_state, current_provider_allowlist, model_switch_provider_allowed,
     scope_model_switch_provider_allowlist, scope_model_switch_state,
 };
 #[cfg(test)]
@@ -4800,12 +4800,24 @@ async fn drive_live_sop_actions(
                             // awaited after it, so a temporary would be dropped
                             // while the future still borrows it.
                             let mut nested_memory_preamble: Option<MemoryPreamble> = None;
+                            // The step boundary is also in force on the task, as
+                            // on the headless path: a tool that starts a child
+                            // run (spawn_subagent, delegate) or chooses another
+                            // model for one reads it there, since it never sees
+                            // `sop_excluded_tools`.
+                            let live_step_scope = crate::sop::executor::headless_step_scope(
+                                &queued.engine,
+                                &run_id,
+                                &step,
+                            );
                             let step_result = ::zeroclaw_log::scope!(
                                 sop_run_id: run_id.as_str(),
                                 =>
                                 crate::sop::executor::scope_step_call_sink(
                                     step_call_sink.clone(),
-                                    Box::pin(run_tool_call_loop(ToolLoop {
+                                    Box::pin(crate::sop::active_scope::with_active_headless_step_scope(
+                                    live_step_scope,
+                                    run_tool_call_loop(ToolLoop {
                                     exec: ResolvedAgentExecution::resolve(
                                         ResolvedModelAccess {
                                             model_provider: eff_model_provider,
@@ -4932,7 +4944,7 @@ async fn drive_live_sop_actions(
                                     // The step runs on the queuing loop's
                                     // binding, same-agent or cross-agent.
                                     capability_binding,
-                                    })),
+                                    }))),
                                 )
                             )
                             .await;
