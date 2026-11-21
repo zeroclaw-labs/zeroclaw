@@ -98,3 +98,44 @@ and `structuredClone()`.
 - Edge 111+
 - Firefox 113+
 - Safari 16.2+
+
+## Provisioning OpenBao secrets from the dashboard
+
+With a server-side OpenBao identity configured, the operator selects **OpenBao**,
+enters the secret value, and selects **Add credential**. The editable reference
+is suggested from the mount, prefix, alias and field. The gateway handles vault
+authentication, so the operator can complete the task without issuing or
+copying a vault token. **Link existing secret** saves the reference without
+writing a value to OpenBao.
+
+Set `BAO_ADDR` to the operator-configured HTTPS origin of an OpenBao server
+and `ZEROCLAW_OPENBAO_WRITE_PREFIX` to an allowed KV v2 mount and prefix,
+for example `secret/agents`. OpenBao then offers **Add** to create a
+record and **Link existing secret** to register an existing reference.
+The editable reference defaults to `<prefix>/<alias>/<field>`.
+Existing read-side OpenBao identity and ACLs still govern later use.
+Set `BAO_CACERT` to a PEM CA bundle if the vault uses a private CA.
+
+For managed writes, set `ZEROCLAW_OPENBAO_WRITE_TOKEN_FILE` to the absolute
+path of a dedicated, short-lived write token managed by OpenBao Agent or an
+equivalent deployment service. If omitted, the gateway can use the configured
+OpenBao Agent token file from BAO_TOKEN_PATH. The dashboard asks the authenticated
+operator for the value only. The gateway reads the token file on each
+write, so lease renewal and replacement do not require a gateway restart.
+Protect the file and the writer identity from agent tools and untrusted
+processes. An explicitly shared OpenBao identity needs scoped permissions for both reads and writes. Use a separate writer identity where the gateway has its own execution boundary. Without a server-side writer, the WebUI can still link an existing secret without issuing an OpenBao write. Give the writer token `create` for new records or `patch` plus `read`
+on the metadata endpoint for rotations, restricted to the configured
+prefix. The gateway sends the value and token over verified HTTPS and
+persists only the encrypted reference. New records use KV v2 CAS zero.
+Replace with a value patches the field on the same reference against
+its current version. A blank replacement preserves the external value.
+Delete removes the catalog entry. Use the vault for remote destruction.
+
+If OpenBao accepts a new write but persisting the local reference fails,
+use **Link existing secret** with the same reference to recover. A
+retry of **Add** cannot overwrite it. A gateway timeout may also leave
+the result uncertain. Verify in OpenBao before retrying.
+
+Other external providers currently support the same reference editor
+with **Link existing secret**. The external creation action is enabled
+only for a backend with a provisioner.
