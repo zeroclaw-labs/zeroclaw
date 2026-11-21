@@ -8401,6 +8401,7 @@ async fn process_channel_message_with_delivery_id(
         msg,
         cancellation_token,
         delivery_message_id,
+        inbound_content,
         turn_lease,
         receipt,
     )
@@ -8411,6 +8412,7 @@ async fn process_channel_message_with_ingress(
     msg: zeroclaw_api::channel::ChannelMessage,
     cancellation_token: CancellationToken,
     delivery_message_id: String,
+    inbound_content: String,
     turn_lease: Option<Arc<zeroclaw_runtime::live_config_authority::AgentTurnLease>>,
     receipt: Option<IngressReceipt>,
 ) {
@@ -8434,6 +8436,7 @@ async fn process_channel_message_with_ingress(
         msg,
         cancellation_token,
         delivery_message_id,
+        inbound_content,
         turn_lease,
     )
     .await;
@@ -8458,6 +8461,7 @@ async fn process_channel_message_with_delivery_id_inner(
     msg: zeroclaw_api::channel::ChannelMessage,
     cancellation_token: CancellationToken,
     delivery_message_id: String,
+    inbound_content: String,
     turn_lease: Option<Arc<zeroclaw_runtime::live_config_authority::AgentTurnLease>>,
 ) {
     if cancellation_token.is_cancelled() {
@@ -27595,6 +27599,7 @@ api_key = "anthropic-key"
             let turn = PendingTurn {
                 ctx,
                 agent_generation: 0,
+                inbound_content: msg.content.clone(),
                 msg,
                 delivery_message_id: "queued".into(),
                 ingress_receipt: Some(receipt),
