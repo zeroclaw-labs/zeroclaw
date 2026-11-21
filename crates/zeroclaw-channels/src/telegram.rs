@@ -46,6 +46,13 @@ const VOICE_DROP_NOTICE_TIMEOUT: Duration = Duration::from_secs(10);
 /// (including its error-body read). A stalled Telegram must not pin the turn.
 const REACTION_CLEAR_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Ceiling on one replied-to attachment prep download (`getFile` plus the
+/// CDN fetch). The prep runs inline while the update queue is being
+/// processed, and the HTTP client sets no request timeout — unbounded, a
+/// stalled Telegram answer would head-of-line block every later message.
+/// The prep is best-effort, so on timeout the file is simply not cached.
+const REPLY_PREP_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(30);
+
 static ORPHAN_THINK_TAG_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
     regex::Regex::new(r"</?(?:redacted_)?think(?:ing)?>").expect("ORPHAN_THINK_TAG_RE must compile")
 });
@@ -1136,6 +1143,10 @@ pub struct TelegramChannel {
     transcription: Option<zeroclaw_config::schema::TranscriptionConfig>,
     transcription_manager: Option<std::sync::Arc<super::transcription::TranscriptionManager>>,
     voice_transcriptions: Mutex<std::collections::HashMap<String, String>>,
+    /// Downloaded replied-to attachment files keyed by `"{chat_id}:{message_id}"`,
+    /// so `extract_reply_context` can hand the agent a path even when the
+    /// original message was dropped by the mention-only gate.
+    reply_file_paths: Mutex<std::collections::HashMap<String, String>>,
     workspace_dir: Option<std::path::PathBuf>,
     ack_reactions: bool,
     tts_manager: Option<Arc<super::tts::TtsManager>>,
@@ -1221,6 +1232,25 @@ enum AttachmentMaterialization {
         attachment: zeroclaw_api::media::MediaAttachment,
     },
     SkipPermanent,
+    RetryTransient,
+}
+
+/// Result of preparing the replied-to attachment before reply-context
+/// extraction, classified so callers can keep the update unacknowledged
+/// when the document is retrievable but the preparation failed transiently.
+///
+/// For a reply such as "summarize this document" the file is the task's
+/// input: acknowledging the update with only a bare `[Document]` marker
+/// would confirm delivery of a request the agent cannot serve.
+enum ReplyPrepOutcome {
+    /// File cached (or already cached); the reply context can reference it.
+    Ready,
+    /// Nothing to prepare, or the attachment can never be retrieved
+    /// (oversize, missing file id, terminal vendor rejection, unauthorized
+    /// sender). The update proceeds without the file, as before.
+    SkipPermanent,
+    /// Lookup, download, or write failed transiently. The update must be
+    /// retried from the same offset so the file can still reach the agent.
     RetryTransient,
 }
 
@@ -2762,6 +2792,7 @@ impl TelegramChannel {
             transcription: None,
             transcription_manager: None,
             voice_transcriptions: Mutex::new(std::collections::HashMap::new()),
+            reply_file_paths: Mutex::new(std::collections::HashMap::new()),
             workspace_dir: None,
             ack_reactions: true,
             tts_manager: None,
@@ -6005,6 +6036,12 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             })
             .unwrap_or("unknown");
 
+        let caption = reply
+            .get("caption")
+            .and_then(serde_json::Value::as_str)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
         let reply_text = if let Some(text) = reply.get("text").and_then(serde_json::Value::as_str) {
             text.to_string()
         } else if reply.get("voice").is_some() || reply.get("audio").is_some() {
@@ -6025,7 +6062,30 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         } else if reply.get("photo").is_some() {
             "[Photo]".to_string()
         } else if reply.get("document").is_some() {
-            "[Document]".to_string()
+            let reply_mid = reply.get("message_id").and_then(serde_json::Value::as_i64);
+            let chat_id = message
+                .get("chat")
+                .and_then(|c| c.get("id"))
+                .and_then(serde_json::Value::as_i64);
+            let body = if let (Some(mid), Some(cid)) = (reply_mid, chat_id) {
+                let key = format!("{cid}:{mid}");
+                if let Some(path) = self.reply_file_paths.lock().get(&key) {
+                    let file_name = std::path::Path::new(path)
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("document");
+                    format!("[Document: {file_name}] {path}")
+                } else {
+                    "[Document]".to_string()
+                }
+            } else {
+                "[Document]".to_string()
+            };
+            if let Some(caption) = caption {
+                format!("{body}\n\n{caption}")
+            } else {
+                body
+            }
         } else if reply.get("video").is_some() {
             "[Video]".to_string()
         } else if reply.get("sticker").is_some() {
@@ -6042,6 +6102,230 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             .join("\n");
 
         Some(format!("> @{reply_sender}:\n{quoted_lines}"))
+    }
+
+    /// Reduce a sender-declared document name to a safe local file name:
+    /// ASCII alphanumerics plus `. - _` survive, everything else becomes `_`,
+    /// leading dots are stripped, and the result is capped at 80 chars.
+    fn sanitize_attachment_filename(name: &str) -> String {
+        let mut out: String = name
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .take(80)
+            .collect();
+        while out.starts_with('.') {
+            out.remove(0);
+        }
+        out
+    }
+
+    /// Pre-download a replied-to document message so `extract_reply_context`
+    /// can reference it even when the original message was dropped by the
+    /// mention-only gate. A quote of a document must hand the agent the
+    /// file, not a bare "[Document]" marker.
+    async fn prepopulate_reply_attachment_context(
+        &self,
+        update: &serde_json::Value,
+    ) -> ReplyPrepOutcome {
+        let Some(message) = update.get("message") else {
+            return ReplyPrepOutcome::SkipPermanent;
+        };
+        let Some(reply) = message.get("reply_to_message") else {
+            return ReplyPrepOutcome::SkipPermanent;
+        };
+        let Some(doc) = reply.get("document") else {
+            return ReplyPrepOutcome::SkipPermanent;
+        };
+        // Same allowlist source as the message parsers: never the
+        // `"unknown"` display placeholder, only genuine identities.
+        if !self.is_any_user_allowed(
+            Self::authorization_identities(message)
+                .iter()
+                .map(String::as_str),
+        ) {
+            return ReplyPrepOutcome::SkipPermanent;
+        }
+
+        let reply_mid = match reply.get("message_id").and_then(serde_json::Value::as_i64) {
+            Some(m) => m,
+            None => return ReplyPrepOutcome::SkipPermanent,
+        };
+        let chat_id = match message
+            .get("chat")
+            .and_then(|c| c.get("id"))
+            .and_then(serde_json::Value::as_i64)
+        {
+            Some(c) => c,
+            None => return ReplyPrepOutcome::SkipPermanent,
+        };
+        let key = format!("{chat_id}:{reply_mid}");
+        if self.reply_file_paths.lock().contains_key(&key) {
+            return ReplyPrepOutcome::Ready;
+        }
+
+        let workspace = match self.workspace_dir.as_ref() {
+            Some(w) => w,
+            None => return ReplyPrepOutcome::SkipPermanent,
+        };
+        let save_dir = workspace.join("telegram_files");
+        if let Err(e) = tokio::fs::create_dir_all(&save_dir).await {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "error_key": "telegram.reply_prep.save_dir_failed",
+                        "error": zeroclaw_runtime::security::scrub(&format!("{}", e)),
+                    })),
+                "Failed to create telegram_files directory for replied-to attachment"
+            );
+            return ReplyPrepOutcome::RetryTransient;
+        }
+
+        // Declared size comes from the update JSON before any download —
+        // the same ceiling the ordinary attachment path applies.
+        let declared_size = reply
+            .get("document")
+            .and_then(|doc| doc.get("file_size"))
+            .and_then(serde_json::Value::as_u64);
+        if let Some(size) = declared_size
+            && size > TELEGRAM_MAX_FILE_DOWNLOAD_BYTES
+        {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                &format!(
+                    "Skipping replied-to attachment: file size {size} bytes exceeds {} MB limit",
+                    TELEGRAM_MAX_FILE_DOWNLOAD_BYTES / (1024 * 1024)
+                )
+            );
+            return ReplyPrepOutcome::SkipPermanent;
+        }
+
+        let file_id = match doc.get("file_id").and_then(serde_json::Value::as_str) {
+            Some(f) => f.to_string(),
+            None => return ReplyPrepOutcome::SkipPermanent,
+        };
+        let file_name = doc
+            .get("file_name")
+            .and_then(serde_json::Value::as_str)
+            .map(Self::sanitize_attachment_filename)
+            .unwrap_or_else(|| "file".to_string());
+        let local_filename = format!("doc_{chat_id}_{reply_mid}_{file_name}");
+
+        let tg_file_path =
+            match tokio::time::timeout(REPLY_PREP_DOWNLOAD_TIMEOUT, self.get_file_path(&file_id))
+                .await
+            {
+                Ok(Ok(p)) => p,
+                Ok(Err(e)) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({
+                                "error_key": "telegram.reply_prep.file_lookup_failed",
+                                "error": zeroclaw_runtime::security::scrub(&format!("{}", e)),
+                                "classification": format!("{:?}", e.kind),
+                            })),
+                        "Failed to get replied-to attachment file path"
+                    );
+                    return match e.kind {
+                        FileLookupFailure::Permanent => ReplyPrepOutcome::SkipPermanent,
+                        FileLookupFailure::Transient => ReplyPrepOutcome::RetryTransient,
+                    };
+                }
+                Err(_) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({
+                                "error_key": "telegram.reply_prep.file_lookup_timeout",
+                                "timeout_secs": REPLY_PREP_DOWNLOAD_TIMEOUT.as_secs(),
+                            })),
+                        "Timed out getting replied-to attachment file path"
+                    );
+                    return ReplyPrepOutcome::RetryTransient;
+                }
+            };
+        let data = match tokio::time::timeout(
+            REPLY_PREP_DOWNLOAD_TIMEOUT,
+            self.download_file(&tg_file_path),
+        )
+        .await
+        {
+            Ok(Ok(d)) => d,
+            Ok(Err(e)) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "error_key": "telegram.reply_prep.download_failed",
+                            "error": zeroclaw_runtime::security::scrub(&format!("{}", e)),
+                        })),
+                    "Failed to download replied-to attachment"
+                );
+                return ReplyPrepOutcome::RetryTransient;
+            }
+            Err(_) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "error_key": "telegram.reply_prep.download_timeout",
+                            "timeout_secs": REPLY_PREP_DOWNLOAD_TIMEOUT.as_secs(),
+                        })),
+                    "Timed out downloading replied-to attachment"
+                );
+                return ReplyPrepOutcome::RetryTransient;
+            }
+        };
+        // The declared size is absent for some media; enforce the ceiling on
+        // the actual payload as well.
+        if data.len() as u64 > TELEGRAM_MAX_FILE_DOWNLOAD_BYTES {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                &format!(
+                    "Skipping replied-to attachment: downloaded {} bytes exceeds {} MB limit",
+                    data.len(),
+                    TELEGRAM_MAX_FILE_DOWNLOAD_BYTES / (1024 * 1024)
+                )
+            );
+            return ReplyPrepOutcome::SkipPermanent;
+        }
+        let local_path = save_dir.join(&local_filename);
+        if let Err(e) = tokio::fs::write(&local_path, &data).await {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "error_key": "telegram.reply_prep.save_failed",
+                        "error": zeroclaw_runtime::security::scrub(&format!("{}", e)),
+                    })),
+                &format!(
+                    "Failed to save replied-to attachment to {}",
+                    local_path.display()
+                )
+            );
+            return ReplyPrepOutcome::RetryTransient;
+        }
+        let mut cache = self.reply_file_paths.lock();
+        if cache.len() >= 100 {
+            cache.clear();
+        }
+        cache.insert(key, local_path.to_string_lossy().into_owned());
+        ReplyPrepOutcome::Ready
     }
 
     /// Forum-topic thread id for history keying and reply routing, if this
@@ -7361,6 +7645,15 @@ Allowlist Telegram username (without '@') or numeric user ID.",
     /// Fixed, bounded delay between retries of a transiently failing update.
     /// The attempt count is diagnostic only.
     const TRANSIENT_RETRY_DELAY_SECS: u64 = 2;
+    /// How many times reply-document preparation may hold the offset for one
+    /// update (greptile P1, review of 17.11): past the cap a transient prep
+    /// failure stops blocking the queue. Parsing then decides — a message
+    /// the parsers would skip (mention-only gate, no bot mention) can never
+    /// stall later updates behind a failing file server, and a deliverable
+    /// reply degrades to the bare `[Document]` marker, the pre-feature
+    /// behavior for replies. The counter is the shared `transient_retry`
+    /// slot — no new state.
+    const REPLY_PREP_MAX_ATTEMPTS: u32 = 3;
 
     async fn pause_for_transient_update(
         uid: Option<i64>,
@@ -7439,6 +7732,29 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 *transient_retry = None;
             }
             return UpdateOutcome::Advanced;
+        }
+
+        // Download and cache the replied-to document before parsing, so the
+        // reply context can reference it even when the original message was
+        // dropped by the mention-only gate. A transient preparation failure
+        // holds the update unacknowledged only up to REPLY_PREP_MAX_ATTEMPTS
+        // times (greptile P1, 17.11): past the cap the update falls through
+        // to parsing, so a message the parsers would skip can never keep
+        // later updates waiting behind a failing file server. The document
+        // is the task's input, and acking the reply with only a bare
+        // `[Document]` marker would confirm delivery of a request the agent
+        // cannot serve — that trade-off stands only while the hold is
+        // bounded.
+        if let ReplyPrepOutcome::RetryTransient =
+            self.prepopulate_reply_attachment_context(update).await
+        {
+            let held = match transient_retry {
+                Some((tracked_uid, n)) if Some(*tracked_uid) == uid => *n,
+                _ => 0,
+            };
+            if held < Self::REPLY_PREP_MAX_ATTEMPTS {
+                return Self::pause_for_transient_update(uid, transient_retry).await;
+            }
         }
 
         // `parse_update_message` handles text messages and has no fallible
@@ -7638,7 +7954,35 @@ impl TelegramChannel {
         &self,
         tx: &tokio::sync::mpsc::Sender<ChannelMessage>,
         batch: MediaGroupBatch,
+        hold_on_prep_failure: bool,
     ) -> MediaGroupDispatchOutcome {
+        // Cache replied-to attachments of album members before parsing, so
+        // the anchor's reply context can reference them exactly like an
+        // ordinary update does in `process_update`. Best-effort and
+        // idempotent: members without a reply return immediately, and an
+        // already-cached file is not re-downloaded. One transient member
+        // failure requeues the whole batch — but only while
+        // `hold_on_prep_failure` stands (the shared REPLY_PREP_MAX_ATTEMPTS
+        // budget, same greptile P1 as `process_update`): past the cap the
+        // batch falls through to parsing, so a skipped album cannot stall
+        // the queue behind a failing file server.
+        let mut prep_outcome = ReplyPrepOutcome::Ready;
+        for update in &batch.updates {
+            match self.prepopulate_reply_attachment_context(update).await {
+                ReplyPrepOutcome::RetryTransient if hold_on_prep_failure => {
+                    prep_outcome = ReplyPrepOutcome::RetryTransient;
+                }
+                ReplyPrepOutcome::SkipPermanent
+                    if matches!(prep_outcome, ReplyPrepOutcome::Ready) =>
+                {
+                    prep_outcome = ReplyPrepOutcome::SkipPermanent;
+                }
+                _ => {}
+            }
+        }
+        if matches!(prep_outcome, ReplyPrepOutcome::RetryTransient) {
+            return MediaGroupDispatchOutcome::Retry(batch);
+        }
         let disposition = self
             .try_parse_media_group_with_unsupported(&batch.updates, &batch.unsupported)
             .await;
@@ -7704,7 +8048,23 @@ impl TelegramChannel {
     ) -> UpdateOutcome {
         let mut batches = batches.into_iter();
         while let Some(batch) = batches.next() {
-            match self.dispatch_media_group_batch(tx, batch).await {
+            // Shared REPLY_PREP_MAX_ATTEMPTS budget (greptile P1): the batch
+            // may hold the offset for reply-prep only while the tracked
+            // attempt count for its first update is below the cap.
+            let hold_on_prep_failure = match (
+                Self::media_group_batch_first_update_id(&batch),
+                *transient_retry,
+            ) {
+                (Some(tracked_uid), Some((uid, n))) => {
+                    uid == tracked_uid && n < Self::REPLY_PREP_MAX_ATTEMPTS
+                }
+                (Some(_), None) => true,
+                (None, _) => true,
+            };
+            match self
+                .dispatch_media_group_batch(tx, batch, hold_on_prep_failure)
+                .await
+            {
                 MediaGroupDispatchOutcome::Delivered(key) => {
                     Self::mark_media_group_delivered(queue, &key);
                     *transient_retry = None;
@@ -18884,6 +19244,275 @@ mod tests {
     // ─────────────────────────────────────────────────────────────────────
     // extract_reply_context tests
     // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn extract_reply_context_document_without_cache_stays_marker() {
+        let ch = TelegramChannel::new(
+            "t".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        );
+        let msg = serde_json::json!({
+            "reply_to_message": {
+                "from": { "username": "bob" },
+                "document": { "file_id": "abc", "file_name": "report.pdf" }
+            }
+        });
+        let ctx = ch.extract_reply_context(&msg).unwrap();
+        assert_eq!(ctx, "> @bob:\n> [Document]");
+    }
+
+    #[tokio::test]
+    async fn replied_document_is_downloaded_and_quoted_with_path() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let workspace = tempfile::tempdir().unwrap();
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/bot[^/]+/getFile$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "file_path": "documents/file_9.pdf" }
+            })))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/file/bot[^/]+/documents/file_9\.pdf$"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"%PDF-1.4 fake".to_vec()))
+            .mount(&mock_server)
+            .await;
+
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_mock_api_base(mock_server.uri())
+        .with_workspace_dir(workspace.path().to_path_buf());
+
+        let update = serde_json::json!({
+            "message": {
+                "message_id": 44,
+                "chat": { "id": -100_200_300, "type": "supergroup" },
+                "from": { "username": "alice", "id": 99 },
+                "text": "what is in this document?",
+                "reply_to_message": {
+                    "message_id": 40,
+                    "from": { "username": "bob", "id": 77 },
+                    "document": {
+                        "file_id": "doc-file-id",
+                        "file_name": "Q3 report final.pdf",
+                        "mime_type": "application/pdf"
+                    },
+                    "caption": "Confidential"
+                }
+            }
+        });
+
+        ch.prepopulate_reply_attachment_context(&update).await;
+
+        let ctx = ch
+            .extract_reply_context(&update["message"])
+            .expect("reply context should be present");
+        assert!(
+            ctx.contains("[Document: doc_-100200300_40_") && ctx.contains("Q3_report_final.pdf"),
+            "quoted document must expose the downloaded path, got: {ctx}"
+        );
+        assert!(
+            ctx.contains(&workspace.path().to_string_lossy().to_string()),
+            "the path must point into the workspace, got: {ctx}"
+        );
+        assert!(
+            ctx.contains("Confidential"),
+            "the caption must follow the document path, got: {ctx}"
+        );
+        let saved = std::fs::read_dir(workspace.path().join("telegram_files"))
+            .expect("telegram_files dir")
+            .count();
+        assert_eq!(saved, 1, "the replied-to document must be downloaded once");
+    }
+
+    #[tokio::test]
+    async fn transient_getfile_failure_holds_update_until_document_arrives() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let workspace = tempfile::tempdir().unwrap();
+        let mock_server = MockServer::start().await;
+
+        // First getFile call fails transiently (a bare 5xx with no
+        // structured terminal envelope), the next one succeeds.
+        let get_file_calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let counter = std::sync::Arc::clone(&get_file_calls);
+        Mock::given(method("GET"))
+            .and(path_regex(r"/bot[^/]+/getFile$"))
+            .respond_with(move |_req: &wiremock::Request| {
+                let n = counter.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    ResponseTemplate::new(500)
+                } else {
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "ok": true,
+                        "result": { "file_path": "documents/report.pdf" }
+                    }))
+                }
+            })
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/file/bot[^/]+/documents/report\.pdf$"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"%PDF-1.7 fake".to_vec()))
+            .mount(&mock_server)
+            .await;
+
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_mock_api_base(mock_server.uri())
+        .with_workspace_dir(workspace.path().to_path_buf());
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<ChannelMessage>(4);
+        let mut transient_retry = None;
+        let update = serde_json::json!({
+            "update_id": 55,
+            "message": {
+                "message_id": 45,
+                "chat": { "id": -100_200_300, "type": "supergroup" },
+                "from": { "username": "alice", "id": 99 },
+                "text": "summarize this document",
+                "reply_to_message": {
+                    "message_id": 40,
+                    "from": { "username": "bob", "id": 77 },
+                    "document": {
+                        "file_id": "doc-file-id",
+                        "file_name": "Q3 report final.pdf"
+                    }
+                }
+            }
+        });
+
+        // First pass: getFile fails transiently. The update must not be
+        // acknowledged or delivered — the document is the task's input, and
+        // acking the reply with only a bare `[Document]` marker would
+        // confirm delivery of a request the agent cannot serve.
+        let outcome = ch.process_update(&update, &tx, &mut transient_retry).await;
+        assert!(
+            matches!(outcome, UpdateOutcome::StopBatch),
+            "a transient prep failure must stop the batch so the offset stays put"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "document-dependent message must not be delivered without its file"
+        );
+        assert_eq!(transient_retry, Some((55, 1)));
+
+        // Second pass: getFile succeeds, the file downloads, and the
+        // message is delivered with the document path in the reply context.
+        let outcome = ch.process_update(&update, &tx, &mut transient_retry).await;
+        assert!(
+            matches!(outcome, UpdateOutcome::Advanced),
+            "retry after a transient getFile failure must deliver"
+        );
+        assert_eq!(transient_retry, None);
+        let msg = rx
+            .try_recv()
+            .expect("document-dependent message must be delivered once its file arrives");
+        assert!(
+            msg.content.contains("[Document: doc_-100200300_40_")
+                && msg.content.contains("Q3_report_final.pdf"),
+            "reply context must reference the downloaded file, got: {}",
+            msg.content
+        );
+        assert!(
+            msg.content
+                .contains(&workspace.path().to_string_lossy().to_string()),
+            "the path must point into the workspace, got: {}",
+            msg.content
+        );
+    }
+
+    #[tokio::test]
+    async fn reply_prep_cap_stops_holding_offset_for_gated_message() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let workspace = tempfile::tempdir().unwrap();
+        let mock_server = MockServer::start().await;
+
+        // The file server never recovers: every getFile call fails with a
+        // bare 5xx (transient classification, so prep keeps returning
+        // RetryTransient on every poll).
+        Mock::given(method("GET"))
+            .and(path_regex(r"/bot[^/]+/getFile$"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&mock_server)
+            .await;
+
+        // mention_only group: this reply names no bot mention and quotes
+        // another user's document, so the parsers would SkipPermanent it.
+        // Before the cap, a transient prep failure held the offset anyway
+        // (greptile P1, 17.11) and every later update waited behind a
+        // message that would never be delivered.
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            true,
+        )
+        .with_mock_api_base(mock_server.uri())
+        .with_workspace_dir(workspace.path().to_path_buf());
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<ChannelMessage>(4);
+        let update = serde_json::json!({
+            "update_id": 56,
+            "message": {
+                "message_id": 46,
+                "chat": { "id": -100_200_300, "type": "supergroup" },
+                "from": { "username": "alice", "id": 99 },
+                "text": "look at this document",
+                "reply_to_message": {
+                    "message_id": 40,
+                    "from": { "username": "bob", "id": 77 },
+                    "document": {
+                        "file_id": "doc-file-id",
+                        "file_name": "Q3 report final.pdf"
+                    }
+                }
+            }
+        });
+
+        // Below the cap each prep failure still holds the offset.
+        let mut transient_retry = None;
+        let outcome = ch.process_update(&update, &tx, &mut transient_retry).await;
+        assert!(
+            matches!(outcome, UpdateOutcome::StopBatch),
+            "below the cap a transient prep failure holds the offset"
+        );
+        assert_eq!(transient_retry, Some((56, 1)));
+
+        // Reach the cap: seed the shared counter at REPLY_PREP_MAX_ATTEMPTS.
+        transient_retry = Some((56, TelegramChannel::REPLY_PREP_MAX_ATTEMPTS));
+        let outcome = ch.process_update(&update, &tx, &mut transient_retry).await;
+        assert!(
+            matches!(outcome, UpdateOutcome::Advanced),
+            "past the cap a message the parsers skip must advance the offset"
+        );
+        assert_eq!(
+            transient_retry, None,
+            "skipped update clears the retry slot"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "a gated reply must not be delivered even after the cap"
+        );
+    }
 
     #[test]
     fn extract_reply_context_text_message() {
