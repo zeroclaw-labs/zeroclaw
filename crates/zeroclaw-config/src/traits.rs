@@ -459,35 +459,39 @@ impl std::fmt::Debug for PropFieldInfo {
 }
 
 pub trait MaskSecrets {
-    fn mask_secrets(&mut self);
-    fn restore_secrets_from(&mut self, current: &Self);
+    fn mask_secrets(&mut self) -> anyhow::Result<()>;
+    fn restore_secrets_from(&mut self, current: &Self) -> anyhow::Result<()>;
 }
 
 impl<T: MaskSecrets> MaskSecrets for std::collections::HashMap<String, T> {
-    fn mask_secrets(&mut self) {
+    fn mask_secrets(&mut self) -> anyhow::Result<()> {
         for v in self.values_mut() {
-            v.mask_secrets();
+            v.mask_secrets()?;
         }
+        Ok(())
     }
-    fn restore_secrets_from(&mut self, current: &Self) {
+    fn restore_secrets_from(&mut self, current: &Self) -> anyhow::Result<()> {
         for (k, v) in self.iter_mut() {
             if let Some(cur) = current.get(k) {
-                v.restore_secrets_from(cur);
+                v.restore_secrets_from(cur)?;
             }
         }
+        Ok(())
     }
 }
 
 impl<T: MaskSecrets> MaskSecrets for Vec<T> {
-    fn mask_secrets(&mut self) {
+    fn mask_secrets(&mut self) -> anyhow::Result<()> {
         for v in self.iter_mut() {
-            v.mask_secrets();
+            v.mask_secrets()?;
         }
+        Ok(())
     }
-    fn restore_secrets_from(&mut self, current: &Self) {
+    fn restore_secrets_from(&mut self, current: &Self) -> anyhow::Result<()> {
         for (v, cur) in self.iter_mut().zip(current.iter()) {
-            v.restore_secrets_from(cur);
+            v.restore_secrets_from(cur)?;
         }
+        Ok(())
     }
 }
 

@@ -157,7 +157,7 @@ pub fn stage(config: &mut Config, edit: RegistryEdit) -> Result<()> {
         serde_json::from_value(document).context("invalid provider registry")?;
     for (id, connection) in &mut registry.connections {
         if let Some(current) = config.providers.connections.get(id) {
-            connection.restore_secrets_from(current);
+            connection.restore_secrets_from(current)?;
         }
         connection.validate_editor_secrets()?;
     }

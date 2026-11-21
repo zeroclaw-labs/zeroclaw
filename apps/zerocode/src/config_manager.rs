@@ -2066,6 +2066,19 @@ impl App {
             .collect()
     }
 
+    /// Cost sheets are keyed by the rate registry's provider slots. They
+    /// intentionally do not reuse the retired provider maps: rate-only slots
+    /// such as `custom` and `openai-compatible` have no corresponding entry
+    /// under `providers.tts` or `providers.transcription`.
+    fn types_for_cost_section(&self, category: &str) -> Vec<ConfigTemplateEntry> {
+        let prefix = format!("cost.rates.providers.{category}");
+        self.templates
+            .iter()
+            .filter(|template| is_direct_child_path(&template.path, &prefix))
+            .cloned()
+            .collect()
+    }
+
     fn section_has_root_settings_row(&self, section_idx: usize) -> bool {
         self.sections.get(section_idx).is_some_and(|section| {
             section.shape == Some(SectionShape::TypedFamilyMap) && section.key == "channels"
@@ -2771,7 +2784,12 @@ impl App {
                     };
                 }
                 Some(SectionShape::CostRates) => {
-                    self.types = self.types_for_section(&section_key);
+                    let category = self
+                        .sections
+                        .get(idx)
+                        .map(|section| section.cost_category.as_str())
+                        .unwrap_or_default();
+                    self.types = self.types_for_cost_section(category);
                     self.type_cursor = 0;
                     self.load_type_alias_counts().await?;
                     self.screen = Screen::TypeList { section_idx: idx };
@@ -7165,6 +7183,31 @@ mod tests {
         App::new(rpc, std::path::Path::new("/tmp"))
     }
 
+    #[tokio::test]
+    async fn cost_type_picker_uses_rate_slots_including_custom() {
+        let mut manager = test_manager();
+        manager.templates = vec![
+            ConfigTemplateEntry {
+                path: "providers.tts.openai".into(),
+            },
+            ConfigTemplateEntry {
+                path: "cost.rates.providers.tts.openai".into(),
+            },
+            ConfigTemplateEntry {
+                path: "cost.rates.providers.tts.custom".into(),
+            },
+            ConfigTemplateEntry {
+                path: "cost.rates.providers.tts.custom.voice".into(),
+            },
+        ];
+
+        let types = manager.types_for_cost_section("tts");
+        assert_eq!(
+            types.iter().map(type_template_label).collect::<Vec<_>>(),
+            vec!["openai", "custom"]
+        );
+    }
+
     fn filter_test_term() -> Term {
         Terminal::with_options(
             WideCellCleanupBackend::new(io::stdout()),
@@ -8118,6 +8161,17 @@ mod tests {
             .handle_paste("{\r\n  \"connections\": {},\r\n  \"models\": {}\r\n}")
             .await;
         assert!(manager.edit_buf.contains('\n'));
+        let footer = manager.bottom_hint();
+        assert!(footer.contains(&format!(
+            "{}={}",
+            editor_key(crate::keymap::ConfigEditorAction::Confirm),
+            crate::i18n::t("zc-config-footer-action-new-line")
+        )));
+        assert!(footer.contains(&format!(
+            "{}={}",
+            editor_key(crate::keymap::ConfigEditorAction::Save),
+            crate::i18n::t("zc-config-footer-action-save")
+        )));
         let candidate: serde_json::Value = serde_json::from_str(&manager.edit_buf).unwrap();
         let answers = async {
             answer_config_request(

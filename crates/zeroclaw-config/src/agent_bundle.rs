@@ -298,7 +298,9 @@ pub fn plan_export(config: &Config, alias: &str) -> Result<ExportPlan, ExportErr
     // MCP server's `env`), so the selection below can never pick up a secret
     // the schema knows about.
     let mut masked = config.clone();
-    masked.mask_secrets();
+    masked
+        .mask_secrets()
+        .map_err(|error| ExportError::Serialize(error.to_string()))?;
     let masked_root = to_table(&masked)?;
 
     let mut out = toml::Table::new();
@@ -1365,7 +1367,9 @@ fn masked_server_table(
         Some(table) => Ok(table),
         None => {
             let mut masked = fallback.clone();
-            masked.mask_secrets();
+            masked
+                .mask_secrets()
+                .map_err(|error| ExportError::Serialize(error.to_string()))?;
             to_table(&masked)
         }
     }

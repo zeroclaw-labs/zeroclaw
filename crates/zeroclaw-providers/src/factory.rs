@@ -1560,8 +1560,8 @@ impl FamilyProviderFactory for AzureModelProviderConfig {
         _api_url: Option<&str>,
         opts: &ModelProviderRuntimeOptions,
     ) -> Result<Box<dyn ModelProvider>> {
-        // Fields were materialized from the selected connection's extra
-        // resource/api_version and the model's extra deployment.
+        // Family-specific fields are read from the legacy Azure model entry
+        // until the later registry activation layer changes the consumer.
         let resource = self.resource.as_deref().ok_or_else(|| {
             ::zeroclaw_log::record!(
                 ERROR,
@@ -1576,7 +1576,7 @@ impl FamilyProviderFactory for AzureModelProviderConfig {
             );
             anyhow::Error::msg(
                 "Azure model_provider requires `resource`: set \
-                 `[providers.models.<family>.<alias>] provider_extra = { resource = \"...\" }` in config.toml.",
+                 `[providers.models.azure.<alias>] resource = \"...\"` in config.toml.",
             )
         })?;
         let deployment = self.deployment.as_deref().ok_or_else(|| {
@@ -1593,7 +1593,7 @@ impl FamilyProviderFactory for AzureModelProviderConfig {
             );
             anyhow::Error::msg(
                 "Azure model_provider requires `deployment`: set \
-                 `[providers.models.<family>.<alias>] provider_extra = { deployment = \"...\" }` in config.toml.",
+                 `[providers.models.azure.<alias>] deployment = \"...\"` in config.toml.",
             )
         })?;
         let api_version = self.api_version.as_deref();
@@ -1762,7 +1762,7 @@ impl FamilyProviderFactory for GroqModelProviderConfig {
             .without_assistant_reasoning_replay();
         // Groq's llama-family models reject native tool calls with HTTP
         // 400; default to text-fallback. Operators can override per-alias
-        // via `[providers.models.<key>.options] native_tools = true`.
+        // via `[providers.models.groq.<alias>] native_tools = true`.
         if opts.native_tools != Some(true) {
             b = b.without_native_tools();
         }
@@ -2030,7 +2030,7 @@ impl FamilyProviderFactory for CustomModelProviderConfig {
             );
             anyhow::Error::msg(
                 "Custom model_provider requires `uri`: set \
-                 `[providers.models.<family>.<alias>] uri = \"https://your-api.com\"` in config.toml.",
+                 `[providers.models.custom.<alias>] uri = \"https://your-api.com\"` in config.toml.",
             )
         })?;
         if let Some(p) = build_responses_provider_if_requested(

@@ -15,21 +15,12 @@ use reqwest::{Client, RequestBuilder};
 
 use zeroclaw_config::provider_registry::{Override, ProviderConnection};
 
-/// Immutable transport policy materialized for one admitted chat model.
-/// Clients remain owned by the shared cache so live proxy updates take effect.
-#[derive(Clone, Copy, Debug)]
+/// Native chat transport policy. The live proxy authority owns cached clients;
+/// this value only describes the builder settings used to select a pool.
+#[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct ChatHttpTimeouts {
     request: Option<Duration>,
     read: Option<Duration>,
-}
-
-impl Default for ChatHttpTimeouts {
-    fn default() -> Self {
-        Self {
-            request: Some(Duration::from_secs(120)),
-            read: Some(crate::STREAM_IDLE_TIMEOUT),
-        }
-    }
 }
 
 impl ChatHttpTimeouts {
@@ -37,13 +28,8 @@ impl ChatHttpTimeouts {
         Self {
             request: (!options.provider_timeout_disabled)
                 .then(|| Duration::from_secs(options.provider_timeout_secs.unwrap_or(120))),
-            read: (!options.provider_read_timeout_disabled).then(|| {
-                Duration::from_secs(
-                    options
-                        .provider_read_timeout_secs
-                        .unwrap_or(crate::STREAM_IDLE_TIMEOUT.as_secs()),
-                )
-            }),
+            read: (!options.provider_read_timeout_disabled)
+                .then(|| Duration::from_secs(options.provider_read_timeout_secs.unwrap_or(300))),
         }
     }
 
@@ -62,6 +48,66 @@ impl ChatHttpTimeouts {
     }
 }
 
+#[derive(Default)]
+pub(crate) struct ChatHttpPolicy<'a> {
+    pub request_timeout: Option<Duration>,
+    pub read_timeout: Option<Duration>,
+    pub headers: HeaderMap,
+    pub redirect_endpoint: Option<&'a str>,
+    /// Compatible adapters historically ignore malformed custom PEM and retain
+    /// system roots. Keep that policy while including the bytes in pool identity.
+    pub tls_ca_cert_pem: Option<&'a [u8]>,
+}
+
+impl ChatHttpPolicy<'_> {
+    pub fn client(self, service_key: &str) -> Result<Client> {
+        let mut fingerprint = std::collections::hash_map::DefaultHasher::new();
+        self.request_timeout.hash(&mut fingerprint);
+        self.read_timeout.hash(&mut fingerprint);
+        self.redirect_endpoint.hash(&mut fingerprint);
+        self.tls_ca_cert_pem.hash(&mut fingerprint);
+        for (name, value) in &self.headers {
+            name.as_str().hash(&mut fingerprint);
+            value.as_bytes().hash(&mut fingerprint);
+        }
+        let profile = format!("chat-http:{:016x}", fingerprint.finish());
+        zeroclaw_config::schema::try_build_runtime_proxy_client_with(
+            service_key,
+            &profile,
+            |builder| {
+                let mut builder = builder
+                    .connect_timeout(Duration::from_secs(10))
+                    .default_headers(self.headers);
+                if let Some(timeout) = self.request_timeout {
+                    builder = builder.timeout(timeout);
+                }
+                if let Some(timeout) = self.read_timeout {
+                    builder = builder.read_timeout(timeout);
+                }
+                if let Some(endpoint) = self.redirect_endpoint {
+                    builder = crate::opencode_session::restrict_redirects(builder, endpoint);
+                }
+                if let Some(pem) = self.tls_ca_cert_pem {
+                    match reqwest::Certificate::from_pem(pem) {
+                        Ok(cert) => builder = builder.add_root_certificate(cert),
+                        Err(error) => ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"error": error.to_string()})),
+                            "Failed to parse CA certificate — TLS will use system roots"
+                        ),
+                    }
+                }
+                Ok(builder)
+            },
+        )
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct HttpTransportConfig {
     pub(crate) base_url: String,
@@ -69,6 +115,10 @@ pub(crate) struct HttpTransportConfig {
     pub(crate) extra_headers: BTreeMap<String, String>,
     pub(crate) request_timeout_secs: Option<Override<NonZeroU64>>,
     pub(crate) tls_ca_cert_path: Option<String>,
+    /// Existing capability adapters follow provider redirects by default.
+    /// Native protocols can opt out when forwarding credentials to a new
+    /// origin would violate their protocol boundary.
+    pub(crate) follow_redirects: bool,
 }
 
 impl std::fmt::Debug for HttpTransportConfig {
@@ -89,6 +139,7 @@ impl HttpTransportConfig {
             extra_headers: connection.extra_headers().cloned().unwrap_or_default(),
             request_timeout_secs,
             tls_ca_cert_path: connection.tls_ca_cert_path().map(ToOwned::to_owned),
+            follow_redirects: true,
         })
     }
 
@@ -99,7 +150,13 @@ impl HttpTransportConfig {
             extra_headers: BTreeMap::new(),
             request_timeout_secs: None,
             tls_ca_cert_path: None,
+            follow_redirects: true,
         }
+    }
+
+    pub(crate) fn without_redirects(mut self) -> Self {
+        self.follow_redirects = false;
+        self
     }
 
     pub fn client(&self, default_timeout: Duration, service_key: &str) -> Result<Client> {
@@ -119,14 +176,16 @@ impl HttpTransportConfig {
         timeout.hash(&mut fingerprint);
         self.extra_headers.hash(&mut fingerprint);
         certificate.hash(&mut fingerprint);
+        self.follow_redirects.hash(&mut fingerprint);
         let profile = format!("provider-http:{:016x}", fingerprint.finish());
         zeroclaw_config::schema::try_build_runtime_proxy_client_with(
             service_key,
             &profile,
             |builder| {
-                let mut builder = builder
-                    .redirect(reqwest::redirect::Policy::none())
-                    .default_headers(self.headers()?);
+                let mut builder = builder.default_headers(self.headers()?);
+                if !self.follow_redirects {
+                    builder = builder.redirect(reqwest::redirect::Policy::none());
+                }
                 if let Some(timeout) = timeout {
                     builder = builder.timeout(timeout);
                 }
@@ -188,55 +247,61 @@ pub(crate) fn append_endpoint(base_url: &str, suffix: &str) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::ChatHttpPolicy;
+    use std::{net::SocketAddr, time::Duration};
 
     #[tokio::test]
-    async fn chat_transport_enforces_total_and_read_deadlines_and_honors_clear() {
-        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_millis(150)))
-            .mount(&server)
-            .await;
-        let short = Some(Duration::from_millis(20));
-        for policy in [
-            ChatHttpTimeouts {
-                request: short,
-                read: None,
-            },
-            ChatHttpTimeouts {
-                request: None,
-                read: short,
-            },
-        ] {
-            let error = policy
-                .client("model_provider.gemini")
-                .unwrap()
-                .get(server.uri())
-                .send()
-                .await
-                .unwrap_err();
-            assert!(error.is_timeout(), "{error:#}");
-        }
-        let cleared = ChatHttpTimeouts::from_options(&crate::ModelProviderRuntimeOptions {
-            provider_timeout_secs: Some(1),
-            provider_timeout_disabled: true,
-            provider_read_timeout_secs: Some(1),
-            provider_read_timeout_disabled: true,
-            ..Default::default()
+    async fn native_chat_reuses_connections_and_respects_policy_and_proxy_changes() {
+        use axum::{Router, extract::ConnectInfo, routing::get};
+
+        let _proxy_guard = crate::RuntimeProxyTestGuard::acquire().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let app = Router::new().route(
+            "/",
+            get(|ConnectInfo(address): ConnectInfo<SocketAddr>| async move { address.to_string() }),
+        );
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
         });
-        assert_eq!(cleared.request, None);
-        assert_eq!(cleared.read, None);
+        let _server_guard = scopeguard::guard(server, |server| server.abort());
+
+        let build = |seconds| {
+            ChatHttpPolicy {
+                request_timeout: Some(Duration::from_secs(seconds)),
+                ..Default::default()
+            }
+            .client("model_provider.openai")
+            .unwrap()
+        };
+        let peer = async |client: &reqwest::Client| {
+            client.get(&url).send().await.unwrap().text().await.unwrap()
+        };
+        let first = build(60);
+        let first_peer = peer(&first).await;
+        let second = build(60);
         assert_eq!(
-            cleared
-                .client("model_provider.gemini")
-                .unwrap()
-                .get(server.uri())
-                .send()
-                .await
-                .unwrap()
-                .status(),
-            200
+            first_peer,
+            peer(&second).await,
+            "same policy reuses its TCP connection"
+        );
+        let changed = build(61);
+        assert_ne!(
+            first_peer,
+            peer(&changed).await,
+            "different timeouts select a different pool"
+        );
+        zeroclaw_config::schema::set_runtime_proxy_config(Default::default());
+        let after_proxy_publication = build(60);
+        assert_ne!(
+            first_peer,
+            peer(&after_proxy_publication).await,
+            "proxy publication invalidates the old pool"
         );
     }
 }

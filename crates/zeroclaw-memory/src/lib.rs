@@ -875,6 +875,47 @@ fn wrap_in_retrieval_pipeline(memory: Arc<dyn Memory>, config: &MemoryConfig) ->
     ))
 }
 
+/// Local Markdown and disabled agents bypass the install-wide backend.
+enum AgentMemorySource {
+    WorkspaceMarkdown,
+    Disabled,
+    InstallWide,
+}
+
+impl AgentMemorySource {
+    fn for_backend(backend: zeroclaw_config::multi_agent::MemoryBackendKind) -> Self {
+        use zeroclaw_config::multi_agent::MemoryBackendKind as Backend;
+        match backend {
+            Backend::Markdown => Self::WorkspaceMarkdown,
+            Backend::None => Self::Disabled,
+            Backend::Sqlite | Backend::Postgres | Backend::Qdrant | Backend::Lucid => {
+                Self::InstallWide
+            }
+        }
+    }
+}
+
+/// Describe the backend selected for an agent without opening its store or running maintenance.
+pub fn configured_memory_backend(config: &Config, agent_alias: Option<&str>) -> String {
+    let source = agent_alias
+        .and_then(|alias| config.agents.get(alias))
+        .map_or(AgentMemorySource::InstallWide, |agent| {
+            AgentMemorySource::for_backend(agent.memory.backend)
+        });
+    match source {
+        AgentMemorySource::WorkspaceMarkdown => "markdown".into(),
+        AgentMemorySource::Disabled => "none".into(),
+        AgentMemorySource::InstallWide => {
+            let key = backend_kind_from_dotted(&config.memory.backend);
+            if classify_memory_backend(&key) == MemoryBackendKind::Unknown {
+                "markdown".into()
+            } else {
+                key
+            }
+        }
+    }
+}
+
 /// Build the per-agent memory wrapper for `agent_alias`.
 ///
 /// Wraps the appropriate inner backend with `AgentScopedMemory` (for
@@ -950,7 +991,8 @@ pub async fn create_memory_for_agent(
     // shared backend. Skip the inner-backend factory entirely, but still
     // apply the install-wide policy decorator to own and peer Markdown
     // stores before composition.
-    if matches!(backend_kind, ConfigBackend::Markdown) {
+    let source = AgentMemorySource::for_backend(backend_kind);
+    if matches!(source, AgentMemorySource::WorkspaceMarkdown) {
         if agent_cfg
             .workspace
             .read_memory_from
@@ -1002,7 +1044,7 @@ pub async fn create_memory_for_agent(
     // attempted store/recall operations on the no-op backend; the
     // install-wide factory wraps `NoneMemory` the same way, and opt-in
     // audit coverage must not become backend/path-dependent.
-    if matches!(backend_kind, ConfigBackend::None) {
+    if matches!(source, AgentMemorySource::Disabled) {
         return Ok(Arc::from(wrap_audit(
             NoneMemory::new("none"),
             &config.data_dir,
@@ -1441,6 +1483,45 @@ mod tests {
             assert_eq!(embedded_rows(&mem), 1);
             assert_eq!(mem.stored_embedding_identity().unwrap(), Some(current));
         }
+    }
+
+    #[tokio::test]
+    async fn v4_embedding_identity_upgrade_through_factory_keeps_vectors() {
+        let tmp = TempDir::new().unwrap();
+        let legacy = static_sqlite(tmp.path(), 4);
+        legacy
+            .record_embedding_identity(&ident("openai", "text-embedding-3-small", 4))
+            .unwrap();
+        legacy
+            .store("legacy", "pre-existing row", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        assert_eq!(embedded_rows(&legacy), 1);
+        drop(legacy);
+
+        // This is the shape admitted from a V4 file: the chat profile carries
+        // the credential while memory still names the embedding provider and
+        // model separately.  The normalizer must promote it before the real
+        // memory factory resolves the canonical binding.
+        let mut config = Config {
+            data_dir: tmp.path().to_path_buf(),
+            ..Config::default()
+        };
+        config.memory.backend = "sqlite".into();
+        config.memory.embedding_provider = "openai".into();
+        config.memory.embedding_model = "text-embedding-3-small".into();
+        config.memory.embedding_dimensions = 4;
+        let profile = config.providers.models.ensure("openai", "work").unwrap();
+        profile.model = Some("chat-model".into());
+        profile.api_key = Some("chat-key".into());
+        zeroclaw_config::migration::normalize_test_input(&mut config);
+
+        let expected_identity = build_embedder_from_config(&config).unwrap().identity();
+        drop(create_memory_from_config(&config).unwrap());
+        let reopened = SqliteMemory::new("test", tmp.path()).unwrap();
+        assert_eq!(embedded_rows(&reopened), 1);
+        let identity = reopened.stored_embedding_identity().unwrap().unwrap();
+        assert_eq!(identity, expected_identity);
     }
 
     #[tokio::test]
@@ -2410,6 +2491,40 @@ url = "http://localhost:6333"
         let mem = create_memory_with_storage(&cfg, ActiveStorage::Qdrant(&storage), tmp.path())
             .expect("qdrant with resolved storage config must still construct");
         assert_eq!(mem.name(), "qdrant");
+    }
+
+    #[tokio::test]
+    async fn configured_memory_backend_matches_the_opened_agent_store() {
+        use zeroclaw_config::multi_agent::{AgentMemoryConfig, MemoryBackendKind as AgentBackend};
+        use zeroclaw_config::schema::AliasedAgentConfig;
+
+        for (agent_backend, shared_backend, expected) in [
+            (AgentBackend::Markdown, "none", "markdown"),
+            (AgentBackend::None, "sqlite", "none"),
+            (AgentBackend::Postgres, "sqlite.default", "sqlite"),
+        ] {
+            let dir = TempDir::new().unwrap();
+            let mut config = Config {
+                config_path: dir.path().join("config.toml"),
+                data_dir: dir.path().join("data"),
+                ..Config::default()
+            };
+            config.memory.backend = shared_backend.into();
+            config.agents.insert(
+                "worker".into(),
+                AliasedAgentConfig {
+                    memory: AgentMemoryConfig {
+                        backend: agent_backend,
+                    },
+                    ..AliasedAgentConfig::default()
+                },
+            );
+
+            let name = configured_memory_backend(&config, Some("worker"));
+            let memory = create_memory_for_agent(&config, "worker").await.unwrap();
+            assert_eq!(name, expected);
+            assert_eq!(memory.name(), name);
+        }
     }
 
     #[test]

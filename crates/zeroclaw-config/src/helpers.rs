@@ -1246,6 +1246,23 @@ mod registry_reflection_tests {
 
     #[test]
     fn nested_map_crud_rebases_flattened_prefix_and_preserves_dotted_keys() {
+        let mut family = Family::default();
+        let sections = Family::map_key_sections();
+        let section = &sections
+            .iter()
+            .find(|section| section.path.ends_with(".models"))
+            .unwrap()
+            .path;
+        assert_eq!(section, "profiles.openai.models");
+        assert!(family.create_map_key(section, "chat.fast").unwrap());
+        assert_eq!(family.get_map_keys(section).unwrap(), vec!["chat.fast"]);
+        assert!(
+            family
+                .rename_map_key(section, "chat.fast", "chat.backup")
+                .unwrap()
+        );
+        assert!(family.delete_map_key(section, "chat.backup").unwrap());
+
         let mut catalog = Catalog::default();
         catalog
             .profiles
@@ -1305,16 +1322,23 @@ mod registry_reflection_tests {
             value.extra.decrypt_in_place(store, "sample.extra")
         }
 
-        pub fn mask_secrets(value: &mut SecretSample) {
+        pub fn mask_secrets(value: &mut SecretSample) -> anyhow::Result<()> {
+            anyhow::ensure!(value.extra != "fixture-error", "extension mask failed");
             if !value.extra.is_empty() {
                 value.extra = MASKED_SECRET.to_owned();
             }
+            Ok(())
         }
 
-        pub fn restore_secrets_from(value: &mut SecretSample, current: &SecretSample) {
+        pub fn restore_secrets_from(
+            value: &mut SecretSample,
+            current: &SecretSample,
+        ) -> anyhow::Result<()> {
+            anyhow::ensure!(current.extra != "fixture-error", "extension restore failed");
             if value.extra == MASKED_SECRET {
                 value.extra.clone_from(&current.extra);
             }
+            Ok(())
         }
     }
 
@@ -1337,12 +1361,35 @@ mod registry_reflection_tests {
             token: value.token.clone(),
             extra: value.extra.clone(),
         };
-        masked.mask_secrets();
+        masked.mask_secrets().unwrap();
         assert_eq!(masked.token, crate::traits::MASKED_SECRET);
         assert_eq!(masked.extra, crate::traits::MASKED_SECRET);
-        masked.restore_secrets_from(&value);
+        masked.restore_secrets_from(&value).unwrap();
         assert_eq!(masked.token, value.token);
         assert_eq!(masked.extra, value.extra);
+    }
+
+    #[test]
+    fn extension_secret_hook_errors_reach_the_caller() {
+        let mut value = SecretSample {
+            token: String::new(),
+            extra: "fixture-error".into(),
+        };
+        assert!(
+            value
+                .mask_secrets()
+                .unwrap_err()
+                .to_string()
+                .contains("extension mask failed")
+        );
+        let mut masked = SecretSample::default();
+        assert!(
+            masked
+                .restore_secrets_from(&value)
+                .unwrap_err()
+                .to_string()
+                .contains("extension restore failed")
+        );
     }
 
     #[zeroclaw_macros::normalize_config_input(normalize)]

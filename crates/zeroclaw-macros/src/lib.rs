@@ -195,10 +195,10 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
         quote! { #path::decrypt_secrets(self, store)?; }
     });
     let mask_secrets_hook = secret_hook.as_ref().map(|path| {
-        quote! { #path::mask_secrets(self); }
+        quote! { #path::mask_secrets(self)?; }
     });
     let restore_secrets_hook = secret_hook.as_ref().map(|path| {
-        quote! { #path::restore_secrets_from(self, current); }
+        quote! { #path::restore_secrets_from(self, current)?; }
     });
     let integration_descriptor_method = match build_integration_descriptor_method(&input.attrs) {
         Ok(method) => method,
@@ -537,10 +537,10 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
 
                 // MaskSecrets — the blanket impl handles both single and double nesting.
                 mask_ops.push(quote! {
-                    crate::traits::MaskSecrets::mask_secrets(&mut self.#field_ident);
+                    crate::traits::MaskSecrets::mask_secrets(&mut self.#field_ident)?;
                 });
                 restore_ops.push(quote! {
-                    crate::traits::MaskSecrets::restore_secrets_from(&mut self.#field_ident, &current.#field_ident);
+                    crate::traits::MaskSecrets::restore_secrets_from(&mut self.#field_ident, &current.#field_ident)?;
                 });
 
                 let field_name_lit = snake_to_kebab(&field_ident.to_string());
@@ -1271,11 +1271,11 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                 continue;
             } else if is_option {
                 mask_ops.push(quote! {
-                    if let Some(inner) = &mut self.#field_ident { inner.mask_secrets(); }
+                    if let Some(inner) = &mut self.#field_ident { inner.mask_secrets()?; }
                 });
                 restore_ops.push(quote! {
                     if let Some(inner) = &mut self.#field_ident {
-                        if let Some(cur) = &current.#field_ident { inner.restore_secrets_from(cur); }
+                        if let Some(cur) = &current.#field_ident { inner.restore_secrets_from(cur)?; }
                     }
                 });
 
@@ -1446,13 +1446,13 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                     }
                 });
                 mask_ops.push(quote! {
-                    crate::traits::MaskSecrets::mask_secrets(&mut self.#field_ident);
+                    crate::traits::MaskSecrets::mask_secrets(&mut self.#field_ident)?;
                 });
                 restore_ops.push(quote! {
                     crate::traits::MaskSecrets::restore_secrets_from(
                         &mut self.#field_ident,
                         &current.#field_ident,
-                    );
+                    )?;
                 });
 
                 let vec_inner_name = vec_inner_ty.to_token_stream().to_string();
@@ -1843,10 +1843,10 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                 });
 
                 mask_ops.push(quote! {
-                    self.#field_ident.mask_secrets();
+                    self.#field_ident.mask_secrets()?;
                 });
                 restore_ops.push(quote! {
-                    self.#field_ident.restore_secrets_from(&current.#field_ident);
+                    self.#field_ident.restore_secrets_from(&current.#field_ident)?;
                 });
 
                 let field_ty = &field.ty;
@@ -2090,18 +2090,18 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                         for mut section in <#field_ty>::map_key_sections() {
                             let outer_prefix = Self::configurable_prefix();
                             let inner_prefix = <#field_ty>::configurable_prefix();
-                            let rebased = if outer_prefix.is_empty() {
+                            let rebased = if inner_prefix.is_empty() {
                                 Some(section.path.as_str())
                             } else {
                                 section.path
-                                    .strip_prefix(outer_prefix)
+                                    .strip_prefix(inner_prefix)
                                     .and_then(|s| s.strip_prefix('.'))
                             };
                             if let Some(leaf) = rebased {
-                                section.path = if inner_prefix.is_empty() {
+                                section.path = if outer_prefix.is_empty() {
                                     leaf.to_string()
                                 } else {
-                                    format!("{inner_prefix}.{leaf}")
+                                    format!("{outer_prefix}.{leaf}")
                                 };
                                 out.push(section);
                             }
@@ -2578,13 +2578,15 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
         }
 
         impl crate::traits::MaskSecrets for #struct_name {
-            fn mask_secrets(&mut self) {
+            fn mask_secrets(&mut self) -> anyhow::Result<()> {
                 #(#mask_ops)*
                 #mask_secrets_hook
+                Ok(())
             }
-            fn restore_secrets_from(&mut self, current: &Self) {
+            fn restore_secrets_from(&mut self, current: &Self) -> anyhow::Result<()> {
                 #(#restore_ops)*
                 #restore_secrets_hook
+                Ok(())
             }
         }
     };
@@ -3282,6 +3284,8 @@ fn extract_hashmap_value_type(ty: &syn::Type) -> Option<&syn::Type> {
 /// Deserialize a configuration through a transient input DTO, then normalize
 /// it before exposing the authoritative value. Both DTO and value use the
 /// original field definitions, so schema fields cannot drift between them.
+/// Only direct `serde` and `cfg` attributes are copied to the input DTO;
+/// conditional serde attributes via `cfg_attr` are not supported.
 #[proc_macro_attribute]
 pub fn normalize_config_input(args: TokenStream, item: TokenStream) -> TokenStream {
     let normalize = parse_macro_input!(args as syn::Path);

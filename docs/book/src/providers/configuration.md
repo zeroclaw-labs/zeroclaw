@@ -209,7 +209,7 @@ Almost every family also takes the shared fields from `ModelProviderConfig`:
 - `vision`: override the provider's image-input (vision) capability. Leave unset to use the family's built-in default. Set `false` for a text-only model served by a vision-capable family (for example, a text model behind llama.cpp) so image messages route to a configured `[multimodal] vision_model_provider` instead of erroring; set `true` to force it on. Without a configured vision provider, a non-vision turn proceeds with media markers replaced by a placeholder when none of the latest user message's image references pass the existence, data-URI-structure, or remote-fetch-policy checks (a missing file, a malformed data URI, or a remote URL while `multimodal.allow_remote_fetch` is off). A local path counts only when it is absolute, allowed by the agent's filesystem policy (the same check the file tools apply), and exists as a file; paths the policy rejects are never probed. If any reference does pass, the turn still fails with the vision capability error. The resolvability check evaluates at most 16 absolute local-path markers per turn; for those, the policy check and the existence probe run together on a blocking thread, off the async executor. A message with more such markers treats the rest as resolvable without any check, so an oversized message fails toward the capability error instead of a silent degrade.
 - `tool_result_image_policy`: handling for images attached to native `role = "tool"` results sent to compatible chat-completions providers. A tool result's images are declared in an `attachments` array beside the result text in the tool-result carrier, never recovered from the result text itself, so literal marker syntax in a tool's output is just text. Defaults to `"relocate"`: the declared image is kept but moved into a following `role = "user"` message, so endpoints that reject image parts in a tool result (HTTP 400) still receive it with no per-provider config; verified against opencode zen (mimo-v2.5) and llama.cpp. Relocation places a user message directly after a tool message: if a backend's chat template rejects that order, fall back to `"image_url"` or `"omit"`. Set to `"image_url"` to send declared images as `image_url` parts inside the tool message, or to `"omit"` to drop them and append a fixed notice. The policy reads the `attachments` array of native carriers only; a legacy tool result (no array key) passes verbatim under all settings, because it declares nothing and its body is text. This does not change direct user images or OpenAI Responses providers.
 - `cache_passthrough`: opt into Anthropic prompt caching on chat-completions gateways that translate to the Anthropic Messages API. Adds at most two `cache_control` breakpoints per request and surfaces gateway-reported cache reads in token usage. Default `false`, requests unchanged. Requires route qualification before production use; see [Prompt cache passthrough](#prompt-cache-passthrough-chat-completions-gateways).
-- `cache_ttl`: cache entry lifetime requested for Anthropic prompt-cache markers. `"5m"` (default) or `"1h"`. Applies to the native Anthropic provider directly, and to chat-completions gateways behind `cache_passthrough`; without passthrough it is inert. Providers that emit their own cache markers by other means (openrouter) ignore the setting. See [Choosing a 1h cache lifetime](#choosing-a-1h-cache-lifetime).
+- `cache_ttl`: cache entry lifetime requested for Anthropic prompt-cache markers. `"5m"` (default), `"1h"`, or `"off"` to place no markers at all. Applies to the native Anthropic provider directly, and to chat-completions gateways behind `cache_passthrough`; without passthrough it is inert. Providers that emit their own cache markers by other means (openrouter) ignore the setting. See [Choosing a 1h cache lifetime](#choosing-a-1h-cache-lifetime).
 - `tls_ca_cert_path`: absolute path to a PEM-encoded CA certificate for TLS connections to this provider (a per-provider trust override, distinct from the gateway TLS `ca_cert_path`). Shell expansion such as `~` is not performed; leave unset to use the system trust store.
 
 Family-specific entries add their own typed fields on top of these shared fields.
@@ -295,11 +295,12 @@ into replayable signed blocks, and signed blocks are replayed on outbound
 history.
 
 Before reaching for this flag, check whether the gateway also exposes an
-Anthropic Messages endpoint. If it does, point a
-`[providers.models."<model-ref>"]` entry at it with `uri`; the native
-provider handles thinking, signed-block replay, and prompt caching without
-translation. `thinking_passthrough` is for gateways that offer only the Chat
-Completions surface.
+Anthropic Messages endpoint. If it does, put that endpoint on the referenced
+`[providers.connections."<connection>"]` entry's `uri` and keep the model's
+`provider` field pointed at that connection; the native provider handles
+thinking, signed-block replay, and prompt caching without translation.
+`thinking_passthrough` is for gateways that offer only the Chat Completions
+surface.
 
 ```toml
 [providers]
@@ -418,8 +419,8 @@ wire_api = "chat_completions"
 
 For most families, the URL is resolved in this order:
 
-1. **Operator override**: `uri` field on the alias entry, if set.
-2. **Family endpoint**: the family's `*Endpoint` enum supplies the URL (e.g. `OpenAIEndpoint::Default` -> `https://api.openai.com/v1`). Multi-region families have an `endpoint` field on the alias entry that picks the variant (e.g. `endpoint = "cn"` for Moonshot).
+1. **Operator override**: `uri` field on the connection entry, if set.
+2. **Family endpoint**: the family's `*Endpoint` enum supplies the URL (e.g. `OpenAIEndpoint::Default` -> `https://api.openai.com/v1`). Multi-region families have an `extra.endpoint` field on the connection entry that picks the variant (e.g. `extra.endpoint = "cn"` for Moonshot).
 3. **Templated families**: Azure takes typed inputs (`resource`, `deployment`, `api_version`) and substitutes them into the family's URI template. Missing fields fail loud at runtime.
 
 Bedrock is an exception: its endpoint hostname is constructed at request time from the signing region resolved through the AWS credential chain (`AWS_REGION`, `AWS_DEFAULT_REGION`, or the `region` from the active `credential_process` or IMDS profile). A canonical `providers.connections.<name>.extra.region` overrides that region for both Bearer-token routing and SigV4 signing. The legacy `uri` alias field and `providers.connections.<connection>.extra.region` field have no effect.
@@ -432,10 +433,10 @@ Every slot, its default endpoint, and whether it runs locally is in the [Catalog
 
 Supported credential input and storage forms:
 
-1. **Inline `api_key = "..."`** in the alias entry (fine for dev, risky for checked-in configs).
+1. **Inline `api_key = "..."`** in the referenced connection's `auth` table (fine for dev, risky for checked-in configs).
 2. **1Password references**: set a secret field to `op://vault/item/field`. ZeroClaw keeps the reference in config and resolves it at runtime with `op read`, so the 1Password CLI must be installed and signed in.
 3. **Config-level secrets store**: encrypted at `~/.zeroclaw/secrets` via a local key file.
-4. **Generic env override**: `ZEROCLAW_providers__models__<type>__<alias>__api_key=...` sets `providers.models."<model-ref>".api_key` at startup. See [Environment variables](../reference/env-vars.md) for the full grammar.
+4. **Generic env override**: `ZEROCLAW_providers__connections__<connection>__auth__api_key=...` sets the referenced connection credential at startup. See [Environment variables](../reference/env-vars.md) for the full grammar.
 
 Schema-mirror env overrides win at startup. They replace the in-memory credential for that process without rewriting the stored inline, encrypted, or `op://` value on disk.
 
@@ -443,7 +444,7 @@ Schema-mirror env overrides win at startup. They replace the in-memory credentia
 
 ## OAuth and subscription auth
 
-Several providers accept OAuth or subscription-style tokens instead of raw API keys. Get the token from the vendor's own dashboard or CLI flow, then drop it into the alias entry the same way you would an API key:
+Several providers accept OAuth or subscription-style tokens instead of raw API keys. Get the token from the vendor's own dashboard or CLI flow, then put it in the referenced connection's `auth` or `extra` table as documented below:
 
 - **Anthropic / Claude**: Console API keys and tokens generated by `claude setup-token` for Claude Max go in the referenced connection's `[providers.connections."<name>".auth]` table with `mode = "api_key"` and `api_key = "..."`. In Quickstart, pick `api_key` or `setup_token`; the saved provider entry remains a canonical model bound to that connection.
 - **OpenAI Codex subscription**: run `zeroclaw auth login --model-provider openai-codex` (or import an existing Codex CLI login with `--import ~/.codex/auth.json`), then set `mode = "codex"` on the referenced `[providers.connections.<name>.auth]` table and leave `api_key` unset; the runtime reads ZeroClaw's stored Codex auth profile.
@@ -660,9 +661,9 @@ and similar); the native Anthropic family already caches by default and
 ignores this field.
 
 Before reaching for this flag, check whether the gateway also exposes an
-Anthropic Messages endpoint. If it does, point a
-`[providers.models."<model-ref>"]` entry at it with `uri` and skip the
-passthrough entirely; the native provider places its own breakpoints.
+Anthropic Messages endpoint. If it does, put that endpoint on the referenced
+connection's `uri` and skip the passthrough entirely; the native Anthropic
+family places its own breakpoints.
 `cache_passthrough` is for gateways that offer only the Chat Completions
 surface.
 
@@ -845,6 +846,41 @@ model = "claude-sonnet-4-5"
 [providers.models."anthropic.direct".options]
 cache_ttl = "1h"
 ```
+
+### Turning the markers off
+
+`cache_ttl = "off"` places no cache breakpoints at all. A prefix that is
+never reused has no cache read to amortise the write premium, so marking
+it only adds cost: every request pays the 1.25x write for an entry that
+expires unread. That is the case for a workload whose every call carries
+a fresh prefix, and for a route where the gateway applies its own caching.
+`off` suppresses the native system, tool, and rolling-message markers and
+the compatible passthrough breakpoints alike. It does not touch
+operator-supplied `cache_control` (through `provider_extra` body fields or
+raw tool JSON), since this setting governs only the markers this
+implementation places.
+
+```toml
+[providers.models.anthropic.direct]
+model = "claude-sonnet-4-5"
+cache_ttl = "off"
+```
+
+### Bedrock and gateway translation
+
+Two observations from a Bedrock deployment reached through a LiteLLM
+gateway (the shape of the gateway example above):
+
+- LiteLLM passes the `ttl` field through to Bedrock unchanged: the request
+  Bedrock receives carries the same `cache_control` object the provider
+  emitted. A gateway that rewrites or drops the field falls back to the
+  five-minute default without saying so, so confirm the translated request
+  when qualifying a route.
+- The one-hour window refreshes on a read rather than counting from the
+  write. In one measurement a cache read landed 76 minutes after the write
+  that created the entry, which a window fixed at the write could not have
+  served. A hit extends the entry's life, which is what makes the
+  break-even arithmetic above hold for a conversation that keeps resuming.
 
 ## Image input limits
 
@@ -1079,7 +1115,7 @@ Then run ZeroClaw with `AWS_PROFILE=zeroclaw-bedrock`. For a systemd user servic
 
 ### Multi-region (Moonshot / Qwen / GLM / MiniMax / ...)
 
-One type per family; pick the region via the typed `endpoint` field on the alias entry.
+One type per family; pick the region via the typed `extra.endpoint` field on the connection entry.
 
 ### Custom OpenAI-compatible endpoint
 

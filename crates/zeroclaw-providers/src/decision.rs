@@ -34,7 +34,8 @@ impl DecisionProviderConfig {
             transport: HttpTransportConfig::from_connection(
                 resolved.selection.connection,
                 resolved.request_timeout_secs.clone(),
-            )?,
+            )?
+            .without_redirects(),
             model: resolved.model.to_owned(),
             wire_api: resolved.wire_api,
         })
@@ -203,22 +204,14 @@ impl DecisionModel for NativeDecisionClient {
                 json!({ "model": self.model, "state": state, "questions": questions })
             }
         };
-        // Resolve the client for every request so proxy-generation changes are
-        // observed by long-lived decision providers just like the other
-        // capability adapters.
-        let mut request = self
+        // Resolve the client through the live proxy cache for every call.
+        // Publishing proxy settings invalidates that cache; retaining a
+        // client constructed here would keep routing requests through the
+        // previous proxy policy for the lifetime of this provider.
+        let http = self
             .transport
-            .client(DEFAULT_DECISION_TIMEOUT, "decision")?
-            .post(&self.endpoint)
-            .json(&body);
-        if let Some(api_key) = self
-            .transport
-            .api_key
-            .as_deref()
-            .filter(|key| !key.trim().is_empty())
-        {
-            request = request.bearer_auth(api_key);
-        }
+            .client(DEFAULT_DECISION_TIMEOUT, "decision")?;
+        let request = self.transport.bearer(http.post(&self.endpoint).json(&body));
         let response = request
             .send()
             .await

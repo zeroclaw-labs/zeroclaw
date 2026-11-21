@@ -6,6 +6,8 @@ use zeroclaw_config::provider_registry::ResolvedEmbedding;
 
 use crate::transport::HttpTransportConfig;
 
+const EMBEDDING_HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 // ── Noop model_provider (keyword-only fallback) ────────────────────
 
 pub struct NoopEmbedding;
@@ -106,7 +108,7 @@ impl EmbeddingProvider for OpenAiEmbedding {
 
         let client = self
             .transport
-            .client(std::time::Duration::from_secs(60), "memory.embeddings")?;
+            .client(EMBEDDING_HTTP_TIMEOUT, "memory.embeddings")?;
         let resp = self
             .transport
             .bearer(client.post(self.embeddings_url()?))

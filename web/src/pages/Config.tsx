@@ -33,7 +33,10 @@ import {
   type PickerItem,
   type SectionInfo,
 } from "../lib/api";
-import FieldForm from "../components/sections/FieldForm";
+import FieldForm, {
+  clearFieldFormCatalogCaches,
+} from "../components/sections/FieldForm";
+import BrowserVoiceSettings from "../components/BrowserVoiceSettings";
 import PersonalityEditor from "../components/sections/PersonalityEditor";
 import SkillsBundleEditor from "../components/sections/SkillsBundleEditor";
 import BindChannelForm from "../components/sections/BindChannelForm";
@@ -52,7 +55,8 @@ import CostRatesEditor, {
 } from "../components/sections/CostRatesEditor";
 import { Badge, Button, Card, PageHeader } from "@/components/ui";
 import { t } from "@/lib/i18n";
-import ProviderRegistryEditor from '../components/sections/ProviderRegistryEditor';
+import { useLocaleContext } from "@/App";
+import ProviderRegistryEditor from "../components/sections/ProviderRegistryEditor";
 
 // Display order for the curated sidebar groups. Each `SectionInfo.group`
 // from the gateway lands in one of these buckets (anything else falls
@@ -81,6 +85,8 @@ const GROUP_ORDER = [
 // (single canonical source). The dashboard preserves response order for
 // the Foundation group instead of carrying its own copy of the list.
 
+const VOICE_SECTION = "voice-and-audio";
+
 export default function Config() {
   // URL params drive the view. No internal mode state for picker/form —
   // the address bar is the source of truth.
@@ -91,17 +97,31 @@ export default function Config() {
     section: sectionParam,
     type: typeParam,
     alias: aliasParam,
-  } = useParams<{
-    section?: string;
-    type?: string;
-    alias?: string;
-  }>();
+  } = useParams<{ section?: string; type?: string; alias?: string }>();
   const location = useLocation();
   const navigate = useNavigate();
   const lockedSection = location.pathname.startsWith("/setup/")
     ? sectionParam
     : undefined;
-  const [sections, setSections] = useState<SectionInfo[]>([]);
+  const setup = location.pathname.startsWith("/setup/");
+  const [schemaSections, setSchemaSections] = useState<SectionInfo[]>([]);
+  useLocaleContext();
+  const voiceLabel = t("voice.settings");
+  const voiceHelp = t("voice.help_intro");
+  const sections = useMemo<SectionInfo[]>(() => setup ? schemaSections : [
+    ...schemaSections,
+    {
+      key: VOICE_SECTION,
+      label: voiceLabel,
+      help: voiceHelp,
+      group: "Other",
+      has_picker: false,
+      completed: false,
+      ready: true,
+      is_quickstart: false,
+      cost_category: "",
+    },
+  ], [schemaSections, setup, voiceLabel, voiceHelp]);
   const [activeKey, setActiveKey] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -126,11 +146,11 @@ export default function Config() {
     getSections()
       .then((resp) => {
         if (cancelled) return;
-        setSections(resp.sections);
-        const initialKey =
-          sectionParam && resp.sections.find((s) => s.key === sectionParam)
-            ? sectionParam
-            : (resp.sections[0]?.key ?? null);
+        setSchemaSections(resp.sections);
+        const initialKey = sectionParam && (
+          (!setup && sectionParam === VOICE_SECTION) ||
+          resp.sections.some((section) => section.key === sectionParam)
+        ) ? sectionParam : (resp.sections[0]?.key ?? null);
         setActiveKey(initialKey);
       })
       .catch((e) => {
@@ -160,6 +180,13 @@ export default function Config() {
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sectionParam, sections]);
+
+  // Bust FieldForm's per-provider model catalog cache on section change so a
+  // model alias just added under e.g. `providers.models.anthropic` shows up
+  // the next time the user opens an agent form, without a hard refresh.
+  useEffect(() => {
+    clearFieldFormCatalogCaches();
+  }, [sectionParam, typeParam, aliasParam]);
 
   const activeSection = useMemo(
     () => sections.find((s) => s.key === activeKey) ?? null,
@@ -224,6 +251,7 @@ export default function Config() {
 
   const mainContent = (() => {
     if (!activeSection) return null;
+    if (activeSection.key === VOICE_SECTION) return <BrowserVoiceSettings />;
 
     if (activeSection.key === 'providers.registry') {
       return <ProviderRegistryEditor onSaved={fetchDrift} />;
@@ -242,31 +270,6 @@ export default function Config() {
       );
     }
 
-    // Cost-only provider sections retain the familiar category entry point,
-    // but never expose the retired provider alias editor. The selected type
-    // is the provider family used by the canonical cost-rate map.
-    if (isCostRatesSection && typeParam) {
-      const category = activeSection.cost_category as CostRatesCategory;
-      return (
-        <div className="flex flex-col gap-3 flex-1 min-h-0">
-          <Button
-            variant="ghost"
-            size="sm"
-            onClick={() => navigate(`/config/${encodeURIComponent(activeSection.key)}`)}
-            className="self-start"
-          >
-            <ArrowLeft className="h-4 w-4" />
-            {t("config.back_to")}{activeSection.label}
-          </Button>
-          <CostRatesEditor
-            category={category}
-            providerType={typeParam}
-            onSaved={fetchDrift}
-          />
-        </div>
-      );
-    }
-
     // /config/:section/:type/:alias — field form
     if (typeParam && aliasParam) {
       const fieldsPrefix = needsAliasTier
@@ -275,15 +278,14 @@ export default function Config() {
           : `${activeSection.key}.${typeParam}.${aliasParam}`
         : typeParam;
 
-      // Extra tabs alongside the wire-driven field tabs for this alias page.
-      // Channels get a pre-scoped operator-bind tab (authorize a user right
-      // where you configured the channel, no /bind message).
-      const aliasExtraTabs: SectionTabSpec[] = [];
+      // Pre-scoped operator-bind tab on a pairing channel's own page, so you
+      // can authorize a user (no /bind message) right where you configured it.
+      const channelExtraTabs: SectionTabSpec[] = [];
       if (
         activeSection.key === "channels" &&
         ["telegram", "wechat", "line"].includes(typeParam)
       ) {
-        aliasExtraTabs.push({
+        channelExtraTabs.push({
           key: "bind",
           label: "Bind identity",
           render: () => (
@@ -296,7 +298,6 @@ export default function Config() {
           ),
         });
       }
-
 
       return (
         <div className="flex flex-col gap-3 flex-1 min-h-0">
@@ -317,7 +318,7 @@ export default function Config() {
             onSaved={fetchDrift}
             drift={drifted}
             extraTabs={
-              aliasExtraTabs.length > 0 ? aliasExtraTabs : undefined
+              channelExtraTabs.length > 0 ? channelExtraTabs : undefined
             }
           />
         </div>
@@ -407,6 +408,28 @@ export default function Config() {
     }
 
     // /config/:section/:type — alias list (providers/channels) or direct form
+    if (typeParam && isCostRatesSection) {
+      const category = activeSection.cost_category as CostRatesCategory;
+      return (
+        <div className="flex flex-col gap-3 flex-1 min-h-0">
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={() => navigate(`/config/${encodeURIComponent(activeSection.key)}`)}
+            className="self-start"
+          >
+            <ArrowLeft className="h-4 w-4" />
+            {t("config.back_to")}{activeSection.label}
+          </Button>
+          <CostRatesEditor
+            category={category}
+            providerType={typeParam}
+            onSaved={fetchDrift}
+          />
+        </div>
+      );
+    }
+
     if (typeParam && needsAliasTier) {
       const aliasListPane = (
         <AliasListView
@@ -503,7 +526,13 @@ export default function Config() {
       <SectionOverview
         section={activeSection}
         onPickType={(typeKey) => {
-          if (needsAliasTier || isCostRatesSection) {
+          if (isCostRatesSection) {
+            // Cost-rate entries are selected from the canonical rate-sheet
+            // templates. They are not provider aliases, so asking the
+            // generic selector to create an item would build a legacy
+            // providers.* prefix and leave the rate editor unreachable.
+            goToType(activeSection.key, typeKey);
+          } else if (needsAliasTier) {
             goToType(activeSection.key, typeKey);
           } else {
             void (async () => {
@@ -714,7 +743,7 @@ export default function Config() {
                   ))}
                 </span>
               }
-              actions={
+              actions={activeSection.key !== VOICE_SECTION && (
                 <>
                   <Button
                     variant="ghost"
@@ -734,7 +763,7 @@ export default function Config() {
                     }}
                   />
                 </>
-              }
+              )}
             />
 
             <div className="flex-1 min-h-0 flex flex-col">{mainContent}</div>

@@ -10182,7 +10182,12 @@ impl RpcDispatcher {
         } else {
             // Return full config, masked.
             let mut masked = config;
-            masked.mask_secrets();
+            masked.mask_secrets().map_err(|error| {
+                rpc_err(
+                    INTERNAL_ERROR,
+                    format!("failed to mask configuration secrets: {error}"),
+                )
+            })?;
             Ok(serde_json::to_value(&masked).unwrap_or(Value::Null))
         }
     }
@@ -10606,6 +10611,68 @@ impl RpcDispatcher {
             };
             if !scope.may_affect_agent(&agent_alias) {
                 continue;
+            }
+
+            // ModelRefs can be narrowed before taking the per-session turn
+            // guard. This is the important fast path for a registry edit:
+            // an unrelated running chat must not hold up the config writer
+            // merely because another model changed. We still re-read the
+            // overrides below after acquiring the guard, so a concurrent
+            // session/configure cannot make this early decision stale.
+            if let LiveSessionRefreshScope::ModelRefs(_) = scope {
+                let Some(overrides) = ctx.sessions.get_overrides(&session_id).await else {
+                    continue;
+                };
+                // A running tool may have selected a provider/model without
+                // persisting it in SessionOverrides. Include that transient
+                // identity when it is immediately observable; if the agent
+                // is busy, retain the conservative old path and acquire the
+                // ordering guard below, where the authoritative state is
+                // re-read under the session boundary.
+                let mut selection = overrides.clone();
+                let mut may_skip = true;
+                if let Some(agent) = ctx.sessions.get_agent(&session_id).await {
+                    match agent.try_lock() {
+                        Ok(agent) => {
+                            if let Some((active_ref, active_model)) = agent
+                                .model_selection_override(
+                                    overrides.model_provider.as_deref(),
+                                    overrides.model.as_deref(),
+                                )
+                            {
+                                selection.model_provider = Some(active_ref);
+                                selection.model = active_model;
+                            }
+                        }
+                        Err(_) => {
+                            // The installed selection is being used by a
+                            // turn. Let the ordered path below inspect it
+                            // after acquiring the session boundary instead
+                            // of risking a false skip from stale overrides.
+                            may_skip = false;
+                        }
+                    }
+                }
+                if may_skip
+                    && scope
+                        .resolve_provider_ref_for_update(
+                            &previous_config,
+                            config,
+                            &agent_alias,
+                            &selection,
+                        )
+                    .map_err(|error| {
+                        rpc_err(
+                            INVALID_PARAMS,
+                            format!(
+                                "Config update cannot scope live session `{session_id}`: {error}"
+                            ),
+                        )
+                    })?
+                    .is_none()
+                {
+                    continue;
+                }
             }
 
             // Acquire the per-session ordering boundary. This serialises

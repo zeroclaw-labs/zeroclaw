@@ -494,21 +494,17 @@ impl OpenAiModelProvider {
         }
     }
 
-    fn http_client(&self) -> Result<Client, reqwest::Error> {
-        let mut builder = Client::builder().connect_timeout(std::time::Duration::from_secs(10));
-        if !self.timeout_disabled {
-            builder = builder.timeout(std::time::Duration::from_secs(self.timeout_secs));
+    fn http_client(&self) -> anyhow::Result<Client> {
+        crate::transport::ChatHttpPolicy {
+            request_timeout: (!self.timeout_disabled)
+                .then(|| std::time::Duration::from_secs(self.timeout_secs)),
+            read_timeout: self
+                .read_timeout_secs
+                .filter(|_| !self.read_timeout_disabled)
+                .map(std::time::Duration::from_secs),
+            ..Default::default()
         }
-        if !self.read_timeout_disabled
-            && let Some(read_timeout) = self.read_timeout_secs
-        {
-            builder = builder.read_timeout(std::time::Duration::from_secs(read_timeout));
-        }
-        let builder = zeroclaw_config::schema::apply_runtime_proxy_to_builder(
-            builder,
-            "model_provider.openai",
-        );
-        builder.build()
+        .client("model_provider.openai")
     }
 }
 
@@ -1319,26 +1315,19 @@ impl OpenAiResponsesModelProvider {
         }
     }
 
-    fn http_client(&self) -> Result<Client, reqwest::Error> {
-        let default_headers = self.build_default_headers();
-        let mut builder = Client::builder().connect_timeout(std::time::Duration::from_secs(10));
-        if !self.timeout_disabled {
-            builder = builder.timeout(std::time::Duration::from_secs(self.timeout_secs));
+    fn http_client(&self) -> anyhow::Result<Client> {
+        crate::transport::ChatHttpPolicy {
+            request_timeout: (!self.timeout_disabled)
+                .then(|| std::time::Duration::from_secs(self.timeout_secs)),
+            read_timeout: self
+                .read_timeout_secs
+                .filter(|_| !self.read_timeout_disabled)
+                .map(std::time::Duration::from_secs),
+            headers: self.build_default_headers(),
+            redirect_endpoint: Some(&self.responses_url),
+            ..Default::default()
         }
-        if !self.read_timeout_disabled
-            && let Some(read_timeout) = self.read_timeout_secs
-        {
-            builder = builder.read_timeout(std::time::Duration::from_secs(read_timeout));
-        }
-        if !default_headers.is_empty() {
-            builder = builder.default_headers(default_headers);
-        }
-        let builder = crate::opencode_session::restrict_redirects(builder, &self.responses_url);
-        let builder = zeroclaw_config::schema::apply_runtime_proxy_to_builder(
-            builder,
-            "model_provider.openai",
-        );
-        builder.build()
+        .client("model_provider.openai")
     }
 
     /// Sibling `/models` endpoint next to the configured `/responses` URL,
@@ -1371,25 +1360,16 @@ impl OpenAiResponsesModelProvider {
         }
     }
 
-    fn streaming_client(&self) -> Result<Client, reqwest::Error> {
-        let default_headers = self.build_default_headers();
-        let mut builder = Client::builder().connect_timeout(std::time::Duration::from_secs(10));
+    fn streaming_client(&self) -> anyhow::Result<Client> {
         let timeouts = self.streaming_timeouts();
-        if let Some(timeout) = timeouts.request {
-            builder = builder.timeout(timeout);
+        crate::transport::ChatHttpPolicy {
+            request_timeout: timeouts.request,
+            read_timeout: timeouts.read.map(|timeout| timeout.duration()),
+            headers: self.build_default_headers(),
+            redirect_endpoint: Some(&self.responses_url),
+            ..Default::default()
         }
-        if let Some(timeout) = timeouts.read {
-            builder = builder.read_timeout(timeout.duration());
-        }
-        if !default_headers.is_empty() {
-            builder = builder.default_headers(default_headers);
-        }
-        let builder = crate::opencode_session::restrict_redirects(builder, &self.responses_url);
-        let builder = zeroclaw_config::schema::apply_runtime_proxy_to_builder(
-            builder,
-            "model_provider.openai",
-        );
-        builder.build()
+        .client("model_provider.openai")
     }
 }
 
@@ -1626,8 +1606,10 @@ impl ModelProvider for OpenAiResponsesModelProvider {
         let client = match self.streaming_client() {
             Ok(client) => client,
             Err(error) => {
-                let error = StreamError::ModelProvider(error.to_string());
-                return stream::once(async move { Err(error) }).boxed();
+                return stream::once(
+                    async move { Err(StreamError::ModelProvider(error.to_string())) },
+                )
+                .boxed();
             }
         };
         let timeouts = self.streaming_timeouts();
@@ -2498,7 +2480,7 @@ mod tests {
         let client = provider.http_client().expect("HTTP client should build");
         let streaming_client = provider
             .streaming_client()
-            .expect("streaming HTTP client should build");
+            .expect("streaming client should build");
         set_runtime_proxy_config(ProxyConfig::default());
 
         let response = client
@@ -2653,19 +2635,11 @@ mod tests {
 
         let opencode = provider("https://opencode.ai/zen/v1");
         assert!(has_policy(opencode.http_client().unwrap()));
-        assert!(has_policy(
-            opencode
-                .streaming_client()
-                .expect("streaming HTTP client should build")
-        ));
+        assert!(has_policy(opencode.streaming_client().unwrap()));
 
         let other = provider("https://api.openai.com/v1");
         assert!(!has_policy(other.http_client().unwrap()));
-        assert!(!has_policy(
-            other
-                .streaming_client()
-                .expect("streaming HTTP client should build")
-        ));
+        assert!(!has_policy(other.streaming_client().unwrap()));
     }
 
     #[test]
