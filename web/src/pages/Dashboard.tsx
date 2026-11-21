@@ -605,7 +605,7 @@ function OverviewTab({
         </div>
 
         {/* Active Channels */}
-        <div className="card p-5 animate-slide-in-up">
+        <div className="card p-5 animate-slide-in-up flex flex-col">
           <div className="flex items-center gap-2 mb-5">
             <Radio className="h-5 w-5" style={{ color: "var(--pc-accent)" }} />
             <h2
@@ -641,7 +641,11 @@ function OverviewTab({
                 : t("dashboard.filter_active")}
             </button>
           </div>
-          <div className="space-y-2 overflow-y-auto max-h-48 pr-1">
+          {/* The card stretches to the tallest card in its row, so on wide
+              screens the list fills the card and scrolls inside it. Size
+              containment keeps a long list from making the row taller (#4178);
+              stacked on narrow screens it keeps the fixed cap. */}
+          <div className="space-y-2 overflow-y-auto max-h-48 pr-1 lg:flex-1 lg:min-h-48 lg:max-h-none lg:[contain:size]">
             {Object.entries(status.channels).length === 0 ? (
               <p className="text-sm" style={{ color: "var(--pc-text-faint)" }}>
                 {t("dashboard.no_channels")}
