@@ -937,14 +937,16 @@ pub enum AuthMode {
 /// Prompt-cache entry lifetime to request for this provider's Anthropic
 /// cache markers. `"5m"` is the API default; `"1h"` extends the cache
 /// entry lifetime to one hour so a pause longer than five minutes does
-/// not force a full-price rewrite of the cached prefix. Meaningful only
-/// where Anthropic-shaped `cache_control` markers reach the API: the
-/// native Anthropic provider always places them, compatible providers
-/// only behind `cache_passthrough` (with passthrough off the setting is
-/// inert). One TTL applies to every marker this implementation places;
-/// operator-supplied `cache_control` (via `provider_extra` or raw tool
-/// JSON) sits outside that guarantee and must order 1h before 5m when
-/// mixing lifetimes in one request.
+/// not force a full-price rewrite of the cached prefix; `"off"` places no
+/// markers at all, for a workload that never reuses a prefix and would
+/// otherwise pay the write premium with no read to amortise it.
+/// Meaningful only where Anthropic-shaped `cache_control` markers reach
+/// the API: the native Anthropic provider always places them, compatible
+/// providers only behind `cache_passthrough` (with passthrough off the
+/// setting is inert). One TTL applies to every marker this implementation
+/// places; operator-supplied `cache_control` (via `provider_extra` or raw
+/// tool JSON) sits outside that guarantee and must order 1h before 5m
+/// when mixing lifetimes in one request.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
 )]
@@ -957,6 +959,9 @@ pub enum CacheTtl {
     /// 1-hour cache lifetime; cache writes bill at a premium write rate.
     #[serde(rename = "1h")]
     OneHour,
+    /// Place no prompt-cache breakpoints at all.
+    #[serde(rename = "off")]
+    Off,
 }
 
 /// Named model_provider profile definition.
@@ -4921,6 +4926,13 @@ impl Config {
     pub fn effective_parallel_tools(&self, agent_alias: &str) -> bool {
         self.runtime_profile_for_agent(agent_alias)
             .and_then(|p| p.parallel_tools)
+            .unwrap_or(false)
+    }
+
+    #[must_use]
+    pub fn effective_tool_elicitation(&self, agent_alias: &str) -> bool {
+        self.runtime_profile_for_agent(agent_alias)
+            .and_then(|p| p.tool_elicitation)
             .unwrap_or(false)
     }
 
@@ -15470,6 +15482,9 @@ pub struct RuntimeProfileConfig {
     pub parallel_tools: Option<bool>,
     /// Request one native tool call per provider response when supported. Default off.
     pub single_tool_rounds: Option<bool>,
+    /// Enable pre-turn tool-elicitation hints (prefilter + ephemeral hint).
+    /// `None` inherits (default off).
+    pub tool_elicitation: Option<bool>,
     /// Tool dispatch strategy (e.g. `"auto"`). `None` inherits.
     pub tool_dispatcher: Option<String>,
     /// Tools exempt from within-turn dedup check.
@@ -15538,6 +15553,7 @@ impl Default for RuntimeProfileConfig {
             compact_context: None,
             parallel_tools: None,
             single_tool_rounds: None,
+            tool_elicitation: None,
             tool_dispatcher: None,
             tool_call_dedup_exempt: Vec::new(),
             deferred_builtin_tools: false,
@@ -30185,6 +30201,17 @@ mod tests {
     }
 
     #[::core::prelude::v1::test]
+    fn cache_ttl_off_is_a_known_lifetime_that_round_trips() {
+        let off: ModelProviderConfig = toml::from_str("cache_ttl = \"off\"").unwrap();
+        assert_eq!(off.cache_ttl, Some(CacheTtl::Off));
+        assert_eq!(
+            toml::to_string(&off).unwrap(),
+            "cache_ttl = \"off\"\n",
+            "off must round-trip its wire string"
+        );
+    }
+
+    #[::core::prelude::v1::test]
     fn cache_ttl_rejects_unknown_lifetime() {
         let parsed = toml::from_str::<ModelProviderConfig>("cache_ttl = \"2h\"");
         assert!(
@@ -36131,6 +36158,30 @@ runtime_profile = "missing"
         assert!(!parsed.effective_single_tool_rounds("enabled"));
         let serialized = toml::to_string(&parsed.runtime_profiles["batch"]).unwrap();
         assert!(serialized.contains("single_tool_rounds = false"));
+    }
+
+    #[test]
+    async fn runtime_profile_tool_elicitation_is_honored() {
+        let raw = r#"
+[runtime_profiles.hinted]
+tool_elicitation = true
+
+[agents.default]
+runtime_profile = "hinted"
+"#;
+        let parsed = parse_test_config(raw);
+        assert!(parsed.effective_tool_elicitation("default"));
+    }
+
+    #[test]
+    async fn tool_elicitation_defaults_off() {
+        let parsed = parse_test_config(
+            r#"
+[agents.default]
+runtime_profile = "default"
+"#,
+        );
+        assert!(!parsed.effective_tool_elicitation("default"));
     }
 
     #[test]
