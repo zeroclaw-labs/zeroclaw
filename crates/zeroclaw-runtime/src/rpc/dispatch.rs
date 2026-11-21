@@ -8067,6 +8067,7 @@ impl RpcDispatcher {
             trust: TrustClass::Untrusted,
             origin: TurnOrigin::Interactive,
             internal_principal: None,
+            thread_ts: None,
         });
         // Fence the current transport owner through queue insertion. Consumption
         // checks the revocable binding too, without contending on the global map.
@@ -25043,6 +25044,7 @@ mod tests {
                             arguments_summary: "private-approval".into(),
                             raw_arguments: None,
                             position: None,
+                            thread_ts: None,
                         },
                     )
                     .await

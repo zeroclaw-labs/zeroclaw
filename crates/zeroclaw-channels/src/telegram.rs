@@ -11882,6 +11882,7 @@ mod tests {
             arguments_summary: "expr=1+1".to_string(),
             raw_arguments: None,
             position: None,
+            thread_ts: None,
         };
 
         let result = ch.request_approval("123", &request).await.unwrap();
@@ -11947,6 +11948,7 @@ mod tests {
             arguments_summary: "expr=1+1".to_string(),
             raw_arguments: None,
             position: None,
+            thread_ts: None,
         };
 
         let started = std::time::Instant::now();
@@ -25373,6 +25375,7 @@ mod tests {
             arguments_summary: "ls -la".to_string(),
             raw_arguments: None,
             position: None,
+            thread_ts: None,
         };
         let attributed = ch
             .request_approval_attributed("12345", &request)
@@ -25449,6 +25452,7 @@ mod tests {
             arguments_summary: "ls -la".to_string(),
             raw_arguments: None,
             position: None,
+            thread_ts: None,
         };
         let attributed = ch
             .request_approval_attributed_with_timeout("12345", &request, Duration::from_millis(100))
@@ -25499,6 +25503,7 @@ mod tests {
             arguments_summary: "ls -la".to_string(),
             raw_arguments: None,
             position: None,
+            thread_ts: None,
         };
         let waiter = {
             let ch = Arc::clone(&ch);
@@ -25645,6 +25650,7 @@ mod tests {
             arguments_summary: "ls -la".to_string(),
             raw_arguments: None,
             position: None,
+            thread_ts: None,
         };
         let mut waiter = Box::pin(ch.request_approval_attributed("12345", &request));
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -25707,6 +25713,7 @@ mod tests {
             arguments_summary: "ls -la".to_string(),
             raw_arguments: None,
             position: None,
+            thread_ts: None,
         };
 
         // No one resolves the pending oneshot — the short timeout above lets
@@ -25802,6 +25809,7 @@ mod tests {
             arguments_summary: summary.clone(),
             raw_arguments: None,
             position: Some(zeroclaw_api::channel::ApprovalPosition { index: 2, total: 3 }),
+            thread_ts: None,
         };
 
         // Nothing resolves the pending oneshot; the short timeout returns a
@@ -25893,6 +25901,7 @@ mod tests {
             arguments_summary: "ls -la".to_string(),
             raw_arguments: None,
             position: Some(zeroclaw_api::channel::ApprovalPosition { index: 1, total: 1 }),
+            thread_ts: None,
         };
 
         let _ = ch.request_approval("12345", &request).await;

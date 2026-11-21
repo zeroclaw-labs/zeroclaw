@@ -261,8 +261,14 @@ mod approval {
     /// prompt text to the requesting recipient, with voice synthesis
     /// suppressed. Kept as a small, pure helper so tests can assert its shape
     /// (recipient, voice suppression) without standing up a live client.
-    pub(super) fn build_prompt_message(prompt: String, recipient: &str) -> SendMessage {
-        SendMessage::new(prompt, recipient).suppress_voice()
+    pub(super) fn build_prompt_message(
+        prompt: String,
+        recipient: &str,
+        thread_ts: Option<String>,
+    ) -> SendMessage {
+        SendMessage::new(prompt, recipient)
+            .in_thread(thread_ts)
+            .suppress_voice()
     }
 
     /// Try to parse an approval reply. Returns `Some((token, response))` if the
@@ -5496,7 +5502,7 @@ impl Channel for MatrixChannel {
             token.clone(),
         );
 
-        let send_msg = approval::build_prompt_message(prompt, recipient);
+        let send_msg = approval::build_prompt_message(prompt, recipient, request.thread_ts.clone());
         if let Err(e) = self.send(&send_msg).await {
             guard.remove().await;
             return Err(e);
@@ -8075,7 +8081,7 @@ mod tests {
                 None,
             );
 
-            let message = build_prompt_message(prompt.clone(), "!room:example.invalid");
+            let message = build_prompt_message(prompt.clone(), "!room:example.invalid", None);
 
             assert_eq!(message.recipient, "!room:example.invalid");
             assert_eq!(message.content, prompt);
@@ -8084,6 +8090,95 @@ mod tests {
                 "the approval prompt must suppress voice synthesis"
             );
             assert!(!message.force_voice);
+        }
+
+        /// Sends one approval prompt through a mock homeserver, lets it time
+        /// out, and returns the body of the `m.room.message` it posted.
+        async fn sent_approval_prompt(thread_ts: Option<&str>) -> serde_json::Value {
+            use matrix_sdk::ruma::room_id;
+            use matrix_sdk::test_utils::mocks::MatrixMockServer;
+            use std::sync::Arc;
+            use wiremock::matchers::{method, path_regex};
+            use wiremock::{Mock, ResponseTemplate};
+            use zeroclaw_api::channel::{Channel, ChannelApprovalRequest};
+            use zeroclaw_config::schema::MatrixConfig;
+            let matrix = MatrixMockServer::new().await;
+            let client = matrix.client_builder().build().await;
+            matrix.mock_room_state_encryption().plain().mount().await;
+            matrix
+                .sync_joined_room(&client, room_id!("!room:localhost"))
+                .await;
+            Mock::given(method("PUT"))
+                .and(path_regex("/send/m.room.message/"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({"event_id":"$prompt:localhost"})),
+                )
+                .expect(1)
+                .mount(matrix.server())
+                .await;
+            // Threaded sends fetch the thread root to build the relation.
+            Mock::given(method("GET"))
+                .and(path_regex("/rooms/.*/event/"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "type": "m.room.message",
+                    "event_id": "$root:localhost",
+                    "room_id": "!room:localhost",
+                    "sender": "@operator:localhost",
+                    "origin_server_ts": 1,
+                    "content": {"msgtype": "m.text", "body": "check my email"}
+                })))
+                .mount(matrix.server())
+                .await;
+            let workspace = tempfile::tempdir().unwrap();
+            let channel = super::super::MatrixChannel::new(
+                MatrixConfig {
+                    homeserver: matrix.server().uri(),
+                    access_token: Some("test-token".to_string()),
+                    approval_timeout_secs: 1,
+                    reply_in_thread: true,
+                    ..MatrixConfig::default()
+                },
+                "test",
+                Arc::new(|| vec!["@operator:localhost".to_string()]),
+                workspace.path().to_path_buf(),
+            )
+            .unwrap();
+            channel.client.set(client).unwrap();
+            let request = ChannelApprovalRequest {
+                tool_name: "shell".to_string(),
+                arguments_summary: "pwd".to_string(),
+                raw_arguments: None,
+                position: None,
+                thread_ts: thread_ts.map(str::to_owned),
+            };
+            channel
+                .request_approval_attributed("!room:localhost", &request)
+                .await
+                .unwrap();
+            let requests = matrix.server().received_requests().await.unwrap();
+            requests
+                .iter()
+                .find(|req| req.url.path().contains("/send/m.room.message/"))
+                .expect("the prompt was sent")
+                .body_json::<serde_json::Value>()
+                .unwrap()
+        }
+
+        #[tokio::test]
+        async fn approval_prompt_stays_in_the_originating_thread() {
+            let body = sent_approval_prompt(Some("$root:localhost")).await;
+            assert_eq!(body["m.relates_to"]["rel_type"], "m.thread", "{body}");
+            assert_eq!(
+                body["m.relates_to"]["event_id"], "$root:localhost",
+                "{body}"
+            );
+        }
+
+        #[tokio::test]
+        async fn approval_prompt_without_a_thread_goes_to_the_room() {
+            let body = sent_approval_prompt(None).await;
+            assert!(body.get("m.relates_to").is_none(), "{body}");
         }
 
         #[test]

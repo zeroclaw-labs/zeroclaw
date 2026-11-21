@@ -8271,6 +8271,7 @@ pub(super) fn channel_ingress_context(
     };
     // Adapter authentication and allowlist admission do not establish content trust.
     ingress.trust = TrustClass::Untrusted;
+    ingress.thread_ts = msg.thread_ts.clone();
     ingress
 }
 
@@ -20376,6 +20377,20 @@ pub(crate) mod tests {
         assert_eq!(ingress.source_class, SourceClass::External);
         assert_eq!(ingress.trust, TrustClass::Untrusted);
         assert_eq!(ingress.origin, TurnOrigin::Channel);
+        assert_eq!(ingress.thread_ts, None);
+    }
+
+    #[test]
+    fn channel_ingress_context_keeps_the_inbound_thread() {
+        let msg = ChannelMessage {
+            channel: "matrix".into(),
+            thread_ts: Some("$root:server".into()),
+            ..ChannelMessage::default()
+        };
+        assert_eq!(
+            channel_ingress_context(&msg).thread_ts.as_deref(),
+            Some("$root:server")
+        );
     }
 
     #[test]
@@ -37336,6 +37351,7 @@ BTC is currently around $65,000 based on latest tool output."#
                             arguments_summary: "command".to_string(),
                             raw_arguments: None,
                             position: None,
+                            thread_ts: None,
                         },
                     )
                     .await

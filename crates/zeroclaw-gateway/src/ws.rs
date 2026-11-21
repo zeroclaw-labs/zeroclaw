@@ -57,6 +57,7 @@ fn gateway_steering_input(content: String) -> SteeringInput {
         trust: TrustClass::Untrusted,
         origin: TurnOrigin::Interactive,
         internal_principal: None,
+        thread_ts: None,
     })
 }
 
