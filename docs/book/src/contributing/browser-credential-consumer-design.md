@@ -32,7 +32,6 @@ A one-shot credential-provider plugin is another supported input path for userna
 
 The action submit_credential takes one catalog alias on the active login page. The executor rechecks the catalog after vault lookup and sends values through standard input. The form helper accepts visible top-level fields and a same-origin HTTPS POST action. Its result indicates submission, not authentication. This implementation targets standard HTML forms and six-digit SHA-1 TOTP with a 30-second step.
 
-
 ## Staged HTTPS browser validation
 
 A loopback-only HTTPS fixture on Jarvis used a one-time certificate pinned to its SPKI in a disposable Chrome session. As the ZeroClaw service user, the test invoked the exact form helper through agent-browser stdin. Its server accepted the synthetic username/password POST, returned a separate TOTP form, accepted the synthetic code POST, and returned the authenticated page title. The fixture exposed neither credential values nor the submitted body in its logs. The probe reported HTTPS_PASSWORD_AND_TOTP_OK and stopped the fixture and browser session. This verifies browser transport and the form helper. A full agent run against an external identity provider requires separate acceptance.

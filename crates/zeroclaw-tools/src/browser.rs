@@ -524,14 +524,14 @@ impl BrowserTool {
         let alias = args
             .get("credential")
             .and_then(Value::as_str)
-            .ok_or_else(|| anyhow::anyhow!("Credential alias required"))?;
+            .ok_or_else(|| anyhow::Error::msg("Credential alias required"))?;
         let record = load_scoped_credential(self.credential_config_path.as_deref(), alias)?;
         let active = self
             .run_command(&["get", "url"])
             .await?
             .data
             .and_then(|data| data.get("url").and_then(Value::as_str).map(str::to_owned))
-            .ok_or_else(|| anyhow::anyhow!("Active browser URL unavailable"))?;
+            .ok_or_else(|| anyhow::Error::msg("Active browser URL unavailable"))?;
         let active = reqwest::Url::parse(&active)?;
         let origin = active.origin().ascii_serialization();
         self.validate_url(&origin)?;
@@ -2886,7 +2886,7 @@ fn browser_totp(seed: &str, timestamp: u64) -> anyhow::Result<String> {
     let normalized = seed.trim().trim_end_matches('=').to_ascii_uppercase();
     let secret = data_encoding::BASE32_NOPAD
         .decode(normalized.as_bytes())
-        .map_err(|_| anyhow::anyhow!("Invalid TOTP seed encoding"))?;
+        .map_err(|_| anyhow::Error::msg("Invalid TOTP seed encoding"))?;
     anyhow::ensure!(!secret.is_empty(), "Empty TOTP seed");
     let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY, &secret);
     let counter = (timestamp / 30).to_be_bytes();

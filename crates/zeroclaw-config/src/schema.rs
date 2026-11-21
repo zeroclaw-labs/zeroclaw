@@ -9286,10 +9286,10 @@ impl ScopedHttpCredential {
         if !Self::is_https_grant_origin(origin) {
             return false;
         }
-        match &self.auth {
-            ScopedHttpAuth::UserPassword { .. } | ScopedHttpAuth::Totp { .. } => true,
-            _ => false,
-        }
+        matches!(
+            &self.auth,
+            ScopedHttpAuth::UserPassword { .. } | ScopedHttpAuth::Totp { .. }
+        )
     }
 
     pub fn is_https_grant_origin(origin: &str) -> bool {
