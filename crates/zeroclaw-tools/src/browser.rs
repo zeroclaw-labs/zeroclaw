@@ -1695,11 +1695,16 @@ impl Tool for BrowserTool {
             return Ok(ToolResult {
                 success,
                 output: if success {
-                    crate::i18n::get_required_tool_string("tool-browser-credential-submitted").into()
+                    crate::i18n::get_required_tool_string("tool-browser-credential-submitted")
+                        .into()
                 } else {
                     ToolOutput::default()
                 },
-                error: (!success).then(|| crate::i18n::get_required_tool_string("tool-browser-credential-submission-failed")),
+                error: (!success).then(|| {
+                    crate::i18n::get_required_tool_string(
+                        "tool-browser-credential-submission-failed",
+                    )
+                }),
             });
         }
 
