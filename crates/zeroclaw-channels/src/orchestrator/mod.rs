@@ -1523,7 +1523,7 @@ async fn route_inbound_slot(
     };
     turn.msg = hooked;
 
-    let routed_key = conversation_history_key(&turn.msg);
+    let routed_key = routed_conversation_key(&ctx, &turn.msg);
     // Hooks run concurrently, but final route admission is an ordered commit
     // within the source conversation. Waiting here holds neither an execution
     // permit nor a conversation lane, and never waits on another conversation.
@@ -1748,11 +1748,13 @@ fn channel_scope(msg: &zeroclaw_api::channel::ChannelMessage) -> String {
 fn conversation_history_key_in_scope(
     msg: &zeroclaw_api::channel::ChannelMessage,
     channel_scope: &str,
+    matrix_thread_scoped: bool,
 ) -> String {
     let thread_scope = match msg.thread_ts.as_deref() {
         // Matrix thread_ts is a delivery anchor, not a topic boundary: root
-        // and follow-ups must share one sender+room session.
-        Some(_) if is_matrix_channel_name(&msg.channel) => None,
+        // and follow-ups share one sender+room session unless the alias opted
+        // into `session_scope = "room_sender_thread"`.
+        Some(_) if is_matrix_channel_name(&msg.channel) && !matrix_thread_scoped => None,
         other => other,
     };
     let raw = match (msg.conversation_scope, thread_scope) {
@@ -1769,8 +1771,36 @@ fn conversation_history_key_in_scope(
     sanitize_session_key(&raw)
 }
 
+/// History key with every channel's default thread semantics. Runtime paths
+/// use `runtime_conversation_history_key` or `routed_conversation_key`,
+/// which also honor Matrix `session_scope` from live config.
 pub fn conversation_history_key(msg: &zeroclaw_api::channel::ChannelMessage) -> String {
-    conversation_history_key_in_scope(msg, &channel_scope(msg))
+    conversation_history_key_in_scope(msg, &channel_scope(msg), false)
+}
+
+/// Whether this Matrix message belongs to a thread-scoped session: its alias
+/// sets `session_scope = "room_sender_thread"` in the live config and the
+/// message carries a thread anchor. The Matrix thread anchor is the thread
+/// root shared by the root message and its follow-ups (see
+/// `matrix::inbound::resolve_outbound_anchor`), never a follow-up's own id.
+fn matrix_thread_scoped(
+    ctx: &ChannelRuntimeContext,
+    msg: &zeroclaw_api::channel::ChannelMessage,
+) -> bool {
+    msg.thread_ts.as_deref().is_some_and(|t| !t.is_empty())
+        && matrix_config_for_message(&ctx.live_config.read(), msg).is_some_and(|mx| {
+            mx.session_scope == zeroclaw_config::schema::MatrixSessionScope::RoomSenderThread
+        })
+}
+
+/// Conversation lane key used for receive ordering and execution lanes: the
+/// alias-scoped key shape plus the live Matrix `session_scope`, so separate
+/// Matrix thread sessions do not serialize behind each other.
+fn routed_conversation_key(
+    ctx: &ChannelRuntimeContext,
+    msg: &zeroclaw_api::channel::ChannelMessage,
+) -> String {
+    conversation_history_key_in_scope(msg, &channel_scope(msg), matrix_thread_scoped(ctx, msg))
 }
 
 /// Resolve the history namespace from the live channel registry.
@@ -1783,10 +1813,11 @@ fn runtime_conversation_history_key(
     ctx: &ChannelRuntimeContext,
     msg: &zeroclaw_api::channel::ChannelMessage,
 ) -> String {
+    let matrix_thread_scoped = matrix_thread_scoped(ctx, msg);
     if msg.channel == "webhook" && ctx.channels_by_name.contains_key("webhook") {
-        conversation_history_key_in_scope(msg, &msg.channel)
+        conversation_history_key_in_scope(msg, &msg.channel, matrix_thread_scoped)
     } else {
-        conversation_history_key(msg)
+        conversation_history_key_in_scope(msg, &channel_scope(msg), matrix_thread_scoped)
     }
 }
 
@@ -1847,6 +1878,28 @@ fn followup_thread_id(msg: &zeroclaw_api::channel::ChannelMessage) -> Option<Str
     }
 }
 
+/// Interruption key from the channel-stamped `interruption_scope_id` alone,
+/// without the live Matrix `session_scope`; tests pin the established shape.
+#[cfg(test)]
+fn interruption_scope_key(msg: &zeroclaw_api::channel::ChannelMessage) -> String {
+    interruption_scope_key_for(msg, msg.interruption_scope_id.as_deref())
+}
+
+/// Interruption key honoring the live Matrix `session_scope`: a thread-scoped
+/// Matrix session is interrupted and `/stop`ped per thread root, the same
+/// boundary its history uses, including the root message itself.
+fn runtime_interruption_scope_key(
+    ctx: &ChannelRuntimeContext,
+    msg: &zeroclaw_api::channel::ChannelMessage,
+) -> String {
+    let scope = if matrix_thread_scoped(ctx, msg) {
+        msg.thread_ts.as_deref()
+    } else {
+        msg.interruption_scope_id.as_deref()
+    };
+    interruption_scope_key_for(msg, scope)
+}
+
 /// Interruption/cancellation is always personal: a newer message or `/stop`
 /// may only target the in-flight request of the member who sent it, so the
 /// key retains `msg.sender` even when conversation history is shared
@@ -1856,7 +1909,10 @@ fn followup_thread_id(msg: &zeroclaw_api::channel::ChannelMessage) -> Option<Str
 /// components to prevent boundary collisions between adjacent components
 /// (e.g., `#room_` + `alice` vs `#room` + `_alice`). Both `Sender` and
 /// `ReplyTarget` variants use the same injective representation.
-fn interruption_scope_key(msg: &zeroclaw_api::channel::ChannelMessage) -> String {
+fn interruption_scope_key_for(
+    msg: &zeroclaw_api::channel::ChannelMessage,
+    scope_id: Option<&str>,
+) -> String {
     let tag = match msg.conversation_scope {
         zeroclaw_api::channel::ChannelConversationScope::Sender => "sender",
         zeroclaw_api::channel::ChannelConversationScope::ReplyTarget => "reply_target",
@@ -1864,7 +1920,7 @@ fn interruption_scope_key(msg: &zeroclaw_api::channel::ChannelMessage) -> String
     let ch = channel_scope(msg);
     let target = &msg.reply_target;
     let sender = &msg.sender;
-    match msg.interruption_scope_id.as_deref() {
+    match scope_id {
         Some(scope) => format!(
             "{tag}:{}:{ch}:{}:{target}:{}:{sender}:{}:{scope}",
             ch.len(),
@@ -2785,6 +2841,23 @@ fn resolve_channel_thinking(
         params,
         effective_temperature,
     }
+}
+
+/// Byte offset where a channel may insert contextual text into inbound
+/// `content` without changing how the runtime interprets it: just after a
+/// leading `/think:` directive, otherwise at the start. `None` when the rest
+/// is empty (a bare `/think:<level>`) or a slash command the runtime
+/// intercepts before the model (`/stop`, or a runtime command such as `/new`),
+/// which must reach it verbatim.
+#[cfg(any(feature = "channel-matrix", test))]
+pub(crate) fn context_insertion_point(channel_name: &str, content: &str) -> Option<usize> {
+    let at = zeroclaw_runtime::agent::thinking::parse_thinking_directive(content)
+        .map_or(0, |(_, rest)| content.len() - rest.len());
+    let rest = &content[at..];
+    let control = rest.trim().is_empty()
+        || is_stop_command(rest)
+        || parse_runtime_command(channel_name, rest).is_some();
+    (!control).then_some(at)
 }
 
 fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRuntimeCommand> {
@@ -11569,7 +11642,7 @@ async fn register_inbound_turn(
     }
 
     let interrupt_enabled = interrupt_on_new_message_enabled(ctx, msg);
-    let scope_key = interruption_scope_key(msg);
+    let scope_key = runtime_interruption_scope_key(ctx.as_ref(), msg);
     // The payload this turn is waiting with lives in its debounce bucket until
     // the window fires. Recording the key here is what lets `/stop` reach that
     // bucket from the turn it is cancelling, even when the stop message itself
@@ -12444,7 +12517,7 @@ async fn run_message_dispatch_loop_until_cancelled(
         // A passive observation carries no turn of its own and must not cancel
         // the sender's live turns or answer in the room.
         if msg.channel != "cli" && !msg.passive_context && is_stop_command(&msg.content) {
-            let scope_key = interruption_scope_key(&msg);
+            let scope_key = runtime_interruption_scope_key(ctx.as_ref(), &msg);
             let states = {
                 let active = in_flight_by_sender
                     .lock()
@@ -12514,7 +12587,7 @@ async fn run_message_dispatch_loop_until_cancelled(
             // folded into that turn while the turn was still debouncing.
             // Answering "no in-flight task" would hide that the payload is on
             // its way, so the folded case gets its own wording.
-            let stop_scope_key = interruption_scope_key(&msg);
+            let stop_scope_key = runtime_interruption_scope_key(ctx.as_ref(), &msg);
             let folded_into_another_scope = !had_registered_turn
                 && debounce_bucket_owners
                     .get(&own_debounce_key)
@@ -12702,7 +12775,7 @@ async fn run_message_dispatch_loop_until_cancelled(
                             .await;
                         }
                     }
-                    let source_key = conversation_history_key(&msg);
+                    let source_key = routed_conversation_key(ctx.as_ref(), &msg);
                     let inbound = InboundTurn {
                         turn: Box::new(PendingTurn {
                             agent_generation: router
@@ -12769,7 +12842,7 @@ async fn run_message_dispatch_loop_until_cancelled(
             )
             .await;
         }
-        let source_key = conversation_history_key(&msg);
+        let source_key = routed_conversation_key(ctx.as_ref(), &msg);
         spawn_inbound_routing(
             Arc::clone(&lanes),
             &ingress_tasks,
@@ -39713,6 +39786,429 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(!root_key.contains("$reply:server"));
     }
 
+    /// A Matrix inbound message shaped the way `matrix::inbound` stamps it:
+    /// `thread_ts` is the outbound anchor (the thread root), and
+    /// `interruption_scope_id` is the root only for a real thread reply.
+    fn matrix_message(id: &str, thread_root: Option<&str>, content: &str) -> ChannelMessage {
+        ChannelMessage {
+            id: id.into(),
+            sender: "@alice:server".into(),
+            reply_target: "!room:server".into(),
+            content: content.into(),
+            channel: "matrix".into(),
+            channel_alias: Some("home".into()),
+            timestamp: 1,
+            thread_ts: thread_root.map(Into::into),
+            interruption_scope_id: thread_root.filter(|root| *root != id).map(Into::into),
+            ..Default::default()
+        }
+    }
+
+    fn matrix_scope_config(scope: zeroclaw_config::schema::MatrixSessionScope) -> Config {
+        let mut config = Config::default();
+        config.channels.matrix.insert(
+            "home".into(),
+            zeroclaw_config::schema::MatrixConfig {
+                session_scope: scope,
+                ..zeroclaw_config::schema::MatrixConfig::default()
+            },
+        );
+        config
+    }
+
+    fn matrix_scope_ctx(
+        live: &zeroclaw_config::live::LiveConfig,
+        session_store: Option<Arc<dyn SessionBackend>>,
+    ) -> Arc<ChannelRuntimeContext> {
+        Arc::new(ChannelRuntimeContext {
+            live_config: live.handle(),
+            session_store,
+            ..(*router_test_ctx()).clone()
+        })
+    }
+
+    fn publish_matrix_scope(
+        live: &zeroclaw_config::live::LiveConfig,
+        scope: zeroclaw_config::schema::MatrixSessionScope,
+    ) {
+        let revision = live.next_revision().unwrap();
+        live.publish(revision, matrix_scope_config(scope)).unwrap();
+    }
+
+    #[test]
+    fn matrix_thread_scope_keys_history_lanes_and_interruption_by_thread_root() {
+        let live = zeroclaw_config::live::LiveConfig::new(matrix_scope_config(
+            zeroclaw_config::schema::MatrixSessionScope::RoomSenderThread,
+        ));
+        let ctx = matrix_scope_ctx(&live, None);
+        let root_a = matrix_message("$a:server", Some("$a:server"), "open A");
+        let follow_a = matrix_message("$a2:server", Some("$a:server"), "more A");
+        let root_b = matrix_message("$b:server", Some("$b:server"), "open B");
+
+        let key_a = runtime_conversation_history_key(&ctx, &root_a);
+        assert_eq!(key_a, runtime_conversation_history_key(&ctx, &follow_a));
+        assert_ne!(key_a, runtime_conversation_history_key(&ctx, &root_b));
+        assert_eq!(key_a, "matrix_home__room_server__a_server__alice_server");
+        assert!(
+            !key_a.contains("a2"),
+            "a follow-up's own event id must never enter the session key"
+        );
+        assert_eq!(
+            routed_conversation_key(&ctx, &root_a),
+            routed_conversation_key(&ctx, &follow_a)
+        );
+        assert_ne!(
+            routed_conversation_key(&ctx, &root_a),
+            routed_conversation_key(&ctx, &root_b),
+            "separate thread sessions must not share an execution lane"
+        );
+        assert_eq!(
+            runtime_interruption_scope_key(&ctx, &root_a),
+            runtime_interruption_scope_key(&ctx, &follow_a),
+            "the root and its follow-ups share one interruption scope"
+        );
+        assert_ne!(
+            runtime_interruption_scope_key(&ctx, &root_a),
+            runtime_interruption_scope_key(&ctx, &root_b),
+            "a message in one thread must not interrupt another thread"
+        );
+    }
+
+    #[test]
+    fn matrix_thread_scope_top_level_without_thread_keeps_room_sender_session() {
+        let live = zeroclaw_config::live::LiveConfig::new(matrix_scope_config(
+            zeroclaw_config::schema::MatrixSessionScope::RoomSenderThread,
+        ));
+        let ctx = matrix_scope_ctx(&live, None);
+        // `reply_in_thread = false`: top-level messages carry no anchor.
+        let first = matrix_message("$first:server", None, "one");
+        let second = matrix_message("$second:server", None, "two");
+
+        let key = runtime_conversation_history_key(&ctx, &first);
+        assert_eq!(key, runtime_conversation_history_key(&ctx, &second));
+        assert_eq!(key, conversation_history_key(&first));
+        assert_eq!(key, "matrix_home__room_server__alice_server");
+        assert_eq!(
+            runtime_interruption_scope_key(&ctx, &first),
+            interruption_scope_key(&first)
+        );
+    }
+
+    #[test]
+    fn matrix_default_scope_runtime_keys_match_established_keys() {
+        for config in [
+            matrix_scope_config(zeroclaw_config::schema::MatrixSessionScope::RoomSender),
+            Config::default(),
+        ] {
+            let live = zeroclaw_config::live::LiveConfig::new(config);
+            let ctx = matrix_scope_ctx(&live, None);
+            for msg in [
+                matrix_message("$a:server", Some("$a:server"), "self-anchored root"),
+                matrix_message("$a2:server", Some("$a:server"), "thread reply"),
+                matrix_message("$b2:server", Some("$b:server"), "other thread"),
+                matrix_message("$top:server", None, "unanchored"),
+            ] {
+                assert_eq!(
+                    runtime_conversation_history_key(&ctx, &msg),
+                    "matrix_home__room_server__alice_server",
+                    "room_sender keeps one history across threads: {}",
+                    msg.content
+                );
+                assert_eq!(
+                    routed_conversation_key(&ctx, &msg),
+                    conversation_history_key(&msg)
+                );
+                assert_eq!(
+                    runtime_interruption_scope_key(&ctx, &msg),
+                    interruption_scope_key(&msg),
+                    "room_sender interruption keys must stay byte-for-byte: {}",
+                    msg.content
+                );
+            }
+        }
+    }
+
+    async fn record_passive(ctx: &Arc<ChannelRuntimeContext>, msg: &ChannelMessage) {
+        let mut passive = msg.clone();
+        passive.passive_context = true;
+        process_channel_message(Arc::clone(ctx), passive, CancellationToken::new()).await;
+    }
+
+    #[tokio::test]
+    async fn matrix_session_scope_follows_live_config_and_preserves_stored_histories() {
+        let live = zeroclaw_config::live::LiveConfig::new(matrix_scope_config(
+            zeroclaw_config::schema::MatrixSessionScope::RoomSender,
+        ));
+        let store_dir = TempDir::new().unwrap();
+        let store: Arc<dyn SessionBackend> =
+            Arc::new(SqliteSessionBackend::new(store_dir.path()).unwrap());
+        let ctx = matrix_scope_ctx(&live, Some(Arc::clone(&store)));
+        let room_sender_key = "matrix_home__room_server__alice_server";
+        let thread_key = "matrix_home__room_server__a_server__alice_server";
+
+        // An existing installation: history already lives under room+sender.
+        record_passive(
+            &ctx,
+            &matrix_message("$a2:server", Some("$a:server"), "before opt-in"),
+        )
+        .await;
+        assert_eq!(store.load(room_sender_key).len(), 1);
+
+        publish_matrix_scope(
+            &live,
+            zeroclaw_config::schema::MatrixSessionScope::RoomSenderThread,
+        );
+        record_passive(
+            &ctx,
+            &matrix_message("$a3:server", Some("$a:server"), "after opt-in"),
+        )
+        .await;
+        record_passive(&ctx, &matrix_message("$top:server", None, "unthreaded")).await;
+        assert_eq!(
+            store.load(thread_key).len(),
+            1,
+            "the opt-in applies to the next message without a restart"
+        );
+        assert_eq!(
+            store.load(room_sender_key).len(),
+            2,
+            "opting in keeps the existing room+sender history and its unthreaded traffic"
+        );
+
+        publish_matrix_scope(
+            &live,
+            zeroclaw_config::schema::MatrixSessionScope::RoomSender,
+        );
+        record_passive(
+            &ctx,
+            &matrix_message("$a4:server", Some("$a:server"), "rolled back"),
+        )
+        .await;
+        assert_eq!(
+            store.load(room_sender_key).len(),
+            3,
+            "rolling back returns thread messages to the room+sender history"
+        );
+        assert_eq!(
+            store.load(thread_key).len(),
+            1,
+            "rolling back leaves the thread-scoped history in the store"
+        );
+    }
+
+    #[tokio::test]
+    async fn matrix_thread_scoped_history_persists_per_thread_and_hydrates_after_restart() {
+        let config =
+            matrix_scope_config(zeroclaw_config::schema::MatrixSessionScope::RoomSenderThread);
+        let store_dir = TempDir::new().unwrap();
+        let runtime = |provider: Arc<HistoryCaptureModelProvider>| {
+            let channel: Arc<dyn Channel> = Arc::new(RecordingChannel::default());
+            let base = test_runtime_ctx_with_config_agent_and_provider_ref(
+                Arc::clone(&channel),
+                provider,
+                config.clone(),
+                zeroclaw_config::schema::AliasedAgentConfig::default(),
+                "test-provider",
+                None,
+            );
+            let store: Arc<dyn SessionBackend> =
+                Arc::new(SqliteSessionBackend::new(store_dir.path()).unwrap());
+            let ctx = Arc::new(ChannelRuntimeContext {
+                channels_by_name: Arc::new(HashMap::from([("matrix".to_string(), channel)])),
+                session_store: Some(Arc::clone(&store)),
+                ..(*base).clone()
+            });
+            (ctx, store)
+        };
+
+        let root_a = matrix_message("$a:server", Some("$a:server"), "alpha codename is quartz");
+        let root_b = matrix_message("$b:server", Some("$b:server"), "bravo codename is onyx");
+        {
+            let (before_restart, _) = runtime(Arc::new(HistoryCaptureModelProvider::default()));
+            for msg in [&root_a, &root_b] {
+                process_channel_message(
+                    Arc::clone(&before_restart),
+                    msg.clone(),
+                    CancellationToken::new(),
+                )
+                .await;
+            }
+        }
+
+        // A fresh runtime over the store reopened from disk: a daemon restart.
+        let provider = Arc::new(HistoryCaptureModelProvider::default());
+        let (after_restart, store) = runtime(Arc::clone(&provider));
+        let key_a = runtime_conversation_history_key(&after_restart, &root_a);
+        let key_b = runtime_conversation_history_key(&after_restart, &root_b);
+        assert_ne!(key_a, key_b);
+        let metadata = store.list_sessions_with_metadata();
+        for key in [&key_a, &key_b] {
+            let session = metadata
+                .iter()
+                .find(|m| &m.key == key)
+                .unwrap_or_else(|| panic!("no persisted session {key}: {metadata:?}"));
+            assert_eq!(session.channel_id.as_deref(), Some("matrix.home"));
+        }
+        assert!(
+            !metadata
+                .iter()
+                .any(|m| m.key == "matrix_home__room_server__alice_server"),
+            "thread-scoped turns must not also land in the room+sender session"
+        );
+
+        process_channel_message(
+            Arc::clone(&after_restart),
+            matrix_message("$a2:server", Some("$a:server"), "what was the codename?"),
+            CancellationToken::new(),
+        )
+        .await;
+        let calls = provider.calls.lock().unwrap_or_else(|e| e.into_inner());
+        let request = calls.last().expect("the follow-up reaches the model");
+        let transcript: Vec<&str> = request.iter().map(|(_, c)| c.as_str()).collect();
+        assert!(
+            transcript
+                .iter()
+                .any(|c| c.contains("alpha codename is quartz")),
+            "thread A's follow-up must see thread A's history after restart: {transcript:?}"
+        );
+        assert!(
+            !transcript
+                .iter()
+                .any(|c| c.contains("bravo codename is onyx")),
+            "thread B's history must not leak into thread A: {transcript:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn matrix_thread_scope_new_resets_only_its_thread() {
+        let live = zeroclaw_config::live::LiveConfig::new(matrix_scope_config(
+            zeroclaw_config::schema::MatrixSessionScope::RoomSenderThread,
+        ));
+        let store_dir = TempDir::new().unwrap();
+        let store: Arc<dyn SessionBackend> =
+            Arc::new(SqliteSessionBackend::new(store_dir.path()).unwrap());
+        let ctx = matrix_scope_ctx(&live, Some(Arc::clone(&store)));
+        let root_a = matrix_message("$a:server", Some("$a:server"), "thread A root");
+        let root_b = matrix_message("$b:server", Some("$b:server"), "thread B root");
+        record_passive(&ctx, &root_a).await;
+        record_passive(&ctx, &root_b).await;
+        let key_a = runtime_conversation_history_key(&ctx, &root_a);
+        let key_b = runtime_conversation_history_key(&ctx, &root_b);
+
+        let reset_a = matrix_message("$new:server", Some("$a:server"), "/new");
+        let channel: Arc<dyn Channel> = Arc::new(RecordingChannel::default());
+        assert!(handle_runtime_command_if_needed(&ctx, &reset_a, Some(&channel)).await);
+
+        {
+            let histories = ctx
+                .conversation_histories
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            assert!(histories.peek(&key_a).is_none_or(Vec::is_empty));
+            assert!(
+                histories
+                    .peek(&key_b)
+                    .is_some_and(|turns| !turns.is_empty())
+            );
+        }
+        let reopened = SqliteSessionBackend::new(store_dir.path()).unwrap();
+        assert!(
+            reopened.load(&key_a).is_empty(),
+            "/new inside thread A must delete thread A's durable transcript"
+        );
+        assert_eq!(
+            reopened.load(&key_b).len(),
+            1,
+            "/new inside thread A must keep thread B's durable transcript"
+        );
+    }
+
+    /// `/stop` sent inside one thread cancels that thread's in-flight turn,
+    /// including a turn started by the thread's root message, and leaves a
+    /// parallel thread of the same sender running.
+    #[tokio::test]
+    async fn matrix_thread_scope_stop_cancels_only_its_thread() {
+        let channel_impl = Arc::new(TelegramRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let provider = Arc::new(GatedProbeModelProvider::default());
+        provider.hold("m1");
+        provider.hold("m2");
+        let base = test_runtime_ctx_with_config_agent_and_provider_ref(
+            Arc::clone(&channel),
+            Arc::clone(&provider) as Arc<dyn ModelProvider>,
+            matrix_scope_config(zeroclaw_config::schema::MatrixSessionScope::RoomSenderThread),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+        let ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(HashMap::from([("matrix".to_string(), channel)])),
+            ..(*base).clone()
+        });
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(8);
+        let probe = Arc::clone(&provider);
+        let sent_probe = Arc::clone(&channel_impl);
+        let send_task = zeroclaw_spawn::spawn!(async move {
+            // Thread ids double as the provider's turn markers.
+            tx.send(matrix_message("m1", Some("m1"), "thread A"))
+                .await
+                .unwrap();
+            tx.send(matrix_message("m2", Some("m2"), "thread B"))
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while !(probe.entered_ids().contains(&"m1".to_string())
+                    && probe.entered_ids().contains(&"m2".to_string()))
+                {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("both thread turns must be in flight at once");
+            tx.send(matrix_message("s1", Some("m1"), "/stop"))
+                .await
+                .unwrap();
+            let stop_sent =
+                zeroclaw_runtime::i18n::get_required_cli_string("channel-runtime-stop-sent");
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while !sent_probe
+                    .sent_messages
+                    .lock()
+                    .await
+                    .iter()
+                    .any(|m| m.ends_with(&stop_sent))
+                {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("/stop in thread A must report a cancellation");
+            // Released after the cancellation: a turn that was not cancelled
+            // would now deliver its reply.
+            probe.release("m1");
+            probe.release("m2");
+        });
+
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            run_message_dispatch_loop(rx, AgentRouter::single(ctx), 4),
+        )
+        .await
+        .expect("dispatch loop drains");
+        send_task.await.unwrap();
+
+        let sent = channel_impl.sent_messages.lock().await;
+        assert!(
+            !sent.iter().any(|m| m.contains("done for message_id=m1")),
+            "/stop in thread A must cancel thread A's root turn: {sent:?}"
+        );
+        assert!(
+            sent.iter().any(|m| m.contains("done for message_id=m2")),
+            "/stop in thread A must leave thread B running: {sent:?}"
+        );
+    }
+
     #[test]
     fn reply_target_conversation_scope_omits_sender_from_history_key() {
         let first = zeroclaw_api::channel::ChannelMessage {
@@ -42566,6 +43062,46 @@ BTC is currently around $65,000 based on latest tool output."#
                 .all(|message| message.starts_with("-1001234:77:")),
             "the busy notice must follow the hook-rewritten route: {busy_messages:?}"
         );
+    }
+
+    #[test]
+    fn context_insertion_point_keeps_control_messages_verbatim() {
+        for control in [
+            "/new",
+            "/NEW@bot",
+            "/stop",
+            "/stop@bot",
+            "/clear",
+            "/thinking high",
+            "/think:off /new",
+            "/think:off",
+            "/think:high  ",
+        ] {
+            assert_eq!(
+                context_insertion_point("matrix", control),
+                None,
+                "{control}"
+            );
+        }
+        assert_eq!(
+            context_insertion_point("matrix", "/think:off explain briefly"),
+            Some("/think:off ".len()),
+            "context goes after a leading thinking directive"
+        );
+        for text in [
+            "hello",
+            "/clear this up",
+            "/new-session",
+            "/help",
+            "/goal ship it",
+            "/etc/hosts is the file",
+            "approve this plan please",
+            // Gate-shaped text is only a gate answer when a run is parked on
+            // it, which ingress cannot know, so it keeps its context.
+            "approve it",
+        ] {
+            assert_eq!(context_insertion_point("matrix", text), Some(0), "{text}");
+        }
     }
 
     #[test]

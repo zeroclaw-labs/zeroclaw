@@ -346,6 +346,7 @@ mod tests {
                 mention_only: false,
                 approval_timeout_secs: 300,
                 reply_in_thread: true,
+                session_scope: zeroclaw_config::schema::MatrixSessionScope::default(),
                 ack_reactions: Some(true),
                 excluded_tools: vec![],
                 reply_min_interval_secs: 0,

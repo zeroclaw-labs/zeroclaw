@@ -2387,10 +2387,60 @@ mod inbound {
             }
         }
 
-        let thread_id = extract_thread_id(&raw);
+        // An edit (`m.replace`) carries no thread relation of its own and can
+        // never be a thread root, so it takes its session and reply anchor
+        // from the event it replaces. When that event cannot be fetched the
+        // edit's conversation is unknown, so it is dropped rather than
+        // filed under a guessed session.
+        let (anchor_event_id, thread_id) = match extract_replaced_event_id(&raw) {
+            Some(original) => match room.event(&original, None).await {
+                Ok(timeline_event) => {
+                    let original_json = timeline_event.into_raw().json().get().to_owned();
+                    match replacement_target_thread(&original_json, sender) {
+                        Ok(thread_id) => (original, thread_id),
+                        Err(reason) => {
+                            ::zeroclaw_log::record!(
+                                DEBUG,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note
+                                )
+                                .with_attrs(::serde_json::json!({
+                                    "edit": ev.event_id,
+                                    "replaced": original,
+                                    "reason": reason,
+                                })),
+                                "matrix: dropping invalid edit"
+                            );
+                            return Ok(());
+                        }
+                    }
+                }
+                Err(e) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "error": format!("{e}"),
+                                "edit": ev.event_id,
+                                "replaced": original,
+                            })),
+                        "matrix: dropping edit whose replaced event could not be fetched"
+                    );
+                    return Ok(());
+                }
+            },
+            None => (ev.event_id.clone(), extract_thread_id(&raw)),
+        };
         let mut content = body.clone();
+        // The preamble must not change how the runtime reads the message: it
+        // goes after a leading `/think:` directive, and runtime slash commands
+        // (`/new`, `/stop`) get none. Those still count as the thread's first
+        // visit, as their own threaded reply would anyway.
         if let Some(tid) = thread_id.as_ref()
             && ctx_mod::claim_first_visit(&ctx.threads_seen, tid).await
+            && let Some(at) = crate::orchestrator::context_insertion_point("matrix", &body)
         {
             match room.event(tid, None).await {
                 Ok(timeline_event) => {
@@ -2398,9 +2448,10 @@ mod inbound {
                         extract_root_summary(timeline_event.into_raw())
                     {
                         content = format!(
-                            "{}{}",
+                            "{}{}{}",
+                            &body[..at],
                             ctx_mod::format_preamble(&root_sender, &root_body),
-                            content
+                            &body[at..]
                         );
                     }
                 }
@@ -2493,18 +2544,21 @@ mod inbound {
         }
         let attachments: Vec<MediaAttachment> = Vec::new();
 
-        let outbound_anchor =
-            resolve_outbound_anchor(thread_id.as_ref(), &ev.event_id, ctx.config.reply_in_thread);
+        let outbound_anchor = resolve_outbound_anchor(
+            thread_id.as_ref(),
+            &anchor_event_id,
+            ctx.config.reply_in_thread,
+        );
         // When the bot is the one starting the thread, mark its root seen
         // so the next inbound that lands inside it does not re-fetch and
         // re-inject a root preamble (the agent already saw the root in this
         // same turn).
         if thread_id.is_none() && ctx.config.reply_in_thread {
-            ctx_mod::mark_seen(&ctx.threads_seen, ev.event_id.clone()).await;
+            ctx_mod::mark_seen(&ctx.threads_seen, anchor_event_id.clone()).await;
         }
 
         let interruption_scope =
-            interruption_scope_from_anchor(outbound_anchor.as_deref(), &ev.event_id);
+            interruption_scope_from_anchor(outbound_anchor.as_deref(), &anchor_event_id);
 
         let msg = ChannelMessage {
             id: ev.event_id.to_string(),
@@ -2587,14 +2641,63 @@ mod inbound {
     }
 
     pub(super) fn extract_thread_id(raw: &RawEvent) -> Option<OwnedEventId> {
-        let v: JsonValue = serde_json::from_str(raw.get()).ok()?;
+        thread_root_from_json(raw.get())
+    }
+
+    pub(super) fn thread_root_from_json(event_json: &str) -> Option<OwnedEventId> {
+        related_event_id(event_json, "m.thread")
+    }
+
+    /// Validate the event an edit replaces and return its thread root.
+    ///
+    /// Matrix ignores a replacement whose target has another sender or event
+    /// type, is a state event, is itself a replacement, or has been redacted,
+    /// so such edits are rejected rather than given the target's conversation.
+    pub(super) fn replacement_target_thread(
+        original_json: &str,
+        edit_sender: &str,
+    ) -> Result<Option<OwnedEventId>, &'static str> {
+        let v: JsonValue = serde_json::from_str(original_json).map_err(|_| "unparseable target")?;
+        if v.get("type").and_then(JsonValue::as_str) != Some("m.room.message") {
+            return Err("target is not m.room.message");
+        }
+        if v.get("sender").and_then(JsonValue::as_str) != Some(edit_sender) {
+            return Err("target has another sender");
+        }
+        if v.get("state_key").is_some() {
+            return Err("target is a state event");
+        }
+        if v.get("unsigned")
+            .and_then(|u| u.get("redacted_because"))
+            .is_some()
+        {
+            return Err("target is redacted");
+        }
+        let target_rel_type = v
+            .get("content")
+            .and_then(|c| c.get("m.relates_to"))
+            .and_then(|r| r.get("rel_type"))
+            .and_then(JsonValue::as_str);
+        if target_rel_type == Some("m.replace") {
+            return Err("target is itself an edit");
+        }
+        Ok(thread_root_from_json(original_json))
+    }
+
+    /// The event an `m.replace` edit replaces.
+    pub(super) fn extract_replaced_event_id(raw: &RawEvent) -> Option<OwnedEventId> {
+        related_event_id(raw.get(), "m.replace")
+    }
+
+    fn related_event_id(event_json: &str, wanted_rel_type: &str) -> Option<OwnedEventId> {
+        let v: JsonValue = serde_json::from_str(event_json).ok()?;
         let relates = v.get("content")?.get("m.relates_to")?;
         let rel_type = relates.get("rel_type")?.as_str()?;
-        if rel_type != "m.thread" {
+        if rel_type != wanted_rel_type {
             return None;
         }
-        let root = relates.get("event_id")?.as_str()?;
-        root.parse().ok()
+        let target = relates.get("event_id")?.as_str()?;
+        target.parse().ok()
     }
 
     pub(super) fn extract_in_reply_to(raw: &RawEvent) -> Option<OwnedEventId> {
@@ -7697,6 +7800,278 @@ mod tests {
             );
             assert_stt_received_the_wav(&stt.received_requests().await.unwrap(), &wav);
         }
+        fn text_event(
+            event_id: &str,
+            body: &str,
+            relates_to: serde_json::Value,
+        ) -> serde_json::Value {
+            let mut content = serde_json::json!({ "msgtype": "m.text", "body": body });
+            if !relates_to.is_null() {
+                content["m.relates_to"] = relates_to;
+            }
+            serde_json::json!({
+                "type": "m.room.message",
+                "event_id": event_id,
+                "sender": "@alice:localhost",
+                "origin_server_ts": 1_000_000u64,
+                "content": content,
+            })
+        }
+
+        fn edit_event(event_id: &str, replaces: &str) -> serde_json::Value {
+            serde_json::json!({
+                "type": "m.room.message",
+                "event_id": event_id,
+                "sender": "@alice:localhost",
+                "origin_server_ts": 1_000_010u64,
+                "content": {
+                    "msgtype": "m.text",
+                    "body": "* fixed",
+                    "m.new_content": { "msgtype": "m.text", "body": "fixed" },
+                    "m.relates_to": { "rel_type": "m.replace", "event_id": replaces },
+                }
+            })
+        }
+
+        /// Sync `events` through the registered inbound handler and return
+        /// what it forwarded. `fetched` answers every `/event/` lookup.
+        async fn forward_events(
+            fetched: &serde_json::Value,
+            events: &[serde_json::Value],
+            threads_seen: Arc<TokioRwLock<HashSet<matrix_sdk::ruma::OwnedEventId>>>,
+        ) -> Vec<zeroclaw_api::channel::ChannelMessage> {
+            let matrix = MatrixMockServer::new().await;
+            let client = matrix.client_builder().build().await;
+            matrix.sync_joined_room(&client, test_room()).await;
+            matrix
+                .mock_room_event()
+                .room(test_room())
+                .ok_with_template(ResponseTemplate::new(200).set_body_json(fetched))
+                .mount()
+                .await;
+            let workspace = tempfile::tempdir().unwrap();
+            let (tx, mut rx) = mpsc::channel(8);
+            let mut ctx = handler_ctx_with_resolver(None, workspace.path(), tx);
+            ctx.threads_seen = threads_seen;
+            let _guards = register_event_handlers(&client, &ctx);
+            let mut builder = JoinedRoomBuilder::new(test_room());
+            for event in events {
+                builder = builder.add_timeline_event(timeline_raw(event));
+            }
+            matrix.sync_room(&client, builder).await;
+            let mut out = Vec::new();
+            for _ in events {
+                out.push(recv_forwarded(&mut rx).await);
+            }
+            out
+        }
+
+        #[tokio::test]
+        async fn thread_command_reaches_runtime_without_root_preamble() {
+            let root = text_event("$root:localhost", "root text", serde_json::Value::Null);
+            let in_thread =
+                serde_json::json!({ "rel_type": "m.thread", "event_id": "$root:localhost" });
+            let threads_seen = Arc::new(TokioRwLock::new(HashSet::new()));
+            let forwarded = forward_events(
+                &root,
+                &[text_event("$cmd:localhost", "/NEW@bot", in_thread)],
+                Arc::clone(&threads_seen),
+            )
+            .await;
+
+            assert_eq!(
+                forwarded[0].content, "/NEW@bot",
+                "a command in an unseen thread must keep its leading slash"
+            );
+            assert_eq!(forwarded[0].thread_ts.as_deref(), Some("$root:localhost"));
+            assert!(
+                threads_seen
+                    .read()
+                    .await
+                    .contains(&matrix_sdk::ruma::owned_event_id!("$root:localhost")),
+                "the command consumes the thread's first visit"
+            );
+        }
+
+        #[tokio::test]
+        async fn thread_control_text_keeps_directive_semantics() {
+            let root = text_event("$root:localhost", "root text", serde_json::Value::Null);
+            let thread =
+                |root: &str| serde_json::json!({ "rel_type": "m.thread", "event_id": root });
+            let forwarded = forward_events(
+                &root,
+                &[
+                    text_event(
+                        "$think:localhost",
+                        "/think:off explain briefly",
+                        thread("$r1:localhost"),
+                    ),
+                    text_event("$bare:localhost", "/think:off", thread("$r3:localhost")),
+                ],
+                Arc::new(TokioRwLock::new(HashSet::new())),
+            )
+            .await;
+
+            assert_eq!(
+                forwarded[0].content,
+                "/think:off [Thread root from @alice:localhost]: root text\n\nexplain briefly",
+                "the directive stays leading and the question keeps the root context"
+            );
+            for message in [&forwarded[0], &forwarded[1]] {
+                assert_eq!(
+                    zeroclaw_runtime::agent::thinking::parse_thinking_directive(&message.content)
+                        .map(|(level, _)| level),
+                    Some(zeroclaw_runtime::agent::thinking::ThinkingLevel::Off),
+                    "the forwarded directive must still parse: {:?}",
+                    message.content
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn thread_path_message_still_gets_root_preamble() {
+            let root = text_event("$root:localhost", "root text", serde_json::Value::Null);
+            let in_thread =
+                serde_json::json!({ "rel_type": "m.thread", "event_id": "$root:localhost" });
+            let forwarded = forward_events(
+                &root,
+                &[text_event(
+                    "$path:localhost",
+                    "/etc/hosts is the one",
+                    in_thread,
+                )],
+                Arc::new(TokioRwLock::new(HashSet::new())),
+            )
+            .await;
+
+            assert_eq!(
+                forwarded[0].content,
+                "[Thread root from @alice:localhost]: root text\n\n/etc/hosts is the one",
+                "a path is not a command and keeps the root context"
+            );
+        }
+
+        #[tokio::test]
+        async fn edit_in_thread_takes_thread_root_of_replaced_event() {
+            let original = text_event(
+                "$orig:localhost",
+                "typo",
+                serde_json::json!({ "rel_type": "m.thread", "event_id": "$root:localhost" }),
+            );
+            // The root context preamble is already established for this thread.
+            let threads_seen = Arc::new(TokioRwLock::new(HashSet::from([
+                matrix_sdk::ruma::owned_event_id!("$root:localhost"),
+            ])));
+            let forwarded = forward_events(
+                &original,
+                &[edit_event("$edit:localhost", "$orig:localhost")],
+                threads_seen,
+            )
+            .await;
+
+            assert_eq!(forwarded[0].id, "$edit:localhost");
+            assert_eq!(
+                forwarded[0].thread_ts.as_deref(),
+                Some("$root:localhost"),
+                "an edit belongs to the thread of the message it replaces"
+            );
+            assert_eq!(
+                forwarded[0].interruption_scope_id.as_deref(),
+                Some("$root:localhost")
+            );
+        }
+
+        #[tokio::test]
+        async fn edit_is_dropped_when_replaced_event_cannot_be_fetched() {
+            let matrix = MatrixMockServer::new().await;
+            let client = matrix.client_builder().build().await;
+            matrix.sync_joined_room(&client, test_room()).await;
+            matrix
+                .mock_room_event()
+                .room(test_room())
+                .ok_with_template(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                    "errcode": "M_NOT_FOUND",
+                    "error": "Event not found"
+                })))
+                .mount()
+                .await;
+            let workspace = tempfile::tempdir().unwrap();
+            let (tx, mut rx) = mpsc::channel(8);
+            let ctx = handler_ctx_with_resolver(None, workspace.path(), tx);
+            let _guards = register_event_handlers(&client, &ctx);
+            matrix
+                .sync_room(
+                    &client,
+                    JoinedRoomBuilder::new(test_room()).add_timeline_event(timeline_raw(
+                        &edit_event("$edit:localhost", "$orig:localhost"),
+                    )),
+                )
+                .await;
+
+            assert!(
+                tokio::time::timeout(Duration::from_millis(300), rx.recv())
+                    .await
+                    .is_err(),
+                "an edit whose conversation cannot be resolved must not be forwarded"
+            );
+        }
+
+        #[tokio::test]
+        async fn edit_of_another_senders_message_is_dropped() {
+            let matrix = MatrixMockServer::new().await;
+            let client = matrix.client_builder().build().await;
+            matrix.sync_joined_room(&client, test_room()).await;
+            let mut original = text_event(
+                "$orig:localhost",
+                "theirs",
+                serde_json::json!({ "rel_type": "m.thread", "event_id": "$root:localhost" }),
+            );
+            original["sender"] = serde_json::json!("@mallory:localhost");
+            matrix
+                .mock_room_event()
+                .room(test_room())
+                .ok_with_template(ResponseTemplate::new(200).set_body_json(&original))
+                .mount()
+                .await;
+            let workspace = tempfile::tempdir().unwrap();
+            let (tx, mut rx) = mpsc::channel(8);
+            let ctx = handler_ctx_with_resolver(None, workspace.path(), tx);
+            let _guards = register_event_handlers(&client, &ctx);
+            matrix
+                .sync_room(
+                    &client,
+                    JoinedRoomBuilder::new(test_room()).add_timeline_event(timeline_raw(
+                        &edit_event("$edit:localhost", "$orig:localhost"),
+                    )),
+                )
+                .await;
+
+            assert!(
+                tokio::time::timeout(Duration::from_millis(300), rx.recv())
+                    .await
+                    .is_err(),
+                "an edit Matrix would reject must not inherit the target's conversation"
+            );
+        }
+
+        #[tokio::test]
+        async fn edit_of_top_level_message_anchors_on_replaced_event() {
+            let original = text_event("$orig:localhost", "typo", serde_json::Value::Null);
+            let forwarded = forward_events(
+                &original,
+                &[edit_event("$edit:localhost", "$orig:localhost")],
+                Arc::new(TokioRwLock::new(HashSet::new())),
+            )
+            .await;
+
+            assert_eq!(
+                forwarded[0].thread_ts.as_deref(),
+                Some("$orig:localhost"),
+                "an edit is never a thread root; it reuses the replaced message's thread"
+            );
+            assert_eq!(forwarded[0].interruption_scope_id, None);
+        }
+
         #[tokio::test]
         async fn sync_ingress_suppresses_rejected_approval_replies_and_delivers_authorized_one() {
             let matrix = MatrixMockServer::new().await;
@@ -10486,6 +10861,7 @@ mod tests {
                 password: password.map(String::from),
                 approval_timeout_secs: 300,
                 reply_in_thread: true,
+                session_scope: zeroclaw_config::schema::MatrixSessionScope::default(),
                 ack_reactions: Some(true),
                 excluded_tools: vec![],
                 reply_min_interval_secs: 0,
@@ -10860,8 +11236,117 @@ mod tests {
     mod thread_extraction {
         use super::super::inbound::{
             extract_mentions_user_ids, extract_thread_id, interruption_scope_from_anchor,
-            resolve_outbound_anchor,
+            replacement_target_thread, resolve_outbound_anchor,
         };
+
+        fn target(sender: &str, content: serde_json::Value, unsigned: serde_json::Value) -> String {
+            serde_json::json!({
+                "type": "m.room.message",
+                "event_id": "$orig:server",
+                "sender": sender,
+                "content": content,
+                "unsigned": unsigned,
+            })
+            .to_string()
+        }
+
+        #[test]
+        fn replacement_target_returns_thread_root_for_valid_targets() {
+            let in_thread = target(
+                "@alice:server",
+                serde_json::json!({
+                    "msgtype": "m.text", "body": "typo",
+                    "m.relates_to": { "rel_type": "m.thread", "event_id": "$root:server" }
+                }),
+                serde_json::json!({}),
+            );
+            assert_eq!(
+                replacement_target_thread(&in_thread, "@alice:server")
+                    .unwrap()
+                    .map(|id| id.to_string())
+                    .as_deref(),
+                Some("$root:server")
+            );
+            let top_level = target(
+                "@alice:server",
+                serde_json::json!({ "msgtype": "m.text", "body": "typo" }),
+                serde_json::json!({}),
+            );
+            assert_eq!(
+                replacement_target_thread(&top_level, "@alice:server"),
+                Ok(None)
+            );
+        }
+
+        #[test]
+        fn replacement_target_rejects_invalid_targets() {
+            let plain = serde_json::json!({ "msgtype": "m.text", "body": "typo" });
+            assert!(
+                replacement_target_thread(
+                    &target("@mallory:server", plain.clone(), serde_json::json!({})),
+                    "@alice:server"
+                )
+                .is_err(),
+                "another sender's message"
+            );
+            assert!(
+                replacement_target_thread(
+                    &target(
+                        "@alice:server",
+                        plain.clone(),
+                        serde_json::json!({ "redacted_because": {} })
+                    ),
+                    "@alice:server"
+                )
+                .is_err(),
+                "a redacted message"
+            );
+            let mut state_event: serde_json::Value = serde_json::from_str(&target(
+                "@alice:server",
+                plain.clone(),
+                serde_json::json!({}),
+            ))
+            .unwrap();
+            state_event["state_key"] = serde_json::json!("");
+            assert!(
+                replacement_target_thread(&state_event.to_string(), "@alice:server").is_err(),
+                "a state event"
+            );
+            let malformed_edit = serde_json::json!({
+                "msgtype": "m.text", "body": "* typo",
+                "m.relates_to": { "rel_type": "m.replace", "event_id": "not-an-event-id" }
+            });
+            assert!(
+                replacement_target_thread(
+                    &target("@alice:server", malformed_edit, serde_json::json!({})),
+                    "@alice:server"
+                )
+                .is_err(),
+                "an edit with a malformed target id is still an edit"
+            );
+            let edit = serde_json::json!({
+                "msgtype": "m.text", "body": "* typo",
+                "m.new_content": { "msgtype": "m.text", "body": "typo" },
+                "m.relates_to": { "rel_type": "m.replace", "event_id": "$first:server" }
+            });
+            assert!(
+                replacement_target_thread(
+                    &target("@alice:server", edit, serde_json::json!({})),
+                    "@alice:server"
+                )
+                .is_err(),
+                "an edit of an edit"
+            );
+            let reaction = serde_json::json!({
+                "type": "m.reaction",
+                "event_id": "$orig:server",
+                "sender": "@alice:server",
+                "content": {}
+            })
+            .to_string();
+            assert!(replacement_target_thread(&reaction, "@alice:server").is_err());
+        }
+
         use matrix_sdk::event_handler::RawEvent;
         use matrix_sdk::ruma::serde::Raw;
 

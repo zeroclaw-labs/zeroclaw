@@ -92,6 +92,25 @@ rooms the bot answers in. Authorize senders with a [peer group](#who-can-talk-to
 
 {{#thread-context channel="Matrix" prop="reply_in_thread" path="channels.matrix.<alias>.reply_in_thread"}}
 
+### Session scope
+
+On Matrix, `reply_in_thread` only decides where replies go. Whether each thread is a separate conversation is set by `channels.matrix.<alias>.session_scope`, and by default threads share one history per sender and room:
+
+```toml
+[channels.matrix.default]
+session_scope = "room_sender"          # default
+# session_scope = "room_sender_thread" # one conversation per Matrix thread
+```
+
+- **`room_sender` (default):** each sender gets one history per room. Matrix threads only decide where replies go, so the agent remembers context across every thread that sender opens in that room. Use this for ordinary chat rooms. Existing installations keep this behavior.
+- **`room_sender_thread`:** each Matrix thread root gets its own history, so one sender can keep several independent conversations going in the same room without creating new rooms. Use this when a client presents threads as separate conversations or tabs. The thread root and every follow-up in that thread share one session, keyed by the root's event id and never by a follow-up's own id. Interrupts, `/stop`, and `/new` act on the thread you send them in.
+  - With `reply_in_thread = true`, every top-level message opens its own thread, so it starts a new conversation. Send follow-ups inside that thread to continue it. `/stop` and `/new` also have to be sent inside the thread they should affect.
+  - With `reply_in_thread = false`, top-level messages keep sharing one room+sender history, and only real Matrix threads get their own history. A thread someone opens under a top-level message starts a new conversation: the agent sees the root message as context, but the room+sender history it was answered in stays separate.
+
+Edited messages belong to the conversation of the message they replace. ZeroClaw ignores an edit when it cannot fetch the replaced message, or when Matrix would treat the edit as invalid (another sender's message, an edit of an edit, or a redacted message), rather than guess its conversation. Slash commands keep working as the first message ZeroClaw sees in a thread, including after a restart: commands such as `/new` and `/stop` arrive without the root preamble, and a leading `/think:<level>` directive stays in front of it.
+
+The setting is read from live config for each message, so a change applies without a restart. Change it while the alias is idle: messages already queued or running when the change lands can finish under the previous scope, and `/stop` may not reach them. Changing the scope does not move or merge stored histories: messages land in the scope configured when they are processed, and earlier sessions stay in the session store. Switching back to `room_sender` returns thread messages to the room+sender history. Thread-scoped sessions are keyed only by room, sender, and thread root, so they rehydrate normally after a daemon restart.
+
 ## 3. Token path (alternative): obtaining `access_token` and `device_id`
 
 > [!IMPORTANT]
