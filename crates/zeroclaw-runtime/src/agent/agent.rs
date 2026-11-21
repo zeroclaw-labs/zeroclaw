@@ -210,6 +210,7 @@ pub(crate) enum RoutedApproval {
     Decided {
         response: zeroclaw_api::channel::ChannelApprovalResponse,
         decider: Option<String>,
+        decided_by_user: Option<String>,
         source: zeroclaw_api::channel::ApprovalSource,
     },
     /// Explicit `InheritOriginator` — defer to the originating-channel fan-out.
@@ -258,6 +259,7 @@ pub(crate) async fn resolve_routed_approval(
                 Ok(Some(attributed)) => {
                     return RoutedApproval::Decided {
                         response: attributed.response,
+                        decided_by_user: attributed.decided_by_user,
                         decider: Some(channel_name),
                         source: attributed.source,
                     };
@@ -300,6 +302,7 @@ pub(crate) async fn resolve_routed_approval(
             RoutedApproval::Decided {
                 response: zeroclaw_api::channel::ChannelApprovalResponse::Deny,
                 decider: None,
+                decided_by_user: None,
                 // The runtime denied this, not a person. Carrying the specific
                 // reason lets the tool result say so instead of reporting a
                 // user denial that never happened.
@@ -427,9 +430,11 @@ impl zeroclaw_api::channel::Channel for RoutedApprovalChannel {
                 response,
                 decider,
                 source,
+                decided_by_user,
             } => Ok(Some(
                 zeroclaw_api::channel::AttributedApprovalResponse::from_runtime(response, source)
-                    .with_decider_opt(decider),
+                    .with_decider_opt(decider)
+                    .with_user(decided_by_user),
             )),
             RoutedApproval::Fallthrough => match self.origin.as_ref() {
                 Some(origin) => match origin
@@ -23199,6 +23204,7 @@ mod approval_route_tests {
                 response,
                 decider,
                 source,
+                ..
             } => {
                 assert_eq!(response, ChannelApprovalResponse::Approve);
                 assert_eq!(
@@ -23268,6 +23274,7 @@ mod approval_route_tests {
                 response,
                 decider,
                 source,
+                ..
             } => {
                 assert_eq!(response, ChannelApprovalResponse::Deny, "fail-closed deny");
                 assert!(decider.is_none(), "synthetic deny has no decider");
@@ -23316,6 +23323,7 @@ mod approval_route_tests {
                 response: ChannelApprovalResponse::Deny,
                 source: zeroclaw_api::channel::ApprovalSource::Unavailable,
                 decider: None,
+                ..
             }
         ));
     }
@@ -23412,6 +23420,7 @@ mod approval_route_tests {
                 response: ChannelApprovalResponse::Deny,
                 decider,
                 source: zeroclaw_api::channel::ApprovalSource::TimedOut,
+                ..
             } => assert!(
                 decider.is_none(),
                 "a runtime timeout denial must not name a deciding operator"
@@ -23439,6 +23448,7 @@ mod approval_route_tests {
                 response: ChannelApprovalResponse::Deny,
                 decider: Some(decider),
                 source: zeroclaw_api::channel::ApprovalSource::Operator,
+                ..
             } => assert_eq!(decider, "ops"),
             _ => panic!("an operator denial must remain final under inherit-originator: {out:?}"),
         }

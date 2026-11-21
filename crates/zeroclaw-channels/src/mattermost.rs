@@ -36,7 +36,7 @@ struct PendingApproval {
     generation: u64,
     /// Mattermost channel ID the prompt was posted into.
     channel_id: String,
-    sender: tokio::sync::oneshot::Sender<ChannelApprovalResponse>,
+    sender: tokio::sync::oneshot::Sender<zeroclaw_api::channel::AttributedApprovalResponse>,
 }
 
 /// How many retired tokens to remember. A token only needs to outlive the
@@ -1332,9 +1332,7 @@ impl Channel for MattermostChannel {
 
         let attributed =
             match tokio::time::timeout(Duration::from_secs(self.approval_timeout_secs), rx).await {
-                Ok(Ok(response)) => {
-                    zeroclaw_api::channel::AttributedApprovalResponse::operator(response)
-                }
+                Ok(Ok(response)) => response,
                 Ok(Err(_)) => zeroclaw_api::channel::AttributedApprovalResponse::from_runtime(
                     ChannelApprovalResponse::Deny,
                     zeroclaw_api::channel::ApprovalSource::Unreachable,
@@ -1942,7 +1940,10 @@ impl MattermostChannel {
         };
         // A closed receiver means the waiter already timed out; the decision is
         // simply dropped.
-        let _ = pending.sender.send(response);
+        let _ = pending.sender.send(
+            zeroclaw_api::channel::AttributedApprovalResponse::operator(response)
+                .with_user(Some(user_id.to_string())),
+        );
         true
     }
 
@@ -2124,7 +2125,10 @@ impl MattermostChannel {
         if let Some(sender) = resolved {
             // A closed receiver means the waiter already gave up; the decision
             // is dropped and the reply is still consumed.
-            let _ = sender.send(response);
+            let _ = sender.send(
+                zeroclaw_api::channel::AttributedApprovalResponse::operator(response)
+                    .with_user(Some(user_id.to_string())),
+            );
         }
         outcome
     }
@@ -4534,7 +4538,7 @@ mod approval_tests {
     async fn pending_in_origin(
         ch: &MattermostChannel,
         token: &str,
-    ) -> tokio::sync::oneshot::Receiver<ChannelApprovalResponse> {
+    ) -> tokio::sync::oneshot::Receiver<zeroclaw_api::channel::AttributedApprovalResponse> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         ch.approvals.lock().pending.insert(
             token.to_string(),
@@ -4572,7 +4576,7 @@ mod approval_tests {
         ch: &MattermostChannel,
         token: &str,
         post_id: &str,
-    ) -> tokio::sync::oneshot::Receiver<ChannelApprovalResponse> {
+    ) -> tokio::sync::oneshot::Receiver<zeroclaw_api::channel::AttributedApprovalResponse> {
         let rx = pending_in_origin(ch, token).await;
         ch.approvals
             .lock()
@@ -4597,7 +4601,7 @@ mod approval_tests {
             .await;
 
         assert!(consumed, "a decision reaction must resolve the prompt");
-        assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::Approve);
+        assert_eq!(rx.await.unwrap().response, ChannelApprovalResponse::Approve);
         assert!(
             ch.approvals.lock().pending.is_empty(),
             "resolving must retire the pending token"
@@ -4622,7 +4626,7 @@ mod approval_tests {
             ))
             .await
         );
-        assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::Deny);
+        assert_eq!(rx.await.unwrap().response, ChannelApprovalResponse::Deny);
     }
 
     /// Reacting is as privileged as replying, so the same allowlist applies.
@@ -4735,7 +4739,7 @@ mod approval_tests {
                 .await
                 == ApprovalReplyOutcome::Consumed
         );
-        assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::Approve);
+        assert_eq!(rx.await.unwrap().response, ChannelApprovalResponse::Approve);
 
         // The reaction arrives afterwards — the operator tapped as well as typed.
         assert!(
@@ -4765,7 +4769,7 @@ mod approval_tests {
             ApprovalReplyOutcome::Consumed,
             "an approval reply must not fall through to the model"
         );
-        assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::Approve);
+        assert_eq!(rx.await.unwrap().response, ChannelApprovalResponse::Approve);
         assert!(
             ch.approvals.lock().pending.is_empty(),
             "resolving must retire the pending token"
@@ -4861,7 +4865,7 @@ mod approval_tests {
         )
         .await;
 
-        assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::Approve);
+        assert_eq!(rx.await.unwrap().response, ChannelApprovalResponse::Approve);
         assert!(ch.approvals.lock().pending.is_empty());
     }
 
@@ -5058,7 +5062,7 @@ mod approval_tests {
                     .await
                     == ApprovalReplyOutcome::Consumed
             );
-            assert_eq!(rx.await.unwrap(), expected);
+            assert_eq!(rx.await.unwrap().response, expected);
         }
     }
 
@@ -5146,7 +5150,7 @@ mod approval_lifecycle_tests {
     fn pending(
         ch: &MattermostChannel,
         token: &str,
-    ) -> tokio::sync::oneshot::Receiver<ChannelApprovalResponse> {
+    ) -> tokio::sync::oneshot::Receiver<zeroclaw_api::channel::AttributedApprovalResponse> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         ch.approvals.lock().pending.insert(
             token.to_string(),
@@ -5186,8 +5190,12 @@ mod approval_lifecycle_tests {
             .lock()
             .retire_generation("abc123", generation)
             .expect("token was live");
-        let _ = resolved.sender.send(ChannelApprovalResponse::Approve);
-        assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::Approve);
+        let _ = resolved
+            .sender
+            .send(zeroclaw_api::channel::AttributedApprovalResponse::operator(
+                ChannelApprovalResponse::Approve,
+            ));
+        assert_eq!(rx.await.unwrap().response, ChannelApprovalResponse::Approve);
 
         // The operator's typed reply is already in flight and lands afterwards.
         ch.process_inbound_post(
@@ -5412,7 +5420,7 @@ mod approval_identity_tests {
     fn pending(
         ch: &MattermostChannel,
         token: &str,
-    ) -> tokio::sync::oneshot::Receiver<ChannelApprovalResponse> {
+    ) -> tokio::sync::oneshot::Receiver<zeroclaw_api::channel::AttributedApprovalResponse> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         ch.approvals.lock().pending.insert(
             token.to_string(),
@@ -5603,7 +5611,10 @@ mod approval_generation_tests {
         ch: &MattermostChannel,
         token: &str,
         post_id: &str,
-    ) -> (tokio::sync::oneshot::Receiver<ChannelApprovalResponse>, u64) {
+    ) -> (
+        tokio::sync::oneshot::Receiver<zeroclaw_api::channel::AttributedApprovalResponse>,
+        u64,
+    ) {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let mut state = ch.approvals.lock();
         let generation = state.next_generation;
@@ -5809,7 +5820,10 @@ mod approval_registration_identity_tests {
         ch: &MattermostChannel,
         token: &str,
         post_id: Option<&str>,
-    ) -> (tokio::sync::oneshot::Receiver<ChannelApprovalResponse>, u64) {
+    ) -> (
+        tokio::sync::oneshot::Receiver<zeroclaw_api::channel::AttributedApprovalResponse>,
+        u64,
+    ) {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let mut state = ch.approvals.lock();
         let generation = state.next_generation;
@@ -5887,7 +5901,11 @@ mod approval_registration_identity_tests {
         struct SwapDuringLookup {
             approvals: Arc<Mutex<ApprovalState>>,
             old_generation: u64,
-            replacement: Mutex<Option<tokio::sync::oneshot::Sender<ChannelApprovalResponse>>>,
+            replacement: Mutex<
+                Option<
+                    tokio::sync::oneshot::Sender<zeroclaw_api::channel::AttributedApprovalResponse>,
+                >,
+            >,
         }
 
         impl Respond for SwapDuringLookup {

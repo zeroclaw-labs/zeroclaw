@@ -819,14 +819,16 @@ impl DiscordChannel {
     ) -> Option<crate::util::PendingApprovalResolution> {
         let (token, response) = crate::util::parse_approval_reply(content)?;
         Some(
-            crate::util::resolve_pending_approval(
+            crate::util::resolve_pending_approval_attributed_with_tool(
                 &self.pending_approvals,
                 &token,
-                response,
+                zeroclaw_api::channel::AttributedApprovalResponse::operator(response)
+                    .with_user(Some(responder.to_string())),
                 !responder_is_bot && self.is_user_allowed(responder),
                 &Self::canonical_approval_destination(destination),
             )
-            .await,
+            .await
+            .0,
         )
     }
 
@@ -892,7 +894,10 @@ impl DiscordChannel {
         token: &str,
         request: &ChannelApprovalRequest,
     ) -> anyhow::Result<()> {
-        let (row, bindings) = approval::build_approval_row(token);
+        let (row, bindings) = approval::build_approval_row(
+            token,
+            request.tool_name == zeroclaw_api::channel::COST_LIMIT_OVERRIDE_APPROVAL,
+        );
         // Register every button's intent first. Single-use is enforced by the
         // registry's `take`; the per-click `interaction_gate` is enforced by the
         // type-3 dispatch before any `take`.
@@ -2940,16 +2945,16 @@ impl Channel for DiscordChannel {
                                         ).await;
                                         let prompt = match intent {
                                             Some(ComponentIntent::Approval { token, decision }) => {
-                                                let resolution = crate::util::resolve_pending_approval(
+                                                let resolution = crate::util::resolve_pending_approval_attributed_with_tool(
                                                     &pending_approvals,
                                                     &token,
-                                                    decision.response(),
+                                                    zeroclaw_api::channel::AttributedApprovalResponse::operator(decision.response()).with_user(Some(user_id.clone())),
                                                     true,
                                                     &Self::canonical_approval_destination(
                                                         &interaction_channel,
                                                     ),
                                                 )
-                                                .await;
+                                                .await.0;
                                                 let key = if matches!(
                                                     resolution,
                                                     crate::util::PendingApprovalResolution::Resolved
@@ -4063,7 +4068,7 @@ impl Channel for DiscordChannel {
             match tokio::time::timeout(Duration::from_secs(self.approval_timeout_secs), rx).await {
                 Ok(Ok(resp)) => {
                     guard.disarm();
-                    zeroclaw_api::channel::AttributedApprovalResponse::operator(resp)
+                    resp
                 }
                 Ok(Err(_)) => {
                     // Sender dropped: the gateway task went away without a click.
@@ -7924,7 +7929,7 @@ mod tests {
         )
         .await;
         assert_eq!(resolution, crate::util::PendingApprovalResolution::Resolved);
-        assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::Deny);
+        assert_eq!(rx.await.unwrap().response, ChannelApprovalResponse::Deny);
     }
 
     /// Compose the production component take and resolver after the ingress gate.
@@ -7994,7 +7999,7 @@ mod tests {
             dispatch_approval_click(&[String::from("*")], "u1", &wire, &reg, &approvals, "c1")
                 .await;
         assert!(resolved, "authorized click resolves the oneshot");
-        assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::Approve);
+        assert_eq!(rx.await.unwrap().response, ChannelApprovalResponse::Approve);
     }
 
     #[tokio::test]
@@ -8094,7 +8099,7 @@ mod tests {
                 .await,
             Some(crate::util::PendingApprovalResolution::Resolved)
         );
-        assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::Approve);
+        assert_eq!(rx.await.unwrap().response, ChannelApprovalResponse::Approve);
         assert_eq!(
             ch.resolve_approval_reply("tok123 no", "u1", false, "c1")
                 .await,
@@ -8186,7 +8191,7 @@ mod tests {
             dispatch_approval_click(&[String::from("*")], "u1", &wire, &reg, &approvals, "c1",)
                 .await
         );
-        assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::Approve);
+        assert_eq!(rx.await.unwrap().response, ChannelApprovalResponse::Approve);
         assert!(reg.lock().take(&wire).is_none());
         assert!(
             !dispatch_approval_click(&[String::from("*")], "u1", &wire, &reg, &approvals, "c1",)
@@ -8224,7 +8229,7 @@ mod tests {
             dispatch_approval_click(&[String::from("*")], "u1", &wire, &reg, &approvals, "c1",)
                 .await
         );
-        assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::Deny);
+        assert_eq!(rx.await.unwrap().response, ChannelApprovalResponse::Deny);
         // The component entry is gone (single-use take), so a replay of the same
         // custom_id resolves nothing even from an authorized user.
         assert!(
@@ -8249,7 +8254,7 @@ mod tests {
         // Register exactly what send_buttoned_approval registers, then confirm
         // every button id resolves to its bound decision (and only its own).
         let token = "abc123";
-        let (_, bindings) = approval::build_approval_row(token);
+        let (_, bindings) = approval::build_approval_row(token, false);
         {
             let mut reg = ch.pending_components.lock();
             for (cid, decision) in &bindings {
