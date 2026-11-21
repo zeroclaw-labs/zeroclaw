@@ -122,6 +122,9 @@ expect "mixed unrelated then runtime" "true" \
     "docs/book/src/plugins/typed-config.md" \
     "crates/zeroclaw-runtime/src/agent/agent.rs"
 
+expect "plugin TLS credential handler" "true" "crates/zeroclaw-gateway/src/api_config.rs"
+expect "plugin TLS credential authorization test" "true" "crates/zeroclaw-gateway/src/principal_gate.rs"
+
 # Unrelated changes must keep the job skipped.
 expect "docs-only changes" "false" \
     "docs/book/src/contributing/testing.md"
