@@ -1954,6 +1954,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.conversation_ended': 'This conversation has ended. Its messages stay here; send a message to start a new conversation.',
     'agent.conversation_ends_with_page': 'This conversation ends when you leave or reload this page, or sign out.',
     'agent.turn_result_lost': 'The turn finished, but its result could not be displayed. You can continue this conversation.',
+    'agent.approval_action_unavailable': 'The approval action could not be accepted. If the approval remains visible, choose another action; otherwise, retry the turn if needed.',
     'agent.ready_status': 'Ready',
     'agent.conversation_started_over': 'This conversation started over. The agent no longer has the earlier messages.',
     'pairing.title': 'Device Pairing',

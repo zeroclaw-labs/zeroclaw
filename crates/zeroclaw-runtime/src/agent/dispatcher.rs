@@ -5,6 +5,8 @@ use zeroclaw_api::media::RenderedMarker;
 use zeroclaw_api::tool_carrier::{render_native_attachments, render_prompt_tool_carrier};
 use zeroclaw_providers::{ChatMessage, ChatResponse, ConversationMessage, ToolResultMessage};
 
+use super::prompt::{SESSION_PROMPT_HISTORY_RESULT_KEY, SESSION_PROMPT_TEXT_RESULT_MARKER};
+
 #[derive(Debug, Clone)]
 pub struct ParsedToolCall {
     pub name: String,
@@ -120,6 +122,12 @@ impl ToolDispatcher for XmlToolDispatcher {
                 result.name, status, result.output
             );
         }
+        if results
+            .iter()
+            .any(|result| zeroclaw_api::SESSION_PROMPT_TOOL_NAMES.contains(&result.name.as_str()))
+        {
+            content.insert_str(0, SESSION_PROMPT_TEXT_RESULT_MARKER);
+        }
         ConversationMessage::Chat(ChatMessage::user(render_prompt_tool_carrier(
             &content,
             &attachments,
@@ -165,6 +173,12 @@ impl ToolDispatcher for XmlToolDispatcher {
                             result.tool_call_id, result.content
                         );
                     }
+                    if results
+                        .iter()
+                        .any(|result| result.session_prompt_tool_result)
+                    {
+                        content.insert_str(0, SESSION_PROMPT_TEXT_RESULT_MARKER);
+                    }
                     vec![ChatMessage::user(render_prompt_tool_carrier(
                         &content,
                         &attachments,
@@ -203,6 +217,8 @@ impl ToolDispatcher for NativeToolDispatcher {
         let messages = results
             .iter()
             .map(|result| ToolResultMessage {
+                session_prompt_tool_result: zeroclaw_api::SESSION_PROMPT_TOOL_NAMES
+                    .contains(&result.name.as_str()),
                 tool_call_id: result
                     .tool_call_id
                     .clone()
@@ -250,14 +266,15 @@ impl ToolDispatcher for NativeToolDispatcher {
                         // always present) with no inferred attachments: a
                         // bare image path in stored tool text stays text.
                         let attachments: Vec<RenderedMarker> = Vec::new();
-                        ChatMessage::tool(
-                            serde_json::json!({
-                                "tool_call_id": result.tool_call_id,
-                                "content": result.content,
-                                "attachments": render_native_attachments(&attachments),
-                            })
-                            .to_string(),
-                        )
+                        let mut envelope = serde_json::json!({
+                            "tool_call_id": result.tool_call_id,
+                            "content": result.content,
+                            "attachments": render_native_attachments(&attachments),
+                        });
+                        if result.session_prompt_tool_result {
+                            envelope[SESSION_PROMPT_HISTORY_RESULT_KEY] = Value::Bool(true);
+                        }
+                        ChatMessage::tool(envelope.to_string())
                     })
                     .collect(),
             })
@@ -607,6 +624,7 @@ mod tests {
         let native = NativeToolDispatcher;
 
         let history = vec![ConversationMessage::ToolResults(vec![ToolResultMessage {
+            session_prompt_tool_result: false,
             tool_call_id: "tc1".into(),
             content: format!("Saved image to {path}"),
             tool_name: String::new(),

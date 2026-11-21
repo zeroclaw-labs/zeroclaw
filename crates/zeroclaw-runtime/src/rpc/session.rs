@@ -327,6 +327,9 @@ type GatedOpPause = (
 #[cfg(test)]
 type PromptRegistrationPause = (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>);
 
+/// A cancellation token is owned by one admitted prompt and, when it comes
+/// from a real prompt path, one concrete session incarnation.
+type CancelTokenEntry = (u64, Option<u64>, tokio_util::sync::CancellationToken);
 #[cfg(test)]
 type RetirementCommitHook = Box<dyn FnMut(bool) + Send>;
 
@@ -340,10 +343,13 @@ type RemovalSignalPause = (
     Arc<tokio::sync::Notify>,
 );
 
-type CancelTokenEntry = (u64, Option<u64>, tokio_util::sync::CancellationToken);
-
 #[cfg(test)]
 type RehydrateSeedPause = (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>);
+
+struct AdminKillFence {
+    session_generation: u64,
+    outstanding_guards: usize,
+}
 
 /// A live session owned by a TUI identity: what deciding whether to retire it
 /// as orphaned needs.
@@ -363,9 +369,20 @@ pub struct SessionStore {
     agent_lock_waiting: Arc<tokio::sync::Notify>,
     #[cfg(test)]
     pending_generation_waiting: Arc<tokio::sync::Notify>,
+    // (registration generation, owning session generation, token). The
+    // session generation is absent only for legacy/test registrations;
+    // lifecycle requests must not use an unbound token to affect a concrete
+    // session incarnation.
     cancel_tokens: std::sync::Mutex<HashMap<String, CancelTokenEntry>>,
     cancel_generation: std::sync::atomic::AtomicU64,
     cancel_causes: std::sync::Mutex<HashMap<String, CancelCause>>,
+    /// An administrative kill is terminal for the observed session
+    /// incarnation. Unlike a pre-registration cancellation latch, this fence
+    /// also covers prompts still waiting for the actor permit, so they cannot
+    /// start provider work between interrupting the active turn and durable
+    /// kill finalization. This map owns the count of outstanding Kill guards
+    /// for the current incarnation; each guard releases only its own share.
+    admin_kill_fences: std::sync::Mutex<HashMap<String, AdminKillFence>>,
     /// Steering sender of each session's running turn, keyed by the same
     /// generation as its cancel token so the turn's exit removes exactly its
     /// own entry.
@@ -387,9 +404,6 @@ pub struct SessionStore {
     test_effect_pauses: std::sync::Mutex<HashMap<&'static str, RehydrateSeedPause>>,
     #[cfg(test)]
     test_gated_op_pause: std::sync::Mutex<Option<GatedOpPause>>,
-    /// Test-only pause immediately after a prompt registers its cancellation
-    /// token. Removal-race tests use this to issue close/kill/delete while the
-    /// prompt owns admission but before any fallible setup or provider work.
     #[cfg(test)]
     test_prompt_registration_pause: std::sync::Mutex<Option<PromptRegistrationPause>>,
     #[cfg(test)]
@@ -457,6 +471,37 @@ pub(crate) struct CancelTokenRegistration<'a> {
     generation: Option<u64>,
 }
 
+/// Releases one share of the generation-bound administrative Kill fence on
+/// every handler exit. The last guard clears it, including when durable
+/// termination fails and the session survives.
+pub(crate) struct LifecycleCancellation<'a> {
+    store: &'a SessionStore,
+    session_id: String,
+    session_generation: u64,
+    admin_kill_fence: bool,
+}
+
+impl Drop for LifecycleCancellation<'_> {
+    fn drop(&mut self) {
+        if self.admin_kill_fence {
+            let mut fences = self
+                .store
+                .admin_kill_fences
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(fence) = fences.get_mut(&self.session_id)
+                && fence.session_generation == self.session_generation
+            {
+                if fence.outstanding_guards > 1 {
+                    fence.outstanding_guards -= 1;
+                } else {
+                    fences.remove(&self.session_id);
+                }
+            }
+        }
+    }
+}
+
 impl CancelTokenRegistration<'_> {
     /// Drain the turn's cancellation attribution before unregistering the
     /// token. `remove_cancel_token` intentionally clears any leftover cause.
@@ -495,6 +540,7 @@ impl SessionStore {
             cancel_tokens: std::sync::Mutex::new(HashMap::new()),
             cancel_generation: std::sync::atomic::AtomicU64::new(0),
             cancel_causes: std::sync::Mutex::new(HashMap::new()),
+            admin_kill_fences: std::sync::Mutex::new(HashMap::new()),
             steering: std::sync::Mutex::new(HashMap::new()),
             cancel_tokens_changed: Arc::new(tokio::sync::Notify::new()),
             max_sessions,
@@ -552,7 +598,7 @@ impl SessionStore {
     }
 
     /// Publish a session while the caller already owns the session's
-    /// admission permit. `handle_session_new` drives the whole incarnation —
+    /// admission permit. `handle_session_new` and rehydration drive the whole incarnation —
     /// predecessor wait, transcript load, build, publish, history restore —
     /// under ONE permit acquisition: the transcript is only read after the
     /// predecessor turn has fully finalized, and no prompt can be admitted
@@ -561,33 +607,7 @@ impl SessionStore {
     /// [`SessionStore::insert`](Self::insert) does) would deadlock against
     /// the caller's guard.
     ///
-    /// This REPLACES any live incarnation already present under `id`:
-    /// rehydration legitimately swaps a same-ID successor for the published
-    /// session while holding the permit, so absence is not required here.
-    /// The `session/new` external boundary, which must never overwrite a
-    /// concurrent incarnation, uses
-    /// [`SessionStore::insert_admitted_if_absent`](Self::insert_admitted_if_absent)
-    /// instead.
-    ///
-    /// The caller must hold `admission` for exactly `id` (debug-asserted)
-    /// and must keep it alive until the published session is fully restored.
-    pub async fn insert_admitted(
-        &self,
-        admission: &zeroclaw_infra::session_queue::SessionGuard,
-        id: String,
-        session: RpcSession,
-    ) -> Result<u64, &'static str> {
-        debug_assert_eq!(
-            admission.session_id(),
-            id,
-            "insert_admitted requires the admission permit for the session being published"
-        );
-        self.publish_session(&id, session).await
-    }
-
-    /// Absence-safe variant of [`SessionStore::insert_admitted`](Self::insert_admitted)
-    /// for the `session/new` external boundary, combining the admission
-    /// permit contract with
+    /// This absence-safe variant combines the admission permit contract with
     /// [`SessionStore::insert_if_absent`](Self::insert_if_absent)'s refusal
     /// to overwrite a live incarnation: under the caller's permit the slot
     /// was cleared (or never occupied) before the rebuild began, so a live
@@ -614,7 +634,7 @@ impl SessionStore {
     }
 
     /// Map-write half shared by [`SessionStore::insert`](Self::insert) and
-    /// [`insert_admitted`](Self::insert_admitted): stamp the
+    /// [`insert_admitted_if_absent`](Self::insert_admitted_if_absent): stamp the
     /// incarnation generation and publish. Callers own the admission
     /// boundary.
     async fn publish_session(
@@ -2046,7 +2066,8 @@ impl SessionStore {
             .collect()
     }
 
-    pub fn register_cancel_token(
+    #[cfg(test)]
+    pub(crate) fn register_cancel_token(
         &self,
         id: &str,
         token: tokio_util::sync::CancellationToken,
@@ -2123,6 +2144,25 @@ impl SessionStore {
                 session_generation,
                 token.clone(),
             );
+            // Administrative kill is signalled before it waits for this same
+            // queue permit.  A queued prompt therefore has no token for the
+            // signal to cancel yet; consume the generation-scoped fence as
+            // soon as admission publishes the token.  Without this check a
+            // killed ACP prompt could start provider execution after the kill
+            // handler had already decided to terminate its session.
+            let admin_kill_fenced = session_generation.is_some_and(|session_generation| {
+                self.admin_kill_fences
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(id)
+                    .is_some_and(|fence| fence.session_generation == session_generation)
+            });
+            let token_for_cancel = token.clone();
+            drop(tokens);
+            if admin_kill_fenced {
+                self.record_cancel_cause(id, CancelCause::AdminKill);
+                token_for_cancel.cancel();
+            }
             Poll::Ready(Ok((
                 guard,
                 CancelTokenRegistration {
@@ -2519,6 +2559,95 @@ impl SessionStore {
                 true
             })
             .unwrap_or(false)
+    }
+
+    /// Signal an administrative kill only for the observed live incarnation.
+    /// The returned guard releases its queued-turn Kill fence share on exit;
+    /// the last guard clears the fence. An already registered turn
+    /// remains interrupted because that provider cancellation is irreversible.
+    #[cfg(test)]
+    pub(crate) async fn signal_session_kill_at_generation(
+        &self,
+        id: &str,
+        expected_generation: u64,
+    ) -> Option<LifecycleCancellation<'_>> {
+        match self
+            .signal_session_lifecycle_authorized(
+                id,
+                expected_generation,
+                None,
+                CancelCause::AdminKill,
+                |_| Ok::<_, std::convert::Infallible>(()),
+            )
+            .await
+        {
+            Ok(result) => result,
+            Err(never) => match never {},
+        }
+    }
+
+    /// Combine the incarnation-owned Kill fence with current authority at the
+    /// cancellation effect. Acquire state locks before the short authority hold;
+    /// no revoked caller may cancel a token or leave a queued-turn fence behind.
+    pub(crate) async fn signal_session_lifecycle_authorized<G, E>(
+        &self,
+        id: &str,
+        expected_generation: u64,
+        expected_access: Option<(u64, Option<&str>)>,
+        cause: CancelCause,
+        authorize: impl FnOnce(Option<&str>) -> Result<G, E>,
+    ) -> Result<Option<LifecycleCancellation<'_>>, E> {
+        let sessions = self.sessions.lock().await;
+        let Some(session) = sessions
+            .get(id)
+            .filter(|s| s.generation == expected_generation)
+        else {
+            return Ok(None);
+        };
+        if expected_access.is_some_and(|(generation, owner)| {
+            generation != session.generation || owner != session.owner_tui_id()
+        }) {
+            return Ok(None);
+        }
+        let tokens = self.cancel_tokens.lock().unwrap_or_else(|e| e.into_inner());
+        let mut causes = self.cancel_causes.lock().unwrap_or_else(|e| e.into_inner());
+        let mut fences = self
+            .admin_kill_fences
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _authority = authorize(session.owner_principal_id.as_deref())?;
+        let admin_kill_fence = matches!(cause, CancelCause::AdminKill);
+        if admin_kill_fence {
+            // Each overlapping Kill owns one share; a denied or failed handler
+            // must not release another admitted handler's queued-turn fence.
+            match fences.get_mut(id) {
+                Some(fence) if fence.session_generation == expected_generation => {
+                    fence.outstanding_guards += 1;
+                }
+                _ => {
+                    fences.insert(
+                        id.to_string(),
+                        AdminKillFence {
+                            session_generation: expected_generation,
+                            outstanding_guards: 1,
+                        },
+                    );
+                }
+            }
+        }
+        if let Some((_, _, token)) = tokens
+            .get(id)
+            .filter(|(_, generation, _)| *generation == Some(expected_generation))
+        {
+            causes.insert(id.to_string(), cause);
+            token.cancel();
+        }
+        Ok(Some(LifecycleCancellation {
+            store: self,
+            session_id: id.to_string(),
+            session_generation: expected_generation,
+            admin_kill_fence,
+        }))
     }
 
     /// Accept steering for the turn registered under `generation`. Removed
@@ -3648,6 +3777,225 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn admin_kill_fence_survives_overlapping_full_queue_rejection() {
+        use std::future::{Future, poll_fn};
+        use std::task::Poll;
+
+        for mode in [
+            crate::rpc::types::ChatMode::Chat,
+            crate::rpc::types::ChatMode::Acp,
+        ] {
+            let queue = Arc::new(SessionActorQueue::new(3, 10, 60));
+            let store = SessionStore::new(4, queue.clone());
+            store
+                .insert("s".into(), RpcSession::new(make_agent(), "a", ".", mode))
+                .await
+                .unwrap();
+            let generation = store.get_generation("s").await.unwrap();
+            let active = queue.acquire("s").await.unwrap();
+            let token = tokio_util::sync::CancellationToken::new();
+            let mut prompt =
+                std::pin::pin!(store.acquire_prompt("s", Some(generation), token.clone()));
+            poll_fn(|cx| {
+                assert!(prompt.as_mut().poll(cx).is_pending());
+                Poll::Ready(())
+            })
+            .await;
+
+            let first = store
+                .signal_session_kill_at_generation("s", generation)
+                .await
+                .unwrap();
+            let mut waiting_kill = std::pin::pin!(queue.acquire("s"));
+            poll_fn(|cx| {
+                assert!(waiting_kill.as_mut().poll(cx).is_pending());
+                Poll::Ready(())
+            })
+            .await;
+            let rejected = store
+                .signal_session_kill_at_generation("s", generation)
+                .await
+                .unwrap();
+            assert!(matches!(
+                queue.acquire("s").await,
+                Err(zeroclaw_infra::session_queue::SessionQueueError::QueueFull { .. })
+            ));
+            // The rejected handler exits while the first Kill still waits
+            // behind this prompt. It must release only its own fence share.
+            drop(rejected);
+            drop(active);
+
+            let (prompt_permit, registration) = prompt.as_mut().await.unwrap();
+            assert!(
+                token.is_cancelled(),
+                "the outstanding Kill must fence the queued prompt"
+            );
+            assert_eq!(registration.finish(), Some(CancelCause::AdminKill));
+            drop(prompt_permit);
+            let kill_permit = waiting_kill.as_mut().await.unwrap();
+            // Model a failed durable Kill: the surviving incarnation becomes
+            // usable only after its last Kill guard exits under admission.
+            drop(first);
+            drop(kill_permit);
+            let next = tokio_util::sync::CancellationToken::new();
+            let (_permit, registration) = store
+                .acquire_prompt("s", Some(generation), next.clone())
+                .await
+                .unwrap();
+            assert!(
+                !next.is_cancelled(),
+                "a completed failed Kill must not poison later work"
+            );
+            assert_eq!(registration.finish(), None);
+        }
+    }
+
+    #[tokio::test]
+    async fn admin_kill_fence_stays_until_last_guard_in_either_drop_order() {
+        for drop_first in [false, true] {
+            let store = make_store(4);
+            store
+                .insert(
+                    "s".into(),
+                    RpcSession::new(make_agent(), "a", ".", crate::rpc::types::ChatMode::Chat),
+                )
+                .await
+                .unwrap();
+            let generation = store.get_generation("s").await.unwrap();
+            let first = store
+                .signal_session_kill_at_generation("s", generation)
+                .await
+                .unwrap();
+            let second = store
+                .signal_session_kill_at_generation("s", generation)
+                .await
+                .unwrap();
+            let remaining = if drop_first {
+                drop(first);
+                second
+            } else {
+                drop(second);
+                first
+            };
+            let token = tokio_util::sync::CancellationToken::new();
+            let (permit, registration) = store
+                .acquire_prompt("s", Some(generation), token.clone())
+                .await
+                .unwrap();
+            assert!(
+                token.is_cancelled(),
+                "either remaining guard must retain the fence"
+            );
+            assert_eq!(registration.finish(), Some(CancelCause::AdminKill));
+            drop(permit);
+            drop(remaining);
+            let next = tokio_util::sync::CancellationToken::new();
+            let (_permit, registration) = store
+                .acquire_prompt("s", Some(generation), next.clone())
+                .await
+                .unwrap();
+            assert!(!next.is_cancelled());
+            assert_eq!(registration.finish(), None);
+        }
+    }
+
+    #[tokio::test]
+    async fn refused_lifecycle_authority_neither_cancels_nor_fences_a_turn() {
+        let store = make_store(4);
+        store
+            .insert(
+                "guarded".into(),
+                RpcSession::new(make_agent(), "a", ".", crate::rpc::types::ChatMode::Chat),
+            )
+            .await
+            .unwrap();
+        let generation = store.get_generation("guarded").await.unwrap();
+        let token = tokio_util::sync::CancellationToken::new();
+        let (permit, registration) = store
+            .acquire_prompt("guarded", Some(generation), token.clone())
+            .await
+            .unwrap();
+        let result = store
+            .signal_session_lifecycle_authorized(
+                "guarded",
+                generation,
+                None,
+                CancelCause::AdminKill,
+                |_| Err::<(), _>("revoked"),
+            )
+            .await;
+        assert!(matches!(result, Err("revoked")));
+        assert!(!token.is_cancelled());
+        assert_eq!(registration.finish(), None);
+        drop(permit);
+        let next = tokio_util::sync::CancellationToken::new();
+        let (_permit, registration) = store
+            .acquire_prompt("guarded", Some(generation), next.clone())
+            .await
+            .unwrap();
+        assert!(
+            !next.is_cancelled(),
+            "refused Kill must not poison queued work"
+        );
+        assert_eq!(registration.finish(), None);
+    }
+
+    #[tokio::test]
+    async fn admin_kill_fence_old_guard_cannot_clear_successor() {
+        let store = make_store(4);
+        store
+            .insert(
+                "s".into(),
+                RpcSession::new(make_agent(), "old", ".", crate::rpc::types::ChatMode::Chat),
+            )
+            .await
+            .unwrap();
+        let predecessor = store.get_generation("s").await.unwrap();
+        let old = store
+            .signal_session_kill_at_generation("s", predecessor)
+            .await
+            .unwrap();
+        store
+            .insert(
+                "s".into(),
+                RpcSession::new(
+                    make_agent(),
+                    "successor",
+                    ".",
+                    crate::rpc::types::ChatMode::Chat,
+                ),
+            )
+            .await
+            .unwrap();
+        let successor = store.get_generation("s").await.unwrap();
+        assert_ne!(predecessor, successor);
+        let current = store
+            .signal_session_kill_at_generation("s", successor)
+            .await
+            .unwrap();
+        drop(old);
+        let token = tokio_util::sync::CancellationToken::new();
+        let (permit, registration) = store
+            .acquire_prompt("s", Some(successor), token.clone())
+            .await
+            .unwrap();
+        assert!(
+            token.is_cancelled(),
+            "the successor retains its own Kill fence"
+        );
+        assert_eq!(registration.finish(), Some(CancelCause::AdminKill));
+        drop(permit);
+        drop(current);
+        let next = tokio_util::sync::CancellationToken::new();
+        let (_permit, registration) = store
+            .acquire_prompt("s", Some(successor), next.clone())
+            .await
+            .unwrap();
+        assert!(!next.is_cancelled());
+        assert_eq!(registration.finish(), None);
+    }
+
+    #[tokio::test]
     async fn cancel_all_inflight_waits_for_every_registration_to_leave() {
         let store = Arc::new(make_store(4));
         let first = tokio_util::sync::CancellationToken::new();
@@ -3713,6 +4061,67 @@ mod tests {
             store.cancel_session("s"),
             "a remove with a non-matching generation must leave the token intact"
         );
+    }
+
+    #[tokio::test]
+    async fn stale_lifecycle_signal_cannot_cancel_or_remove_same_id_successor() {
+        use crate::rpc::types::ChatMode;
+
+        let store = make_store(4);
+        store
+            .insert(
+                "reused".to_string(),
+                RpcSession::new(make_agent(), "a", ".", ChatMode::Chat),
+            )
+            .await
+            .unwrap();
+        let predecessor_generation = store.get_generation("reused").await.unwrap();
+
+        store
+            .insert(
+                "reused".to_string(),
+                RpcSession::new(make_agent(), "b", ".", ChatMode::Chat),
+            )
+            .await
+            .unwrap();
+        let successor_generation = store.get_generation("reused").await.unwrap();
+        assert_ne!(predecessor_generation, successor_generation);
+
+        let token = tokio_util::sync::CancellationToken::new();
+        let (_permit, registration) = store
+            .acquire_prompt("reused", Some(successor_generation), token.clone())
+            .await
+            .expect("the successor prompt must enter production admission");
+        assert!(
+            !store.signal_cancellation_for_generation(
+                "reused",
+                Some(predecessor_generation),
+                CancelCause::SessionRemoved,
+            ),
+            "a stale close/delete signal must not target a successor token"
+        );
+        assert!(
+            !token.is_cancelled(),
+            "a stale close/delete signal must leave the successor turn live"
+        );
+        assert!(
+            !store
+                .remove_generation("reused", predecessor_generation)
+                .await,
+            "a stale close/delete must not remove the successor"
+        );
+        assert!(
+            !store
+                .kill_session_generation("reused", predecessor_generation)
+                .await,
+            "a stale kill must not remove the successor"
+        );
+        assert_eq!(
+            store.get_generation("reused").await,
+            Some(successor_generation),
+            "the successor must remain the live incarnation"
+        );
+        drop(registration);
     }
 
     #[tokio::test]

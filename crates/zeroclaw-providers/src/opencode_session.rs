@@ -24,9 +24,11 @@
 //! unambiguously safe as an HTTP header value, and non-reversible.
 //!
 //! The digest is taken over the ambient conversation scope
-//! ([`zeroclaw_api::TOOL_LOOP_SESSION_KEY`]) rather than over a cached random
+//! ([`zeroclaw_api::TOOL_LOOP_SESSION_ID`], falling back to
+//! [`zeroclaw_api::TOOL_LOOP_SESSION_KEY`]) rather than over a cached random
 //! token, so the value is resolved from the canonical source at use time and
-//! this module holds no per-session lookup table.
+//! this module holds no per-session lookup table. Prefer the caller-visible ID
+//! so introducing a storage-domain prefix does not change an existing token.
 //!
 //! # Why the scope is hashed rather than sent
 //!
@@ -189,10 +191,16 @@ pub fn session_token(base_url: &str) -> Option<String> {
     if !is_opencode_target(base_url) {
         return None;
     }
-    let scope = zeroclaw_api::TOOL_LOOP_SESSION_KEY
+    let scope = zeroclaw_api::TOOL_LOOP_SESSION_ID
         .try_with(Clone::clone)
         .ok()
         .flatten()
+        .or_else(|| {
+            zeroclaw_api::TOOL_LOOP_SESSION_KEY
+                .try_with(Clone::clone)
+                .ok()
+                .flatten()
+        })
         .filter(|key| !key.trim().is_empty());
     Some(match scope {
         Some(key) => digest_scope(&key),
@@ -302,6 +310,23 @@ mod tests {
             first, other,
             "distinct conversations must not share a scope"
         );
+    }
+
+    #[tokio::test]
+    async fn token_preserves_caller_id_over_namespaced_storage_key() {
+        for caller_id in ["chat-session-a", "rpc_alpha"] {
+            let token = zeroclaw_api::TOOL_LOOP_SESSION_ID
+                .scope(Some(caller_id.to_owned()), async {
+                    zeroclaw_api::TOOL_LOOP_SESSION_KEY
+                        .scope(Some(format!("rpc_{caller_id}")), async {
+                            session_token("https://opencode.ai/zen/v1").expect("token")
+                        })
+                        .await
+                })
+                .await;
+            assert_eq!(token, digest_scope(caller_id));
+            assert_ne!(token, digest_scope(&format!("rpc_{caller_id}")));
+        }
     }
 
     #[tokio::test]

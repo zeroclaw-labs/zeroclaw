@@ -169,6 +169,56 @@ async fn selected_calculator_executes_through_the_scoped_registry() {
     assert!(result.output.contains("42"), "{result:?}");
 }
 
+// Attachment opt-in does not widen minimal, while a named prompt tool must
+// not depend on selecting the ordinary session-list/history family.
+#[tokio::test]
+async fn prompt_tools_compose_selection_with_chat_prerequisites() {
+    let tmp = TempDir::new().unwrap();
+    let mut config = fixture(&tmp);
+    config.channels.session_prompts_enabled = true;
+    config.channels.session_persistence = true;
+    config.channels.session_backend = "sqlite".into();
+    config.tools.optional.clear();
+    let minimal = assemble(&tmp, &config, None, None, None).await;
+    assert_eq!(names(&minimal).len(), CORE_TOOL_NAMES.len());
+    assert!(!config.data_dir.exists());
+
+    for selected in zeroclaw_api::SESSION_PROMPT_TOOL_NAMES {
+        config.tools.optional = vec![selected.into()];
+        let assembled = assemble(&tmp, &config, None, None, None).await;
+        let mut expected: BTreeSet<String> =
+            CORE_TOOL_NAMES.iter().map(|name| (*name).into()).collect();
+        expected.insert(selected.into());
+        assert_eq!(names(&assembled), expected);
+        let denied = assemble(&tmp, &config, Some(vec!["shell".into()]), None, None).await;
+        assert_eq!(names(&denied), BTreeSet::from(["shell".to_string()]));
+    }
+}
+
+// Naming a prompt tool is availability selection, not a feature/persistence
+// override. Invalid prerequisites must not create its backing session store.
+#[tokio::test]
+async fn named_prompt_tools_do_not_bypass_prerequisites() {
+    for (enabled, persistence, backend) in [
+        (false, true, "sqlite"),
+        (true, false, "sqlite"),
+        (true, true, "jsonl"),
+    ] {
+        let tmp = TempDir::new().unwrap();
+        let mut config = fixture(&tmp);
+        config.channels.session_prompts_enabled = enabled;
+        config.channels.session_persistence = persistence;
+        config.channels.session_backend = backend.into();
+        config.tools.optional = zeroclaw_api::SESSION_PROMPT_TOOL_NAMES
+            .iter()
+            .map(|name| (*name).into())
+            .collect();
+        let assembled = assemble(&tmp, &config, None, None, None).await;
+        assert_eq!(names(&assembled).len(), CORE_TOOL_NAMES.len());
+        assert!(!config.data_dir.exists());
+    }
+}
+
 #[tokio::test]
 async fn selection_never_expands_agent_or_caller_permission() {
     let tmp = TempDir::new().unwrap();

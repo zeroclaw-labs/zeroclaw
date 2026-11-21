@@ -248,7 +248,9 @@ being reached. A plugin is reported admitted only when its config entry passes
 the settings check the runtime applies on every call. Admitted is not yet
 registered: the tool registry registers the plugin when it is next built, and
 it still refuses a package whose name clashes with a tool already registered,
-such as a built-in tool, or whose tool description it cannot read. The runtime
+such as a built-in tool, or an
+[always-reserved name](../developing/how-plugins-work.md#tool-name-conflicts),
+or whose tool description it cannot read. The runtime
 log records those refusals. When the settings check fails instead, for example
 when you installed the plugin without its required settings, its status shows
 the reason the check gives,

@@ -10903,6 +10903,7 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                           reload_controls,
                           tui_registry,
                           daemon_authority,
+                          session_coordination,
                           ready_tx| {
                         let canvas_store = canvas_store_for_gateway.clone();
                         let sop_engine = sop_e.clone();
@@ -10922,6 +10923,7 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                                 plugin_webhooks,
                                 authority,
                                 sop_driver_handles,
+                                session_coordination,
                             );
                             let supervision = match dashboard_ingress {
                                 Some(ingress) => supervision.with_dashboard_ingress(ingress),

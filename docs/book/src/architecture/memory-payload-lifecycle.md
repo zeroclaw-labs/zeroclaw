@@ -86,7 +86,19 @@ dispatcher converts those results into provider messages for the next model
 call, while streaming clients can receive correlated `ToolCall` and
 `ToolResult` events during the turn.
 
-Tool result payloads are easy to over-preserve. Reviewers should check:
+Tool result payloads require explicit privacy provenance as well as size limits.
+
+The typed `ToolResultMessage.session_prompt_tool_result` flag carries the host's
+executed-result privacy provenance through Agent history and request replay.
+It is independent of the original provider-selected tool name, which a hook may
+have changed before execution. Native reconstruction restores the host result
+key; text reconstruction restores the private-result carrier marker. Provider
+content remains intact while non-provider exports mask the result. Ordinary
+Rust struct literals set the flag to `false`; absent serialized fields default
+to `false` and ordinary serialized results omit it. Chat replay conversions
+preserve the flag. This adds no ACP prompt-tool capability.
+
+Reviewers should check:
 
 - maximum result size, including `max_tool_result_chars`;
 - whether truncation preserves structured envelopes and image markers;

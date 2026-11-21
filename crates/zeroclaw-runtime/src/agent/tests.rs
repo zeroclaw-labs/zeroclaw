@@ -1501,6 +1501,7 @@ fn conversation_message_serialization_roundtrip() {
             reasoning_content: None,
         },
         ConversationMessage::ToolResults(vec![ToolResultMessage {
+            session_prompt_tool_result: false,
             tool_call_id: "tc1".into(),
             content: "ok".into(),
             tool_name: String::new(),
@@ -1687,6 +1688,7 @@ fn xml_dispatcher_converts_history_to_provider_messages() {
             reasoning_content: None,
         },
         ConversationMessage::ToolResults(vec![ToolResultMessage {
+            session_prompt_tool_result: false,
             tool_call_id: "tc1".into(),
             content: "ok".into(),
             tool_name: String::new(),
@@ -1715,11 +1717,13 @@ fn native_dispatcher_converts_tool_results_to_tool_messages() {
     let dispatcher = NativeToolDispatcher;
     let history = vec![ConversationMessage::ToolResults(vec![
         ToolResultMessage {
+            session_prompt_tool_result: false,
             tool_call_id: "tc1".into(),
             content: format!("Saved image to {}", image_path.display().to_string()),
             tool_name: String::new(),
         },
         ToolResultMessage {
+            session_prompt_tool_result: false,
             tool_call_id: "tc2".into(),
             content: "output2".into(),
             tool_name: String::new(),

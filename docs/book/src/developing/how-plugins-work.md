@@ -189,17 +189,18 @@ another. Tool plugins register in package-name order, and the host checks each
 one twice:
 
 1. **Package name.** A plugin whose package name (the manifest `name`) matches
-   an already registered tool is refused before its component is instantiated.
+   an already registered tool or an always-reserved name is refused before its
+   component is instantiated.
    The host logs a `WARN` event with `error_key`
    `plugin_package_name_conflict` in its `attributes`.
 2. **Tool name.** The guest declares its own tool name, so the host learns it
    only by instantiating the component to read its metadata. A plugin whose
-   tool name matches an already registered tool is not registered. The host
-   logs a `WARN` event with `error_key` `plugin_tool_name_conflict` in its
-   `attributes`. A tool name that contains `__` is refused even when nothing
-   holds it yet, because MCP tools are named `<server>__<tool>` and register
-   after plugin tools. That refusal carries `error_key`
-   `plugin_tool_name_reserved`.
+   tool name matches an already registered tool or an always-reserved name is
+   not registered. The host logs a `WARN` event with `error_key`
+   `plugin_tool_name_conflict` in its `attributes`. A tool name that contains
+   `__` is refused even when nothing holds it yet, because MCP tools are named
+   `<server>__<tool>` and register after plugin tools. That refusal carries
+   `error_key` `plugin_tool_name_reserved`.
 
 The names checked are the host's built-in tools, including ones the current
 tool selection leaves out of the agent, plus plugin tools accepted earlier in
@@ -209,6 +210,11 @@ on a host with no MCP servers, and `execute_pipeline` when
 `[pipeline] enabled = true`. The set still depends on the build and its
 config, so do not treat it as a fixed list of every built-in name: a name that
 loads on one host can be refused on another.
+
+The native session-prompt names `session_prompt_list`, `session_prompt_set`,
+and `session_prompt_delete` are always reserved, even when
+`channels.session_prompts_enabled = false`, so plugins cannot impersonate
+these sensitive operations.
 
 Tools that a connected peripheral or a skill contributes join the registry
 later, when the agent's tool set is assembled. They own their names too: a
