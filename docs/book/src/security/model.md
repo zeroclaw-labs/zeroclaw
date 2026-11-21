@@ -72,7 +72,7 @@ Docs: [Tool receipts](./tool-receipts.md).
 Beyond the six layers:
 
 - **OTP gating**: `[security.otp] gated_actions = ["shell", "browser", "file_write"]` requires a one-time code before each listed action. Useful for remote-access scenarios.
-- **Emergency stop**: `zeroclaw estop` halts all in-flight tool calls. With `[security.estop] enabled = true`, resuming requires an OTP.
+- **Emergency stop (not enforced)**: `zeroclaw estop` is not a safety control today. No running agent, daemon, or tool reads the state file it used to write, so it cannot halt in-flight tool calls or block new ones. Every form of the command (including `status`, `resume`, and `--otp`) now refuses to run with a not-enforced error and leaves that file untouched, rather than report a stop that did not happen. To halt the agent now, stop the ZeroClaw process itself.
 - **Prompt injection guard**: scans model output for known injection patterns before tool calls are validated.
 - **Leak detector**: scans outbound channel responses for credentials and redacts matches before delivery. It covers deterministic credential patterns and can also run a standalone high-entropy-token heuristic.
 - **Pairing guard**: device pairing for channel auth; prevents stolen credentials from working on a new device.
