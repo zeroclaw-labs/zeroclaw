@@ -75,6 +75,7 @@ pub(crate) fn build_iteration_tool_specs(
     activated_tools: Option<&Arc<Mutex<ActivatedToolSet>>>,
 ) -> Result<IterationToolSpecs> {
     // Rebuild tool_specs each iteration so newly activated deferred tools appear.
+    // Advertisement shares execution and elicitation's normalized exclusions.
     // Native session-prompt tools are meaningful only in a daemon-owned
     // primary chat turn. Generic/one-shot construction keeps the concrete
     // implementations available to supported callers but must not advertise
@@ -85,7 +86,7 @@ pub(crate) fn build_iteration_tool_specs(
     let mut tool_specs: Vec<crate::tools::ToolSpec> = tools_registry
         .iter()
         .filter(|tool| {
-            !excluded_tools.iter().any(|ex| ex == tool.name())
+            !crate::agent::tool_execution::is_excluded_tool(tool.name(), excluded_tools)
                 && (session_prompt_tools_allowed
                     || !crate::tools::SESSION_PROMPT_TOOL_NAMES.contains(&tool.name()))
         })
@@ -111,7 +112,7 @@ pub(crate) fn build_iteration_tool_specs(
             hidden_builtin_names = activated_tools.hidden_builtin_names();
         }
         for spec in activated_tools.tool_specs() {
-            if !excluded_tools.iter().any(|ex| ex == &spec.name) {
+            if !crate::agent::tool_execution::is_excluded_tool(&spec.name, excluded_tools) {
                 tool_specs.push(spec);
             }
         }
@@ -381,6 +382,76 @@ mod tests {
                 .iter()
                 .any(|spec| spec.name == "docker-mcp__extract_text"),
             "recovered poisoned lock should still expose activated tool specs"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_prompt_advertisement_preserves_both_gates() {
+        let name = crate::tools::SESSION_PROMPT_TOOL_NAMES[0];
+        let registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
+            name,
+            Arc::new(AtomicUsize::new(0)),
+        ))];
+        let specs = |excluded: &[String]| {
+            build_iteration_tool_specs(
+                &NativeToolsProvider,
+                "test-model",
+                &registry,
+                excluded,
+                None,
+            )
+            .unwrap()
+            .tool_specs
+        };
+        assert!(specs(&[]).is_empty());
+        zeroclaw_api::TOOL_LOOP_SESSION_PROMPTS_ALLOWED
+            .scope(true, async {
+                assert_eq!(specs(&[]).len(), 1);
+                assert!(specs(&[format!(" {} ", name.to_uppercase())]).is_empty());
+            })
+            .await;
+    }
+
+    #[test]
+    fn advertisement_uses_execution_exclusion_normalization() {
+        // Advertisement, execution, and elicitation share one exclusion
+        // predicate: a case- or whitespace-variant exclusion must suppress
+        // the provider-facing spec for static and activated tools alike.
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let static_tool = Box::new(CountingTool::new("send_via", Arc::clone(&invocations)));
+        let activated = Arc::new(Mutex::new(ActivatedToolSet::new()));
+        let activated_tool: Arc<dyn Tool> = Arc::new(CountingTool::new(
+            "docker-mcp__extract_text",
+            Arc::clone(&invocations),
+        ));
+        activated
+            .lock()
+            .unwrap()
+            .activate("docker-mcp__extract_text".into(), activated_tool);
+
+        let excluded = vec![
+            " SEND_VIA ".to_string(),
+            "DOCKER-MCP__EXTRACT_TEXT".to_string(),
+        ];
+        let specs = build_iteration_tool_specs(
+            &NativeToolsProvider,
+            "test-model",
+            &[static_tool],
+            &excluded,
+            Some(&activated),
+        )
+        .expect("specs should build");
+        assert!(
+            !specs
+                .tool_specs
+                .iter()
+                .any(|spec| spec.name == "send_via" || spec.name == "docker-mcp__extract_text"),
+            "normalized exclusions must suppress advertisement: {:?}",
+            specs
+                .tool_specs
+                .iter()
+                .map(|s| s.name.as_str())
+                .collect::<Vec<_>>()
         );
     }
 

@@ -1502,12 +1502,13 @@ impl OpenAiCompatibleModelProvider {
     /// Style resolution is shared with the native Anthropic provider via
     /// `crate::anthropic::anthropic_thinking_style` (same crate, free
     /// function): budget models get the fixed-budget `enabled` shape,
-    /// adaptive-only models (Opus 4.7, the whole Fable 5 family) get
+    /// adaptive-only models (every Claude model numbered 4.7 or later) get
     /// `{"type":"adaptive"}` with no `budget_tokens`, matching the native
     /// `NativeThinkingConfig` serialization. `params.display` rides on both
     /// shapes as the snake_case `display` key when present, exactly as the
     /// native provider emits it. Gateway model IDs may carry routing
-    /// prefixes; the resolver's substring matching handles them.
+    /// prefixes and suffixes; the version is read immediately after the
+    /// family token, so decorated IDs resolve like the bare name.
     /// History-path chat with optional thinking rethreading. Fallback paths
     /// that rebuild a tool request as prompt-guided text pass the original
     /// `request.thinking` so the rebuilt body keeps the same injection the
@@ -1844,6 +1845,12 @@ impl MessageContent {
     /// turn's rolling breakpoint. Empty text is never marked, because the
     /// wire format rejects empty text blocks that carry `cache_control`.
     fn apply_cache_control(&mut self, cache_ttl: CacheTtl) -> bool {
+        // Caching disabled: place nothing and leave the wire shape untouched.
+        // The block conversion below exists only to host a breakpoint, so
+        // converting here would perturb the request for no gain.
+        let Some(control) = crate::anthropic::CacheControl::ephemeral_with_ttl(cache_ttl) else {
+            return false;
+        };
         match self {
             MessageContent::Text(text) => {
                 if text.is_empty() {
@@ -1851,9 +1858,7 @@ impl MessageContent {
                 }
                 *self = MessageContent::Parts(vec![MessagePart::Text {
                     text: std::mem::take(text),
-                    cache_control: Some(crate::anthropic::CacheControl::ephemeral_with_ttl(
-                        cache_ttl,
-                    )),
+                    cache_control: Some(control),
                 }]);
                 true
             }
@@ -1865,9 +1870,7 @@ impl MessageContent {
                     } = part
                         && !text.is_empty()
                     {
-                        *cache_control = Some(crate::anthropic::CacheControl::ephemeral_with_ttl(
-                            cache_ttl,
-                        ));
+                        *cache_control = Some(control.clone());
                         return true;
                     }
                 }
@@ -5833,6 +5836,64 @@ mod tests {
         assert_eq!(msgs[3]["content"][0]["cache_control"]["type"], "ephemeral");
     }
 
+    /// `off` behind the flag: no breakpoint anywhere, and the wire shape is
+    /// untouched — a message that would have carried a breakpoint does not
+    /// convert to block form, so the body is byte-identical to the same
+    /// request with `cache_passthrough` off.
+    #[tokio::test]
+    async fn cache_ttl_off_leaves_the_compat_wire_unmarked() {
+        let messages = vec![
+            ChatMessage::system("be brief"),
+            ChatMessage::user("first question"),
+            ChatMessage::assistant("first answer"),
+            ChatMessage::user("second question"),
+        ];
+
+        let (provider, captured, server) =
+            mock_cache_capture_with_ttl(true, Some(CacheTtl::Off)).await;
+        let result = provider
+            .chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "test-model",
+                None,
+            )
+            .await;
+        server.abort();
+        result.unwrap_or_else(|error| panic!("off request failed: {error}"));
+        let off_body = captured.lock().unwrap()[0].clone();
+        assert!(
+            !off_body.to_string().contains("cache_control"),
+            "off must emit no cache_control key anywhere: {off_body}"
+        );
+
+        // Control run: same request, flag off. `off` must be indistinguishable
+        // from not asking for caching at all.
+        let (provider, captured, server) =
+            mock_cache_capture_with_ttl(false, Some(CacheTtl::Off)).await;
+        let result = provider
+            .chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "test-model",
+                None,
+            )
+            .await;
+        server.abort();
+        result.unwrap_or_else(|error| panic!("control request failed: {error}"));
+        let control_body = captured.lock().unwrap()[0].clone();
+        assert_eq!(
+            off_body, control_body,
+            "off must leave the compat wire byte-identical to the flag-off wire"
+        );
+    }
+
     /// D3: `cache_ttl` without `cache_passthrough` is inert — the structured
     /// `chat` path hits the `!cache_passthrough` early return in
     /// `apply_cache_breakpoints`, so the body is byte-identical to the
@@ -7034,9 +7095,9 @@ mod tests {
 
     #[test]
     fn thinking_passthrough_prefixed_adaptive_model_id_resolves_adaptive() {
-        // Gateway routing prefixes model IDs; the shared style resolver
-        // matches on substrings, so a prefixed adaptive-only ID must still
-        // resolve to the adaptive shape (live gateways emit IDs like
+        // Gateway routing prefixes model IDs. The version is read after the
+        // family token, so a prefixed adaptive-only ID must still resolve to
+        // the adaptive shape (live gateways emit IDs like
         // "claude-group/claude-fable-5").
         let params = zeroclaw_api::model_provider::NativeThinkingParams {
             budget_tokens: 8_192,
@@ -7095,6 +7156,72 @@ mod tests {
             serde_json::json!({"type": "adaptive", "display": "summarized"}),
             "the request builder must carry the adaptive plus display shape to the wire"
         );
+    }
+
+    #[test]
+    fn thinking_passthrough_request_builder_follows_family_version() {
+        // Request-building coverage for IDs the end-of-string parser
+        // misread, and for the families Anthropic also rejects `enabled` on.
+        let params = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: 8_192,
+            display: None,
+        };
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("http://localhost:8000/v1")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .build();
+        let messages = vec![ChatMessage::user("hello")];
+
+        for model in [
+            "claude-fable-5-2-fast",
+            "anthropic.claude-opus-4-7-v1:0",
+            "claude-sonnet-5",
+            "claude-sonnet-5-5",
+            "claude-haiku-5-5",
+            "claude-opus-5-5-fast",
+        ] {
+            let req = p.build_native_tool_chat_request(
+                &messages,
+                None,
+                model,
+                None,
+                false,
+                false,
+                Some(params),
+            );
+            let value = serde_json::to_value(&req).unwrap();
+            assert_eq!(
+                value["thinking"],
+                serde_json::json!({"type": "adaptive"}),
+                "{model} must reach the wire as adaptive, with no budget"
+            );
+        }
+
+        for model in [
+            "claude-opus-4-20250514",
+            "claude-mythos-preview",
+            "claude-opus-4-6",
+            "claude-sonnet-4-6-latest",
+        ] {
+            let req = p.build_native_tool_chat_request(
+                &messages,
+                None,
+                model,
+                None,
+                false,
+                false,
+                Some(params),
+            );
+            let value = serde_json::to_value(&req).unwrap();
+            assert_eq!(
+                value["thinking"],
+                serde_json::json!({"type": "enabled", "budget_tokens": 8_192}),
+                "{model} must keep the budget shape on the wire"
+            );
+        }
     }
 
     #[test]

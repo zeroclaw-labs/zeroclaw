@@ -674,6 +674,24 @@ pub(crate) fn client_key_from_request(
         .unwrap_or_else(|| "unknown".to_string())
 }
 
+/// Whether this request counts as a local (loopback) caller for locality guards.
+///
+/// Defined as the rate-limit key being a loopback address, so
+/// [`client_key_from_request`] and SOP-cancel locality cannot drift apart: a
+/// forwarded loopback address is never local, and a direct loopback peer with
+/// no trusted forwarded header still is.
+pub(crate) fn request_is_local(
+    peer_addr: Option<SocketAddr>,
+    headers: &HeaderMap,
+    trust_forwarded_headers: bool,
+) -> bool {
+    auth_rate_limit::is_loopback_key(&client_key_from_request(
+        peer_addr,
+        headers,
+        trust_forwarded_headers,
+    ))
+}
+
 fn normalize_max_keys(configured: usize, fallback: usize) -> usize {
     if configured == 0 {
         fallback.max(1)
@@ -1059,7 +1077,10 @@ impl ServeTasks {
         let cancelled = self.0.cancelled.clone();
         // No lock is held here: spawning can drop the task at once (a runtime
         // that has shut down does), and that only updates the count.
-        zeroclaw_spawn::spawn!(async move {
+        // Every connection and HTTP/2 stream is one of these tasks, so their
+        // lifecycle is recorded at DEBUG: at INFO it would fill the runtime
+        // trace with routine traffic.
+        zeroclaw_spawn::spawn!(level = DEBUG, async move {
             // Moves the whole task in. Naming only `task.future` below would
             // capture just that field, and `_done` would take the task off the
             // count as soon as `spawn` returned.
@@ -7927,6 +7948,66 @@ path = "{trigger_path}"
         );
     }
 
+    /// Each connection, and each stream hyper hands to the executor, is a task
+    /// of the set. Their spawn and completion are recorded at DEBUG, so the
+    /// runtime trace, recorded at INFO by default, does not get a pair of
+    /// records for every connection.
+    #[test]
+    fn serve_tasks_record_their_lifecycle_below_info() {
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut receiver = zeroclaw_log::subscribe_or_install();
+        let test_case = "serve-tasks-lifecycle-level";
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(::zeroclaw_log::scope!(test_case: test_case, => async {
+            let tasks = ServeTasks::default();
+            tasks.spawn(async {});
+            hyper::rt::Executor::execute(&tasks, async {});
+            tasks.idle().await;
+        }));
+        drop(runtime);
+
+        let mut records = Vec::new();
+        loop {
+            let event = match receiver.try_recv() {
+                Ok(event) => event,
+                // Other tests log into the same capture; a lagged receiver
+                // has only dropped older events, so keep reading.
+                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => continue,
+                Err(_) => break,
+            };
+            if event
+                .pointer("/attributes/test_case")
+                .and_then(|v| v.as_str())
+                == Some(test_case)
+                && event.pointer("/attributes/task_site").is_some()
+            {
+                records.push(format!(
+                    "{} {}",
+                    event["severity_text"].as_str().unwrap_or_default(),
+                    event["message"].as_str().unwrap_or_default()
+                ));
+            }
+        }
+        zeroclaw_log::clear_broadcast_hook();
+
+        records.sort();
+        assert_eq!(
+            records,
+            [
+                "DEBUG task complete",
+                "DEBUG task complete",
+                "DEBUG task spawned",
+                "DEBUG task spawned",
+            ],
+            "a connection's or stream's task lifecycle must stay out of the INFO trace"
+        );
+    }
+
     /// Retiring takes at most the drain plus the join of what it cancelled,
     /// which together fit inside the daemon's 500 ms grace.
     #[tokio::test]
@@ -9713,6 +9794,20 @@ path = "{trigger_path}"
 
         let key = client_key_from_request(Some(peer), &headers, true);
         assert_eq!(key, "unknown");
+    }
+
+    #[test]
+    fn request_is_local_matches_rate_limit_loopback_exemption() {
+        let loopback = SocketAddr::from(([127, 0, 0, 1], 42617));
+        let remote = SocketAddr::from(([203, 0, 113, 50], 42617));
+        let mut forwarded_loopback = HeaderMap::new();
+        forwarded_loopback.insert("X-Forwarded-For", HeaderValue::from_static("127.0.0.1"));
+
+        assert!(request_is_local(Some(loopback), &HeaderMap::new(), true));
+        assert!(request_is_local(Some(loopback), &HeaderMap::new(), false));
+        assert!(!request_is_local(Some(loopback), &forwarded_loopback, true));
+        assert!(!request_is_local(Some(remote), &forwarded_loopback, true));
+        assert!(!request_is_local(Some(remote), &HeaderMap::new(), true));
     }
 
     #[test]
