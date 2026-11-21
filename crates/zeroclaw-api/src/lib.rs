@@ -26,6 +26,7 @@ pub mod runtime_status;
 pub mod runtime_traits;
 pub mod schema;
 pub mod session_keys;
+pub mod task;
 pub mod tool;
 pub mod tool_carrier;
 pub mod turn_stop;
