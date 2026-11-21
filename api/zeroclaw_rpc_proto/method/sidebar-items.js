@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["EXTERNAL_TYPES"],"enum":["Method","Shape"],"struct":["MethodContract"]};

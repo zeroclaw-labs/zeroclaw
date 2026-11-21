@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["RemoveMode","ServiceError","SkillOrigin"],"struct":["EffectiveSkill","EffectiveSkillSet","SkillSummary","SkillsService"]};

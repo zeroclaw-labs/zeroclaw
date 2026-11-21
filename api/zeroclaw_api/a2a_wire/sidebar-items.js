@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["Role","SendMessageResponse","TaskState"],"fn":["escape_fence_body","rpc_result"],"struct":["AgentCapabilities","AgentCard","AgentInterface","AgentSkill","Artifact","JsonRpcError","JsonRpcRequest","JsonRpcResponse","Message","Part","SendMessageConfiguration","SendMessageParams","Task","TaskStatus"]};

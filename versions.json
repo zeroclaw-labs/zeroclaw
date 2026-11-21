@@ -1,0 +1,21 @@
+{
+  "stable": "v0.9.0",
+  "versions": [
+    {
+      "label": "Development (master)",
+      "tag": "master"
+    },
+    {
+      "label": "Stable (latest release)",
+      "tag": "v0.9.0"
+    },
+    {
+      "label": "v0.8.7",
+      "tag": "v0.8.7"
+    },
+    {
+      "label": "v0.8.6",
+      "tag": "v0.8.6"
+    }
+  ]
+}

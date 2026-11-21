@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["discord_slash_specs_from_skills"],"struct":["DiscordChannel","DiscordSlashCommandSpec"],"type":["DiscordSlashCommandResolver"]};
