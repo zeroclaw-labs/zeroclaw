@@ -4630,33 +4630,109 @@ impl TelegramChannel {
             .and_then(|i| i.as_i64())
             .is_some_and(|id| id == bot_id)
     }
+}
+
+/// Outcome of the shared media mention gate for one update: the participation
+/// decision rendered for the media parsers. The gate is the single source of
+/// media participation decisions — parsers carry no admission rules of their
+/// own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MediaAdmission {
+    /// Addressed to the bot — hand to the agent with a reply. The payload is
+    /// the caption to deliver: normalized after a group mention, verbatim on
+    /// the DM / mention_only-off paths (`None` = admitted without a caption).
+    Admit(Option<String>),
+    /// Unaddressed, but the group is listened to — record as passive context.
+    /// The caption (if any) is kept verbatim by the caller.
+    Passive,
+    /// Unaddressed — do not process.
+    Drop,
+}
+
+/// How one update participates in the conversation. The same matrix the text
+/// parser in `parse_update_message` applies through
+/// `should_record_passive_group_context`, extracted so the media gate renders
+/// identical decisions for updates the text-only gate can never see.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Participation {
+    /// Addressed (or no gating applies) — the agent answers.
+    Reply,
+    /// Unaddressed in a listened-to group — record as passive context.
+    PassiveContext,
+    /// Unaddressed — do not process.
+    Drop,
+}
+
+impl TelegramChannel {
+    /// Pure participation matrix: one row per (group?, mention_only?,
+    /// addressed?, listened?). Mirrors the text parser's gate so media and
+    /// text updates with the same addressing render the same decision.
+    fn participation_decision(
+        is_group: bool,
+        addressed: bool,
+        mention_only: bool,
+        passive_group_context: bool,
+    ) -> Participation {
+        if !is_group || !mention_only || addressed {
+            return Participation::Reply;
+        }
+        if Self::should_record_passive_group_context(passive_group_context, is_group, addressed) {
+            Participation::PassiveContext
+        } else {
+            Participation::Drop
+        }
+    }
 
     fn check_media_mention_gate(
         &self,
         message: &serde_json::Value,
         caption: Option<&str>,
-    ) -> Option<Option<String>> {
+    ) -> MediaAdmission {
         let is_group = Self::is_group_message(message);
         if !self.mention_only || !is_group {
-            return Some(caption.map(String::from));
+            return MediaAdmission::Admit(caption.map(String::from));
         }
+
+        // Media without a caption is not addressable through its text —
+        // there is nothing the mention predicate can work on — and its
+        // participation decision is identity-independent: the matrix only
+        // needs the group/listen flags. A voice note never carries a
+        // caption, so for voice this is the row that decides. Computing it
+        // before the bot identity is resolved also keeps passive listening
+        // working while the username cache is still warming up.
+        let unaddressed = match Self::participation_decision(
+            is_group,
+            false,
+            self.mention_only,
+            self.passive_group_context,
+        ) {
+            Participation::PassiveContext => MediaAdmission::Passive,
+            // Reply cannot occur for an unaddressed update; fail closed.
+            Participation::Reply | Participation::Drop => MediaAdmission::Drop,
+        };
+        let Some(caption) = caption else {
+            return unaddressed;
+        };
+
         let bot_username_guard = self.bot_username.lock();
-        let bot_username = bot_username_guard.as_ref()?;
+        let Some(bot_username) = bot_username_guard.as_ref() else {
+            // Captioned media could still be addressed, but the mention
+            // predicate cannot run without the identity — fail closed, as
+            // before.
+            return MediaAdmission::Drop;
+        };
 
         // If the user is replying directly to the bot's message, bypass the
         // mention check — replies are an unambiguous signal of intent.
-        if let Some(caption) = caption
-            && let Some(bot_id) = *self.bot_id.lock()
+        if let Some(bot_id) = *self.bot_id.lock()
             && Self::is_reply_to_bot(message, bot_id)
         {
-            return Some(Self::normalize_incoming_content(caption, bot_username));
+            return MediaAdmission::Admit(Self::normalize_incoming_content(caption, bot_username));
         }
-
-        let caption = caption?;
         if !Self::contains_bot_mention(caption, bot_username) {
-            return None;
+            return unaddressed;
         }
-        Some(Self::normalize_incoming_content(caption, bot_username))
+        MediaAdmission::Admit(Self::normalize_incoming_content(caption, bot_username))
     }
 
     /// Single-identifier convenience kept for the unit tests; the polling
@@ -5425,11 +5501,18 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         // updates carry no `text` field, so the text-only gate in
         // `parse_update_message` can never see them and they used to slip
         // through unconditionally.
-        let Some(gated_caption) =
-            self.check_media_mention_gate(message, attachment.caption.as_deref())
-        else {
-            return UpdateDisposition::SkipPermanent;
-        };
+        let gated_caption =
+            match self.check_media_mention_gate(message, attachment.caption.as_deref()) {
+                MediaAdmission::Admit(caption) => caption,
+                // Uniform passive recording for photo/document is a follow-up:
+                // it needs the file kept on disk as a document path, which
+                // this parser only materializes for admitted updates. Until
+                // then an unaddressed attachment in a listened-to group is
+                // skipped exactly like a dropped one.
+                MediaAdmission::Passive | MediaAdmission::Drop => {
+                    return UpdateDisposition::SkipPermanent;
+                }
+            };
         let Some((chat_id, message_id)) = Self::extract_update_message_target(update) else {
             return UpdateDisposition::SkipPermanent;
         };
@@ -5536,11 +5619,17 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             .filter(|caption| seen_captions.insert((*caption).to_string()))
             .collect::<Vec<_>>()
             .join("\n\n");
-        let Some(gated_caption) = self.check_media_mention_gate(
+        let gated_caption = match self.check_media_mention_gate(
             anchor_message,
             (!shared_caption.is_empty()).then_some(shared_caption.as_str()),
-        ) else {
-            return UpdateDisposition::SkipPermanent;
+        ) {
+            MediaAdmission::Admit(caption) => caption,
+            // Same follow-up as the single-attachment parser: passive
+            // recording of unaddressed media groups needs the files kept on
+            // disk, which only admitted updates get today.
+            MediaAdmission::Passive | MediaAdmission::Drop => {
+                return UpdateDisposition::SkipPermanent;
+            }
         };
 
         let mut contents = Vec::with_capacity(ordered.len());
@@ -5676,12 +5765,17 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         }
 
         let voice_caption = message.get("caption").and_then(serde_json::Value::as_str);
-        if self
-            .check_media_mention_gate(message, voice_caption)
-            .is_none()
-        {
-            return UpdateDisposition::SkipPermanent;
-        }
+        // Admission is the shared media gate alone; this parser has no
+        // participation rules of its own. A passive admission records the
+        // transcription as context instead of answering — the same contract
+        // the text parser gives unaddressed messages in a listened-to group:
+        // mention decides whether the agent replies, not whether the content
+        // exists in context.
+        let passive_context = match self.check_media_mention_gate(message, voice_caption) {
+            MediaAdmission::Admit(_) => false,
+            MediaAdmission::Passive => true,
+            MediaAdmission::Drop => return UpdateDisposition::SkipPermanent,
+        };
 
         let Some(chat_id) = message
             .get("chat")
@@ -5805,8 +5899,10 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             return UpdateDisposition::SkipPermanent;
         }
 
-        // Enter voice-chat mode so outgoing replies get a TTS voice note
-        if let Ok(mut vc) = self.voice_chats.lock() {
+        // Enter voice-chat mode so outgoing replies get a TTS voice note. A
+        // passive observation is not that participant (same discipline as
+        // the text parser), so it leaves the room's voice mode alone.
+        if !passive_context && let Ok(mut vc) = self.voice_chats.lock() {
             vc.insert(reply_target.clone());
         }
 
@@ -5823,6 +5919,16 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             format!("{quote}\n\n[Voice] {text}")
         } else {
             format!("[Voice] {text}")
+        };
+
+        // A passive caption (rare on a voice note, but the gate works on it)
+        // is kept verbatim, mirroring the passive text path.
+        let content = if passive_context
+            && let Some(caption) = voice_caption.filter(|caption| !caption.is_empty())
+        {
+            format!("{content}\n\n{caption}")
+        } else {
+            content
         };
 
         // Prepend forwarding attribution when the message was forwarded
@@ -5848,6 +5954,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             interruption_scope_id: None,
             attachments: vec![],
             subject: None,
+            passive_context,
             conversation_scope: self.conversation_scope_for(message),
 
             ..Default::default()
@@ -18398,13 +18505,11 @@ mod tests {
         });
 
         let result = ch.check_media_mention_gate(&message, Some("enhance this"));
-        assert!(
-            result.is_some(),
+        assert_eq!(
+            result,
+            MediaAdmission::Admit(Some("enhance this".to_string())),
             "reply-to-bot caption should bypass mention_only gate"
         );
-        let gated = result.unwrap();
-        assert!(gated.is_some(), "gate should return the normalized caption");
-        assert_eq!(gated.unwrap(), "enhance this");
     }
 
     #[test]
@@ -18529,20 +18634,21 @@ mod tests {
             *cache = Some("mybot".to_string());
         }
         let no_caption = group_message_with_caption(None);
-        assert!(
-            ch.check_media_mention_gate(&no_caption, None).is_none(),
+        assert_eq!(
+            ch.check_media_mention_gate(&no_caption, None),
+            MediaAdmission::Drop,
             "no caption + mention_only group ⇒ reject"
         );
         let unrelated_caption = group_message_with_caption(Some("nice photo"));
-        assert!(
-            ch.check_media_mention_gate(&unrelated_caption, Some("nice photo"))
-                .is_none(),
+        assert_eq!(
+            ch.check_media_mention_gate(&unrelated_caption, Some("nice photo")),
+            MediaAdmission::Drop,
             "caption without bot mention + mention_only group ⇒ reject"
         );
         let other_bot_caption = group_message_with_caption(Some("hey @otherbot look"));
-        assert!(
-            ch.check_media_mention_gate(&other_bot_caption, Some("hey @otherbot look"))
-                .is_none(),
+        assert_eq!(
+            ch.check_media_mention_gate(&other_bot_caption, Some("hey @otherbot look")),
+            MediaAdmission::Drop,
             "caption mentioning a different bot ⇒ reject"
         );
     }
@@ -18563,7 +18669,7 @@ mod tests {
         let result = ch.check_media_mention_gate(&msg, Some("@mybot describe this"));
         assert_eq!(
             result,
-            Some(Some("@mybot describe this".to_string())),
+            MediaAdmission::Admit(Some("@mybot describe this".to_string())),
             "mention text preserved verbatim once gate admits"
         );
     }
@@ -18584,7 +18690,7 @@ mod tests {
         });
         assert_eq!(
             ch.check_media_mention_gate(&dm, Some("hello")),
-            Some(Some("hello".to_string())),
+            MediaAdmission::Admit(Some("hello".to_string())),
             "DM media must always pass with caption verbatim"
         );
         let dm_no_caption = serde_json::json!({
@@ -18594,7 +18700,7 @@ mod tests {
         });
         assert_eq!(
             ch.check_media_mention_gate(&dm_no_caption, None),
-            Some(None),
+            MediaAdmission::Admit(None),
             "DM media with no caption must pass"
         );
     }
@@ -18610,7 +18716,7 @@ mod tests {
         let group_no_caption = group_message_with_caption(None);
         assert_eq!(
             ch.check_media_mention_gate(&group_no_caption, None),
-            Some(None),
+            MediaAdmission::Admit(None),
             "mention_only off ⇒ all media pass"
         );
     }
@@ -18625,10 +18731,94 @@ mod tests {
         );
         // Do NOT set bot_username — leave it None.
         let group = group_message_with_caption(Some("@somebody hi"));
-        assert!(
-            ch.check_media_mention_gate(&group, Some("@somebody hi"))
-                .is_none(),
+        assert_eq!(
+            ch.check_media_mention_gate(&group, Some("@somebody hi")),
+            MediaAdmission::Drop,
             "missing bot_username in group must fail closed"
+        );
+    }
+
+    #[test]
+    fn check_media_mention_gate_records_voice_note_passively_without_caption() {
+        // A voice note never carries a caption, so it can never be addressed
+        // through text — but in a listened-to group the recording itself is
+        // the observation. Passive context, not a drop.
+        let ch = TelegramChannel::new(
+            "token".into(),
+            "default",
+            std::sync::Arc::new(|| vec!["*".into()]),
+            true,
+        )
+        .with_passive_group_context(true);
+        let mut msg = group_message_with_caption(None);
+        msg["voice"] = serde_json::json!({ "file_id": "voice_file", "duration": 4 });
+        assert_eq!(
+            ch.check_media_mention_gate(&msg, None),
+            MediaAdmission::Passive,
+            "an unaddressed voice note in a listened-to group is passive context"
+        );
+    }
+
+    #[test]
+    fn check_media_mention_gate_drops_captionless_voice_note_when_not_listened() {
+        let ch = TelegramChannel::new(
+            "token".into(),
+            "default",
+            std::sync::Arc::new(|| vec!["*".into()]),
+            true,
+        );
+        let mut msg = group_message_with_caption(None);
+        msg["voice"] = serde_json::json!({ "file_id": "voice_file", "duration": 4 });
+        assert_eq!(
+            ch.check_media_mention_gate(&msg, None),
+            MediaAdmission::Drop,
+            "passive off: an unaddressed voice note drops like any unaddressed media"
+        );
+    }
+
+    #[test]
+    fn check_media_mention_gate_passive_branch_covers_captioned_media() {
+        // The passive branch is not voice-specific: any unaddressed captioned
+        // media update renders the same matrix row.
+        let ch = TelegramChannel::new(
+            "token".into(),
+            "default",
+            std::sync::Arc::new(|| vec!["*".into()]),
+            true,
+        )
+        .with_passive_group_context(true);
+        {
+            let mut cache = ch.bot_username.lock();
+            *cache = Some("mybot".to_string());
+        }
+        let msg = group_message_with_caption(Some("послушай это"));
+        assert_eq!(
+            ch.check_media_mention_gate(&msg, Some("послушай это")),
+            MediaAdmission::Passive,
+            "unaddressed captioned media in a listened-to group is passive context"
+        );
+    }
+
+    #[test]
+    fn check_media_mention_gate_admit_branch_unchanged_when_listened() {
+        // Passive listening must not weaken the addressed paths: a real
+        // mention still admits, and the normalized caption is still the
+        // Admit payload.
+        let ch = TelegramChannel::new(
+            "token".into(),
+            "default",
+            std::sync::Arc::new(|| vec!["*".into()]),
+            true,
+        )
+        .with_passive_group_context(true);
+        {
+            let mut cache = ch.bot_username.lock();
+            *cache = Some("mybot".to_string());
+        }
+        let msg = group_message_with_caption(Some("@mybot describe this"));
+        assert_eq!(
+            ch.check_media_mention_gate(&msg, Some("@mybot describe this")),
+            MediaAdmission::Admit(Some("@mybot describe this".to_string())),
         );
     }
 
@@ -19416,6 +19606,107 @@ mod tests {
         };
         assert_eq!(message.platform_sender_id.as_deref(), Some("123"));
         assert_eq!(message.content, "[Voice] hello from voice");
+    }
+
+    #[tokio::test]
+    async fn try_parse_voice_message_records_unmentioned_voice_passively_when_listened() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/bot[^/]+/getFile$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "file_path": "voice/file_1.ogg" }
+            })))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/file/bot[^/]+/voice/file_1\.ogg$"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![0u8; 64]))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/transcribe$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "text": "hello there" })),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let tc = zeroclaw_config::schema::TranscriptionConfig {
+            enabled: true,
+            api_key: Some("test_key".to_string()),
+            api_url: format!("{}/transcribe", mock_server.uri()),
+            max_duration_secs: 120,
+            ..Default::default()
+        };
+        // A mention_only group with passive listening on: an allowlisted
+        // sender's unmentioned recording is transcribed into the shared
+        // context instead of being dropped.
+        let ch = TelegramChannel::new(
+            "token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            true,
+        )
+        .with_passive_group_context(true)
+        .with_mock_api_base(mock_server.uri())
+        .with_transcription(tc);
+
+        let update = serde_json::json!({
+            "message": {
+                "message_id": 10,
+                "voice": { "file_id": "voice_file", "duration": 4 },
+                "from": { "id": 123, "username": "alice" },
+                "chat": { "id": -100_200_300, "type": "supergroup" }
+            }
+        });
+
+        let UpdateDisposition::Parsed(message) = ch.try_parse_voice_message(&update).await else {
+            panic!("passively admitted voice note in a mention_only group should parse");
+        };
+        assert_eq!(message.content, "[Voice] hello there");
+        assert!(
+            message.passive_context,
+            "the unmentioned recording must be recorded as passive context"
+        );
+    }
+
+    #[tokio::test]
+    async fn try_parse_voice_message_passive_keeps_allowlist_mandatory() {
+        let tc = zeroclaw_config::schema::TranscriptionConfig {
+            enabled: true,
+            api_key: Some("test_key".to_string()),
+            max_duration_secs: 120,
+            ..Default::default()
+        };
+
+        // Passive listening skips only the mention gate: a sender the
+        // allowlist rejects must still be dropped before anything is
+        // downloaded.
+        let ch = TelegramChannel::new(
+            "token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["alice".into()]),
+            true,
+        )
+        .with_passive_group_context(true)
+        .with_transcription(tc);
+        let update = serde_json::json!({
+            "message": {
+                "message_id": 11,
+                "voice": { "file_id": "voice_file", "duration": 4 },
+                "from": { "id": 999, "username": "bob" },
+                "chat": { "id": -100_200_300, "type": "supergroup" }
+            }
+        });
+
+        let parsed = ch.try_parse_voice_message(&update).await;
+        assert!(matches!(parsed, UpdateDisposition::SkipPermanent));
+        assert!(ch.voice_transcriptions.lock().is_empty());
     }
 
     // ─────────────────────────────────────────────────────────────────────
