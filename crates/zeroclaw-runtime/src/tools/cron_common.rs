@@ -108,6 +108,17 @@ fn reject_at_without_explicit_offset(value: &Value) -> Result<(), String> {
         })
 }
 
+/// True when an agent-supplied `cron_update` patch names an owning agent.
+/// Ownership is not a `CronJobPatch` field, so serde would silently drop the
+/// key; the tool rejects it instead so the model learns that reassignment is
+/// operator-only (`zeroclaw cron update --agent`).
+pub(crate) fn patch_requests_owner_change(value: &Value) -> bool {
+    normalize_maybe_stringified_json(value)
+        .as_ref()
+        .and_then(Value::as_object)
+        .is_some_and(|patch| patch.contains_key("agent_alias") || patch.contains_key("agent"))
+}
+
 fn normalize_maybe_stringified_json(value: &Value) -> Option<Value> {
     match value {
         Value::String(raw) => {
