@@ -80,6 +80,7 @@ impl CanvasStore {
         };
 
         let mut store = self.inner.write();
+        Self::prune_unused_empty_locked(&mut store);
 
         // Enforce canvas count limit for new canvases.
         if !store.contains_key(canvas_id) && store.len() >= MAX_CANVAS_COUNT {
@@ -123,23 +124,28 @@ impl CanvasStore {
     }
 
     /// Clear a canvas (removes current content and history).
+    ///
+    /// When the canvas has no remaining viewers, the empty entry is removed so it
+    /// no longer occupies a slot toward the maximum canvas count.
     pub fn clear(&self, canvas_id: &str) -> bool {
         let mut store = self.inner.write();
-        if let Some(entry) = store.get_mut(canvas_id) {
-            entry.current = None;
-            entry.history.clear();
-            // Send an empty frame to signal clear to subscribers.
-            let clear_frame = CanvasFrame {
-                frame_id: uuid::Uuid::new_v4().to_string(),
-                content_type: "clear".to_string(),
-                content: String::new(),
-                timestamp: chrono::Utc::now().to_rfc3339(),
-            };
-            let _ = entry.tx.send(clear_frame);
-            true
-        } else {
-            false
+        let Some(entry) = store.get_mut(canvas_id) else {
+            return false;
+        };
+        entry.current = None;
+        entry.history.clear();
+        // Send an empty frame to signal clear to subscribers.
+        let clear_frame = CanvasFrame {
+            frame_id: uuid::Uuid::new_v4().to_string(),
+            content_type: "clear".to_string(),
+            content: String::new(),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+        };
+        let _ = entry.tx.send(clear_frame);
+        if entry.tx.receiver_count() == 0 {
+            store.remove(canvas_id);
         }
+        true
     }
 
     /// Subscribe to real-time updates for a canvas.
@@ -147,6 +153,7 @@ impl CanvasStore {
     /// Returns `None` if the canvas does not exist and the limit has been reached.
     pub fn subscribe(&self, canvas_id: &str) -> Option<broadcast::Receiver<CanvasFrame>> {
         let mut store = self.inner.write();
+        Self::prune_unused_empty_locked(&mut store);
 
         // Enforce canvas count limit for new entries.
         if !store.contains_key(canvas_id) && store.len() >= MAX_CANVAS_COUNT {
@@ -166,7 +173,19 @@ impl CanvasStore {
     /// List all canvas IDs that currently have content.
     pub fn list(&self) -> Vec<String> {
         let store = self.inner.read();
-        store.keys().cloned().collect()
+        store
+            .iter()
+            .filter(|(_, entry)| entry.current.is_some())
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+
+    /// Drop empty canvases that have no live subscribers so they stop counting
+    /// toward the maximum canvas count.
+    fn prune_unused_empty_locked(store: &mut HashMap<String, CanvasEntry>) {
+        store.retain(|_, entry| {
+            entry.current.is_some() || !entry.history.is_empty() || entry.tx.receiver_count() > 0
+        });
     }
 }
 
@@ -641,6 +660,32 @@ mod tests {
         assert!(store.render("one_too_many", "html", "content").is_none());
         // But rendering to an existing canvas should still work
         assert!(store.render("canvas_0", "html", "updated").is_some());
+    }
+
+    #[test]
+    fn canvas_store_list_omits_empty_canvases_and_clear_frees_slots() {
+        let store = CanvasStore::new();
+        assert!(store.render("keep", "html", "<p>hi</p>").is_some());
+        assert!(store.render("drop", "html", "<p>bye</p>").is_some());
+        assert!(store.subscribe("view-only").is_some());
+
+        let mut listed = store.list();
+        listed.sort();
+        assert_eq!(listed, vec!["drop".to_string(), "keep".to_string()]);
+
+        assert!(store.clear("drop"));
+        let mut listed = store.list();
+        listed.sort();
+        assert_eq!(listed, vec!["keep".to_string()]);
+
+        // Fill the remaining slots after clearing one without viewers.
+        for i in 0..(MAX_CANVAS_COUNT - 2) {
+            // keep + view-only still occupy slots; drop was removed.
+            assert!(
+                store.render(&format!("fill_{i}"), "html", "x").is_some(),
+                "expected fill_{i} to fit after clear freed a slot"
+            );
+        }
     }
 
     #[tokio::test]
