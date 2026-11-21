@@ -1086,7 +1086,8 @@ mod tests {
             level: AutonomyLevel::Full,
             ..RiskProfileConfig::default()
         };
-        let bounded = crate::approval::ApprovalManager::for_bounded_non_interactive(&full_profile);
+        let bounded =
+            crate::approval::ApprovalManager::for_bounded_non_interactive(&full_profile, &[]);
         let explicit_profile = RiskProfileConfig {
             auto_approve: vec!["*".to_string()],
             ..RiskProfileConfig::default()

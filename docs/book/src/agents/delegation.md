@@ -187,6 +187,13 @@ Two approval and scoping rules apply to the granted instance. First, it is **del
 
 The same no-operator boundary applies to tool calls in a bounded agentic child. The child loop creates a fresh non-interactive approval manager from the target's risk profile at the dispatch seam. A prompt-required call is denied before the tool implementation runs, while a call explicitly listed in `auto_approve` (or allowed by full autonomy) may proceed. For inherited caller-owned command tools (`shell`, `schedule`, `cron_add`, `cron_update`, and `cron_run`), that target-profile decision approves only tool invocation: it does not supply or override the command-specific approval consumed by the caller's command policy. The caller's command policy remains authoritative, so those tools continue to enforce its approval requirements. The inherited caller-capped registry is unchanged: approval evaluates calls that survived capability filtering; it does not grant additional tools or forward the caller's approval session.
 
+Two roles set that decision, and they are kept separate:
+
+- **Target authority.** The target's risk profile is the normal approval policy for the child, as described above.
+- **Caller limit.** The caller's explicit `always_ask` entries are an additional deny condition on inherited tools. The child has no operator to ask, so a call to a tool the caller lists in `always_ask` is denied before the tool implementation runs, even when the target profile runs at full autonomy or lists the tool in `auto_approve`. A `"*"` entry denies every tool call in the child. The limit binds the whole bounded subtree: a bounded child that delegates again passes its caller's entries down, together with its own profile's entries. The caller's other approval settings are not carried: a supervised caller's default prompt stays in the caller's own loop, and the target decides every tool the caller did not list. For `shell`, a caller entry fails closed at tool invocation; the caller's command policy stays authoritative for inherited shell commands either way.
+
+If the caller's risk profile is named but cannot be resolved, bounded agentic delegation is refused before the child starts.
+
 In independent agentic delegation the sub-agent's tools are built from the target agent's own configured policy and runtime registry, like opening a fresh chat with that target. The parent registry is not used as the ceiling. The `delegate` tool is removed from that child registry: independent delegation does not recurse through another `delegate` call.
 
 Depth is capped per the delegating parent's `runtime_profile.max_delegation_depth`, and each granted hop carries that ceiling tightened (min) with the next target's own profile cap, so a parent's cap binds its whole subtree and a chain can only tighten. Set it to `1` to allow the top agent a single delegation hop with no further sub-delegation.
@@ -259,7 +266,8 @@ them as Fluent keys.
 11. Unknown action: error is `Unknown action '<value>'. Use delegate/check_result/list_results/cancel_task/await_sessions.`
 12. Target whose risk profile has `always_ask` entries: an independent target without a complete explicit approval route returns `delegate target "<target>" cannot run in independent mode from "<caller>": risk profile "<profile>" has always_ask entries (<list>). See ZeroClaw docs, "Delegation & SubAgents" > "What's not supported".` A bounded agentic target returns the same error with `cannot run in bounded agentic mode`.
 13. Agentic target with a missing target risk profile: error is `Agent '<target>' is agentic but risk_profile '<target_profile>' is not configured`.
-14. Agentic target with zero executable child tools: no error is emitted for the empty tool set itself; the target receives a normal model turn without tools.
+14. Bounded agentic child calling a tool listed in the caller's `always_ask`: the call is denied at the child's approval gate and the child model receives the same "requires approval" denial as any other prompt-required call; the delegation itself still completes. A bounded agentic delegation whose caller risk profile cannot be resolved returns `delegation refused: risk profile "<caller_profile>" could not be resolved for the bounded child's caller always_ask limit`.
+15. Agentic target with zero executable child tools: no error is emitted for the empty tool set itself; the target receives a normal model turn without tools.
 
 ### `delegate`: how to verify it actually fired
 

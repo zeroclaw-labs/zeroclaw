@@ -554,6 +554,8 @@ pub struct DelegateTool {
     /// (root tools, synchronous and parallel delegates, nested hops), whose
     /// loops keep the inert observer.
     progress: Option<Arc<super::delegate_progress::DelegateProgressSink>>,
+    /// Explicit `always_ask` entries passed down by bounded ancestor callers.
+    inherited_caller_always_ask: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -689,6 +691,7 @@ impl DelegateTool {
             prebuilt_cost_ctx: None,
             inherited_cost_tracker: None,
             progress: None,
+            inherited_caller_always_ask: Vec::new(),
         }
     }
 
@@ -750,6 +753,7 @@ impl DelegateTool {
             prebuilt_cost_ctx: None,
             inherited_cost_tracker: None,
             progress: None,
+            inherited_caller_always_ask: Vec::new(),
         }
     }
 
@@ -2079,6 +2083,28 @@ impl DelegateTool {
             ));
         }
         None
+    }
+
+    /// Explicit `always_ask` entries of this caller and its bounded ancestors.
+    fn bounded_caller_always_ask(&self, config: Option<&Config>) -> Result<Vec<String>, String> {
+        let mut entries = self.inherited_caller_always_ask.clone();
+        let profile_name = self.security.risk_profile_name.trim();
+        if !profile_name.is_empty() {
+            let profile = match config {
+                Some(config) => config.risk_profiles.get(profile_name),
+                None => self.risk_profiles.get(profile_name),
+            };
+            let Some(profile) = profile else {
+                return Err(crate::i18n::get_required_cli_string_with_args(
+                    "tool-delegate-error-caller-profile-unresolved",
+                    &[("profile", profile_name)],
+                ));
+            };
+            entries.extend(profile.always_ask.iter().cloned());
+        }
+        entries.sort();
+        entries.dedup();
+        Ok(entries)
     }
 
     /// Resolve per-call delegation timeout from the named runtime profile.
@@ -3631,6 +3657,25 @@ impl DelegateTool {
         if let Some(refusal) = refusal {
             return Ok(refusal);
         }
+        // The worker runs as the target, so resolve this caller's limit now.
+        let inherited_caller_always_ask = match admitted_config.as_deref().map_or_else(
+            || self.mode_for_target(agent_name),
+            |config| self.mode_for_target_from_config(config, agent_name),
+        ) {
+            DelegateExecutionMode::Bounded => match self.bounded_caller_always_ask(
+                admitted_config.as_deref().or(self.root_config.as_deref()),
+            ) {
+                Ok(entries) => entries,
+                Err(error) => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: ToolOutput::default(),
+                        error: Some(error),
+                    });
+                }
+            },
+            DelegateExecutionMode::Independent => Vec::new(),
+        };
 
         // Runaway backstop: refuse a new background delegation once too many are already in
         // flight (each is a full agent loop). The in-flight set is the live cancel-token map.
@@ -3946,6 +3991,7 @@ impl DelegateTool {
                     prebuilt_cost_ctx,
                     inherited_cost_tracker,
                     progress: Some(progress_sink),
+                    inherited_caller_always_ask,
                 };
 
                 let args_inner = json!({
@@ -4259,6 +4305,7 @@ impl DelegateTool {
             // Same-hop re-executor (see the background spawn): the inherited
             // cost base is carried verbatim from the spawning tool.
             let inherited_cost_tracker = self.inherited_cost_tracker.clone();
+            let inherited_caller_always_ask = self.inherited_caller_always_ask.clone();
             // The parallel fan-out task re-executes the SAME hop as the outer
             // tool, so the rebuilt inner tool carries the outer chain
             // verbatim rather than extending it.
@@ -4326,6 +4373,7 @@ impl DelegateTool {
                         // Parallel delegates are awaited by the caller's own
                         // turn; only detached (background) work reports progress.
                         progress: None,
+                        inherited_caller_always_ask,
                     };
                     let agent_name_for_return = agent_name.clone();
                     let result = ExecutionTreeBudget::scope_optional(
@@ -5288,6 +5336,23 @@ impl DelegateTool {
                 )),
             });
         };
+        // Independent targets run under their own authority.
+        let bounded_caller_always_ask = match target_mode {
+            DelegateExecutionMode::Bounded => {
+                match self.bounded_caller_always_ask(target_config.or(self.root_config.as_deref()))
+                {
+                    Ok(entries) => entries,
+                    Err(error) => {
+                        return Ok(ToolResult {
+                            success: false,
+                            output: ToolOutput::default(),
+                            error: Some(error),
+                        });
+                    }
+                }
+            }
+            DelegateExecutionMode::Independent => Vec::new(),
+        };
         let approval_route = Self::independent_approval_route(target_mode, target_risk_profile);
         let approval_channel = approval_route.and_then(|route| {
             target_config
@@ -5298,9 +5363,10 @@ impl DelegateTool {
                 })
         });
         let approval_manager = Some(match target_mode {
-            DelegateExecutionMode::Bounded => {
-                ApprovalManager::for_bounded_non_interactive(target_risk_profile)
-            }
+            DelegateExecutionMode::Bounded => ApprovalManager::for_bounded_non_interactive(
+                target_risk_profile,
+                &bounded_caller_always_ask,
+            ),
             DelegateExecutionMode::Independent if approval_route.is_some() => {
                 ApprovalManager::for_non_interactive_backchannel(target_risk_profile)
             }
@@ -5535,6 +5601,7 @@ impl DelegateTool {
                         prebuilt_cost_ctx: None,
                         inherited_cost_tracker,
                         progress: None,
+                        inherited_caller_always_ask: bounded_caller_always_ask.clone(),
                     }) as Arc<dyn Tool>
                 });
 
@@ -7851,13 +7918,14 @@ mod tests {
     }
 
     struct CountingEchoTool {
+        name: &'static str,
         executions: Arc<std::sync::atomic::AtomicUsize>,
     }
 
     #[async_trait]
     impl Tool for CountingEchoTool {
         fn name(&self) -> &str {
-            "echo_tool"
+            self.name
         }
 
         fn description(&self) -> &str {
@@ -11707,6 +11775,7 @@ mod tests {
         .with_runtime_profiles(agentic_runtime_profiles(10))
         .with_risk_profiles(profiles)
         .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(CountingEchoTool {
+            name: "echo_tool",
             executions: Arc::clone(&executions),
         })])));
         if rooted {
@@ -11838,6 +11907,455 @@ mod tests {
             messages
                 .iter()
                 .any(|message| message.contains("echo:probe"))
+        );
+    }
+
+    /// `caller` (profile `caller_profile`) delegates in bounded mode to
+    /// `agentic`, whose child calls `tool_name`.
+    async fn bounded_caller_approval_probe(
+        caller_profile: Option<RiskProfileConfig>,
+        target_profile: RiskProfileConfig,
+        inherited: Vec<String>,
+        tool_name: &'static str,
+    ) -> (ToolResult, usize, Vec<String>) {
+        use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
+
+        let executions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let provider = ApprovalProbeModelProvider {
+            tool_name,
+            tool_arguments: "{\"value\":\"probe\"}".to_string(),
+            tool_messages: std::sync::Mutex::new(Vec::new()),
+        };
+        let target_profile = RiskProfileConfig {
+            allowed_tools: vec![tool_name.to_string()],
+            ..target_profile
+        };
+        let mut root_config = Config::default();
+        if let Some(caller_profile) = caller_profile {
+            root_config.risk_profiles.insert(
+                "caller_profile".to_string(),
+                RiskProfileConfig {
+                    delegation_policy: DelegationPolicy {
+                        mode: DelegationMode::Allow,
+                    },
+                    ..caller_profile
+                },
+            );
+        }
+        root_config
+            .risk_profiles
+            .insert("agentic_test".to_string(), target_profile.clone());
+        root_config.runtime_profiles.insert(
+            "agentic_test".to_string(),
+            RuntimeProfileConfig {
+                agentic: true,
+                max_tool_iterations: 10,
+                ..RuntimeProfileConfig::default()
+            },
+        );
+        root_config.agents.insert(
+            "caller".to_string(),
+            AliasedAgentConfig {
+                risk_profile: "caller_profile".into(),
+                runtime_profile: "agentic_test".into(),
+                delegates: vec![DelegateTargetConfig {
+                    agent: "agentic".to_string(),
+                    mode: DelegateExecutionMode::Bounded,
+                }],
+                ..AliasedAgentConfig::default()
+            },
+        );
+        root_config.agents.insert(
+            "agentic".to_string(),
+            AliasedAgentConfig {
+                risk_profile: "agentic_test".into(),
+                runtime_profile: "agentic_test".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        let caller_security = Arc::new(SecurityPolicy {
+            risk_profile_name: "caller_profile".to_string(),
+            delegation_policy: DelegationPolicy {
+                mode: DelegationMode::Allow,
+            },
+            ..SecurityPolicy::default()
+        });
+        let mut profiles = HashMap::new();
+        profiles.insert("agentic_test".to_string(), target_profile);
+        let mut tool = DelegateTool::new(HashMap::new(), None, caller_security)
+            .with_runtime_profiles(agentic_runtime_profiles(10))
+            .with_risk_profiles(profiles)
+            .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(CountingEchoTool {
+                name: tool_name,
+                executions: Arc::clone(&executions),
+            })])))
+            .with_root_config(Arc::new(root_config))
+            .with_caller_alias("caller");
+        tool.inherited_caller_always_ask = inherited;
+        let result = tool
+            .execute_agentic(
+                "agentic",
+                &agentic_agent_config(),
+                "openrouter",
+                "model-test",
+                &provider,
+                "run",
+                Some(0.2),
+            )
+            .await
+            .unwrap();
+        let messages = provider.tool_messages.lock().unwrap().clone();
+        (
+            result,
+            executions.load(std::sync::atomic::Ordering::SeqCst),
+            messages,
+        )
+    }
+
+    fn caller_always_ask(entries: &[&str]) -> Option<RiskProfileConfig> {
+        Some(RiskProfileConfig {
+            always_ask: entries.iter().map(|entry| (*entry).to_string()).collect(),
+            ..RiskProfileConfig::default()
+        })
+    }
+
+    fn full_target() -> RiskProfileConfig {
+        RiskProfileConfig {
+            level: AutonomyLevel::Full,
+            ..RiskProfileConfig::default()
+        }
+    }
+
+    fn assert_denied_before_execution(
+        case: &str,
+        (result, executions, messages): (ToolResult, usize, Vec<String>),
+    ) {
+        assert!(
+            result.success,
+            "{case}: denial should be returned to the child model: {result:?}"
+        );
+        assert_eq!(executions, 0, "{case}: the tool must not execute");
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains("requires approval")),
+            "{case}: expected an approval denial, got {messages:?}"
+        );
+    }
+
+    fn assert_executed(
+        case: &str,
+        (result, executions, messages): (ToolResult, usize, Vec<String>),
+    ) {
+        assert!(result.success, "{case}: {result:?}");
+        assert_eq!(executions, 1, "{case}: the tool should run once");
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains("echo:probe")),
+            "{case}: expected tool output, got {messages:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_caller_always_ask_denies_tool_a_full_target_would_approve() {
+        assert_denied_before_execution(
+            "caller always_ask / target full",
+            bounded_caller_approval_probe(
+                caller_always_ask(&["file_write"]),
+                full_target(),
+                Vec::new(),
+                "file_write",
+            )
+            .await,
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_caller_always_ask_denies_tool_a_target_auto_approves() {
+        assert_denied_before_execution(
+            "caller always_ask / target auto_approve",
+            bounded_caller_approval_probe(
+                caller_always_ask(&["file_write"]),
+                RiskProfileConfig {
+                    auto_approve: vec!["file_write".to_string()],
+                    ..RiskProfileConfig::default()
+                },
+                Vec::new(),
+                "file_write",
+            )
+            .await,
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_caller_always_ask_keeps_target_prompt_denial() {
+        assert_denied_before_execution(
+            "caller always_ask / target supervised",
+            bounded_caller_approval_probe(
+                caller_always_ask(&["file_write"]),
+                RiskProfileConfig::default(),
+                Vec::new(),
+                "file_write",
+            )
+            .await,
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_caller_always_ask_denies_read_tool_under_read_only_target() {
+        assert_denied_before_execution(
+            "caller always_ask / target read_only",
+            bounded_caller_approval_probe(
+                caller_always_ask(&["file_read"]),
+                RiskProfileConfig {
+                    level: AutonomyLevel::ReadOnly,
+                    ..RiskProfileConfig::default()
+                },
+                Vec::new(),
+                "file_read",
+            )
+            .await,
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_caller_always_ask_leaves_unlisted_tools_to_the_target() {
+        assert_executed(
+            "caller always_ask other tool / target full",
+            bounded_caller_approval_probe(
+                caller_always_ask(&["file_write"]),
+                full_target(),
+                Vec::new(),
+                "file_read",
+            )
+            .await,
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_child_does_not_inherit_caller_supervised_default() {
+        assert_executed(
+            "caller supervised default / target full",
+            bounded_caller_approval_probe(
+                Some(RiskProfileConfig::default()),
+                full_target(),
+                Vec::new(),
+                "file_write",
+            )
+            .await,
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_caller_always_ask_shell_fails_closed_at_tool_invocation() {
+        assert_denied_before_execution(
+            "caller always_ask shell / target full",
+            bounded_caller_approval_probe(
+                caller_always_ask(&["shell"]),
+                full_target(),
+                Vec::new(),
+                "shell",
+            )
+            .await,
+        );
+        assert_executed(
+            "caller without shell entry / target full",
+            bounded_caller_approval_probe(
+                caller_always_ask(&[]),
+                full_target(),
+                Vec::new(),
+                "shell",
+            )
+            .await,
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_child_honors_always_ask_inherited_from_an_ancestor_caller() {
+        assert_denied_before_execution(
+            "ancestor always_ask / target full",
+            bounded_caller_approval_probe(
+                caller_always_ask(&[]),
+                full_target(),
+                vec!["file_write".to_string()],
+                "file_write",
+            )
+            .await,
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_delegation_fails_closed_when_caller_profile_is_unresolvable() {
+        let (result, executions, _) =
+            bounded_caller_approval_probe(None, full_target(), Vec::new(), "file_write").await;
+        assert!(!result.success, "expected a refusal: {result:?}");
+        assert_eq!(executions, 0);
+        let error = result.error.unwrap_or_default();
+        assert!(
+            error.contains("caller_profile")
+                && error.contains(
+                    "could not be resolved for the bounded child's caller always_ask limit"
+                ),
+            "got: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn background_bounded_child_keeps_the_callers_always_ask() {
+        use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
+
+        let (server, captured) = start_scripted_chat_server(&[
+            chat_completion_tool_call(
+                "echo_tool",
+                "call_echo_bg",
+                serde_json::json!({"value": "probe"}),
+            ),
+            serde_json::json!({"choices": [{"message": {"content": "background done"}}]}),
+        ])
+        .await;
+        let tmp = TempDir::new().unwrap();
+        let model_provider_config = ModelProviderConfig {
+            uri: Some(server.uri.clone()),
+            model: Some("always-ask-test-model".to_string()),
+            api_key: Some("always-ask-test-key".to_string()),
+            timeout_secs: Some(5),
+            native_tools: Some(true),
+            ..ModelProviderConfig::default()
+        };
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.providers.models.custom.insert(
+            "local".to_string(),
+            CustomModelProviderConfig {
+                base: model_provider_config.clone(),
+            },
+        );
+        config.risk_profiles.insert(
+            "caller_profile".to_string(),
+            RiskProfileConfig {
+                delegation_policy: DelegationPolicy {
+                    mode: DelegationMode::Allow,
+                },
+                allowed_tools: vec![DelegateTool::NAME.to_string(), "echo_tool".to_string()],
+                always_ask: vec!["echo_tool".to_string()],
+                ..RiskProfileConfig::default()
+            },
+        );
+        config
+            .risk_profiles
+            .insert("target_profile".to_string(), full_target());
+        config.runtime_profiles.insert(
+            "target_agentic".to_string(),
+            RuntimeProfileConfig {
+                agentic: true,
+                max_tool_iterations: 2,
+                ..RuntimeProfileConfig::default()
+            },
+        );
+        config.agents.insert(
+            "caller".to_string(),
+            AliasedAgentConfig {
+                model_provider: "custom.local".into(),
+                risk_profile: "caller_profile".into(),
+                delegates: vec![DelegateTargetConfig {
+                    agent: "target".to_string(),
+                    mode: DelegateExecutionMode::Bounded,
+                }],
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.agents.insert(
+            "target".to_string(),
+            AliasedAgentConfig {
+                model_provider: "custom.local".into(),
+                risk_profile: "target_profile".into(),
+                runtime_profile: "target_agentic".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        let config = Arc::new(config);
+        let mut providers_models: HashMap<String, HashMap<String, ModelProviderConfig>> =
+            HashMap::new();
+        providers_models
+            .entry("custom".to_string())
+            .or_default()
+            .insert("local".to_string(), model_provider_config);
+        let executions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let tool = DelegateTool::new(
+            config.agents.clone(),
+            None,
+            Arc::new(SecurityPolicy::for_agent(&config, "caller").unwrap()),
+        )
+        .with_root_config(Arc::clone(&config))
+        .with_caller_alias("caller")
+        .with_workspace_dir(tmp.path().join("workspace"))
+        .with_providers_models(providers_models)
+        .with_risk_profiles(config.risk_profiles.clone())
+        .with_runtime_profiles(config.runtime_profiles.clone())
+        .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(CountingEchoTool {
+            name: "echo_tool",
+            executions: Arc::clone(&executions),
+        })])));
+
+        let result = tool
+            .execute(json!({"agent": "target", "prompt": "run", "background": true}))
+            .await
+            .unwrap();
+        assert!(result.success, "background delegate failed: {result:?}");
+        let task_id = result
+            .output
+            .lines()
+            .find(|line| line.starts_with("task_id:"))
+            .unwrap()
+            .trim_start_matches("task_id: ")
+            .trim();
+        let settled = wait_for_terminal_background_result(&tool, task_id).await;
+        assert_eq!(
+            settled.status,
+            BackgroundTaskStatus::Completed,
+            "{settled:?}"
+        );
+
+        assert_eq!(
+            executions.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the background child must not run a tool its caller lists in always_ask"
+        );
+        let bodies = captured.lock().unwrap();
+        assert!(
+            bodies.iter().any(|body| body.contains("requires approval")),
+            "expected an approval denial in the child's tool result: {bodies:?}"
+        );
+    }
+
+    #[test]
+    fn bounded_caller_always_ask_combines_inherited_and_own_entries() {
+        let mut profiles = HashMap::new();
+        profiles.insert(
+            "caller_profile".to_string(),
+            RiskProfileConfig {
+                always_ask: vec!["shell".to_string(), "file_write".to_string()],
+                ..RiskProfileConfig::default()
+            },
+        );
+        let mut tool = DelegateTool::new(
+            HashMap::new(),
+            None,
+            Arc::new(SecurityPolicy {
+                risk_profile_name: "caller_profile".to_string(),
+                ..SecurityPolicy::default()
+            }),
+        )
+        .with_risk_profiles(profiles);
+        tool.inherited_caller_always_ask = vec!["file_write".to_string(), "cron_add".to_string()];
+
+        assert_eq!(
+            tool.bounded_caller_always_ask(None).unwrap(),
+            vec!["cron_add", "file_write", "shell"]
         );
     }
 
