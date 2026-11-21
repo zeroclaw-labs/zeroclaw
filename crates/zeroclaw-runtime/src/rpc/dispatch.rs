@@ -34115,7 +34115,7 @@ mod tests {
     #[tokio::test]
     async fn cron_trigger_rpc_reports_degraded_status_and_broadcasts() {
         crate::cron::scheduler::register_delivery_fn(Box::new(
-            |_config, channel, _target, _thread_id, _output| {
+            |_config, channel, _target, _thread_id, _output, _addressing| {
                 Box::pin(async move {
                     if channel == "fail-delivery" {
                         anyhow::bail!("synthetic delivery failure");

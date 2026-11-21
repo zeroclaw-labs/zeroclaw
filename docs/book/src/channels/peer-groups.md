@@ -28,6 +28,7 @@ A `[peer_groups.<name>]` block carries:
 | `ignore` | Per-group blocklist; travels with the resolved peer set and overrides any grant, including a wildcard. Applied by the channel, under that channel's identity rules. |
 | `output_modality` | Preferred reply modality for the group: `mirror` (input-driven, default), `voice` (always reply and deliver proactive messages as TTS notes on audio-capable channels), or `text` (always text). |
 | `admin_for_agent_scope` | When `true`, the group's `external_peers` are authorized to issue `/model --agent <model>` on the bound agent. Default `false` (deny-by-default). See [Admin agent-scope authorization](#admin-agent-scope-authorization). |
+| `routes` | Where messages to an external peer are posted, keyed by an `external_peers` entry, on channels that identify external peers by user (Discord today). Admission data stays in `external_peers`. See [Delivery routes](#delivery-routes). |
 
 ## Resolution
 
@@ -125,6 +126,58 @@ channel page states the identifier shape it expects.
 
 Each channel page shows the directive form with that channel's sender-identifier
 shape.
+
+## Delivery routes
+
+An `external_peers` entry says who may talk to the agent; it is not always an
+address. Some channels identify external peers by user while messages are
+posted to channels and threads. On Discord, for example, an external peer is a
+user ID, and bots cannot open direct messages with other bots. Such a channel
+declares that it supports peer routes, and when an agent sends to one of its
+external peers with `send_message_to_peer` or `send_via`, the peer group needs
+an explicit route for that peer:
+
+```toml
+[peer_groups.discord_peers]
+channel = "discord.main"
+agents = ["assistant"]
+external_peers = ["111111111111111111", "222222222222222222"]
+
+[peer_groups.discord_peers.routes."111111111111111111"]
+destination = "333333333333333333"   # where to post: on Discord, a channel or thread ID
+mention = true                       # optional
+```
+
+- The route key must be one of the group's `external_peers`. Keys are matched
+  case-insensitively and a leading `@` is tolerated, so a key may be written as
+  the peer appears in chat; the peer is passed to the channel as written and
+  the channel applies its own ID format (Discord strips a leading `@`). A route
+  never admits anyone, a wildcard cannot be routed, and a peer that an `ignore`
+  list covers is not routable.
+- `destination` is where to post, in the channel's own address format. The
+  sender posts directly to it, even outside the channel's listening filter
+  (on Discord, `channel_ids`). Everyone with access to the destination can read
+  routed messages.
+- Routed messages always carry an explicit mention policy. With
+  `mention = true` the channel starts the message with a mention of the peer
+  and only that peer can be pinged; otherwise the message pings nobody,
+  whatever its text contains. On Discord the policy applies to every chunk and
+  attachment.
+- `send_message_to_peer` uses routes from the sending agent's own groups that
+  cover the channel, by bare type or dotted alias. If those groups route the
+  peer differently, the send fails and names them. Without a route it fails
+  with an error explaining how to add one.
+- `send_via` to such a peer group, or to such a channel that exactly one of the
+  agent's groups covers, posts to that group's single routed peer. With no
+  routed peer or several, it fails; use `send_message_to_peer` to address one
+  peer. A group with no external peers is rejected as before.
+- Add a route by editing the config file. `zeroclaw config` cannot create a
+  new route key yet (the same holds for other maps nested inside a map entry,
+  such as `channels.git.<alias>.events`), but `zeroclaw config set` can change
+  the fields of an existing route.
+- Discord supports peer routes today. On a channel that does not, the external
+  peer itself is the recipient as before, and a send that finds a route for
+  the peer fails instead of ignoring it.
 
 ## Admin agent-scope authorization
 

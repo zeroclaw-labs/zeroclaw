@@ -266,6 +266,8 @@ fn outbound(content: &str, recipient: &str) -> SendMessage {
         references: Vec::new(),
         suppress_voice: false,
         force_voice: false,
+        allowed_mentions: None,
+        routed_peer: None,
     }
 }
 

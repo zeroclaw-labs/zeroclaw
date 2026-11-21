@@ -286,6 +286,12 @@ tool-a2a-cancel-desc-peer = Configured peer name hosting the task.
 tool-a2a-cancel-desc-task-id = The task id to cancel.
 tool-a2a-cancel-desc-agent = Optional agent alias or tenant that created the task (from a2a_send). Helps route the cancel to the correct interface when discovery is re-run (the cached route is used first).
 
+# send_via: external-peer routes
+tool-send-via-error-no-routed-peer = Peer group '{ $group }' has no routed external peer on '{ $channel }'. This channel identifies external peers by user, not by a place to post, so delivery needs an explicit route: add [peer_groups.{ $group }.routes."<peer>"] with destination = "<where to post>"
+tool-send-via-error-routes-unsupported = Peer group '{ $group }' sets routes, but '{ $channel }' does not support peer routes; remove [peer_groups.{ $group }.routes] or use a channel that supports them
+tool-send-via-error-several-routed-peers = Peer group '{ $group }' has several routed external peers on '{ $channel }' ({ $peers }), so send_via cannot choose one; use send_message_to_peer to address one peer
+tool-send-via-error-route-conflict = External peer '{ $peer }' is routed differently on '{ $channel }' by peer groups { $groups }; make those routes agree or keep the route in one group
+
 tool-send-via-error-no-active-reply = No active channel reply to redirect. To start or resume a conversation, call send_via with both `target` and a non-empty `body`.
 
 tool-send-via-description-background =

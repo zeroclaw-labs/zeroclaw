@@ -474,6 +474,77 @@ pub struct SendMessage {
     /// a voice note even if the peer's default modality is text.
     /// Ignored when `suppress_voice` is also `true`.
     pub force_voice: bool,
+    /// Explicit mention restriction for channels whose message content can
+    /// ping users. `None` keeps the channel's default handling. `Some(users)`
+    /// lets the message ping exactly these user IDs and nothing else, so an
+    /// empty list pings nobody. Channels without such pings ignore it.
+    pub allowed_mentions: Option<Vec<String>>,
+    /// The external peer this message is posted for, when it goes to that
+    /// peer's route rather than to the peer itself. Set through
+    /// [`SendMessage::with_routed_peer`]; channels that support peer routes
+    /// (see [`Channel::supports_peer_routes`]) render the mention themselves.
+    pub routed_peer: Option<RoutedPeer>,
+}
+
+/// An external peer a message is posted for on the peer's route: the channel
+/// or thread an operator configured in `peer_groups.<name>.routes`, used when
+/// the channel identifies external peers by user rather than by a place to
+/// post (see [`Channel::supports_peer_routes`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoutedPeer {
+    /// The peer's channel-native ID, as written in the route key; the channel
+    /// applies its own ID format (Discord strips a leading `@`).
+    pub peer: String,
+    /// Whether the message mentions the peer. Without it the message pings
+    /// nobody; with it, it may ping this peer and nobody else.
+    pub mention: bool,
+}
+
+/// How a delivery's recipient relates to an external peer, so the delivery
+/// can be checked against the channel's [`Channel::supports_peer_routes`]
+/// declaration before anything is sent.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum PeerAddressing {
+    /// The recipient is a place to post (an announcement or cron target).
+    #[default]
+    Direct,
+    /// The recipient is an external peer itself, with no route.
+    Peer,
+    /// The recipient is the route destination configured for this peer.
+    Routed(RoutedPeer),
+}
+
+/// Why a delivery to an external peer was refused before sending.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerRouteError {
+    /// The channel needs a route to reach an external peer, and none applies.
+    RouteRequired,
+    /// A route applies, but the channel does not support peer routes.
+    RoutesUnsupported,
+}
+
+impl fmt::Display for PeerRouteError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::RouteRequired => "this channel needs a peer route to reach an external peer",
+            Self::RoutesUnsupported => "this channel does not support peer routes",
+        })
+    }
+}
+
+impl std::error::Error for PeerRouteError {}
+
+impl PeerAddressing {
+    /// Check this addressing against a channel's peer-route declaration and
+    /// return the routed peer to attach with [`SendMessage::with_routed_peer`].
+    pub fn check(&self, supports_peer_routes: bool) -> Result<Option<RoutedPeer>, PeerRouteError> {
+        match (self, supports_peer_routes) {
+            (Self::Direct, _) | (Self::Peer, false) => Ok(None),
+            (Self::Peer, true) => Err(PeerRouteError::RouteRequired),
+            (Self::Routed(routed), true) => Ok(Some(routed.clone())),
+            (Self::Routed(_), false) => Err(PeerRouteError::RoutesUnsupported),
+        }
+    }
 }
 
 /// What happens when someone votes on a poll this channel posted.
@@ -659,6 +730,8 @@ impl SendMessage {
             references: Vec::new(),
             suppress_voice: false,
             force_voice: false,
+            allowed_mentions: None,
+            routed_peer: None,
         }
     }
 
@@ -691,6 +764,8 @@ impl SendMessage {
             references: Vec::new(),
             suppress_voice: false,
             force_voice: false,
+            allowed_mentions: None,
+            routed_peer: None,
         }
     }
 
@@ -721,6 +796,23 @@ impl SendMessage {
     /// Attach files to this message.
     pub fn with_attachments(mut self, attachments: Vec<MediaAttachment>) -> Self {
         self.attachments = attachments;
+        self
+    }
+
+    /// Post this message for an external peer on the peer's route. A routed
+    /// message pings nobody unless the route sets `mention`, and then only the
+    /// routed peer; the channel renders the mention. A channel that receives a
+    /// routed peer derives the same policy itself even if this helper was not
+    /// used. `None` leaves the message unchanged.
+    pub fn with_routed_peer(mut self, routed: Option<RoutedPeer>) -> Self {
+        if let Some(routed) = &routed {
+            self.allowed_mentions = Some(if routed.mention {
+                vec![routed.peer.clone()]
+            } else {
+                Vec::new()
+            });
+        }
+        self.routed_peer = routed;
         self
     }
 }
@@ -1101,6 +1193,16 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
     /// without sending anything.
     fn supports_outbound_send(&self) -> bool {
         true
+    }
+
+    /// Whether this channel identifies external peers by user rather than by a
+    /// place to post, so reaching one needs a peer route: the channel or thread
+    /// an operator configured in `peer_groups.<name>.routes`. Default `false`:
+    /// an external peer is itself the recipient and routes do not apply. A
+    /// channel that returns `true` renders [`SendMessage::routed_peer`]'s
+    /// mention itself. Check deliveries with [`PeerAddressing::check`].
+    fn supports_peer_routes(&self) -> bool {
+        false
     }
 
     /// Self-loop guard for multi-agent runs: the bot's own handle/identity on
@@ -1809,5 +1911,49 @@ mod tests {
         assert!(
             matches!(back, ChannelApprovalResponse::DenyWithEdit { replacement } if replacement == "new content")
         );
+    }
+
+    fn routed(mention: bool) -> RoutedPeer {
+        RoutedPeer {
+            peer: "111".to_string(),
+            mention,
+        }
+    }
+
+    #[test]
+    fn peer_addressing_follows_the_channel_declaration() {
+        for supports in [false, true] {
+            assert_eq!(PeerAddressing::Direct.check(supports), Ok(None));
+        }
+        assert_eq!(PeerAddressing::Peer.check(false), Ok(None));
+        assert_eq!(
+            PeerAddressing::Peer.check(true),
+            Err(PeerRouteError::RouteRequired),
+            "a peer on a route-only channel is not a place to post"
+        );
+        assert_eq!(
+            PeerAddressing::Routed(routed(true)).check(true),
+            Ok(Some(routed(true)))
+        );
+        assert_eq!(
+            PeerAddressing::Routed(routed(false)).check(false),
+            Err(PeerRouteError::RoutesUnsupported),
+            "a route is never silently ignored"
+        );
+    }
+
+    #[test]
+    fn a_routed_message_pings_only_the_routed_peer_and_only_with_mention() {
+        let quiet = SendMessage::new("hi", "333").with_routed_peer(Some(routed(false)));
+        assert_eq!(quiet.allowed_mentions, Some(Vec::new()));
+        assert_eq!(quiet.routed_peer, Some(routed(false)));
+        assert_eq!(quiet.content, "hi", "the channel renders the mention");
+
+        let pinging = SendMessage::new("hi", "333").with_routed_peer(Some(routed(true)));
+        assert_eq!(pinging.allowed_mentions, Some(vec!["111".to_string()]));
+
+        let plain = SendMessage::new("hi", "333").with_routed_peer(None);
+        assert_eq!(plain.allowed_mentions, None);
+        assert_eq!(plain.routed_peer, None);
     }
 }

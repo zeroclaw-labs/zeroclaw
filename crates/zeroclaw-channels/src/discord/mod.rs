@@ -11,7 +11,7 @@ use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
 use zeroclaw_api::channel::{
     Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelGatePrompt, ChannelMessage,
-    GateChoiceEmphasis, SendMessage,
+    GateChoiceEmphasis, RoutedPeer, SendMessage,
 };
 use zeroclaw_api::media::{
     MarkerKind, MediaAttachment, RenderedMarker, provider_loadable_image_mime_for,
@@ -1169,6 +1169,67 @@ fn channel_passes_filter(
     false
 }
 
+/// A routed peer's ID in Discord's form: a bare snowflake, tolerating a route
+/// key written with a leading `@`.
+fn routed_user_id(routed: &RoutedPeer) -> String {
+    routed.peer.trim().trim_start_matches('@').to_string()
+}
+
+/// The users a message may ping. A routed message's policy is the channel's
+/// own invariant, not the caller's: the routed peer alone when its route sets
+/// `mention`, nobody otherwise, whatever `allowed_mentions` says. Other
+/// messages keep the caller's policy.
+fn mention_policy(message: &SendMessage) -> Option<Vec<String>> {
+    match &message.routed_peer {
+        Some(routed) if routed.mention => Some(vec![routed_user_id(routed)]),
+        Some(_) => Some(Vec::new()),
+        None => message.allowed_mentions.clone(),
+    }
+}
+
+/// `content` with the routed peer's mention in front when its route sets
+/// `mention`. Discord writes a user mention as `<@id>`; content that already
+/// starts with it is left alone. Which users may actually be pinged comes from
+/// [`mention_policy`].
+fn with_routed_mention(content: &str, routed: Option<&RoutedPeer>) -> String {
+    match routed {
+        Some(routed) if routed.mention => {
+            let mention = format!("<@{}>", routed_user_id(routed));
+            if content.trim_start().starts_with(&mention) {
+                content.to_string()
+            } else {
+                format!("{mention} {content}")
+            }
+        }
+        _ => content.to_string(),
+    }
+}
+
+/// The payload for chunk `index` of an outgoing message. The first chunk
+/// carries the message's embeds and components (attachments ride along with it
+/// at the call site); every chunk carries the sender's mention policy, so a
+/// later chunk cannot ping anyone the policy excludes.
+fn chunk_payload(
+    index: usize,
+    chunk: &str,
+    embeds: &[DiscordEmbed],
+    components: &[components::DiscordActionRow],
+    allowed_mentions: Option<&[String]>,
+) -> DiscordOutgoing {
+    let first = index == 0;
+    DiscordOutgoing {
+        content: Some(chunk.to_string()),
+        embeds: if first { embeds.to_vec() } else { Vec::new() },
+        components: if first {
+            components.to_vec()
+        } else {
+            Vec::new()
+        },
+        allowed_mentions: allowed_mentions.map(<[String]>::to_vec),
+        ..Default::default()
+    }
+}
+
 /// Resolve the recipient a Discord send targets. A non-empty per-message
 /// recipient is authoritative; when it is empty (e.g. an escalation alert that
 /// carries no per-message target), fall back to the channel's first configured
@@ -1815,6 +1876,14 @@ impl Channel for DiscordChannel {
 
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
         if let Some(interaction_id) = parse_discord_interaction_target(&message.recipient) {
+            // An interaction reply cannot carry a routed peer's mention policy,
+            // so a route pointing at one is refused instead of posted unguarded.
+            if message.routed_peer.is_some() {
+                anyhow::bail!(
+                    "a peer route's destination must be a Discord channel or thread, \
+                     not an interaction reply (id {interaction_id})"
+                );
+            }
             let pending = {
                 let guard = self.pending_interactions.lock();
                 guard.get(interaction_id).cloned()
@@ -1848,6 +1917,7 @@ impl Channel for DiscordChannel {
         }
 
         let raw_content = crate::util::strip_tool_call_tags(&message.content);
+        let raw_content = with_routed_mention(&raw_content, message.routed_peer.as_ref());
 
         // Embeds first: their `[EMBED:{json}]` payload can itself contain `[`/`]`,
         // so they must be lifted out before the media-marker scan runs on the rest.
@@ -1924,45 +1994,32 @@ impl Channel for DiscordChannel {
                     );
                 }
             };
+        let mentions = mention_policy(message);
         for (i, chunk) in chunks.iter().enumerate() {
-            let message_id = if i == 0 && (!embeds.is_empty() || !component_action_rows.is_empty())
-            {
-                let payload = DiscordOutgoing {
-                    content: Some(chunk.clone()),
-                    embeds: embeds.clone(),
-                    components: component_action_rows.clone(),
-                    ..Default::default()
-                };
-                if local_files.is_empty() {
-                    send_discord_message_payload(
-                        &client,
-                        &self.bot_token,
-                        effective_recipient,
-                        &payload,
-                    )
-                    .await?
-                } else {
-                    send_discord_message_payload_with_files(
-                        &client,
-                        &self.bot_token,
-                        effective_recipient,
-                        &payload,
-                        &local_files,
-                    )
-                    .await?
-                }
-            } else if i == 0 && !local_files.is_empty() {
+            let payload = chunk_payload(
+                i,
+                chunk,
+                &embeds,
+                &component_action_rows,
+                mentions.as_deref(),
+            );
+            let message_id = if i == 0 && !local_files.is_empty() {
                 send_discord_message_payload_with_files(
                     &client,
                     &self.bot_token,
                     effective_recipient,
-                    &DiscordOutgoing::text(chunk.clone()),
+                    &payload,
                     &local_files,
                 )
                 .await?
             } else {
-                send_discord_message_json(&client, &self.bot_token, effective_recipient, chunk)
-                    .await?
+                send_discord_message_payload(
+                    &client,
+                    &self.bot_token,
+                    effective_recipient,
+                    &payload,
+                )
+                .await?
             };
             if first_message_id.is_none() {
                 first_message_id = Some(message_id);
@@ -3489,6 +3546,13 @@ impl Channel for DiscordChannel {
         Ok(())
     }
 
+    /// Discord identifies external peers by user ID, and a user ID is not a
+    /// place a bot can post (bots cannot DM other bots), so reaching one needs
+    /// the channel or thread its peer route names.
+    fn supports_peer_routes(&self) -> bool {
+        true
+    }
+
     fn supports_draft_updates(&self) -> bool {
         matches!(
             self.stream_mode,
@@ -4136,6 +4200,7 @@ impl Channel for DiscordChannel {
             }],
             components: vec![components::action_row(buttons)],
             flags: Default::default(),
+            allowed_mentions: None,
         };
         let message_id = rest::send_discord_outgoing(
             &self.http_client(),
@@ -4231,6 +4296,152 @@ impl Channel for DiscordChannel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_routed_mention_is_rendered_by_the_channel() {
+        let routed = |mention| RoutedPeer {
+            peer: "111111111111111111".to_string(),
+            mention,
+        };
+        assert_eq!(
+            with_routed_mention("hi @everyone and <@999>", Some(&routed(true))),
+            "<@111111111111111111> hi @everyone and <@999>"
+        );
+        assert_eq!(
+            with_routed_mention("<@111111111111111111> already", Some(&routed(true))),
+            "<@111111111111111111> already",
+            "an existing leading mention is not doubled"
+        );
+        assert_eq!(with_routed_mention("hi", Some(&routed(false))), "hi");
+        assert_eq!(with_routed_mention("hi", None), "hi");
+    }
+
+    #[test]
+    fn a_routed_message_pings_only_the_routed_peer_in_discord_native_form() {
+        // Built without with_routed_peer, so the caller's policy is wrong on
+        // purpose: the channel must not trust it for a routed message.
+        let routed = |mention| SendMessage {
+            routed_peer: Some(RoutedPeer {
+                peer: " @111111111111111111 ".into(),
+                mention,
+            }),
+            allowed_mentions: Some(vec!["999".into()]),
+            ..SendMessage::new("delivered", "222222222222222222")
+        };
+        let users = |message: &SendMessage| {
+            let policy = mention_policy(message);
+            let payload: serde_json::Value = serde_json::from_str(
+                &chunk_payload(0, "x", &[], &[], policy.as_deref()).payload_json(),
+            )
+            .unwrap();
+            payload["allowed_mentions"].clone()
+        };
+
+        let mentioned = routed(true);
+        assert_eq!(
+            with_routed_mention(&mentioned.content, mentioned.routed_peer.as_ref()),
+            "<@111111111111111111> delivered"
+        );
+        assert_eq!(
+            users(&mentioned),
+            serde_json::json!({"parse": [], "users": ["111111111111111111"]}),
+            "only the routed peer, as a bare snowflake (Discord rejects '@')"
+        );
+        assert_eq!(
+            users(&routed(false)),
+            serde_json::json!({"parse": [], "users": []}),
+            "a route without mention pings nobody, whatever the text contains"
+        );
+
+        let unrouted = SendMessage {
+            allowed_mentions: Some(vec!["999".into()]),
+            ..SendMessage::new("x", "222222222222222222")
+        };
+        assert_eq!(mention_policy(&unrouted), Some(vec!["999".to_string()]));
+    }
+
+    #[tokio::test]
+    async fn a_routed_message_is_never_posted_as_an_interaction_reply() {
+        let channel = DiscordChannel::new(
+            "fake".into(),
+            vec![],
+            "discord_test_alias",
+            Arc::new(Vec::new),
+            false,
+            false,
+        );
+        let message =
+            SendMessage::new("hi", "interaction:123").with_routed_peer(Some(RoutedPeer {
+                peer: "111111111111111111".into(),
+                mention: false,
+            }));
+        let error = channel.send(&message).await.unwrap_err().to_string();
+        assert!(error.contains("not an interaction reply"), "{error}");
+    }
+
+    #[test]
+    fn discord_declares_peer_routes() {
+        assert!(Channel::supports_peer_routes(&DiscordChannel::new(
+            "fake".into(),
+            vec![],
+            "discord_test_alias",
+            Arc::new(Vec::new),
+            false,
+            false,
+        )));
+    }
+
+    #[test]
+    fn chunk_payload_carries_the_mention_policy_on_every_chunk() {
+        let embeds = vec![embed::DiscordEmbed {
+            title: Some("t".to_string()),
+            ..Default::default()
+        }];
+        let users = vec!["111111111111111111".to_string()];
+        let first = chunk_payload(0, "a", &embeds, &[], Some(users.as_slice())).to_rest_json();
+        let later = chunk_payload(1, "b", &embeds, &[], Some(users.as_slice())).to_rest_json();
+        let policy = serde_json::json!({"parse": [], "users": ["111111111111111111"]});
+        assert_eq!(first["allowed_mentions"], policy);
+        assert_eq!(
+            later["allowed_mentions"], policy,
+            "later chunks keep the policy"
+        );
+        assert!(
+            first.get("embeds").is_some(),
+            "the first chunk carries the embeds"
+        );
+        assert!(later.get("embeds").is_none(), "embeds are sent once");
+        // The multipart form used with attachments carries the same payload.
+        let multipart: serde_json::Value =
+            serde_json::from_str(&chunk_payload(0, "a", &[], &[], Some(&[][..])).payload_json())
+                .unwrap();
+        assert_eq!(
+            multipart["allowed_mentions"],
+            serde_json::json!({"parse": [], "users": []})
+        );
+    }
+
+    #[test]
+    fn chunk_payload_without_a_policy_keeps_the_legacy_shape() {
+        // Plain chunks used to go out as `DiscordOutgoing::text`; the shared
+        // payload builder must produce the same request body for them.
+        let embeds = vec![embed::DiscordEmbed {
+            title: Some("t".to_string()),
+            ..Default::default()
+        }];
+        assert_eq!(
+            chunk_payload(0, "a", &[], &[], None).to_rest_json(),
+            DiscordOutgoing::text("a".to_string()).to_rest_json()
+        );
+        assert_eq!(
+            chunk_payload(1, "b", &embeds, &[], None).to_rest_json(),
+            DiscordOutgoing::text("b".to_string()).to_rest_json()
+        );
+        assert_eq!(
+            chunk_payload(1, "b", &[], &[], None).to_rest_json(),
+            serde_json::json!({"content": "b"})
+        );
+    }
 
     #[test]
     fn effective_recipient_prefers_per_message_target() {
@@ -4911,6 +5122,8 @@ mod tests {
             in_reply_to: None,
             references: Vec::new(),
             force_voice: false,
+            allowed_mentions: None,
+            routed_peer: None,
             suppress_voice: false,
         };
         let err = ch.send(&msg).await.unwrap_err();
