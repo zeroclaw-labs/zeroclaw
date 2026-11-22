@@ -41,7 +41,7 @@ function underPath(pathname: string, prefix: string): boolean {
   return pathname === prefix || pathname.startsWith(`${prefix}/`);
 }
 
-const PAIRED_BROWSER_PATHS = ['/acp-console'];
+const PAIRED_BROWSER_PATHS = ['/acp-console', '/code'];
 const CONFIG_PATHS = ['/config', '/setup'];
 
 /** Chat: the agent list and an agent's chat, not its workspace files. */
@@ -52,7 +52,7 @@ function isChatPath(pathname: string): boolean {
 }
 
 export function pathAccess(rawPathname: string, access: NavAccess): PathAccess {
-  const pathname = rawPathname.toLowerCase().replace(/\/+$/, '') || '/';
+  const pathname = rawPathname.replace(/[?#].*$/, '').toLowerCase().replace(/\/+$/, '') || '/';
   if (PAIRED_BROWSER_PATHS.some((p) => underPath(pathname, p))) {
     return access.pairedBrowserPages ? 'allowed' : 'needs-pairing';
   }

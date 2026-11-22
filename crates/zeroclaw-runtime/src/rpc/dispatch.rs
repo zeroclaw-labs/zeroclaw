@@ -7184,6 +7184,12 @@ impl RpcDispatcher {
             }
             Ok(guard)
         };
+        let reasoning_effort = self
+            .ctx
+            .sessions
+            .get_overrides(sid)
+            .await
+            .and_then(|overrides| overrides.reasoning_effort);
         let turn = crate::rpc::turn::execute_turn_prepared(
             agent,
             prompt.clone(),
@@ -7199,6 +7205,7 @@ impl RpcDispatcher {
             self.connection_activity.clone(),
             Some(steering_rx),
             None,
+            reasoning_effort,
             (prepare, move |event| {
                 let rpc = rpc.clone();
                 let sid = sid_owned.clone();
@@ -7715,12 +7722,97 @@ impl RpcDispatcher {
         }
     }
 
+    fn require_code_settings_admin(
+        &self,
+        lease: &crate::rpc::auth::AuthorityLease<'_>,
+    ) -> Result<(), JsonRpcError> {
+        if self
+            .auth
+            .as_ref()
+            .is_some_and(|auth| lease.current_grants(auth).is_ok_and(|grants| grants.admin))
+        {
+            return Ok(());
+        }
+        Err(rpc_err(
+            FORBIDDEN,
+            "Code session settings require operator access",
+        ))
+    }
+
+    async fn code_session_settings(
+        &self,
+        id: &str,
+    ) -> Result<(String, SessionOverrides), JsonRpcError> {
+        self.ctx
+            .sessions
+            .with_session_effect(id, |session| {
+                session
+                    .filter(|session| {
+                        session.interaction_surface
+                            == Some(crate::agent::prompt::InteractionSurface::ZerocodeCode)
+                    })
+                    .map(|session| (session.agent_alias.clone(), session.overrides.clone()))
+                    .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Code session not found"))
+            })
+            .await
+    }
+
+    async fn validate_code_settings(
+        &self,
+        id: &str,
+        patch: &SessionOverrides,
+    ) -> Result<(), JsonRpcError> {
+        let (alias, current) = self.code_session_settings(id).await?;
+        let config = self.ctx.config.read();
+        let Some((provider, model)) = code_model(&config, &alias, &current) else {
+            return Err(rpc_err(
+                INVALID_PARAMS,
+                "Code session has no configured model",
+            ));
+        };
+        let selected_provider = patch.model_provider.as_deref().unwrap_or(&provider);
+        let selected_model = patch.model.as_deref().unwrap_or(&model);
+        if (patch.model_provider.is_some() || patch.model.is_some())
+            && (patch.model.is_none()
+                || !code_model_choices(&config).any(|(provider, model)| {
+                    provider == selected_provider && model == selected_model
+                }))
+        {
+            return Err(rpc_err(
+                INVALID_PARAMS,
+                "Select a configured model for Code",
+            ));
+        }
+        if patch.temperature.is_some() {
+            return Err(rpc_err(
+                INVALID_PARAMS,
+                "Temperature is unavailable in Code settings",
+            ));
+        }
+        if let Some(effort) = patch.reasoning_effort.as_deref()
+            && effort != "default"
+            && !code_reasoning_efforts(&config, selected_provider, selected_model).contains(&effort)
+        {
+            return Err(rpc_err(
+                INVALID_PARAMS,
+                "Reasoning effort is unavailable for the selected model",
+            ));
+        }
+        Ok(())
+    }
+
     async fn handle_session_configure(&self, params: &Value) -> RpcResult {
         let req: SessionConfigureParams = parse_params(params)?;
         let authorized = self
             .authorize_session_owner(&req.session_id, Method::SessionConfigure)
             .await?;
         validate_session_configure_overrides(&req.overrides)?;
+        if req.overrides.reasoning_effort.is_some() && !req.code_settings {
+            return Err(rpc_err(
+                INVALID_PARAMS,
+                "Reasoning effort requires Code session settings",
+            ));
+        }
 
         // Wait for a provisional binding to be confirmed, for the same reason
         // `session/prompt` does: a session rehydrated during a route-affecting
@@ -7816,6 +7908,17 @@ impl RpcDispatcher {
         )
         .await?;
 
+        if req.code_settings {
+            self.require_code_settings_admin(&self.ctx.auth.hold_authority())?;
+            if self.ctx.sessions.has_running_work(&req.session_id).await {
+                return Err(rpc_err(
+                    SESSION_BUSY,
+                    "Wait for the current Code turn to finish",
+                ));
+            }
+            self.validate_code_settings(&req.session_id, &req.overrides)
+                .await?;
+        }
         let merged = self
             .ctx
             .sessions
@@ -7827,7 +7930,11 @@ impl RpcDispatcher {
         // which requires Config — held here, not in the session store. Resolve
         // the provider from the prospective merged override or configured
         // agent, build the box, and only then commit the override.
-        let built_model_provider = if merged.model_provider.is_some() || merged.model.is_some() {
+        let selecting_model =
+            req.overrides.model_provider.is_some() || req.overrides.model.is_some();
+        let built_model_provider = if selecting_model
+            || (!req.code_settings && (merged.model_provider.is_some() || merged.model.is_some()))
+        {
             let agent_alias = self
                 .ctx
                 .sessions
@@ -7915,10 +8022,14 @@ impl RpcDispatcher {
                     {
                         return Err(self.stale_session_incarnation_error());
                     }
-                    self.session_effect_lease(
+                    let lease = self.session_effect_lease(
                         Method::SessionConfigure,
                         session.owner_principal_id.as_deref(),
-                    )
+                    )?;
+                    if req.code_settings {
+                        self.require_code_settings_admin(&lease)?;
+                    }
+                    Ok(lease)
                 },
             )
             .await?
@@ -8792,7 +8903,7 @@ impl RpcDispatcher {
 
         let scope = self.scoped_principal_id();
         let visible_ids = self.owner_visible_session_ids().await;
-        let sessions: Vec<SessionEntry> = summaries
+        let sessions: Vec<(SessionEntry, Option<String>)> = summaries
             .into_iter()
             .filter_map(|s| {
                 if scope
@@ -8804,24 +8915,50 @@ impl RpcDispatcher {
                 {
                     return None;
                 }
-                Some(SessionEntry {
-                    session_id: s.session_uuid.clone(),
-                    // ACP sessions are keyed by their UUID directly — no `rpc_`/`gw_`
-                    // prefix exists in this store, so session_id == session_key.
-                    session_key: s.session_uuid,
-                    created_at: s.created_at.to_rfc3339(),
-                    last_activity: s.last_activity.to_rfc3339(),
-                    message_count: s.message_count,
-                    agent_alias: Some(s.agent_alias),
-                    channel_id: None,
-                    // ACP sessions don't carry a user-set display name today; the
-                    // picker falls back to `session_id` when this is None.
-                    name: None,
-                })
+                Some((
+                    SessionEntry {
+                        session_id: s.session_uuid.clone(),
+                        // ACP sessions are keyed by their UUID directly — no `rpc_`/`gw_`
+                        // prefix exists in this store, so session_id == session_key.
+                        session_key: s.session_uuid,
+                        created_at: s.created_at.to_rfc3339(),
+                        last_activity: s.last_activity.to_rfc3339(),
+                        message_count: s.message_count,
+                        agent_alias: Some(s.agent_alias),
+                        channel_id: None,
+                        name: s.first_prompt.and_then(|prompt| {
+                            let prompt =
+                                crate::agent::prompt::strip_runtime_user_timestamp_prefix(&prompt);
+                            let title = prompt.lines().find(|line| !line.trim().is_empty())?.trim();
+                            Some(title.chars().take(80).collect())
+                        }),
+                    },
+                    s.interaction_surface,
+                ))
             })
             .collect();
 
-        to_result(SessionListResult { sessions })
+        #[derive(Serialize)]
+        struct ActivityEntry {
+            #[serde(flatten)]
+            session: SessionEntry,
+            state: &'static str,
+            interaction_surface: Option<String>,
+        }
+        let mut activity = Vec::with_capacity(sessions.len());
+        for (session, interaction_surface) in sessions {
+            let running = self
+                .ctx
+                .sessions
+                .has_running_work(&session.session_id)
+                .await;
+            activity.push(ActivityEntry {
+                session,
+                interaction_surface,
+                state: if running { "running" } else { "idle" },
+            });
+        }
+        Ok(serde_json::json!({ "sessions": activity }))
     }
 
     async fn handle_session_messages(&self, params: &Value) -> RpcResult {
@@ -9190,27 +9327,30 @@ impl RpcDispatcher {
         if self.ctx.sessions.get_agent(&req.session_id).await.is_some() {
             let turn_generation = self.ctx.sessions.inflight_turn_generation(&req.session_id);
             let plan = self.ctx.sessions.get_plan(&req.session_id).await;
-            let queued = self
-                .ctx
-                .sessions
-                .session_queue
-                .queue_depth(&req.session_id)
-                .await
-                > 0;
+            let running = self.ctx.sessions.has_running_work(&req.session_id).await;
+            let settings = if params["include_code_settings"] == true {
+                let (alias, overrides) = self.code_session_settings(&req.session_id).await?;
+                let config = self.ctx.config.read();
+                let can_change = self
+                    .require_code_settings_admin(&self.ctx.auth.hold_authority())
+                    .is_ok();
+                code_settings(&config, &alias, &overrides, can_change)
+            } else {
+                None
+            };
             self.ensure_session_incarnation(&req.session_id, expected_generation)
                 .await?;
-            return to_result(SessionStateResult {
+            let mut result = to_result(SessionStateResult {
                 session_id: req.session_id,
-                state: if turn_generation.is_some() || queued {
-                    "running"
-                } else {
-                    "idle"
-                }
-                .to_string(),
+                state: if running { "running" } else { "idle" }.to_string(),
                 turn_id: turn_generation.map(|generation| generation.to_string()),
                 turn_started_at: None,
                 plan,
-            });
+            })?;
+            if let Some(settings) = settings {
+                result["code_settings"] = settings;
+            }
+            return Ok(result);
         }
 
         // Gateway/legacy sessions that are not live in the RPC session store
@@ -14025,6 +14165,88 @@ fn still_authorized(
 
 fn parse_params<T: DeserializeOwned>(params: &Value) -> Result<T, JsonRpcError> {
     serde_json::from_value(params.clone()).map_err(|e| rpc_err(INVALID_PARAMS, e.to_string()))
+}
+
+fn code_model(
+    config: &Config,
+    alias: &str,
+    overrides: &SessionOverrides,
+) -> Option<(String, String)> {
+    let agent = config.resolved_agent_config(alias)?;
+    let provider = overrides
+        .model_provider
+        .as_deref()
+        .unwrap_or(&agent.model_provider);
+    let (_, _, profile) = config.providers.models.find_by_name(provider)?;
+    let model = overrides.model.as_deref().or(profile.model.as_deref())?;
+    Some((provider.to_owned(), model.to_owned()))
+}
+
+fn code_model_choices(config: &Config) -> impl Iterator<Item = (String, &str)> {
+    let configured =
+        config
+            .providers
+            .models
+            .iter_entries()
+            .filter_map(|(family, alias, profile)| {
+                let model = profile.model.as_deref().filter(|model| !model.is_empty())?;
+                Some((format!("{family}.{alias}"), model))
+            });
+    configured.chain(config.model_routes.iter().filter_map(|route| {
+        // Alternate models can share a configured provider. Routes with
+        // separate credentials are resolved by the route itself.
+        (route.api_key.is_none()
+            && !route.model.is_empty()
+            && config
+                .providers
+                .models
+                .find_by_name(&route.model_provider)
+                .is_some())
+        .then_some((route.model_provider.clone(), route.model.as_str()))
+    }))
+}
+
+fn code_reasoning_efforts(config: &Config, provider: &str, model: &str) -> &'static [&'static str] {
+    if let Some((family, _, profile)) = config.providers.models.find_by_name(provider)
+        && family == "anthropic"
+        && profile.kind.as_deref().unwrap_or(family) == "anthropic"
+    {
+        zeroclaw_providers::anthropic::reasoning_efforts(model)
+    } else {
+        &[]
+    }
+}
+
+fn code_settings(
+    config: &Config,
+    alias: &str,
+    overrides: &SessionOverrides,
+    can_change: bool,
+) -> Option<Value> {
+    let (provider, model) = code_model(config, alias, overrides)?;
+    let options: std::collections::BTreeSet<_> = if can_change {
+        code_model_choices(config).collect()
+    } else {
+        Default::default()
+    };
+    let choices: Vec<_> = options
+        .into_iter()
+        .map(|(provider, model)| {
+            serde_json::json!({
+                "model_provider": provider,
+                "model": model,
+                "reasoning_options": code_reasoning_efforts(config, &provider, model),
+            })
+        })
+        .collect();
+    Some(serde_json::json!({
+        "model": model,
+        "model_provider": provider,
+        "reasoning_effort": overrides.reasoning_effort,
+        "reasoning_options": code_reasoning_efforts(config, &provider, &model),
+        "models": choices,
+        "can_change": can_change,
+    }))
 }
 
 fn validate_session_configure_overrides(overrides: &SessionOverrides) -> Result<(), JsonRpcError> {

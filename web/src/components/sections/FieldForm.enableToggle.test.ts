@@ -122,16 +122,16 @@ for (const concurrentSave of [false, true]) {
       const { ConfigDraftProvider } = await jiti.import<
         typeof import("../../lib/draftStore.tsx")
       >("../../lib/draftStore.tsx");
+      const { MemoryRouter } = await import("react-router-dom");
       root = createRoot(container as unknown as HTMLElement);
       await act(async () => {
         root?.render(
           React.createElement(
             ConfigDraftProvider,
             null,
-            React.createElement(FieldForm, {
-              prefix: "browser",
-              title: "Browser",
-            }),
+            React.createElement(MemoryRouter, null,
+              React.createElement(FieldForm, { prefix: "browser", title: "Browser" }),
+            ),
           ),
         );
         await flushEffects();

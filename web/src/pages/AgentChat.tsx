@@ -1,8 +1,8 @@
 import { displayMessageText } from '@/lib/chatMessageText';
 import BrowserVoiceControls from '@/components/BrowserVoiceControls';
 import { memo, useState, useEffect, useRef, useCallback, useMemo, useId } from 'react';
-import { Link, Navigate, useParams } from 'react-router-dom';
-import { Send, Square, Bot, User, AlertCircle, Copy, Check, X, Trash2, Minimize2, Maximize2, ChevronDown, Wrench, Brain, BarChart2, FolderOpen, ImagePlus, Loader2 } from 'lucide-react';
+import { Link, Navigate, useParams, useSearchParams } from 'react-router-dom';
+import { Send, Square, Bot, User, AlertCircle, Copy, Check, X, Trash2, Minimize2, Maximize2, ChevronDown, Wrench, Brain, BarChart2, FolderOpen, ImagePlus, Loader2, Settings } from 'lucide-react';
 import ReactMarkdown, { type Components } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { useAgent, type ChatMessage } from '@/contexts/AgentContext';
@@ -24,6 +24,8 @@ import ChatWorkspace from '@/pages/ChatWorkspace';
 
 import ToolCallCard from '@/components/ToolCallCard';
 import ApprovalBanner from '@/components/ApprovalBanner';
+import WorkspaceAttention from '@/components/layout/WorkspaceAttention';
+import { useWorkspaceSettings } from '@/components/WorkspaceSettings';
 import { resolveContextBarState } from '@/lib/contextBar';
 import SessionPicker from '@/components/SessionPicker';
 
@@ -81,6 +83,7 @@ function ContextBar({ contextMaxTokens, contextModelWindow, contextInputTokens, 
  */
 export default function AgentChat() {
   const { alias } = useParams<{ alias: string }>();
+  const [params] = useSearchParams();
   const access = useNavAccess();
   if (!alias) {
     return <Navigate to="/agents" replace />;
@@ -88,7 +91,7 @@ export default function AgentChat() {
   if (!access.operatorPages) {
     return <ScopedChatWorkspace alias={alias} />;
   }
-  return <ChatWorkspace initialAlias={alias} />;
+  return <ChatWorkspace initialAlias={alias} initialSessionId={params.get('session') ?? undefined} />;
 }
 
 /**
@@ -168,6 +171,7 @@ export function AgentChatInner({
   agentAlias: string;
   onStatus?: (s: AgentChatStatus) => void;
 }) {
+  const openSettings = useWorkspaceSettings();
   const {
     messages,
     sendMessage,
@@ -684,6 +688,7 @@ export function AgentChatInner({
        with a single ancestor. Static UI chrome here localizes through
        t() i18n, so losing browser translation on it is intentional. */
     <div
+      data-workspace-conversation
       translate="no"
       className="notranslate relative flex flex-col h-full min-h-0"
       onDragEnter={handleDragEnter}
@@ -734,6 +739,7 @@ export function AgentChatInner({
         </div>
 
         <div className="flex items-center justify-between gap-2 min-w-0 w-full @xl/chat-header:w-auto ms-auto">
+          {operator && <button type="button" onClick={() => openSettings(`/config/agents/${encodeURIComponent(agentAlias)}`)} aria-label={`${t('workspace.settings')}: ${agentAlias}`} className="rounded-md p-2 text-pc-text-muted hover:bg-pc-elevated"><Settings className="h-4 w-4" /></button>}
           {/* Nothing to list or reopen when each socket is its own conversation. */}
           {!conversationPerSocket && <SessionPicker agentAlias={agentAlias} />}
 
@@ -859,6 +865,10 @@ export function AgentChatInner({
 
       {/* Messages area. */}
       <div
+        data-workspace-transcript
+        tabIndex={-1}
+        role="region"
+        aria-label={t('workspace.keyboard_transcript')}
         className={`flex-1 overflow-y-auto p-4 ${compact ? 'space-y-1.5' : 'space-y-4'}`}
       >
         {messages.length === 0 && (
@@ -930,7 +940,10 @@ export function AgentChatInner({
 
       {/* Tool approval banner — supervised-mode consent prompt (#6522). */}
       {pendingApproval && (
-        <ApprovalBanner pending={pendingApproval} onRespond={respondToApproval} />
+        <>
+          <WorkspaceAttention to={`/agent/${encodeURIComponent(agentAlias)}?session=${encodeURIComponent(sessionId)}`} label={agentAlias} />
+          <ApprovalBanner pending={pendingApproval} onRespond={respondToApproval} />
+        </>
       )}
 
       {/* Input area */}
@@ -997,6 +1010,7 @@ export function AgentChatInner({
             </>
           )}
           <textarea
+            data-workspace-composer
             ref={inputRef}
             rows={1}
             value={input}

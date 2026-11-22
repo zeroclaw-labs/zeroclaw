@@ -8,9 +8,9 @@ import { RelayNotice } from '@/components/auth/RelayNotice';
  * Above the column it would make the page taller than the window, and any
  * scroll, such as chat jumping to its latest message, would carry it away.
  */
-export function MainColumn({ viaRelay, children }: { viaRelay: boolean; children: ReactNode }) {
+export function MainColumn({ viaRelay, showRail = true, children }: { viaRelay: boolean; showRail?: boolean; children: ReactNode }) {
   return (
-    <div className="flex flex-col flex-1 min-w-0 h-screen md:ml-14 ml-0">
+    <div className={`flex flex-col flex-1 min-w-0 h-screen ml-0 ${showRail ? "md:ml-14" : ""}`}>
       {viaRelay && <RelayNotice bar />}
       {children}
     </div>

@@ -113,7 +113,7 @@ export class AcpWebSocketClient {
   private nextId = 1;
   private pending = new Map<JsonRpcId, PendingRequest>();
 
-  constructor(private readonly handlers: AcpClientHandlers = {}) {}
+  constructor(private readonly handlers: AcpClientHandlers = {}, private readonly endpoint: '/acp' | '/ws/code' = '/acp') {}
 
   connect(): void {
     if (this.ws?.readyState === WebSocket.OPEN || this.ws?.readyState === WebSocket.CONNECTING) {
@@ -121,8 +121,9 @@ export class AcpWebSocketClient {
     }
 
     const token = getToken();
-    const url = `${acpWebSocketBaseUrl()}${basePath}/acp`;
-    const protocols = token ? [ACP_PROTOCOL, `bearer.${token}`] : [ACP_PROTOCOL];
+    const url = `${acpWebSocketBaseUrl()}${basePath}${this.endpoint}`;
+    const protocol = this.endpoint === '/ws/code' ? 'zeroclaw.code.v1' : ACP_PROTOCOL;
+    const protocols = token ? [protocol, `bearer.${token}`] : [protocol];
 
     this.ws = new WebSocket(url, protocols);
     this.ws.onopen = () => this.handlers.onOpen?.();

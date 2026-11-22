@@ -118,6 +118,7 @@ where
         connection_activity,
         steering_rx,
         admission,
+        None,
         (|guard| async { Ok(guard) }, on_event),
     )
     .await
@@ -132,6 +133,7 @@ pub async fn execute_turn_prepared<F, Fut, P, Prep>(
     connection_activity: Option<crate::rpc::ConnectionActivity>,
     steering_rx: Option<mpsc::Receiver<crate::agent::SteeringInput>>,
     admission: Option<TurnAdmission>,
+    reasoning_effort: Option<String>,
     callbacks: (P, F),
 ) -> Result<TurnOutcome, TurnError>
 where
@@ -167,7 +169,7 @@ where
             });
         }
         let sk = attribution.session_key.clone();
-        crate::agent::loop_::scope_session_key(attribution.session_key, async move {
+        let turn = crate::agent::loop_::scope_session_key(attribution.session_key, async move {
             use ::zeroclaw_log::Instrument as _;
             let span = ::zeroclaw_log::info_span!(
                 target: "zeroclaw_log_internal_scope",
@@ -191,8 +193,10 @@ where
                         .instrument(span),
                 )
                 .await
-        })
-        .await
+        });
+        zeroclaw_providers::anthropic::TURN_REASONING_EFFORT
+            .scope(reasoning_effort, turn)
+            .await
     });
 
     let mut turn_handle_guard = TurnHandleGuard(Some(turn_handle));

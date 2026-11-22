@@ -1,5 +1,5 @@
 import { createContext, useState, useEffect, useCallback, type ReactNode } from 'react';
-import { colorThemeMap, DEFAULT_DARK_THEME, DEFAULT_LIGHT_THEME, type ColorThemeId } from './colorThemes';
+import { colorThemeMap, DEFAULT_DARK_THEME, DEFAULT_LIGHT_THEME, themeForScheme, type ColorThemeId } from './colorThemes';
 
 // ── Types (was ThemeContextDef.ts) ───────────────────────────────────────────
 
@@ -43,7 +43,7 @@ export interface ThemeContextValue {
 export const ThemeContext = createContext<ThemeContextValue>({
   theme: 'dark',
   accent: 'cyan',
-  colorTheme: 'operator-dark',
+  colorTheme: DEFAULT_DARK_THEME,
   uiFont: 'system',
   monoFont: 'jetbrains',
   uiFontSize: 15,
@@ -114,7 +114,7 @@ interface StoredTheme {
 const DEFAULTS: StoredTheme = {
   theme: 'dark',
   accent: 'cyan',
-  colorTheme: 'operator-dark',
+  colorTheme: DEFAULT_DARK_THEME,
   uiFont: 'system',
   monoFont: 'jetbrains',
   uiFontSize: 15,
@@ -206,7 +206,7 @@ function resolveColorTheme(mode: ThemeMode, colorTheme: ColorThemeId): ColorThem
     if (ct && ((preferLight && ct.scheme === 'light') || (!preferLight && ct.scheme === 'dark'))) {
       return colorTheme;
     }
-    return preferLight ? DEFAULT_LIGHT_THEME : DEFAULT_DARK_THEME;
+    return themeForScheme(colorTheme, preferLight ? 'light' : 'dark');
   }
   if (mode === 'oled') return 'oled-black';
   return colorTheme;
@@ -246,9 +246,20 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
     const resolvedId = resolveColorTheme(s.theme, s.colorTheme);
     const ct = colorThemeMap[resolvedId];
     const themeVars = ct?.vars ?? colorThemeMap[DEFAULT_DARK_THEME].vars;
-    applyVars({
+    // Calm uses its own accent; other palettes keep the original accent override behavior.
+    const paletteAccent = s.accent === 'cyan' && ct?.family === 'calm';
+    const colors = {
       ...themeVars,
-      ...accents[s.accent],
+      ...(paletteAccent ? {} : accents[s.accent]),
+    };
+    const rgb = colors['--pc-accent']!.slice(1).match(/.{2}/g)!.map((part) => {
+      const channel = parseInt(part, 16) / 255;
+      return channel <= 0.04045 ? channel / 12.92 : ((channel + 0.055) / 1.055) ** 2.4;
+    });
+    const luminance = rgb[0]! * 0.2126 + rgb[1]! * 0.7152 + rgb[2]! * 0.0722;
+    applyVars({
+      ...colors,
+      '--pc-accent-foreground': ct?.family === 'calm' && luminance > 0.179 ? '#000000' : '#ffffff',
       ...fontVars(s.uiFont, s.monoFont, s.uiFontSize, s.monoFontSize),
     });
   }, []);
@@ -261,8 +272,7 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
       // System mode should preserve the user's current palette and defer scheme resolution to OS preference.
       targetScheme === null || (currentCt && currentCt.scheme === targetScheme) ? colorTheme : (
         t === 'oled' ? 'oled-black' :
-        t === 'light' ? DEFAULT_LIGHT_THEME :
-        DEFAULT_DARK_THEME
+        themeForScheme(colorTheme, t === 'light' ? 'light' : 'dark')
       );
     setThemeState(t);
     setColorThemeState(newColorTheme);

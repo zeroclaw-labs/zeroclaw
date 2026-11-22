@@ -35,6 +35,7 @@ pub mod api_webhook;
 pub mod auth_rate_limit;
 pub mod canvas;
 mod chat_core;
+mod code;
 pub mod core_rpc;
 pub mod dashboard_core;
 pub mod dashboard_session;
@@ -2752,6 +2753,7 @@ pub async fn run_gateway_with_plugin_webhooks(
         )
         .route("/api/health", get(api::handle_api_health))
         .route("/api/tuis", get(api::handle_api_tuis))
+        .route("/api/workspace", get(api::handle_api_workspace))
         .route("/api/sessions", get(dashboard_core::sessions_list))
         .route("/api/sessions/running", get(api::handle_api_sessions_running))
         .route(
@@ -2844,6 +2846,7 @@ pub async fn run_gateway_with_plugin_webhooks(
         .route("/api/events/history", get(sse::handle_events_history))
         // ── ACP client bridge ──
         .route("/acp", get(acp::handle_ws_acp))
+        .route("/ws/code", get(code::handle_ws_code))
         // ── WebSocket agent chat ──
         .route("/ws/chat", get(ws::handle_ws_chat))
         // ── WebSocket SOP runs feed ──

@@ -76,6 +76,7 @@
   --pc-accent-dim: rgba(34, 211, 238, 0.3);
   --pc-accent-glow: rgba(34, 211, 238, 0.1);
   --pc-accent-rgb: 34, 211, 238;
+  --pc-accent-foreground: #ffffff;
 
   /* Link text — derived from the per-theme accent so it tracks every palette. */
   --pc-text-link: var(--pc-accent-light);
@@ -139,6 +140,23 @@ body {
 
 :focus:not(:focus-visible) {
   outline: none;
+}
+
+[data-workspace-mode="transcript"] [data-workspace-transcript]:focus-within {
+  outline: 1px solid color-mix(in srgb, var(--pc-accent) 65%, transparent);
+  outline-offset: -1px;
+  box-shadow: inset 0 0 12px color-mix(in srgb, var(--pc-accent) 14%, transparent);
+}
+
+[data-workspace-mode="workspace"] [data-workspace-window]::after {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: 45;
+  pointer-events: none;
+  outline: 2px solid color-mix(in srgb, var(--pc-accent) 50%, transparent);
+  outline-offset: -2px;
+  box-shadow: inset 0 0 16px color-mix(in srgb, var(--pc-accent) 10%, transparent);
 }
 
 /* Scrollbar */
@@ -412,15 +430,15 @@ code, kbd, pre {
 /* Primary action (pill) */
 .btn-primary {
   background: var(--pc-accent);
-  color: white;
-  border-radius: 1rem;
+  color: var(--pc-accent-foreground);
+  border-radius: 0.625rem;
   font-weight: 600;
   font-size: 0.875rem;
   padding: 0.5rem 1.25rem;
   border: none;
   cursor: pointer;
   transition: all 0.2s ease;
-  box-shadow: 0 4px 12px rgba(var(--pc-accent-rgb), 0.2);
+  box-shadow: var(--pc-shadow-sm);
 }
 
 .btn-primary:hover:not(:disabled) {

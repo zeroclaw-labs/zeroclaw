@@ -8,6 +8,7 @@ import {
   type ReactNode,
 } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
+import { LayoutPreferenceProvider } from "./contexts/LayoutPreference";
 import { ThemeProvider } from "./contexts/ThemeContext";
 
 import { loadLocale, saveLocale } from "./contexts/ThemeContext";
@@ -239,7 +240,7 @@ export default function App() {
   return (
     <AuthProvider>
       <ThemeProvider>
-        <AppContent />
+        <LayoutPreferenceProvider><AppContent /></LayoutPreferenceProvider>
       </ThemeProvider>
     </AuthProvider>
   );

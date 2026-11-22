@@ -22,10 +22,12 @@ export const Canvas = lazyPage(() => import('../pages/Canvas'));
 export const AcpConsole = lazyPage(() => import('../pages/AcpConsole'));
 export const Quickstart = lazyPage(() => import('../pages/quickstart/Quickstart'));
 export const Skills = lazyPage(() => import('../pages/Skills'));
-export const SopsList = lazyPage(() => import('../pages/Sops').then((m) => ({ default: m.SopsList })));
-export const SopView = lazyPage(() => import('../pages/Sops').then((m) => ({ default: m.SopView })));
-export const SopEditor = lazyPage(() =>
-  import('../pages/Sops').then((m) => ({ default: m.SopEditor })),
-);
+export const SopWorkspace = lazyPage(() => import('../pages/SopWorkspace'));
 export const Runs = lazyPage(() => import('../pages/Runs'));
 export const RunDetail = lazyPage(() => import('../pages/RunDetail'));
+
+export const Home = lazyPage(() => import('../pages/Home'));
+export const Sessions = lazyPage(() => import('../pages/Sessions'));
+export const Code = lazyPage(() => import('../pages/Code'));
+
+export const Admin = lazyPage(() => import('../pages/Admin'));

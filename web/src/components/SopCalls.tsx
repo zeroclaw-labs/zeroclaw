@@ -45,7 +45,7 @@ function stringify(value: unknown): string {
 
 /// JSON textarea that keeps invalid intermediate text local and only
 /// propagates parseable values. The parse error stays visible until fixed.
-function JsonField({
+export function JsonField({
   label,
   value,
   onChange,

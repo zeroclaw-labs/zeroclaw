@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useMemo } from "react";
+import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import {
   Clock,
@@ -40,6 +40,8 @@ import {
   getStatus,
   getCost,
   getSessions,
+  getWorkspaceAvailability,
+  apiFetch,
   getChannels,
   getSessionMessages,
   deleteSession,
@@ -52,6 +54,8 @@ import {
   listProps,
 } from "@/lib/api";
 import { resolveModelToProviderType } from "@/lib/configuredModels";
+import { resumeSessionTarget } from '@/lib/sessionNavigation';
+import { useFocusTrap } from '@/hooks/useFocusTrap';
 import DoctorFixModal from "@/components/DoctorFixModal";
 
 type CostWindow = "today" | "7d" | "30d" | "month" | "all";
@@ -943,7 +947,7 @@ function isSessionSort(v: string): v is SessionSort {
   return SESSION_SORT_OPTIONS.some((o) => o.value === v);
 }
 
-function SessionsTab() {
+export function SessionsTab() {
   const [sessions, setSessions] = useState<Session[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -975,6 +979,8 @@ function SessionsTab() {
     messages: SessionMessageRow[] | null;
     error: string | null;
   } | null>(null);
+  const inspectRef = useRef<HTMLDivElement>(null);
+  const [resumeTarget, setResumeTarget] = useState<string | null>(null);
   const [inspectNewestFirst, setInspectNewestFirst] = useState(true);
   const [deleting, setDeleting] = useState<string | null>(null);
   // The session queued for deletion; non-null opens the confirm dialog.
@@ -988,6 +994,7 @@ function SessionsTab() {
   const loadSessions = useCallback(() => {
     getSessions()
       .then((data) => {
+        setError(null);
         setSessions(data);
         setLoading(false);
       })
@@ -1058,24 +1065,44 @@ function SessionsTab() {
     return sorted;
   }, [sessions, agentFilter, channelFilter, searchQuery, sortBy]);
 
-  const openInspect = (session: Session) => {
+  const selectedSession = searchParams.get('session');
+  const openInspect = (session: Session) => setSearchParams((previous) => {
+    const next = new URLSearchParams(previous);
+    next.set('session', session.session_key);
+    return next;
+  });
+  const closeInspect = () => setSearchParams((previous) => {
+    const next = new URLSearchParams(previous);
+    next.delete('session');
+    return next;
+  });
+  useFocusTrap(inspectRef, { enabled: inspect !== null, onClose: closeInspect, preventDefaultOnEscape: true, filterVisible: true });
+  useEffect(() => {
+    if (inspect) inspectRef.current?.focus();
+  }, [inspect?.session.session_key]);
+  useEffect(() => {
+    const session = sessions.find((item) => item.session_key === selectedSession);
+    setResumeTarget(null);
+    if (!session || !resumeSessionTarget(session)) return;
+    let cancelled = false;
+    void Promise.all([
+      apiFetch<{ state: string }>(`/api/sessions/${encodeURIComponent(session.session_key)}/state`),
+      getWorkspaceAvailability(),
+    ]).then(([state, availability]) => {
+      if (!cancelled && state.state !== 'running' && availability.agents.includes(session.agent_alias ?? '')) setResumeTarget(resumeSessionTarget(session));
+    }).catch(() => { /* Unknown activity never enables a potentially conflicting reconnect. */ });
+    return () => { cancelled = true; };
+  }, [selectedSession, sessions]);
+  useEffect(() => {
+    const session = sessions.find((item) => item.session_key === selectedSession);
+    if (!session) { setInspect(null); return; }
+    let cancelled = false;
     setInspect({ session, messages: null, error: null });
     getSessionMessages(session.session_key)
-      .then((resp) =>
-        setInspect((curr) =>
-          curr && curr.session.session_key === session.session_key
-            ? { ...curr, messages: resp.messages }
-            : curr,
-        ),
-      )
-      .catch((err) =>
-        setInspect((curr) =>
-          curr && curr.session.session_key === session.session_key
-            ? { ...curr, error: err.message }
-            : curr,
-        ),
-      );
-  };
+      .then((response) => { if (!cancelled) setInspect({ session, messages: response.messages, error: null }); })
+      .catch((error: Error) => { if (!cancelled) setInspect({ session, messages: null, error: error.message }); });
+    return () => { cancelled = true; };
+  }, [selectedSession, sessions]);
 
   // Runs once the operator confirms in the dialog; the destructive intent is
   // gated by ConfirmDialog rather than the native window.confirm.
@@ -1326,9 +1353,14 @@ function SessionsTab() {
         <div
           className="fixed inset-0 z-50 flex items-center justify-center p-4"
           style={{ background: "rgba(0,0,0,0.5)" }}
-          onClick={() => setInspect(null)}
+          onClick={closeInspect}
         >
           <div
+            ref={inspectRef}
+            tabIndex={-1}
+            role="dialog"
+            aria-modal="true"
+            aria-label={t("dashboard.session_label")}
             className="card p-5 w-full max-w-3xl max-h-[80vh] overflow-hidden flex flex-col"
             onClick={(e) => e.stopPropagation()}
           >
@@ -1376,6 +1408,7 @@ function SessionsTab() {
                 </div>
               </div>
               <div className="flex items-center gap-2 flex-shrink-0">
+                {resumeTarget && <Link to={resumeTarget} className="text-sm text-pc-accent">{t("home.resume")}</Link>}
                 {inspect.messages && inspect.messages.length > 1 && (
                   <button
                     type="button"
@@ -1394,7 +1427,7 @@ function SessionsTab() {
                 )}
                 <button
                   type="button"
-                  onClick={() => setInspect(null)}
+                  onClick={closeInspect}
                   className="p-1 rounded-lg hover:bg-[var(--pc-hover)]"
                   style={{ color: "var(--pc-text-muted)" }}
                   title={t("common.close")}
@@ -1774,6 +1807,7 @@ export default function Dashboard() {
       Promise.all([getStatus(), getCost(from, to), getTuis()])
         .then(([s, c, t]) => {
           if (isStale()) return;
+          setError(null);
           setStatus(s);
           setCost(c);
           setTuis(t);

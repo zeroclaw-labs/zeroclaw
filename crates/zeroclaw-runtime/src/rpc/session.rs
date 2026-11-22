@@ -1524,6 +1524,12 @@ impl SessionStore {
         if let Some(t) = patch.temperature {
             merged.temperature = Some(t);
         }
+        if patch.model.is_some() || patch.model_provider.is_some() {
+            merged.reasoning_effort = None;
+        }
+        if let Some(effort) = &patch.reasoning_effort {
+            merged.reasoning_effort = (effort != "default").then(|| effort.clone());
+        }
         Some(merged)
     }
 
@@ -1923,6 +1929,12 @@ impl SessionStore {
         sessions
             .get(session_id)
             .map(|s| s.owner_tui_id().map(str::to_owned))
+    }
+
+    /// Live activity includes admitted turns and queued work. Used by both
+    /// session recovery and activity listings; persistence is not a live lock.
+    pub async fn has_running_work(&self, id: &str) -> bool {
+        self.inflight_turn_generation(id).is_some() || self.session_queue.queue_depth(id).await > 0
     }
 
     /// Read the owning-principal stamp from a LIVE session. Same tri-state

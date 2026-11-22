@@ -125,6 +125,9 @@ pub struct AcpSessionSummary {
     pub principal_id: Option<String>,
     pub agent_alias: String,
     pub workspace_dir: String,
+    /// Bounded preview of the first retained user prompt for Code history.
+    pub first_prompt: Option<String>,
+    pub interaction_surface: Option<String>,
     pub token_count: u64,
     pub created_at: DateTime<Utc>,
     pub last_activity: DateTime<Utc>,
@@ -1304,7 +1307,14 @@ impl AcpSessionStore {
                         s.created_at,
                         s.last_activity,
                         s.projected_message_count AS message_count,
-                        s.principal_id
+                        s.principal_id,
+                        s.interaction_surface,
+                        CASE WHEN s.interaction_surface = 'zerocode_code' THEN (
+                            SELECT substr(m.content, 1, 160)
+                            FROM acp_messages m
+                            WHERE m.session_id = s.id AND m.role = 'user' AND m.content != ?1
+                            ORDER BY m.id LIMIT 1
+                        ) END
                  FROM acp_sessions s
                  WHERE s.killed_at IS NULL
                  ORDER BY s.last_activity DESC",
@@ -1312,7 +1322,7 @@ impl AcpSessionStore {
             .context("Failed to prepare ACP session list query")?;
 
         let rows = stmt
-            .query_map([], |row| {
+            .query_map([HISTORY_TRIM_BREADCRUMB_CANONICAL], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
@@ -1322,6 +1332,8 @@ impl AcpSessionStore {
                     row.get::<_, String>(5)?,
                     row.get::<_, i64>(6)?,
                     row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, Option<String>>(9)?,
                 ))
             })
             .context("Failed to query ACP sessions")?;
@@ -1337,6 +1349,8 @@ impl AcpSessionStore {
                 activity_s,
                 msg_count,
                 principal_id,
+                interaction_surface,
+                first_prompt,
             ) = row.context("Failed to read ACP session row")?;
             out.push(AcpSessionSummary {
                 created_at: parse_ts(&created_s, "created_at", &session_uuid),
@@ -1345,6 +1359,8 @@ impl AcpSessionStore {
                 principal_id,
                 agent_alias,
                 workspace_dir,
+                interaction_surface,
+                first_prompt,
                 token_count: token_count.max(0) as u64,
                 message_count: msg_count.max(0) as usize,
             });
@@ -1371,7 +1387,8 @@ impl AcpSessionStore {
                         s.created_at,
                         s.last_activity,
                         s.projected_message_count AS message_count,
-                        s.principal_id
+                        s.principal_id,
+                        s.interaction_surface
                  FROM acp_sessions s
                  WHERE s.agent_alias = ?1 AND s.killed_at IS NULL
                  ORDER BY s.last_activity DESC",
@@ -1389,6 +1406,7 @@ impl AcpSessionStore {
                     row.get::<_, String>(5)?,
                     row.get::<_, i64>(6)?,
                     row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
                 ))
             })
             .context("Failed to query live ACP sessions for agent")?;
@@ -1404,12 +1422,15 @@ impl AcpSessionStore {
                 activity_s,
                 msg_count,
                 principal_id,
+                interaction_surface,
             ) = row.context("Failed to read live ACP session row")?;
             out.push(AcpSessionSummary {
+                first_prompt: None,
                 created_at: parse_ts(&created_s, "created_at", &session_uuid),
                 last_activity: parse_ts(&activity_s, "last_activity", &session_uuid),
                 session_uuid,
                 principal_id,
+                interaction_surface,
                 agent_alias: owner_alias,
                 workspace_dir,
                 token_count: token_count.max(0) as u64,
@@ -3007,7 +3028,8 @@ impl AcpSessionStore {
                         s.created_at,
                         s.last_activity,
                         s.projected_message_count AS message_count,
-                        s.principal_id
+                        s.principal_id,
+                        s.interaction_surface
                  FROM acp_sessions s
                  WHERE s.agent_alias = ?1
                  ORDER BY s.last_activity DESC",
@@ -3025,6 +3047,7 @@ impl AcpSessionStore {
                     row.get::<_, String>(5)?,
                     row.get::<_, i64>(6)?,
                     row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
                 ))
             })
             .context("Failed to query ACP sessions for agent")?;
@@ -3040,14 +3063,17 @@ impl AcpSessionStore {
                 activity_s,
                 msg_count,
                 principal_id,
+                interaction_surface,
             ) = row.context("Failed to read ACP session row")?;
             out.push(AcpSessionSummary {
+                first_prompt: None,
                 created_at: parse_ts(&created_s, "created_at", &session_uuid),
                 last_activity: parse_ts(&activity_s, "last_activity", &session_uuid),
                 session_uuid,
                 principal_id,
                 agent_alias,
                 workspace_dir,
+                interaction_surface,
                 token_count: token_count.max(0) as u64,
                 message_count: msg_count.max(0) as usize,
             });
@@ -7036,7 +7062,13 @@ mod tests {
             .unwrap();
         std::thread::sleep(std::time::Duration::from_millis(10));
         store
-            .create_session("alpha-new", "alpha", "/ws/new", None)
+            .create_session_with_interaction_surface(
+                "alpha-new",
+                "alpha",
+                "/ws/new",
+                Some("zerocode_code"),
+                Some("fixture-owner"),
+            )
             .unwrap();
         store
             .append_turn(
@@ -7056,6 +7088,11 @@ mod tests {
         assert_eq!(list.len(), 2);
         assert_eq!(list[0].session_uuid, "alpha-new");
         assert_eq!(list[0].message_count, 1);
+        assert_eq!(list[0].principal_id.as_deref(), Some("fixture-owner"));
+        assert_eq!(
+            list[0].interaction_surface.as_deref(),
+            Some("zerocode_code")
+        );
         assert_eq!(list[1].session_uuid, "alpha-old");
         assert!(list.iter().all(|summary| summary.agent_alias == "alpha"));
         assert!(
