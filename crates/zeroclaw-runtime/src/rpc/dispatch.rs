@@ -7722,15 +7722,21 @@ impl RpcDispatcher {
         }
     }
 
-    fn can_edit_code_settings(&self) -> bool {
-        self.auth.as_ref().is_some_and(|auth| {
-            self.ctx.auth.credential_is_live(auth).is_ok()
-                && self
-                    .ctx
-                    .auth
-                    .resolve_current(auth)
-                    .is_ok_and(|authority| authority.grants.admin)
-        })
+    fn require_code_settings_admin(
+        &self,
+        lease: &crate::rpc::auth::AuthorityLease<'_>,
+    ) -> Result<(), JsonRpcError> {
+        if self
+            .auth
+            .as_ref()
+            .is_some_and(|auth| lease.current_grants(auth).is_ok_and(|grants| grants.admin))
+        {
+            return Ok(());
+        }
+        Err(rpc_err(
+            FORBIDDEN,
+            "Code session settings require operator access",
+        ))
     }
 
     async fn code_session_settings(
@@ -7903,12 +7909,7 @@ impl RpcDispatcher {
         .await?;
 
         if req.code_settings {
-            if !self.can_edit_code_settings() {
-                return Err(rpc_err(
-                    FORBIDDEN,
-                    "Code session settings require operator access",
-                ));
-            }
+            self.require_code_settings_admin(&self.ctx.auth.hold_authority())?;
             if self.ctx.sessions.has_running_work(&req.session_id).await {
                 return Err(rpc_err(
                     SESSION_BUSY,
@@ -8021,10 +8022,14 @@ impl RpcDispatcher {
                     {
                         return Err(self.stale_session_incarnation_error());
                     }
-                    self.session_effect_lease(
+                    let lease = self.session_effect_lease(
                         Method::SessionConfigure,
                         session.owner_principal_id.as_deref(),
-                    )
+                    )?;
+                    if req.code_settings {
+                        self.require_code_settings_admin(&lease)?;
+                    }
+                    Ok(lease)
                 },
             )
             .await?
@@ -8922,6 +8927,8 @@ impl RpcDispatcher {
                         agent_alias: Some(s.agent_alias),
                         channel_id: None,
                         name: s.first_prompt.and_then(|prompt| {
+                            let prompt =
+                                crate::agent::prompt::strip_runtime_user_timestamp_prefix(&prompt);
                             let title = prompt.lines().find(|line| !line.trim().is_empty())?.trim();
                             Some(title.chars().take(80).collect())
                         }),
@@ -9324,7 +9331,9 @@ impl RpcDispatcher {
             let settings = if params["include_code_settings"] == true {
                 let (alias, overrides) = self.code_session_settings(&req.session_id).await?;
                 let config = self.ctx.config.read();
-                let can_change = self.can_edit_code_settings();
+                let can_change = self
+                    .require_code_settings_admin(&self.ctx.auth.hold_authority())
+                    .is_ok();
                 code_settings(&config, &alias, &overrides, can_change)
             } else {
                 None

@@ -1,5 +1,6 @@
 use super::traits::{LlmMessageSnapshot, Observer, ObserverEvent, ObserverMetric};
 use crate::agent::loop_::scrub_for_export;
+use crate::agent::prompt::strip_runtime_user_timestamp_prefix;
 use crate::observability::otel_config::OtelContentConfig;
 use crate::util::{truncate_field, truncate_json_leaves};
 use opentelemetry::metrics::{Counter, Gauge, Histogram};
@@ -10,7 +11,7 @@ use opentelemetry_sdk::metrics::SdkMeterProvider;
 use opentelemetry_sdk::trace::SdkTracerProvider;
 use std::any::Any;
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 use std::time::SystemTime;
 use zeroclaw_config::schema::OtelContentPolicy;
 
@@ -923,31 +924,6 @@ impl Observer for OtelObserver {
     fn as_any(&self) -> &dyn Any {
         self
     }
-}
-
-fn strip_runtime_user_timestamp_prefix(content: &str) -> &str {
-    const LABEL: &str = "[CURRENT DATE & TIME:";
-    static TIMESTAMP_PATTERN: OnceLock<regex::Regex> = OnceLock::new();
-
-    let Some(rest) = content.strip_prefix(LABEL) else {
-        return content;
-    };
-    let Some(bracket_end) = rest.find(']') else {
-        return content;
-    };
-    let timestamp = rest[..bracket_end].trim();
-    let timestamp_regex = TIMESTAMP_PATTERN.get_or_init(|| {
-        regex::Regex::new(r"^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\s+\S+$")
-            .expect("the runtime timestamp pattern is a valid fixed regex")
-    });
-    if !timestamp_regex.is_match(timestamp) {
-        return content;
-    }
-    let after_label = &rest[bracket_end + 1..];
-    after_label
-        .strip_prefix("\r\n\r\n")
-        .or_else(|| after_label.strip_prefix("\n\n"))
-        .unwrap_or(content)
 }
 
 fn strip_first_complete_block(content: &mut String, start_marker: &str, end_marker: &str) {

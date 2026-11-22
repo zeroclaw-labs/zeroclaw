@@ -79,7 +79,7 @@ const second = makeSession("fixture-b", "reviewer", "Review the release", "01");
         }
         if (method === "session/prompt") {
           active.set(sid, { id, generation: params.client_turn_generation });
-          messages[sid].push({ role: "user", content: params.prompt });
+          messages[sid].push({ role: "user", content: `[CURRENT DATE & TIME: 2026-11-22 13:00:00 UTC]\n\n${params.prompt}` });
           update(sid, { type: "tool_call", tool_call_id: "test-" + sid, name: "shell", raw_input: { command: "cargo test" } });
           if (sid === second.session_id) {
             update(sid, { type: "approval_request", request_id: "approval-" + id, tool_name: "shell", arguments_summary: "Review tests", timeout_secs: 90 });
@@ -219,6 +219,8 @@ const second = makeSession("fixture-b", "reviewer", "Review the release", "01");
     messages[second.session_id].push({ role: "assistant", content: "Recovered the retained transcript." });
     await previous.close();
     await chat.getByText("Recovered the retained transcript.", { exact: true }).waitFor();
+    await chat.getByText("Review after reload", { exact: true }).waitFor();
+    assert.equal(await chat.getByText(/CURRENT DATE & TIME/).count(), 0);
     assert.equal(await chat.getByRole("button", { name: "Approve", exact: true }).count(), 0);
     assert.notEqual(lastSocket, previous);
     assert.deepEqual(errors, []);

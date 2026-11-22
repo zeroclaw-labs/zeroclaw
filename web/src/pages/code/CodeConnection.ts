@@ -1,3 +1,4 @@
+import { normalizeServerUserContent } from "@/contexts/chatHydration.logic";
 import { AcpWebSocketClient, type AcpRequest } from "@/lib/acp";
 import { AUTH_EVENTS, isReauthPending } from "@/lib/auth";
 import { t } from "@/lib/i18n";
@@ -276,6 +277,16 @@ export class CodeConnection {
     return client.request<SessionState>("session/state", { session_id: id, include_code_settings: true });
   }
 
+  private async readHistory(client: AcpWebSocketClient, id: string, cursor: string | null) {
+    const page = await client.request<HistoryPage>("session/messages", { session_id: id, cursor, limit: 120 });
+    return {
+      ...page,
+      messages: page.messages.map((message) => message.role === "user"
+        ? { ...message, content: normalizeServerUserContent(message.content) }
+        : message),
+    };
+  }
+
   private async reconcile(client: AcpWebSocketClient, id: string, attaching = false) {
     if (this.recovering.has(id)) return;
     this.recovering.add(id);
@@ -283,7 +294,7 @@ export class CodeConnection {
     try {
       const state = await this.readState(client, id);
       if (!attaching && state.state === "running") return;
-      const page = await client.request<HistoryPage>("session/messages", { session_id: id, cursor: null, limit: 120 });
+      const page = await this.readHistory(client, id, null);
       this.assertClient(client);
       this.edit(id, (chat) => chat.turn !== before?.turn ? chat : ({
         ...chat, attached: true, busy: state.state === "running", observed: state.state === "running",
@@ -355,7 +366,7 @@ export class CodeConnection {
     const client = this.requireClient();
     const cursor = this.snapshot.chats.get(id)?.historyCursor;
     if (!cursor) return;
-    const page = await client.request<HistoryPage>("session/messages", { session_id: id, cursor, limit: 120 });
+    const page = await this.readHistory(client, id, cursor);
     this.assertClient(client);
     this.edit(id, (chat) => chat.historyCursor !== cursor ? chat : ({
       ...chat, messages: [...page.messages, ...chat.messages],

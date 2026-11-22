@@ -7,6 +7,7 @@ use anyhow::Result;
 use chrono::{Datelike, Local};
 use std::fmt::Write;
 use std::path::Path;
+use std::sync::OnceLock;
 use zeroclaw_config::schema::IdentityConfig;
 
 /// Closed identifier supplied by a trusted interaction client. The identifier
@@ -97,6 +98,31 @@ pub(crate) const TIMESTAMP_ORIENTATION: &str = "This is an interactive conversat
 
 pub(crate) fn append_timestamp_orientation(prompt: &mut String) {
     prompt.push_str(TIMESTAMP_ORIENTATION);
+}
+
+pub(crate) fn strip_runtime_user_timestamp_prefix(content: &str) -> &str {
+    const LABEL: &str = "[CURRENT DATE & TIME:";
+    static TIMESTAMP_PATTERN: OnceLock<regex::Regex> = OnceLock::new();
+
+    let Some(rest) = content.strip_prefix(LABEL) else {
+        return content;
+    };
+    let Some(bracket_end) = rest.find(']') else {
+        return content;
+    };
+    let timestamp = rest[..bracket_end].trim();
+    let timestamp_regex = TIMESTAMP_PATTERN.get_or_init(|| {
+        regex::Regex::new(r"^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\s+\S+$")
+            .expect("the runtime timestamp pattern is a valid fixed regex")
+    });
+    if !timestamp_regex.is_match(timestamp) {
+        return content;
+    }
+    let after_label = &rest[bracket_end + 1..];
+    after_label
+        .strip_prefix("\r\n\r\n")
+        .or_else(|| after_label.strip_prefix("\n\n"))
+        .unwrap_or(content)
 }
 
 pub struct PromptContext<'a> {
