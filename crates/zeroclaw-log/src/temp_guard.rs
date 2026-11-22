@@ -12,9 +12,9 @@ use anyhow::{Context, Result};
 
 /// Removes the temp file on drop unless [`TempFileCleanup::disarm`] was called.
 ///
-/// Declare it before any handle or writer on the same file: locals drop in
-/// reverse order, and a file cannot be removed on Windows while a handle to it
-/// is still open.
+/// Keep it alive until the rename, and let the file handle (or a writer that
+/// owns it) go out of scope before the guard does, so the file is closed when
+/// it is removed.
 pub(crate) struct TempFileCleanup {
     path: PathBuf,
     armed: bool,

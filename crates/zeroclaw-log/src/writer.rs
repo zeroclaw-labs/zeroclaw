@@ -728,9 +728,9 @@ fn trim_to_last_entries(state: &Arc<WorkerState>) -> Result<()> {
         chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default(),
     ));
 
-    // Declared before the `BufWriter` and outside the inner block so the file
-    // handle closes before the guard removes the temp file (Windows cannot
-    // remove a file that still has an open handle).
+    // The guard lives outside the inner block and the file is moved into the
+    // `BufWriter` inside it, so the handle is closed before the guard can
+    // remove the temp file.
     let (out_file, mut temp_cleanup) = create_exclusive_temp(&tmp, "trim")?;
     {
         let mut out = BufWriter::new(out_file);
@@ -1359,6 +1359,9 @@ mod tests {
     fn trim_state(dir: &Path, max_entries: usize) -> Arc<WorkerState> {
         let mut policy = detached_enabled_policy(dir);
         policy.max_entries = max_entries;
+        // The default log path sits in a `state/` subdirectory, which the
+        // detached policy has not necessarily created.
+        fs::create_dir_all(policy.path.parent().unwrap()).unwrap();
         Arc::new(WorkerState {
             policy,
             worker_dead: Arc::new(AtomicBool::new(false)),
@@ -1403,7 +1406,7 @@ mod tests {
         }
 
         assert_eq!(
-            trim_temp_names(tmp.path()),
+            trim_temp_names(state.policy.path.parent().unwrap()),
             Vec::<String>::new(),
             "a trim that fails after writing its temp file must remove it"
         );
@@ -1423,7 +1426,10 @@ mod tests {
 
         trim_to_last_entries(&state).unwrap();
 
-        assert_eq!(trim_temp_names(tmp.path()), Vec::<String>::new());
+        assert_eq!(
+            trim_temp_names(state.policy.path.parent().unwrap()),
+            Vec::<String>::new()
+        );
         assert_eq!(count_lines(&state.policy.path), 2);
         let kept = fs::read_to_string(&state.policy.path).unwrap();
         assert_eq!(kept, "{\"n\":3}\n{\"n\":4}\n");
@@ -1442,7 +1448,8 @@ mod tests {
         }
         flush_for_test().unwrap();
 
-        assert_eq!(trim_temp_names(tmp.path()), Vec::<String>::new());
+        let dir = runtime_trace_path().unwrap().parent().unwrap().to_path_buf();
+        assert_eq!(trim_temp_names(&dir), Vec::<String>::new());
     }
 
     #[test]
@@ -2177,14 +2184,24 @@ mod tests {
         let _guard = WRITER_TEST_LOCK.lock();
         let tmp = tempfile::tempdir().unwrap();
         let mut policy = detached_enabled_policy(tmp.path());
+        // The default log path sits in a `state/` subdirectory, and archives
+        // are discovered next to the active file.
+        let dir = policy.path.parent().unwrap().to_path_buf();
+        fs::create_dir_all(&dir).unwrap();
         fs::write(&policy.path, "").unwrap();
         fs::write(
-            tmp.path()
-                .join("runtime-trace.0000000007-20260624-031500.jsonl"),
+            dir.join("runtime-trace.0000000007-20260624-031500.jsonl"),
             "x\n",
         )
         .unwrap();
         record_seq_watermark(&policy.path, 30);
+        assert!(
+            list_archives(&policy.path)
+                .unwrap()
+                .iter()
+                .any(|(_, order)| matches!(order, ArchiveOrder::Seq(7))),
+            "test setup: archive 7 must be discoverable next to the active file"
+        );
 
         for (storage, expected) in [
             (StoragePolicy::Rotating, 31),
@@ -2209,9 +2226,10 @@ mod tests {
         let _guard = WRITER_TEST_LOCK.lock();
         let tmp = tempfile::tempdir().unwrap();
         install_writer(tmp.path(), 10);
+        let dir = runtime_trace_path().unwrap().parent().unwrap().to_path_buf();
+        fs::create_dir_all(&dir).unwrap();
         fs::write(
-            tmp.path()
-                .join("runtime-trace.0000000007-20260624-031500.jsonl"),
+            dir.join("runtime-trace.0000000007-20260624-031500.jsonl"),
             "x\n",
         )
         .unwrap();

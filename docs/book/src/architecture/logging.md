@@ -348,7 +348,7 @@ Archive discovery rejects symlinks. Matching the writer's filename shape is not 
 
 Age and count retention run only after rotation. They do not sweep continuously, do not apply to `full` or `rolling`, and do not delete arbitrary neighboring files: archive discovery accepts only names generated from the active path's archive shape. Under `rotating`, the live `/api/logs` reader merges the active file with all retained archives; under the other policies it reads the active file alone. See [Reader cursors](#reader-cursors-span-the-active-file-and-retained-archives).
 
-Only `rotating` reads the log directory when the writer starts: it needs the highest archive number already on disk to keep the archive sequence increasing. The other policies create no archives, so the writer skips that listing for them.
+Only `rotating` lists the log directory when the writer starts: it needs the highest archive number already on disk to keep the archive sequence increasing. The other policies create no archives, so the writer skips that listing for them.
 
 ## Schema migration is an active-file rewrite
 
