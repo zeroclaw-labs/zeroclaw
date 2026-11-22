@@ -1005,6 +1005,7 @@ export function AgentChatInner({
             </>
           )}
           <textarea
+            data-workspace-composer
             ref={inputRef}
             rows={1}
             value={input}

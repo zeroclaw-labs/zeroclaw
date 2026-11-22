@@ -1,3 +1,4 @@
+import { WorkspaceKeyboardToggle } from './WorkspaceKeyboard';
 import { useLayoutPreference } from '@/contexts/LayoutPreference';
 import { useState } from 'react';
 import { Link, useLocation } from 'react-router-dom';
@@ -75,6 +76,8 @@ export default function Header({
             <span className="min-w-0 flex-1 truncate text-left text-xs">{t('workspace.search_settings')}</span>
             <kbd className="shrink-0 whitespace-nowrap rounded border border-pc-border px-1.5 py-0.5 text-xs">⌘ K / Ctrl K</kbd>
           </button>
+          <div className="col-start-3 row-start-1 flex items-center justify-self-end gap-1">
+          <WorkspaceKeyboardToggle />
           <button
             type="button"
             onClick={() => setMenu(!menu)}
@@ -84,6 +87,7 @@ export default function Header({
           >
             <MoreHorizontal className="h-4 w-4" />
           </button>
+          </div>
         </div>
         {menu && (
           <>

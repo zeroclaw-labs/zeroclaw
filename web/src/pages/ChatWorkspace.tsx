@@ -1,3 +1,4 @@
+import { useWorkspaceItems } from '@/components/layout/WorkspaceKeyboard';
 import { useLayoutPreference } from '@/contexts/LayoutPreference';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { AgentProvider } from '@/contexts/AgentContext';
@@ -324,6 +325,11 @@ export default function ChatWorkspace({ initialAlias, initialSessionId, allowedA
     });
   }, [tabs]);
 
+  useWorkspaceItems('agent', visible && presentation === 'classic', {
+    ids: labelledTabs.map((tab) => tab.key),
+    selected: activeTab?.key,
+    select: selectTab,
+  });
   const Navigation = presentation === 'classic' ? ChatTabBar : AgentSidebar;
   return (
     <div translate="no" className={`notranslate relative flex h-full min-h-0 ${presentation === 'classic' ? 'flex-col' : ''}`}>

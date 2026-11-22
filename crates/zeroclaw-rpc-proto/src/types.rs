@@ -269,6 +269,9 @@ rpc_type! {
 rpc_type! {
     pub struct SessionConfigureParams {
         pub session_id: String,
+        /// Limit the edit to the operator's advertised Code session options.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        pub code_settings: bool,
         #[serde(default)]
         pub overrides: SessionOverrides,
     }
@@ -1927,6 +1930,9 @@ rpc_type! {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct SessionOverrides {
+    /// Provider-native effort scoped to this session. "default" clears the override.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

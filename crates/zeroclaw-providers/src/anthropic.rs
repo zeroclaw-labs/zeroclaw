@@ -290,6 +290,42 @@ pub(crate) enum AnthropicThinkingStyle {
     Adaptive,
 }
 
+tokio::task_local! {
+    /// Native effort for the admitted RPC turn. Other sessions and callers use
+    /// the configured provider value.
+    pub static TURN_REASONING_EFFORT: Option<String>;
+}
+
+/// Explicitly supported Messages API models. Unknown and older models retain
+/// their existing provider defaults. See the Claude Platform effort reference.
+pub fn reasoning_efforts(model: &str) -> &'static [&'static str] {
+    let model = model.strip_prefix("claude-").unwrap_or_default();
+    let Some((family, version)) = model.split_once('-') else {
+        return &[];
+    };
+    let version = version.replace('.', "-");
+    let versioned = |name: &str| {
+        version == name
+            || version
+                .strip_prefix(name)
+                .is_some_and(|suffix| suffix.starts_with('-'))
+    };
+    let extended = match family {
+        "fable" | "mythos" => versioned("5"),
+        "opus" => versioned("4-7") || versioned("4-8") || versioned("5"),
+        "sonnet" => versioned("5"),
+        "haiku" => versioned("5-5"),
+        _ => false,
+    };
+    if extended {
+        &["low", "medium", "high", "xhigh", "max"]
+    } else if matches!(family, "opus" | "sonnet") && versioned("4-6") {
+        &["low", "medium", "high", "max"]
+    } else {
+        &[]
+    }
+}
+
 /// Adaptive thinking for every Claude model numbered 4.7 or later, whatever
 /// the family. Anthropic rejects `enabled` + `budget_tokens` with HTTP 400
 /// on those models. 4.6 and earlier, and IDs that carry no such version
@@ -785,8 +821,19 @@ impl AnthropicModelProvider {
         }
     }
 
-    fn output_config(&self) -> Option<OutputConfig> {
-        self.effort.clone().map(|effort| OutputConfig { effort })
+    fn output_config(&self, model: &str) -> Option<OutputConfig> {
+        let turn_effort = TURN_REASONING_EFFORT
+            .try_with(|value| {
+                value
+                    .as_ref()
+                    .filter(|effort| reasoning_efforts(model).contains(&effort.as_str()))
+                    .cloned()
+            })
+            .ok()
+            .flatten();
+        turn_effort
+            .or_else(|| self.effort.clone())
+            .map(|effort| OutputConfig { effort })
     }
 
     fn is_setup_token(token: &str) -> bool {
@@ -2979,7 +3026,7 @@ impl ModelProvider for AnthropicModelProvider {
             stream: None,
             thinking: None,
             fallbacks,
-            output_config: self.output_config(),
+            output_config: self.output_config(model),
         };
 
         let mut request = self
@@ -3134,7 +3181,7 @@ impl ModelProvider for AnthropicModelProvider {
             stream: None,
             thinking: thinking_config,
             fallbacks,
-            output_config: self.output_config(),
+            output_config: self.output_config(model),
         };
 
         let req = self
@@ -3373,7 +3420,7 @@ impl ModelProvider for AnthropicModelProvider {
                 // Streaming path (incl. this thinking `stream: None` request):
                 // never opts into server-side fallback.
                 fallbacks: None,
-                output_config: self.output_config(),
+                output_config: self.output_config(model),
             };
             // Serialize eagerly so the request body is owned and `'static`
             // across the async boundary.
@@ -3505,7 +3552,7 @@ impl ModelProvider for AnthropicModelProvider {
             thinking: thinking_config,
             // Streaming never opts into server-side fallback.
             fallbacks: None,
-            output_config: self.output_config(),
+            output_config: self.output_config(model),
         };
 
         let body = match Self::build_streaming_request(&native_request) {

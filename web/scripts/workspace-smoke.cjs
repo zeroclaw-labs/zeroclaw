@@ -418,6 +418,7 @@ async function chooseLayout(page, name) {
     .fill("Run the project tests");
   await page.getByRole("button", { name: "Send", exact: true }).click();
   await page.getByText("Run project tests", { exact: true }).waitFor();
+  await page.getByRole("button", { name: "Workspace files", exact: true }).click();
   await page.getByRole("button", { name: "README.md", exact: true }).click();
   await page
     .getByText("A small project for interface verification.", { exact: true })
@@ -435,7 +436,7 @@ async function chooseLayout(page, name) {
   await page.getByRole("link", { name: "Home", exact: true }).first().click();
   await page.getByRole("link", { name: "Agent", exact: true }).waitFor();
   assert.equal(codeRunning, true);
-  await page.getByRole("link", { name: "Needs your attention · Code" }).click();
+  await page.getByRole("link", { name: /Needs your attention · Code/ }).click();
   await page.getByText("Run project tests", { exact: true }).waitFor();
   await page.getByRole("button", { name: "Approve", exact: true }).click();
   await page.getByText("The project tests passed.", { exact: true }).waitFor();
@@ -445,9 +446,9 @@ async function chooseLayout(page, name) {
   // A task resumed from another connection has no terminal event on this one.
   codeRunning = true;
   await page.reload();
-  await page.getByText("Working…", { exact: true }).waitFor();
+  await page.getByRole("region", { name: "Code conversation" }).getByText("Working…", { exact: true }).waitFor();
   codeRunning = false;
-  await page.getByText("Ready", { exact: true }).waitFor();
+  await page.getByRole("region", { name: "Code conversation" }).getByText("Ready", { exact: true }).waitFor();
   await page.getByText("This workspace contains a README and a source directory.", { exact: true }).waitFor();
   await page.setViewportSize({ width: 390, height: 844 });
   assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);

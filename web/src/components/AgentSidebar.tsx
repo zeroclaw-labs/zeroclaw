@@ -1,3 +1,5 @@
+import { useWorkspaceItems } from '@/components/layout/WorkspaceKeyboard';
+import { useWorkspaceVisible } from '@/components/layout/WorkspaceOutlet';
 import { useEffect, useState } from 'react';
 import { PanelLeft, Search, Settings, X, Columns2 } from 'lucide-react';
 import { loadAgentPickerSummaries } from '@/lib/agents';
@@ -51,6 +53,15 @@ export default function AgentSidebar({
       .filter((alias) => !tabs.some((tab) => tab.alias === alias))
       .map((alias) => ({ alias, label: alias, key: alias, sessionId: '' })),
   ].filter((row) => row.label.toLowerCase().includes(query.toLowerCase()));
+  const select = (key: string) => {
+    const row = rows.find((item) => item.key === key);
+    if (!row) return;
+    if (row.sessionId) onSelect(row.key);
+    else onOpen(row.alias);
+    setOpen(false);
+  };
+  const visible = useWorkspaceVisible();
+  useWorkspaceItems('agent', visible, { ids: rows.map((row) => row.key), selected: activeKey, select });
   return (
     <>
       <button
@@ -121,11 +132,7 @@ export default function AgentSidebar({
                 aria-controls={
                   row.sessionId ? `chat-panel-${row.key}` : undefined
                 }
-                onClick={() => {
-                  if (row.sessionId) onSelect(row.key);
-                  else onOpen(row.alias);
-                  setOpen(false);
-                }}
+                onClick={() => select(row.key)}
                 className="flex min-w-0 flex-1 items-center gap-2 px-3 py-3 text-left text-sm"
               >
                 <span

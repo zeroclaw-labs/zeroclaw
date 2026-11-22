@@ -125,6 +125,8 @@ pub struct AcpSessionSummary {
     pub principal_id: Option<String>,
     pub agent_alias: String,
     pub workspace_dir: String,
+    /// Bounded preview of the first retained user prompt for Code history.
+    pub first_prompt: Option<String>,
     pub interaction_surface: Option<String>,
     pub token_count: u64,
     pub created_at: DateTime<Utc>,
@@ -1306,7 +1308,13 @@ impl AcpSessionStore {
                         s.last_activity,
                         s.projected_message_count AS message_count,
                         s.principal_id,
-                        s.interaction_surface
+                        s.interaction_surface,
+                        CASE WHEN s.interaction_surface = 'zerocode_code' THEN (
+                            SELECT substr(m.content, 1, 160)
+                            FROM acp_messages m
+                            WHERE m.session_id = s.id AND m.role = 'user' AND m.content != ?1
+                            ORDER BY m.id LIMIT 1
+                        ) END
                  FROM acp_sessions s
                  WHERE s.killed_at IS NULL
                  ORDER BY s.last_activity DESC",
@@ -1314,7 +1322,7 @@ impl AcpSessionStore {
             .context("Failed to prepare ACP session list query")?;
 
         let rows = stmt
-            .query_map([], |row| {
+            .query_map([HISTORY_TRIM_BREADCRUMB_CANONICAL], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
@@ -1325,6 +1333,7 @@ impl AcpSessionStore {
                     row.get::<_, i64>(6)?,
                     row.get::<_, Option<String>>(7)?,
                     row.get::<_, Option<String>>(8)?,
+                    row.get::<_, Option<String>>(9)?,
                 ))
             })
             .context("Failed to query ACP sessions")?;
@@ -1341,6 +1350,7 @@ impl AcpSessionStore {
                 msg_count,
                 principal_id,
                 interaction_surface,
+                first_prompt,
             ) = row.context("Failed to read ACP session row")?;
             out.push(AcpSessionSummary {
                 created_at: parse_ts(&created_s, "created_at", &session_uuid),
@@ -1350,6 +1360,7 @@ impl AcpSessionStore {
                 agent_alias,
                 workspace_dir,
                 interaction_surface,
+                first_prompt,
                 token_count: token_count.max(0) as u64,
                 message_count: msg_count.max(0) as usize,
             });
@@ -1414,6 +1425,7 @@ impl AcpSessionStore {
                 interaction_surface,
             ) = row.context("Failed to read live ACP session row")?;
             out.push(AcpSessionSummary {
+                first_prompt: None,
                 created_at: parse_ts(&created_s, "created_at", &session_uuid),
                 last_activity: parse_ts(&activity_s, "last_activity", &session_uuid),
                 session_uuid,
@@ -3054,6 +3066,7 @@ impl AcpSessionStore {
                 interaction_surface,
             ) = row.context("Failed to read ACP session row")?;
             out.push(AcpSessionSummary {
+                first_prompt: None,
                 created_at: parse_ts(&created_s, "created_at", &session_uuid),
                 last_activity: parse_ts(&activity_s, "last_activity", &session_uuid),
                 session_uuid,

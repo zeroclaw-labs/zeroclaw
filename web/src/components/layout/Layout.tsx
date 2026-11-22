@@ -9,6 +9,7 @@ import UnsavedChangesBanner from '@/components/layout/UnsavedChangesBanner';
 import { MainColumn } from '@/components/layout/MainColumn';
 import CommandPalette, { useCommandPalette } from '@/components/CommandPalette';
 import WorkspaceOutlet from './WorkspaceOutlet';
+import WorkspaceKeyboard from './WorkspaceKeyboard';
 import { NotAvailable } from '@/components/auth/NotAvailable';
 import { useAuth } from '@/hooks/useAuth';
 import { t } from '@/lib/i18n';
@@ -51,7 +52,7 @@ export default function Layout() {
   }, [pathname, layout]);
 
   return (
-    <WorkspaceSettings><div className="min-h-screen bg-pc-base text-pc-text">
+    <WorkspaceKeyboard access={access}><WorkspaceSettings><div className="min-h-screen bg-pc-base text-pc-text">
       {layout === 'classic' && <Sidebar open={sidebarOpen} onClose={() => setSidebarOpen(false)} />}
       <MainColumn viaRelay={viaRelay} showRail={layout === 'classic'}>
         <Header onOpenPalette={openPalette} onOpenSidebar={() => setSidebarOpen(true)} />
@@ -79,6 +80,6 @@ export default function Layout() {
       {/* Command palette — mounted once for the whole app. Toggled globally
           via ⌘K / Ctrl+K and from the Header search trigger. */}
       <CommandPalette open={paletteOpen} onClose={closePalette} />
-    </div></WorkspaceSettings>
+    </div></WorkspaceSettings></WorkspaceKeyboard>
   );
 }

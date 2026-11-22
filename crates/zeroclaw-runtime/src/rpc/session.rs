@@ -1524,6 +1524,12 @@ impl SessionStore {
         if let Some(t) = patch.temperature {
             merged.temperature = Some(t);
         }
+        if patch.model.is_some() || patch.model_provider.is_some() {
+            merged.reasoning_effort = None;
+        }
+        if let Some(effort) = &patch.reasoning_effort {
+            merged.reasoning_effort = (effort != "default").then(|| effort.clone());
+        }
         Some(merged)
     }
 

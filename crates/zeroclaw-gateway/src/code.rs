@@ -139,6 +139,19 @@ fn code_frame(text: &str) -> Result<String, Value> {
                 "interaction_surface": "zerocode_code",
             });
         }
+        "session/configure" => {
+            let params = &frame["params"];
+            let overrides = &params["overrides"];
+            frame["params"] = json!({
+                "session_id": params.get("session_id"),
+                "code_settings": true,
+                "overrides": {
+                    "model": overrides.get("model"),
+                    "model_provider": overrides.get("model_provider"),
+                    "reasoning_effort": overrides.get("reasoning_effort"),
+                },
+            });
+        }
         "session/prompt" | "session/cancel" | "session/approve" | "session/messages"
         | "session/state" | "session/list-acp" => {}
         _ => return Err(error()),

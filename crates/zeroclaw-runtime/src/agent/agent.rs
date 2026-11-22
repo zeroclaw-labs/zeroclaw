@@ -1923,6 +1923,9 @@ impl Agent {
             || zeroclaw_api::NATIVE_THINKING_OVERRIDE
                 .try_with(Option::is_some)
                 .unwrap_or(false)
+            || zeroclaw_providers::anthropic::TURN_REASONING_EFFORT
+                .try_with(Option::is_some)
+                .unwrap_or(false)
             || self
                 .hook_runner
                 .as_ref()

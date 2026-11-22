@@ -1,3 +1,4 @@
+import { useWorkspaceItems } from '@/components/layout/WorkspaceKeyboard';
 import { useLayoutPreference } from '@/contexts/LayoutPreference';
 import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { useLocation, useNavigate, useParams } from 'react-router-dom';
@@ -129,6 +130,12 @@ export default function SopWorkspace() {
   const filtered = sops
     .filter((sop) => `${sop.name} ${sop.description}`.toLowerCase().includes(query.toLowerCase()))
     .sort((a, b) => a.name.localeCompare(b.name));
+
+  useWorkspaceItems('sop', visible, {
+    ids: filtered.map((sop) => sop.name),
+    selected: selected ?? undefined,
+    select: (id) => selectSop(id),
+  });
 
   return (
     <div className="relative flex h-full min-h-0 min-w-0 overflow-hidden">
