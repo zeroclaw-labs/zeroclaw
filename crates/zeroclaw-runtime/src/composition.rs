@@ -102,7 +102,7 @@ impl RuntimeCapabilities {
     /// calls its `*_with_capabilities` form, so its construction is unchanged.
     /// Built per call, as the adapters' callers built their capabilities
     /// before; the application layer's own set replaces it as callers move.
-    pub(crate) fn config_backed(config: &Config) -> Self {
+    pub fn config_backed(config: &Config) -> Self {
         config_backed::capabilities(config)
     }
 
