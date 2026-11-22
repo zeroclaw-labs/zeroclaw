@@ -76,8 +76,8 @@ and a valid issued token. Browser clients supply subprotocols
 Standalone gateways without the daemon return an unavailable response.
 
 The bridge admits `initialize`, `session/new`, `session/prompt`, `session/cancel`,
-`session/approve`, `session/messages`, `session/state`, and `session/list-acp`,
-plus responses to daemon-initiated elicitation. Configuration writes,
+`session/approve`, `session/messages`, `session/state`, `session/list-acp`, and
+`session/configure` for Code model and effort settings, plus responses to daemon-initiated elicitation. Configuration writes,
 certificates, session deletion, and other RPC methods are unavailable here.
 Initialization strips forwarded environment variables. Session creation uses
 the configured agent workspace, ACP mode, and the `zerocode_code` interaction
@@ -85,6 +85,14 @@ surface, excludes conversational memory, and preserves sibling sessions.
 The browser cannot choose a local endpoint, working directory, or TUI owner.
 Runtime tools, live policies, approval handling, and persisted history remain
 owned by the existing daemon dispatcher.
+
+An authorized `session/state` request can include `include_code_settings: true`
+to read the model and reasoning choices for a live Code session. The settings
+write accepts `overrides.model_provider` and `overrides.model` from the daemon's
+configured choices and `overrides.reasoning_effort` for the supported native
+provider levels. `"default"` clears the session's effort override. Operators
+can configure authorized idle Code sessions. Changes take effect on the next
+turn and are stored with the live session.
 
 WebSocket and NDJSON frames are bounded to 8 MiB. Closing the connection invokes
 the existing RPC teardown and cancellation behavior. The dashboard keeps its

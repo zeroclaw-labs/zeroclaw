@@ -129,9 +129,29 @@ beyond v1 has no milestone: [persistent SOP managers and conversations][sop-mana
 The Code workspace uses the daemon's zerocode RPC dispatcher through the paired
 `/ws/code` bridge. It supports session history, streaming output, approvals,
 choice questions, cancellation, and read-only file previews. Agents edit files
-through their runtime tools and existing permission checks. **Cmd+Enter /
-Ctrl+Enter** sends a prompt. Refreshing or closing the browser still disconnects
-clients; active code turns and unsaved SOP edits request browser confirmation.
+through their runtime tools and existing permission checks. You can switch
+between Code chats while turns run. The sidebar marks chats that need a
+decision, and each turn's tool steps collapse into an Activity section after
+it finishes.
+
+On desktop, resize the Code sidebar and the optional Files drawer by dragging
+their separators or focusing them and pressing the arrow keys. The browser
+remembers the open panels and their widths. On narrow screens the panels open
+over the conversation.
+
+Press **Esc** from the composer to enter navigation mode. **h/l** moves between
+Agent, Code, and SOP. **j/k** selects a row in the current workspace. **i**
+returns focus to the composer. Holding **Shift** reveals shortcuts for visible
+actions. From navigation mode, **Shift+M**, **Shift+R**, and **Shift+F** open
+the Code model picker, reasoning picker, and Files drawer when available.
+**Cmd+Enter / Ctrl+Enter** sends a prompt.
+
+Model choices are drawn from the daemon's configured providers and routes.
+The daemon reports the supported reasoning levels for the selected model.
+A setting picked during a turn takes effect before the next turn. The
+controls edit the current Code session. Refreshing or closing the browser
+disconnects the client. On reconnect, Code reads the daemon's current state
+and transcript before enabling turn actions.
 
 Availability comes from `GET /api/workspace`. Empty or unavailable workspaces
 provide setup or reconnect paths. Operational metrics remain at `/system`, and
@@ -145,6 +165,9 @@ HTTP and RPC fixtures. It covers the workspace entries, modal settings search
 and focus, approvals across page changes, stale turn events, resumed task
 recovery, unavailable capabilities, mobile layout, and light mode. It writes
 screenshots to `/tmp/zeroclaw-workspace-evidence` by default.
+`web/scripts/code-keyboard-smoke.cjs` covers navigation and Shift hints,
+simultaneous Code chats, session-scoped approvals, queued settings,
+saved panel sizes, and transport recovery.
 
 Start Vite on port 5178, then run the script with an existing Playwright module
 and Chrome installation. `PLAYWRIGHT_MODULE` can be an absolute path to that

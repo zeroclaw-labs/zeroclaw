@@ -296,7 +296,7 @@ mod tests {
             "default".into(),
             AnthropicModelProviderConfig {
                 base: ModelProviderConfig {
-                    model: Some("test-model".into()),
+                    model: Some("claude-sonnet-5-5".into()),
                     ..Default::default()
                 },
                 ..Default::default()
@@ -466,6 +466,44 @@ mod tests {
             expected.canonicalize().unwrap().to_string_lossy().as_ref()
         );
         let sid = created["result"]["session_id"].as_str().unwrap();
+        let state = rpc(
+            &mut ws,
+            7,
+            "session/state",
+            json!({"session_id":sid, "include_code_settings":true}),
+        )
+        .await;
+        assert_eq!(
+            state["result"]["code_settings"]["model"],
+            "claude-sonnet-5-5"
+        );
+        assert_eq!(state["result"]["code_settings"]["can_change"], true);
+        assert_eq!(
+            state["result"]["code_settings"]["reasoning_options"][2],
+            "high"
+        );
+        let refused = rpc(&mut ws, 8, "session/configure", json!({
+            "session_id": sid, "overrides":{"model":"unconfigured-model","reasoning_effort":"high"}
+        })).await;
+        assert!(refused.get("error").is_some(), "{refused}");
+        let configured = rpc(
+            &mut ws,
+            9,
+            "session/configure",
+            json!({
+                "session_id": sid, "overrides":{"reasoning_effort":"high", "temperature":0.0}
+            }),
+        )
+        .await;
+        assert_eq!(
+            configured["result"]["overrides"]["reasoning_effort"], "high",
+            "{configured}"
+        );
+        assert!(
+            configured["result"]["overrides"]
+                .get("temperature")
+                .is_none()
+        );
         let turn = tokio_util::sync::CancellationToken::new();
         let generation = store.register_cancel_token(sid, turn);
         let activity = rpc(&mut ws, 4, "session/list-acp", json!({})).await;

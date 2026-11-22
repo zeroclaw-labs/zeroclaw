@@ -32,10 +32,6 @@ interface CodeProps {
 const modelKey = (model: CodeModel) => JSON.stringify([model.model_provider, model.model]);
 const effortLabel = (effort: string) => t(`code.effort.${effort}`);
 
-function codeTitle(row: CodeHistory) {
-  return row.name || `${row.agent_alias} · ${row.session_id.slice(0, 8)}`;
-}
-
 export default function Code({
   embedded = false, contextText, sopAssistant, onBusyChange, attentionTarget, draftScope, onAttentionOpen,
 }: CodeProps) {
@@ -49,6 +45,11 @@ export default function Code({
   const openSettings = useWorkspaceSettings();
   const [connection] = useState(() => new CodeConnection(JSON.stringify(["code-transport", owner, draftScope ?? "workspace"])));
   const snapshot = useSyncExternalStore(connection.subscribe, connection.getSnapshot);
+  function codeTitle(row: CodeHistory) {
+    const first = snapshot.chats.get(row.session_id)?.messages.find((message) => message.role === "user");
+    const preview = first?.content.trim().split("\n", 1)[0]?.slice(0, 80);
+    return row.name || preview || `${row.agent_alias} · ${row.session_id.slice(0, 8)}`;
+  }
   const [routeParams, setRouteParams] = useSearchParams();
   const [inlineParams, setInlineParams] = useState(() => new URLSearchParams({ new: "1" }));
   const lastParams = useRef(routeParams);
@@ -113,8 +114,8 @@ export default function Code({
   }, [alias, connection, embedded, id, requestedId, setRouteParams, snapshot.ready, visible]);
 
   const { ref, narrow, layout, setPane, filesWidth, filesMax, sessionsWidth, sessionsMax } = useCodeLayout(owner);
-  const showSessions = !embedded && layout.sessions.open;
   const showFiles = !embedded && access.operatorPages && layout.files.open && !!alias && !!availability?.code;
+  const showSessions = !embedded && layout.sessions.open && !(narrow && showFiles);
   const narrowOverlay = narrow && (showSessions || showFiles);
   const sessionTrigger = useRef<HTMLButtonElement>(null);
   const filesTrigger = useRef<HTMLButtonElement>(null);
@@ -135,6 +136,10 @@ export default function Code({
   reading.current.set(key, position);
   const prompt = draftStore.getDraft(key);
   const settings = chat?.settings;
+  const queuedModel = chat?.nextSettings?.model;
+  const reasoningOptions = queuedModel
+    ? settings?.models.find((model) => model.model === queuedModel && model.model_provider === chat?.nextSettings?.model_provider)?.reasoning_options ?? []
+    : settings?.reasoning_options ?? [];
   // The order is fixed by creation, so new activity, approvals and refreshed
   // labels cannot reshuffle the keys under someone's hand.
   const rows = history.filter((item) =>
@@ -158,6 +163,9 @@ export default function Code({
     const range = carets.current.get(key);
     if (range) textarea.current?.setSelectionRange(...range);
   }, [key]);
+  useEffect(() => {
+    if (visible && showSessions) ref.current?.querySelector('#code-sessions [aria-current="page"]')?.scrollIntoView({ block: "nearest" });
+  }, [id, ref, showSessions, visible]);
 
   // On desktop the drawer is non-modal. Let other browser dialogs and the
   // keyboard hint overlay handle Escape before closing it.
@@ -256,7 +264,7 @@ export default function Code({
 
   return (
     <div ref={ref} className="relative flex h-full min-h-0 min-w-0 overflow-hidden bg-pc-base">
-      {showSessions && !(narrow && showFiles) && (
+      {showSessions && (
         <CodePanel side="left" id="code-sessions" label={t("code.history")} narrow={narrow} visible={visible}
           width={sessionsWidth} minimum={154} maximum={sessionsMax} onResize={(width) => setPane("sessions", { width })}
           onClose={() => { setPane("sessions", { open: false }); sessionTrigger.current?.focus({ preventScroll: true }); }}
@@ -427,10 +435,10 @@ export default function Code({
                 </button>
                 <button type="button" data-workspace-hint="r" aria-keyshortcuts="Shift+R"
                   onClick={() => void openPicker("reasoning")}
-                  disabled={!canPick || (!!id && !settings?.reasoning_options.length)}
-                  title={id && !settings?.reasoning_options.length ? t("code.reasoning_unavailable") : undefined}
+                  disabled={!canPick || (!!id && !reasoningOptions.length)}
+                  title={id && !reasoningOptions.length ? t("code.reasoning_unavailable") : undefined}
                   className="rounded-md border border-pc-border px-2 py-1 text-pc-text-secondary hover:bg-pc-elevated disabled:opacity-60">
-                  {t("code.reasoning")} · {id && !settings?.reasoning_options.length ? t("code.unavailable_short") : effortLabel(settings?.reasoning_effort ?? "default")}
+                  {t("code.reasoning")} · {id && !reasoningOptions.length ? t("code.unavailable_short") : effortLabel(settings?.reasoning_effort ?? "default")}
                 </button>
                 {(chat?.nextSettings || chat?.settingsBusy) && <span role="status" className="text-pc-text-muted">{t(chat.nextSettings ? "code.settings_queued" : "code.settings_applying")}</span>}
               </div> : <p className="text-xs text-pc-text-muted">{t("code.send_hint")}</p>}
@@ -459,12 +467,12 @@ export default function Code({
             options={settings.models.map((model) => ({ id: modelKey(model), label: model.model, description: model.model_provider }))}
             onClose={() => setPicker(undefined)} onSelect={(choice) => {
               const model = settings.models.find((value) => modelKey(value) === choice);
-              if (model) applySettings(model);
+              if (model) applySettings({ model: model.model, model_provider: model.model_provider });
             }} />
         : id ? <CodePicker label={t("code.model")} options={[]} onClose={() => setPicker(undefined)} onSelect={() => {}} /> : null)}
       {visible && picker === "reasoning" && id && (
-        <CodePicker label={t("code.reasoning")} selected={settings?.reasoning_effort ?? "default"}
-          options={settings?.reasoning_options.length ? ["default", ...settings.reasoning_options].map((effort) => ({ id: effort, label: effortLabel(effort) })) : []}
+        <CodePicker label={t("code.reasoning")} selected={chat?.nextSettings?.reasoning_effort ?? (queuedModel ? "default" : settings?.reasoning_effort ?? "default")}
+          options={reasoningOptions.length ? ["default", ...reasoningOptions].map((effort) => ({ id: effort, label: effortLabel(effort) })) : []}
           onClose={() => setPicker(undefined)} onSelect={(effort) => applySettings({ reasoning_effort: effort })} />
       )}
     </div>

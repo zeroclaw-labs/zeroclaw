@@ -7724,10 +7724,12 @@ impl RpcDispatcher {
 
     fn can_edit_code_settings(&self) -> bool {
         self.auth.as_ref().is_some_and(|auth| {
-            self.ctx
-                .auth
-                .resolve(&auth.identity)
-                .is_ok_and(|authority| authority.grants.admin)
+            self.ctx.auth.credential_is_live(auth).is_ok()
+                && self
+                    .ctx
+                    .auth
+                    .resolve_current(auth)
+                    .is_ok_and(|authority| authority.grants.admin)
         })
     }
 
@@ -14220,7 +14222,13 @@ fn code_settings(
     };
     let choices: Vec<_> = options
         .into_iter()
-        .map(|(provider, model)| serde_json::json!({"model_provider":provider,"model":model}))
+        .map(|(provider, model)| {
+            serde_json::json!({
+                "model_provider": provider,
+                "model": model,
+                "reasoning_options": code_reasoning_efforts(config, &provider, model),
+            })
+        })
         .collect();
     Some(serde_json::json!({
         "model": model,

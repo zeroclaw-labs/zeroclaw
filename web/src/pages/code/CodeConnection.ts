@@ -19,13 +19,13 @@ export interface CodeModel {
 }
 
 export interface CodeSettings extends CodeModel {
-  models: CodeModel[];
+  models: (CodeModel & { reasoning_options?: string[] })[];
   reasoning_effort: string | null;
   reasoning_options: string[];
   can_change: boolean;
 }
 
-export type CodeSettingsPatch = CodeModel | { reasoning_effort: string };
+export type CodeSettingsPatch = Partial<CodeModel> & { reasoning_effort?: string };
 
 interface SessionIdentity {
   session_id: string;
@@ -482,7 +482,9 @@ export class CodeConnection {
     const chat = this.snapshot.chats.get(id);
     if (!chat?.attached || !chat.settings?.can_change || chat.settingsBusy) return;
     if (chat.busy) {
-      this.edit(id, (current) => ({ ...current, nextSettings: patch }));
+      this.edit(id, (current) => ({
+        ...current, nextSettings: patch.model ? patch : { ...current.nextSettings, ...patch },
+      }));
       return;
     }
     this.edit(id, (current) => ({ ...current, settingsBusy: true, nextSettings: undefined, error: null }));
