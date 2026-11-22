@@ -2497,11 +2497,100 @@ mod inbound {
         // classified before anything consumes the body: the event's own
         // `body` is the pre-edit fallback ("* old text"), so letting it
         // through would start a duplicate turn. Disabled (default): edits
-        // are dropped entirely. Enabled: the corrected `m.new_content` body
-        // flows through the ordinary pipeline, marked `edited`.
+        // are dropped entirely. Enabled: the edit is resolved against the
+        // replaced event and the corrected `m.new_content` flows through
+        // the ordinary pipeline, marked `edited`.
         let mut edited = false;
+        let mut edit_timestamp: Option<u64> = None;
+        let mut raw = raw;
         let body = match inbound::classify_replacement(&raw) {
-            Some(inbound::InboundEdit::Text { original, body }) if ctx.config.edited_messages => {
+            inbound::ReplacementClass::NotAReplacement => body,
+            inbound::ReplacementClass::Malformed => {
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({
+                            "event_id": ev.event_id.to_string(),
+                        })),
+                    "matrix: drop malformed replacement event"
+                );
+                return Ok(());
+            }
+            inbound::ReplacementClass::NonText => {
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({
+                            "reason": "non_text_edit",
+                            "event_id": ev.event_id.to_string(),
+                        })),
+                    "matrix: drop replacement event"
+                );
+                return Ok(());
+            }
+            inbound::ReplacementClass::Text {
+                original,
+                new_content,
+            } => {
+                if !ctx.config.edited_messages {
+                    ::zeroclaw_log::record!(
+                        DEBUG,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_attrs(::serde_json::json!({
+                                "reason": "edited_messages_disabled",
+                                "event_id": ev.event_id.to_string(),
+                            })),
+                        "matrix: drop replacement event"
+                    );
+                    return Ok(());
+                }
+                // Resolve the edit against the replaced event before
+                // admitting it. The replacement event carries no thread or
+                // reply relations of its own — they live on the original —
+                // and MSC2676 restricts an edit to the original's sender.
+                let Some(resolved) = inbound::resolve_replacement_target(&room, &original).await
+                else {
+                    ::zeroclaw_log::record!(
+                        DEBUG,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_attrs(::serde_json::json!({
+                                "original_event_id": original,
+                                "event_id": ev.event_id.to_string(),
+                            })),
+                        "matrix: drop replacement with invalid or missing target"
+                    );
+                    return Ok(());
+                };
+                if resolved.sender != ev.sender.as_str() {
+                    ::zeroclaw_log::record!(
+                        DEBUG,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_attrs(::serde_json::json!({
+                                "original_event_id": original,
+                                "original_sender": resolved.sender,
+                                "editor": ev.sender.to_string(),
+                            })),
+                        "matrix: drop replacement from a different sender"
+                    );
+                    return Ok(());
+                }
+                let original_ts = resolved.origin_server_ts_ms / 1000;
+                let now = SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                if now.saturating_sub(original_ts) > inbound::EDIT_FRESHNESS_SECS {
+                    ::zeroclaw_log::record!(
+                        DEBUG,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_attrs(::serde_json::json!({
+                                "original_event_id": original,
+                                "original_ts": original_ts,
+                            })),
+                        "matrix: drop replacement of a stale original"
+                    );
+                    return Ok(());
+                }
                 ::zeroclaw_log::record!(
                     DEBUG,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -2512,25 +2601,29 @@ mod inbound {
                     "matrix: accept replacement event"
                 );
                 edited = true;
-                body
+                edit_timestamp = Some(original_ts);
+                // The rest of handle_message reads `raw`; rebuild it as the
+                // corrected content grafted onto the original's relation
+                // context so thread anchoring, reply-parent media, and the
+                // mention gate all inherit the conversation the edit
+                // belongs to. The timestamp follows the ORIGINAL, not the
+                // edit: an edit clarifies history, it is not a live prompt.
+                let effective_content =
+                    inbound::overlay_edit_content(&resolved.raw_content, &new_content);
+                let mut effective_event: JsonValue =
+                    serde_json::from_str(raw.get()).unwrap_or_default();
+                effective_event["content"] = effective_content;
+                if let Ok(raw_value) =
+                    serde_json::value::RawValue::from_string(effective_event.to_string())
+                {
+                    raw = RawEvent(raw_value);
+                }
+                new_content
+                    .get("body")
+                    .and_then(JsonValue::as_str)
+                    .unwrap_or("")
+                    .to_string()
             }
-            Some(edit) => {
-                let reason = match edit {
-                    inbound::InboundEdit::Text { .. } => "edited_messages_disabled",
-                    inbound::InboundEdit::NonText => "non_text_edit",
-                };
-                ::zeroclaw_log::record!(
-                    DEBUG,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_attrs(::serde_json::json!({
-                            "reason": reason,
-                            "event_id": ev.event_id.to_string(),
-                        })),
-                    "matrix: drop replacement event"
-                );
-                return Ok(());
-            }
-            None => body,
         };
         let sender = ev.sender.as_str();
         let room_id = room.room_id().as_str();
@@ -2755,10 +2848,15 @@ mod inbound {
             content,
             channel: "matrix".to_string(),
             channel_alias: Some(ctx.alias.clone()),
-            timestamp: SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
+            // An edit inherits the ORIGINAL's send time, not the edit time:
+            // the freshness policy (and any consumer keying on age) must see
+            // when the conversation actually happened.
+            timestamp: edit_timestamp.unwrap_or_else(|| {
+                SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs()
+            }),
             thread_ts: outbound_anchor.clone(),
             interruption_scope_id: interruption_scope,
             attachments,
@@ -2848,33 +2946,147 @@ mod inbound {
         event_id.parse().ok()
     }
 
-    /// Classification of an inbound edit (Matrix `m.replace` replacement
-    /// event). A replacement arrives as its own `m.room.message` event whose
-    /// content carries `m.relates_to` with `rel_type = "m.replace"` and the
-    /// corrected content under `m.new_content`.
-    pub(super) enum InboundEdit {
-        /// Text edit: the original event id and the corrected body.
-        Text { original: String, body: String },
-        /// Replacement of a non-text message (media, poll, ...): the v1
-        /// inbound pipeline has no edit semantics for these.
+    /// Classification of an inbound replacement event (Matrix `m.replace`).
+    /// A replacement arrives as its own `m.room.message` event whose content
+    /// carries `m.relates_to` with `rel_type = "m.replace"` and the corrected
+    /// content under `m.new_content`.
+    pub(super) enum ReplacementClass {
+        /// Not a replacement event — `handle_message` continues on the
+        /// ordinary path.
+        NotAReplacement,
+        /// `rel_type = "m.replace"` is present but the event is malformed:
+        /// a missing target `event_id`, `m.new_content`, `msgtype`, or
+        /// `body`. The spec treats such a replacement as invalid, so it is
+        /// ignored — in both modes. Falling through to the ordinary path
+        /// would process the `* …` fallback body as a new message, which is
+        /// the duplicate-turn behavior this feature exists to stop.
+        Malformed,
+        /// A valid text replacement: the original event id and the
+        /// corrected content (`m.new_content`, taken wholesale — body,
+        /// msgtype, and the full `m.mentions` set).
+        Text {
+            original: String,
+            new_content: JsonValue,
+        },
+        /// A valid replacement of a non-text message (media, poll, ...):
+        /// the v1 inbound pipeline has no edit semantics for these.
         NonText,
     }
 
-    pub(super) fn classify_replacement(raw: &RawEvent) -> Option<InboundEdit> {
-        let v: JsonValue = serde_json::from_str(raw.get()).ok()?;
-        let relates = v.get("content")?.get("m.relates_to")?;
-        if relates.get("rel_type")?.as_str()? != "m.replace" {
+    pub(super) fn classify_replacement(raw: &RawEvent) -> ReplacementClass {
+        let Ok(v) = serde_json::from_str::<JsonValue>(raw.get()) else {
+            return ReplacementClass::NotAReplacement;
+        };
+        let Some(relates) = v.get("content").and_then(|c| c.get("m.relates_to")) else {
+            return ReplacementClass::NotAReplacement;
+        };
+        if relates.get("rel_type").and_then(JsonValue::as_str) != Some("m.replace") {
+            return ReplacementClass::NotAReplacement;
+        }
+        let Some(original) = relates
+            .get("event_id")
+            .and_then(JsonValue::as_str)
+            .filter(|s| !s.is_empty())
+        else {
+            return ReplacementClass::Malformed;
+        };
+        let Some(new_content) = v.get("content").and_then(|c| c.get("m.new_content")) else {
+            return ReplacementClass::Malformed;
+        };
+        match new_content.get("msgtype").and_then(JsonValue::as_str) {
+            Some("m.text" | "m.notice") => {
+                if new_content
+                    .get("body")
+                    .and_then(JsonValue::as_str)
+                    .is_some_and(|b| !b.is_empty())
+                {
+                    ReplacementClass::Text {
+                        original: original.to_string(),
+                        new_content: new_content.clone(),
+                    }
+                } else {
+                    ReplacementClass::Malformed
+                }
+            }
+            Some(_) => ReplacementClass::NonText,
+            None => ReplacementClass::Malformed,
+        }
+    }
+
+    /// How long after the ORIGINAL an edit still starts a turn. Fixing a
+    /// typo in an old message clarifies history, it is not a live prompt;
+    /// edits of older originals are dropped. Matches the freshness window
+    /// of the Telegram edit policy (#12371) so both channels bound edits
+    /// the same way.
+    pub(super) const EDIT_FRESHNESS_SECS: u64 = 600;
+
+    /// The replaced event of an accepted edit, resolved and validated.
+    pub(super) struct ReplacementTarget {
+        pub(super) sender: String,
+        pub(super) origin_server_ts_ms: u64,
+        pub(super) raw_content: JsonValue,
+    }
+
+    /// Fetch and validate the event a replacement targets. Returns `None`
+    /// when the target is missing or invalid per MSC2676: another sender, a
+    /// non-message event, a redacted event, or an edit of an edit.
+    pub(super) async fn resolve_replacement_target(
+        room: &Room,
+        event_id: &str,
+    ) -> Option<ReplacementTarget> {
+        let target: OwnedEventId = event_id.parse().ok()?;
+        let timeline = room.event(&target, None).await.ok()?;
+        let v: JsonValue = serde_json::from_str(timeline.raw().json().get()).ok()?;
+        if v.get("type").and_then(JsonValue::as_str) != Some("m.room.message") {
             return None;
         }
-        let original = relates.get("event_id")?.as_str()?.to_string();
-        let new_content = v.get("content")?.get("m.new_content")?;
-        match new_content.get("msgtype")?.as_str()? {
-            "m.text" | "m.notice" => Some(InboundEdit::Text {
-                original,
-                body: new_content.get("body")?.as_str()?.to_string(),
-            }),
-            _ => Some(InboundEdit::NonText),
+        // A redacted event keeps its id but loses its content; editing one
+        // is meaningless and the spec says to ignore the replacement.
+        if v.get("unsigned")
+            .and_then(|u| u.get("redacted_because"))
+            .is_some()
+        {
+            return None;
         }
+        let content = v.get("content")?.clone();
+        if content.as_object().is_some_and(|o| o.is_empty()) {
+            return None;
+        }
+        // An edit of an edit: the chain is anchored on the first
+        // replacement's target instead.
+        if content
+            .get("m.relates_to")
+            .and_then(|r| r.get("rel_type"))
+            .and_then(JsonValue::as_str)
+            .is_some_and(|t| t == "m.replace")
+        {
+            return None;
+        }
+        let sender = v.get("sender").and_then(JsonValue::as_str)?.to_string();
+        let origin_server_ts_ms = v.get("origin_server_ts").and_then(JsonValue::as_u64)?;
+        Some(ReplacementTarget {
+            sender,
+            origin_server_ts_ms,
+            raw_content: content,
+        })
+    }
+
+    /// Compose the content the rest of `handle_message` reads for an
+    /// accepted edit: `m.new_content` wholesale (corrected body, msgtype,
+    /// and the full `m.mentions` set), grafted onto the ORIGINAL's relation
+    /// context (`m.relates_to` — the thread root and `m.in_reply_to`). The
+    /// replacement event itself carries none of those relations; without
+    /// the graft an in-thread edit would anchor a brand-new thread on the
+    /// replacement event and an edited reply would lose its parent.
+    pub(super) fn overlay_edit_content(
+        original_content: &JsonValue,
+        new_content: &JsonValue,
+    ) -> JsonValue {
+        let mut effective = new_content.clone();
+        if let Some(relates) = original_content.get("m.relates_to") {
+            effective["m.relates_to"] = relates.clone();
+        }
+        effective
     }
 
     pub(super) fn is_voice_message(raw: &RawEvent) -> bool {
@@ -8405,6 +8617,33 @@ mod tests {
             })
         }
 
+        /// The replaced event `$orig:localhost` as the homeserver serves it
+        /// for the edit-resolution fetch.
+        fn original_event(
+            sender: &str,
+            origin_server_ts_ms: u64,
+            relates_to: serde_json::Value,
+        ) -> serde_json::Value {
+            serde_json::json!({
+                "type": "m.room.message",
+                "event_id": "$orig:localhost",
+                "sender": sender,
+                "origin_server_ts": origin_server_ts_ms,
+                "content": {
+                    "msgtype": "m.text",
+                    "body": "origianl text",
+                    "m.relates_to": relates_to,
+                }
+            })
+        }
+
+        fn now_ms() -> u64 {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64
+        }
+
         #[tokio::test]
         async fn sync_ingress_drops_text_replacement_by_default() {
             let matrix = MatrixMockServer::new().await;
@@ -8440,6 +8679,16 @@ mod tests {
             let matrix = MatrixMockServer::new().await;
             let client = matrix.client_builder().build().await;
             matrix.sync_joined_room(&client, test_room()).await;
+            mount_parent_event(
+                &matrix,
+                original_event(
+                    "@operator:localhost",
+                    now_ms() - 60_000,
+                    serde_json::json!(null),
+                ),
+                1,
+            )
+            .await;
             let (tx, mut inbound_rx) = mpsc::channel(4);
             let ctx = test_ctx(
                 tx,
@@ -8461,6 +8710,175 @@ mod tests {
             let msg = recv_forwarded(&mut inbound_rx).await;
             assert_eq!(msg.content, "corrected text");
             assert!(msg.edited, "enabled edits must be marked for the runtime");
+        }
+
+        #[tokio::test]
+        async fn sync_ingress_keeps_original_thread_for_threaded_replacement() {
+            let matrix = MatrixMockServer::new().await;
+            let client = matrix.client_builder().build().await;
+            matrix.sync_joined_room(&client, test_room()).await;
+            mount_parent_event(
+                &matrix,
+                original_event(
+                    "@operator:localhost",
+                    now_ms() - 60_000,
+                    serde_json::json!({
+                        "rel_type": "m.thread",
+                        "event_id": "$root:localhost"
+                    }),
+                ),
+                1,
+            )
+            .await;
+            let (tx, mut inbound_rx) = mpsc::channel(4);
+            let ctx = test_ctx(
+                tx,
+                MatrixConfig {
+                    allowed_rooms: vec![test_room().to_string()],
+                    edited_messages: true,
+                    ..MatrixConfig::default()
+                },
+            );
+            let _guards = register_event_handlers(&client, &ctx);
+            matrix
+                .sync_room(
+                    &client,
+                    JoinedRoomBuilder::new(test_room()).add_timeline_event(timeline_raw(
+                        &replacement_event("m.text", "corrected text"),
+                    )),
+                )
+                .await;
+            let msg = recv_forwarded(&mut inbound_rx).await;
+            assert_eq!(
+                msg.thread_ts.as_deref(),
+                Some("$root:localhost"),
+                "an edit inside a thread must stay in the original thread, not anchor a new one on the replacement event"
+            );
+        }
+
+        #[tokio::test]
+        async fn sync_ingress_drops_replacement_of_another_senders_message() {
+            let matrix = MatrixMockServer::new().await;
+            let client = matrix.client_builder().build().await;
+            matrix.sync_joined_room(&client, test_room()).await;
+            mount_parent_event(
+                &matrix,
+                original_event(
+                    "@someone-else:localhost",
+                    now_ms() - 60_000,
+                    serde_json::json!(null),
+                ),
+                1,
+            )
+            .await;
+            let (tx, mut inbound_rx) = mpsc::channel(4);
+            let ctx = test_ctx(
+                tx,
+                MatrixConfig {
+                    allowed_rooms: vec![test_room().to_string()],
+                    edited_messages: true,
+                    ..MatrixConfig::default()
+                },
+            );
+            let _guards = register_event_handlers(&client, &ctx);
+            matrix
+                .sync_room(
+                    &client,
+                    JoinedRoomBuilder::new(test_room()).add_timeline_event(timeline_raw(
+                        &replacement_event("m.text", "corrected text"),
+                    )),
+                )
+                .await;
+            assert!(
+                tokio::time::timeout(Duration::from_millis(300), inbound_rx.recv())
+                    .await
+                    .is_err(),
+                "MSC2676: an edit is valid only for the original sender's own message"
+            );
+        }
+
+        #[tokio::test]
+        async fn sync_ingress_drops_replacement_of_stale_original() {
+            let matrix = MatrixMockServer::new().await;
+            let client = matrix.client_builder().build().await;
+            matrix.sync_joined_room(&client, test_room()).await;
+            mount_parent_event(
+                &matrix,
+                original_event(
+                    "@operator:localhost",
+                    now_ms() - 700_000,
+                    serde_json::json!(null),
+                ),
+                1,
+            )
+            .await;
+            let (tx, mut inbound_rx) = mpsc::channel(4);
+            let ctx = test_ctx(
+                tx,
+                MatrixConfig {
+                    allowed_rooms: vec![test_room().to_string()],
+                    edited_messages: true,
+                    ..MatrixConfig::default()
+                },
+            );
+            let _guards = register_event_handlers(&client, &ctx);
+            matrix
+                .sync_room(
+                    &client,
+                    JoinedRoomBuilder::new(test_room()).add_timeline_event(timeline_raw(
+                        &replacement_event("m.text", "corrected text"),
+                    )),
+                )
+                .await;
+            assert!(
+                tokio::time::timeout(Duration::from_millis(300), inbound_rx.recv())
+                    .await
+                    .is_err(),
+                "fixing a typo in a message older than the freshness window clarifies history, it must not start a turn"
+            );
+        }
+
+        #[tokio::test]
+        async fn sync_ingress_drops_malformed_replacement_in_both_modes() {
+            let matrix = MatrixMockServer::new().await;
+            let client = matrix.client_builder().build().await;
+            matrix.sync_joined_room(&client, test_room()).await;
+            let malformed = serde_json::json!({
+                "type": "m.room.message",
+                "event_id": "$edit1:localhost",
+                "sender": "@operator:localhost",
+                "origin_server_ts": 1_000_010u64,
+                "content": {
+                    "msgtype": "m.text",
+                    "body": "* corrected text",
+                    "m.relates_to": { "rel_type": "m.replace", "event_id": "$orig:localhost" }
+                }
+            });
+            for edited_messages in [false, true] {
+                let (tx, mut inbound_rx) = mpsc::channel(4);
+                let ctx = test_ctx(
+                    tx,
+                    MatrixConfig {
+                        allowed_rooms: vec![test_room().to_string()],
+                        edited_messages,
+                        ..MatrixConfig::default()
+                    },
+                );
+                let _guards = register_event_handlers(&client, &ctx);
+                matrix
+                    .sync_room(
+                        &client,
+                        JoinedRoomBuilder::new(test_room())
+                            .add_timeline_event(timeline_raw(&malformed)),
+                    )
+                    .await;
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(300), inbound_rx.recv())
+                        .await
+                        .is_err(),
+                    "a malformed replacement (no m.new_content) must be ignored in both modes, not processed as a new message with the fallback body (edited_messages={edited_messages})"
+                );
+            }
         }
 
         #[tokio::test]
