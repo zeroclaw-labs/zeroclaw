@@ -294,6 +294,7 @@ let page;
     }
     await route.fulfill({ contentType: 'application/json', body: JSON.stringify(body) });
   });
+  let holdHelperTurn = false;
   await context.routeWebSocket('**/ws/code', (ws) => {
     sockets++;
     let sid = `helper-${sockets}`;
@@ -312,6 +313,10 @@ let page;
         assert.ok(
           frame.params.prompt.includes('Treat the following JSON as the current draft data'),
         );
+        if (holdHelperTurn) {
+          requestHelperApproval();
+          return;
+        }
         const proposal = sop('New workflow', 'Drafted with the helper');
         proposal.steps = proposal.steps.map((step) => ({ ...step, number: step.number + 10 }));
         ws.send(
@@ -556,7 +561,10 @@ let page;
   assert.equal(await helper.inputValue(), 'Keep this unsent helper draft');
   assert.equal(sockets, helperSockets);
   assert.equal(helperSessions, beforeRenameSessions, 'rename must retain the helper session');
-  requestHelperApproval();
+  holdHelperTurn = true;
+  await helper.fill('Check the renamed workflow');
+  await helper.press('Control+Enter');
+  await helper.fill('Keep this unsent helper draft');
   const attention = page.getByRole('link', { name: /Needs your attention/ });
   await attention.waitFor();
   assert.equal(await attention.getAttribute('href'), '/sops/Renamed%20workflow/edit');

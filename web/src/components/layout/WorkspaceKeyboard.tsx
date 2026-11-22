@@ -1,6 +1,7 @@
 import { createContext, useCallback, useContext, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { useLocation, useNavigate } from "react-router-dom";
+import { basePath } from "@/lib/basePath";
 import { pathAccess, type NavAccess } from "@/lib/navAccess";
 import { t } from "@/lib/i18n";
 import { adjacentItem, assignHints, workspaceForPath, workspaces, type WorkspaceId } from "@/lib/workspaceKeys";
@@ -93,7 +94,12 @@ export default function WorkspaceKeyboard({ access, children }: { access: NavAcc
   const navigate = useNavigate();
   const location = useLocation();
   const workspace = workspaceForPath(location.pathname);
-  const [navigation, setNavigation] = useState(false);
+  const [navigation, setNavigationState] = useState(false);
+  const navigationRef = useRef(false);
+  const setNavigation = useCallback((value: boolean) => {
+    navigationRef.current = value;
+    setNavigationState(value);
+  }, []);
   const [hints, setHints] = useState<HintLayer | null>(null);
   const [prefix, setPrefix] = useState("");
   const [revision, redraw] = useState(0);
@@ -120,7 +126,7 @@ export default function WorkspaceKeyboard({ access, children }: { access: NavAcc
   const enterNavigation = useCallback(() => {
     setNavigation(true);
     keyboardFocus.current?.focus({ preventScroll: true });
-  }, []);
+  }, [setNavigation]);
 
   useLayoutEffect(() => {
     if (!workspace) return;
@@ -133,13 +139,13 @@ export default function WorkspaceKeyboard({ access, children }: { access: NavAcc
   useEffect(() => {
     if (!workspace || pendingFocus.current !== workspace || !root.current) return;
     const focus = () => {
-      if (workspace === "code" || workspace === "agent") {
+      if (workspace === "code") {
         if (!focusComposer()) return false;
         setNavigation(false);
       } else {
         const target = remembered.current[workspace]?.focus;
-        if (target && visibleBox(target)) target.focus({ preventScroll: true });
-        else keyboardFocus.current?.focus({ preventScroll: true });
+        if (target && isEnabled(target) && visibleBox(target)) target.focus({ preventScroll: true });
+        else if (workspace !== "agent" || !focusComposer()) keyboardFocus.current?.focus({ preventScroll: true });
       }
       pendingFocus.current = null;
       return true;
@@ -149,7 +155,7 @@ export default function WorkspaceKeyboard({ access, children }: { access: NavAcc
       if (!focus() && root.current) observer.observe(root.current, { childList: true, subtree: true, attributes: true, attributeFilter: ["disabled", "hidden"] });
     });
     return () => { cancelAnimationFrame(frame); observer.disconnect(); };
-  }, [workspace]);
+  }, [location.key, setNavigation, workspace]);
 
   useEffect(() => {
     if (!hints) return;
@@ -167,6 +173,10 @@ export default function WorkspaceKeyboard({ access, children }: { access: NavAcc
 
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
+      // The URL can change before a lazy route or its effects have committed.
+      // Read the destination synchronously when two keys arrive back to back.
+      const path = window.location.pathname.slice(basePath.length);
+      const workspace = workspaceForPath(path);
       if (!workspace || event.defaultPrevented || event.isComposing || event.keyCode === 229) return;
       if (event.key === "Escape" && hintRef.current) {
         closeHints();
@@ -178,7 +188,7 @@ export default function WorkspaceKeyboard({ access, children }: { access: NavAcc
       const target = event.target instanceof HTMLElement ? event.target : undefined;
       const modified = event.altKey || event.metaKey || event.ctrlKey;
       if (modified) return;
-      if (event.key === "Shift" && navigation && !event.repeat) {
+      if (event.key === "Shift" && navigationRef.current && !event.repeat && !target?.matches(editable)) {
         const scope = dialog ?? document.body;
         const targets = [...scope.querySelectorAll<HTMLElement>(clickable)].filter((element) =>
           isEnabled(element) && visibleBox(element));
@@ -217,7 +227,7 @@ export default function WorkspaceKeyboard({ access, children }: { access: NavAcc
         event.preventDefault();
         return;
       }
-      if (!navigation || target?.matches(editable)) return;
+      if (!navigationRef.current || target?.matches(editable)) return;
       if (event.key === "i") {
         if (focusComposer()) {
           setNavigation(false);
@@ -231,6 +241,10 @@ export default function WorkspaceKeyboard({ access, children }: { access: NavAcc
         if (index < 0 || allowed.length < 2) return;
         const step = event.key === "l" ? 1 : -1;
         const next = allowed[(index + step + allowed.length) % allowed.length]!;
+        remembered.current[workspace] = {
+          ...remembered.current[workspace],
+          path: path + window.location.search + window.location.hash,
+        };
         pendingFocus.current = next.id;
         void navigate(remembered.current[next.id]?.path ?? next.path);
         event.preventDefault();
@@ -260,7 +274,7 @@ export default function WorkspaceKeyboard({ access, children }: { access: NavAcc
       window.removeEventListener("keyup", release);
       window.removeEventListener("blur", closeHints);
     };
-  }, [access, closeHints, enterNavigation, navigate, navigation, workspace]);
+  }, [access, closeHints, enterNavigation, navigate, setNavigation]);
 
   const toggle = workspace && (
     <button type="button" ref={keyboardFocus}

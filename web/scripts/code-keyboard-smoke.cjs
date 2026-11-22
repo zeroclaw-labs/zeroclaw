@@ -37,6 +37,7 @@ const second = makeSession("fixture-b", "reviewer", "Review the release", "01");
         "/api/sops/runs": { runs: [] },
       };
       if (path === "/api/events") return route.fulfill({ contentType: "text/event-stream", body: ": fixture\n\n" });
+      if (path.endsWith("/workspace/list")) return route.fulfill({ json: { path: "", entries: [] } });
       return route.fulfill({ json: responses[path] ?? {} });
     });
     const messages = {
@@ -125,7 +126,7 @@ const second = makeSession("fixture-b", "reviewer", "Review the release", "01");
     await page.getByRole("link", { name: "L0", exact: true }).waitFor();
     await navigate();
     await page.keyboard.down("Shift");
-    const badges = page.locator("kbd.pointer-events-auto, kbd.fixed");
+    const badges = page.locator("kbd.fixed");
     assert.ok(await badges.count() > 26);
     assert.ok((await badges.allTextContents()).some((text) => text.length === 2));
     await page.keyboard.up("Shift");

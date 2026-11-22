@@ -80,9 +80,10 @@ export default function Code({
   const selected = requestedId ? history.find((row) => row.session_id === requestedId &&
     (!requestedAgent || row.agent_alias === requestedAgent))
     : !params.has("new") && !embedded ? resumeCodeSession(history, availability?.agents ?? []) as CodeHistory | undefined : undefined;
-  const alias = selected?.agent_alias ?? (requestedAgent && availability?.agents.includes(requestedAgent) ? requestedAgent
+  const inlineChat = embedded && requestedId ? snapshot.chats.get(requestedId) : undefined;
+  const alias = selected?.agent_alias ?? inlineChat?.alias ?? (requestedAgent && availability?.agents.includes(requestedAgent) ? requestedAgent
     : availability?.agents.find((item) => item === loadCodeSelection()?.agent) ?? availability?.agents[0] ?? "");
-  const id = selected?.session_id;
+  const id = selected?.session_id ?? (inlineChat ? requestedId ?? undefined : undefined);
   const [draftModel, setDraftModel] = useState<string>();
   useEffect(() => {
     setDraftModel(undefined);
@@ -145,7 +146,7 @@ export default function Code({
   const rows = history.filter((item) =>
     `${codeTitle(item)} ${item.agent_alias} ${item.session_id}`.toLowerCase().includes(query.toLowerCase()))
     .sort((a, b) => b.created_at.localeCompare(a.created_at) || a.session_id.localeCompare(b.session_id));
-  const missing = requestedId !== null && snapshot.loaded && !selected;
+  const missing = requestedId !== null && snapshot.loaded && !id;
 
   const select = (row: CodeHistory) => {
     setPicker(undefined);
@@ -267,7 +268,7 @@ export default function Code({
       {showSessions && (
         <CodePanel side="left" id="code-sessions" label={t("code.history")} narrow={narrow} visible={visible}
           width={sessionsWidth} minimum={154} maximum={sessionsMax} onResize={(width) => setPane("sessions", { width })}
-          onClose={() => { setPane("sessions", { open: false }); sessionTrigger.current?.focus({ preventScroll: true }); }}
+          onClose={() => { setPane("sessions", { open: false }); requestAnimationFrame(() => sessionTrigger.current?.focus({ preventScroll: true })); }}
           actions={
             <button type="button" aria-label={t("code.new_session")} title={t("code.new_session")} disabled={!alias}
               onClick={() => {
@@ -458,7 +459,7 @@ export default function Code({
       {showFiles && (
         <CodePanel side="right" id="code-files" label={t("code.files")} narrow={narrow} visible={visible}
           width={filesWidth} minimum={276} maximum={filesMax} onResize={(width) => setPane("files", { width })}
-          onClose={() => { setPane("files", { open: false }); filesTrigger.current?.focus({ preventScroll: true }); }}>
+          onClose={() => { setPane("files", { open: false }); requestAnimationFrame(() => filesTrigger.current?.focus({ preventScroll: true })); }}>
           <CodeFiles key={alias} alias={alias} refresh={chat?.refresh ?? 0} />
         </CodePanel>
       )}
