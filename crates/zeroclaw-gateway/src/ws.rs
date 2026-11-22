@@ -25,12 +25,13 @@ use std::sync::Arc;
 use std::time::Duration;
 use zeroclaw_api::channel::ChannelApprovalResponse;
 use zeroclaw_api::ingress::{IngressContext, SourceClass, Transport, TrustClass, TurnOrigin};
+use zeroclaw_channels::orchestrator::consolidation::build_consolidation_model as ws_consolidation_model;
 use zeroclaw_runtime::agent::SteeringInput;
 #[cfg(test)]
 use zeroclaw_runtime::agent::turn_accounting::resolve_done_context_limits;
 pub(crate) use zeroclaw_runtime::agent::turn_accounting::{
     ContextDisplay, ProviderUsageEntry, SafeguardFallbackDisplay, UsageFold,
-    build_consolidation_model as ws_consolidation_model, done_frame_context_limits,
+    done_frame_context_limits,
 };
 use zeroclaw_runtime::sop::approval::{
     ApprovalDecision as SopApprovalDecision, ApprovalPrincipal as SopApprovalPrincipal,
