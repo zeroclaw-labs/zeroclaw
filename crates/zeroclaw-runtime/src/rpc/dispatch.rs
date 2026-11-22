@@ -3625,7 +3625,7 @@ impl RpcDispatcher {
     // ── Core handlers ────────────────────────────────────────────
 
     async fn handle_initialize(&mut self, params: &Value) -> RpcResult {
-        let req: InitializeParams = parse_params(params)?;
+        let mut req: InitializeParams = parse_params(params)?;
 
         if req.protocol_version != RPC_PROTOCOL_VERSION {
             return Err(rpc_err(
@@ -3717,23 +3717,30 @@ impl RpcDispatcher {
             connection_auth.code_workspace = true;
         }
 
-        // A Code transport identity is usable only by Code and only by its
-        // original principal. A signed identity from another RPC client
-        // must never turn its pre-existing conversation into a Code session.
-        let code_prefix = connection_auth.code_workspace.then(|| {
+        // A live Code conversation was opened with a particular agent and tool
+        // scope. A permission change starts a fresh transport instead of
+        // reattaching that conversation under a different set of grants.
+        let code_prefix = if connection_auth.code_workspace {
             use sha2::{Digest, Sha256};
-            format!(
-                "web-code-{:x}-",
-                Sha256::digest(connection_auth.principal.id.as_str().as_bytes())
-            )
-        });
+            let domain = serde_json::to_vec(&(
+                connection_auth.principal.id.as_str(),
+                &connection_auth.grants,
+            ))
+            .map_err(|_| rpc_err(INTERNAL_ERROR, "Cannot encode Code authority"))?;
+            Some(format!("web-code-{:x}-", Sha256::digest(domain)))
+        } else {
+            None
+        };
         if let Some(id) = req.tui_id.as_deref() {
-            let valid_domain = match &code_prefix {
-                Some(prefix) => id.starts_with(prefix),
-                None => !id.starts_with("web-code-"),
-            };
-            if !valid_domain {
-                return Err(rpc_err(AUTH_REQUIRED, "Invalid TUI identity"));
+            match &code_prefix {
+                Some(prefix) if !id.starts_with(prefix) => {
+                    req.tui_id = None;
+                    req.tui_sig = None;
+                }
+                None if id.starts_with("web-code-") => {
+                    return Err(rpc_err(AUTH_REQUIRED, "Invalid TUI identity"));
+                }
+                _ => {}
             }
         }
 

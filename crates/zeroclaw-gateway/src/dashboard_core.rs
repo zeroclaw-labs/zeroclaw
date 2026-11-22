@@ -2625,6 +2625,11 @@ mod tests {
             session.principal().id.as_str(),
             "{init}"
         );
+        let receipt = json!({
+            "tui_id": init["result"]["tui_id"],
+            "tui_sig": init["result"]["tui_sig"],
+        });
+        assert!(receipt["tui_id"].is_string());
         let bad = rpc(&mut ws, 2, "session/new", json!({"agent_alias":"other"})).await;
         assert!(bad["error"].is_object(), "{bad}");
         let created = rpc(&mut ws, 3, "session/new", json!({"agent_alias":"support"})).await;
@@ -2632,7 +2637,8 @@ mod tests {
         let id = created["result"]["session_id"].as_str().unwrap();
         let (bob, _) = fixture.sign_in("bob").await;
         let (mut other, _) = connect_async(request(&bob)).await.unwrap();
-        let init = rpc(&mut other, 1, "initialize", json!({})).await;
+        let init = rpc(&mut other, 1, "initialize", receipt.clone()).await;
+        assert_ne!(init["result"]["tui_id"], receipt["tui_id"]);
         assert!(init["result"].is_object(), "{init}");
         for method in [
             "session/messages",
@@ -2643,8 +2649,23 @@ mod tests {
             let answer = rpc(&mut other, 2, method, json!({"session_id":id})).await;
             assert!(answer["error"].is_object(), "{method}: {answer}");
         }
+        fixture.narrow_profile_everywhere("chat-user", |profile| {
+            profile.allowed_code_agents = vec!["other".into()];
+        });
+        let (mut narrowed, _) = connect_async(request(&alice)).await.unwrap();
+        let fresh = rpc(&mut narrowed, 1, "initialize", receipt.clone()).await;
+        assert!(fresh["result"]["tui_id"].is_string(), "{fresh}");
+        assert_ne!(fresh["result"]["tui_id"], receipt["tui_id"]);
+        let denied = rpc(
+            &mut narrowed,
+            2,
+            "session/messages",
+            json!({"session_id":id}),
+        )
+        .await;
+        assert!(denied["error"].is_object(), "{denied}");
         fixture.auth.end(&session);
-        let ended = tokio::time::timeout(Duration::from_secs(5), ws.next())
+        let ended = tokio::time::timeout(Duration::from_secs(5), narrowed.next())
             .await
             .expect("sign-out closes Code");
         assert!(!matches!(ended, Some(Ok(ClientMessage::Text(_)))));

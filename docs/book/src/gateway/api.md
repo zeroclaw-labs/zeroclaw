@@ -68,10 +68,14 @@ permission checks.
 
 ### Code workspace WebSocket
 
-`/ws/code` bridges code-session JSON-RPC to the daemon's local IPC listener.
-Paired clients use an issued token. Signed-in browsers use their existing dashboard cookie on a same-origin connection. The gateway presents the held access token only to the provider-bound in-process core connector. Each signed-in account operates on its own Code sessions, including administrators. Browser clients supply subprotocols
-`zeroclaw.code.v1` and `bearer.<token>`; non-browser clients may use an
-`Authorization: Bearer ...` header. Query-string tokens are not accepted.
+`/ws/code` bridges Code-session JSON-RPC to the daemon. Browsers request the
+`zeroclaw.code.v1` subprotocol. Paired browsers additionally present their
+issued token through the `bearer.<token>` subprotocol, and the gateway uses
+local IPC. Non-browser paired clients may use an `Authorization: Bearer ...`
+header. Signed-in browsers use their dashboard cookie on a same-origin
+connection. The gateway presents the held access token only to the
+provider-bound in-process core connector. Each signed-in account operates on
+its own Code sessions, including administrators. Query-string tokens are rejected.
 Standalone gateways without the daemon return an unavailable response.
 
 For a non-administrator account, assign a permission profile through the existing OIDC claim mapping. For example:
