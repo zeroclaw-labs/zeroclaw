@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { Button, Select } from "@/components/ui";
+import { t } from "@/lib/i18n";
 import { changeHttpCredential, type HttpCredentialRow, type PamChallengeRole, type SshAuthProfile, type SshDestination, type SshProfileAuth } from "@/lib/api";
 
 const field = "block w-full rounded-md border border-border bg-background p-2";
@@ -76,6 +77,23 @@ export default function SshProfiles({ rows, reload, form, setForm }: { rows: Htt
     <h3 className="font-medium">SSH authentication profiles</h3>
     {error && <p role="alert">Could not save the SSH profile. Check its destination, grants and challenge settings.</p>}
     {form && <form className="space-y-3" onSubmit={event => { event.preventDefault(); update(form); }}>
+      <details className="space-y-2 rounded-md border p-3 text-sm">
+        <summary className="cursor-pointer font-medium">{t("ssh_profile_help.title")}</summary>
+        <p>{t("ssh_profile_help.destination")}</p>
+        <ul className="list-disc space-y-1 pl-5">
+          <li>{t("ssh_profile_help.key")}</li>
+          <li>{t("ssh_profile_help.password")}</li>
+          <li>{t("ssh_profile_help.pam")}
+            <ul className="list-disc space-y-1 pl-5">
+              <li>{t("ssh_profile_help.username_reply")}</li>
+              <li>{t("ssh_profile_help.password_reply")}</li>
+              <li>{t("ssh_profile_help.totp_reply")}</li>
+              <li>{t("ssh_profile_help.combined_reply")}</li>
+            </ul>
+          </li>
+        </ul>
+        <p>{t("ssh_profile_help.example")}</p>
+      </details>
       <label className="block">Host<input className={field} required value={form.destination.host}
         onChange={event => setForm({ ...form, destination: { ...form.destination, host: event.target.value } })} /></label>
       <label className="block">Port<input className={field} required type="number" min={1} max={65535} value={form.destination.port}
