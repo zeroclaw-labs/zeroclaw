@@ -43,6 +43,26 @@ idle expiration. Authentication material has a shorter lifetime than the
 master. A cleanup failure must not result in fallback to an unmanaged SSH
 connection.
 
+## PAM challenge contract
+
+The SSH login is fixed by the approved destination. If a keyboard-interactive
+server also asks for a username, an operator-configured challenge can return
+that same login. It cannot select another account.
+
+Each keyboard-interactive profile declares an ordered set of expected challenge
+roles and exact labels for that deployment. Labels can be localized without
+changing the broker. The supported roles are username, password, TOTP and an
+explicit combined password-plus-code field. The combined role requires both
+grants and an operator-selected format. A password-only profile cannot answer
+a TOTP or combined challenge. The broker must match a challenge before looking
+up the requested factor, and require the complete configured sequence before
+making the authenticated session available.
+
+The challenge tests must cover username, password, TOTP, separate password and
+TOTP prompts, a combined field and a localized label. They must reject unknown,
+ambiguous, repeated, reordered and unexpectedly omitted challenges. The string
+received from the server never grants permission or changes the selected mode.
+
 ## Validation required before deployment
 
 Use a disposable QEMU guest with OpenSSH, PAM, a synthetic password and a
