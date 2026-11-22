@@ -342,7 +342,7 @@ Archive discovery rejects symlinks. Matching the writer's filename shape is not 
 | Policy | Active-file behavior | Retention owner |
 |---|---|---|
 | `none` | No new JSONL writes. | None. |
-| `rolling` | After each append past `max_entries`, rewrite the retained tail entries to a temporary file and rename it over the active file. | The writer keeps the configured active-window size. It creates no archives and leaves archives from an earlier `rotating` configuration unmanaged. |
+| `rolling` | After each append past `max_entries`, rewrite the retained tail entries to a temporary file and rename it over the active file. A trim that fails before the rename removes its temporary file and leaves the active file unchanged. | The writer keeps the configured active-window size. It creates no archives and leaves archives from an earlier `rotating` configuration unmanaged. |
 | `full` | Append without writer-managed trim or rotation. | The operator owns file growth and any external rotation. |
 | `rotating` | Before a new UTC day's first append, or after an append reaches the byte or entry-count threshold, rename the active file to a timestamped archive. | After each successful rotation, the writer prunes matching archives by age and then count. Removal is best-effort and never fails the enclosing append. |
 

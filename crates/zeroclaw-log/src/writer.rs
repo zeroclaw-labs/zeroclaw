@@ -41,6 +41,7 @@ use crate::event::LogEvent;
 use crate::migrate;
 use crate::observer_bridge;
 use crate::reader::{ArchiveOrder, SEQ_WIDTH, list_archives, split_base_ext};
+use crate::temp_guard::create_exclusive_temp;
 use anyhow::{Context, Result};
 use serde_json::Value;
 
@@ -725,17 +726,11 @@ fn trim_to_last_entries(state: &Arc<WorkerState>) -> Result<()> {
         chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default(),
     ));
 
+    // Declared before the `BufWriter` and outside the inner block so the file
+    // handle closes before the guard removes the temp file (Windows cannot
+    // remove a file that still has an open handle).
+    let (out_file, mut temp_cleanup) = create_exclusive_temp(&tmp, "trim")?;
     {
-        let mut opts = OpenOptions::new();
-        opts.create_new(true).write(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
-        }
-        let out_file = opts
-            .open(&tmp)
-            .with_context(|| format!("creating trim temp file {}", tmp.display()))?;
         let mut out = BufWriter::new(out_file);
 
         let in_file = fs::File::open(&state.policy.path)
@@ -767,6 +762,7 @@ fn trim_to_last_entries(state: &Arc<WorkerState>) -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
         let _ = fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600));
     }
+    before_trim_rename_hook()?;
     fs::rename(&tmp, &state.policy.path).with_context(|| {
         format!(
             "renaming trim temp {} → {}",
@@ -774,7 +770,30 @@ fn trim_to_last_entries(state: &Arc<WorkerState>) -> Result<()> {
             state.policy.path.display()
         )
     })?;
+    temp_cleanup.disarm();
 
+    Ok(())
+}
+
+// Test seam: fails the trim after the temp file is fully written and before
+// the rename, the window in which every earlier error path leaked the file.
+// Thread-local, so a test must call `trim_to_last_entries` from its own
+// thread rather than through the worker.
+#[cfg(test)]
+thread_local! {
+    static FAIL_BEFORE_TRIM_RENAME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn before_trim_rename_hook() -> Result<()> {
+    if FAIL_BEFORE_TRIM_RENAME.with(std::cell::Cell::get) {
+        anyhow::bail!("injected failure before trim rename");
+    }
+    Ok(())
+}
+
+#[cfg(not(test))]
+fn before_trim_rename_hook() -> Result<()> {
     Ok(())
 }
 
@@ -1300,6 +1319,107 @@ mod tests {
             let v: serde_json::Value = serde_json::from_str(line).unwrap();
             assert_eq!(v["message"].as_str().unwrap(), format!("event-{}", idx + 7));
         }
+    }
+
+    /// Names in `dir` that look like a leaked trim temp file
+    /// (`runtime-trace.tmp.<pid>.<nanos>`).
+    fn trim_temp_names(dir: &Path) -> Vec<String> {
+        fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".tmp."))
+            .collect()
+    }
+
+    /// Worker state over a fresh log in `dir`, for calling the trim directly
+    /// from the test thread (the failure seam is thread-local).
+    fn trim_state(dir: &Path, max_entries: usize) -> Arc<WorkerState> {
+        let mut policy = detached_enabled_policy(dir);
+        policy.max_entries = max_entries;
+        Arc::new(WorkerState {
+            policy,
+            worker_dead: Arc::new(AtomicBool::new(false)),
+            line_count: AtomicU64::new(0),
+            next_archive_seq: AtomicU64::new(1),
+        })
+    }
+
+    fn write_numbered_lines(path: &Path, count: usize) {
+        let body: String = (0..count).map(|i| format!("{{\"n\":{i}}}\n")).collect();
+        fs::write(path, body).unwrap();
+    }
+
+    /// Arms the failure seam for the current thread and disarms it on drop, so
+    /// a failing assertion cannot leak the armed state into a later test.
+    struct FailTrimRename;
+
+    impl FailTrimRename {
+        fn arm() -> Self {
+            FAIL_BEFORE_TRIM_RENAME.with(|flag| flag.set(true));
+            Self
+        }
+    }
+
+    impl Drop for FailTrimRename {
+        fn drop(&mut self) {
+            FAIL_BEFORE_TRIM_RENAME.with(|flag| flag.set(false));
+        }
+    }
+
+    #[test]
+    fn failed_trim_removes_its_temp_file_and_keeps_the_log() {
+        let _guard = WRITER_TEST_LOCK.lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let state = trim_state(tmp.path(), 2);
+        write_numbered_lines(&state.policy.path, 5);
+        let before = fs::read(&state.policy.path).unwrap();
+
+        {
+            let _armed = FailTrimRename::arm();
+            assert!(trim_to_last_entries(&state).is_err());
+        }
+
+        assert_eq!(
+            trim_temp_names(tmp.path()),
+            Vec::<String>::new(),
+            "a trim that fails after writing its temp file must remove it"
+        );
+        assert_eq!(
+            fs::read(&state.policy.path).unwrap(),
+            before,
+            "a failed trim must leave the active log untouched"
+        );
+    }
+
+    #[test]
+    fn successful_trim_leaves_no_temp_file() {
+        let _guard = WRITER_TEST_LOCK.lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let state = trim_state(tmp.path(), 2);
+        write_numbered_lines(&state.policy.path, 5);
+
+        trim_to_last_entries(&state).unwrap();
+
+        assert_eq!(trim_temp_names(tmp.path()), Vec::<String>::new());
+        assert_eq!(count_lines(&state.policy.path), 2);
+        let kept = fs::read_to_string(&state.policy.path).unwrap();
+        assert_eq!(kept, "{\"n\":3}\n{\"n\":4}\n");
+    }
+
+    #[test]
+    fn rolling_writer_leaves_no_temp_file_behind() {
+        let _guard = WRITER_TEST_LOCK.lock();
+        let tmp = tempfile::tempdir().unwrap();
+        install_writer(tmp.path(), 3);
+
+        for i in 0..10 {
+            let mut ev = LogEvent::new(Severity::Info, "test", EventCategory::Agent);
+            ev.message = Some(format!("event-{i}"));
+            record_event(ev);
+        }
+        flush_for_test().unwrap();
+
+        assert_eq!(trim_temp_names(tmp.path()), Vec::<String>::new());
     }
 
     #[test]
