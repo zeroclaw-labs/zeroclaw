@@ -1538,9 +1538,20 @@ pub struct WorkspaceAvailability {
 /// Config and runtime owners remain authoritative; no capability cache is kept.
 pub async fn handle_api_workspace(
     State(state): State<AppState>,
+    core: Option<axum::Extension<crate::core_rpc::CoreRpc>>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    if let Err(e) = require_auth(&state, &headers) {
+    let mut code_grants = None;
+    if extract_bearer_token(&headers).is_none()
+        && let Some(crate::dashboard_session::DashboardCaller::Session(session)) =
+            crate::dashboard_session::current_caller()
+        && session.grants.may_open_code()
+    {
+        if let Some(rejection) = session.ended_now() {
+            return crate::dashboard_session::rejection_response(rejection);
+        }
+        code_grants = Some(session.grants.code_session_grants());
+    } else if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
     let config = state.config.read().clone();
@@ -1551,6 +1562,11 @@ pub async fn handle_api_workspace(
             super::api_sections::quickstart_agent_missing_requirements(&config, alias, agent)
                 .is_empty()
         })
+        .filter(|(alias, _)| {
+            code_grants
+                .as_ref()
+                .is_none_or(|g| g.may_use_agent(alias.as_str()))
+        })
         .map(|(alias, _)| alias.clone())
         .collect();
     agents.sort_unstable();
@@ -1558,7 +1574,13 @@ pub async fn handle_api_workspace(
         agents,
         session_persistence: state.session_backend.is_some(),
         workflows: state.sop_engine.is_some(),
-        code: super::code::available(&state).await,
+        code: if code_grants.is_some() {
+            core.is_some_and(|axum::Extension(c)| {
+                c.connector().is_some_and(|connector| connector.is_bound())
+            })
+        } else {
+            super::code::available(&state).await
+        },
     })
     .into_response()
 }

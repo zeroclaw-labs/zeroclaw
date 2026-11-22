@@ -2874,6 +2874,7 @@ impl RpcDispatcher {
             .resolve(&identity)
             .expect("the test identity resolves");
         self.auth = Some(crate::rpc::auth::ConnectionAuth {
+            code_workspace: false,
             identity,
             principal: resolved.principal,
             grants: resolved.grants,
@@ -2896,6 +2897,7 @@ impl RpcDispatcher {
             .resolve(&identity)
             .expect("the shared operator always resolves");
         self.auth = Some(crate::rpc::auth::ConnectionAuth {
+            code_workspace: false,
             identity,
             principal: resolved.principal,
             grants: resolved.grants,
@@ -3623,7 +3625,7 @@ impl RpcDispatcher {
     // ── Core handlers ────────────────────────────────────────────
 
     async fn handle_initialize(&mut self, params: &Value) -> RpcResult {
-        let req: InitializeParams = parse_params(params)?;
+        let mut req: InitializeParams = parse_params(params)?;
 
         if req.protocol_version != RPC_PROTOCOL_VERSION {
             return Err(rpc_err(
@@ -3687,7 +3689,7 @@ impl RpcDispatcher {
                     .await
             }
         };
-        let connection_auth = match verified {
+        let mut connection_auth = match verified {
             Ok(auth) => auth,
             Err(denied) => return Err(rpc_err(denied.code, denied.message)),
         };
@@ -3701,6 +3703,45 @@ impl RpcDispatcher {
                 AUTH_REQUIRED,
                 crate::i18n::get_required_cli_string("rpc-auth-credential-rejected"),
             ));
+        }
+
+        if self
+            .auth_binding
+            .as_ref()
+            .is_some_and(|binding| binding.code_workspace)
+        {
+            if !connection_auth.grants.may_open_code() {
+                return Err(rpc_err(FORBIDDEN, "Code workspace access is required"));
+            }
+            connection_auth.grants = connection_auth.grants.code_session_grants();
+            connection_auth.code_workspace = true;
+        }
+
+        // A live Code conversation was opened with a particular agent and tool
+        // scope. A permission change starts a fresh transport instead of
+        // reattaching that conversation under a different set of grants.
+        let code_prefix = if connection_auth.code_workspace {
+            use sha2::{Digest, Sha256};
+            let domain = serde_json::to_vec(&(
+                connection_auth.principal.id.as_str(),
+                &connection_auth.grants,
+            ))
+            .map_err(|_| rpc_err(INTERNAL_ERROR, "Cannot encode Code authority"))?;
+            Some(format!("web-code-{:x}-", Sha256::digest(domain)))
+        } else {
+            None
+        };
+        if let Some(id) = req.tui_id.as_deref() {
+            match &code_prefix {
+                Some(prefix) if !id.starts_with(prefix) => {
+                    req.tui_id = None;
+                    req.tui_sig = None;
+                }
+                None if id.starts_with("web-code-") => {
+                    return Err(rpc_err(AUTH_REQUIRED, "Invalid TUI identity"));
+                }
+                _ => {}
+            }
         }
 
         // TUI identity: reconnect with previous credentials or generate new
@@ -3723,7 +3764,11 @@ impl RpcDispatcher {
             claimed_id.to_string()
         } else {
             // Fresh connection — generate new ID
-            self.ctx.tui_registry.generate_unique_tui_id()
+            if let Some(prefix) = code_prefix {
+                format!("{prefix}{}", uuid::Uuid::new_v4())
+            } else {
+                self.ctx.tui_registry.generate_unique_tui_id()
+            }
         };
 
         let env = self.retained_tui_env(&connection_auth, req.env);
@@ -8795,6 +8840,13 @@ impl RpcDispatcher {
         let sessions: Vec<(SessionEntry, Option<String>)> = summaries
             .into_iter()
             .filter_map(|s| {
+                if self.auth.as_ref().is_some_and(|auth| {
+                    auth.code_workspace
+                        && (s.interaction_surface.as_deref() != Some("zerocode_code")
+                            || !auth.grants.may_use_agent(&s.agent_alias))
+                }) {
+                    return None;
+                }
                 if scope
                     .as_deref()
                     .is_some_and(|mine| s.principal_id.as_deref() != Some(mine))

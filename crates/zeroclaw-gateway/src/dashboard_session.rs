@@ -1047,6 +1047,7 @@ impl DashboardAuth {
             crate::dashboard_core::CoreCredential {
                 bearer: held.bearer.clone(),
                 binding: zeroclaw_runtime::rpc::inproc::OidcSessionBinding {
+                    code_workspace: false,
                     provider: held.provider.binding(),
                     principal_id: held.auth.principal.id.clone(),
                 },
@@ -1403,6 +1404,7 @@ pub(crate) struct SessionWatch {
     /// grants a chat needs and that agent, as the upgrade checked them, or
     /// the socket closes as an administrator's does on demotion.
     chat_agent: Option<String>,
+    code_grants: Option<ResolvedGrants>,
     recheck: tokio::time::Interval,
     /// A recheck in progress. Kept here, not in a `lost` future, because
     /// a socket's loop drops that future whenever another branch fires: a
@@ -1440,6 +1442,7 @@ impl SessionWatch {
             session,
             require_admin,
             chat_agent: None,
+            code_grants: None,
             recheck,
             pending: None,
             stopping,
@@ -1457,6 +1460,17 @@ impl SessionWatch {
     ) -> Self {
         let mut watch = Self::new(auth, session, false, state);
         watch.chat_agent = Some(agent.to_string());
+        watch
+    }
+
+    pub(crate) fn for_code(
+        auth: Arc<DashboardAuth>,
+        session: Arc<SessionAuth>,
+        state: &AppState,
+    ) -> Self {
+        let grants = session.grants.code_session_grants();
+        let mut watch = Self::new(auth, session, false, state);
+        watch.code_grants = Some(grants);
         watch
     }
 
@@ -1510,6 +1524,13 @@ impl SessionWatch {
     /// operator stream; for a scoped chat, the session grants a chat needs
     /// and its agent.
     fn still_admits(&self, session: &SessionAuth) -> bool {
+        if self
+            .code_grants
+            .as_ref()
+            .is_some_and(|opened| *opened != session.grants.code_session_grants())
+        {
+            return false;
+        }
         if self.require_admin && !session.is_admin() {
             return false;
         }

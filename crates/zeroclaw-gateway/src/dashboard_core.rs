@@ -1276,6 +1276,35 @@ pub(crate) fn core_caller(
 }
 
 impl CoreCaller {
+    /// Dial only the generation's authenticated in-process transport. Keep
+    /// its admission charge until the serving task (including verification) exits.
+    pub(crate) async fn open_code(
+        &self,
+    ) -> Result<(tokio::io::DuplexStream, CoreCredential), CoreFailure> {
+        let account = self
+            .core
+            .accounts
+            .take(self.session.principal().id.as_str())?;
+        let place = self.binding.take_place(account)?;
+        let mut credential = self
+            .auth
+            .core_credential(&self.session)
+            .ok_or(CoreFailure::SessionEnded)?;
+        credential.binding.code_workspace = true;
+        let (stream, served) = self
+            .core
+            .connector()
+            .ok_or(CoreFailure::Unavailable)?
+            .connect_bound(credential.binding.clone())
+            .await
+            .ok_or(CoreFailure::Unavailable)?;
+        zeroclaw_spawn::spawn!(async move {
+            served.wait().await;
+            drop(place);
+        });
+        Ok((stream, credential))
+    }
+
     /// A connection of its own presenting `credential`, and `identity` when
     /// there is one. A refusal ends the session, without asking the identity
     /// provider again, unless a policy was published during the handshake:
@@ -2219,6 +2248,9 @@ mod tests {
                 zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(&config.data_dir)
                     .expect("sqlite session backend"),
             ));
+            ctx.acp_session_store = Some(Arc::new(
+                zeroclaw_infra::acp_session_store::AcpSessionStore::new(&config.data_dir).unwrap(),
+            ));
             let mut hooks = zeroclaw_runtime::hooks::HookRunner::new();
             hooks.register(Box::new(GatedHooks {
                 start: Arc::clone(gates.0),
@@ -2485,6 +2517,8 @@ mod tests {
                 .route("/api/sessions/{id}/abort", post(session_abort))
                 .route("/api/status", get(status))
                 .route("/api/agents/available", get(agents_available))
+                .route("/api/workspace", get(crate::api::handle_api_workspace))
+                .route("/ws/code", get(crate::code::handle_ws_code))
                 .route("/ws/chat", get(crate::ws::handle_ws_chat))
                 .with_state(self.state.clone())
                 .layer(Extension(self.core.clone()))
@@ -2504,6 +2538,137 @@ mod tests {
                 .await
                 .expect("sign-in succeeds")
         }
+    }
+
+    #[tokio::test]
+    async fn code_workspace_uses_its_own_grants_and_binds_the_core_principal() {
+        let fixture = Fixture::with_config(|cfg| {
+            let profile = cfg.permission_profiles.get_mut("chat-user").unwrap();
+            profile.grants = Map::from([(
+                Resource::Code,
+                vec![Verb::Read, Verb::Create, Verb::Update, Verb::Execute],
+            )]);
+            profile.allowed_agents.clear();
+            profile.allowed_code_agents = vec!["support".into()];
+        })
+        .await;
+        let router = fixture.router();
+        let (alice, session) = fixture.sign_in("alice").await;
+        let (_, identity) = call(
+            &router,
+            "GET",
+            "/api/auth/session",
+            Some((&alice, &session)),
+            None,
+        )
+        .await;
+        assert_eq!(identity["features"]["chat"], false);
+        assert_eq!(identity["features"]["code"], true);
+        let (status, workspace) = call(
+            &router,
+            "GET",
+            "/api/workspace",
+            Some((&alice, &session)),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(workspace["code"], true);
+        assert!(
+            !workspace["agents"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("other"))
+        );
+        let addr = serve(router).await;
+        let request = |cookie: &str| {
+            let mut req = chat_request(addr, cookie, "support", "unused");
+            *req.uri_mut() = format!("ws://{addr}/ws/code").parse().unwrap();
+            req.headers_mut().insert(
+                "sec-websocket-protocol",
+                "zeroclaw.code.v1".parse().unwrap(),
+            );
+            req
+        };
+        let (denied, _) = fixture.sign_in("carol").await;
+        assert!(connect_async(request(&denied)).await.is_err());
+        let mut foreign = request(&alice);
+        foreign
+            .headers_mut()
+            .insert("origin", "https://other.invalid".parse().unwrap());
+        assert!(connect_async(foreign).await.is_err());
+        let (mut ws, _) = connect_async(request(&alice)).await.unwrap();
+        async fn rpc(ws: &mut ChatSocket, id: u64, method: &str, params: Value) -> Value {
+            ws.send(ClientMessage::Text(
+                json!({"jsonrpc":"2.0","id":id,"method":method,"params":params})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    if let ClientMessage::Text(text) = ws.next().await.unwrap().unwrap() {
+                        let message: Value = serde_json::from_str(&text).unwrap();
+                        if message["id"] == id {
+                            return message;
+                        }
+                    }
+                }
+            })
+            .await
+            .unwrap()
+        }
+        let init = rpc(&mut ws, 1, "initialize", json!({"protocol_version":1})).await;
+        assert_eq!(
+            init["result"]["principal_id"],
+            session.principal().id.as_str(),
+            "{init}"
+        );
+        let receipt = json!({
+            "tui_id": init["result"]["tui_id"],
+            "tui_sig": init["result"]["tui_sig"],
+        });
+        assert!(receipt["tui_id"].is_string());
+        let bad = rpc(&mut ws, 2, "session/new", json!({"agent_alias":"other"})).await;
+        assert!(bad["error"].is_object(), "{bad}");
+        let created = rpc(&mut ws, 3, "session/new", json!({"agent_alias":"support"})).await;
+        assert!(created["result"]["session_id"].is_string(), "{created}");
+        let id = created["result"]["session_id"].as_str().unwrap();
+        let (bob, _) = fixture.sign_in("bob").await;
+        let (mut other, _) = connect_async(request(&bob)).await.unwrap();
+        let init = rpc(&mut other, 1, "initialize", receipt.clone()).await;
+        assert_ne!(init["result"]["tui_id"], receipt["tui_id"]);
+        assert!(init["result"].is_object(), "{init}");
+        for method in [
+            "session/messages",
+            "session/state",
+            "session/cancel",
+            "session/approve",
+        ] {
+            let answer = rpc(&mut other, 2, method, json!({"session_id":id})).await;
+            assert!(answer["error"].is_object(), "{method}: {answer}");
+        }
+        fixture.narrow_profile_everywhere("chat-user", |profile| {
+            profile.allowed_code_agents = vec!["other".into()];
+        });
+        let (mut narrowed, _) = connect_async(request(&alice)).await.unwrap();
+        let fresh = rpc(&mut narrowed, 1, "initialize", receipt.clone()).await;
+        assert!(fresh["result"]["tui_id"].is_string(), "{fresh}");
+        assert_ne!(fresh["result"]["tui_id"], receipt["tui_id"]);
+        let denied = rpc(
+            &mut narrowed,
+            2,
+            "session/messages",
+            json!({"session_id":id}),
+        )
+        .await;
+        assert!(denied["error"].is_object(), "{denied}");
+        fixture.auth.end(&session);
+        let ended = tokio::time::timeout(Duration::from_secs(5), narrowed.next())
+            .await
+            .expect("sign-out closes Code");
+        assert!(!matches!(ended, Some(Ok(ClientMessage::Text(_)))));
     }
 
     async fn call(

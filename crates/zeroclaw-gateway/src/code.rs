@@ -3,6 +3,11 @@
 //! environment forwarding and arbitrary local endpoints are not exposed.
 
 use super::AppState;
+use crate::core_rpc::CoreRpc;
+use crate::dashboard_session::{DashboardAuth, DashboardCaller, SessionWatch};
+use axum::Extension;
+use std::sync::Arc;
+
 use axum::{
     extract::{
         State, WebSocketUpgrade,
@@ -52,6 +57,8 @@ pub async fn available(state: &AppState) -> bool {
 
 pub async fn handle_ws_code(
     State(state): State<AppState>,
+    core: Option<Extension<CoreRpc>>,
+    dashboard: Option<Extension<Arc<DashboardAuth>>>,
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
@@ -70,6 +77,50 @@ pub async fn handle_ws_code(
                 })
         })
         .unwrap_or("");
+    if token.is_empty()
+        && !headers.contains_key("authorization")
+        && let Some(cookie) = crate::dashboard_session::current_caller()
+    {
+        let session = match cookie {
+            DashboardCaller::Session(session) => session,
+            DashboardCaller::Rejected(reason) => {
+                return crate::dashboard_session::rejection_response(reason);
+            }
+        };
+        if !session.grants.may_open_code() {
+            return StatusCode::FORBIDDEN.into_response();
+        }
+        let Some(Extension(auth)) = dashboard else {
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        };
+        let Some(caller) = crate::dashboard_core::core_caller(
+            &state,
+            &headers,
+            core,
+            Some(Extension(auth.clone())),
+            crate::dashboard_core::Reach::AnySession,
+        ) else {
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        };
+        let mut watch = Some(SessionWatch::for_code(auth, session.clone(), &state));
+        let provider = format!("oidc.{}", session.alias);
+        return ws
+            .protocols([PROTOCOL])
+            .max_message_size(MAX_FRAME)
+            .max_frame_size(MAX_FRAME)
+            .on_upgrade(move |socket| async move {
+                let serve = async {
+                    if let Ok((stream, credential)) = caller.open_code().await {
+                        bridge(socket, stream, Some((provider, credential.bearer))).await;
+                    }
+                };
+                tokio::select! { biased;
+                    _ = crate::dashboard_session::session_lost(&mut watch, &state) => {},
+                    _ = serve => {}
+                }
+            })
+            .into_response();
+    }
     // Local IPC carries more authority than an anonymous HTTP gateway. This
     // surface always requires an issued token, even on pairing-disabled hosts.
     if !authenticated(&state.pairing, token) {
@@ -98,11 +149,11 @@ pub async fn handle_ws_code(
     ws.protocols([PROTOCOL])
         .max_message_size(MAX_FRAME)
         .max_frame_size(MAX_FRAME)
-        .on_upgrade(move |socket| bridge(socket, stream))
+        .on_upgrade(move |socket| bridge(socket, stream, None))
         .into_response()
 }
 
-fn code_frame(text: &str) -> Result<String, Value> {
+fn code_frame(text: &str) -> Result<Value, Value> {
     let mut frame: Value = serde_json::from_str(text).map_err(
         |_| json!({"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Invalid JSON"}}),
     )?;
@@ -113,7 +164,7 @@ fn code_frame(text: &str) -> Result<String, Value> {
     zeroclaw_api::jsonrpc::JsonRpcFrame::from_value(frame.clone()).map_err(|_| error())?;
     let Some(method) = frame.get("method").and_then(Value::as_str) else {
         // Responses to daemon-initiated elicitation go back to their owner.
-        return Ok(frame.to_string());
+        return Ok(frame);
     };
     match method {
         "initialize" => {
@@ -143,11 +194,14 @@ fn code_frame(text: &str) -> Result<String, Value> {
         | "session/state" | "session/list-acp" => {}
         _ => return Err(error()),
     }
-    Ok(frame.to_string())
+    Ok(frame)
 }
 
-async fn bridge<S>(socket: WebSocket, stream: S)
-where
+async fn bridge<S>(
+    socket: WebSocket,
+    stream: S,
+    credential: Option<(String, zeroize::Zeroizing<String>)>,
+) where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let (mut sender, mut receiver) = socket.split();
@@ -155,10 +209,19 @@ where
     let mut reader = BufReader::new(read);
     let (error_tx, mut errors) = tokio::sync::mpsc::channel::<String>(8);
     let input = async {
+        let signed_in = credential.is_some();
+        let mut credential = credential;
         while let Some(Ok(message)) = receiver.next().await {
             match message {
                 Message::Text(text) => match code_frame(&text) {
-                    Ok(frame) => {
+                    Ok(mut frame) => {
+                        if signed_in && frame["method"] == "initialize" {
+                            let Some((provider, bearer)) = credential.take() else {
+                                break;
+                            };
+                            frame["params"]["auth_provider"] = json!(provider);
+                            frame["params"]["auth_token"] = json!(bearer.as_str());
+                        }
                         if write
                             .write_all(format!("{frame}\n").as_bytes())
                             .await
@@ -243,8 +306,7 @@ mod tests {
         let request = json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{
             "agent_alias":"test-agent","cwd":"/outside","chat_mode":"chat","exclude_memory":false,"tui_id":"another-client"
         }});
-        let frame: Value =
-            serde_json::from_str(&code_frame(&request.to_string()).unwrap()).unwrap();
+        let frame: Value = code_frame(&request.to_string()).unwrap();
         assert_eq!(frame["params"]["chat_mode"], "acp");
         assert_eq!(frame["params"]["interaction_surface"], "zerocode_code");
         assert_eq!(frame["params"]["exclude_memory"], true);
@@ -255,8 +317,7 @@ mod tests {
     #[test]
     fn initialization_never_forwards_a_browser_environment() {
         let request = json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"env":{"PATH":"/outside"}}});
-        let frame: Value =
-            serde_json::from_str(&code_frame(&request.to_string()).unwrap()).unwrap();
+        let frame: Value = code_frame(&request.to_string()).unwrap();
         assert!(frame["params"].get("env").is_none());
     }
 

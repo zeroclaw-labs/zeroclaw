@@ -1215,6 +1215,7 @@ async fn handle_auth_session(
                 "csrf_token": session.csrf,
                 "features": {
                     "chat": chat,
+                    "code": session.grants.may_open_code() && core.as_ref().is_some_and(|Extension(c)| c.connector().is_some_and(|connector| connector.is_bound())),
                     "core_sessions": core_sessions,
                     "operator_pages": admin,
                     // The config routes' own read rule; an administrator's
