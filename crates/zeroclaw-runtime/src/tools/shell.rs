@@ -62,7 +62,7 @@ impl Drop for ChildGroupGuard {
 
 // The host broker executes outside OS sandboxes. Never pass that capability
 // through a sandbox, including values supplied by passthrough/TUI overlays.
-pub(super) fn configure_task_ssh_environment(
+fn configure_task_ssh_environment(
     cmd: &mut tokio::process::Command,
     sandbox: &dyn Sandbox,
     task: Option<zeroclaw_tools::task_ssh::SshTask>,
@@ -298,10 +298,7 @@ impl Tool for ShellTool {
 
         // A shared host broker must not be reachable from an OS sandbox,
         // even by discovering its socket in a shared directory such as /tmp.
-        if self.sandbox.name() != "none"
-            && (zeroclaw_tools::task_ssh::current().is_some()
-                || std::env::var_os("ZEROCLAW_SSH_TASK_HELPER").is_some())
-        {
+        if self.sandbox.name() != "none" && zeroclaw_tools::task_ssh::current().is_some() {
             return Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
@@ -2568,13 +2565,17 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
     async fn effective_path_resolves_independent_native_runtime_launcher() {
+        use std::os::unix::fs::PermissionsExt;
+
         let launcher_dir = tempfile::tempdir().expect("launcher tempdir should be created");
         let launcher = launcher_dir.path().join("tui-only-shell");
-        // Use an existing executable so parallel process creation cannot inherit
-        // a writable descriptor to the launcher and cause ETXTBSY.
-        std::os::unix::fs::symlink("/bin/sh", &launcher)
-            .expect("test launcher should link to the system shell");
-
+        std::fs::write(
+            &launcher,
+            "#!/bin/sh\necho TUI_PATH_SHIM_RAN\nfor arg in \"$@\"; do echo \"arg:$arg\"; done\n",
+        )
+        .expect("recording shell should be written");
+        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755))
+            .expect("recording shell should be executable");
         let split_path = std::env::join_paths([
             std::path::PathBuf::new(),
             std::path::PathBuf::from("relative-decoy"),
@@ -2595,7 +2596,7 @@ mod tests {
             .expect("shell tool should return a result");
 
         assert!(
-            result.success && result.output.contains("direct_tui_path"),
+            result.success && result.output.contains("TUI_PATH_SHIM_RAN"),
             "TUI-only launcher should execute, got output={:?} error={:?}",
             result.output,
             result.error

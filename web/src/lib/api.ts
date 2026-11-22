@@ -1382,6 +1382,68 @@ export interface MapKeyResponse {
   created: boolean;
 }
 
+export type HttpCredentialKind = "user_password" | "api_key" | "ssh_key" | "totp";
+export type HttpCredentialSource = "local" | "open_bao" | "one_password" | "azure" | "aws" | "google";
+export type SshDestination = { host: string; port: number; username: string };
+export type PamChallengeRole = "username" | "password" | "totp" | "password_then_totp";
+export type PamChallenge = { label: string; role: PamChallengeRole };
+export type SshProfileAuth =
+  | { mode: "public_key"; key_alias: string }
+  | { mode: "password"; password_alias: string }
+  | { mode: "pam"; password_alias?: string; totp_alias?: string; challenges: PamChallenge[] };
+export type SshAuthProfile = { destination: SshDestination; authentication: SshProfileAuth };
+export type HttpCredentialRow = { name: string; permission_revision: string; origin: string; kind: HttpCredentialKind; source: HttpCredentialSource; destinations?: SshDestination[] | null; ssh_profiles?: SshAuthProfile[]; http_allowed?: boolean | null; http_origins?: string[]; browser_origin?: string | null; browser_origins?: string[]; header?: "bearer" | "x_api_key" | "token" | null };
+type HttpCredentialAuth =
+  | { kind: "totp"; seed: string }
+  | { kind: "user_password"; username: string; password: string }
+  | { kind: "ssh_key"; private_key: string; destinations: SshDestination[] }
+  | { kind: "api_key"; value: string; header: "bearer" | "x_api_key" | "token" };
+
+const httpCredentialsPath = "/api/config/http-credentials";
+
+export function listHttpCredentials() {
+  return apiFetch<{ encryption_enabled: boolean; credentials: HttpCredentialRow[] }>(
+    httpCredentialsPath,
+  );
+}
+
+export function changeHttpCredential(mutation:
+  | { name: string; operation: "create" | "replace"; credential: { origin: string; source: HttpCredentialSource; auth: HttpCredentialAuth } }
+  | { name: string; operation: "replace"; permissions: { expected_revision?: string } & ({ http_allowed: boolean } | { http_origins: string[] } | { destinations: SshDestination[] } | { ssh_profiles: SshAuthProfile[] } | { browser: { origins: string[] } }) }
+  | { name: string; operation: "delete" }
+) {
+  return apiFetch<void>(httpCredentialsPath, { method: "POST", body: JSON.stringify(mutation) });
+}
+
+export interface PluginTlsCredential {
+  instance: string;
+  property: string;
+  configured: boolean;
+  profiles: Record<string, string[]>;
+}
+
+const pluginTlsCredentialsPath = "/api/config/plugin-tls-credentials";
+
+export function listPluginTlsCredentials() {
+  return apiFetch<{ encryption_enabled: boolean; credentials: PluginTlsCredential[] }>(
+    pluginTlsCredentialsPath,
+  );
+}
+
+export function changePluginTlsCredential(
+  credential: Pick<PluginTlsCredential, "instance" | "property">,
+  mutation: { operation: "create" | "replace"; value: string } | { operation: "delete" },
+) {
+  return apiFetch<{ configured: boolean }>(pluginTlsCredentialsPath, {
+    method: "POST",
+    body: JSON.stringify({
+      instance: credential.instance,
+      property: credential.property,
+      ...mutation,
+    }),
+  });
+}
+
 // ── Shared workspace browse ────────────────────────────────────────
 // Hard-scoped to `<install>/shared/`. The gateway adapter at
 // `crates/zeroclaw-gateway/src/api_browse.rs` defers all containment

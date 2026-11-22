@@ -47,9 +47,8 @@ connection-stage errors. Connecting one key does not hold the
 pool lock while waiting for the network; other keys and task shutdown proceed.
 
 When a turn owns a host SSH broker, the built-in shell refuses commands under
-an OS sandbox. Shell and coding CLI launchers reject sandboxed execution
-while the host helper is configured or a broker lease is active. This also
-protects a broker owned by a different turn when the sandbox shares host paths.
+an OS sandbox, including ordinary non-SSH commands. Unrelated turns without
+a broker remain governed by the configured sandbox policy.
 
 Foreground parallel delegates awaited by the current turn reuse its SSH task
 owner. Tokio workers restore the captured task identity before entering their
@@ -59,7 +58,9 @@ background jobs do not inherit this owner and keep their own lifetime.
 
 ## Trust and credentials
 
-The Python helper uses the operator-configured SSH agent. Neither executable reads catalog credentials or loads keys from OpenBao. The Python helper needs only the standard library, OpenSSH and the existing process supervision tools.
+The Python helper uses the operator-configured SSH agent. Catalog aliases and
+the vault belong to the native broker. The Python helper needs only the
+standard library, OpenSSH and the existing process supervision tools.
 
 For localized helper diagnostics, install the optional compiled gettext
 catalog for the service locale. Set `LANG` and, when using a custom catalog
@@ -101,22 +102,55 @@ grant itself such an exception or introduce a second task scheduler.
 Build the Linux binary with `cargo build --locked --release -p zeroclaw-tools
 --bin zeroclaw-ssh-task`. Configure the service helper path and the shell's
 managed SSH wrapper to point to the same binary. The existing task protocol,
-SSH-agent identity, trust configuration, and idle timeout apply. Roll back by restoring
-both paths to the previous helper. For rollback, retain a protected backup of the previous helper executable and PATH link.
+catalog, trust configuration, and idle timeout apply. Roll back by restoring
+both paths to the previous helper. Keep the Python adapter during review.
 
-## Native broker scope
+To enable catalog-backed SSH credentials in the Rust broker:
 
-The Rust broker uses the operator-configured SSH agent and existing OpenSSH
-host aliases. It requires Linux, OpenSSH 8.7 or later, and util-linux setpriv. Configure the
-native executable using the helper path described above.
+1. Register an SSH key or OpenBao KV field in **Storage → Secrets** and grant
+   the effective hostname, port and SSH login. Install the expected host key
+   in the service user's configured known-hosts file.
+2. Set `ZEROCLAW_SSH_CREDENTIAL_DIR` to the protected directory containing
+   `config.toml` and its encryption key.
+3. Invoke `ssh --credential ALIAS HOST COMMAND` through the managed wrapper,
+   or set `ZEROCLAW_SSH_DEFAULT_CREDENTIAL` for a default alias. Keep the alias
+   unset when rolling back to the agent-only Python helper.
 
-Each persistent master owns a process group. Connection setup failure,
-cancellation, idle retirement and task shutdown clean up proxy descendants.
-Pre-existing master socket paths are refused. The broker's directory is private
-to its operating-system user. Arbitrary unsandboxed code under the same user
-has that user's SSH authority.
+The Rust broker reads the existing encrypted catalog with ZeroClaw's own
+configuration and secret store. OpenSSH still owns transport and host-key
+validation. Scoped credentials require OpenSSH 8.9 or newer. The signer
+loads the key with a 20-second lifetime and a destination constraint derived
+from the authorized effective user, hostname, port and host-key alias. It
+uses the configured known-hosts files and refuses the scoped connection if
+those files cannot establish the constraint. Use distinct, pinned host keys
+for different servers. The SSH agent binds the constraint to host keys and
+the username, while the catalog separately checks the effective port. The
+broker terminates the signer before leasing the authenticated transport.
 
-Catalog-backed credential loading and broker-managed vault signing are not supported by this executable.
+For OpenBao, the broker invokes the operator-managed `bao` CLI with discrete
+arguments and a bounded lifetime and output. Its standard error is excluded
+from user-facing diagnostics. Keep the CLI on the trusted service PATH and
+configure service authentication and TLS through the CLI's normal settings.
+Upgrading the CLI alongside OpenBao can accommodate protocol changes without
+changing ZeroClaw, as long as the supported CLI commands and output contract
+remain stable.
+
+## Native broker security boundary
+
+The native scoped signer requires OpenSSH 8.9 or newer. Broker, shell tools and
+the private signer execute under the same operating-system user. Catalog keys
+and the signer are therefore accessible to arbitrary unsandboxed shell code
+running as that user. Destination-constrained signing is defense in depth.
+Confidentiality against those shell processes requires a separately privileged
+credential broker and is outside this adapter's current boundary.
+
+Agent and master socket paths must be absent before setup. The broker rechecks
+signer liveness after its socket appears and before loading a key. These checks
+reject pre-bound fake sockets. They cannot eliminate a same-user replacement
+race during authentication.
+
+Each master owns a process group. Setup failure, cancellation, idle retirement
+and task shutdown terminate the group's proxy descendants as well as the master.
 
 ### Abrupt native broker death
 

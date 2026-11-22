@@ -129,3 +129,7 @@ tool-web-search-tool-error-searxng-not-configured = SearXNG インスタンス U
 tool-web-search-tool-note-truncated-results = （以降の結果は省略）
 tool-workspace = マルチクライアントワークスペースを管理します。サブコマンド：list、switch、create、info、export。各ワークスペースは分離されたメモリ、監査、シークレット、ツール制限を提供します。
 tool-weather = 世界中のあらゆる場所の現在の天気条件と予報を取得します。都市名（任意の言語またはスクリプト）、IAIAエアポートコード（例：'LAX'）、GPS座標（例：'51.5,-0.1'）、郵便番号、ドメインベースのジオロケーションをサポートしています。気温、体感温度、湿度、風速/風向、降水量、視程、気圧、紫外線指数、雲量を返します。オプションで0～3日間の予報と時間単位の詳細データがあります。単位はデフォルトでメートル法（°C、km/h、mm）ですが、リクエストに応じてヤード・ポンド法（°F、mph、インチ）に設定できます。APIキーは不要です。
+
+# Managed browser credentials
+tool-browser-credential-submitted = 認証情報を送信しました
+tool-browser-credential-submission-failed = 管理対象ブラウザーで認証情報を送信できませんでした

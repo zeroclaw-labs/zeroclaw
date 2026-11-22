@@ -1,5 +1,7 @@
 //! Tool implementations for agent-callable capabilities.
 
+mod scoped_credentials;
+
 pub mod attribution;
 pub mod helpers;
 pub(crate) mod i18n;
