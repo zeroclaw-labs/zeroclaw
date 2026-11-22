@@ -1063,9 +1063,7 @@ mod tests {
                 },
             )
             .await;
-            let error = result
-                .err()
-                .expect("revoked or replaced admission must fail");
+            let error = result.expect_err("revoked or replaced admission must fail");
             assert!(!error.to_string().contains("invalid SSH key"));
             assert!(!path.exists(), "no signer starts for a stale admission");
         }
