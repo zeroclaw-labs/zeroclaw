@@ -606,7 +606,9 @@ path = "tests/channel_websocket_e2e.rs"
 name = "agent_benchmarks"
 harness = false
 
-# Temporary upstream terminal EOF/error backport. See vendor/crossterm-0.29.0/PATCH.md.
 [patch.crates-io]
+# Checkout-only SQLite compatibility bridge; publication/removal conditions:
+# vendor/matrix-sdk-sqlite-0.19.1/ZEROCLAW-PATCH.md.
 matrix-sdk-sqlite = { path = "vendor/matrix-sdk-sqlite-0.19.1" }
+# Temporary upstream terminal EOF/error backport. See vendor/crossterm-0.29.0/PATCH.md.
 crossterm = { path = "vendor/crossterm-0.29.0" }
