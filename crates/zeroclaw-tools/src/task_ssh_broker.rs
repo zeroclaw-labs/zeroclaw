@@ -408,6 +408,7 @@ async fn signer(
     source: ScopedCredentialSource,
     value: String,
     effective: &str,
+    recheck: &(dyn Fn() -> Result<()> + Sync),
 ) -> Result<Child> {
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let loader_args = signer_loader_args(effective, home.as_deref())?;
@@ -423,6 +424,8 @@ async fn signer(
         }
         _ => anyhow::bail!("unsupported SSH credential source"),
     };
+    // Vault resolution may have waited across a catalog revocation.
+    recheck()?;
     let key = std::str::from_utf8(&bytes)?.trim_end();
     ensure!(
         bytes.len() as u64 <= FRAME_LIMIT
@@ -486,12 +489,13 @@ async fn open(
     host: &str,
     credential: Option<(ScopedCredentialSource, String)>,
     effective: &str,
+    recheck: &(dyn Fn() -> Result<()> + Sync),
 ) -> Result<OwnedMaster> {
     require_unused_socket(path)?;
     require_unused_socket(&path.with_extension("agent"))?;
     let socket = SocketPath(path.with_extension("agent"));
     let mut agent = if let Some((source, value)) = credential {
-        Some(signer(&socket.0, source, value, effective).await?)
+        Some(signer(&socket.0, source, value, effective, recheck).await?)
     } else {
         None
     };
@@ -531,6 +535,7 @@ async fn open(
             "PreferredAuthentications=publickey",
         ]);
     }
+    recheck()?;
     let mut master = OwnedMaster::spawn(command.args(options).args(["--", host]))?;
     timeout(Duration::from_secs(15), async {
         while !path.exists() {
@@ -596,11 +601,21 @@ async fn lease(
         .transpose()
         .context("tool-native-ssh-credential")?;
     let fingerprint =
-        serde_json::to_vec(&(host, effective, alias, credential.as_ref().map(|c| &c.0)))?;
+        serde_json::to_vec(&(host, effective, &alias, credential.as_ref().map(|c| &c.0)))?;
+    let recheck = || -> Result<()> {
+        if let (Some(alias), Some((revision, _, _))) = (alias.as_deref(), credential.as_ref()) {
+            ensure!(
+                record(alias, effective)?.0 == *revision,
+                "credential changed"
+            );
+        }
+        Ok(())
+    };
     let key = format!("{:x}", Sha256::digest(fingerprint));
     let path = dir.join(&key[..24]);
     let entry = pool.lock().await.entry(path.clone()).or_default().clone();
     let mut state = entry.lock().await;
+    recheck().context("tool-native-ssh-credential")?;
     ensure!(!state.failed, "failed connection");
     if state.master.is_none() {
         state.failed = true;
@@ -609,13 +624,23 @@ async fn lease(
                 &path,
                 options,
                 host,
-                credential.map(|(_, source, value)| (source, value)),
+                credential
+                    .as_ref()
+                    .map(|(_, source, value)| (*source, value.clone())),
                 effective,
+                &recheck,
             )
             .await
             .context("tool-native-ssh-connection")?,
         );
         state.failed = false;
+    }
+    if let Err(error) = recheck() {
+        state.failed = true;
+        if let Some(mut master) = state.master.take() {
+            let _ = master.kill().await;
+        }
+        return Err(error.context("tool-native-ssh-credential"));
     }
     ensure!(
         state
@@ -1008,6 +1033,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn revoked_catalog_record_is_refused_before_starting_a_signer() {
+        let dir = tempfile::tempdir().unwrap();
+        let effective = "hostname build.example\nport 2222\nuser runner\nuserknownhostsfile /tmp/fixture-known-hosts\nglobalknownhostsfile none\n";
+        let auth = serde_json::json!({
+            "kind": "ssh_key",
+            "private_key": "synthetic-key",
+            "destinations": [{"host": "build.example", "port": 2222, "username": "runner"}]
+        });
+        write_catalog(dir.path(), auth.clone(), true, true);
+        let reviewed = record_at(dir.path(), "FIXTURE", effective).unwrap().0;
+        let path = dir.path().join("agent");
+        for replacement in [
+            serde_json::json!({"kind": "ssh_key", "private_key": "synthetic-key", "destinations": []}),
+            auth,
+        ] {
+            // The operator changes the saved record after its initial admission.
+            write_catalog(dir.path(), replacement, true, true);
+            let result = super::signer(
+                &path,
+                ScopedCredentialSource::Local,
+                "synthetic-key".into(),
+                effective,
+                &|| {
+                    let current = record_at(dir.path(), "FIXTURE", effective)?;
+                    ensure!(current.0 == reviewed, "credential changed");
+                    Ok(())
+                },
+            )
+            .await;
+            let error = result
+                .err()
+                .expect("revoked or replaced admission must fail");
+            assert!(!error.to_string().contains("invalid SSH key"));
+            assert!(!path.exists(), "no signer starts for a stale admission");
+        }
+        std::fs::remove_file(dir.path().join("config.toml")).unwrap();
+        let result = super::signer(
+            &path,
+            ScopedCredentialSource::Local,
+            "synthetic-key".into(),
+            effective,
+            &|| record_at(dir.path(), "FIXTURE", effective).map(|_| ()),
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
     async fn signer_rejects_prebound_socket_before_delivering_key() {
         let dir = tempfile::tempdir().unwrap();
         let key = dir.path().join("fixture");
@@ -1025,7 +1099,8 @@ mod tests {
         let result = super::signer(
             &path, zeroclaw_config::schema::ScopedCredentialSource::Local,
             std::fs::read_to_string(&key).unwrap(),
-            "hostname fixture.example\nport 22\nuser fixture\nuserknownhostsfile /tmp/fixture-known-hosts\nglobalknownhostsfile none\n"
+            "hostname fixture.example\nport 22\nuser fixture\nuserknownhostsfile /tmp/fixture-known-hosts\nglobalknownhostsfile none\n",
+            &|| Ok(())
         ).await;
         assert!(result.is_err());
         assert_eq!(
