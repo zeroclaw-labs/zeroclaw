@@ -176,6 +176,7 @@ const second = makeSession("fixture-b", "reviewer", "Review the release", "01");
     await navigate();
     await page.keyboard.press("k");
     await page.waitForURL("**/code?agent=builder&session=fixture-a");
+    await chat.getByRole("button", { name: "Settings · builder", exact: true }).waitFor();
     assert.equal(await composer.inputValue(), "Draft for A");
     await chat.getByRole("button", { name: "Cancel", exact: true }).click();
     await chat.getByRole("button", { name: "Model · claude-sonnet-5-5", exact: true }).waitFor();
@@ -203,9 +204,12 @@ const second = makeSession("fixture-b", "reviewer", "Review the release", "01");
     assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
 
     await page.setViewportSize({ width: 1440, height: 950 });
+    await page.getByRole("separator", { name: "Resize Code sessions" }).waitFor();
+    await composer.focus();
     await navigate();
     await page.keyboard.press("j");
     await page.waitForURL("**/code?agent=reviewer&session=fixture-b");
+    await chat.getByText("The review conversation.").waitFor();
     await page.keyboard.press("i");
     await composer.fill("Review after reload");
     await page.keyboard.press("Control+Enter");
@@ -222,7 +226,6 @@ const second = makeSession("fixture-b", "reviewer", "Review the release", "01");
   } catch (error) {
     if (page) {
       console.error(page.url(), await page.locator("body").ariaSnapshot({ timeout: 2000 }).catch(() => ""));
-      console.error(await page.locator("#root").innerHTML({ timeout: 2000 }).then((text) => text.slice(0, 500)).catch(() => ""));
     }
     throw error;
   } finally {
