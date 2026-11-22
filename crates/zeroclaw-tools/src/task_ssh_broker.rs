@@ -899,10 +899,11 @@ pub fn run(args: Vec<String>) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        Entry, Pool, SecretStore, SocketPath, parse, record_at, retire_idle, serve_inner,
-        valid_task,
+        Entry, Pool, ScopedCredentialSource, SecretStore, SocketPath, parse, record_at,
+        retire_idle, serve_inner, valid_task,
     };
     use super::{OwnedMaster, require_unused_socket, signer_loader_args};
+    use anyhow::ensure;
     use std::{
         sync::Arc,
         time::{Duration, Instant},
