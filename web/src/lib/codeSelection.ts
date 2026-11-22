@@ -2,10 +2,14 @@ import type { Session } from '@/types/api';
 
 // A browser preference creates the fact of which conversation this operator
 // last selected. Session existence, ownership and status come from the daemon.
-const KEY = 'zeroclaw-code-selection';
+import { getOidcSession } from './auth';
+function selectionKey() {
+  const account = getOidcSession();
+  return account ? JSON.stringify(['zeroclaw-code-selection', account.provider, account.principal_id]) : 'zeroclaw-code-selection';
+}
 export function loadCodeSelection(): { agent: string; session: string } | null {
   try {
-    const value: unknown = JSON.parse(localStorage.getItem(KEY) ?? 'null');
+    const value: unknown = JSON.parse(localStorage.getItem(selectionKey()) ?? 'null');
     if (
       value &&
       typeof value === 'object' &&
@@ -22,7 +26,7 @@ export function loadCodeSelection(): { agent: string; session: string } | null {
 }
 export function saveCodeSelection(agent: string, session: string) {
   try {
-    localStorage.setItem(KEY, JSON.stringify({ agent, session }));
+    localStorage.setItem(selectionKey(), JSON.stringify({ agent, session }));
   } catch {
     /* Optional browser preference. */
   }

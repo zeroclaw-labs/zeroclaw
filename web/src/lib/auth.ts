@@ -30,6 +30,7 @@ export interface OidcSession {
   csrf_token: string;
   features: {
     chat: boolean;
+    code?: boolean;
     operator_pages: boolean;
     /** Chat goes through the core, one conversation per chat socket: nothing
      * to load, list or resume. Absent on servers without core-path chat. */
