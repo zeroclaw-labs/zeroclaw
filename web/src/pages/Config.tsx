@@ -19,7 +19,6 @@ import { Link, useLocation, useNavigate, useParams } from "react-router-dom";
 import { ArrowLeft, Check, ChevronRight, MessageSquare, Pencil, Plus, Sparkles, Trash2, X } from "lucide-react";
 import {
   ApiError,
-  createMapKey,
   deleteMapKey,
   getDeletePlan,
   getDrift,
@@ -1116,9 +1115,11 @@ function XmppAllowedUsers({ channelAlias, onSaved }: { channelAlias: string; onS
     try {
       const { keys } = await getMapKeys("peer_groups");
       const key = nextXmppPolicyKey(channelAlias, keys);
-      await createMapKey("peer_groups", key);
-      // An empty group grants nobody if this second request fails.
-      await patchConfig([{ op: "replace", path: `peer_groups.${key}.channel`, value: `xmpp.${channelAlias}` }]);
+      await patchConfig([{
+        op: "add",
+        path: `peer_groups.${key}`,
+        value: { channel: `xmpp.${channelAlias}`, agents: [], external_peers: [], ignore: [] },
+      }]);
       setGroups(previous => [...previous, { key, channel: `xmpp.${channelAlias}` }]);
       onSaved();
     } catch (e) {

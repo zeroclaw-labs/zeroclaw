@@ -28,7 +28,7 @@ use tokio_xmpp::{
     },
     xmlstream::{ReadError, StreamHeader, Timeouts, XmlStream},
 };
-use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
+use zeroclaw_api::channel::{Channel, ChannelMessage, ListenerHealth, SendMessage};
 use zeroclaw_config::schema::{XmppConfig, XmppProtocol};
 
 const OUTBOUND_TIMEOUT: Duration = Duration::from_secs(60);
@@ -942,7 +942,16 @@ impl Channel for XmppChannel {
         Some(self.config.username.clone())
     }
     async fn health_check(&self) -> bool {
-        self.outbound.lock().map(|s| s.is_some()).unwrap_or(false)
+        self.listener_health() == Some(ListenerHealth::Healthy)
+    }
+    fn listener_health(&self) -> Option<ListenerHealth> {
+        Some(match self.outbound.lock() {
+            Ok(sender) => match sender.as_ref() {
+                Some(sender) if !sender.is_closed() => ListenerHealth::Healthy,
+                _ => ListenerHealth::Pending,
+            },
+            Err(_) => ListenerHealth::Unhealthy,
+        })
     }
     async fn listen(&self, tx: mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
         struct Reset<'a>(&'a XmppChannel);
