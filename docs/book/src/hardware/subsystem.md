@@ -39,7 +39,7 @@ The hardware features are `hardware` (core subsystem), `peripheral-rpi`
 
 ## Runtime tools
 
-With the `hardware` feature, the agent gains these built-in tools:
+With the `hardware` feature, configured boards can provide these GPIO tools:
 
 {{#include ../_snippets/hardware-tools-base.md}}
 
@@ -75,7 +75,6 @@ The stock systemd unit sets `SupplementaryGroups=gpio spi i2c`.
 
 Hardware tools can brick things. Real, expensive things.
 
-- `pico_flash` writes firmware; a bad image can brick the board. The tool requires operator approval at `Supervised` autonomy regardless of autonomy level; there's no way to auto-approve it.
 - GPIO writes that conflict with external drivers (voltage fights) damage pins.
 
 For production deployments with untrusted channels exposed, keep hardware tools off non-CLI channels via the global `autonomy.non_cli_excluded_tools` list (the schema has no per-channel `tools_deny` field). Tools listed there are omitted from the tool specs sent to the model on every non-CLI channel (Discord, Telegram, Bluesky, etc.). The local CLI still sees them.
