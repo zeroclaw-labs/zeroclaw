@@ -50,6 +50,37 @@ See [NixOS](./nixos.md) for source builds, the Nixpkgs package, and the
 multi-instance NixOS service module. For prebuilt binaries, use the installer
 described above.
 
+### CLI-only build (servers)
+
+For a server that only runs agents and channels, install the CLI-only build:
+the standard features without the dashboard and the web gateway.
+
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/install.sh | sh -s -- --cli-only
+```
+
+</div>
+
+It builds from source, so the installer sets up Rust when it is missing. In a
+CLI-only build:
+
+- `zeroclaw gateway` and `zeroclaw desktop` say that the dashboard needs the
+  standard build, and `zeroclaw status` shows the web UI as not included.
+- Channels that receive webhooks, such as `webhook` and Lark, keep their own
+  listeners.
+- To update and stay CLI-only, re-run the installer with `--cli-only`.
+  Releases publish only the standard build, so `zeroclaw update` stops and
+  explains the choice. `zeroclaw update --standard` switches to the standard
+  build, which adds the dashboard and web gateway; the daemon then starts the
+  gateway, by default on `127.0.0.1:42617` with pairing required.
+- There is no gateway pairing for remote clients. Run zerocode on the server
+  over SSH, or connect with an OIDC token; see
+  [Remote setup](../zerocode/remote.md#bearer-token-required-for-every-connection).
+
 ## System dependencies
 
 The core binary is statically linked where possible. Some features require system libraries:
@@ -134,7 +165,8 @@ permission gates. Plain Cargo-default source builds, including a Homebrew formul
 that uses only those defaults, can still omit adapters. See
 [minimal/full tools and build recovery](../tools/overview.md#builds-and-upgrade-path).
 
-Re-run the installer, it detects the existing install and upgrades in place:
+Re-run the installer, it detects the existing install and upgrades in place
+(add `--cli-only` for a [CLI-only build](#cli-only-build-servers)):
 
 <div class="os-tabs-src">
 

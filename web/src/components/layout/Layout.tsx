@@ -1,14 +1,18 @@
 import { useLayoutPreference } from '@/contexts/LayoutPreference';
 import Sidebar from './Sidebar';
 import { useEffect, useState } from 'react';
-import { useLocation } from 'react-router-dom';
+import { Navigate, useLocation } from 'react-router-dom';
 import WorkspaceSettings from '@/components/WorkspaceSettings';
 import Header from '@/components/layout/Header';
 import ReloadBanner from '@/components/layout/ReloadBanner';
 import UnsavedChangesBanner from '@/components/layout/UnsavedChangesBanner';
+import { MainColumn } from '@/components/layout/MainColumn';
 import CommandPalette, { useCommandPalette } from '@/components/CommandPalette';
 import WorkspaceOutlet from './WorkspaceOutlet';
+import { NotAvailable } from '@/components/auth/NotAvailable';
+import { useAuth } from '@/hooks/useAuth';
 import { t } from '@/lib/i18n';
+import { homePathFor, navAccessFor, pathAccess } from '@/lib/navAccess';
 
 import { routeTitleKey } from '@/lib/navigation';
 
@@ -17,6 +21,19 @@ export default function Layout() {
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const { pathname } = useLocation();
   const { open: paletteOpen, openPalette, closePalette } = useCommandPalette();
+  // A signed-in account without the operator dashboard lands on chat or
+  // config, and a deep link to another page says it isn't available. An
+  // account with neither sees that at `/` too.
+  const { session, viaRelay } = useAuth();
+  const access = navAccessFor(session);
+  const routeAccess = pathAccess(pathname, access);
+  const home = homePathFor(access);
+
+  // Close the mobile drawer on route change.
+  useEffect(() => {
+    setSidebarOpen(false);
+  }, [pathname]);
+
   // Per-route browser tab title.
   useEffect(() => {
     const seg = pathname.split('/').filter(Boolean);
@@ -36,7 +53,7 @@ export default function Layout() {
   return (
     <WorkspaceSettings><div className="min-h-screen bg-pc-base text-pc-text">
       {layout === 'classic' && <Sidebar open={sidebarOpen} onClose={() => setSidebarOpen(false)} />}
-      <div className={`flex h-dvh min-w-0 flex-col ${layout === 'classic' ? 'md:ml-14' : ''}`}>
+      <MainColumn viaRelay={viaRelay} showRail={layout === 'classic'}>
         <Header onOpenPalette={openPalette} onOpenSidebar={() => setSidebarOpen(true)} />
         <ReloadBanner />
         <UnsavedChangesBanner />
@@ -49,9 +66,15 @@ export default function Layout() {
             Keying on the full pathname remounted the entire route tree
             on every section click and reset scroll/state. */}
         <main className="flex-1 overflow-y-auto min-h-0">
-          <WorkspaceOutlet />
+            {pathname === '/' && !access.operatorPages && home ? (
+              <Navigate to={home} replace />
+            ) : routeAccess === 'allowed' ? (
+              <WorkspaceOutlet />
+            ) : (
+              <NotAvailable access={routeAccess} />
+            )}
         </main>
-      </div>
+      </MainColumn>
 
       {/* Command palette — mounted once for the whole app. Toggled globally
           via ⌘K / Ctrl+K and from the Header search trigger. */}

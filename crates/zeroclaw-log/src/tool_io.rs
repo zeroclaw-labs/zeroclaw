@@ -209,6 +209,15 @@ mod tests {
     }
 
     #[test]
+    fn redacted_zero_cap_keeps_metadata_without_text() {
+        let p = make_policy("redacted", 0, vec![]);
+        let c = capture_tool_input(&p, "shell", "sensitive output").unwrap();
+        assert!(c.text.is_empty());
+        assert_eq!(c.original_bytes, "sensitive output".len());
+        assert!(c.truncated);
+    }
+
+    #[test]
     fn capture_tool_output_uses_the_same_policy_path() {
         let p = make_policy("off", 8192, vec![]);
         assert!(capture_tool_output(&p, "shell", "x").is_none());

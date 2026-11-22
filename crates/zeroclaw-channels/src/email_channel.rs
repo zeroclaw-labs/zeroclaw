@@ -848,24 +848,26 @@ impl EmailChannel {
     }
 
     fn smtp_credentials(&self) -> Credentials {
-        let user = smtp_credential_override(self.config.smtp_username.as_deref())
+        let user = non_blank_value(self.config.smtp_username.as_deref())
             .unwrap_or(&self.config.username)
             .to_owned();
-        let pass = smtp_credential_override(self.config.smtp_password.as_deref())
+        let pass = non_blank_value(self.config.smtp_password.as_deref())
             .unwrap_or(&self.config.password)
             .to_owned();
         Credentials::new(user, pass)
     }
 
     fn create_smtp_transport(&self) -> Result<SmtpTransport> {
+        let host = non_blank_value(self.config.smtp_host.as_deref())
+            .context("smtp_host is not configured for this email channel")?;
         let creds = self.smtp_credentials();
         let transport = if self.config.smtp_tls {
-            SmtpTransport::relay(&self.config.smtp_host)?
+            SmtpTransport::relay(host)?
                 .port(self.config.smtp_port)
                 .credentials(creds)
                 .build()
         } else {
-            SmtpTransport::builder_dangerous(&self.config.smtp_host)
+            SmtpTransport::builder_dangerous(host)
                 .port(self.config.smtp_port)
                 .credentials(creds)
                 .build()
@@ -895,7 +897,11 @@ impl EmailChannel {
         };
 
         let mut builder = Message::builder()
-            .from(self.config.from_address.parse()?)
+            .from(
+                non_blank_value(self.config.from_address.as_deref())
+                    .context("from_address is not configured for this email channel")?
+                    .parse()?,
+            )
             .to(message.recipient.parse()?)
             .subject(subject);
         if let Some(ref reply_id) = message.in_reply_to
@@ -982,7 +988,10 @@ fn markdown_to_html(md: &str) -> String {
     html_output
 }
 
-fn smtp_credential_override(value: Option<&str>) -> Option<&str> {
+/// Treat a blank configured value as unset. Credentials, relay host and From
+/// identity all use this so a legacy `field = ""` behaves like an omitted
+/// field instead of pointing at an empty host or address.
+fn non_blank_value(value: Option<&str>) -> Option<&str> {
     value.filter(|value| !value.trim().is_empty())
 }
 
@@ -1020,7 +1029,22 @@ impl Channel for EmailChannel {
         "email"
     }
 
+    /// Inbound-only email (no `smtp_host`/`from_address`) cannot deliver
+    /// anything, so surfaces that must actually deliver — SOP approval routes,
+    /// no-reply notices, escalations, text polls — refuse it up front instead
+    /// of failing at send time.
+    fn supports_outbound_send(&self) -> bool {
+        self.config.outbound_smtp_configured()
+    }
+
     async fn send(&self, message: &SendMessage) -> Result<()> {
+        if !self.config.outbound_smtp_configured() {
+            anyhow::bail!(
+                "channels.email.{}: outbound email is disabled because smtp_host and \
+                 from_address are not both configured; set both to enable sending",
+                self.alias
+            );
+        }
         let email = self.build_email_message(message)?;
         let transport = self.create_smtp_transport()?;
         transport.send(&email)?;
@@ -1037,6 +1061,15 @@ impl Channel for EmailChannel {
     }
 
     async fn listen(&self, tx: mpsc::Sender<ChannelMessage>) -> Result<()> {
+        if !self.config.outbound_smtp_configured() {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                "Email channel is inbound-only: smtp_host/from_address are not configured, \
+                 so outbound sends will be refused. IMAP reading and flag updates stay active."
+            );
+        }
         ::zeroclaw_log::record!(
             INFO,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
@@ -1307,12 +1340,12 @@ mod tests {
         assert_eq!(config.imap_host, "");
         assert_eq!(config.imap_port, 993);
         assert_eq!(config.imap_folder, "INBOX");
-        assert_eq!(config.smtp_host, "");
+        assert!(config.smtp_host.is_none());
         assert_eq!(config.smtp_port, 465);
         assert!(config.smtp_tls);
         assert_eq!(config.username, "");
         assert_eq!(config.password, "");
-        assert_eq!(config.from_address, "");
+        assert!(config.from_address.is_none());
         assert_eq!(config.idle_timeout_secs, 1740);
     }
 
@@ -1331,14 +1364,14 @@ mod tests {
             imap_host: "imap.example.com".to_string(),
             imap_port: 993,
             imap_folder: "Archive".to_string(),
-            smtp_host: "smtp.example.com".to_string(),
+            smtp_host: Some("smtp.example.com".to_string()),
             smtp_port: 465,
             smtp_tls: true,
             username: "user@example.com".to_string(),
             password: "pass123".to_string(),
             smtp_username: None,
             smtp_password: None,
-            from_address: "bot@example.com".to_string(),
+            from_address: Some("bot@example.com".to_string()),
             idle_timeout_secs: 1200,
             poll_interval_secs: 60,
             default_subject: "Custom Subject".to_string(),
@@ -1361,14 +1394,14 @@ mod tests {
             imap_host: "imap.test.com".to_string(),
             imap_port: 993,
             imap_folder: "INBOX".to_string(),
-            smtp_host: "smtp.test.com".to_string(),
+            smtp_host: Some("smtp.test.com".to_string()),
             smtp_port: 587,
             smtp_tls: true,
             username: "user@test.com".to_string(),
             password: "secret".to_string(),
             smtp_username: None,
             smtp_password: None,
-            from_address: "bot@test.com".to_string(),
+            from_address: Some("bot@test.com".to_string()),
             idle_timeout_secs: 1740,
             poll_interval_secs: 60,
             default_subject: "Test Subject".to_string(),
@@ -1390,14 +1423,14 @@ mod tests {
             imap_host: "imap.private.example.invalid".to_string(),
             imap_port: 993,
             imap_folder: "Sensitive Folder".to_string(),
-            smtp_host: "smtp.example.invalid".to_string(),
+            smtp_host: Some("smtp.example.invalid".to_string()),
             smtp_port: 465,
             smtp_tls: true,
             username: "private-user@example.invalid".to_string(),
             password: "secret".to_string(),
             smtp_username: None,
             smtp_password: None,
-            from_address: "bot@example.invalid".to_string(),
+            from_address: Some("bot@example.invalid".to_string()),
             idle_timeout_secs: 1740,
             poll_interval_secs: 60,
             default_subject: "Test Subject".to_string(),
@@ -2187,14 +2220,14 @@ mod tests {
             imap_host: "imap.example.com".to_string(),
             imap_port: 993,
             imap_folder: "INBOX".to_string(),
-            smtp_host: "smtp.example.com".to_string(),
+            smtp_host: Some("smtp.example.com".to_string()),
             smtp_port: 587,
             smtp_tls: true,
             username: "user@example.com".to_string(),
             password: "password123".to_string(),
             smtp_username: None,
             smtp_password: None,
-            from_address: "bot@example.com".to_string(),
+            from_address: Some("bot@example.com".to_string()),
             idle_timeout_secs: 1740,
             poll_interval_secs: 60,
             default_subject: "Serialization Test".to_string(),
@@ -2371,5 +2404,98 @@ mod tests {
             "  smtp_pass  ".to_string(),
         );
         assert_eq!(creds, expected);
+    }
+
+    fn outbound_test_channel(smtp_host: Option<&str>, from_address: Option<&str>) -> EmailChannel {
+        EmailChannel::new(
+            EmailConfig {
+                imap_host: "imap.example.com".to_string(),
+                username: "user@example.com".to_string(),
+                password: "pass".to_string(),
+                smtp_host: smtp_host.map(str::to_string),
+                from_address: from_address.map(str::to_string),
+                ..Default::default()
+            },
+            "email_test_alias",
+            empty_resolver(),
+        )
+    }
+
+    fn outbound_test_message() -> SendMessage {
+        SendMessage {
+            content: "hello".to_string(),
+            recipient: "peer@example.com".to_string(),
+            subject: Some("hi".to_string()),
+            thread_ts: None,
+            cancellation_token: None,
+            attachments: Vec::new(),
+            in_reply_to: None,
+            references: Vec::new(),
+            suppress_voice: false,
+            force_voice: false,
+        }
+    }
+
+    #[test]
+    fn outbound_disabled_without_smtp_host() {
+        let channel = outbound_test_channel(None, Some("bot@example.com"));
+        assert!(!Channel::supports_outbound_send(&channel));
+    }
+
+    #[test]
+    fn outbound_disabled_without_from_address() {
+        let channel = outbound_test_channel(Some("smtp.example.com"), None);
+        assert!(!Channel::supports_outbound_send(&channel));
+    }
+
+    #[test]
+    fn outbound_supported_with_relay_and_from_address() {
+        let channel = outbound_test_channel(Some("smtp.example.com"), Some("bot@example.com"));
+        assert!(Channel::supports_outbound_send(&channel));
+    }
+
+    #[test]
+    fn outbound_support_follows_smtp_configuration() {
+        let inbound_only = outbound_test_channel(None, None);
+        assert!(!Channel::supports_outbound_send(&inbound_only));
+    }
+
+    #[test]
+    fn outbound_treats_legacy_blank_values_as_unset() {
+        // Older configs could carry `smtp_host = ""` / `from_address = ""`
+        // from the previous required-string defaults; those must stay
+        // inbound-only rather than pointing SMTP at an empty host.
+        let channel = outbound_test_channel(Some("   "), Some(""));
+        assert!(!Channel::supports_outbound_send(&channel));
+    }
+
+    #[tokio::test]
+    async fn send_refuses_when_smtp_is_not_configured() {
+        let channel = outbound_test_channel(None, None);
+        let err = channel
+            .send(&outbound_test_message())
+            .await
+            .expect_err("inbound-only channel must not send");
+        assert!(
+            err.to_string().contains("outbound email is disabled"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            err.to_string().contains("channels.email.email_test_alias"),
+            "the refusal must name the alias so multi-mailbox setups can tell which \
+             block to fix: {err}"
+        );
+    }
+
+    #[test]
+    fn build_email_message_requires_from_address() {
+        let channel = outbound_test_channel(Some("smtp.example.com"), None);
+        let err = channel
+            .build_email_message(&outbound_test_message())
+            .expect_err("a message without a From identity cannot be built");
+        assert!(
+            err.to_string().contains("from_address is not configured"),
+            "unexpected error: {err}"
+        );
     }
 }

@@ -37,6 +37,7 @@ import {
 import FieldForm, {
   clearFieldFormCatalogCaches,
 } from "../components/sections/FieldForm";
+import BrowserVoiceSettings from "../components/BrowserVoiceSettings";
 import PersonalityEditor from "../components/sections/PersonalityEditor";
 import SkillsBundleEditor from "../components/sections/SkillsBundleEditor";
 import BindChannelForm from "../components/sections/BindChannelForm";
@@ -55,6 +56,7 @@ import CostRatesEditor, {
 } from "../components/sections/CostRatesEditor";
 import { Badge, Button, Card, PageHeader } from "@/components/ui";
 import { t } from "@/lib/i18n";
+import { useLocaleContext } from "@/App";
 
 // Display order for the curated sidebar groups. Each `SectionInfo.group`
 // from the gateway lands in one of these buckets (anything else falls
@@ -83,6 +85,8 @@ const GROUP_ORDER = [
 // (single canonical source). The dashboard preserves response order for
 // the Foundation group instead of carrying its own copy of the list.
 
+const VOICE_SECTION = "voice-and-audio";
+
 export default function Config({ compact = false }: { compact?: boolean }) {
   const location = useConfigLocation();
   const navigate = useConfigNavigate();
@@ -90,7 +94,25 @@ export default function Config({ compact = false }: { compact?: boolean }) {
   const lockedSection = location.pathname.startsWith("/setup/")
     ? sectionParam
     : undefined;
-  const [sections, setSections] = useState<SectionInfo[]>([]);
+  const setup = location.pathname.startsWith("/setup/");
+  const [schemaSections, setSchemaSections] = useState<SectionInfo[]>([]);
+  useLocaleContext();
+  const voiceLabel = t("voice.settings");
+  const voiceHelp = t("voice.help_intro");
+  const sections = useMemo<SectionInfo[]>(() => setup ? schemaSections : [
+    ...schemaSections,
+    {
+      key: VOICE_SECTION,
+      label: voiceLabel,
+      help: voiceHelp,
+      group: "Other",
+      has_picker: false,
+      completed: false,
+      ready: true,
+      is_quickstart: false,
+      cost_category: "",
+    },
+  ], [schemaSections, setup, voiceLabel, voiceHelp]);
   const [activeKey, setActiveKey] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -115,11 +137,11 @@ export default function Config({ compact = false }: { compact?: boolean }) {
     getSections()
       .then((resp) => {
         if (cancelled) return;
-        setSections(resp.sections);
-        const initialKey =
-          sectionParam && resp.sections.find((s) => s.key === sectionParam)
-            ? sectionParam
-            : (resp.sections[0]?.key ?? null);
+        setSchemaSections(resp.sections);
+        const initialKey = sectionParam && (
+          (!setup && sectionParam === VOICE_SECTION) ||
+          resp.sections.some((section) => section.key === sectionParam)
+        ) ? sectionParam : (resp.sections[0]?.key ?? null);
         setActiveKey(initialKey);
       })
       .catch((e) => {
@@ -176,25 +198,13 @@ export default function Config({ compact = false }: { compact?: boolean }) {
     );
   };
 
-  // Navigate to the form for a specific alias. Calls selectSectionItem
-  // to instantiate the entry if needed, then navigates to the alias URL.
-  const goToAlias = async (
-    sectionKey: string,
-    typeKey: string,
-    alias: string,
-  ) => {
-    try {
-      await selectSectionItem(sectionKey, typeKey, alias);
-      navigate(
-        `/config/${encodeURIComponent(sectionKey)}/${encodeURIComponent(typeKey)}/${encodeURIComponent(alias)}`,
-      );
-    } catch (e) {
-      if (e instanceof ApiError) {
-        setError(`[${e.envelope.code}] ${e.envelope.message}`);
-      } else {
-        setError(e instanceof Error ? e.message : String(e));
-      }
-    }
+  // Navigate to the form for an existing alias. Opening an entry only reads
+  // it, so it sends no write: an account that can read config but not change
+  // it can still browse. Creating an entry goes through selectSectionItem.
+  const goToAlias = (sectionKey: string, typeKey: string, alias: string) => {
+    navigate(
+      `/config/${encodeURIComponent(sectionKey)}/${encodeURIComponent(typeKey)}/${encodeURIComponent(alias)}`,
+    );
   };
 
   if (loading) {
@@ -243,6 +253,7 @@ export default function Config({ compact = false }: { compact?: boolean }) {
 
   const mainContent = (() => {
     if (!activeSection) return null;
+    if (activeSection.key === VOICE_SECTION) return <BrowserVoiceSettings />;
 
     if (!activeSection.has_picker) {
       return (
@@ -401,11 +412,10 @@ export default function Config({ compact = false }: { compact?: boolean }) {
           sectionKey={activeSection.key}
           typeKey={typeParam}
           sectionHelp={activeSection.help}
-          onSelectAlias={async (alias) => {
+          onOpenAlias={(alias) => goToAlias(activeSection.key, typeParam, alias)}
+          onCreateAlias={async (alias) => {
             await selectSectionItem(activeSection.key, typeParam, alias);
-            navigate(
-              `/config/${encodeURIComponent(activeSection.key)}/${encodeURIComponent(typeParam)}/${encodeURIComponent(alias)}`,
-            );
+            goToAlias(activeSection.key, typeParam, alias);
           }}
           onBack={() =>
             navigate(`/config/${encodeURIComponent(activeSection.key)}`)
@@ -472,7 +482,12 @@ export default function Config({ compact = false }: { compact?: boolean }) {
         <AliasListView
           sectionKey={activeSection.key}
           sectionHelp={activeSection.help}
-          onSelectAlias={async (alias) => {
+          onOpenAlias={(alias) =>
+            navigate(
+              `/config/${encodeURIComponent(activeSection.key)}/${encodeURIComponent(alias)}`,
+            )
+          }
+          onCreateAlias={async (alias) => {
             await selectSectionItem(activeSection.key, alias);
             navigate(
               `/config/${encodeURIComponent(activeSection.key)}/${encodeURIComponent(alias)}`,
@@ -517,7 +532,7 @@ export default function Config({ compact = false }: { compact?: boolean }) {
           }
         }}
         onPickAlias={(typeKey, alias) =>
-          void goToAlias(activeSection.key, typeKey, alias)
+          goToAlias(activeSection.key, typeKey, alias)
         }
         sectionUrl={`/config/${encodeURIComponent(activeSection.key)}`}
         reloadKey={reloadKey}
@@ -698,7 +713,7 @@ export default function Config({ compact = false }: { compact?: boolean }) {
                   ))}
                 </span>
               }
-              actions={
+              actions={activeSection.key !== VOICE_SECTION && (
                 <>
                   <Button
                     variant="ghost"
@@ -718,7 +733,7 @@ export default function Config({ compact = false }: { compact?: boolean }) {
                     }}
                   />
                 </>
-              }
+              )}
             />
 
             <div className="flex-1 min-h-0 flex flex-col">{mainContent}</div>
@@ -779,7 +794,8 @@ function AliasListView({
   sectionKey,
   typeKey,
   sectionHelp,
-  onSelectAlias,
+  onOpenAlias,
+  onCreateAlias,
   onBack,
 }: {
   sectionKey: string;
@@ -790,7 +806,10 @@ function AliasListView({
    *  generic alias-name help so operators see what the section is
    *  before being asked to name an entry inside it. */
   sectionHelp?: string;
-  onSelectAlias: (alias: string) => Promise<void>;
+  /** Opens an existing entry. Sends no write, so read-only accounts can. */
+  onOpenAlias: (alias: string) => void;
+  /** Creates a new entry, then opens it. */
+  onCreateAlias: (alias: string) => Promise<void>;
   onBack: () => void;
 }) {
   const [aliases, setAliases] = useState<string[]>([]);
@@ -834,7 +853,7 @@ function AliasListView({
       return;
     }
     try {
-      await onSelectAlias(trimmed);
+      await onCreateAlias(trimmed);
     } catch (e) {
       setAliasError(
         e instanceof ApiError
@@ -889,17 +908,7 @@ function AliasListView({
               key={alias}
               alias={alias}
               mapPath={mapPath}
-              onSelect={() =>
-                onSelectAlias(alias).catch((e) => {
-                  setError(
-                    e instanceof ApiError
-                      ? `[${e.envelope.code}] ${e.envelope.message}`
-                      : e instanceof Error
-                        ? e.message
-                        : String(e),
-                  );
-                })
-              }
+              onSelect={() => onOpenAlias(alias)}
               onDeleted={() => {
                 setAliases((prev) => prev.filter((a) => a !== alias));
               }}

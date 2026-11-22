@@ -7,7 +7,9 @@ import { useLocaleContext } from '@/App';
 import { useAuth } from '@/hooks/useAuth';
 import { SettingsModal } from '@/components/SettingsModal';
 import { useWorkspaceSettings } from '@/components/WorkspaceSettings';
+import { navAccessFor, pathAccess } from '@/lib/navAccess';
 import { activeWorkspace } from '@/lib/navigation';
+import { AccountMenu } from '@/components/auth/AccountMenu';
 
 export default function Header({
   onOpenPalette,
@@ -19,7 +21,8 @@ export default function Header({
   const { layout } = useLayoutPreference();
   const { pathname } = useLocation();
   const workspace = activeWorkspace(pathname);
-  const { logout } = useAuth();
+  const { logout, session, signOut } = useAuth();
+  const access = navAccessFor(session);
   const { locale, setAppLocale } = useLocaleContext();
   const openSettings = useWorkspaceSettings();
   const [appearance, setAppearance] = useState(false);
@@ -46,7 +49,7 @@ export default function Header({
             ['/code', 'nav.code'],
             ['/sops', 'workspace.sop'],
             ['/admin', 'workspace.admin'],
-          ].map(([to, label]) => {
+          ].filter(([to]) => pathAccess(to!, access) === 'allowed').map(([to, label]) => {
             const active = workspace === to;
             return (
               <Link
@@ -91,7 +94,7 @@ export default function Header({
               onClick={() => setMenu(false)}
             />
             <div className="absolute right-4 top-14 z-10 w-56 rounded-xl border border-pc-border bg-pc-surface p-2 text-sm shadow-xl">
-              <button
+              {access.config && <button
                 className="w-full rounded-lg p-2 text-left hover:bg-pc-elevated"
                 onClick={() => {
                   setMenu(false);
@@ -99,7 +102,7 @@ export default function Header({
                 }}
               >
                 {t('config.all_settings')}
-              </button>
+              </button>}
               <button
                 className="w-full rounded-lg p-2 text-left hover:bg-pc-elevated"
                 onClick={() => {
@@ -124,14 +127,14 @@ export default function Header({
                   ))}
                 </select>
               </label>
-              <button
+              {session ? <AccountMenu session={session} onSignOut={signOut} /> : <button
                 className="w-full rounded-lg p-2 text-left hover:bg-pc-elevated"
                 onClick={() => {
                   if (window.confirm(t('auth.logout_confirm'))) logout();
                 }}
               >
                 {t('auth.logout')}
-              </button>
+              </button>}
             </div>
           </>
         )}

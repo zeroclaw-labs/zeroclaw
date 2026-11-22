@@ -10,6 +10,8 @@ import { sessionTarget } from '@/lib/sessionNavigation';
 import type { Session } from '@/types/api';
 import { t } from '@/lib/i18n';
 import { loadConfigSearchItems, type ConfigSearchItem } from '@/lib/configSearch';
+import { useAuth } from '@/hooks/useAuth';
+import { navAccessFor, pathAccess, type NavAccess } from '@/lib/navAccess';
 
 // Navigation, session history, and schema-derived settings share one search.
 type ResultKind = 'page' | 'session' | 'section' | 'entry' | 'field';
@@ -17,7 +19,7 @@ type ResultKind = 'page' | 'session' | 'section' | 'entry' | 'field';
 // A unified, keyboard-navigable result row. Nav destinations and config items
 // are normalized into this single shape so the filter / selection / render
 // pipeline treats them identically.
-interface PaletteItem {
+export interface PaletteItem {
   kind: ResultKind;
   /** Navigated to on select. */
   to: string;
@@ -70,6 +72,25 @@ function toPaletteItem(c: ConfigSearchItem): PaletteItem {
     searchExtra: `${c.path ?? ''} ${c.url}`,
     icon: KIND_ICON[kind],
   };
+}
+
+/**
+ * Every searchable item `access` lets the caller open: the pages first, then
+ * the config sections and entries. Both go through `pathAccess`. Config results
+ * load once and stay cached, so ones loaded while the account could read config
+ * drop out as soon as its session says it no longer can.
+ */
+export function paletteItemsFor(access: NavAccess, configItems: ConfigSearchItem[]): PaletteItem[] {
+  const allowed = (to: string) => pathAccess(to, access) === 'allowed';
+  const pages: PaletteItem[] = destinations.filter((d) => allowed(d.to)).map((d) => ({
+    kind: 'page',
+    to: d.to,
+    label: t(d.labelKey),
+    sublabel: t(d.groupKey),
+    searchExtra: d.to,
+    icon: d.icon,
+  }));
+  return [...pages, ...configItems.map(toPaletteItem).filter((item) => allowed(item.to))];
 }
 
 // Substring (case-insensitive) match across label + sublabel + path. Returns a
@@ -163,24 +184,20 @@ export default function CommandPalette({ open, onClose }: CommandPaletteProps) {
     };
   }, [open]);
 
+  // Only pages the signed-in account can use; every page when paired.
+  const { session } = useAuth();
+
   // All searchable items in one flat list: static pages first, then config
   // sections, then config entries (toPaletteItem assigns the bucket/icon).
   const allItems = useMemo<PaletteItem[]>(() => {
-    const pages: PaletteItem[] = destinations.map((d) => ({
-      kind: 'page',
-      to: d.to,
-      label: t(d.labelKey),
-      sublabel: t(d.groupKey),
-      searchExtra: d.to,
-      icon: d.icon,
-    }));
     const history: PaletteItem[] = [...sessions, ...code.sessions].map((session) => ({
       kind: 'session', to: sessionTarget(session), label: session.name || ('surface' in session ? `${t('nav.code')} · ${session.agent_alias}` : session.session_id),
       sublabel: session.agent_alias ?? session.channel_id ?? t('home.sessions'),
       searchExtra: `${session.session_key} ${session.channel_id ?? ''}`, icon: History,
     }));
-    return [...pages, ...history, ...configItems.map(toPaletteItem)];
-  }, [configItems, sessions, code.sessions]);
+    const access = navAccessFor(session);
+    return [...paletteItemsFor(access, configItems), ...history.filter(item => pathAccess(item.to, access) === 'allowed')];
+  }, [configItems, sessions, code.sessions, session]);
 
   // Filter + sort + bucket + cap. The flat `results` list (header rows
   // interleaved) is what we render; `items` (no headers) is the keyboard-

@@ -35,6 +35,9 @@ export interface ChatWorkspaceProps {
    * workspace. */
   initialAlias: string;
   initialSessionId?: string;
+  /** When set, only these agents may be open: tabs restored from storage for
+   * any other agent are dropped (an account limited to some agents). */
+  allowedAliases?: ReadonlySet<string>;
 }
 
 /**
@@ -46,14 +49,16 @@ export interface ChatWorkspaceProps {
  * so background chats stay connected and keep streaming. A pane only unmounts —
  * and its socket only closes — when its tab is explicitly closed.
  */
-export default function ChatWorkspace({ initialAlias, initialSessionId }: ChatWorkspaceProps) {
+export default function ChatWorkspace({ initialAlias, initialSessionId, allowedAliases }: ChatWorkspaceProps) {
   const { layout: presentation } = useLayoutPreference();
   const visible = useWorkspaceVisible();
   const navigate = useNavigate();
   const persisted = useRef<Partial<PersistedState>>(loadPersisted());
 
   const [tabs, setTabs] = useState<ChatTab[]>(() => {
-    const stored = persisted.current.tabs ?? [];
+    const stored = (persisted.current.tabs ?? []).filter(
+      (tb) => !allowedAliases || allowedAliases.has(tb.alias),
+    );
     // The route's agent is always open, but only add it when it is not already
     // there — a deep link should land on the existing pane, not fork a new one.
     return stored.some((tb) => matchesChatRequest(tb, initialAlias, initialSessionId))
