@@ -551,6 +551,26 @@ impl HttpRequestTool {
         name: &str,
         target: &ValidatedHttpRequestTarget,
     ) -> anyhow::Result<Vec<String>> {
+        self.apply_scoped_credential_with_resolver(
+            headers,
+            name,
+            target,
+            Self::resolve_scoped_value,
+        )
+        .await
+    }
+
+    async fn apply_scoped_credential_with_resolver<F, Fut>(
+        &self,
+        headers: &mut HeaderMap,
+        name: &str,
+        target: &ValidatedHttpRequestTarget,
+        resolve: F,
+    ) -> anyhow::Result<Vec<String>>
+    where
+        F: FnOnce(zeroclaw_config::schema::ScopedCredentialSource, String) -> Fut + Send,
+        Fut: std::future::Future<Output = anyhow::Result<String>> + Send,
+    {
         use base64::Engine as _;
         use zeroclaw_config::{
             schema::{Config, ScopedApiKeyHeader, ScopedHttpAuth, ScopedHttpCredential},
@@ -599,9 +619,10 @@ impl HttpRequestTool {
                 "tool-http-credential-origin",
             )));
         }
+        let alias = name;
         let (name, authorization, mut sensitive) = match credential.auth {
             ScopedHttpAuth::ApiKey { value, header } => {
-                let value = Self::resolve_scoped_value(credential.source, value).await?;
+                let value = resolve(credential.source, value).await?;
                 match header {
                     ScopedApiKeyHeader::Bearer => {
                         (AUTHORIZATION, format!("Bearer {value}"), vec![value])
@@ -617,7 +638,7 @@ impl HttpRequestTool {
                 }
             }
             ScopedHttpAuth::UserPassword { username, password } => {
-                let password = Self::resolve_scoped_value(credential.source, password).await?;
+                let password = resolve(credential.source, password).await?;
                 let pair = format!("{username}:{password}");
                 let encoded = base64::engine::general_purpose::STANDARD.encode(&pair);
                 (
@@ -632,6 +653,19 @@ impl HttpRequestTool {
                 )));
             }
         };
+        let current: Config = std::fs::read_to_string(path)
+            .ok()
+            .and_then(|contents| toml::from_str(&contents).ok())
+            .ok_or_else(|| {
+                anyhow::Error::msg(scoped_credential_message("tool-http-credential-store"))
+            })?;
+        if !current.secrets.encrypt
+            || current.http_request.scoped_credentials.get(alias) != Some(stored)
+        {
+            return Err(anyhow::Error::msg(scoped_credential_message(
+                "tool-http-credential-origin",
+            )));
+        }
         let mut header = HeaderValue::from_str(&authorization).map_err(|_| {
             anyhow::Error::msg(scoped_credential_message("tool-http-credential-invalid"))
         })?;
