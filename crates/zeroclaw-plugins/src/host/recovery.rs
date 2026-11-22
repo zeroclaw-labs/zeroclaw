@@ -440,6 +440,7 @@ thread_local! {
 #[cfg(windows)]
 fn rename_new(from: &Dir, name: &str, to: &Dir, dest: &str) -> std::io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::Foundation::WIN32_ERROR;
     use windows::Win32::Storage::FileSystem::MoveFileW;
     use windows::core::PCWSTR;
 
@@ -470,8 +471,12 @@ fn rename_new(from: &Dir, name: &str, to: &Dir, dest: &str) -> std::io::Result<(
     // SAFETY: owned UTF-16 buffers each have one terminating NUL, no interior
     // NUL, and live through this synchronous call. Neither pointer escapes.
     // MoveFileW refuses ANY existing destination; never use a replacing fallback.
-    unsafe { MoveFileW(PCWSTR(source.as_ptr()), PCWSTR(destination.as_ptr())) }
-        .map_err(std::io::Error::other)
+    unsafe { MoveFileW(PCWSTR(source.as_ptr()), PCWSTR(destination.as_ptr())) }.map_err(|error| {
+        match WIN32_ERROR::from_error(&error) {
+            Some(code) => std::io::Error::from_raw_os_error(code.0 as i32),
+            None => std::io::Error::other(error),
+        }
+    })
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -963,6 +968,17 @@ mod rename_tests {
 #[cfg(all(test, windows))]
 mod windows_tests {
     use super::*;
+
+    #[test]
+    fn move_reports_a_missing_source_as_a_win32_file_error() {
+        use windows::Win32::Foundation::ERROR_FILE_NOT_FOUND;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = Root::open(temp.path()).unwrap();
+        let error = rename_new(&root.dir, "missing", &root.dir, "dest").unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(error.raw_os_error(), Some(ERROR_FILE_NOT_FOUND.0 as i32));
+    }
 
     #[test]
     fn move_refuses_existing_files_and_directories_without_clobbering() {
