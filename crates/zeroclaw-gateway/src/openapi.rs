@@ -235,111 +235,113 @@ pub fn build_spec() -> serde_json::Value {
         }
     });
 
-    let http_credentials = serde_json::json!({
-        "get": {
-            "tags": ["config"],
-            "summary": "List scoped credential metadata",
-            "responses": {
-                "200": {
-                    "description": "Credential metadata. Secret values and references are omitted.",
-                    "content": {"application/json": {"schema": {
-                        "type": "object",
-                        "required": ["encryption_enabled", "credentials"],
-                        "properties": {
-                            "encryption_enabled": {"type": "boolean"},
-                            "credentials": {"type": "array", "items": {
-                                "type": "object",
-                                "required": ["name", "origin", "kind", "source", "permission_revision"],
-                                "properties": {
-                                    "name": {"type": "string"},
-                                    "origin": {"type": "string"},
-                                    "kind": {"type": "string"},
-                                    "source": {"type": "string"},
-                                    "permission_revision": {"type": "string", "description": "Current revision of the credential permission state."},
-                                    "http_allowed": {"type": ["boolean", "null"]},
-                                    "http_origins": {"type": "array", "items": {"type": "string"}},
-                                    "browser_origin": {"type": ["string", "null"]},
-                                    "browser_origins": {"type": "array", "items": {"type": "string"}},
-                                    "header": {"type": ["string", "null"]},
-                                    "destinations": {"type": ["array", "null"], "items": {
-                                        "type": "object",
-                                        "properties": {
-                                            "host": {"type": "string"},
-                                            "port": {"type": "integer"},
-                                            "username": {"type": "string"}
-                                        }
-                                    }}
-                                }
-                            }}
-                        }
-                    }}}
-                },
-                "403": {"description": "Authenticated operator required"},
-                "503": {"description": "Credential catalog unavailable"}
-            }
-        },
-        "post": {
-            "tags": ["config"],
-            "summary": "Create, replace or remove a scoped credential or update its grant",
-            "description": "New aliases have no HTTP grant. Grant changes use a separate replace request with permissions.",
-            "requestBody": {
-                "required": true,
+    let http_credentials_get = serde_json::json!({
+        "tags": ["config"],
+        "summary": "List scoped credential metadata",
+        "responses": {
+            "200": {
+                "description": "Credential metadata. Secret values and references are omitted.",
                 "content": {"application/json": {"schema": {
                     "type": "object",
-                    "required": ["name", "operation"],
+                    "required": ["encryption_enabled", "credentials"],
                     "properties": {
-                        "name": {"type": "string"},
-                        "operation": {"type": "string", "enum": ["create", "replace", "delete"]},
-                        "credential": {
+                        "encryption_enabled": {"type": "boolean"},
+                        "credentials": {"type": "array", "items": {
                             "type": "object",
-                            "required": ["origin", "auth"],
+                            "required": ["name", "origin", "kind", "source", "permission_revision"],
                             "properties": {
+                                "name": {"type": "string"},
                                 "origin": {"type": "string"},
+                                "kind": {"type": "string"},
                                 "source": {"type": "string"},
-                                "auth": {
-                                    "type": "object",
-                                    "required": ["kind"],
-                                    "properties": {
-                                        "kind": {"type": "string", "enum": ["api_key", "user_password", "totp", "ssh_key"]},
-                                        "header": {"type": "string"},
-                                        "username": {"type": "string", "writeOnly": true},
-                                        "value": {"type": "string", "writeOnly": true},
-                                        "password": {"type": "string", "writeOnly": true},
-                                        "seed": {"type": "string", "writeOnly": true},
-                                        "private_key": {"type": "string", "writeOnly": true},
-                                        "destinations": {"type": "array", "items": ssh_destination}
-                                    }
-                                }
-                            }
-                        },
-                        "permissions": {
-                            "type": "object",
-                            "properties": {
-                                "expected_revision": {"type": "string", "description": "Use the permission_revision from GET. Required when replacing http_origins, browser.origins, or destinations. A missing required or stale revision returns 409."},
-                                "http_allowed": {"type": "boolean"},
-                                "http_origins": {"type": "array", "maxItems": 32, "items": {"type": "string"}},
-                                "browser": {
+                                "permission_revision": {"type": "string", "description": "Current revision of the credential permission state."},
+                                "http_allowed": {"type": ["boolean", "null"]},
+                                "http_origins": {"type": "array", "items": {"type": "string"}},
+                                "browser_origin": {"type": ["string", "null"]},
+                                "browser_origins": {"type": "array", "items": {"type": "string"}},
+                                "header": {"type": ["string", "null"]},
+                                "destinations": {"type": ["array", "null"], "items": {
                                     "type": "object",
                                     "properties": {
-                                        "origin": {"type": ["string", "null"]},
-                                        "origins": {"type": "array", "maxItems": 32, "items": {"type": "string"}}
+                                        "host": {"type": "string"},
+                                        "port": {"type": "integer"},
+                                        "username": {"type": "string"}
                                     }
-                                },
-                                "destinations": {"type": "array", "items": ssh_destination}
+                                }}
                             }
-                        }
+                        }}
                     }
                 }}}
             },
-            "responses": {
-                "204": {"description": "Mutation saved"},
-                "400": {"description": "Invalid credential or grant"},
-                "403": {"description": "Authenticated operator required"},
-                "404": {"description": "Credential not found for grant update"},
-                "409": {"description": "Credential state conflicts with the operation"},
-                "412": {"description": "Initialized encryption required"}
-            }
+            "403": {"description": "Authenticated operator required"},
+            "503": {"description": "Credential catalog unavailable"}
         }
+    });
+    let http_credentials_post = serde_json::json!({
+        "tags": ["config"],
+        "summary": "Create, replace or remove a scoped credential or update its grant",
+        "description": "New aliases have no HTTP grant. Grant changes use a separate replace request with permissions.",
+        "requestBody": {
+            "required": true,
+            "content": {"application/json": {"schema": {
+                "type": "object",
+                "required": ["name", "operation"],
+                "properties": {
+                    "name": {"type": "string"},
+                    "operation": {"type": "string", "enum": ["create", "replace", "delete"]},
+                    "credential": {
+                        "type": "object",
+                        "required": ["origin", "auth"],
+                        "properties": {
+                            "origin": {"type": "string"},
+                            "source": {"type": "string"},
+                            "auth": {
+                                "type": "object",
+                                "required": ["kind"],
+                                "properties": {
+                                    "kind": {"type": "string", "enum": ["api_key", "user_password", "totp", "ssh_key"]},
+                                    "header": {"type": "string"},
+                                    "username": {"type": "string", "writeOnly": true},
+                                    "value": {"type": "string", "writeOnly": true},
+                                    "password": {"type": "string", "writeOnly": true},
+                                    "seed": {"type": "string", "writeOnly": true},
+                                    "private_key": {"type": "string", "writeOnly": true},
+                                    "destinations": {"type": "array", "items": ssh_destination}
+                                }
+                            }
+                        }
+                    },
+                    "permissions": {
+                        "type": "object",
+                        "properties": {
+                            "expected_revision": {"type": "string", "description": "Use the permission_revision from GET. Required when replacing http_origins, browser.origins, or destinations. A missing required or stale revision returns 409."},
+                            "http_allowed": {"type": "boolean"},
+                            "http_origins": {"type": "array", "maxItems": 32, "items": {"type": "string"}},
+                            "browser": {
+                                "type": "object",
+                                "properties": {
+                                    "origin": {"type": ["string", "null"]},
+                                    "origins": {"type": "array", "maxItems": 32, "items": {"type": "string"}}
+                                }
+                            },
+                            "destinations": {"type": "array", "items": ssh_destination}
+                        }
+                    }
+                }
+            }}}
+        },
+        "responses": {
+            "204": {"description": "Mutation saved"},
+            "400": {"description": "Invalid credential or grant"},
+            "403": {"description": "Authenticated operator required"},
+            "404": {"description": "Credential not found for grant update"},
+            "409": {"description": "Credential state conflicts with the operation"},
+            "412": {"description": "Initialized encryption required"}
+        }
+    });
+    let http_credentials = serde_json::json!({
+        "get": http_credentials_get,
+        "post": http_credentials_post
     });
     let paths = serde_json::json!({
         "/api/status": {
