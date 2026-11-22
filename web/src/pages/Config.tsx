@@ -1117,8 +1117,8 @@ function XmppAllowedUsers({ channelAlias, onSaved }: { channelAlias: string; onS
       const key = nextXmppPolicyKey(channelAlias, keys);
       await patchConfig([{
         op: "add",
-        path: `peer_groups.${key}`,
-        value: { channel: `xmpp.${channelAlias}`, agents: [], external_peers: [], ignore: [] },
+        path: `peer_groups.${key}.channel`,
+        value: `xmpp.${channelAlias}`,
       }]);
       setGroups(previous => [...previous, { key, channel: `xmpp.${channelAlias}` }]);
       onSaved();
