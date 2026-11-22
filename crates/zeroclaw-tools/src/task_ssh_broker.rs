@@ -28,6 +28,13 @@ const SSH: &str = "/usr/bin/ssh";
 const FOREGROUND: [&str; 2] = ["-o", "ForkAfterAuthentication=no"];
 const FRAME_LIMIT: u64 = 16_384;
 
+const PAM_STEP_KEYS: [&str; 3] = [
+    "tool-native-ssh-pam-step-one",
+    "tool-native-ssh-pam-step-two",
+    "tool-native-ssh-pam-step-three",
+];
+const LEASE_ERROR_KEYS: [&str; 2] = ["tool-native-ssh-credential", "tool-native-ssh-connection"];
+
 fn message(key: &str) -> String {
     crate::i18n::get_required_tool_string(key)
 }
@@ -869,10 +876,10 @@ async fn serve_inner(
                             state.idle_since = Some(Instant::now());
                         }
                         Err(error) => {
-                            let key = error.chain()
-                                .map(|cause| cause.to_string())
-                                .find(|text| matches!(text.as_str(), "tool-native-ssh-credential" | "tool-native-ssh-connection"))
-                                .unwrap_or_else(|| "tool-native-ssh-denied".into());
+                            let causes = error.chain().map(ToString::to_string).collect::<Vec<_>>();
+                            let key = PAM_STEP_KEYS.iter().chain(&LEASE_ERROR_KEYS)
+                                .find(|key| causes.iter().any(|cause| cause == **key))
+                                .copied().unwrap_or("tool-native-ssh-denied").to_owned();
                             let _ = write(&mut stream, &Reply {path:None, error:Some(key)}).await;
                         }
                     }
@@ -909,12 +916,7 @@ async fn client(mut args: Vec<String>) -> Result<i32> {
     let error_key = reply
         .error
         .as_deref()
-        .filter(|key| {
-            matches!(
-                *key,
-                "tool-native-ssh-credential" | "tool-native-ssh-connection"
-            )
-        })
+        .filter(|key| PAM_STEP_KEYS.contains(key) || LEASE_ERROR_KEYS.contains(key))
         .unwrap_or("tool-native-ssh-denied");
     let path = reply.path.context(message(error_key))?;
     let status = Command::new(SSH)
@@ -983,14 +985,12 @@ pub fn run(args: Vec<String>) -> i32 {
         Ok(code) => code,
         Err(error) => {
             let display = error.to_string();
-            let allowed = [
-                "tool-native-ssh-credential",
-                "tool-native-ssh-connection",
-                "tool-native-ssh-arguments",
-            ]
-            .iter()
-            .map(|key| message(key))
-            .find(|text| *text == display);
+            let allowed = PAM_STEP_KEYS
+                .iter()
+                .chain(&LEASE_ERROR_KEYS)
+                .chain(&["tool-native-ssh-arguments"])
+                .map(|key| message(key))
+                .find(|text| *text == display);
             eprintln!(
                 "{}",
                 allowed.unwrap_or_else(|| message("tool-native-ssh-denied"))

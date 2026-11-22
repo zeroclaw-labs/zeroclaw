@@ -170,10 +170,11 @@ impl<'a> PamExchange<'a> {
             .split_first()
             .ok_or_else(|| anyhow::Error::msg("Extra PAM challenge"))?;
         let role = expected.match_prompt(prompt, echo).map_err(|_| {
-            anyhow::Error::msg(format!(
-                "SSH PAM challenge {} did not match the configured {:?} prompt",
-                self.step, expected.role
-            ))
+            anyhow::Error::msg(match self.step {
+                1 => "tool-native-ssh-pam-step-one",
+                2 => "tool-native-ssh-pam-step-two",
+                _ => "tool-native-ssh-pam-step-three",
+            })
         })?;
         self.step += 1;
         self.remaining = rest;

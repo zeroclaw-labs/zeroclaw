@@ -315,6 +315,9 @@ tool-ssh-task-unsupported = The task SSH broker requires Linux.
 
 tool-native-ssh-credential = The SSH credential or destination grant is unavailable.
 
+tool-native-ssh-pam-step-one = SSH rejected PAM challenge 1. Check the configured role and prompt label for this step.
+tool-native-ssh-pam-step-two = SSH rejected PAM challenge 2. Check the configured role and prompt label for this step.
+tool-native-ssh-pam-step-three = SSH rejected PAM challenge 3. Check the configured role and prompt label for this step.
 tool-native-ssh-connection = The managed SSH connection could not be established.
 
 # Managed browser credentials
