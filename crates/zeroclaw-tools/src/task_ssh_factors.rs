@@ -127,7 +127,7 @@ impl Factors {
                     .to_ascii_uppercase()
                     .as_bytes(),
             )
-            .map_err(|_| anyhow::anyhow!("invalid SSH TOTP seed"))?;
+            .map_err(|_| anyhow::Error::msg("invalid SSH TOTP seed"))?;
         ensure!(!bytes.is_empty(), "empty SSH TOTP seed");
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?

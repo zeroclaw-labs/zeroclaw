@@ -139,7 +139,7 @@ impl<'a> PamExchange<'a> {
         let (expected, rest) = self
             .remaining
             .split_first()
-            .ok_or_else(|| anyhow::anyhow!("Extra PAM challenge"))?;
+            .ok_or_else(|| anyhow::Error::msg("Extra PAM challenge"))?;
         let role = expected.match_prompt(prompt, echo)?;
         self.remaining = rest;
         self.rejected = false;

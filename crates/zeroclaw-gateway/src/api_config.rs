@@ -1392,7 +1392,10 @@ fn validate_ssh_profiles(
     credentials: &std::collections::HashMap<String, String>,
     store: &zeroclaw_config::secrets::SecretStore,
 ) -> anyhow::Result<()> {
-    use zeroclaw_config::{schema::{ScopedHttpAuth, ScopedHttpCredential}, ssh_auth_profile::SshAuthentication};
+    use zeroclaw_config::{
+        schema::{ScopedHttpAuth, ScopedHttpCredential},
+        ssh_auth_profile::SshAuthentication,
+    };
 
     anyhow::ensure!(profiles.len() <= 32, "Too many SSH profiles");
     let mut destinations = std::collections::HashSet::new();
@@ -1408,24 +1411,35 @@ fn validate_ssh_profiles(
             SshAuthentication::Password { password_alias } => {
                 [Some((password_alias, "user_password")), None]
             }
-            SshAuthentication::Pam { password_alias, totp_alias, .. } => [
-                password_alias.as_ref().map(|alias| (alias, "user_password")),
+            SshAuthentication::Pam {
+                password_alias,
+                totp_alias,
+                ..
+            } => [
+                password_alias
+                    .as_ref()
+                    .map(|alias| (alias, "user_password")),
                 totp_alias.as_ref().map(|alias| (alias, "totp")),
             ],
         };
         anyhow::ensure!(
-            factors.iter().flatten().any(|(alias, _)| alias.as_str() == anchor),
+            factors
+                .iter()
+                .flatten()
+                .any(|(alias, _)| alias.as_str() == anchor),
             "SSH profile must belong to one of its credential aliases"
         );
         for (alias, kind) in factors.into_iter().flatten() {
-            let encrypted = credentials.get(alias).filter(|value| value.starts_with("enc2:"))
-                .ok_or_else(|| anyhow::anyhow!("SSH grant missing"))?;
+            let encrypted = credentials
+                .get(alias)
+                .filter(|value| value.starts_with("enc2:"))
+                .ok_or_else(|| anyhow::Error::msg("SSH grant missing"))?;
             let record: ScopedHttpCredential = serde_json::from_str(&store.decrypt(encrypted)?)?;
             anyhow::ensure!(
                 scoped_credential_kind(&record.auth) == kind
-                    && record.ssh_grants().is_some_and(|grants| grants.iter().any(|grant|
-                        grant.matches(&dest.host, dest.port, &dest.username)
-                    )),
+                    && record.ssh_grants().is_some_and(|grants| grants
+                        .iter()
+                        .any(|grant| grant.matches(&dest.host, dest.port, &dest.username))),
                 "SSH factor is not authorized for the profile destination"
             );
             if let ScopedHttpAuth::UserPassword { username, .. } = &record.auth {
@@ -1476,11 +1490,13 @@ fn ssh_factor_grants_change_permission_revision() -> anyhow::Result<()> {
             serde_json::from_value(serde_json::json!({"origin":"","auth":auth}))?;
         assert_eq!(record.ssh_grants().map(|grants| grants.len()), Some(0));
         let initial = permission_revision(&record);
-        record.ssh_factor_destinations.push(SshCredentialDestination {
-            host: "guest.example.test".into(),
-            port: 2222,
-            username: "fixture".into(),
-        });
+        record
+            .ssh_factor_destinations
+            .push(SshCredentialDestination {
+                host: "guest.example.test".into(),
+                port: 2222,
+                username: "fixture".into(),
+            });
         assert_eq!(record.ssh_grants().map(|grants| grants.len()), Some(1));
         assert_ne!(permission_revision(&record), initial);
         record.ssh_factor_destinations.clear();
