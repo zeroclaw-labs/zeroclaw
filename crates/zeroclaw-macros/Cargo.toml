@@ -15,3 +15,7 @@ proc-macro = true
 syn = { version = "2", features = ["full", "extra-traits"] }
 quote = "1"
 proc-macro2 = "1"
+
+[lints.clippy]
+allow_attributes = "deny"
+allow_attributes_without_reason = "deny"

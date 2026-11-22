@@ -29,7 +29,6 @@ pub const TASK_EVENT_NAME: &str = "runtime.task.spawn";
 #[macro_export]
 macro_rules! spawn {
     (level = $level:ident, $body:expr) => {{
-        #[allow(unused_imports)]
         use $crate::__private::tracing::Instrument as _;
 
         // Capture the call-site once. `module_path!`, `file!`, `line!`
@@ -80,7 +79,10 @@ macro_rules! spawn {
             __zc_task_output
         };
 
-        #[allow(clippy::disallowed_methods)]
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "this macro is the sanctioned wrapper around tokio::spawn"
+        )]
         let __zc_spawn_handle =
             $crate::__private::tokio::spawn(__zc_task_future.in_current_span());
         __zc_spawn_handle

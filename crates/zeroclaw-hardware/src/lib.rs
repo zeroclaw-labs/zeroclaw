@@ -58,7 +58,6 @@ pub mod tool_registry;
 use crate::device::DeviceRegistry;
 #[cfg(feature = "hardware")]
 use anyhow::Result;
-#[allow(unused_imports)]
 pub use tool_registry::{ToolError, ToolRegistry};
 
 // Re-export config types so wizard can use `hardware::HardwareConfig` etc.

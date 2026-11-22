@@ -24,3 +24,7 @@ tracing = { version = "0.1", default-features = false, features = ["std"] }
 tokio = { version = "1.50", features = ["rt-multi-thread", "macros", "time"] }
 tracing = { version = "0.1", default-features = false, features = ["std"] }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "std"] }
+
+[lints.clippy]
+allow_attributes = "deny"
+allow_attributes_without_reason = "deny"

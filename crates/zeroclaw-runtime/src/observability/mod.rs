@@ -14,9 +14,7 @@ pub mod runtime_trace;
 pub mod traits;
 pub mod verbose;
 
-#[allow(unused_imports)]
 pub use self::log::LogObserver;
-#[allow(unused_imports)]
 pub use self::multi::MultiObserver;
 #[cfg(feature = "observability-otel")]
 use self::otel_config::OtelContentConfig;
@@ -27,7 +25,6 @@ pub use otel::OtelObserver;
 #[cfg(feature = "observability-prometheus")]
 pub use prometheus::PrometheusObserver;
 pub use traits::{Observer, ObserverEvent};
-#[allow(unused_imports)]
 pub use verbose::VerboseObserver;
 
 use std::any::Any;

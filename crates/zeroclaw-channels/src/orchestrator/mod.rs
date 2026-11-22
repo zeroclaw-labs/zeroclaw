@@ -260,7 +260,6 @@ const WHATSAPP_OBSERVED_GROUP_MESSAGE_LABEL: &str = "Observed WhatsApp group mes
 const WHATSAPP_CURRENT_GROUP_MESSAGE_LABEL: &str = "Current WhatsApp group message";
 
 // System prompt functions live in `zeroclaw_runtime::agent::system_prompt`.
-#[allow(unused_imports)]
 pub use zeroclaw_runtime::agent::system_prompt::{
     BOOTSTRAP_MAX_CHARS, COMPACT_BOOTSTRAP_MAX_CHARS, build_system_prompt,
     build_system_prompt_with_mode, build_system_prompt_with_mode_and_autonomy,

@@ -42,3 +42,7 @@ testing = []
 [dev-dependencies]
 filetime = "0.2"
 tempfile = "3.26"
+
+[lints.clippy]
+allow_attributes = "deny"
+allow_attributes_without_reason = "deny"

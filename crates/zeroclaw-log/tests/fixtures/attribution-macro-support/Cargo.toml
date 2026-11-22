@@ -7,3 +7,7 @@ publish = false
 
 [dependencies]
 zeroclaw-api.workspace = true
+
+[lints.clippy]
+allow_attributes = "deny"
+allow_attributes_without_reason = "deny"

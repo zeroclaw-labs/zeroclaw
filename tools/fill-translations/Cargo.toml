@@ -18,3 +18,7 @@ toml = "0.8"
 xtask = { path = "../../xtask" }
 zeroclaw-api = { workspace = true }
 zeroclaw-providers = { workspace = true }
+
+[lints.clippy]
+allow_attributes = "deny"
+allow_attributes_without_reason = "deny"

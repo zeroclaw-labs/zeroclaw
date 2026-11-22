@@ -117,7 +117,6 @@ impl Drop for RuntimeProxyTestGuard {
     }
 }
 
-#[allow(unused_imports)]
 pub use traits::{
     ChatMessage, ChatRequest, ChatResponse, ConversationMessage, ModelProvider,
     ProviderCapabilityError, ToolCall, ToolResultMessage, durable_chat_messages,

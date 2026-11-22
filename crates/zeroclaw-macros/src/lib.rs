@@ -2555,8 +2555,6 @@ pub fn derive_trigger_fields(input: TokenStream) -> TokenStream {
             pub(crate) fn field_specs(self) -> ::std::vec::Vec<crate::sop::trigger_registry::TriggerField> {
                 use crate::sop::trigger_registry::TriggerField;
                 use crate::sop::types::SopTriggerSource;
-                #[allow(unused_imports)]
-                use ::strum::IntoEnumIterator;
                 match self {
                     #(#source_arms)*
                 }

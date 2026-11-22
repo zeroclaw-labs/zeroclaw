@@ -10,3 +10,7 @@ publish = true
 
 [dependencies]
 serde = { version = "1.0", default-features = false, features = ["derive"] }
+
+[lints.clippy]
+allow_attributes = "deny"
+allow_attributes_without_reason = "deny"

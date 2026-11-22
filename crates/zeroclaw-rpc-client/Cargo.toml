@@ -19,3 +19,7 @@ zeroclaw-rpc-proto = { workspace = true }
 
 [dev-dependencies]
 tokio = { version = "1.50", features = ["rt-multi-thread", "macros", "io-util", "sync", "time"] }
+
+[lints.clippy]
+allow_attributes = "deny"
+allow_attributes_without_reason = "deny"

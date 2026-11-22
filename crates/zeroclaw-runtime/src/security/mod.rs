@@ -38,37 +38,26 @@ pub mod vulnerability;
 #[cfg(feature = "webauthn")]
 pub mod webauthn;
 
-#[allow(unused_imports)]
 pub use audit::{AuditEvent, AuditEventType, AuditLogger};
-#[allow(unused_imports)]
 pub use detect::create_sandbox;
 pub use detect::linux_memcg_available;
 pub use detect::{SandboxExtraRoots, SandboxPosture, sandbox_posture};
 pub use domain_matcher::DomainMatcher;
-#[allow(unused_imports)]
 pub use estop::{EstopLevel, EstopManager, EstopState, ResumeSelector};
-#[allow(unused_imports)]
 pub use external_content::{
     ContentSafety, FramingPolicy, OutboundPolicy, ScanOutcome, ScanPolicy, ScreenVerdict,
     cap_untrusted, frame_untrusted, new_marker_id, sanitize_untrusted, scan_untrusted,
     scrub_outbound,
 };
 // Universal ingress policy front door.
-#[allow(unused_imports)]
 pub use ingress::{IngressPolicy, ingress_policy};
-#[allow(unused_imports)]
 pub use otp::OtpValidator;
-#[allow(unused_imports)]
 pub use pairing::PairingGuard;
 pub use policy::{AutonomyLevel, SecurityPolicy};
-#[allow(unused_imports)]
 pub use secrets::SecretStore;
-#[allow(unused_imports)]
 pub use traits::{NoopSandbox, Sandbox};
 // Prompt injection defense exports
-#[allow(unused_imports)]
 pub use leak_detector::{LeakDetector, LeakResult};
-#[allow(unused_imports)]
 pub use prompt_guard::{GuardAction, GuardResult, PromptGuard};
 use zeroclaw_config::schema::LeakDetectionConfig;
 
