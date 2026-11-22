@@ -2226,6 +2226,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'dashboard.cost.last_30_days': 'Last 30 days',
     'dashboard.cost.this_month': 'This month',
     'dashboard.cost.all_time': 'All time',
+    'dashboard.cost.resets': 'Resets {time}',
     'dashboard.cost.spend_by_agent': 'Spend by agent',
     'dashboard.cost.spend_by_model': 'Spend by model',
     'dashboard.cost.no_per_agent_pre': 'No per-agent tracking. Enable',

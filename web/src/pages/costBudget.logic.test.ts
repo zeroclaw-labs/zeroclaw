@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { CostBudget } from '@/types/api';
-import { costBar, costOverviewBars } from './costBudget.logic.ts';
+import { costBar, costOverviewBars, nextUtcDayStart, nextUtcMonthStart } from './costBudget.logic.ts';
 
 const budget: CostBudget = {
   tracking: true,
@@ -53,4 +53,13 @@ test('no bar without tracking, without a limit, or without the budget fields', (
     daily: null,
     monthly: null,
   });
+});
+
+test('the daily and monthly totals reset at the next UTC midnight and UTC month start', () => {
+  const late = new Date('2026-11-21T23:59:59Z');
+  assert.equal(nextUtcDayStart(late).toISOString(), '2026-11-22T00:00:00.000Z');
+  assert.equal(nextUtcMonthStart(late).toISOString(), '2026-12-01T00:00:00.000Z');
+  const yearEnd = new Date('2026-12-31T12:00:00Z');
+  assert.equal(nextUtcDayStart(yearEnd).toISOString(), '2027-01-01T00:00:00.000Z');
+  assert.equal(nextUtcMonthStart(yearEnd).toISOString(), '2027-01-01T00:00:00.000Z');
 });

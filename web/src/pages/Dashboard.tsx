@@ -53,7 +53,11 @@ import {
   listProps,
 } from "@/lib/api";
 import { resolveModelToProviderType } from "@/lib/configuredModels";
-import { costOverviewBars } from "@/pages/costBudget.logic";
+import {
+  costOverviewBars,
+  nextUtcDayStart,
+  nextUtcMonthStart,
+} from "@/pages/costBudget.logic";
 import DoctorFixModal from "@/components/DoctorFixModal";
 
 type CostWindow = "today" | "7d" | "30d" | "month" | "all";
@@ -444,6 +448,18 @@ function OverviewTab({
   // Each period's spend against its configured limit. The Cost tab's window
   // total has no limit to measure against, so the card doesn't show it.
   const costBars = costOverviewBars(cost, budget);
+  // The tracker's day and month, and so the limits, are UTC: say when each
+  // resets in the viewer's local time, since the Cost tab's "Today" is local.
+  const now = new Date();
+  const resetsAt = (when: Date, withDate: boolean) =>
+    t("dashboard.cost.resets").replace(
+      "{time}",
+      when.toLocaleString(undefined, {
+        ...(withDate ? { month: "short", day: "numeric" } : {}),
+        hour: "numeric",
+        minute: "2-digit",
+      }),
+    );
 
   // Component Health → "fix in place" modal target (set when an error row's
   // last_error parses to a config entity). Same modal as the Doctor page.
@@ -542,14 +558,16 @@ function OverviewTab({
                 value: cost.daily_cost_usd,
                 color: "#34d399",
                 bar: costBars.daily,
+                resets: resetsAt(nextUtcDayStart(now), false),
               },
               {
                 label: t("dashboard.monthly_label"),
                 value: cost.monthly_cost_usd,
                 color: "#a78bfa",
                 bar: costBars.monthly,
+                resets: resetsAt(nextUtcMonthStart(now), true),
               },
-            ].map(({ label, value, color, bar }) => (
+            ].map(({ label, value, color, bar, resets }) => (
               <div key={label}>
                 <div className="flex justify-between text-sm mb-1.5">
                   <span style={{ color: "var(--pc-text-muted)" }}>{label}</span>
@@ -585,6 +603,12 @@ function OverviewTab({
                     />
                   </div>
                 )}
+                <div
+                  className="mt-1 text-[11px]"
+                  style={{ color: "var(--pc-text-faint)" }}
+                >
+                  {resets}
+                </div>
               </div>
             ))}
           </div>

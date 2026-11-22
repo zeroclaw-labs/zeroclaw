@@ -51,3 +51,13 @@ export function costOverviewBars(
     monthly: costBar(cost.monthly_cost_usd, budget.monthly_limit_usd, warn, budget.tracking),
   };
 }
+
+/** When the current UTC day ends: when the daily total and limit reset. */
+export function nextUtcDayStart(now: Date = new Date()): Date {
+  return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1));
+}
+
+/** When the current UTC month ends: when the monthly total and limit reset. */
+export function nextUtcMonthStart(now: Date = new Date()): Date {
+  return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1));
+}
