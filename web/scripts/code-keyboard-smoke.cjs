@@ -25,23 +25,41 @@ const second = makeSession("fixture-b", "reviewer", "Review the release", "01");
       localStorage.setItem("zeroclaw-layout", "focused");
       localStorage.setItem("zeroclaw_locale", "en");
     });
+    const sops = ["build", "review"].map((name) => ({
+      name, description: `${name} workflow`, version: "1.0.0", priority: "normal", execution_mode: "supervised",
+      triggers: [{ type: "manual" }], steps: [], cooldown_secs: 0, max_concurrent: 1,
+    }));
+    const graph = { nodes: [], wires: [], diagnostics: [], layout: { columns: 0, rows: 0, positions: [] } };
     await context.route("**/api/**", (route) => {
-      const path = new URL(route.request().url()).pathname;
+      const { pathname: path, searchParams } = new URL(route.request().url());
+      const agentPath = searchParams.get("prefix");
       const responses = {
         "/api/status": { model: models[0].model, locale: "en", version: "0.9.0", check_updates: false, gateway_port: 42628 },
         "/api/quickstart/state": { quickstart_completed: true, agents: ["builder", "reviewer"] },
         "/api/workspace": { code: true, agents: ["builder", "reviewer"], workflows: true, session_persistence: true },
         "/api/config/drift": { drifted: [] },
         "/api/config/reload-status": { pending_reload: false },
-        "/api/sops": { sops: [] },
+        "/api/config/map-keys": { keys: ["builder", "reviewer"] },
+        "/api/config/list": { entries: agentPath ? [{ path: `${agentPath}.enabled`, populated: true, value: true }] : [] },
+        "/api/sops": { sops: sops.map(({ name, description, steps }) => ({ name, description, steps: steps.length })) },
+        "/api/sops/graph-draft": graph,
+        "/api/sops/graph-legend": { flow_roles: [], pin_classes: [], run_states: [] },
+        "/api/sops/trigger-sources": { sources: ["manual"], bound: [], channels: [], operators: [] },
         "/api/sops/runs": { runs: [] },
       };
+      const sop = sops.find(({ name }) => path === `/api/sops/${name}/full`);
+      if (sop) return route.fulfill({ json: sop });
+      if (/^\/api\/sops\/[^/]+\/graph$/.test(path)) return route.fulfill({ json: graph });
       if (path === "/api/events") return route.fulfill({ contentType: "text/event-stream", body: ": fixture\n\n" });
       if (path.endsWith("/workspace/list")) return route.fulfill({ json: { path: "", entries: [] } });
       return route.fulfill({ json: responses[path] ?? {} });
     });
+    await context.routeWebSocket("**/ws/chat?*", () => {});
     const messages = {
-      "fixture-a": [{ role: "assistant", content: Array.from({ length: 45 }, (_, i) => `[L${i}](#fixture-${i})`).join(" ") }],
+      "fixture-a": [{ role: "assistant", content: [
+        ...Array.from({ length: 40 }, (_, i) => `Build transcript line ${i}.`),
+        Array.from({ length: 45 }, (_, i) => `[L${i}](#fixture-${i})`).join(" "),
+      ].join("\n\n") }],
       "fixture-b": [{ role: "assistant", content: "The review conversation." }],
     };
     const settings = {};
@@ -112,19 +130,40 @@ const second = makeSession("fixture-b", "reviewer", "Review the release", "01");
     });
     await page.goto(new URL("/code?agent=builder&session=fixture-a", base).toString());
     const chat = page.getByRole("region", { name: "Code conversation" });
+    const transcript = chat.getByRole("region", { name: "Transcript" });
     const composer = chat.getByRole("textbox", { name: /Describe a code change/ });
+    const mode = (name) => page.getByRole("button", { name, exact: true });
+    const windowFrame = page.locator("[data-workspace-window]");
     const navigate = async () => {
       await page.keyboard.press("Escape");
-      await page.getByRole("button", { name: "Navigate", exact: true }).waitFor();
+      if (await mode("Transcript").isVisible()) await page.keyboard.press("Escape");
+      await mode("Workspace").waitFor();
     };
     const hint = async (key) => {
       await page.keyboard.down("Shift");
+      await page.locator("kbd.fixed").filter({ hasText: new RegExp(`^${key}$`, "i") }).waitFor();
       for (const letter of key) await page.keyboard.press("Key" + letter.toUpperCase());
       await page.keyboard.up("Shift");
     };
 
     await page.getByRole("link", { name: "L0", exact: true }).waitFor();
+    await composer.focus();
+    await page.waitForFunction(() => document.querySelector("[data-workspace-transcript]")?.scrollTop > 48);
+    await page.keyboard.press("Escape");
+    await mode("Transcript").waitFor();
+    assert.equal(await transcript.evaluate((element) => element === document.activeElement), true);
+    assert.notEqual(await transcript.evaluate((element) => getComputedStyle(element).boxShadow), "none");
+    assert.equal(await windowFrame.evaluate((element) => getComputedStyle(element, "::after").content), "none");
+    const bottom = await transcript.evaluate((element) => element.scrollTop);
+    await page.keyboard.press("k");
+    assert.ok(await transcript.evaluate((element) => element.scrollTop) < bottom);
+    await page.keyboard.press("j");
+    assert.equal(await transcript.evaluate((element) => element.scrollTop), bottom);
+    await page.keyboard.press("l");
+    assert.ok(page.url().endsWith("/code?agent=builder&session=fixture-a"));
     await navigate();
+    assert.equal(await windowFrame.evaluate((element) => element === document.activeElement), true);
+    assert.equal(await windowFrame.evaluate((element) => getComputedStyle(element, "::after").outlineStyle), "solid");
     await page.keyboard.down("Shift");
     const badges = page.locator("kbd.fixed");
     assert.ok(await badges.count() > 26);
@@ -133,11 +172,13 @@ const second = makeSession("fixture-b", "reviewer", "Review the release", "01");
 
     await page.keyboard.press("i");
     assert.equal(await composer.evaluate((element) => element === document.activeElement), true);
+    await page.keyboard.press("Shift+KeyM");
+    assert.equal(await composer.inputValue(), "M");
+    assert.equal(await page.getByRole("dialog", { name: "Model", exact: true }).count(), 0);
     await composer.fill("Start build");
     await page.keyboard.press("Control+Enter");
     await chat.getByRole("list", { name: "Progress" }).getByText("Running tests", { exact: true }).waitFor();
     await composer.fill("Draft for A");
-    await navigate();
     await hint("m");
     const modelPicker = page.getByRole("dialog", { name: "Model", exact: true });
     await modelPicker.getByRole("combobox").fill("sonnet");
@@ -149,6 +190,7 @@ const second = makeSession("fixture-b", "reviewer", "Review the release", "01");
     await page.keyboard.press("Enter");
     assert.deepEqual(edits, []);
 
+    await navigate();
     await page.keyboard.press("j");
     await chat.getByText("The review conversation.").waitFor();
     assert.equal(active.has(first.session_id), true);
@@ -169,11 +211,26 @@ const second = makeSession("fixture-b", "reviewer", "Review the release", "01");
     await navigate();
     await page.keyboard.press("l");
     await page.waitForURL("**/sops");
-    await page.keyboard.press("h");
+    await page.getByRole("button", { name: /review workflow/ }).waitFor();
+    await page.keyboard.press("j");
+    await page.waitForURL("**/sops/review");
+    await page.keyboard.press("k");
+    await page.waitForURL("**/sops/build");
+    await page.keyboard.press("l");
+    await page.waitForURL((url) => url.pathname === "/agent/builder");
+    await page.getByRole("tab", { name: "reviewer", exact: true }).waitFor();
+    await page.keyboard.press("j");
+    await page.waitForURL((url) => url.pathname === "/agent/reviewer");
+    await page.keyboard.press("k");
+    await page.waitForURL((url) => url.pathname === "/agent/builder");
+    await page.keyboard.press("l");
     await page.waitForURL("**/code?agent=reviewer&session=fixture-b");
-    await page.waitForFunction(() => document.activeElement?.matches("[data-workspace-composer]"));
+    await page.keyboard.press("h");
+    await page.waitForURL((url) => url.pathname === "/agent/builder");
+    await page.keyboard.press("l");
+    await page.waitForURL("**/code?agent=reviewer&session=fixture-b");
+    assert.equal(await windowFrame.evaluate((element) => element === document.activeElement), true);
     assert.equal(await composer.inputValue(), "Draft for B");
-    await navigate();
     await page.keyboard.press("k");
     await page.waitForURL("**/code?agent=builder&session=fixture-a");
     await chat.getByRole("button", { name: "Settings · builder", exact: true }).waitFor();
@@ -186,6 +243,10 @@ const second = makeSession("fixture-b", "reviewer", "Review the release", "01");
     const files = chat.getByRole("button", { name: "Workspace files", exact: true });
     assert.equal(await files.getAttribute("aria-expanded"), "false");
     await files.click();
+    await composer.focus();
+    await page.keyboard.press("Escape");
+    await mode("Transcript").waitFor();
+    assert.equal(await files.getAttribute("aria-expanded"), "true");
     for (const [name, arrow] of [["Resize Code sessions", "ArrowRight"], ["Resize workspace files", "ArrowLeft"]]) {
       const grip = page.getByRole("separator", { name });
       const initial = Number(await grip.getAttribute("aria-valuenow"));

@@ -688,6 +688,7 @@ export function AgentChatInner({
        with a single ancestor. Static UI chrome here localizes through
        t() i18n, so losing browser translation on it is intentional. */
     <div
+      data-workspace-conversation
       translate="no"
       className="notranslate relative flex flex-col h-full min-h-0"
       onDragEnter={handleDragEnter}
@@ -864,6 +865,10 @@ export function AgentChatInner({
 
       {/* Messages area. */}
       <div
+        data-workspace-transcript
+        tabIndex={-1}
+        role="region"
+        aria-label={t('workspace.keyboard_transcript')}
         className={`flex-1 overflow-y-auto p-4 ${compact ? 'space-y-1.5' : 'space-y-4'}`}
       >
         {messages.length === 0 && (

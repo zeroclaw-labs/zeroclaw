@@ -139,12 +139,15 @@ their separators or focusing them and pressing the arrow keys. The browser
 remembers the open panels and their widths. On narrow screens the panels open
 over the conversation.
 
-Press **Esc** from the composer to enter navigation mode. **h/l** moves between
-Agent, Code, and SOP. **j/k** selects a row in the current workspace. **i**
-returns focus to the composer. Holding **Shift** reveals shortcuts for visible
-actions. From navigation mode, **Shift+M**, **Shift+R**, and **Shift+F** open
-the Code model picker, reasoning picker, and Files drawer when available.
-**Cmd+Enter / Ctrl+Enter** sends a prompt.
+Press **Esc** from the composer to focus the transcript. **j/k** scrolls the
+conversation. Press **Esc** again to focus the workspace. **h/l** moves between
+Agent, Code, and SOP, and **j/k** selects a row in the current section. A subtle
+outline marks the active area. **i** returns focus to the composer.
+
+Hold **Shift** until the hints appear, then press the displayed letters. This
+works from the composer as well. A quick shifted letter still types a capital.
+**Shift+M**, **Shift+R**, and **Shift+F** open the Code model picker, reasoning
+picker, and Files drawer when available. **Cmd+Enter / Ctrl+Enter** sends a prompt.
 
 Model choices are drawn from the daemon's configured providers and routes.
 The daemon reports the supported reasoning levels for the selected model.

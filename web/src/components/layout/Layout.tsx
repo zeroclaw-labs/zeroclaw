@@ -52,7 +52,8 @@ export default function Layout() {
   }, [pathname, layout]);
 
   return (
-    <WorkspaceKeyboard access={access}><WorkspaceSettings><div className="min-h-screen bg-pc-base text-pc-text">
+    <WorkspaceKeyboard access={access}><WorkspaceSettings><div data-workspace-window tabIndex={-1}
+      role="region" aria-label={t('workspace.keyboard_workspace')} className="min-h-screen bg-pc-base text-pc-text">
       {layout === 'classic' && <Sidebar open={sidebarOpen} onClose={() => setSidebarOpen(false)} />}
       <MainColumn viaRelay={viaRelay} showRail={layout === 'classic'}>
         <Header onOpenPalette={openPalette} onOpenSidebar={() => setSidebarOpen(true)} />

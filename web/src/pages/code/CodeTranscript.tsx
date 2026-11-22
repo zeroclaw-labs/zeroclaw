@@ -157,7 +157,7 @@ export default function CodeTranscript({
     </div>
   );
   return (
-    <div ref={ref} onScroll={(event) => {
+    <div ref={ref} data-workspace-transcript tabIndex={-1} role="region" aria-label={t("workspace.keyboard_transcript")} onScroll={(event) => {
       if (!visible || !loaded) return;
       const pane = event.currentTarget;
       position.top = pane.scrollTop;

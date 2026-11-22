@@ -12,6 +12,7 @@ interface WorkspaceItems {
   select: (id: string) => void;
 }
 type RegisterItems = (workspace: WorkspaceId, items: WorkspaceItems) => () => void;
+type FocusMode = "type" | "transcript" | "workspace";
 const Context = createContext<RegisterItems | undefined>(undefined);
 const KeyboardMode = createContext<ReactNode>(null);
 
@@ -34,7 +35,13 @@ export function useWorkspaceItems(workspace: WorkspaceId, enabled: boolean, item
 }
 
 const clickable = 'button, a[href], input:not([type="hidden"]), select, textarea, summary, [role="button"][tabindex]';
-const editable = 'input:not([type="checkbox"]):not([type="radio"]):not([type="button"]), textarea, [contenteditable="true"]';
+const editable = 'input:not([type="checkbox"], [type="radio"], [type="button"]), textarea';
+const transcript = "[data-workspace-transcript]";
+const composer = "[data-workspace-composer]";
+
+function isEditing(target: HTMLElement | undefined) {
+  return target?.isContentEditable || target?.matches(editable);
+}
 
 function visibleBox(target: HTMLElement) {
   if (!target.isConnected || target.closest("[hidden], [inert], [aria-hidden=true]")) return;
@@ -73,12 +80,18 @@ function isEnabled(target: HTMLElement) {
   return !target.matches(":disabled") && !target.closest("[aria-disabled=true]");
 }
 
-function focusComposer() {
-  const target = [...document.querySelectorAll<HTMLElement>("[data-workspace-composer]")]
+function visibleControl(scope: ParentNode | null | undefined, selector: string) {
+  return [...scope?.querySelectorAll<HTMLElement>(selector) ?? []]
     .find((element) => isEnabled(element) && visibleBox(element));
-  if (!target) return false;
-  target.focus({ preventScroll: true });
-  return true;
+}
+
+function activeWorkspace() {
+  return workspaceForPath(window.location.pathname.slice(basePath.length));
+}
+
+function consume(event: KeyboardEvent) {
+  event.preventDefault();
+  event.stopImmediatePropagation();
 }
 
 interface Hint {
@@ -94,22 +107,23 @@ export default function WorkspaceKeyboard({ access, children }: { access: NavAcc
   const navigate = useNavigate();
   const location = useLocation();
   const workspace = workspaceForPath(location.pathname);
-  const [navigation, setNavigationState] = useState(false);
-  const navigationRef = useRef(false);
-  const setNavigation = useCallback((value: boolean) => {
-    navigationRef.current = value;
-    setNavigationState(value);
+  const [mode, setModeState] = useState<FocusMode>("type");
+  const modeRef = useRef<FocusMode>("type");
+  const setMode = useCallback((value: FocusMode) => {
+    modeRef.current = value;
+    setModeState(value);
   }, []);
   const [hints, setHints] = useState<HintLayer | null>(null);
   const [prefix, setPrefix] = useState("");
   const [revision, redraw] = useState(0);
   const hintRef = useRef<HintLayer | null>(null);
   const prefixRef = useRef("");
-  const remembered = useRef<Partial<Record<WorkspaceId, { path: string; focus?: HTMLElement }>>>({});
+  const hintTimer = useRef<number | undefined>(undefined);
+  const remembered = useRef<Partial<Record<WorkspaceId, { path: string; conversation?: HTMLElement }>>>({});
   const registered = useRef(new Map<WorkspaceId, WorkspaceItems>());
-  const pendingFocus = useRef<WorkspaceId | null>(null);
+  const pendingItem = useRef<{ list: WorkspaceItems; item: string; url: string } | undefined>(undefined);
+  const previousWorkspace = useRef(workspace);
   const root = useRef<HTMLDivElement>(null);
-  const keyboardFocus = useRef<HTMLButtonElement>(null);
   const register = useCallback<RegisterItems>((id, list) => {
     registered.current.set(id, list);
     return () => {
@@ -117,45 +131,63 @@ export default function WorkspaceKeyboard({ access, children }: { access: NavAcc
     };
   }, []);
 
+  const cancelHintTimer = useCallback(() => {
+    window.clearTimeout(hintTimer.current);
+    hintTimer.current = undefined;
+  }, []);
   const closeHints = useCallback(() => {
+    cancelHintTimer();
     hintRef.current = null;
     prefixRef.current = "";
     setHints(null);
     setPrefix("");
+  }, [cancelHintTimer]);
+
+  const conversationControl = useCallback((id: WorkspaceId, selector: string, origin?: HTMLElement) => {
+    const conversation = origin?.closest("[data-workspace-conversation]") ?? remembered.current[id]?.conversation;
+    return visibleControl(conversation, selector) ?? visibleControl(root.current, selector);
   }, []);
-  const enterNavigation = useCallback(() => {
-    setNavigation(true);
-    keyboardFocus.current?.focus({ preventScroll: true });
-  }, [setNavigation]);
+
+  const enterWorkspace = useCallback(() => {
+    setMode("workspace");
+    root.current?.querySelector<HTMLElement>("[data-workspace-window]")?.focus({ preventScroll: true });
+  }, [setMode]);
+
+  const enterComposer = useCallback((id: WorkspaceId, origin?: HTMLElement) => {
+    const target = conversationControl(id, composer, origin);
+    if (!target) return false;
+    setMode("type");
+    target.focus({ preventScroll: true });
+    return true;
+  }, [conversationControl, setMode]);
+
+  const expandFocus = useCallback((id: WorkspaceId, origin?: HTMLElement) => {
+    const target = modeRef.current === "type" && conversationControl(id, transcript, origin);
+    if (target) {
+      setMode("transcript");
+      target.focus({ preventScroll: true });
+    } else {
+      enterWorkspace();
+    }
+  }, [conversationControl, enterWorkspace, setMode]);
 
   useLayoutEffect(() => {
+    const pending = pendingItem.current;
+    if (pending && (pending.url !== window.location.href || pending.list.selected === pending.item)) {
+      pendingItem.current = undefined;
+    }
+    if (previousWorkspace.current !== workspace) {
+      closeHints();
+      if (!workspace) setMode("type");
+      else if (modeRef.current === "transcript") enterWorkspace();
+      previousWorkspace.current = workspace;
+    }
     if (!workspace) return;
     remembered.current[workspace] = {
       ...remembered.current[workspace],
       path: location.pathname + location.search + location.hash,
     };
-  }, [location, workspace]);
-
-  useEffect(() => {
-    if (!workspace || pendingFocus.current !== workspace || !root.current) return;
-    const focus = () => {
-      if (workspace === "code") {
-        if (!focusComposer()) return false;
-        setNavigation(false);
-      } else {
-        const target = remembered.current[workspace]?.focus;
-        if (target && isEnabled(target) && visibleBox(target)) target.focus({ preventScroll: true });
-        else if (workspace !== "agent" || !focusComposer()) keyboardFocus.current?.focus({ preventScroll: true });
-      }
-      pendingFocus.current = null;
-      return true;
-    };
-    const observer = new MutationObserver(() => { if (focus()) observer.disconnect(); });
-    const frame = requestAnimationFrame(() => {
-      if (!focus() && root.current) observer.observe(root.current, { childList: true, subtree: true, attributes: true, attributeFilter: ["disabled", "hidden"] });
-    });
-    return () => { cancelAnimationFrame(frame); observer.disconnect(); };
-  }, [location.key, setNavigation, workspace]);
+  }, [closeHints, enterWorkspace, location, setMode, workspace]);
 
   useEffect(() => {
     if (!hints) return;
@@ -172,132 +204,159 @@ export default function WorkspaceKeyboard({ access, children }: { access: NavAcc
   }, [hints]);
 
   useEffect(() => {
-    const onKey = (event: KeyboardEvent) => {
-      // The URL can change before a lazy route or its effects have committed.
-      // Read the destination synchronously when two keys arrive back to back.
-      const path = window.location.pathname.slice(basePath.length);
-      const workspace = workspaceForPath(path);
-      if (!workspace || event.defaultPrevented || event.isComposing || event.keyCode === 229) return;
-      if (event.key === "Escape" && hintRef.current) {
-        closeHints();
-        event.preventDefault();
-        event.stopImmediatePropagation();
-        return;
-      }
-      const dialog = activeDialog();
+    const showHints = () => {
+      cancelHintTimer();
+      const scope = activeDialog() ?? document.body;
+      const targets = [...scope.querySelectorAll<HTMLElement>(clickable)].filter((element) =>
+        isEnabled(element) && visibleBox(element));
+      const keys = assignHints(targets.map((element) => element.dataset.workspaceHint));
+      const layer = { scope, items: targets.flatMap((element, index) => (
+        keys[index] ? [{ target: element, key: keys[index]! }] : []
+      )) };
+      hintRef.current = layer;
+      setHints(layer);
+    };
+
+    const capture = (event: KeyboardEvent) => {
+      const id = activeWorkspace();
+      if (!id || event.defaultPrevented || event.isComposing || event.keyCode === 229) return;
       const target = event.target instanceof HTMLElement ? event.target : undefined;
       const modified = event.altKey || event.metaKey || event.ctrlKey;
-      if (modified) return;
-      if (event.key === "Shift" && navigationRef.current && !event.repeat && !target?.matches(editable)) {
-        const scope = dialog ?? document.body;
-        const targets = [...scope.querySelectorAll<HTMLElement>(clickable)].filter((element) =>
-          isEnabled(element) && visibleBox(element));
-        const keys = assignHints(targets.map((element) => element.dataset.workspaceHint));
-        const layer = { scope, items: targets.flatMap((element, index) => (
-          keys[index] ? [{ target: element, key: keys[index]! }] : []
-        )) };
-        hintRef.current = layer;
-        setHints(layer);
+      if (event.key === "Shift") {
+        if (!modified && !event.repeat && !hintRef.current) {
+          if (isEditing(target)) {
+            // A normal shifted keystroke cancels this timer before typing.
+            hintTimer.current = window.setTimeout(showHints, 250);
+          } else {
+            showHints();
+          }
+        }
         return;
       }
-      if (hintRef.current && event.shiftKey && /^[a-z]$/i.test(event.key) && !event.repeat) {
-        event.preventDefault();
-        event.stopImmediatePropagation();
-        const key = prefixRef.current + event.key.toLowerCase();
-        const item = hintRef.current.items.find((entry) => entry.key === key);
-        if (item && hintRef.current.scope === (dialog ?? document.body)) {
+      cancelHintTimer();
+      const layer = hintRef.current;
+      if (layer) {
+        if (event.key === "Escape") {
           closeHints();
-          if (visibleBox(item.target) && isEnabled(item.target)) {
-            item.target.focus({ preventScroll: true });
-            item.target.click();
+          consume(event);
+          return;
+        }
+        if (!modified && event.shiftKey && /^[a-z]$/i.test(event.key)) {
+          consume(event);
+          if (event.repeat) return;
+          const key = prefixRef.current + event.key.toLowerCase();
+          const item = layer.items.find((entry) => entry.key === key);
+          if (item && layer.scope === (activeDialog() ?? document.body)) {
+            closeHints();
+            if (visibleBox(item.target) && isEnabled(item.target)) {
+              item.target.focus({ preventScroll: true });
+              item.target.click();
+            }
+          } else {
+            const next = layer.items.some((entry) => entry.key.startsWith(key)) ? key : "";
+            prefixRef.current = next;
+            setPrefix(next);
+          }
+          return;
+        }
+        closeHints();
+      }
+      const mode = modeRef.current;
+      const key = event.key.toLowerCase();
+      if (mode === "type" || modified || event.shiftKey || !/^[hjkli]$/.test(key) || isEditing(target) || activeDialog()) return;
+      if (key === "i") {
+        if (enterComposer(id, target)) consume(event);
+        return;
+      }
+      if (key === "j" || key === "k") {
+        const step = key === "j" ? 1 : -1;
+        consume(event);
+        if (mode === "transcript") {
+          const scroller = conversationControl(id, transcript, target);
+          if (scroller) {
+            if (!scroller.contains(document.activeElement)) scroller.focus({ preventScroll: true });
+            scroller.scrollTop += step * 48;
           }
         } else {
-          const next = hintRef.current.items.some((entry) => entry.key.startsWith(key)) ? key : "";
-          prefixRef.current = next;
-          setPrefix(next);
+          const list = registered.current.get(id);
+          if (list) {
+            const pending = pendingItem.current;
+            const selected = pending?.list === list && pending.url === window.location.href ? pending.item : list.selected;
+            const next = adjacentItem(list.ids, selected, step);
+            if (next === undefined) return;
+            enterWorkspace();
+            list.select(next);
+            // History can advance before React renders the newly selected row.
+            pendingItem.current = { list, item: next, url: window.location.href };
+          }
         }
         return;
       }
-      if (dialog || event.shiftKey) return;
-      if (event.key === "Escape") {
-        if (target?.matches("select, [contenteditable=true]")) return;
-        if (target?.closest("[data-workspace-escape]")) return;
-        pendingFocus.current = null;
-        enterNavigation();
-        event.preventDefault();
-        return;
-      }
-      if (!navigationRef.current || target?.matches(editable)) return;
-      if (event.key === "i") {
-        if (focusComposer()) {
-          setNavigation(false);
-          event.preventDefault();
-        }
-        return;
-      }
-      if (event.key === "h" || event.key === "l") {
-        const allowed = workspaces.filter((item) => pathAccess(item.path, access) === "allowed");
-        const index = allowed.findIndex((item) => item.id === workspace);
-        if (index < 0 || allowed.length < 2) return;
-        const step = event.key === "l" ? 1 : -1;
-        const next = allowed[(index + step + allowed.length) % allowed.length]!;
-        remembered.current[workspace] = {
-          ...remembered.current[workspace],
-          path: path + window.location.search + window.location.hash,
-        };
-        pendingFocus.current = next.id;
-        void navigate(remembered.current[next.id]?.path ?? next.path);
-        event.preventDefault();
-      } else if (event.key === "j" || event.key === "k") {
-        const list = registered.current.get(workspace);
-        const id = list && adjacentItem(list.ids, list.selected, event.key === "j" ? 1 : -1);
-        if (id !== undefined) {
-          list?.select(id);
-          event.preventDefault();
-        }
-      }
+      if (mode !== "workspace") return;
+      consume(event);
+      const allowed = workspaces.filter((item) => pathAccess(item.path, access) === "allowed");
+      const index = allowed.findIndex((item) => item.id === id);
+      if (index < 0 || allowed.length < 2) return;
+      const step = key === "l" ? 1 : -1;
+      const next = allowed[(index + step + allowed.length) % allowed.length]!;
+      pendingItem.current = undefined;
+      remembered.current[id] = {
+        ...remembered.current[id],
+        path: window.location.pathname.slice(basePath.length) + window.location.search + window.location.hash,
+      };
+      enterWorkspace();
+      void navigate(remembered.current[next.id]?.path ?? next.path);
     };
-    // Process hint keys before dialog shortcuts and browser defaults. Other
-    // keys run after the focused control has handled them.
-    const capture = (event: KeyboardEvent) => {
-      if (event.key === "Shift" || (hintRef.current && (event.shiftKey || event.key === "Escape"))) onKey(event);
+
+    // Escape runs after the focused widget has had a chance to dismiss itself.
+    const escape = (event: KeyboardEvent) => {
+      if (event.key !== "Escape" || event.defaultPrevented || event.isComposing || event.keyCode === 229 ||
+          event.repeat || event.shiftKey || event.altKey || event.metaKey || event.ctrlKey) return;
+      const id = activeWorkspace();
+      const target = event.target instanceof HTMLElement ? event.target : undefined;
+      if (!id || activeDialog() || target?.isContentEditable || target?.closest("select, [data-workspace-escape]")) return;
+      expandFocus(id, target);
+      consume(event);
     };
-    const bubble = (event: KeyboardEvent) => { if (event.key !== "Shift") onKey(event); };
     const release = (event: KeyboardEvent) => { if (event.key === "Shift") closeHints(); };
     window.addEventListener("keydown", capture, true);
-    window.addEventListener("keydown", bubble);
+    window.addEventListener("keydown", escape);
     window.addEventListener("keyup", release);
     window.addEventListener("blur", closeHints);
     return () => {
+      cancelHintTimer();
       window.removeEventListener("keydown", capture, true);
-      window.removeEventListener("keydown", bubble);
+      window.removeEventListener("keydown", escape);
       window.removeEventListener("keyup", release);
       window.removeEventListener("blur", closeHints);
     };
-  }, [access, closeHints, enterNavigation, navigate, setNavigation]);
+  }, [access, cancelHintTimer, closeHints, conversationControl, enterComposer, enterWorkspace, expandFocus, navigate]);
 
   const toggle = workspace && (
-    <button type="button" ref={keyboardFocus}
+    <button type="button"
       title={t("workspace.keyboard_help")}
-      aria-pressed={navigation}
-      onClick={() => navigation && focusComposer() ? setNavigation(false) : enterNavigation()}
+      onClick={() => {
+        if (mode === "workspace") {
+          if (!enterComposer(workspace)) setMode("type");
+        } else {
+          expandFocus(workspace);
+        }
+      }}
       className="rounded-md border border-pc-border bg-pc-surface px-1.5 py-1 text-[0.6875rem] text-pc-text-secondary focus-visible:ring-2 focus-visible:ring-pc-accent"
     >
-      {t(navigation ? "workspace.keyboard_navigation" : "workspace.keyboard_insert")}
+      {t(mode === "type" ? "workspace.keyboard_insert" : `workspace.keyboard_${mode}`)}
     </button>
   );
   return (
     <Context.Provider value={register}>
       <KeyboardMode.Provider value={toggle}>
-        <div ref={root} className="contents" onFocusCapture={(event) => {
+        <div ref={root} className="contents" data-workspace-mode={workspace ? mode : undefined} onFocusCapture={(event) => {
           const target = event.nativeEvent.target;
           if (!workspace || !(target instanceof HTMLElement)) return;
           const current = remembered.current[workspace];
-          if (current && target !== keyboardFocus.current) current.focus = target;
-          if (target.closest("[data-workspace-composer]")) {
-            setNavigation(false);
-            pendingFocus.current = null;
-          }
+          const conversation = target.closest<HTMLElement>("[data-workspace-conversation]");
+          if (current && conversation) current.conversation = conversation;
+          if (isEditing(target) && !target.closest('dialog, [role="dialog"][aria-modal="true"]')) setMode("type");
         }}>
           {children}
         </div>

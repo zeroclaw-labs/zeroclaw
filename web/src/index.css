@@ -142,6 +142,23 @@ body {
   outline: none;
 }
 
+[data-workspace-mode="transcript"] [data-workspace-transcript]:focus-within {
+  outline: 1px solid color-mix(in srgb, var(--pc-accent) 65%, transparent);
+  outline-offset: -1px;
+  box-shadow: inset 0 0 12px color-mix(in srgb, var(--pc-accent) 14%, transparent);
+}
+
+[data-workspace-mode="workspace"] [data-workspace-window]::after {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: 45;
+  pointer-events: none;
+  outline: 2px solid color-mix(in srgb, var(--pc-accent) 50%, transparent);
+  outline-offset: -2px;
+  box-shadow: inset 0 0 16px color-mix(in srgb, var(--pc-accent) 10%, transparent);
+}
+
 /* Scrollbar */
 * {
   scrollbar-width: thin;

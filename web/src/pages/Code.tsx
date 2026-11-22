@@ -168,12 +168,13 @@ export default function Code({
     if (visible && showSessions) ref.current?.querySelector('#code-sessions [aria-current="page"]')?.scrollIntoView({ block: "nearest" });
   }, [id, ref, showSessions, visible]);
 
-  // On desktop the drawer is non-modal. Let other browser dialogs and the
-  // keyboard hint overlay handle Escape before closing it.
+  // On desktop the drawer only handles Escape when focus is on its controls.
   useEffect(() => {
     if (!visible || !showFiles || narrow) return;
     const escape = (event: KeyboardEvent) => {
-      if (event.key === "Escape" && !event.defaultPrevented &&
+      const target = event.target;
+      if (event.key === "Escape" && !event.defaultPrevented && !event.isComposing && target instanceof HTMLElement &&
+          (target === filesTrigger.current || target.closest("#code-files")) &&
           !document.querySelector('dialog:modal, [role="dialog"][aria-modal="true"]')) {
         event.preventDefault();
         setPane("files", { open: false });
@@ -304,7 +305,7 @@ export default function Code({
           </nav>
         </CodePanel>
       )}
-      <section inert={narrowOverlay || undefined} aria-label={t("code.conversation")} className="flex min-h-0 min-w-0 flex-1 flex-col">
+      <section data-workspace-conversation inert={narrowOverlay || undefined} aria-label={t("code.conversation")} className="flex min-h-0 min-w-0 flex-1 flex-col">
         {[...snapshot.chats.entries()].map(([sid, current]) => (
           (current.approval || current.question) && (!visible || embedded || id !== sid) ? (
             <WorkspaceAttention key={sid} to={attentionTarget ?? `/code?${new URLSearchParams({ agent: current.alias, session: sid })}`}
@@ -412,7 +413,7 @@ export default function Code({
                   redraw((value) => value + 1);
                 }}>{t("workspace.insert_sop")}</button>
             )}
-            <textarea ref={textarea} data-workspace-composer={embedded ? undefined : ""} value={prompt} rows={2} disabled={!canCompose}
+            <textarea ref={textarea} data-workspace-composer value={prompt} rows={2} disabled={!canCompose}
               aria-label={t(sopAssistant ? "sop_workspace.helper_prompt" : "code.prompt")} placeholder={t(sopAssistant ? "sop_workspace.helper_prompt" : "code.prompt")}
               className="input-electric max-h-[28vh] min-h-12 w-full resize-y px-3 py-2.5 text-sm"
               onSelect={(event) => carets.current.set(key, [event.currentTarget.selectionStart, event.currentTarget.selectionEnd])}
