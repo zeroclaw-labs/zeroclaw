@@ -1063,7 +1063,7 @@ impl AcpServer {
     /// The process/connection default is intentionally omitted: restore accepts
     /// only a session ID and must not let launcher or transport input rebind a
     /// persisted workspace/history to a different agent.
-    fn resolve_restore_agent_alias(config: &Config, persisted_agent_alias: &str) -> String {
+    pub fn resolve_restore_agent_alias(config: &Config, persisted_agent_alias: &str) -> String {
         Self::alias_if_dispatchable(config, persisted_agent_alias)
             .or_else(|| {
                 config

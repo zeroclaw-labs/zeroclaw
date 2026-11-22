@@ -194,15 +194,14 @@ impl AcpSessionStore {
     pub fn import_legacy_gateway_sessions(
         &self,
         legacy: &dyn crate::session_backend::SessionBackend,
-        workspace_for_agent: impl Fn(&str) -> std::path::PathBuf,
+        resolve_agent: impl Fn(Option<&str>) -> (String, std::path::PathBuf),
     ) -> Result<usize> {
         let mut imported = 0;
         for metadata in legacy.list_sessions_with_metadata() {
             let Some(id) = metadata.key.strip_prefix("gw_").filter(|id| !id.is_empty()) else {
                 continue;
             };
-            let alias = metadata.agent_alias.as_deref().unwrap_or("default");
-            let workspace = workspace_for_agent(alias);
+            let (alias, workspace) = resolve_agent(metadata.agent_alias.as_deref());
             let mut conn = self.conn.lock();
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let changed = tx.execute(
@@ -4257,9 +4256,15 @@ mod tests {
         legacy
             .append("discord_other", &ChatMessage::user("unrelated"))
             .unwrap();
-        let import = || store.import_legacy_gateway_sessions(&legacy, |_| "/workspace".into());
+        let import = || {
+            store.import_legacy_gateway_sessions(&legacy, |alias| {
+                (alias.unwrap_or("alpha").to_owned(), "/workspace".into())
+            })
+        };
         assert_eq!(import().unwrap(), 1);
         let data = store.load_session("team_alpha").unwrap().unwrap();
+        assert_eq!(data.agent_alias, "alpha");
+        assert_eq!(data.workspace_dir, "/workspace");
         assert_eq!(data.interaction_surface.as_deref(), Some("webchat"));
         assert_eq!(data.messages.len(), 2);
         for (message, expected) in data.messages.iter().zip(["question", "answer"]) {
@@ -4325,7 +4330,9 @@ mod tests {
             .unwrap();
 
         let imported = store
-            .import_legacy_gateway_sessions(&legacy, |_| "/workspace".into())
+            .import_legacy_gateway_sessions(&legacy, |alias| {
+                (alias.unwrap_or("alpha").to_owned(), "/workspace".into())
+            })
             .unwrap();
         assert_eq!(imported, 1, "only the non-colliding gw_fresh_id imports");
 
@@ -4398,7 +4405,9 @@ mod tests {
 
         let (_dir, store) = open_store();
         let err = store
-            .import_legacy_gateway_sessions(&FailingLegacyBackend, |_| "/workspace".into())
+            .import_legacy_gateway_sessions(&FailingLegacyBackend, |alias| {
+                (alias.unwrap_or("alpha").to_owned(), "/workspace".into())
+            })
             .expect_err("failed legacy read must fail the import");
         assert!(err.to_string().contains("simulated legacy read failure"));
         assert!(
