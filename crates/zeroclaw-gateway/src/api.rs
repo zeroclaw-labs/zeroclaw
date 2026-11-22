@@ -287,6 +287,36 @@ pub struct StatusResponse {
 /// have `model_provider`, `model`, `temperature`, and `memory_backend`
 /// reflect that specific agent's resolved config; omit it for the
 /// install-wide summary.
+/// The model a configured agent answers with, as the status page reports
+/// it.
+#[derive(Debug, Default)]
+pub(crate) struct AgentModel {
+    pub(crate) provider_ref: Option<String>,
+    pub(crate) model: String,
+    pub(crate) temperature: Option<f64>,
+}
+
+/// [`AgentModel`] for `alias`, or `None` when no such agent is configured.
+pub(crate) fn agent_model(config: &Config, alias: &str) -> Option<AgentModel> {
+    let agent = config.agent(alias)?;
+    let provider_ref = if agent.model_provider.is_empty() {
+        None
+    } else {
+        Some(agent.model_provider.as_str().to_string())
+    };
+    let resolved = config.resolved_model_provider_for_agent(alias);
+    let model = resolved
+        .as_ref()
+        .and_then(|(_, _, cfg)| cfg.model.clone())
+        .unwrap_or_default();
+    let temperature = resolved.as_ref().and_then(|(_, _, cfg)| cfg.temperature);
+    Some(AgentModel {
+        provider_ref,
+        model,
+        temperature,
+    })
+}
+
 #[derive(Debug, Deserialize)]
 pub struct StatusQuery {
     #[serde(default)]
@@ -329,18 +359,11 @@ pub async fn handle_api_status(
     let (model_provider, model, temperature, memory_backend) =
         match agent_alias.and_then(|alias| config.agent(alias).map(|a| (alias, a))) {
             Some((alias, agent)) => {
-                let provider_ref = if agent.model_provider.is_empty() {
-                    None
-                } else {
-                    Some(agent.model_provider.as_str().to_string())
-                };
-                let resolved = config.resolved_model_provider_for_agent(alias);
-                let model = resolved
-                    .as_ref()
-                    .and_then(|(_, _, cfg)| cfg.model.clone())
-                    .unwrap_or_default();
-                let temperature: Option<f64> =
-                    resolved.as_ref().and_then(|(_, _, cfg)| cfg.temperature);
+                let AgentModel {
+                    provider_ref,
+                    model,
+                    temperature,
+                } = agent_model(&config, alias).unwrap_or_default();
                 let backend_kind = agent.memory.backend;
                 let backend = serde_json::to_value(backend_kind)
                     .ok()
@@ -5763,7 +5786,7 @@ pub(crate) mod tests {
         let token = pairing.try_pair(&code, "test").await.unwrap().unwrap();
         let token_hash = PairingGuard::token_hash(&token);
 
-        let registry = Arc::new(DeviceRegistry::new(&data_dir));
+        let registry = Arc::new(DeviceRegistry::new(&data_dir).unwrap());
         let device_id = "dev-1".to_string();
         registry
             .register(
@@ -5798,7 +5821,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn reconcile_backfills_orphan_token_hashes() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let registry = DeviceRegistry::new(tmp.path());
+        let registry = DeviceRegistry::new(tmp.path()).unwrap();
 
         // A real, already-registered device with a name.
         let known_hash = "a".repeat(64);
@@ -5862,7 +5885,7 @@ pub(crate) mod tests {
         assert!(pairing.is_authenticated(&token));
 
         // Simulate the `/pair` orphan: token is paired but never registered.
-        let registry = DeviceRegistry::new(&data_dir);
+        let registry = DeviceRegistry::new(&data_dir).unwrap();
         assert_eq!(registry.device_count(), 0);
 
         let inserted = registry
@@ -6316,7 +6339,7 @@ pub(crate) mod tests {
         let code = pairing.pairing_code().unwrap();
         let admin_token = pairing.try_pair(&code, "admin").await.unwrap().unwrap();
 
-        let registry = Arc::new(DeviceRegistry::new(&data_dir));
+        let registry = Arc::new(DeviceRegistry::new(&data_dir).unwrap());
         for id in ["dev-a", "dev-b"] {
             // Each device needs its own paired token so revoke has a hash.
             let code = pairing
