@@ -27,13 +27,13 @@ use zeroclaw_providers::SafeguardFallbackNotice;
 use zeroclaw_runtime::agent::SteeringInput;
 use zeroclaw_runtime::agent::agent::{Agent, TurnEvent};
 use zeroclaw_runtime::agent::turn_accounting::{
-    ContextDisplay, SafeguardFallbackDisplay, UsageFold, build_consolidation_model,
-    done_frame_context_limits,
+    ContextDisplay, SafeguardFallbackDisplay, UsageFold, done_frame_context_limits,
 };
 use zeroclaw_runtime::cost::CostTracker;
 use zeroclaw_runtime::tools::CanvasStore;
 
 use super::acp_embedded;
+use super::consolidation::build_consolidation_model;
 use crate::acp_channel::AcpChannel;
 
 /// Tool name of the structured, replay-only cancellation event a client-cancel
@@ -258,6 +258,8 @@ pub struct AcpServer {
     /// `None` for unscoped/operator sessions; `Some(id)` stamps created
     /// sessions and restricts list/rename/load/resume to that exact principal.
     principal_id: Option<String>,
+    scoped_grants:
+        Option<Arc<dyn Fn() -> Option<zeroclaw_api::grants::ResolvedGrants> + Send + Sync>>,
     /// Process- or connection-scoped default agent alias (`--agent` for
     /// standalone ACP or `?agent=` on the gateway endpoint). Slots into the
     /// `session/new` alias precedence chain between an explicit `agentAlias`
@@ -412,6 +414,7 @@ impl AcpServer {
             default_session_policy: AcpSessionPolicy::default(),
             allow_webchat_policy: false,
             principal_id: None,
+            scoped_grants: None,
             connection_default_agent: None,
             client_elicitation_caps: std::sync::RwLock::new(ElicitationCapabilities::default()),
         }
@@ -494,6 +497,42 @@ impl AcpServer {
         workspace_dir: &std::path::Path,
         policy: AcpSessionPolicy,
     ) -> Result<Agent> {
+        let grants = if let Some(resolve) = &self.scoped_grants {
+            let grants = resolve()
+                .filter(|g| g.may_use_agent(agent_alias))
+                .ok_or_else(|| anyhow::anyhow!("ACP agent access revoked"))?;
+            anyhow::ensure!(
+                self.connection_default_agent.as_deref() == Some(agent_alias),
+                "ACP agent is outside this connection's grant"
+            );
+            Some(grants)
+        } else {
+            None
+        };
+        let mut agent = self
+            .build_configured_agent(config, agent_alias, workspace_dir, policy)
+            .await?;
+        if let Some(owner) = &self.principal_id {
+            agent.route_memory_to_principal(
+                zeroclaw_api::memory_traits::PrincipalScope::new(owner.clone())
+                    .with_agent(Some(agent_alias.to_owned())),
+            )?;
+        }
+        if let Some(grants) = grants {
+            agent.apply_principal_tool_posture(
+                zeroclaw_runtime::rpc::dispatch::principal_tool_posture(&grants),
+            );
+        }
+        Ok(agent)
+    }
+
+    async fn build_configured_agent(
+        &self,
+        config: &Config,
+        agent_alias: &str,
+        workspace_dir: &std::path::Path,
+        policy: AcpSessionPolicy,
+    ) -> Result<Agent> {
         let enable_mcp = policy.resolved_enable_mcp(config, agent_alias);
         let exclude_memory = policy.exclude_memory;
         let Some(store) = self.store.as_ref() else {
@@ -569,34 +608,20 @@ impl AcpServer {
 
     fn apply_session_policy_to_agent(
         config: &Config,
+        agent_alias: &str,
         agent: &mut Agent,
         session_id: &str,
         policy: AcpSessionPolicy,
     ) {
         if !policy.exclude_memory {
-            agent.set_memory_session_id(Some(session_id.to_string()));
+            agent.set_memory_session_id(Some(zeroclaw_api::session_keys::sanitize_session_key(
+                session_id,
+            )));
         }
         if policy.seed_external_channels {
             let ch = agent.channel_handles();
-            let channel_names = crate::orchestrator::register_channels_for_tools(
-                config,
-                &ch.ask_user,
-                &ch.channel_room,
-                &Some(ch.reaction.clone()),
-                &ch.poll,
-                &ch.escalate,
-            );
-            if !channel_names.is_empty() {
-                ::zeroclaw_log::record!(
-                    INFO,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_category(::zeroclaw_log::EventCategory::Channel)
-                        .with_attrs(::serde_json::json!({
-                            "channels": channel_names,
-                            "session_id": session_id,
-                        })),
-                    "Seeded external channel(s) into ACP session"
-                );
+            for (name, channel) in super::live_channel_map_for_agent(config, agent_alias) {
+                ch.register_channel(name, channel);
             }
         }
     }
@@ -665,6 +690,15 @@ impl AcpServer {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(str::to_string);
+        self
+    }
+
+    /// Resolve the authenticated dashboard caller's current grants at agent admission.
+    pub fn with_scoped_grants(
+        mut self,
+        grants: Option<Arc<dyn Fn() -> Option<zeroclaw_api::grants::ResolvedGrants> + Send + Sync>>,
+    ) -> Self {
+        self.scoped_grants = grants;
         self
     }
 
@@ -1108,7 +1142,7 @@ impl AcpServer {
     /// The process/connection default is intentionally omitted: restore accepts
     /// only a session ID and must not let launcher or transport input rebind a
     /// persisted workspace/history to a different agent.
-    fn resolve_restore_agent_alias(config: &Config, persisted_agent_alias: &str) -> String {
+    pub fn resolve_restore_agent_alias(config: &Config, persisted_agent_alias: &str) -> String {
         Self::alias_if_dispatchable(config, persisted_agent_alias)
             .or_else(|| {
                 config
@@ -1184,6 +1218,19 @@ impl AcpServer {
                     .to_string(),
                 data: None,
             })?;
+        if let Some(resolve) = &self.scoped_grants
+            && (self.connection_default_agent.as_deref() != Some(&agent_alias)
+                || !resolve().is_some_and(|g| g.may_use_agent(&agent_alias))
+                || self.requested_session_cwd(params).is_some())
+        {
+            return Err(RpcError {
+                code: FORBIDDEN,
+                message:
+                    "Scoped ACP session requires its authorized agent and configured workspace"
+                        .into(),
+                data: None,
+            });
+        }
         Self::validate_dispatchable_agent_alias(&config, &agent_alias)?;
         let admission = self
             .agent_lifecycle
@@ -1347,7 +1394,13 @@ impl AcpServer {
         ));
         agent.set_channel_name("acp".to_string());
         agent.channel_handles().register_channel("acp", acp_channel);
-        Self::apply_session_policy_to_agent(&config, &mut agent, &session_id, session_policy);
+        Self::apply_session_policy_to_agent(
+            &config,
+            &agent_alias,
+            &mut agent,
+            &session_id,
+            session_policy,
+        );
 
         // Persist before publishing the session, so a failed write never
         // leaves a live-but-unpersisted session; release the reservation on
@@ -1473,6 +1526,10 @@ impl AcpServer {
         };
         let sessions: Vec<_> = rows
             .into_iter()
+            .filter(|(s, _)| {
+                self.scoped_grants.is_none()
+                    || self.connection_default_agent.as_deref() == Some(s.agent_alias.as_str())
+            })
             .map(|(session, name)| {
                 serde_json::json!({
                     "sessionId": session.session_uuid,
@@ -1507,6 +1564,9 @@ impl AcpServer {
             data: None,
         })?;
         let id = session_id.to_owned();
+        if self.scoped_grants.is_some() {
+            self.load_session_for_restore(&store, session_id)?;
+        }
         let persisted_name = name.to_owned();
         let principal = self.principal_id.clone();
         let result = tokio::task::spawn_blocking(move || {
@@ -1534,7 +1594,18 @@ impl AcpServer {
         session_id: &str,
     ) -> Result<Box<AcpSessionData>, RpcError> {
         match store.load_session_for_restore_owned(session_id, self.principal_id.as_deref()) {
-            Ok(Some(AcpSessionRestore::Restorable(data))) => Ok(data),
+            Ok(Some(AcpSessionRestore::Restorable(data)))
+                if self.scoped_grants.is_none()
+                    || self.connection_default_agent.as_deref()
+                        == Some(data.agent_alias.as_str()) =>
+            {
+                Ok(data)
+            }
+            Ok(Some(AcpSessionRestore::Restorable(_))) => Err(RpcError {
+                code: FORBIDDEN,
+                message: "Session agent is outside this connection".into(),
+                data: None,
+            }),
             Ok(Some(AcpSessionRestore::Missing)) => Err(RpcError {
                 code: SESSION_NOT_FOUND,
                 message: format!("Session not found: {session_id}"),
@@ -1786,7 +1857,13 @@ impl AcpServer {
         ));
         agent.set_channel_name("acp".to_string());
         agent.channel_handles().register_channel("acp", acp_channel);
-        Self::apply_session_policy_to_agent(&config, &mut agent, &session_id, session_policy);
+        Self::apply_session_policy_to_agent(
+            &config,
+            &restore_alias,
+            &mut agent,
+            &session_id,
+            session_policy,
+        );
 
         let lifecycle_lease = match admission.publish() {
             Ok(lease) => lease,
@@ -2071,7 +2148,13 @@ impl AcpServer {
         ));
         agent.set_channel_name("acp".to_string());
         agent.channel_handles().register_channel("acp", acp_channel);
-        Self::apply_session_policy_to_agent(&config, &mut agent, &session_id, session_policy);
+        Self::apply_session_policy_to_agent(
+            &config,
+            &restore_alias,
+            &mut agent,
+            &session_id,
+            session_policy,
+        );
 
         let lifecycle_lease = match admission.publish() {
             Ok(lease) => lease,
@@ -2287,6 +2370,60 @@ impl AcpServer {
     }
 
     async fn handle_session_prompt(&self, params: &Value, _request_id: &Value) -> RpcResult {
+        self.run_prompt(params, tokio_util::sync::CancellationToken::new())
+            .await
+    }
+
+    /// Whether this socket has already admitted the session for this principal and agent.
+    pub async fn has_gateway_session(&self, id: &str) -> bool {
+        self.sessions.lock().await.contains_key(id)
+    }
+
+    /// Dispatch an admitted gateway turn with the same cancellation token that reconnect uses.
+    pub async fn gateway_prompt(
+        &self,
+        id: Value,
+        params: &Value,
+        cancel: tokio_util::sync::CancellationToken,
+        refresh: bool,
+    ) {
+        if refresh {
+            let refreshed = async {
+                self.handle_session_close(params).await?;
+                self.handle_session_resume(params).await
+            }
+            .await;
+            if let Err(e) = refreshed {
+                self.write_error_with_data(id, e.code, &e.message, e.wire_data())
+                    .await;
+                return;
+            }
+        }
+        match self.run_prompt(params, cancel).await {
+            Ok(value) => self.write_result(id, value).await,
+            Err(e) => {
+                self.write_error_with_data(id, e.code, &e.message, e.wire_data())
+                    .await
+            }
+        }
+    }
+
+    /// Route a reattached client's answer back to the original pending ACP request.
+    pub fn answer_request(&self, id: &str, response: &Value) {
+        self.rpc.dispatch_response(
+            id,
+            response.get("result").cloned(),
+            response
+                .get("error")
+                .and_then(|e| serde_json::from_value(e.clone()).ok()),
+        );
+    }
+
+    async fn run_prompt(
+        &self,
+        params: &Value,
+        cancel_token: tokio_util::sync::CancellationToken,
+    ) -> RpcResult {
         let session_id = params
             .get("sessionId")
             .or_else(|| params.get("session_id"))
@@ -2332,7 +2469,6 @@ impl AcpServer {
         // `resource.blob` parts writes files into uploads/; two concurrent prompts for
         // the same session must not both perform that side effect before one is
         // rejected with SESSION_BUSY. Reserve first, then do the work.
-        let cancel_token = tokio_util::sync::CancellationToken::new();
         self.register_cancel_token(&session_id, cancel_token.clone())?;
 
         // Hold the per-session finalization gate for the rest of the prompt,

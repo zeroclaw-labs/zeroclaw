@@ -339,7 +339,7 @@ fn principal_tool_ceiling(grants: &zeroclaw_api::grants::ResolvedGrants) -> Opti
 /// prompts and steering. A wildcard tool or agent selector does not grant
 /// ownership of other sessions, or authority for work that runs later, on
 /// another agent or as SOP steps without the caller's principal.
-fn principal_tool_posture(
+pub fn principal_tool_posture(
     grants: &zeroclaw_api::grants::ResolvedGrants,
 ) -> crate::agent::SteeringPosture {
     crate::agent::SteeringPosture {

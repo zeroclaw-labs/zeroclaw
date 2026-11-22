@@ -2132,7 +2132,11 @@ pub async fn run_gateway_with_plugin_webhooks(
         // The listener is bound but the router is not serving yet. With the
         // previous gateway stopped, no legacy chat writes can race the copy.
         zeroclaw_infra::acp_session_store::AcpSessionStore::new(&config.data_dir)?
-            .import_legacy_gateway_sessions(legacy, |alias| config.agent_workspace_dir(alias))?;
+            .import_legacy_gateway_sessions(legacy, |persisted| {
+                let alias = zeroclaw_channels::orchestrator::acp_server::AcpServer::resolve_restore_agent_alias(&config, persisted.unwrap_or(""));
+                let workspace = config.agent_workspace_dir(&alias);
+                (alias,workspace)
+            })?;
         // Legacy REST and webhook handlers must no longer write to this store.
         None
     } else {
@@ -2863,7 +2867,7 @@ pub async fn run_gateway_with_plugin_webhooks(
         .route("/api/events", get(sse::handle_sse_events))
         .route("/api/events/history", get(sse::handle_events_history))
         // ── ACP client bridge ──
-        .route("/acp", get(acp::handle_ws_acp))
+        .route("/acp", get(acp::handle_ws_acp).layer(axum::Extension(Arc::new(acp::AcpTurnHub::new(Arc::clone(&state.session_queue))))))
         // ── WebSocket SOP runs feed ──
         .route("/ws/sops/runs", get(ws_sop_runs::handle_ws_sop_runs))
         // ── WebSocket canvas updates ──

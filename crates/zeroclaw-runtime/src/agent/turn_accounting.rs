@@ -1,6 +1,5 @@
 //! Shared per-turn usage accounting, context-window limit resolution,
-//! post-trim display projection, safeguard-fallback display projection, and
-//! post-turn memory-consolidation model resolution.
+//! post-trim display projection, and safeguard-fallback display projection.
 //!
 //! Used across runtime RPC and gateway chat surfaces so token totals, cost
 //! attribution, context-meter display semantics, and safeguard-fallback
@@ -8,13 +7,10 @@
 
 use std::collections::HashMap;
 use zeroclaw_api::agent::{TokenCountSource, TurnEvent};
-use zeroclaw_api::model_provider::ModelProvider;
 use zeroclaw_config::schema::{
-    Config, ModelContextWindowSource, ResolvedContextLimits, UNCONFIGURED_CONTEXT_WINDOW_FALLBACK,
+    ModelContextWindowSource, ResolvedContextLimits, UNCONFIGURED_CONTEXT_WINDOW_FALLBACK,
 };
 use zeroclaw_providers::{SafeguardFallbackKind, SafeguardFallbackNotice};
-
-use crate::agent::agent::build_session_model_provider;
 
 /// Per-provider usage snapshot in a turn's `usage_by_provider` breakdown.
 /// Tracks ALL billable attempts (accepted + rejected Reliable attempts).
@@ -330,30 +326,6 @@ impl SafeguardFallbackDisplay {
     }
 }
 
-/// Resolve provider, model, and temperature for post-turn memory consolidation
-/// from the live provider reference the agent reports after the turn.
-///
-/// A mid-session model switch replaces the agent's active provider and model
-/// together without touching the agent's configured default, so consolidation
-/// must be built from that live pair. Returns `None` when the reference no
-/// longer resolves (e.g. removed by config reload or not a dotted
-/// `<family>.<alias>`), in which case consolidation is skipped rather than
-/// silently rerouted to an unrelated entry.
-pub fn build_consolidation_model(
-    config: &Config,
-    provider_ref: &str,
-    model: &str,
-) -> Option<(Box<dyn ModelProvider>, String, Option<f64>)> {
-    let (provider_type, provider_alias) = provider_ref.split_once('.')?;
-    let entry = config
-        .providers
-        .models
-        .find(provider_type, provider_alias)?;
-    let (provider, _, resolved_model, _) =
-        build_session_model_provider(config, provider_ref, Some(model)).ok()?;
-    Some((provider, resolved_model, entry.temperature))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -566,12 +538,5 @@ mod tests {
             assert_eq!(wire.requested_model, "req-m");
             assert_eq!(wire.served_model, "srv-m");
         }
-    }
-
-    #[test]
-    fn build_consolidation_model_skips_missing_or_invalid_provider_refs() {
-        let config = Config::default();
-        assert!(build_consolidation_model(&config, "not-dotted", "m").is_none());
-        assert!(build_consolidation_model(&config, "ollama.missing", "m").is_none());
     }
 }

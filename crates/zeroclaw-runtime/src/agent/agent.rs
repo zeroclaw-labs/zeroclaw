@@ -2243,7 +2243,7 @@ impl Agent {
 
     /// Apply fresh principal grants through the same monotonic tool posture
     /// for prompt admission and steering, including its post-write recheck.
-    pub(crate) fn apply_principal_tool_posture(&mut self, posture: crate::agent::SteeringPosture) {
+    pub fn apply_principal_tool_posture(&mut self, posture: crate::agent::SteeringPosture) {
         self.narrow_to_principal_tools(posture.tool_ceiling.as_deref());
         if posture.disable_principal_unaware_nested_tools {
             self.disable_principal_unaware_nested_tools();

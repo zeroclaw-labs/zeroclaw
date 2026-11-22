@@ -841,6 +841,16 @@ impl DashboardAuth {
         })
     }
 
+    pub(crate) fn chat_grants(&self, session: &SessionAuth) -> Option<ResolvedGrants> {
+        if session.ended_now().is_some() {
+            return None;
+        }
+        self.inbound
+            .current_grants(&session.connection)
+            .ok()
+            .filter(crate::dashboard_core::may_chat)
+    }
+
     /// Check again, from a long-lived socket, the session a request admitted
     /// earlier: the same checks as for a request.
     pub(crate) async fn recheck(&self, state: &AppState, session: &SessionAuth) -> DashboardCaller {
@@ -1403,6 +1413,7 @@ pub(crate) struct SessionWatch {
     /// grants a chat needs and that agent, as the upgrade checked them, or
     /// the socket closes as an administrator's does on demotion.
     chat_agent: Option<String>,
+    require_same_grants: bool,
     recheck: tokio::time::Interval,
     /// A recheck in progress. Kept here, not in a `lost` future, because
     /// a socket's loop drops that future whenever another branch fires: a
@@ -1440,6 +1451,7 @@ impl SessionWatch {
             session,
             require_admin,
             chat_agent: None,
+            require_same_grants: false,
             recheck,
             pending: None,
             stopping,
@@ -1457,6 +1469,17 @@ impl SessionWatch {
     ) -> Self {
         let mut watch = Self::new(auth, session, false, state);
         watch.chat_agent = Some(agent.to_string());
+        watch
+    }
+
+    pub(crate) fn for_acp_chat(
+        auth: Arc<DashboardAuth>,
+        session: Arc<SessionAuth>,
+        agent: &str,
+        state: &AppState,
+    ) -> Self {
+        let mut watch = Self::for_chat(auth, session, agent, state);
+        watch.require_same_grants = true;
         watch
     }
 
@@ -1510,6 +1533,9 @@ impl SessionWatch {
     /// operator stream; for a scoped chat, the session grants a chat needs
     /// and its agent.
     fn still_admits(&self, session: &SessionAuth) -> bool {
+        if self.require_same_grants && self.session.grants != session.grants {
+            return false;
+        }
         if self.require_admin && !session.is_admin() {
             return false;
         }
