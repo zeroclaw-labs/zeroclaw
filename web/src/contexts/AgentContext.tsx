@@ -399,8 +399,11 @@ export function AgentProvider({
   // Set from a reopen until its reload has started that check: a
   // `session_start` can arrive before the reload has begun.
   const reloadDueRef = useRef(false);
-  // Conversation whose started-over notice waits for that check's answer.
-  const startedOverDueRef = useRef<string | null>(null);
+  // Conversation whose started-over notice waits for the reload to settle.
+  // A `session_start` reporting no stored messages while the reload's state
+  // check is out, or while a failed load waits for its retry, defers the
+  // decision; that load applies it once the gateway's answer is known.
+  const pendingStartedOverRef = useRef<string | null>(null);
   // The last definite answer on whether the gateway stores transcripts.
   // `sessionPersistence` is null again while each reload is in flight, and a
   // `session_start` arriving then still needs to know.
@@ -476,6 +479,59 @@ export function AgentProvider({
     setContextInput(EMPTY_CONTEXT_INPUT);
   }, []);
 
+  // A `session_start` reporting no stored messages cannot tell, on its own,
+  // between a conversation the gateway started over and its first turn still
+  // running (nothing is stored until a turn ends). While the reload is
+  // mid-flight its load makes that call; defer the decision here. Never
+  // defer for a check that already saw a running turn: that conversation is
+  // known to exist and its watch shows the turn.
+  const deferStartedOverDecision = (
+    sid: string | null,
+    reloadDue = false,
+  ): 'deferred' | 'running' | 'now' => {
+    // A check that already confirmed a running turn: the conversation is
+    // known to exist, its watch shows the turn. No notice.
+    if (reloadTurnCheckRef.current?.state === 'running') return 'running';
+    if (
+      sid !== null
+      && (
+        reloadDue
+        || reloadTurnCheckRef.current?.state === 'pending'
+        || hydrationFailedRef.current === sid
+      )
+    ) {
+      pendingStartedOverRef.current = sid;
+      return 'deferred';
+    }
+    // No reload in flight: nothing will answer later, decide now.
+    return 'now';
+  };
+
+  // Apply a deferred notice decision once the load has settled. Whether the
+  // conversation exists is judged from what the load itself saw, so a stale
+  // flag can never invent a notice. True means the notice was shown.
+  const runStartedOverDecision = (
+    sid: string | null,
+    sawStore: boolean,
+    sawMessages: boolean,
+  ): boolean => {
+    const fire = pendingStartedOverRef.current === sid;
+    pendingStartedOverRef.current = null;
+    if (
+      fire
+      && sid !== null
+      && sid === activeSessionIdRef.current
+      && sawStore
+      && !sawMessages
+      && !typingRef.current
+      && messagesRef.current.some((m) => !m.ephemeral)
+    ) {
+      showStartedOver();
+      return true;
+    }
+    return false;
+  };
+
   // Hydrate chat from server (preferred) or localStorage fallback. Re-runs on
   // every session switch, which is what rehydrates the transcript of the
   // conversation the operator just selected.
@@ -503,7 +559,7 @@ export function AgentProvider({
     setSessionPersistence(null);
     setHydratedSessionId(null);
     hydrationFailedRef.current = null;
-    if (startedOverDueRef.current !== sid) startedOverDueRef.current = null;
+    if (pendingStartedOverRef.current !== sid) pendingStartedOverRef.current = null;
     const watch = new AbortController();
     // Whether the gateway is still running this conversation's turn. Any
     // failure, including the 404 of a gateway without session persistence,
@@ -572,25 +628,13 @@ export function AgentProvider({
         const runningBeforeLoad = await turnStillRunning();
         if (cancelled) return;
         reloadTurnCheckRef.current = { watch, state: runningBeforeLoad ? 'running' : 'idle' };
-        // A running turn means the gateway still has the conversation.
-        if (runningBeforeLoad && startedOverDueRef.current === sid) startedOverDueRef.current = null;
+        // A running turn means the gateway still has the conversation: a
+        // notice deferred before the check answered was about a live turn.
+        if (runningBeforeLoad) pendingStartedOverRef.current = null;
         const res = await sessionRuntime.getMessages(sid);
         if (cancelled) return;
         serverKeepsTranscriptsRef.current = res.session_persistence;
         setSessionPersistence(res.session_persistence);
-        if (startedOverDueRef.current === sid) {
-          startedOverDueRef.current = null;
-          // No turn running and still nothing stored (a turn that ended while
-          // the check was out is stored by now): the gateway did start over.
-          if (
-            res.session_persistence
-            && res.messages.length === 0
-            && !typingRef.current
-            && messagesRef.current.some((m) => !m.ephemeral)
-          ) {
-            showStartedOver();
-          }
-        }
         if (res.session_persistence) {
           if (localMessageMutationVersionRef.current === hydrationStartedAtMutationVersion) {
             const snapshotUsers = res.messages
@@ -621,6 +665,16 @@ export function AgentProvider({
             return ls.length ? persistedToUiMessages(ls) : prev;
           });
         }
+        // The notice a `session_start` deferred is judged here, from what
+        // this load itself saw: a store still empty at the end of a check
+        // that found no running turn means the gateway did start over; a
+        // turn that ended during the check is stored by now and loads, no
+        // notice.
+        runStartedOverDecision(
+          sid,
+          res.session_persistence === true,
+          res.messages.length > 0,
+        );
       } catch {
         if (!cancelled) {
           hydrationFailedRef.current = sid;
@@ -634,7 +688,13 @@ export function AgentProvider({
           // socket opens it. If that happened while this request was out, the
           // refusal may predate it: ask again.
           if (sessionStartsRef.current !== sessionStartsAtRequest) {
+            // That retry decides a notice deferred to this load.
             setTranscriptVersion((v) => v + 1);
+          } else {
+            // Nothing retries now, so nothing would decide: drop the deferred
+            // notice rather than let a later load fire it without a fresh
+            // `session_start`. The next `session_start` decides again.
+            pendingStartedOverRef.current = null;
           }
         }
       } finally {
@@ -742,11 +802,13 @@ export function AgentProvider({
           && !typingRef.current
           && messagesRef.current.some((m) => !m.ephemeral)
         ) {
-          const turnCheck = reloadDueRef.current ? 'pending' : reloadTurnCheckRef.current?.state;
-          if (turnCheck === 'pending') {
-            // The reload's state check decides once it answers.
-            startedOverDueRef.current = activeSessionIdRef.current;
-          } else if (turnCheck !== 'running') {
+          // A reload whose state check is still out, or a failed load about
+          // to retry, decides once the gateway's answer is known. A check
+          // that already saw a running turn confirms the conversation.
+          if (
+            deferStartedOverDecision(activeSessionIdRef.current, reloadDueRef.current)
+            === 'now'
+          ) {
             showStartedOver();
           }
         }

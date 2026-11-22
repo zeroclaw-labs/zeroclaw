@@ -2523,6 +2523,77 @@ test('a reopen whose reload finds no running turn and nothing stored still shows
   await unmount(mounted.renderer);
 });
 
+test('a started-over notice deferred to a load that fails is not shown by a later reload', async () => {
+  const runtime = new FakeSessionRuntime();
+  const mounted = await mountWithHistory(runtime);
+  await act(async () => { mounted.context().sendMessage('hello'); });
+  // The reopen's load fails; nothing retries it, since the socket's
+  // `session_start` arrived before that load began.
+  runtime.queueMessages('A', () => Promise.reject(new Error('network')));
+  await act(async () => { runtime.sockets[0]!.emitClose(1006); });
+  await act(async () => {
+    runtime.sockets[0]!.emitOpen();
+    runtime.sockets[0]!.emitMessage(sessionStart(0));
+  });
+  await flushPromises();
+  assert.equal(startedOverNotices(mounted).length, 0);
+  assert.ok(mounted.context().messages.some((m) => m.content === 'an earlier answer'));
+
+  // A later reopen whose socket reports nothing new: no notice from the old frame.
+  await act(async () => { mounted.context().sendMessage('again'); });
+  await act(async () => { runtime.sockets[0]!.emitClose(1006); });
+  await openSocket(runtime, 0);
+  await flushPromises();
+  assert.equal(startedOverNotices(mounted).length, 0);
+  await unmount(mounted.renderer);
+});
+
+test('a started-over notice deferred to a load that fails is decided by its retry', async () => {
+  const runtime = new FakeSessionRuntime();
+  const mounted = await mountWithHistory(runtime);
+  const check = new Deferred<SessionStateResponse>();
+  await act(async () => { mounted.context().sendMessage('hello'); });
+  runtime.queueStatePlan('A', () => check.promise);
+  runtime.queueMessages('A', () => Promise.reject(new Error('network')));
+  await act(async () => { runtime.sockets[0]!.emitClose(1006); });
+
+  await openSocket(runtime, 0);
+  // Arrives while the reload's check is out, so the failed load retries.
+  await act(async () => { runtime.sockets[0]!.emitMessage(sessionStart(0)); });
+  await act(async () => { check.resolve(sessionState('A', 'idle')); });
+  await flushPromises();
+  // The retry finds no running turn and nothing stored: the gateway started over.
+  assert.deepEqual(runtime.messageCalls, ['A', 'A', 'A'], 'mount, reload, retry');
+  assertStartedOver(mounted);
+  await unmount(mounted.renderer);
+});
+
+test('a session_start reporting no messages after a failed load waits for the retry', async () => {
+  const runtime = new FakeSessionRuntime();
+  const mounted = await mountWithHistory(runtime);
+  await act(async () => { mounted.context().sendMessage('hello'); });
+  runtime.queueMessages('A', () => Promise.reject(new Error('network')));
+  await act(async () => { runtime.sockets[0]!.emitClose(1006); });
+  await openSocket(runtime, 0);
+  await flushPromises();
+  assert.ok(mounted.context().messages.some((m) => m.content === 'an earlier answer'));
+
+  // A first turn is running on the gateway: nothing is stored yet. The
+  // frame's retry asks for the turn state; until it answers, the transcript
+  // stays and no notice shows.
+  const retryCheck = new Deferred<SessionStateResponse>();
+  runtime.queueStatePlan('A', () => retryCheck.promise);
+  await act(async () => { runtime.sockets[0]!.emitMessage(sessionStart(0)); });
+  assert.equal(startedOverNotices(mounted).length, 0, 'no notice while the retry asks');
+  assert.ok(mounted.context().messages.some((m) => m.content === 'an earlier answer'));
+
+  await act(async () => { retryCheck.resolve(sessionState('A', 'running')); });
+  await flushPromises();
+  assert.equal(startedOverNotices(mounted).length, 0);
+  assert.equal(mounted.context().typing, true);
+  await unmount(mounted.renderer);
+});
+
 test('a reload in the middle of a turn that ended the conversation keeps only the notice', async () => {
   {
     const runtime = new FakeSessionRuntime();
