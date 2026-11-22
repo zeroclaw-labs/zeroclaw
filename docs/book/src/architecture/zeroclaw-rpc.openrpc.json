@@ -3382,6 +3382,10 @@
       },
       "SessionConfigureParams": {
         "properties": {
+          "code_settings": {
+            "description": "Limit the edit to the operator's advertised Code session options.",
+            "type": "boolean"
+          },
           "overrides": {
             "allOf": [
               {
@@ -3693,6 +3697,13 @@
             ]
           },
           "model_provider": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "reasoning_effort": {
+            "description": "Provider-native effort scoped to this session. \"default\" clears the override.",
             "type": [
               "string",
               "null"
@@ -5071,6 +5082,14 @@
           "required": true,
           "schema": {
             "type": "string"
+          }
+        },
+        {
+          "name": "code_settings",
+          "required": false,
+          "schema": {
+            "description": "Limit the edit to the operator's advertised Code session options.",
+            "type": "boolean"
           }
         },
         {
