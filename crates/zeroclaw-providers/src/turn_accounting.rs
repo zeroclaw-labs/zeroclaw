@@ -5,12 +5,12 @@
 //! attribution, context-meter display semantics, and safeguard-fallback
 //! privacy guarantees share a single source of truth.
 
+use crate::{SafeguardFallbackKind, SafeguardFallbackNotice};
 use std::collections::HashMap;
 use zeroclaw_api::agent::{TokenCountSource, TurnEvent};
 use zeroclaw_config::schema::{
     ModelContextWindowSource, ResolvedContextLimits, UNCONFIGURED_CONTEXT_WINDOW_FALLBACK,
 };
-use zeroclaw_providers::{SafeguardFallbackKind, SafeguardFallbackNotice};
 
 /// Per-provider usage snapshot in a turn's `usage_by_provider` breakdown.
 /// Tracks ALL billable attempts (accepted + rejected Reliable attempts).
