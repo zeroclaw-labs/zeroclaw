@@ -63,6 +63,25 @@ TOTP prompts, a combined field and a localized label. They must reject unknown,
 ambiguous, repeated, reordered and unexpectedly omitted challenges. The string
 received from the server never grants permission or changes the selected mode.
 
+## WebUI and persisted SSH profiles
+
+The operator manages SSH connection profiles from the credential configuration
+WebUI. A form selects the destination, authentication mode and authorized
+aliases. For PAM profiles it also edits the ordered challenge list, including
+the role, accepted label and, for a combined field, the response format.
+The UI lists only aliases authorized for the selected destination. It shows
+secret aliases and grant metadata only.
+
+The API validates and persists one canonical profile used by both the WebUI
+and broker. The broker resolves the saved profile and verifies the grants
+every time it admits an authentication or a new connection lease. The UI must
+not present a mode as available until the configured broker supports it.
+
+Acceptance requires creating and editing a profile in the WebUI, reloading
+and verifying persistence, and using that same saved profile through the
+broker against the QEMU guest. A second end-to-end check must revoke one
+factor and verify that the broker refuses a subsequent lease.
+
 ## Validation required before deployment
 
 Use a disposable QEMU guest with OpenSSH, PAM, a synthetic password and a
