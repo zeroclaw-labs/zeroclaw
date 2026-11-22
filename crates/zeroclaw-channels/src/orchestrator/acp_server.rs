@@ -26,7 +26,7 @@ use zeroclaw_memory::Memory;
 use zeroclaw_providers::SafeguardFallbackNotice;
 use zeroclaw_runtime::agent::SteeringInput;
 use zeroclaw_runtime::agent::agent::{Agent, TurnEvent};
-use zeroclaw_runtime::agent::turn_accounting::{
+use zeroclaw_providers::turn_accounting::{
     ContextDisplay, SafeguardFallbackDisplay, UsageFold, done_frame_context_limits,
 };
 use zeroclaw_runtime::cost::CostTracker;

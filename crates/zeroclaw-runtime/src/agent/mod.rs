@@ -24,7 +24,6 @@ pub(crate) mod tool_call_format;
 pub mod tool_execution;
 pub mod tool_receipts;
 pub(crate) mod turn;
-pub mod turn_accounting;
 
 pub use turn::context::TurnMeta;
 pub use turn::{
