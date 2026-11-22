@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { Button } from "@/components/ui";
+import { Button, Select } from "@/components/ui";
 import { changeHttpCredential, type HttpCredentialRow, type PamChallengeRole, type SshAuthProfile, type SshDestination, type SshProfileAuth } from "@/lib/api";
 
 const field = "block w-full rounded-md border border-border bg-background p-2";
@@ -40,6 +40,11 @@ export default function SshProfiles({ rows, reload }: { rows: HttpCredentialRow[
 
   const options = (kind: HttpCredentialRow["kind"]) => rows.filter(row =>
     form && row.kind === kind && row.destinations?.some(destination => matches(destination, form.destination)));
+  const aliasOptions = (kind: HttpCredentialRow["kind"], placeholder: string) => [
+    { value: "", label: placeholder },
+    ...options(kind).map(row => ({ value: row.name, label: row.name })),
+  ];
+
   function mode(value: SshProfileAuth["mode"]): SshProfileAuth {
     if (value === "public_key") return { mode: value, key_alias: "" };
     if (value === "password") return { mode: value, password_alias: "" };
@@ -49,6 +54,10 @@ export default function SshProfiles({ rows, reload }: { rows: HttpCredentialRow[
     const { destination, auth, previous } = form;
     const factors = auth.mode === "public_key" ? [auth.key_alias]
       : auth.mode === "password" ? [auth.password_alias] : [auth.password_alias, auth.totp_alias];
+    if (factors.every(factor => !factor)) {
+      setError(true);
+      return;
+    }
     const anchor = previous?.anchor ?? factors.find(Boolean);
     const row = rows.find(row => row.name === anchor);
     if (!row || !factors.includes(row.name)
@@ -75,42 +84,42 @@ export default function SshProfiles({ rows, reload }: { rows: HttpCredentialRow[
         onChange={event => setForm({ ...form, destination: { ...form.destination, port: Number(event.target.value) } })} /></label>
       <label className="block">SSH username<input className={field} required value={form.destination.username}
         onChange={event => setForm({ ...form, destination: { ...form.destination, username: event.target.value } })} /></label>
-      <label className="block">Authentication<select className={field} value={form.auth.mode}
-        onChange={event => setForm({ ...form, auth: mode(event.target.value as SshProfileAuth["mode"]) })}>
-        {Object.entries(modes).map(([value, label]) => <option key={value} value={value}>{label}</option>)}
-      </select></label>
-      {form.auth.mode === "public_key" && <label className="block">SSH key alias<select className={field} required value={form.auth.key_alias}
-        onChange={event => setForm({ ...form, auth: { mode: "public_key", key_alias: event.target.value } })}>
-        <option value="">Select an authorized key</option>
-        {options("ssh_key").map(row => <option key={row.name}>{row.name}</option>)}
-      </select></label>}
-      {form.auth.mode !== "public_key" && <label className="block">Password alias<select className={field}
-        required={form.auth.mode === "password"} value={form.auth.password_alias ?? ""}
-        onChange={event => {
-          const value = event.target.value;
-          const auth = form.auth;
-          if (auth.mode === "password") setForm({ ...form, auth: { ...auth, password_alias: value } });
-          if (auth.mode === "pam") setForm({ ...form, auth: { ...auth, password_alias: value || undefined } });
-        }}>
-        <option value="">No password selected</option>
-        {options("user_password").map(row => <option key={row.name}>{row.name}</option>)}
-      </select></label>}
+      <label className="block">Authentication
+        <Select aria-label="Authentication" value={form.auth.mode}
+          onChange={value => setForm({ ...form, auth: mode(value as SshProfileAuth["mode"]) })}
+          options={Object.entries(modes).map(([value, label]) => ({ value, label }))} />
+      </label>
+      {form.auth.mode === "public_key" && <label className="block">SSH key alias
+        <Select aria-label="SSH key alias" value={form.auth.key_alias}
+          onChange={value => setForm({ ...form, auth: { mode: "public_key", key_alias: value } })}
+          options={aliasOptions("ssh_key", "Select an authorized key")} />
+      </label>}
+      {form.auth.mode !== "public_key" && <label className="block">Password alias
+        <Select aria-label="Password alias" value={form.auth.password_alias ?? ""}
+          onChange={value => {
+            const auth = form.auth;
+            if (auth.mode === "password") setForm({ ...form, auth: { ...auth, password_alias: value } });
+            if (auth.mode === "pam") setForm({ ...form, auth: { ...auth, password_alias: value || undefined } });
+          }}
+          options={aliasOptions("user_password", "No password selected")} />
+      </label>}
       {form.auth.mode === "pam" && (() => {
         const auth = form.auth;
         return <>
-          <label className="block">TOTP alias<select className={field} value={auth.totp_alias ?? ""}
-            onChange={event => setForm({ ...form, auth: { ...auth, totp_alias: event.target.value || undefined } })}>
-            <option value="">No TOTP selected</option>
-            {options("totp").map(row => <option key={row.name}>{row.name}</option>)}
-          </select></label>
+          <label className="block">TOTP alias
+            <Select aria-label="TOTP alias" value={auth.totp_alias ?? ""}
+              onChange={value => setForm({ ...form, auth: { ...auth, totp_alias: value || undefined } })}
+              options={aliasOptions("totp", "No TOTP selected")} />
+          </label>
           <fieldset className="space-y-3">
             <legend>PAM challenges in server order</legend>
             {auth.challenges.map((challenge, index) => <div key={index} className="space-y-2">
-              <label className="block">Challenge role<select className={field} value={challenge.role} onChange={event =>
-                setForm({ ...form, auth: { ...auth, challenges: auth.challenges.map((item, pos) =>
-                  pos === index ? { ...item, role: event.target.value as PamChallengeRole } : item) } })}>
-                {Object.entries(roles).map(([value, label]) => <option key={value} value={value}>{label}</option>)}
-              </select></label>
+              <label className="block">Challenge role
+                <Select aria-label="Challenge role" value={challenge.role}
+                  onChange={value => setForm({ ...form, auth: { ...auth, challenges: auth.challenges.map((item, pos) =>
+                    pos === index ? { ...item, role: value as PamChallengeRole } : item) } })}
+                  options={Object.entries(roles).map(([value, label]) => ({ value, label }))} />
+              </label>
               <label className="block">Exact prompt label<input className={field} required maxLength={128} value={challenge.label}
                 onChange={event => setForm({ ...form, auth: { ...auth, challenges: auth.challenges.map((item, pos) =>
                   pos === index ? { ...item, label: event.target.value } : item) } })} /></label>
