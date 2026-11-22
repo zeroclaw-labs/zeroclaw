@@ -765,7 +765,11 @@ fn rewrite_agent_refs(cfg: &mut Config, old: &str, new: &str) -> Vec<String> {
     // compiles it; wildcards and unrelated selectors are left as they are.
     for (pname, profile) in cfg.permission_profiles.iter_mut() {
         let mut touched = false;
-        for selector in profile.allowed_agents.iter_mut() {
+        for selector in profile
+            .allowed_agents
+            .iter_mut()
+            .chain(&mut profile.allowed_code_agents)
+        {
             if profile_selector_names_agent(selector, old) {
                 *selector = new.to_string();
                 touched = true;
@@ -1298,13 +1302,18 @@ fn collect_agent_refs(cfg: &Config, alias: &str, sites: &mut Vec<RefSite>) {
     // selector naming a missing agent, so deletion is refused rather than
     // silently narrowing the grant.
     for (pname, profile) in sorted_permission_profiles(cfg) {
-        for (i, selector) in profile.allowed_agents.iter().enumerate() {
-            if profile_selector_names_agent(selector, alias) {
-                sites.push(RefSite::hard(
-                    format!("permission_profiles.{pname}.allowed_agents[{i}]"),
-                    ScrubAction::Refuse,
-                    selector,
-                ));
+        for (field, selectors) in [
+            ("allowed_agents", &profile.allowed_agents),
+            ("allowed_code_agents", &profile.allowed_code_agents),
+        ] {
+            for (i, selector) in selectors.iter().enumerate() {
+                if profile_selector_names_agent(selector, alias) {
+                    sites.push(RefSite::hard(
+                        format!("permission_profiles.{pname}.{field}[{i}]"),
+                        ScrubAction::Refuse,
+                        selector,
+                    ));
+                }
             }
         }
     }
