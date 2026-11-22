@@ -55,6 +55,7 @@ pub(crate) struct AcpTurnAttachment {
     pub(crate) live: broadcast::Receiver<AcpTurnEventFrame>,
     pub(crate) completed: bool,
     pub(crate) turn_id: uuid::Uuid,
+    pub(crate) truncated: bool,
 }
 
 /// Gateway-shared registry of in-flight ACP turns, backed by [`SessionActorQueue`]
@@ -207,6 +208,8 @@ impl AcpTurnHub {
         session_id: &str,
         principal_id: Option<&str>,
         after_seq: u64,
+        active_only: bool,
+        accept_partial: bool,
     ) -> Result<Option<AcpTurnAttachment>, i32> {
         let turns = self.turns.lock().unwrap_or_else(|e| e.into_inner());
         let Some(turn) = turns.get(session_id) else {
@@ -215,11 +218,14 @@ impl AcpTurnHub {
         if turn.principal_id.as_deref() != principal_id {
             return Err(FORBIDDEN);
         }
-        if turn
+        if active_only && turn.completed {
+            return Ok(None);
+        }
+        let truncated = turn
             .events
             .front()
-            .is_some_and(|e| e.seq > after_seq.saturating_add(1))
-        {
+            .is_some_and(|e| e.seq > after_seq.saturating_add(1));
+        if truncated && !accept_partial {
             return Err(zeroclaw_api::jsonrpc::error_codes::INVALID_PARAMS);
         }
         let mut replay: Vec<_> = turn
@@ -235,10 +241,12 @@ impl AcpTurnHub {
             })
             .cloned()
             .collect();
+        // Include unanswered requests even when they have left the ring.
+        let first_buffered = turn.events.front().map_or(turn.next_seq, |frame| frame.seq);
         replay.extend(
             turn.pending
                 .values()
-                .filter(|e| e.seq <= after_seq)
+                .filter(|e| e.seq <= after_seq || e.seq < first_buffered)
                 .cloned(),
         );
         replay.sort_by_key(|e| e.seq);
@@ -247,6 +255,7 @@ impl AcpTurnHub {
             live: turn.tx.subscribe(),
             completed: turn.completed,
             turn_id: turn.identity,
+            truncated,
         }))
     }
 
@@ -500,7 +509,10 @@ async fn handle_socket(
                             line = frame.payload;
                         }
                         let generation = hub_for_output.queue.advance_generation(&sid);
-                        output_generations.lock().unwrap_or_else(|e|e.into_inner()).insert(sid.clone(),generation);
+                        output_generations
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .insert(sid.clone(), generation);
                         hub_for_output.finish_turn(&sid);
                     }
                 }
@@ -646,7 +658,10 @@ async fn handle_socket(
                             continue;
                         }
                         attached_sessions.insert(sid.to_owned());
-                        match turn_hub.reattach(sid, principal_id.as_deref(), after_seq) {
+                        let params = &parsed["params"];
+                        let active_only = params["activeOnly"].as_bool().unwrap_or(false);
+                        let accept_partial = params["acceptPartial"].as_bool().unwrap_or(false);
+                        match turn_hub.reattach(sid, principal_id.as_deref(), after_seq, active_only, accept_partial) {
                             Ok(Some(attachment)) => {
                                 let ack = serde_json::json!({
                                     "jsonrpc": "2.0",
@@ -655,6 +670,7 @@ async fn handle_socket(
                                         "sessionId": sid,
                                         "inFlight": !attachment.completed,
                                         "replayed": attachment.replay.len(),
+                                        "truncated": attachment.truncated,
                                         "turnId": attachment.turn_id.to_string(),
                                     }
                                 });
@@ -1057,7 +1073,7 @@ mod tests {
 
         // Client reloads and reattaches after seq=1 (saw tool_call:1 before reload).
         let mut attached = hub
-            .reattach("sess-reload", Some("alice"), 1)
+            .reattach("sess-reload", Some("alice"), 1, false, false)
             .expect("owner reattach must succeed")
             .expect("turn is still active");
         assert!(!attached.completed);
@@ -1121,7 +1137,7 @@ mod tests {
             "reattach must replay missed frames in exact order with zero duplicates"
         );
         assert!(
-            hub.reattach("sess-reload", Some("alice"), 0)
+            hub.reattach("sess-reload", Some("alice"), 0, false, false)
                 .unwrap()
                 .is_some_and(|a| a.completed),
             "terminal replay must survive completion"
@@ -1146,11 +1162,12 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            hub.reattach("sess-scoped", Some("bob"), 0).err(),
+            hub.reattach("sess-scoped", Some("bob"), 0, false, false)
+                .err(),
             Some(zeroclaw_api::jsonrpc::error_codes::FORBIDDEN)
         );
         assert_eq!(
-            hub.reattach("sess-scoped", None, 0).err(),
+            hub.reattach("sess-scoped", None, 0, false, false).err(),
             Some(zeroclaw_api::jsonrpc::error_codes::FORBIDDEN)
         );
         assert_eq!(

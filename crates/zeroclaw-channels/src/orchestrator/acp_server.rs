@@ -500,7 +500,7 @@ impl AcpServer {
         let grants = if let Some(resolve) = &self.scoped_grants {
             let grants = resolve()
                 .filter(|g| g.may_use_agent(agent_alias))
-                .ok_or_else(|| anyhow::anyhow!("ACP agent access revoked"))?;
+                .ok_or_else(|| anyhow::Error::msg("ACP agent access revoked"))?;
             anyhow::ensure!(
                 self.connection_default_agent.as_deref() == Some(agent_alias),
                 "ACP agent is outside this connection's grant"
