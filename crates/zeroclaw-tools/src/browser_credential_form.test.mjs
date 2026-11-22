@@ -6,9 +6,17 @@ import test from "node:test";
 const source = readFileSync(new URL("./browser_credential_form.js", import.meta.url), "utf8");
 const origin = "https://login.example.test";
 
-function fixture({ action = origin + "/submit", method = "post", top = true, maskedOtp = false, duplicateOtp = false, frameOrigin = origin, submitOverride } = {}) {
+function fixture({ action = origin + "/submit", method = "post", top = true, invalid = false, canceled = false, maskedOtp = false, duplicateOtp = false, frameOrigin = origin, submitOverride } = {}) {
   const sent = [];
-  class Form { requestSubmit() { sent.push(fields.map(field => field.value)); } }
+  class Form {
+    addEventListener(type, handler) { this.observeSubmit = handler; }
+    removeEventListener() { this.observeSubmit = undefined; }
+    requestSubmit() {
+      if (invalid) return;
+      this.observeSubmit?.({ target: this, defaultPrevented: canceled });
+      if (!canceled) sent.push(fields.map(field => field.value));
+    }
+  }
   class Input {
     value = "";
     getClientRects() { return [1]; }
@@ -112,3 +120,12 @@ test("refuses a submit button that overrides the destination", () => {
   assert.deepEqual(sent,[]);
   assert.ok(fields.every(field=>field.value===""));
 });
+
+for (const options of [{ invalid: true }, { canceled: true }]) {
+  test(`does not report an unsent form as submitted: ${JSON.stringify(options)}`, () => {
+    const { run, sent, fields } = fixture(options);
+    assert.equal(run({ username: "fixture", password: "sentinel" }), false);
+    assert.deepEqual(sent, []);
+    assert.ok(fields.every(field => field.value === ""));
+  });
+}

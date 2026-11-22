@@ -65,12 +65,18 @@ function submitCatalogCredential({ origin, values, stage = "auto", field = null,
     if (method.toLowerCase() !== "post" || (target && target !== "_self") ||
         new URL(action, doc.baseURI).origin !== origin) return false;
 
+    let submission;
+    const observeSubmit = event => {
+      if (event.target === form) submission = event;
+    };
+    form.addEventListener("submit", observeSubmit, true);
     try {
       for (const [control, value] of fields) control.value = value;
       if (submitter) formType.prototype.requestSubmit.call(form, submitter);
       else formType.prototype.requestSubmit.call(form);
-      return true;
+      return submission !== undefined && !submission.defaultPrevented;
     } finally {
+      form.removeEventListener("submit", observeSubmit, true);
       for (const [control] of fields) control.value = "";
     }
   } catch {

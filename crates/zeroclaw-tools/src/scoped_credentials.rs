@@ -13,6 +13,13 @@ pub(crate) fn load_scoped_credential(
     path: Option<&Path>,
     name: &str,
 ) -> anyhow::Result<ScopedHttpCredential> {
+    load_scoped_credential_snapshot(path, name).map(|(credential, _)| credential)
+}
+
+pub(crate) fn load_scoped_credential_snapshot(
+    path: Option<&Path>,
+    name: &str,
+) -> anyhow::Result<(ScopedHttpCredential, String)> {
     anyhow::ensure!(
         ScopedHttpCredential::valid_name(name),
         "{}",
@@ -39,8 +46,10 @@ pub(crate) fn load_scoped_credential(
     let plaintext = SecretStore::new(dir, true)
         .decrypt(stored)
         .map_err(|_| anyhow::Error::msg(scoped_credential_message("tool-http-credential-store")))?;
-    serde_json::from_str(&plaintext)
-        .map_err(|_| anyhow::Error::msg(scoped_credential_message("tool-http-credential-invalid")))
+    let credential = serde_json::from_str(&plaintext).map_err(|_| {
+        anyhow::Error::msg(scoped_credential_message("tool-http-credential-invalid"))
+    })?;
+    Ok((credential, stored.clone()))
 }
 
 pub(crate) async fn resolve_scoped_value(

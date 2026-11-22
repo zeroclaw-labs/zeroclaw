@@ -17,7 +17,7 @@ const HTTP_REQUEST_PROXY_PINNING_ERROR: &str = "http_request requires direct tra
      proxy.scope = \"environment\" is incompatible with pinned HTTP requests";
 
 use crate::scoped_credentials::{
-    load_scoped_credential, resolve_scoped_value, scoped_credential_message,
+    load_scoped_credential_snapshot, resolve_scoped_value, scoped_credential_message,
 };
 
 /// HTTP request tool for API interactions.
@@ -476,7 +476,9 @@ impl HttpRequestTool {
                 "tool-http-credential-host",
             )));
         }
-        let credential = load_scoped_credential(self.config_path.as_deref(), name)?;
+        let alias = name;
+        let (credential, reviewed) =
+            load_scoped_credential_snapshot(self.config_path.as_deref(), alias)?;
         if !ScopedHttpCredential::https_origin(&target.url)
             .is_some_and(|origin| credential.http_grants().contains(&origin))
         {
@@ -517,6 +519,13 @@ impl HttpRequestTool {
                 )));
             }
         };
+        // The external lookup can await while the operator changes the catalog.
+        let (_, current) = load_scoped_credential_snapshot(self.config_path.as_deref(), alias)?;
+        if current != reviewed {
+            return Err(anyhow::Error::msg(scoped_credential_message(
+                "tool-http-credential-origin",
+            )));
+        }
         let mut header = HeaderValue::from_str(&authorization).map_err(|_| {
             anyhow::Error::msg(scoped_credential_message("tool-http-credential-invalid"))
         })?;
