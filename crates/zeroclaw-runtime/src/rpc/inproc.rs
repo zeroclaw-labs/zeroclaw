@@ -452,6 +452,8 @@ impl InprocConnector {
 /// The provider and principal established when the dashboard accepted the bearer.
 #[derive(Clone)]
 pub struct OidcSessionBinding {
+    /// Only a gateway Code connection selects the Code permission profile view.
+    pub code_workspace: bool,
     pub provider: super::auth::OidcBinding,
     pub principal_id: zeroclaw_api::principal::PrincipalId,
 }
@@ -754,6 +756,7 @@ mod tests {
 
     fn alice_binding(provider: crate::rpc::auth::OidcBinding) -> OidcSessionBinding {
         OidcSessionBinding {
+            code_workspace: false,
             principal_id: zeroclaw_api::principal::PrincipalId::for_oidc(&provider.issuer, "alice"),
             provider,
         }
@@ -849,6 +852,7 @@ mod tests {
             ..params
         };
         let other_account = OidcSessionBinding {
+            code_workspace: false,
             principal_id: zeroclaw_api::principal::PrincipalId::for_oidc(&other.uri(), "bob"),
             provider: now_bound,
         };

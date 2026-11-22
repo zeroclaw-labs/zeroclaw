@@ -48,6 +48,8 @@ use crate::security::principal_resolver::{PrincipalResolver, ResolvedPrincipal, 
 /// from `identity` whenever the authorization generation moves.
 #[derive(Clone, Debug)]
 pub struct ConnectionAuth {
+    /// Selected by the trusted in-process connector, never by an RPC frame.
+    pub(crate) code_workspace: bool,
     /// The provider-verified identity (retained so grants can be
     /// re-resolved after a policy change; claims are non-secret).
     pub identity: AuthenticatedIdentity,
@@ -64,6 +66,15 @@ pub struct ConnectionAuth {
     /// Non-secret evidence that can be rechecked after a policy generation
     /// changes. Bearers themselves never outlive initialize.
     pub local_evidence: LocalCredentialEvidence,
+}
+
+impl ConnectionAuth {
+    fn project(&self, mut resolved: ResolvedPrincipal) -> ResolvedPrincipal {
+        if self.code_workspace {
+            resolved.grants = resolved.grants.code_session_grants();
+        }
+        resolved
+    }
 }
 
 /// Only non-secret, local authentication evidence retained on a connection.
@@ -541,7 +552,9 @@ impl RpcInboundAuth {
             auth.native_token_hash.as_deref(),
             &|hash| self.pairing.token_hash_is_paired(hash),
         )?;
-        state.resolve(&auth.identity)
+        state
+            .resolve(&auth.identity)
+            .map(|resolved| auth.project(resolved))
     }
 
     /// Resolve an established binding against the accepted policy, rechecking
@@ -568,7 +581,9 @@ impl RpcInboundAuth {
                 &|hash| self.pairing.token_hash_is_paired(hash),
             )?;
         }
-        state.resolve(&auth.identity)
+        state
+            .resolve(&auth.identity)
+            .map(|resolved| auth.project(resolved))
     }
 
     /// Whether the credential behind `auth` is still live: not expired, not
@@ -642,7 +657,7 @@ impl AuthorityLease<'_> {
         }
         self.state
             .resolve(&auth.identity)
-            .map(|resolved| resolved.grants)
+            .map(|resolved| auth.project(resolved).grants)
             .map_err(AuthDenied::from_deny_reason)
     }
 }
@@ -865,6 +880,7 @@ impl RpcInboundAuth {
             .resolve(&identity)
             .map_err(AuthDenied::from_deny_reason)?;
         Ok(ConnectionAuth {
+            code_workspace: false,
             identity,
             principal: resolved.principal,
             grants: resolved.grants,
@@ -1391,6 +1407,7 @@ mod tests {
         .with_claims(claims);
         let resolved = auth.resolve(&identity).expect("the OIDC identity resolves");
         ConnectionAuth {
+            code_workspace: false,
             identity,
             principal: resolved.principal,
             grants: resolved.grants,

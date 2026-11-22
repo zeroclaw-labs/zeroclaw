@@ -69,11 +69,21 @@ permission checks.
 ### Code workspace WebSocket
 
 `/ws/code` bridges code-session JSON-RPC to the daemon's local IPC listener.
-Unlike pairing-optional HTTP surfaces, it always requires pairing to be enabled
-and a valid issued token. Browser clients supply subprotocols
+Paired clients use an issued token. Signed-in browsers use their existing dashboard cookie on a same-origin connection. The gateway presents the held access token only to the provider-bound in-process core connector. Each signed-in account operates on its own Code sessions, including administrators. Browser clients supply subprotocols
 `zeroclaw.code.v1` and `bearer.<token>`; non-browser clients may use an
 `Authorization: Bearer ...` header. Query-string tokens are not accepted.
 Standalone gateways without the daemon return an unavailable response.
+
+For a non-administrator account, assign a permission profile through the existing OIDC claim mapping. For example:
+
+```toml
+[permission_profiles.project_coder]
+allowed_code_agents = ["project"]
+[permission_profiles.project_coder.grants]
+code = ["create", "read", "update", "execute"]
+```
+
+Replace `project` with a configured agent. Ordinary chat access is independent. An account also needs its usual tool grants and selectors to run tools. Expiry, sign-out and a change to the account's effective Code permissions end its open Code connections.
 
 The bridge admits `initialize`, `session/new`, `session/prompt`, `session/cancel`,
 `session/approve`, `session/messages`, `session/state`, and `session/list-acp`,
