@@ -10034,6 +10034,8 @@ impl RpcDispatcher {
             ));
         }
         if authorized.is_none() {
+            #[cfg(test)]
+            self.ctx.sessions.wait_test_removal_signal_pause().await;
             return Err(rpc_err(SESSION_NOT_FOUND, "Session not found"));
         }
         // A session ID may be reused while this request waits for an active

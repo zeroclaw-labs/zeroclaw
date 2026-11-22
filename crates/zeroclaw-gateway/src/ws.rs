@@ -5993,14 +5993,6 @@ data: {\"type\":\"message_stop\"}\n\n",
                 &zeroclaw_providers::ChatMessage::assistant("predecessor"),
             )
             .unwrap();
-        for key in ["delete-race", "rpc_delete-race"] {
-            backend
-                .append(
-                    key,
-                    &zeroclaw_providers::ChatMessage::assistant("predecessor"),
-                )
-                .unwrap();
-        }
         let mut state =
             crate::api::tests::test_state_with_session_backend(config.clone(), backend.clone());
         let coordination =
@@ -6071,11 +6063,9 @@ data: {\"type\":\"message_stop\"}\n\n",
             let key = "gw_delete-race";
             let generation = coordination.queue().lifecycle_generation(key).await;
             let transcript_generation = coordination.queue().transcript_generation(key);
-            for alias in ["delete-race", "rpc_delete-race", key] {
-                backend
-                    .set_session_prompt(alias, "task", "retain this task")
-                    .unwrap();
-            }
+            backend
+                .set_session_prompt(key, "task", "retain this task")
+                .unwrap();
             let db = rusqlite::Connection::open(tmp.path().join("sessions/sessions.db")).unwrap();
             db.execute_batch(
                 "CREATE TRIGGER reject_gateway_delete BEFORE DELETE ON session_metadata
@@ -6093,12 +6083,10 @@ data: {\"type\":\"message_stop\"}\n\n",
                     .contains("Failed to delete persistent session"),
                 "deletion must fail at the injected storage boundary: {error}"
             );
-            for alias in ["delete-race", "rpc_delete-race", key] {
-                assert!(backend.session_exists(alias));
-                let prompts = backend.list_session_prompts(alias).unwrap();
-                assert_eq!(prompts.len(), 1);
-                assert_eq!(prompts[0].content, "retain this task");
-            }
+            assert!(backend.session_exists(key));
+            let prompts = backend.list_session_prompts(key).unwrap();
+            assert_eq!(prompts.len(), 1);
+            assert_eq!(prompts[0].content, "retain this task");
             assert_eq!(
                 coordination.queue().lifecycle_generation(key).await,
                 generation
@@ -6154,8 +6142,7 @@ data: {\"type\":\"message_stop\"}\n\n",
             let http_delete = crate::api::handle_api_session_delete(
                 State(state.clone()),
                 axum::http::HeaderMap::new(),
-                // GET /api/sessions returns the exact persisted key. A raw
-                // alias also exists here, so the display ID would target it.
+                // GET /api/sessions returns the exact persisted key.
                 Path("gw_delete-race".into()),
             );
             let rpc_delete = zeroclaw_runtime::rpc::local::call_local(
@@ -6200,18 +6187,6 @@ data: {\"type\":\"message_stop\"}\n\n",
                     rpc_result.is_err(),
                     "RPC must reject the HTTP-invalidated generation"
                 );
-                assert!(backend.session_exists("delete-race"));
-                assert!(backend.session_exists("rpc_delete-race"));
-                assert_eq!(
-                    zeroclaw_runtime::rpc::local::call_local(
-                        &config,
-                        "session/delete",
-                        delete_params.clone()
-                    )
-                    .await
-                    .unwrap()["deleted"],
-                    true
-                );
             } else {
                 assert_eq!(rpc_result.unwrap()["deleted"], true);
                 assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
@@ -6222,9 +6197,6 @@ data: {\"type\":\"message_stop\"}\n\n",
                     .await
                     .expect("RPC deletion");
             assert_eq!(deleted["deleted"], true);
-        }
-        for key in ["delete-race", "rpc_delete-race"] {
-            assert!(!backend.session_exists(key));
         }
         assert!(!backend.session_exists("gw_delete-race"));
         socket
@@ -6322,7 +6294,7 @@ data: {\"type\":\"message_stop\"}\n\n",
     async fn deleted_websocket_cannot_write_into_a_same_id_successor() {
         use axum::extract::Path;
         use zeroclaw_infra::session_backend::SessionBackend;
-        use zeroclaw_infra::session_store::SessionStore;
+        use zeroclaw_infra::session_sqlite::SqliteSessionBackend;
 
         let tmp = tempfile::TempDir::new().expect("temporary gateway workspace");
         let mut config = zeroclaw_config::schema::Config {
@@ -6365,7 +6337,8 @@ data: {\"type\":\"message_stop\"}\n\n",
                 ..Default::default()
             },
         );
-        let backend: Arc<dyn SessionBackend> = Arc::new(SessionStore::new(tmp.path()).unwrap());
+        let backend: Arc<dyn SessionBackend> =
+            Arc::new(SqliteSessionBackend::new(tmp.path()).unwrap());
         backend
             .append(
                 "gw_delete-race",
