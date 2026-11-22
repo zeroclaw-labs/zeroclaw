@@ -42,11 +42,6 @@ pub mod datasheet;
 #[cfg(feature = "hardware")]
 pub mod wizard;
 
-/// Raspberry Pi self-discovery and native GPIO tools.
-/// Only compiled on Linux with the `peripheral-rpi` feature.
-#[cfg(all(feature = "peripheral-rpi", target_os = "linux"))]
-pub mod rpi;
-
 pub mod util;
 
 // ── Phase 4: ToolRegistry + plugin system ─────────────────────────────────────
@@ -63,8 +58,6 @@ pub use tool_registry::{ToolError, ToolRegistry};
 
 // Re-export config types so wizard can use `hardware::HardwareConfig` etc.
 pub use zeroclaw_config::schema::{HardwareConfig, HardwareTransport};
-
-// ── Phase 5: boot() — hardware tool integration into agent loop ───────────────
 
 /// Merge hardware tools from a [`HardwareBootResult`] into an existing tool
 /// registry, deduplicating by name.
@@ -171,59 +164,7 @@ pub fn load_hardware_context_from_dir(hw_dir: &std::path::Path, aliases: &[&str]
     sections.join("\n\n")
 }
 
-#[cfg(all(feature = "peripheral-rpi", target_os = "linux"))]
-fn inject_rpi_context(
-    tools: &mut Vec<Box<dyn zeroclaw_api::tool::Tool>>,
-    context_files_prompt: &mut String,
-) {
-    if let Some(ctx) = rpi::RpiSystemContext::discover() {
-        ::zeroclaw_log::record!(
-            INFO,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
-                ::serde_json::json!({"board": ctx.model.display_name(), "ip": ctx.ip_address})
-            ),
-            "RPi self-discovery complete"
-        );
-        if let Some(led) = ctx.model.onboard_led_gpio() {
-            ::zeroclaw_log::record!(
-                INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_attrs(::serde_json::json!({"gpio": led})),
-                "Onboard ACT LED"
-            );
-        }
-        println!("[registry] rpi0 ready \u{2192} /dev/gpiomem");
-        if ctx.gpio_available {
-            tools.push(Box::new(rpi::GpioRpiWriteTool));
-            tools.push(Box::new(rpi::GpioRpiReadTool));
-            tools.push(Box::new(rpi::GpioRpiBlinkTool));
-            println!("[registry] loaded built-in: gpio_rpi_write");
-            println!("[registry] loaded built-in: gpio_rpi_read");
-            println!("[registry] loaded built-in: gpio_rpi_blink");
-        }
-        tools.push(Box::new(rpi::RpiSystemInfoTool));
-        println!("[registry] loaded built-in: rpi_system_info");
-        ctx.write_hardware_context_file();
-        // Load the device profile (rpi0.md) that was just written so its full
-        // GPIO reference and tool-usage rules appear in the system prompt.
-        let device_ctx = load_hardware_context_prompt(&["rpi0"]);
-        if !device_ctx.is_empty() {
-            if !context_files_prompt.is_empty() {
-                context_files_prompt.push_str("\n\n");
-            }
-            context_files_prompt.push_str("## Connected Hardware Devices\n\n");
-            context_files_prompt.push_str(&device_ctx);
-        }
-        let rpi_prompt = ctx.to_system_prompt();
-        if !context_files_prompt.is_empty() {
-            context_files_prompt.push_str("\n\n");
-        }
-        context_files_prompt.push_str(&rpi_prompt);
-    }
-}
-
 #[cfg(feature = "hardware")]
-#[allow(unused_mut)] // tools and context_files_prompt are mutated on Linux+peripheral-rpi
 pub async fn boot(
     peripherals: &zeroclaw_config::schema::PeripheralsConfig,
 ) -> anyhow::Result<HardwareBootResult> {
@@ -305,7 +246,7 @@ pub async fn boot(
         let reg = devices.read().await;
         reg.prompt_summary()
     };
-    let mut tools = registry.into_tools();
+    let tools = registry.into_tools();
     if !tools.is_empty() {
         ::zeroclaw_log::record!(
             INFO,
@@ -322,7 +263,7 @@ pub async fn boot(
             .collect()
     };
     let alias_refs: Vec<&str> = alias_strings.iter().map(|s: &String| s.as_str()).collect();
-    let mut context_files_prompt = load_hardware_context_prompt(&alias_refs);
+    let context_files_prompt = load_hardware_context_prompt(&alias_refs);
     if !context_files_prompt.is_empty() {
         ::zeroclaw_log::record!(
             INFO,
@@ -330,9 +271,6 @@ pub async fn boot(
             "Hardware context files loaded"
         );
     }
-    // RPi self-discovery: detect board model and inject GPIO tools + prompt context.
-    #[cfg(all(feature = "peripheral-rpi", target_os = "linux"))]
-    inject_rpi_context(&mut tools, &mut context_files_prompt);
     Ok(HardwareBootResult {
         tools,
         device_summary,
@@ -342,7 +280,6 @@ pub async fn boot(
 
 /// Fallback when the `hardware` feature is disabled — plugins only.
 #[cfg(not(feature = "hardware"))]
-#[allow(unused_mut)] // tools and context_files_prompt are mutated on Linux+peripheral-rpi
 pub async fn boot(
     _peripherals: &zeroclaw_config::schema::PeripheralsConfig,
 ) -> anyhow::Result<HardwareBootResult> {
@@ -352,7 +289,7 @@ pub async fn boot(
         let reg = devices.read().await;
         reg.prompt_summary()
     };
-    let mut tools = registry.into_tools();
+    let tools = registry.into_tools();
     if !tools.is_empty() {
         ::zeroclaw_log::record!(
             INFO,
@@ -362,10 +299,7 @@ pub async fn boot(
         );
     }
     // No discovered devices in no-hardware fallback; still load global files.
-    let mut context_files_prompt = load_hardware_context_prompt(&[]);
-    // RPi self-discovery: detect board model and inject GPIO tools + prompt context.
-    #[cfg(all(feature = "peripheral-rpi", target_os = "linux"))]
-    inject_rpi_context(&mut tools, &mut context_files_prompt);
+    let context_files_prompt = load_hardware_context_prompt(&[]);
     Ok(HardwareBootResult {
         tools,
         device_summary,
